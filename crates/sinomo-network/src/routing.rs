@@ -19,7 +19,10 @@ use sinomo_node::NodeId;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -27,6 +30,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 pub const MAX_ROUTE_CANDIDATES: usize = 16;
 const MAX_ROUTE_SEARCH_STATES: usize = 4096;
 const MAX_ROUTED_SESSION_HOPS: usize = 16;
+const ROUTED_CANDIDATE_BASE_HANDSHAKE_BUDGET: Duration = Duration::from_millis(100);
+const ROUTED_CANDIDATE_PER_HOP_HANDSHAKE_BUDGET: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RouteConstraints {
@@ -65,6 +70,7 @@ pub struct RouteHop {
     pub target_node_id: NodeId,
     pub endpoint: ClusterEndpointRecord,
     pub capabilities: DirectStreamCapabilities,
+    pub connectivity_state: DirectConnectivityState,
     pub latency_micros: Option<u64>,
 }
 
@@ -96,6 +102,34 @@ impl CandidatePath {
             .map(|hop| hop.latency_micros.unwrap_or(u64::MAX / 4))
             .fold(0_u64, u64::saturating_add)
     }
+
+    fn degraded_hop_count(&self) -> usize {
+        self.hops
+            .iter()
+            .filter(|hop| hop.connectivity_state == DirectConnectivityState::Degraded)
+            .count()
+    }
+}
+
+fn compare_candidate_paths(left: &CandidatePath, right: &CandidatePath) -> std::cmp::Ordering {
+    // Fully healthy paths always precede paths containing degraded evidence,
+    // even when the latter are shorter. Degraded edges remain executable as a
+    // last resort so a transient observation generation cannot make an
+    // otherwise connected node publish zero candidates.
+    left.degraded_hop_count()
+        .cmp(&right.degraded_hop_count())
+        .then_with(|| left.hops.len().cmp(&right.hops.len()))
+        .then_with(|| {
+            left.total_latency_micros()
+                .cmp(&right.total_latency_micros())
+        })
+        .then_with(|| left.nodes.cmp(&right.nodes))
+}
+
+fn retain_ranked_candidate(candidates: &mut Vec<CandidatePath>, candidate: CandidatePath) {
+    candidates.push(candidate);
+    candidates.sort_by(compare_candidate_paths);
+    candidates.truncate(MAX_ROUTE_CANDIDATES);
 }
 
 fn directory_contains_endpoint(
@@ -140,7 +174,7 @@ pub fn plan_routes(
 
     let mut adjacency = BTreeMap::<NodeId, Vec<RouteHop>>::new();
     for observation in connectivity.edges() {
-        if observation.state != DirectConnectivityState::Reachable
+        if observation.state == DirectConnectivityState::Unreachable
             || !directory.is_authorized(&observation.source_node_id)
             || !directory.is_authorized(&observation.target_node_id)
             || !directory_contains_endpoint(directory, observation)
@@ -156,6 +190,7 @@ pub fn plan_routes(
                 target_node_id: observation.target_node_id.clone(),
                 endpoint: observation.endpoint.clone(),
                 capabilities: observation.capabilities,
+                connectivity_state: observation.state,
                 latency_micros: observation.latency_micros,
             });
     }
@@ -172,7 +207,7 @@ pub fn plan_routes(
     let mut visited_states = 0_usize;
     while let Some(path) = pending.pop_front() {
         visited_states = visited_states.saturating_add(1);
-        if visited_states > MAX_ROUTE_SEARCH_STATES || candidates.len() >= MAX_ROUTE_CANDIDATES {
+        if visited_states > MAX_ROUTE_SEARCH_STATES {
             break;
         }
         if path.hops.len() >= constraints.max_hops.min(MAX_ROUTED_SESSION_HOPS) {
@@ -196,26 +231,13 @@ pub fn plan_routes(
                         .iter()
                         .all(|hop| hop.capabilities.relay_forwarding)
                 {
-                    candidates.push(next_path);
-                }
-                if candidates.len() >= MAX_ROUTE_CANDIDATES {
-                    break;
+                    retain_ranked_candidate(&mut candidates, next_path);
                 }
             } else {
                 pending.push_back(next_path);
             }
         }
     }
-    candidates.sort_by(|left, right| {
-        left.hops
-            .len()
-            .cmp(&right.hops.len())
-            .then_with(|| {
-                left.total_latency_micros()
-                    .cmp(&right.total_latency_micros())
-            })
-            .then_with(|| left.nodes.cmp(&right.nodes))
-    });
     candidates
 }
 
@@ -1130,6 +1152,7 @@ pub async fn connect_direct_routed_endpoint(
                 target_node_id: endpoint.node_id.clone(),
                 endpoint: endpoint.clone(),
                 capabilities: link.capabilities(),
+                connectivity_state: DirectConnectivityState::Reachable,
                 latency_micros: None,
             }],
         };
@@ -1362,34 +1385,58 @@ pub async fn accept_or_relay_routed_session(
         .cloned()
         .ok_or(NetworkError::AuthDenied)?;
     let connect_time = routed_session_remaining_connect_time(descriptor)?;
+    enum RelayEstablishmentError {
+        DirectEdge(NetworkError),
+        DownstreamSession(NetworkError),
+    }
+    let direct_edge_established = Arc::new(AtomicBool::new(false));
+    let establish_edge = Arc::clone(&direct_edge_established);
     let establish = async {
-        let link = link_provider.connect(&endpoint).await?;
+        let link = link_provider
+            .connect(&endpoint)
+            .await
+            .map_err(RelayEstablishmentError::DirectEdge)?;
         if link.local_node_id() != &relay_node_id
             || link.peer_node_id() != &next_node_id
             || !link.capabilities().relay_forwarding
             || !link.capabilities().full_duplex
         {
-            return Err(NetworkError::AuthDenied);
+            return Err(RelayEstablishmentError::DirectEdge(
+                NetworkError::AuthDenied,
+            ));
         }
-        let mut outgoing = link.open_stream().await?;
+        let mut outgoing = link
+            .open_stream()
+            .await
+            .map_err(RelayEstablishmentError::DirectEdge)?;
+        // From this point the direct edge has been authenticated and opened.
+        // A missing acceptance is a downstream routed-session rejection (for
+        // example while a newly admitted member is still materializing), not
+        // evidence that this adjacent edge is unreachable.
+        establish_edge.store(true, Ordering::Release);
         write_routed_session_frame(&mut *outgoing.io, ROUTED_SESSION_OPEN_FRAME, &open_frame)
-            .await?;
+            .await
+            .map_err(RelayEstablishmentError::DownstreamSession)?;
         let acceptance_frame =
-            read_routed_session_frame(&mut *outgoing.io, ROUTED_SESSION_ACCEPT_FRAME).await?;
+            read_routed_session_frame(&mut *outgoing.io, ROUTED_SESSION_ACCEPT_FRAME)
+                .await
+                .map_err(RelayEstablishmentError::DownstreamSession)?;
         let signed_acceptance: SignedRoutedSessionAcceptance =
-            routed_session_decode(&acceptance_frame)?;
+            routed_session_decode(&acceptance_frame)
+                .map_err(RelayEstablishmentError::DownstreamSession)?;
         verify_routed_session_acceptance(
             directory,
             identity,
             descriptor,
             &descriptor_transcript,
             &signed_acceptance,
-        )?;
-        Ok::<_, NetworkError>((outgoing, acceptance_frame))
+        )
+        .map_err(RelayEstablishmentError::DownstreamSession)?;
+        Ok::<_, RelayEstablishmentError>((outgoing, acceptance_frame))
     };
     let (outgoing, acceptance_frame) = match tokio::time::timeout(connect_time, establish).await {
         Ok(Ok(established)) => established,
-        Ok(Err(error)) => {
+        Ok(Err(RelayEstablishmentError::DirectEdge(error))) => {
             report_routed_edge_failure(
                 failure_sink,
                 &relay_node_id,
@@ -1399,20 +1446,29 @@ pub async fn accept_or_relay_routed_session(
             );
             return Err(error);
         }
+        Ok(Err(RelayEstablishmentError::DownstreamSession(error))) => return Err(error),
         Err(_) => {
             let error = NetworkError::timeout(
-                format!("establish routed relay edge {relay_node_id} -> {next_node_id}"),
+                if direct_edge_established.load(Ordering::Acquire) {
+                    format!(
+                        "await routed-session acceptance through {relay_node_id} -> {next_node_id}"
+                    )
+                } else {
+                    format!("establish routed relay edge {relay_node_id} -> {next_node_id}")
+                },
                 NetworkTimeoutPhase::Connect,
                 connect_time,
                 NetworkDeliveryState::DefinitelyNotSent,
             );
-            report_routed_edge_failure(
-                failure_sink,
-                &relay_node_id,
-                &next_node_id,
-                &endpoint_id,
-                &error.to_string(),
-            );
+            if !direct_edge_established.load(Ordering::Acquire) {
+                report_routed_edge_failure(
+                    failure_sink,
+                    &relay_node_id,
+                    &next_node_id,
+                    &endpoint_id,
+                    &error.to_string(),
+                );
+            }
             return Err(error);
         }
     };
@@ -1674,7 +1730,7 @@ impl RoutedConnector for DirectRoutedConnector {
 /// by [`plan_routes`], including paths through intermediate relays.
 pub struct MultiHopRoutedConnector {
     local_node_id: NodeId,
-    directory: Arc<dyn ClusterDirectory>,
+    directory: DirectorySnapshot,
     connectivity: Arc<dyn crate::connectivity_snapshot::ConnectivityView>,
     failure_sink: Arc<dyn ConnectivityFailureSink>,
     link_provider: Arc<dyn LinkProvider>,
@@ -1685,6 +1741,24 @@ impl MultiHopRoutedConnector {
     pub fn new(
         local_node_id: NodeId,
         directory: Arc<dyn ClusterDirectory>,
+        connectivity: Arc<dyn crate::connectivity_snapshot::ConnectivityView>,
+        failure_sink: Arc<dyn ConnectivityFailureSink>,
+        link_provider: Arc<dyn LinkProvider>,
+        identity: Arc<dyn RoutedSessionIdentity>,
+    ) -> Result<Self, NetworkError> {
+        Self::from_snapshot(
+            local_node_id,
+            directory.snapshot()?,
+            connectivity,
+            failure_sink,
+            link_provider,
+            identity,
+        )
+    }
+
+    pub fn from_snapshot(
+        local_node_id: NodeId,
+        directory: DirectorySnapshot,
         connectivity: Arc<dyn crate::connectivity_snapshot::ConnectivityView>,
         failure_sink: Arc<dyn ConnectivityFailureSink>,
         link_provider: Arc<dyn LinkProvider>,
@@ -1708,7 +1782,7 @@ impl MultiHopRoutedConnector {
         destination_node_id: NodeId,
         options: ConnectOptions,
     ) -> Result<PeerStream, NetworkError> {
-        let directory = self.directory.snapshot()?;
+        let directory = &self.directory;
         if !directory.is_authorized(&self.local_node_id) {
             return Err(NetworkError::UnauthorizedNode {
                 node_id: self.local_node_id.clone(),
@@ -1721,55 +1795,66 @@ impl MultiHopRoutedConnector {
         }
         let connectivity = self.connectivity.snapshot();
         let paths = plan_routes(
-            &directory,
+            directory,
             &connectivity,
             &self.local_node_id,
             &destination_node_id,
             options.constraints,
         );
-        let deadline_unix_millis = routed_session_deadline_unix_millis(options.timeout);
+        let deadline = tokio::time::Instant::now() + options.timeout;
+        let path_count = paths.len();
         let mut attempts = 0_usize;
         let mut failures = Vec::new();
-        for path in paths {
+        for (path_index, path) in paths.into_iter().enumerate() {
             let Some(first_hop) = path.hops.first() else {
                 continue;
             };
             attempts = attempts.saturating_add(1);
-            let link = match self.link_provider.connect(&first_hop.endpoint).await {
-                Ok(link) => link,
-                Err(error) => {
-                    report_routed_edge_failure(
-                        Some(self.failure_sink.as_ref()),
-                        &first_hop.source_node_id,
-                        &first_hop.target_node_id,
-                        &first_hop.endpoint.endpoint_id,
-                        &error.to_string(),
-                    );
-                    failures.push(format!("{}: {error}", first_hop.endpoint.address));
-                    continue;
-                }
-            };
-            if link.local_node_id() != &self.local_node_id
-                || link.peer_node_id() != &first_hop.target_node_id
-                || !options
-                    .constraints
-                    .accepts_capabilities(link.capabilities())
-                || (path.hops.len() > 1 && !link.capabilities().relay_forwarding)
-            {
-                let error = NetworkError::AuthDenied;
-                report_routed_edge_failure(
-                    Some(self.failure_sink.as_ref()),
-                    &first_hop.source_node_id,
-                    &first_hop.target_node_id,
-                    &first_hop.endpoint.endpoint_id,
-                    &error.to_string(),
-                );
-                failures.push(format!("{}: {error}", first_hop.endpoint.address));
-                continue;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let paths_left =
+                u32::try_from(path_count.saturating_sub(path_index)).unwrap_or(u32::MAX);
+            let attempt_timeout =
+                routed_candidate_attempt_timeout(remaining, paths_left, path.hops.len());
+            let attempt_deadline_unix_millis = routed_session_deadline_unix_millis(attempt_timeout);
+            enum PathAttemptError {
+                DirectEdge(NetworkError),
+                RoutedSession(NetworkError),
             }
-            let stream = match link.open_stream().await {
-                Ok(stream) => stream,
-                Err(error) => {
+            let direct_edge_established = Arc::new(AtomicBool::new(false));
+            let established = Arc::clone(&direct_edge_established);
+            let attempt = async {
+                let link = self
+                    .link_provider
+                    .connect(&first_hop.endpoint)
+                    .await
+                    .map_err(PathAttemptError::DirectEdge)?;
+                if link.local_node_id() != &self.local_node_id
+                    || link.peer_node_id() != &first_hop.target_node_id
+                    || !options
+                        .constraints
+                        .accepts_capabilities(link.capabilities())
+                    || (path.hops.len() > 1 && !link.capabilities().relay_forwarding)
+                {
+                    return Err(PathAttemptError::DirectEdge(NetworkError::AuthDenied));
+                }
+                let stream = link
+                    .open_stream()
+                    .await
+                    .map_err(PathAttemptError::DirectEdge)?;
+                established.store(true, Ordering::Release);
+                initiate_routed_session(
+                    stream,
+                    directory,
+                    &path,
+                    self.identity.as_ref(),
+                    attempt_deadline_unix_millis,
+                )
+                .await
+                .map_err(PathAttemptError::RoutedSession)
+            };
+            match tokio::time::timeout(attempt_timeout, attempt).await {
+                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(PathAttemptError::DirectEdge(error))) => {
                     report_routed_edge_failure(
                         Some(self.failure_sink.as_ref()),
                         &first_hop.source_node_id,
@@ -1778,20 +1863,8 @@ impl MultiHopRoutedConnector {
                         &error.to_string(),
                     );
                     failures.push(format!("{}: {error}", first_hop.endpoint.address));
-                    continue;
                 }
-            };
-            match initiate_routed_session(
-                stream,
-                &directory,
-                &path,
-                self.identity.as_ref(),
-                deadline_unix_millis,
-            )
-            .await
-            {
-                Ok(stream) => return Ok(stream),
-                Err(error) => failures.push(format!(
+                Ok(Err(PathAttemptError::RoutedSession(error))) => failures.push(format!(
                     "path {}: {error}",
                     path.nodes
                         .iter()
@@ -1799,6 +1872,31 @@ impl MultiHopRoutedConnector {
                         .collect::<Vec<_>>()
                         .join(" -> ")
                 )),
+                Err(_) => {
+                    let error = NetworkError::timeout(
+                        format!(
+                            "establish routed candidate path {}",
+                            path.nodes
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(" -> ")
+                        ),
+                        NetworkTimeoutPhase::Connect,
+                        attempt_timeout,
+                        NetworkDeliveryState::DefinitelyNotSent,
+                    );
+                    if !direct_edge_established.load(Ordering::Acquire) {
+                        report_routed_edge_failure(
+                            Some(self.failure_sink.as_ref()),
+                            &first_hop.source_node_id,
+                            &first_hop.target_node_id,
+                            &first_hop.endpoint.endpoint_id,
+                            &error.to_string(),
+                        );
+                    }
+                    failures.push(error.to_string());
+                }
             }
         }
         Err(NetworkError::RetryExhausted {
@@ -1812,6 +1910,35 @@ impl MultiHopRoutedConnector {
             },
         })
     }
+}
+
+fn routed_candidate_attempt_timeout(
+    remaining: Duration,
+    paths_left: u32,
+    hop_count: usize,
+) -> Duration {
+    let paths_left = paths_left.max(1);
+    let equal_share = remaining.checked_div(paths_left).unwrap_or(remaining);
+    if paths_left == 1 {
+        return remaining.max(Duration::from_millis(1));
+    }
+
+    // A routed-session open is verified and forwarded once per hop. Dividing
+    // the operation deadline equally across every graph candidate can leave a
+    // multi-hop candidate only a few milliseconds at its final relay when the
+    // planner emits the full candidate set. Preserve a usable hop-scaled
+    // handshake window while reserving at least half of the current budget for
+    // another candidate. Fast authentication or dial failures still move to
+    // the next path immediately.
+    let hop_budget = ROUTED_CANDIDATE_PER_HOP_HANDSHAKE_BUDGET
+        .checked_mul(u32::try_from(hop_count).unwrap_or(u32::MAX))
+        .unwrap_or(Duration::MAX)
+        .saturating_add(ROUTED_CANDIDATE_BASE_HANDSHAKE_BUDGET);
+    let fallback_preserving_cap = remaining.checked_div(2).unwrap_or(remaining);
+    equal_share
+        .max(hop_budget.min(fallback_preserving_cap))
+        .min(remaining)
+        .max(Duration::from_millis(1))
 }
 
 impl RoutedConnector for MultiHopRoutedConnector {
@@ -1838,9 +1965,7 @@ impl RoutedConnector for MultiHopRoutedConnector {
     }
 
     fn availability(&self, destination_node_id: &NodeId) -> RoutedAvailability {
-        let Ok(directory) = self.directory.snapshot() else {
-            return RoutedAvailability::Unknown;
-        };
+        let directory = &self.directory;
         if !directory.is_authorized(&self.local_node_id)
             || !directory.is_authorized(destination_node_id)
         {
@@ -1848,7 +1973,7 @@ impl RoutedConnector for MultiHopRoutedConnector {
         }
         let connectivity = self.connectivity.snapshot();
         if plan_routes(
-            &directory,
+            directory,
             &connectivity,
             &self.local_node_id,
             destination_node_id,
@@ -1984,6 +2109,36 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[0].nodes, vec![a.clone(), c.clone()]);
         assert_eq!(paths[1].nodes, vec![a, b, c]);
+    }
+
+    #[test]
+    fn planner_prefers_healthy_relay_but_keeps_degraded_direct_fallback() {
+        let a = node("node_route_degraded_a");
+        let b = node("node_route_degraded_b");
+        let c = node("node_route_degraded_c");
+        let mut degraded_direct = edge(&a, &c, "endpoint_route_degraded_a_c", 11, 1);
+        degraded_direct.state = DirectConnectivityState::Degraded;
+        let (directory, connectivity) = fixtures(
+            11,
+            vec![
+                degraded_direct,
+                edge(&a, &b, "endpoint_route_degraded_a_b", 11, 10),
+                edge(&b, &c, "endpoint_route_degraded_b_c", 11, 10),
+            ],
+        );
+
+        let paths = plan_routes(
+            &directory,
+            &connectivity,
+            &a,
+            &c,
+            RouteConstraints::default(),
+        );
+
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].nodes, vec![a.clone(), b, c.clone()]);
+        assert_eq!(paths[1].nodes, vec![a, c]);
+        assert_eq!(paths[1].degraded_hop_count(), 1);
     }
 
     #[test]
@@ -2140,6 +2295,43 @@ mod tests {
         }
     }
 
+    struct ChangingDirectory {
+        first: DirectorySnapshot,
+        later: DirectorySnapshot,
+        snapshots: AtomicUsize,
+    }
+
+    impl ClusterDirectory for ChangingDirectory {
+        fn members(&self) -> Result<Vec<ClusterMemberRecord>, NetworkError> {
+            panic!("changing test directory must be consumed through snapshot")
+        }
+
+        fn endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+            panic!("changing test directory must be consumed through snapshot")
+        }
+
+        fn node_statuses(&self) -> Result<BTreeMap<NodeId, ClusterNodeStatusRecord>, NetworkError> {
+            Ok(BTreeMap::new())
+        }
+
+        fn connectivity_records(&self) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
+            Ok(Vec::new())
+        }
+
+        fn version(&self) -> Result<DirectoryVersion, NetworkError> {
+            panic!("changing test directory must be consumed through snapshot")
+        }
+
+        fn snapshot(&self) -> Result<DirectorySnapshot, NetworkError> {
+            let call = self.snapshots.fetch_add(1, Ordering::SeqCst);
+            Ok(if call == 0 {
+                self.first.clone()
+            } else {
+                self.later.clone()
+            })
+        }
+    }
+
     #[derive(Clone)]
     struct TestRoutedIdentity {
         local_node_id: NodeId,
@@ -2269,6 +2461,9 @@ mod tests {
         relay_reports: Arc<Mutex<Vec<RoutedRelayReport>>>,
         errors: Arc<Mutex<Vec<String>>>,
         failed_endpoints: Arc<Mutex<BTreeSet<Id>>>,
+        stalled_endpoints: Arc<Mutex<BTreeSet<Id>>>,
+        delayed_endpoints: Arc<Mutex<BTreeMap<Id, Duration>>>,
+        rejected_origins: Arc<Mutex<BTreeMap<NodeId, BTreeSet<NodeId>>>>,
         blocked_destinations: Arc<Mutex<BTreeSet<NodeId>>>,
         blocked_destination_release: Arc<Notify>,
         tamper_next_data_frame: Arc<AtomicBool>,
@@ -2288,6 +2483,9 @@ mod tests {
                 relay_reports: Arc::new(Mutex::new(Vec::new())),
                 errors: Arc::new(Mutex::new(Vec::new())),
                 failed_endpoints: Arc::new(Mutex::new(BTreeSet::new())),
+                stalled_endpoints: Arc::new(Mutex::new(BTreeSet::new())),
+                delayed_endpoints: Arc::new(Mutex::new(BTreeMap::new())),
+                rejected_origins: Arc::new(Mutex::new(BTreeMap::new())),
                 blocked_destinations: Arc::new(Mutex::new(BTreeSet::new())),
                 blocked_destination_release: Arc::new(Notify::new()),
                 tamper_next_data_frame: Arc::new(AtomicBool::new(false)),
@@ -2309,13 +2507,31 @@ mod tests {
             let network = self.clone();
             tokio::spawn(async move {
                 let local_node_id = stream.local_node_id.clone();
+                let rejected_origins = network
+                    .rejected_origins
+                    .lock()
+                    .expect("rejected origins lock")
+                    .get(&local_node_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let directory = DirectorySnapshot::try_new(
+                    network.directory.version(),
+                    network
+                        .directory
+                        .nodes()
+                        .values()
+                        .filter(|node| !rejected_origins.contains(&node.node_id))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
+                .expect("node-specific test directory");
                 let identity = TestRoutedIdentity {
                     local_node_id: local_node_id.clone(),
                 };
                 let provider = network.provider(local_node_id.clone());
                 match accept_or_relay_routed_session(
                     stream,
-                    network.directory.as_ref(),
+                    &directory,
                     &identity,
                     &provider,
                     Some(network.connectivity.as_ref()),
@@ -2428,6 +2644,23 @@ mod tests {
                         operation: "test routed relay dial".to_string(),
                         detail: "synthetic edge rejection".to_string(),
                     });
+                }
+                if network
+                    .stalled_endpoints
+                    .lock()
+                    .expect("stalled endpoints lock")
+                    .contains(&endpoint.endpoint_id)
+                {
+                    std::future::pending::<()>().await;
+                }
+                let delay = network
+                    .delayed_endpoints
+                    .lock()
+                    .expect("delayed endpoints lock")
+                    .get(&endpoint.endpoint_id)
+                    .copied();
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
                 }
                 let peer_node_id = endpoint.node_id.clone();
                 let link_id = Id::derived(
@@ -2907,6 +3140,283 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_hop_connector_timeslices_candidates_before_retrying_another_endpoint() {
+        let source = node("node_relay_endpoint_budget_source");
+        let destination = node("node_relay_endpoint_budget_destination");
+        let first = edge(
+            &source,
+            &destination,
+            "endpoint_relay_endpoint_budget_01_stalled",
+            39,
+            1,
+        );
+        let first_endpoint_id = first.endpoint.endpoint_id.clone();
+        let second = edge(
+            &source,
+            &destination,
+            "endpoint_relay_endpoint_budget_02_ready",
+            39,
+            2,
+        );
+        let second_endpoint_id = second.endpoint.endpoint_id.clone();
+        let (directory, connectivity) = fixtures(39, vec![first, second]);
+        let network = TestRelayNetwork::new(directory.clone(), connectivity);
+        network
+            .stalled_endpoints
+            .lock()
+            .expect("stalled endpoints lock")
+            .insert(first_endpoint_id.clone());
+        let connector = MultiHopRoutedConnector::new(
+            source.clone(),
+            Arc::new(FixedDirectory(directory)),
+            network.connectivity.clone(),
+            network.connectivity.clone(),
+            Arc::new(network.provider(source.clone())),
+            Arc::new(TestRoutedIdentity {
+                local_node_id: source.clone(),
+            }),
+        )
+        .expect("multi-hop connector");
+
+        let mut stream = connector
+            .connect(
+                destination.clone(),
+                ConnectOptions {
+                    timeout: Duration::from_millis(400),
+                    ..ConnectOptions::default()
+                },
+            )
+            .await
+            .expect("second endpoint should retain a bounded attempt window");
+        stream
+            .write_all(TEST_ROUTED_PAYLOAD)
+            .await
+            .expect("write routed payload");
+        let mut echoed = [0_u8; TEST_ROUTED_PAYLOAD.len()];
+        stream
+            .read_exact(&mut echoed)
+            .await
+            .expect("read routed echo");
+        assert_eq!(echoed, *TEST_ROUTED_PAYLOAD);
+        stream.shutdown().await.expect("close routed session");
+        network.wait_idle().await;
+
+        let dialed = network.dialed_edges.lock().expect("dialed edges lock");
+        assert_eq!(dialed.len(), 2);
+        assert_eq!(dialed[0].2, first_endpoint_id);
+        assert_eq!(dialed[1].2, second_endpoint_id);
+        drop(dialed);
+        let snapshot = network.connectivity.snapshot();
+        assert_eq!(
+            snapshot
+                .edges()
+                .iter()
+                .find(|edge| edge.endpoint.endpoint_id == first_endpoint_id)
+                .expect("first endpoint")
+                .state,
+            DirectConnectivityState::Unreachable
+        );
+        assert_eq!(stream.route_trace.endpoint_ids, vec![second_endpoint_id]);
+    }
+
+    #[tokio::test]
+    async fn multi_hop_connector_preserves_handshake_budget_with_full_candidate_set() {
+        let source = node("node_relay_full_budget_source");
+        let destination = node("node_relay_full_budget_destination");
+        let mut edges = (0..MAX_ROUTE_CANDIDATES)
+            .map(|index| {
+                edge(
+                    &source,
+                    &destination,
+                    &format!("endpoint_relay_full_budget_{index:02}"),
+                    57,
+                    u64::try_from(index).expect("latency index") + 1,
+                )
+            })
+            .collect::<Vec<_>>();
+        let first_endpoint_id = edges[0].endpoint.endpoint_id.clone();
+        let second_endpoint_id = edges[1].endpoint.endpoint_id.clone();
+        let (directory, connectivity) = fixtures(57, std::mem::take(&mut edges));
+        let network = TestRelayNetwork::new(directory.clone(), connectivity);
+        network
+            .stalled_endpoints
+            .lock()
+            .expect("stalled endpoints lock")
+            .insert(first_endpoint_id);
+        network
+            .delayed_endpoints
+            .lock()
+            .expect("delayed endpoints lock")
+            .insert(second_endpoint_id.clone(), Duration::from_millis(75));
+        let connector = MultiHopRoutedConnector::new(
+            source.clone(),
+            Arc::new(FixedDirectory(directory)),
+            network.connectivity.clone(),
+            network.connectivity.clone(),
+            Arc::new(network.provider(source)),
+            Arc::new(TestRoutedIdentity {
+                local_node_id: node("node_relay_full_budget_source"),
+            }),
+        )
+        .expect("multi-hop connector");
+
+        let mut stream = connector
+            .connect(
+                destination,
+                ConnectOptions {
+                    timeout: Duration::from_millis(400),
+                    ..ConnectOptions::default()
+                },
+            )
+            .await
+            .expect("the delayed second path retains a viable handshake budget");
+        stream
+            .write_all(TEST_ROUTED_PAYLOAD)
+            .await
+            .expect("write routed payload");
+        let mut echoed = [0_u8; TEST_ROUTED_PAYLOAD.len()];
+        stream
+            .read_exact(&mut echoed)
+            .await
+            .expect("read routed echo");
+        assert_eq!(echoed, *TEST_ROUTED_PAYLOAD);
+        assert_eq!(stream.route_trace.endpoint_ids, vec![second_endpoint_id]);
+        stream.shutdown().await.expect("close routed session");
+        network.wait_idle().await;
+    }
+
+    #[tokio::test]
+    async fn multi_hop_connector_freezes_one_directory_generation_before_connect() {
+        let source = node("node_relay_frozen_directory_source");
+        let destination = node("node_relay_frozen_directory_destination");
+        let (directory, connectivity) = fixtures(
+            58,
+            vec![edge(
+                &source,
+                &destination,
+                "endpoint_relay_frozen_directory",
+                58,
+                1,
+            )],
+        );
+        let network = TestRelayNetwork::new(directory.clone(), connectivity);
+        let changing = Arc::new(ChangingDirectory {
+            first: directory.clone(),
+            later: DirectorySnapshot::try_new(
+                DirectoryVersion(directory.version().0.saturating_add(1)),
+                Vec::new(),
+            )
+            .expect("empty later directory"),
+            snapshots: AtomicUsize::new(0),
+        });
+        let directory_provider: Arc<dyn ClusterDirectory> = changing.clone();
+        let connector = MultiHopRoutedConnector::new(
+            source.clone(),
+            directory_provider,
+            network.connectivity.clone(),
+            network.connectivity.clone(),
+            Arc::new(network.provider(source.clone())),
+            Arc::new(TestRoutedIdentity {
+                local_node_id: source,
+            }),
+        )
+        .expect("multi-hop connector");
+
+        let mut stream = connector
+            .connect(destination, ConnectOptions::default())
+            .await
+            .expect("connector uses the directory generation captured at construction");
+        stream
+            .write_all(TEST_ROUTED_PAYLOAD)
+            .await
+            .expect("write routed payload");
+        let mut echoed = [0_u8; TEST_ROUTED_PAYLOAD.len()];
+        stream
+            .read_exact(&mut echoed)
+            .await
+            .expect("read routed echo");
+        assert_eq!(echoed, *TEST_ROUTED_PAYLOAD);
+        stream.shutdown().await.expect("close routed session");
+        network.wait_idle().await;
+
+        assert_eq!(
+            changing.snapshots.load(Ordering::SeqCst),
+            1,
+            "route execution must not resnapshot a newer directory generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn degraded_endpoint_variants_cannot_crowd_out_a_healthy_relay() {
+        let source = node("node_candidate_cap_source");
+        let destination = node("node_candidate_cap_00_destination");
+        let relay = node("node_candidate_cap_99_relay");
+        let mut observations = (0..MAX_ROUTE_CANDIDATES)
+            .map(|index| {
+                let mut observation = edge(
+                    &source,
+                    &destination,
+                    &format!("endpoint_candidate_cap_degraded_{index:02}"),
+                    59,
+                    u64::try_from(index).expect("latency index") + 1,
+                );
+                observation.state = DirectConnectivityState::Degraded;
+                observation
+            })
+            .collect::<Vec<_>>();
+        observations.push(edge(
+            &source,
+            &relay,
+            "endpoint_candidate_cap_source_relay",
+            59,
+            20,
+        ));
+        observations.push(edge(
+            &relay,
+            &destination,
+            "endpoint_candidate_cap_relay_destination",
+            59,
+            20,
+        ));
+        let (directory, connectivity) = fixtures(59, observations);
+        let network = TestRelayNetwork::new(directory.clone(), connectivity);
+        let connector = MultiHopRoutedConnector::new(
+            source.clone(),
+            Arc::new(FixedDirectory(directory)),
+            network.connectivity.clone(),
+            network.connectivity.clone(),
+            Arc::new(network.provider(source.clone())),
+            Arc::new(TestRoutedIdentity {
+                local_node_id: source.clone(),
+            }),
+        )
+        .expect("multi-hop connector");
+
+        let mut stream = connector
+            .connect(destination.clone(), ConnectOptions::default())
+            .await
+            .expect("healthy relay remains in the bounded candidate set");
+        assert_eq!(
+            stream.route_trace.nodes,
+            vec![source, relay, destination],
+            "the healthy relay must rank ahead of every degraded direct variant"
+        );
+        stream
+            .write_all(TEST_ROUTED_PAYLOAD)
+            .await
+            .expect("write routed payload");
+        let mut echoed = [0_u8; TEST_ROUTED_PAYLOAD.len()];
+        stream
+            .read_exact(&mut echoed)
+            .await
+            .expect("read routed echo");
+        assert_eq!(echoed, *TEST_ROUTED_PAYLOAD);
+        stream.shutdown().await.expect("close routed session");
+        network.wait_idle().await;
+        assert_eq!(network.accepted_payloads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn every_planned_line_ring_star_and_mesh_path_is_realizable_and_opaque() {
         let topologies = vec![
             ("line", vec![(0, 1), (1, 2), (2, 3)]),
@@ -3177,6 +3687,65 @@ mod tests {
         assert_eq!(
             rejected.provenance,
             "routed-session-edge-failure".to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn downstream_membership_rejection_does_not_invalidate_authenticated_edge() {
+        let (nodes, directory, connectivity) =
+            topology_fixture("downstream-membership-lag", 55, 3, &[(0, 1), (1, 2)]);
+        let network = TestRelayNetwork::new(directory.clone(), connectivity);
+        network
+            .rejected_origins
+            .lock()
+            .expect("rejected origins lock")
+            .entry(nodes[2].clone())
+            .or_default()
+            .insert(nodes[0].clone());
+        let connector = MultiHopRoutedConnector::new(
+            nodes[0].clone(),
+            Arc::new(FixedDirectory(directory)),
+            network.connectivity.clone(),
+            network.connectivity.clone(),
+            Arc::new(network.provider(nodes[0].clone())),
+            Arc::new(TestRoutedIdentity {
+                local_node_id: nodes[0].clone(),
+            }),
+        )
+        .expect("multi-hop connector");
+
+        let result = connector
+            .connect(
+                nodes[2].clone(),
+                ConnectOptions {
+                    timeout: Duration::from_secs(2),
+                    ..ConnectOptions::default()
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(NetworkError::RetryExhausted { .. })));
+        network.wait_idle().await;
+
+        let snapshot = network.connectivity.snapshot();
+        let relay_edge = snapshot
+            .edges()
+            .iter()
+            .find(|edge| edge.source_node_id == nodes[1] && edge.target_node_id == nodes[2])
+            .expect("relay outgoing edge");
+        assert_eq!(
+            relay_edge.state,
+            DirectConnectivityState::Reachable,
+            "the downstream node rejected the routed origin after the direct link was authenticated"
+        );
+        assert_eq!(relay_edge.provenance, "routing-test");
+        assert!(
+            network
+                .errors
+                .lock()
+                .expect("relay errors lock")
+                .iter()
+                .any(|error| error.contains(nodes[0].as_str())),
+            "the destination must still report the unauthorized routed origin"
         );
     }
 

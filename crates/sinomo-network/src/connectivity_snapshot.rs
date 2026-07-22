@@ -24,12 +24,16 @@ pub struct ConnectivityGeneration(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirectConnectivityState {
     Reachable,
+    /// Recent failure evidence exists, but the edge remains an executable
+    /// fallback when no fully healthy path is available.
+    Degraded,
     Unreachable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirectConnectivityStatus {
     Reachable,
+    Degraded,
     Unreachable,
     Unknown,
 }
@@ -95,7 +99,7 @@ impl DirectConnectivityObservation {
                 detail: "connectivity evidence must expire after it was observed".to_string(),
             });
         }
-        if self.state == DirectConnectivityState::Reachable
+        if self.state != DirectConnectivityState::Unreachable
             && (!self.capabilities.full_duplex || self.capabilities.max_concurrent_streams == 0)
         {
             return Err(NetworkError::Serialization {
@@ -253,6 +257,7 @@ impl ConnectivitySnapshot {
         source_node_id: &NodeId,
         target_node_id: &NodeId,
     ) -> DirectConnectivityStatus {
+        let mut saw_degraded = false;
         let mut saw_unreachable = false;
         for edge in self.edges.iter().filter(|edge| {
             &edge.source_node_id == source_node_id && &edge.target_node_id == target_node_id
@@ -261,10 +266,13 @@ impl ConnectivitySnapshot {
                 DirectConnectivityState::Reachable => {
                     return DirectConnectivityStatus::Reachable;
                 }
+                DirectConnectivityState::Degraded => saw_degraded = true,
                 DirectConnectivityState::Unreachable => saw_unreachable = true,
             }
         }
-        if saw_unreachable {
+        if saw_degraded {
+            DirectConnectivityStatus::Degraded
+        } else if saw_unreachable {
             DirectConnectivityStatus::Unreachable
         } else {
             DirectConnectivityStatus::Unknown
@@ -324,9 +332,8 @@ pub fn connectivity_snapshot_from_directory_records(
                 max_concurrent_streams: 1,
             },
             state: match record.state {
-                ClusterConnectivityState::Healthy | ClusterConnectivityState::Degraded => {
-                    DirectConnectivityState::Reachable
-                }
+                ClusterConnectivityState::Healthy => DirectConnectivityState::Reachable,
+                ClusterConnectivityState::Degraded => DirectConnectivityState::Degraded,
                 ClusterConnectivityState::Unreachable => DirectConnectivityState::Unreachable,
             },
             failure_reason: record.failure_reason.map(|reason| format!("{reason:?}")),
@@ -627,7 +634,9 @@ impl ConnectivityFailureSink for ConnectivityTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DirectoryNode, DirectoryVersion};
     use sinomo_base::{ClusterEndpointPrivacy, ClusterEndpointSource, ClusterTransportKind};
+    use sinomo_node::ClusterId;
     use time::Duration;
 
     fn node(name: &str) -> NodeId {
@@ -668,6 +677,76 @@ mod tests {
             observed_at,
             expires_at: observed_at + Duration::minutes(1),
         }
+    }
+
+    #[test]
+    fn degraded_directory_record_remains_an_explicit_fallback_edge() {
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::hours(1);
+        let source = node("node_connectivity_projection_source");
+        let target = node("node_connectivity_projection_target");
+        let endpoint = observation(
+            &source,
+            &target,
+            "endpoint_connectivity_projection",
+            DirectConnectivityState::Reachable,
+            1,
+            7,
+            now,
+        )
+        .endpoint;
+        let directory = DirectorySnapshot::try_new(
+            DirectoryVersion(7),
+            [
+                DirectoryNode::try_new(source.clone(), "source-key", Vec::new())
+                    .expect("source directory node"),
+                DirectoryNode::try_new(target.clone(), "target-key", vec![endpoint.clone()])
+                    .expect("target directory node"),
+            ],
+        )
+        .expect("directory");
+        let record = ClusterConnectivityRecord {
+            cluster_id: ClusterId::from_legacy_named("cluster_connectivity_projection")
+                .expect("cluster"),
+            source_node_id: source.clone(),
+            target_node_id: target.clone(),
+            endpoint_id: endpoint.endpoint_id.clone(),
+            transport: endpoint.transport.clone(),
+            address: endpoint.address.clone(),
+            state: ClusterConnectivityState::Degraded,
+            latency_ms: Some(10),
+            consecutive_failures: 1,
+            last_success_at: None,
+            last_failure_at: Some(now.to_string()),
+            failure_reason: None,
+            observed_at: now,
+            expires_at: now + Duration::minutes(1),
+        };
+
+        let degraded =
+            connectivity_snapshot_from_directory_records(&directory, [record.clone()], now)
+                .expect("degraded snapshot");
+        assert_eq!(
+            degraded.direct_status(&source, &target),
+            DirectConnectivityStatus::Degraded,
+            "failed direct evidence must remain distinct from a proven-unreachable edge"
+        );
+
+        let healthy = connectivity_snapshot_from_directory_records(
+            &directory,
+            [ClusterConnectivityRecord {
+                state: ClusterConnectivityState::Healthy,
+                consecutive_failures: 0,
+                last_success_at: Some(now.to_string()),
+                last_failure_at: None,
+                ..record
+            }],
+            now,
+        )
+        .expect("healthy snapshot");
+        assert_eq!(
+            healthy.direct_status(&source, &target),
+            DirectConnectivityStatus::Reachable
+        );
     }
 
     #[test]

@@ -169,8 +169,9 @@ pub use direct_link::{
     write_authenticated_transport_prelude,
 };
 pub use directory::{
-    ClusterDirectory, ClusterDirectoryFactory, DirectoryNode, DirectorySnapshot, DirectoryVersion,
-    EmptyClusterDirectory, cluster_directory_for, set_cluster_directory_provider,
+    ClusterDirectory, ClusterDirectoryFactory, DirectoryNode, DirectoryRecordsSnapshot,
+    DirectoryRoutingRecordsSnapshot, DirectorySnapshot, DirectoryVersion, EmptyClusterDirectory,
+    cluster_directory_for, cluster_directory_with_bootstrap_state, set_cluster_directory_provider,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use endpoint_advertisement::{

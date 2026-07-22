@@ -2850,8 +2850,14 @@ where
             deadline,
         )
         .await?;
-        let directory = crate::cluster_directory_for(paths);
-        let directory_snapshot = directory.snapshot()?;
+        let directory = crate::cluster_directory_with_bootstrap_state(
+            crate::cluster_directory_for(paths),
+            state,
+        );
+        let (directory_version, members, endpoints, directory_connectivity) =
+            directory.routing_records_snapshot()?.into_parts();
+        let directory_snapshot =
+            crate::DirectorySnapshot::try_from_records(directory_version, members, endpoints)?;
         if !directory_snapshot.is_authorized(&state.local_node_id) {
             return Err(NetworkError::UnauthorizedNode {
                 node_id: state.local_node_id.clone(),
@@ -2864,7 +2870,12 @@ where
         }
         let connectivity = crate::connectivity_snapshot_from_directory_records(
             &directory_snapshot,
-            crate::read_cluster_connectivity_graph(paths)?,
+            crate::route_graph_read_model::read_cluster_connectivity_graph_for_routing_snapshot(
+                paths,
+                state,
+                &directory_snapshot,
+                directory_connectivity,
+            )?,
             OffsetDateTime::now_utc(),
         )?;
         let connectivity = Arc::new(crate::ConnectivityTracker::new(connectivity));
@@ -2879,9 +2890,9 @@ where
         )?);
         let connectivity_view: Arc<dyn crate::ConnectivityView> = connectivity.clone();
         let failure_sink: Arc<dyn crate::ConnectivityFailureSink> = connectivity;
-        let connector = crate::MultiHopRoutedConnector::new(
+        let connector = crate::MultiHopRoutedConnector::from_snapshot(
             state.local_node_id.clone(),
-            directory,
+            directory_snapshot,
             connectivity_view,
             failure_sink,
             provider,

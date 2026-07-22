@@ -493,4 +493,102 @@ mod tests {
             assert_eq!(relayed, direct);
         }
     }
+
+    #[tokio::test]
+    async fn stream_native_service_proxy_preserves_declared_attachment_lengths() {
+        let request_bytes =
+            crate::object_rpc_stream::OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES * 3 + 17;
+        let response_bytes =
+            crate::object_rpc_stream::OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES * 2 + 23;
+        let (client, proxy_incoming) =
+            tokio::io::duplex(2 * OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES);
+        let (proxy_outgoing, server) =
+            tokio::io::duplex(2 * OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES);
+        let upstream_client_context = local_context();
+        let upstream_proxy_context = upstream_client_context.clone();
+        let downstream_proxy_context = local_context();
+        let downstream_server_context = downstream_proxy_context.clone();
+
+        let server_task = tokio::spawn(async move {
+            serve_service_rpc_stream(
+                server,
+                &downstream_server_context,
+                ObjectFrameIoOptions::default(),
+                move |mut request, _| async move {
+                    assert_eq!(request.request.route, "/test/service-proxy-attachment");
+                    assert_eq!(request.body.total_bytes(), Some(request_bytes as u64));
+                    let mut received = Vec::new();
+                    request
+                        .body
+                        .read_to_end(&mut received)
+                        .await
+                        .expect("read proxied request attachment");
+                    assert_eq!(received, vec![0; request_bytes]);
+                    Ok(ObjectRpcSessionResponse::new(
+                        ObjectRpcResponse::from_encoded_body(
+                            "/test/service-proxy-attachment",
+                            b"proxied-response-head".to_vec(),
+                        ),
+                        crate::ObjectRpcBodySource::zeroes(response_bytes as u64),
+                    ))
+                },
+            )
+            .await
+        });
+
+        let proxy_task = tokio::spawn(async move {
+            serve_service_rpc_stream(
+                proxy_incoming,
+                &upstream_proxy_context,
+                ObjectFrameIoOptions::default(),
+                move |request, _| async move {
+                    assert_eq!(request.body.total_bytes(), Some(request_bytes as u64));
+                    let call = ObjectRpcSessionCall::from_relay_body(request.request, request.body);
+                    let result = call_service_rpc_stream(
+                        proxy_outgoing,
+                        &downstream_proxy_context,
+                        call,
+                        b"proxy-auth".to_vec(),
+                        ObjectFrameIoOptions::default(),
+                    )
+                    .await?;
+                    assert_eq!(result.body.total_bytes(), Some(response_bytes as u64));
+                    result.into_relay_response()
+                },
+            )
+            .await
+        });
+
+        let result = call_service_rpc_stream(
+            client,
+            &upstream_client_context,
+            ObjectRpcSessionCall::new(
+                ObjectRpcRequest::from_encoded_body(
+                    "/test/service-proxy-attachment",
+                    "test.service-proxy-attachment",
+                    b"proxied-request-head".to_vec(),
+                ),
+                crate::ObjectRpcBodySource::zeroes(request_bytes as u64),
+            ),
+            b"origin-auth".to_vec(),
+            ObjectFrameIoOptions::default(),
+        )
+        .await
+        .expect("stream-native proxied attachment call");
+        assert_eq!(result.response.body, b"proxied-response-head");
+        assert_eq!(result.body.total_bytes(), Some(response_bytes as u64));
+        assert_eq!(
+            result
+                .body
+                .collect_to_vec(response_bytes)
+                .await
+                .expect("read proxied response attachment"),
+            vec![0; response_bytes]
+        );
+        proxy_task.await.expect("proxy task").expect("proxy stream");
+        server_task
+            .await
+            .expect("server task")
+            .expect("server stream");
+    }
 }
