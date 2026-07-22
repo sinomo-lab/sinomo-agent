@@ -87,10 +87,6 @@
 #   SINOMO_TEST_NETWORK_MIN_RPS             min network ping throughput (default 250)
 #   SINOMO_TEST_NETWORK_REALTIME_REQUESTS   measured RPCs in each no-load realtime gate (default 100)
 #   SINOMO_TEST_NETWORK_REALTIME_WARMUP_REQUESTS warmup RPCs in each no-load realtime gate (default 20)
-#   SINOMO_TEST_NETWORK_DIRECT_MAX_P50_US   max direct small-RPC p50 (default 20000)
-#   SINOMO_TEST_NETWORK_DIRECT_MAX_P95_US   max direct small-RPC p95 (default 30000)
-#   SINOMO_TEST_NETWORK_FORWARD_MAX_P50_US  max one-forward small-RPC p50 (default 25000)
-#   SINOMO_TEST_NETWORK_FORWARD_MAX_P95_US  max one-forward small-RPC p95 (default 35000)
 #   SINOMO_TEST_NETWORK_QUIET_WAIT           seconds to find the hard 30-second idle window (default and maximum 120)
 #   SINOMO_TEST_NETWORK_QUIET_MAX_CPU_PERCENT max CPU percent allowed per cluster container (default and maximum 10)
 #   SINOMO_TEST_NETWORK_PAYLOAD_BYTES       request bytes per latency-baseline ping payload (default 0)
@@ -247,10 +243,14 @@ NETWORK_MAX_P95_US="${SINOMO_TEST_NETWORK_MAX_P95_US:-200000}"
 NETWORK_MIN_RPS="${SINOMO_TEST_NETWORK_MIN_RPS:-250}"
 NETWORK_REALTIME_REQUESTS="${SINOMO_TEST_NETWORK_REALTIME_REQUESTS:-100}"
 NETWORK_REALTIME_WARMUP_REQUESTS="${SINOMO_TEST_NETWORK_REALTIME_WARMUP_REQUESTS:-20}"
-NETWORK_DIRECT_MAX_P50_US="${SINOMO_TEST_NETWORK_DIRECT_MAX_P50_US:-20000}"
-NETWORK_DIRECT_MAX_P95_US="${SINOMO_TEST_NETWORK_DIRECT_MAX_P95_US:-30000}"
-NETWORK_FORWARD_MAX_P50_US="${SINOMO_TEST_NETWORK_FORWARD_MAX_P50_US:-25000}"
-NETWORK_FORWARD_MAX_P95_US="${SINOMO_TEST_NETWORK_FORWARD_MAX_P95_US:-35000}"
+# HARD CORRECTNESS GATES: after route stabilization, a direct small RPC must
+# remain at or below 1ms and the same RPC over exactly one relay must remain at
+# or below 2ms at both p50 and p95. These are deliberately non-configurable.
+# Exceeding either limit is an implementation error (for example, reconnecting
+# or rebuilding a stabilized route per call), not ordinary benchmark variance
+# or an inefficiency to tolerate by widening the threshold.
+NETWORK_DIRECT_MAX_US=1000
+NETWORK_FORWARD_MAX_US=2000
 # HARD ACCEPTANCE GATE: the cluster must remain continuously below the CPU
 # ceiling for thirty monotonic seconds. A continuous Docker stats stream covers
 # the complete interval; observation count is deliberately not part of the
@@ -343,21 +343,6 @@ validate_network_realtime_gate_config() {
     "$NETWORK_REALTIME_REQUESTS" 1 10000 \
     && require_bounded_uint SINOMO_TEST_NETWORK_REALTIME_WARMUP_REQUESTS \
       "$NETWORK_REALTIME_WARMUP_REQUESTS" 1 1000 \
-    && require_bounded_uint SINOMO_TEST_NETWORK_DIRECT_MAX_P50_US \
-      "$NETWORK_DIRECT_MAX_P50_US" 1 1000000 \
-    && require_bounded_uint SINOMO_TEST_NETWORK_DIRECT_MAX_P95_US \
-      "$NETWORK_DIRECT_MAX_P95_US" 1 1000000 \
-    && require_bounded_uint SINOMO_TEST_NETWORK_FORWARD_MAX_P50_US \
-      "$NETWORK_FORWARD_MAX_P50_US" 1 1000000 \
-    && require_bounded_uint SINOMO_TEST_NETWORK_FORWARD_MAX_P95_US \
-      "$NETWORK_FORWARD_MAX_P95_US" 1 1000000 \
-    && if [ "$((10#$NETWORK_DIRECT_MAX_P95_US))" -lt "$((10#$NETWORK_DIRECT_MAX_P50_US))" ]; then
-      log "SINOMO_TEST_NETWORK_DIRECT_MAX_P95_US must be at least SINOMO_TEST_NETWORK_DIRECT_MAX_P50_US"
-      return 1
-    elif [ "$((10#$NETWORK_FORWARD_MAX_P95_US))" -lt "$((10#$NETWORK_FORWARD_MAX_P50_US))" ]; then
-      log "SINOMO_TEST_NETWORK_FORWARD_MAX_P95_US must be at least SINOMO_TEST_NETWORK_FORWARD_MAX_P50_US"
-      return 1
-    fi \
     && require_bounded_uint SINOMO_TEST_NETWORK_QUIET_WAIT \
       "$NETWORK_QUIET_WAIT" "$NETWORK_QUIET_DURATION_SECONDS" \
       "$NETWORK_QUIET_MAX_WAIT_SECONDS" \
@@ -2481,9 +2466,13 @@ network_baseline() {
   return $rc
 }
 
-# Exercise the ordinary object-RPC API at concurrency one before other test
-# traffic starts. In this topology node4 reaches node3 directly over seg_ab;
-# node1 requires exactly one application-level forward through node3.
+# HARD CORRECTNESS GATE. Exercise the ordinary stream-native object-RPC API at
+# concurrency one only after routes and background work have stabilized. In
+# this topology node4 reaches node3 directly over seg_ab, while node1 requires
+# exactly one relay through node3. Direct p50/p95 must be <=1ms and one-relay
+# p50/p95 must be <=2ms. A failure means the implementation is not reusing the
+# stabilized routed data path correctly; never relax these limits or classify
+# the failure as an acceptable performance inefficiency.
 network_realtime_latency_gate() {
   local rc=0 direct_target_id forward_target_id
   assert_network_realtime_topology || return 1
@@ -2505,8 +2494,8 @@ network_realtime_latency_gate() {
     --param max-failures=0 \
     --param max-p50-ms=0 \
     --param max-p95-ms=0 \
-    --param "max-p50-us=$NETWORK_DIRECT_MAX_P50_US" \
-    --param "max-p95-us=$NETWORK_DIRECT_MAX_P95_US" \
+    --param "max-p50-us=$NETWORK_DIRECT_MAX_US" \
+    --param "max-p95-us=$NETWORK_DIRECT_MAX_US" \
     --param min-requests-per-second=0 || rc=1
   wait_for_network_quiet one-forward || return 1
   run_probe node4 cluster.network.ping-benchmark \
@@ -2518,8 +2507,8 @@ network_realtime_latency_gate() {
     --param max-failures=0 \
     --param max-p50-ms=0 \
     --param max-p95-ms=0 \
-    --param "max-p50-us=$NETWORK_FORWARD_MAX_P50_US" \
-    --param "max-p95-us=$NETWORK_FORWARD_MAX_P95_US" \
+    --param "max-p50-us=$NETWORK_FORWARD_MAX_US" \
+    --param "max-p95-us=$NETWORK_FORWARD_MAX_US" \
     --param min-requests-per-second=0 || rc=1
   return $rc
 }
