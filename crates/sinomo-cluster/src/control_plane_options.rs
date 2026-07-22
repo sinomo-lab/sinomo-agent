@@ -125,6 +125,11 @@ impl ClusterKvTxnQuorumOptions {
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_MAX_ATTEMPTS: usize = 32;
 /// End-to-end budget for selecting and reaching a membership authority.
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT: Duration = Duration::from_secs(15);
+/// Command budget for quorum-bearing control-plane RPCs. These requests can
+/// legitimately spend several seconds committing and durably replicating on
+/// the target after the route is established, so the ordinary five-second
+/// request/read budget is too short for forwarded writes.
+pub const DEFAULT_CLUSTER_CONTROL_PLANE_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 // Foreground attempts deliberately use shorter topology-specific caps so one
 // degraded endpoint cannot consume the operation deadline before alternatives
 // are tried. These are route-fallback budgets, not transport idle defaults.
@@ -161,8 +166,8 @@ impl ClusterControlPlaneTimeouts {
             rpc_timeout: DEFAULT_NETWORK_TIMEOUT,
             membership_rpc_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
             raft_campaign_jitter_max: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_CAMPAIGN_JITTER_MAX,
-            tcp_command_timeout: DEFAULT_NETWORK_TIMEOUT,
-            iroh_command_timeout: DEFAULT_NETWORK_TIMEOUT,
+            tcp_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_COMMAND_TIMEOUT,
+            iroh_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_COMMAND_TIMEOUT,
             tcp_foreground_attempt_timeout:
                 DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
             public_foreground_attempt_timeout:
@@ -268,12 +273,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_control_plane_uses_network_timeout_for_rpc_phases() {
+    fn default_control_plane_preserves_bounded_wan_command_budget() {
         let timeouts = ClusterControlPlaneTimeouts::default_daemon_transport();
 
         assert_eq!(timeouts.rpc_timeout, DEFAULT_NETWORK_TIMEOUT);
-        assert_eq!(timeouts.tcp_command_timeout, DEFAULT_NETWORK_TIMEOUT);
-        assert_eq!(timeouts.iroh_command_timeout, DEFAULT_NETWORK_TIMEOUT);
+        assert_eq!(
+            timeouts.tcp_command_timeout,
+            DEFAULT_CLUSTER_CONTROL_PLANE_COMMAND_TIMEOUT
+        );
+        assert_eq!(
+            timeouts.iroh_command_timeout,
+            DEFAULT_CLUSTER_CONTROL_PLANE_COMMAND_TIMEOUT
+        );
         assert!(timeouts.membership_rpc_timeout > DEFAULT_NETWORK_TIMEOUT);
         assert!(timeouts.raft_append_timeout > DEFAULT_NETWORK_TIMEOUT);
     }
@@ -298,7 +309,13 @@ mod tests {
             options.routed_node_append_attempt_timeout(remaining),
             remaining
         );
-        assert_eq!(options.tcp_command_timeout, DEFAULT_NETWORK_TIMEOUT);
-        assert_eq!(options.iroh_command_timeout, DEFAULT_NETWORK_TIMEOUT);
+        assert_eq!(
+            options.tcp_command_timeout,
+            DEFAULT_CLUSTER_CONTROL_PLANE_COMMAND_TIMEOUT
+        );
+        assert_eq!(
+            options.iroh_command_timeout,
+            DEFAULT_CLUSTER_CONTROL_PLANE_COMMAND_TIMEOUT
+        );
     }
 }

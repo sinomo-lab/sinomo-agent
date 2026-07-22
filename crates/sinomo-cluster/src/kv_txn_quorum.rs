@@ -325,12 +325,16 @@ where
         state: &ClusterBootstrapState,
         request: &KvTxnRequest,
     ) -> Result<Option<sinomo_kv::ClusterKvTxnCommitResult>, Self::Error> {
-        self.host.forward_cluster_kv_txn_to_state_authority(
+        let result = self.host.forward_cluster_kv_txn_to_state_authority(
             self.paths,
             state,
             request,
             self.options,
-        )
+        );
+        if let Err(error) = &result {
+            clear_verified_stale_cluster_raft_leader(self.paths, state, error)?;
+        }
+        result
     }
 
     fn elect_cluster_raft_leader(
@@ -514,12 +518,20 @@ fn read_cluster_kv_authoritative_snapshot_with_consensus_state(
             ) {
                 Ok(Some(read)) => return validate_forwarded_authoritative_read(read, state),
                 Ok(None) => None,
-                Err(error) => Some(error),
+                Err(error) => {
+                    clear_verified_stale_cluster_raft_leader(paths, state, &error)?;
+                    Some(error)
+                }
             }
         } else {
             None
         };
-        if !options.allow_forwarding || !host.elect_kv_state_authority(paths, state, options)? {
+        if !options.allow_forwarding {
+            return Err(NetworkError::ClusterReadOnly {
+                detail: "forwarded authoritative cluster KV read reached a non-leader voter; forwarded requests do not start elections".to_string(),
+            });
+        }
+        if !host.elect_kv_state_authority(paths, state, options)? {
             return Err(NetworkError::ClusterReadOnly {
                 detail: forwarding_failure.map_or_else(
                     || "local node could not establish current-term Raft leadership".to_string(),
@@ -576,6 +588,46 @@ pub(crate) fn locked_cluster_raft_local_is_leader(
         .kv_paths()
         .locked_raft_local_is_leader(state)
         .map_err(kv_err)
+}
+
+fn clear_verified_stale_cluster_raft_leader(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    error: &NetworkError,
+) -> Result<bool, NetworkError> {
+    let NetworkError::VerifiedClusterNonLeader { node_id, .. } = error else {
+        return Ok(false);
+    };
+    if node_id == &state.local_node_id || !sinomo_kv::cluster_kv_raft_local_is_voter(state) {
+        return Ok(false);
+    }
+    let store = paths.kv_paths().raft_store();
+    let _raft_guard = store.lock_operation().map_err(kv_err)?;
+    if store.known_voter_leader_id(state).map_err(kv_err)?.as_ref() != Some(node_id) {
+        return Ok(false);
+    }
+    store
+        .clear_leader_and_write_snapshot_if_changed(&state.local_node_id)
+        .map_err(kv_err)?;
+    Ok(true)
+}
+
+async fn clear_verified_stale_cluster_raft_leader_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    error: &NetworkError,
+) -> Result<bool, NetworkError> {
+    let paths = paths.clone();
+    let state = state.clone();
+    let error = error.clone();
+    runtime
+        .spawn_blocking(move || clear_verified_stale_cluster_raft_leader(&paths, &state, &error))
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "clear rejected cluster Raft leader".to_string(),
+            detail: format!("stale leader clear task failed: {source}"),
+        })?
 }
 
 async fn locked_cluster_raft_local_is_leader_async(
@@ -653,10 +705,15 @@ where
         let options = self.options.forward_options;
         let host = &mut *self.host;
         Box::pin(async move {
-            forward_cluster_kv_txn_to_state_authority_async_with_host(
+            let result = forward_cluster_kv_txn_to_state_authority_async_with_host(
                 runtime, paths, state, request, options, host,
             )
-            .await
+            .await;
+            if let Err(error) = &result {
+                clear_verified_stale_cluster_raft_leader_async(runtime, paths, state, error)
+                    .await?;
+            }
+            result
         })
     }
 
@@ -872,20 +929,28 @@ where
             {
                 Ok(Some(read)) => return validate_forwarded_authoritative_read(read, state),
                 Ok(None) => None,
-                Err(error) => Some(error),
+                Err(error) => {
+                    clear_verified_stale_cluster_raft_leader_async(runtime, paths, state, &error)
+                        .await?;
+                    Some(error)
+                }
             }
         } else {
             None
         };
-        if !options.allow_forwarding
-            || !elect_cluster_raft_leader_async_with_host(
-                runtime,
-                paths,
-                state,
-                options.leader_election_options,
-                host,
-            )
-            .await?
+        if !options.allow_forwarding {
+            return Err(NetworkError::ClusterReadOnly {
+                detail: "forwarded authoritative cluster KV read reached a non-leader voter; forwarded requests do not start elections".to_string(),
+            });
+        }
+        if !elect_cluster_raft_leader_async_with_host(
+            runtime,
+            paths,
+            state,
+            options.leader_election_options,
+            host,
+        )
+        .await?
         {
             return Err(NetworkError::ClusterReadOnly {
                 detail: forwarding_failure.map_or_else(
@@ -977,6 +1042,70 @@ mod tests {
     use sinomo_kv::{InProcessKvStore, KvAuthorityProof, KvRevision};
     use sinomo_node::ClusterId;
     use time::OffsetDateTime;
+
+    #[test]
+    fn verified_non_leader_response_clears_only_the_matching_durable_leader() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-verified-non-leader");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        paths.ensure().expect("cluster paths");
+        let state = three_voter_state();
+        crate::write_cluster_state(&paths, &state).expect("cluster state");
+        crate::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+            .expect("seed cluster raft");
+        let remote = state.members[1].node_id.clone();
+        let other = state.members[2].node_id.clone();
+        let store = paths.kv_paths().raft_store();
+        let metadata = store
+            .local_vote_metadata(&state.local_node_id)
+            .expect("local vote metadata");
+        let heartbeat = sinomo_kv::RaftAppendEntriesRequest {
+            term: metadata.current_term.saturating_add(1),
+            leader_id: remote.clone(),
+            prev_log_index: metadata.last_log_index,
+            prev_log_term: metadata.last_log_term,
+            entries: Vec::new(),
+            leader_commit: metadata.last_log_index,
+        };
+        assert!(
+            crate::apply_cluster_raft_append(&paths, &state.local_node_id, None, heartbeat.clone())
+                .expect("remote leader heartbeat")
+                .success
+        );
+
+        assert!(
+            !clear_verified_stale_cluster_raft_leader(
+                &paths,
+                &state,
+                &NetworkError::VerifiedClusterNonLeader {
+                    node_id: other,
+                    detail: "different voter rejected forwarding".to_string(),
+                },
+            )
+            .expect("preserve nonmatching leader")
+        );
+        assert_eq!(
+            store.known_voter_leader_id(&state).expect("known leader"),
+            Some(remote.clone())
+        );
+
+        assert!(
+            clear_verified_stale_cluster_raft_leader(
+                &paths,
+                &state,
+                &NetworkError::VerifiedClusterNonLeader {
+                    node_id: remote,
+                    detail: "known voter rejected forwarding".to_string(),
+                },
+            )
+            .expect("clear matching leader")
+        );
+        assert_eq!(
+            store
+                .known_voter_leader_id(&state)
+                .expect("known leader after clear"),
+            None
+        );
+    }
 
     fn three_voter_state() -> ClusterBootstrapState {
         let now = OffsetDateTime::UNIX_EPOCH;

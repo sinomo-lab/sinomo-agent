@@ -6929,7 +6929,17 @@ const DAEMON_CLUSTER_CONTROL_IROH_JOIN_TIMEOUT: Duration = DAEMON_CLUSTER_CONTRO
 fn daemon_cluster_control_rpc_options(
     timeout: Duration,
 ) -> sinomo_core::network::ClusterObjectRpcOptions {
-    sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout)
+    // Routed control calls must preserve time for endpoint fallback. The
+    // default five-second connect health limit can otherwise consume an
+    // entire member-publish budget on one stale private address before a
+    // reachable WireGuard, public, or Iroh endpoint is tried. Once connected,
+    // quorum work may legitimately be quiet while the target commits and
+    // durably replicates, so keep the longer control-plane progress limit.
+    let health = sinomo_core::network::NetworkHealthPolicy::new(
+        sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_IROH_FOREGROUND_ATTEMPT_TIMEOUT,
+        sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_COMMAND_TIMEOUT,
+    );
+    sinomo_core::network::ClusterObjectRpcOptions::new(health.into()).with_overall_timeout(timeout)
 }
 
 /// Hostname-derived default display name for the local node.
@@ -20475,7 +20485,22 @@ mod tests {
             cluster_state_authority_reachability_options().routed_node_command_timeout(
                 sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT
             ),
-            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT
+            sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_COMMAND_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn routed_cluster_control_rpc_preserves_endpoint_fallback_budget() {
+        let timeout = Duration::from_secs(30);
+        let health = sinomo_core::network::NetworkHealthPolicy::new(
+            sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_IROH_FOREGROUND_ATTEMPT_TIMEOUT,
+            sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_COMMAND_TIMEOUT,
+        );
+
+        assert_eq!(
+            daemon_cluster_control_rpc_options(timeout),
+            sinomo_core::network::ClusterObjectRpcOptions::new(health.into())
+                .with_overall_timeout(timeout)
         );
     }
 

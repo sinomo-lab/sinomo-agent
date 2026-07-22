@@ -1,13 +1,37 @@
 use crate::internal::*;
 
-pub(crate) static CLUSTER_KV_RAFT_OPERATION_LOCKS: LazyLock<
-    Mutex<HashMap<PathBuf, &'static Mutex<()>>>,
+static CLUSTER_KV_RAFT_OPERATION_LOCKS: LazyLock<
+    Mutex<HashMap<PathBuf, &'static ClusterKvRaftOperationLock>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 #[cfg(test)]
 pub(crate) static CLUSTER_KV_RAFT_SNAPSHOT_BYTES_LIMIT_FOR_TEST: AtomicU64 =
     AtomicU64::new(MAX_CLUSTER_KV_RAFT_SNAPSHOT_BYTES);
 
-pub type ClusterKvRaftOperationGuard = MutexGuard<'static, ()>;
+struct ClusterKvRaftOperationLock {
+    held: Mutex<bool>,
+    ready: Condvar,
+}
+
+/// Owned permit for one local cluster-KV Raft operation.
+///
+/// Unlike `std::sync::MutexGuard`, this permit is `Send`, so an async quorum
+/// command can retain it while its durable node remains open across blocking
+/// storage phases and network awaits.
+pub struct ClusterKvRaftOperationGuard {
+    lock: &'static ClusterKvRaftOperationLock,
+}
+
+impl Drop for ClusterKvRaftOperationGuard {
+    fn drop(&mut self) {
+        let mut held = self
+            .lock
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *held = false;
+        self.lock.ready.notify_one();
+    }
+}
 
 pub fn lock_cluster_kv_raft_operation_for_root(
     root: impl AsRef<Path>,
@@ -21,14 +45,27 @@ pub fn lock_cluster_kv_raft_operation_for_root(
                 detail: format!("cluster kv raft operation lock table poisoned: {error}"),
             })?;
         *guard.entry(root.clone()).or_insert_with(|| {
-            let lock: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
+            let lock: &'static ClusterKvRaftOperationLock =
+                Box::leak(Box::new(ClusterKvRaftOperationLock {
+                    held: Mutex::new(false),
+                    ready: Condvar::new(),
+                }));
             lock
         })
     };
-    lock.lock().map_err(|error| KvError::Io {
+    let mut held = lock.held.lock().map_err(|error| KvError::Io {
         path: root.display().to_string(),
         detail: format!("cluster kv raft operation lock poisoned: {error}"),
-    })
+    })?;
+    while *held {
+        held = lock.ready.wait(held).map_err(|error| KvError::Io {
+            path: root.display().to_string(),
+            detail: format!("cluster kv raft operation lock poisoned while waiting: {error}"),
+        })?;
+    }
+    *held = true;
+    drop(held);
+    Ok(ClusterKvRaftOperationGuard { lock })
 }
 
 pub fn lock_cluster_kv_raft_operation_for_paths(
@@ -3446,6 +3483,7 @@ where
     store: ClusterKvRaftStore,
     node_id: NodeId,
     node: Option<DurableRaftKvNode>,
+    operation_guard: Option<ClusterKvRaftOperationGuard>,
     key_can_defer_materialized_snapshot: F,
     last_snapshot_publish_wrote: Option<bool>,
 }
@@ -3473,6 +3511,7 @@ where
             store,
             node_id,
             node: None,
+            operation_guard: None,
             key_can_defer_materialized_snapshot,
             last_snapshot_publish_wrote: None,
         }
@@ -3488,16 +3527,15 @@ where
         discard_uncommitted_tail: bool,
     ) -> Result<&mut DurableRaftKvNode, KvError> {
         if self.node.is_none() {
-            let node = {
-                let _raft_guard = self.store.lock_operation()?;
-                if discard_uncommitted_tail {
-                    self.store
-                        .open_node_discarding_uncommitted_tail(&self.node_id)?
-                } else {
-                    self.store.open_node(&self.node_id)?
-                }
+            let operation_guard = self.store.lock_operation()?;
+            let node = if discard_uncommitted_tail {
+                self.store
+                    .open_node_discarding_uncommitted_tail(&self.node_id)?
+            } else {
+                self.store.open_node(&self.node_id)?
             };
             self.node = Some(node);
+            self.operation_guard = Some(operation_guard);
         }
         self.node.as_mut().ok_or_else(|| KvError::Io {
             path: self

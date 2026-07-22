@@ -135,7 +135,37 @@ pub(crate) fn daemon_paths_from_defaults() -> Result<DaemonPaths, CliError> {
 }
 
 pub(crate) fn default_main_daemon_status() -> Result<Option<DaemonStatus>, CliError> {
-    daemon_default_main_daemon_status(DAEMON_PROBE_TIMEOUT).map_err(Into::into)
+    if let Some(status) = cli_default_main_daemon_status() {
+        return Ok(Some(status));
+    }
+    let paths = daemon_paths_from_defaults()?;
+    Ok(probe_daemon_status_until_settled(
+        DAEMON_LOCKED_DISCOVERY_TIMEOUT,
+        DAEMON_LOCKED_REPROBE_INTERVAL,
+        |timeout| probe_daemon_status(&paths, timeout),
+    ))
+}
+
+pub(crate) fn probe_daemon_status_until_settled(
+    locked_discovery_timeout: Duration,
+    retry_interval: Duration,
+    mut probe: impl FnMut(Duration) -> DaemonProbeStatus,
+) -> Option<DaemonStatus> {
+    let deadline = Instant::now() + locked_discovery_timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let attempt_timeout = DAEMON_PROBE_TIMEOUT.min(remaining.max(Duration::from_millis(1)));
+        match probe(attempt_timeout) {
+            DaemonProbeStatus::Running(status) => return Some(status),
+            DaemonProbeStatus::NotRunning => return None,
+            DaemonProbeStatus::Locked { .. } if Instant::now() < deadline => {
+                std::thread::sleep(
+                    retry_interval.min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            DaemonProbeStatus::Locked { .. } => return None,
+        }
+    }
 }
 
 /// Probe the main daemon that owns `data_dir` — not the env/home default.

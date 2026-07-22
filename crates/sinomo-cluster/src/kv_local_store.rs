@@ -619,10 +619,19 @@ pub(crate) fn locked_cache_cluster_kv_snapshot_if_newer_than_raft(
     snapshot: KvSnapshot,
 ) -> Result<bool, NetworkError> {
     let observed = snapshot.clone();
-    let changed = paths
+    let changed = match paths
         .kv_paths()
         .locked_cache_snapshot_if_newer_than_raft_and_notify(node_id, snapshot)
-        .map_err(kv_err)?;
+    {
+        Ok(changed) => changed,
+        // Snapshot refresh materializes the imported view before invoking this
+        // reconciliation hook. If a foreground quorum command currently owns
+        // the Raft node, do not fail the read-only refresh: the holder will
+        // publish its local view when it commits, and a later refresh can
+        // reconcile again. Other storage errors still fail closed.
+        Err(KvError::Busy { .. }) => return Ok(false),
+        Err(error) => return Err(kv_err(error)),
+    };
     if changed {
         notify_cluster_kv_committed_snapshot_observers(paths, &observed);
     }
@@ -983,5 +992,40 @@ pub fn kv_err(error: sinomo_kv::KvError) -> sinomo_network::NetworkError {
         error => sinomo_network::NetworkError::Directory {
             detail: error.to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn imported_snapshot_reconciliation_defers_while_local_raft_node_is_busy() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-kv-import-busy");
+        let data_dir = sinomo_local::SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let node_id = NodeId::from_legacy_named("node_kv_import_busy").expect("node");
+        let held = open_cluster_raft_kv_node(&paths, &node_id).expect("hold local raft node");
+        let mut imported = InProcessKvStore::new();
+        imported
+            .put("/imported", b"value".to_vec(), None)
+            .expect("imported value");
+        let snapshot = imported.try_snapshot().expect("imported snapshot");
+
+        assert!(
+            !locked_cache_cluster_kv_snapshot_if_newer_than_raft(
+                &paths,
+                &node_id,
+                snapshot.clone(),
+            )
+            .expect("busy reconciliation is deferred")
+        );
+
+        drop(held);
+        assert!(
+            locked_cache_cluster_kv_snapshot_if_newer_than_raft(&paths, &node_id, snapshot)
+                .expect("reconcile after lock release")
+        );
     }
 }

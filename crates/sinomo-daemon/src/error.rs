@@ -98,6 +98,9 @@ impl From<sinomo_core::network::NetworkError> for DaemonError {
             sinomo_core::network::NetworkError::ClusterReadOnly { detail } => {
                 Self::ClusterReadOnly { detail }
             }
+            sinomo_core::network::NetworkError::VerifiedClusterNonLeader { detail, .. } => {
+                Self::ClusterReadOnly { detail }
+            }
             sinomo_core::network::NetworkError::InvalidClusterCommand { detail } => {
                 Self::Parse { detail }
             }

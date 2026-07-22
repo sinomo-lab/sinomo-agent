@@ -10011,8 +10011,8 @@ fn cluster_control_plane_timeouts_derive_driver_options() {
             rpc_timeout: DEFAULT_NETWORK_TIMEOUT,
             membership_rpc_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
             raft_campaign_jitter_max: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_CAMPAIGN_JITTER_MAX,
-            tcp_command_timeout: DEFAULT_NETWORK_TIMEOUT,
-            iroh_command_timeout: DEFAULT_NETWORK_TIMEOUT,
+            tcp_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_COMMAND_TIMEOUT,
+            iroh_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_COMMAND_TIMEOUT,
             tcp_foreground_attempt_timeout:
                 DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
             public_foreground_attempt_timeout:
@@ -21488,35 +21488,6 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
     }
 
     impl ClusterRaftQuorumAsyncHost for AcceptingAsyncQuorumHost {
-        fn last_local_raft_log_index_async<'a>(
-            &'a mut self,
-            paths: &'a ClusterPaths,
-            state: &'a ClusterBootstrapState,
-        ) -> ClusterMembershipRpcFuture<'a, u64> {
-            Box::pin(async move {
-                paths
-                    .kv_paths()
-                    .locked_last_raft_log_index_async(&state.local_node_id)
-                    .await
-                    .map_err(kv_err)
-            })
-        }
-
-        fn build_raft_append_request_async<'a>(
-            &'a mut self,
-            paths: &'a ClusterPaths,
-            state: &'a ClusterBootstrapState,
-            next_index: u64,
-        ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendRequest> {
-            Box::pin(async move {
-                paths
-                    .kv_paths()
-                    .locked_build_raft_append_request_from_next_index_async(state, next_index)
-                    .await
-                    .map_err(kv_err)
-            })
-        }
-
         fn send_raft_append_to_node_async<'a>(
             &'a mut self,
             _paths: &'a ClusterPaths,
@@ -21670,35 +21641,6 @@ fn async_cluster_raft_quorum_commit_races_voters_and_returns_at_quorum() {
     }
 
     impl ClusterRaftQuorumAsyncHost for ConcurrentQuorumHost {
-        fn last_local_raft_log_index_async<'a>(
-            &'a mut self,
-            paths: &'a ClusterPaths,
-            state: &'a ClusterBootstrapState,
-        ) -> ClusterMembershipRpcFuture<'a, u64> {
-            Box::pin(async move {
-                paths
-                    .kv_paths()
-                    .locked_last_raft_log_index_async(&state.local_node_id)
-                    .await
-                    .map_err(kv_err)
-            })
-        }
-
-        fn build_raft_append_request_async<'a>(
-            &'a mut self,
-            paths: &'a ClusterPaths,
-            state: &'a ClusterBootstrapState,
-            next_index: u64,
-        ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendRequest> {
-            Box::pin(async move {
-                paths
-                    .kv_paths()
-                    .locked_build_raft_append_request_from_next_index_async(state, next_index)
-                    .await
-                    .map_err(kv_err)
-            })
-        }
-
         fn send_raft_append_to_node_async<'a>(
             &'a mut self,
             _paths: &'a ClusterPaths,
