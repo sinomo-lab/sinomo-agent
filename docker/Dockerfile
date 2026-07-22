@@ -32,8 +32,9 @@ RUN if [ "$SINOMO_BENCH_DEPS" = "1" ]; then \
         python -m pip install --break-system-packages --no-cache-dir swebench; \
     fi
 
-# Build the daemon binary. The source is copied (target/ excluded via .dockerignore)
-# and committed so the in-container managed source repo + build.rs commit stamp work.
+# Build the daemon binary and the opt-in readiness module. The source is copied
+# (target/ excluded via .dockerignore) and committed so the in-container managed
+# source repo + build.rs commit stamp work.
 WORKDIR /sinomo-src
 COPY . /sinomo-src
 # A normal clone ships a real .git directory, which we preserve so build.rs stamps the
@@ -48,8 +49,10 @@ RUN { [ -d .git ] || rm -rf .git; } \
     && git config --global init.defaultBranch main \
     && if [ ! -d .git ]; then git init -q && git add -A && git commit -qm "dev-cluster baseline"; fi
 
-RUN cargo build -p sinomo \
-    && install -Dm755 target/debug/sinomo /usr/local/bin/sinomo
+RUN cargo build -p sinomo -p sinomo-benchmarks \
+    && install -Dm755 target/debug/sinomo /usr/local/bin/sinomo \
+    && install -Dm755 target/debug/libsinomo_benchmarks.so \
+        /opt/sinomo/test-modules/libsinomo_benchmarks.so
 
 COPY docker/entrypoint.sh /usr/local/bin/sinomo-node-entrypoint
 COPY docker/single-node-entrypoint.sh /usr/local/bin/sinomo-single-node-entrypoint
