@@ -11,6 +11,7 @@ x-single-node: &single-node
     dockerfile: docker/Dockerfile
     args:
       SINOMO_BENCH_DEPS: "1"
+  init: true
   entrypoint: ["/usr/local/bin/sinomo-single-node-entrypoint"]
   environment:
     CLUSTER_NAME: single-node-evolution
