@@ -218,9 +218,9 @@ use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::module::ModuleReplayReport;
 use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::{
-    ClusterId, DAEMON_MAIN_CLUSTER_ROLE, NodeId, cluster_member_expected_daemon_process,
-    cluster_member_is_local_process, load_or_create_main_node_identity,
-    load_or_create_shadow_node_identity, shadow_daemon_node_id,
+    ClusterId, DAEMON_MAIN_CLUSTER_ROLE, LocalNodePermission, LocalNodePermissionStore, NodeId,
+    cluster_member_expected_daemon_process, cluster_member_is_local_process,
+    load_or_create_main_node_identity, load_or_create_shadow_node_identity, shadow_daemon_node_id,
 };
 #[cfg(not(test))]
 use sinomo_runtime::rollout::install_current_executable;
@@ -4059,6 +4059,28 @@ pub(crate) fn agent_package_inspection_text(definition: &AgentDefinition) -> Str
         "    sandbox node: {}\n",
         format_optional_value(definition.tool_runtime.sandbox_node_id.as_deref())
     ));
+    if definition.tool_runtime.mcp_servers.is_empty() {
+        output.push_str("    MCP servers: none\n");
+    } else {
+        output.push_str("    MCP servers:\n");
+        for server in &definition.tool_runtime.mcp_servers {
+            output.push_str(&format!(
+                "      {}: {} ({}, {})\n",
+                server.name,
+                server.url,
+                if server.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                if server.required {
+                    "required"
+                } else {
+                    "optional"
+                }
+            ));
+        }
+    }
     output.push_str("  tool surface:\n");
     output.push_str(&format!(
         "    visible toolsets: {}\n",
@@ -5259,6 +5281,7 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
     // registry. A failed SIFS/history setup must leave the previous agent's
     // complete registry intact rather than exposing a partial rebuild.
     let recall_tools = agent_recall_tool_registry(data_dir, definition)?;
+    let mcp_tools = agent_mcp_tool_registry(data_dir, definition)?;
     registry.clear();
     // Effect-boundary permissions are host-local state. Configure the
     // authoritative store after rebuilding the registry so unrestricted tools
@@ -5283,6 +5306,7 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
         sinomo_agent::SkillAgentToolConfig::new(data_dir.clone()),
     );
     register_openai_hosted_tools_for_workspace(registry, data_dir, resolved_workspace_roots);
+    registry.replace_registered_tools_from(&mcp_tools);
     registry.replace_registered_tools_from(&recall_tools);
     let remote_transport: Arc<dyn sinomo_agent::AgentRemoteObjectRpcTransport> = Arc::new(
         sinomo_agent::TargetAwareAgentRemoteObjectRpcTransport::new(
@@ -5305,6 +5329,77 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
     sinomo_agent::register_remote_management_agent_tools(registry, remote_transport);
     registry.register(CliClusterStatusAgentTool::new(data_dir.clone()));
     Ok(())
+}
+
+fn agent_mcp_tool_registry(
+    data_dir: &SinomoDataDir,
+    definition: &AgentDefinition,
+) -> Result<AgentToolRegistry, CliError> {
+    let registry = AgentToolRegistry::new();
+    let servers = definition
+        .tool_runtime
+        .mcp_servers
+        .iter()
+        .filter(|server| server.enabled)
+        .collect::<Vec<_>>();
+    if servers.is_empty() {
+        return Ok(registry);
+    }
+
+    let required = servers.iter().any(|server| server.required);
+    let permission = LocalNodePermissionStore::new(data_dir.root())
+        .try_permission_granted(LocalNodePermission::ExternalIntegrations);
+    match permission {
+        Ok(true) => {}
+        Ok(false) if required => {
+            return Err(CliError::Parse {
+                detail: "required MCP integrations need the node-local `external-integrations` permission; grant it with `sinomo node permissions allow external-integrations`"
+                    .to_string(),
+            });
+        }
+        Ok(false) => {
+            eprintln!(
+                "warning: configured MCP integrations are disabled until `sinomo node permissions allow external-integrations` is run locally"
+            );
+            return Ok(registry);
+        }
+        Err(source) if required => {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "cannot verify node-local authority for required MCP integrations: {source}"
+                ),
+            });
+        }
+        Err(source) => {
+            eprintln!(
+                "warning: configured MCP integrations fail closed because node-local permission state is unreadable: {source}"
+            );
+            return Ok(registry);
+        }
+    }
+
+    for server in servers {
+        match sinomo_agent::register_mcp_server_tools(&registry, server) {
+            Ok(_) => {}
+            Err(source) if server.required => {
+                return Err(CliError::Parse {
+                    detail: format!(
+                        "configure required MCP server `{}` for agent `{}`: {source}",
+                        server.name,
+                        definition.key()
+                    ),
+                });
+            }
+            Err(source) => {
+                eprintln!(
+                    "warning: optional MCP server `{}` is unavailable for agent `{}`: {source}",
+                    server.name,
+                    definition.key()
+                );
+            }
+        }
+    }
+    Ok(registry)
 }
 
 fn register_openai_hosted_tools_for_workspace(

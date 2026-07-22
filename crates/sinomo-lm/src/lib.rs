@@ -2335,6 +2335,7 @@ pub fn provider_capabilities(provider: &str) -> LanguageModelProviderCapabilitie
     }
     match normalize_model_provider(provider).as_deref() {
         Some(CODEX_PROVIDER_ID) => LanguageModelProviderCapabilities::responses_http(),
+        Some(OpenAiProvider::PROVIDER_ID) => LanguageModelProviderCapabilities::openai(),
         Some(OLLAMA_PROVIDER_ID | LM_STUDIO_PROVIDER_ID) => {
             LanguageModelProviderCapabilities::local_responses()
         }
@@ -3884,7 +3885,7 @@ impl LanguageModelProviderCapabilities {
             image_editing: true,
             transcription: true,
             local_model_management: false,
-            mcp: false,
+            mcp: true,
         }
     }
 
@@ -5798,5 +5799,12 @@ mod tests {
             assert!(capabilities.realtime_websocket, "provider={provider}");
             assert!(!capabilities.responses_http, "provider={provider}");
         }
+    }
+
+    #[test]
+    fn openai_capabilities_advertise_mcp_for_responses_and_realtime() {
+        assert!(OpenAiProvider::default().info().capabilities.mcp);
+        assert!(provider_capabilities(OpenAiProvider::PROVIDER_ID).mcp);
+        assert!(provider_capabilities("openai-api").mcp);
     }
 }

@@ -64,6 +64,7 @@ A package carries:
 - context strategy and compaction strategy;
 - provider preferences and raw model policy;
 - optional runtime caps;
+- tool-runtime placement and MCP integration references;
 - output format.
 
 Built-in packages use built-in provenance. Custom and imported package
@@ -393,6 +394,52 @@ individual tool names:
   while remaining available to authorized runtime components.
 - Validation distinguishes patch failures from missing dependencies or other
   environment blockers.
+
+## MCP Tools
+
+Agent packages may declare bounded Streamable HTTP MCP servers under
+`tool_runtime.mcp_servers`. Sinomo initializes each enabled server, discovers
+its tools, and registers namespaced tools such as `mcp__docs__search` in the
+ordinary `AgentToolRegistry`. The same executor is consequently available to
+turn-based chat and realtime voice; MCP is not a second tool implementation
+path and does not bypass Sinomo's tool-surface or execution checks.
+
+An agent package can contain a runtime fragment like:
+
+```json
+{
+  "tool_runtime": {
+    "mcp_servers": [
+      {
+        "name": "docs",
+        "url": "https://mcp.example.net/v1",
+        "required": false,
+        "allowed_tools": ["search", "fetch"],
+        "bearer_token_env": "SINOMO_MCP_DOCS_TOKEN"
+      }
+    ]
+  }
+}
+```
+
+Definitions contain only environment-variable names; values are resolved on
+the executing node and credential references must use the dedicated
+`SINOMO_MCP_*` namespace. Discovery and every final tool call fail closed unless
+the local operator grants `external-integrations` on that node:
+
+```bash
+sinomo node permissions allow external-integrations
+```
+
+Revoking the permission blocks already-registered MCP tools at the final
+registry boundary. Optional unavailable servers are omitted with a warning;
+an unavailable server marked `required` prevents that agent registry from
+being reconfigured. Server responses, tool counts, pagination, startup, and
+calls are bounded. This implementation supports Streamable HTTP JSON/SSE;
+non-loopback endpoints must use HTTPS and redirects are rejected. Stdio process
+spawning and OAuth negotiation are not part of this host path. After granting a
+previously denied integration, reopen or otherwise reconfigure the agent
+session so tool discovery can run.
 
 ## Runtime Services and Live Control
 
