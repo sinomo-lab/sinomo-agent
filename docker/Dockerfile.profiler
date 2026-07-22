@@ -1,0 +1,16 @@
+# Disposable profiler sidecar for the Docker debug cluster.
+#
+# Keep profiling tools out of the thin node runtime. The host runs Arch Linux,
+# so this image supplies a closely matching perf build while the Compose
+# override mounts the exact host-built Sinomo binary for symbol resolution.
+FROM archlinux:base
+
+RUN pacman -Syu --noconfirm \
+    && pacman -S --needed --noconfirm \
+        binutils \
+        perf \
+        python \
+    && pacman -Scc --noconfirm
+
+WORKDIR /profiles
+CMD ["sleep", "infinity"]

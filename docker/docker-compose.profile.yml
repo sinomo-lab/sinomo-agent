@@ -1,0 +1,29 @@
+# Opt-in profiler sidecar for docker-compose.dev.yml.
+#
+# Usage:
+#   mkdir -p target/network-profiles
+#   docker compose -p <project> \
+#     -f docker/docker-compose.dev.yml \
+#     -f docker/docker-compose.profile.yml \
+#     up --build -d profiler
+#
+# The sidecar shares the host PID namespace so it can sample any node without
+# adding tools or privileges to the node containers themselves. PERFMON permits
+# perf_event_open and SYS_PTRACE permits reading root-owned daemon mappings.
+# Seccomp is relaxed only for this disposable profiler because Docker's default
+# profile blocks perf_event_open.
+services:
+  profiler:
+    image: sinomo-dev-profiler
+    build:
+      context: .
+      dockerfile: Dockerfile.profiler
+    pid: host
+    cap_add:
+      - PERFMON
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      - ${SINOMO_DOCKER_BINARY:-../target/debug/sinomo}:/usr/local/bin/sinomo:ro
+      - ${SINOMO_PROFILE_OUTPUT:-../target/network-profiles}:/profiles

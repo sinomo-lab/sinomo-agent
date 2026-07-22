@@ -59,6 +59,68 @@ self-rollout builds (`rollout apply` from the managed source repo) are
 unavailable here — use the root production compose or the single-node compose
 when testing rollout-from-source.
 
+## Opt-in profiling sidecar
+
+`docker/docker-compose.profile.yml` adds a disposable `perf` sidecar without
+putting profiling tools or privileges in the six node containers. It uses the
+host PID namespace, mounts the same host-built Sinomo binary for symbols, and
+writes captures under `target/network-profiles/` by default:
+
+```bash
+mkdir -p target/network-profiles
+docker compose -p sinomo-dfs-test \
+  -f docker/docker-compose.dev.yml \
+  -f docker/docker-compose.profile.yml \
+  up --build -d profiler
+```
+
+Resolve a daemon's host PID with `docker top`, then record userspace stacks
+from the profiler container. On Intel hybrid hosts, select one PMU explicitly:
+generic `cycles` expands to both `cpu_core` and `cpu_atom`, which can create a
+high-overhead perf wakeup loop when combined with LBR. LBR supplies low-overhead
+call chains; the `:u` suffix excludes kernel stacks, which are not needed for
+object-RPC CPU attribution:
+
+```bash
+docker top sinomo-dfs-test-node4-1 -eo pid,args
+docker compose -p sinomo-dfs-test \
+  -f docker/docker-compose.dev.yml \
+  -f docker/docker-compose.profile.yml \
+  exec profiler perf record -F 99 -e cpu_core/cycles/u -g --call-graph lbr \
+    -p <daemon-host-pid> -o /profiles/node4-rpc.data -- sleep 20
+```
+
+Use `perf list` to select another userspace event on hosts without
+`cpu_core/cycles` or LBR support. DWARF call graphs are portable but materially
+more intrusive for sub-millisecond latency work.
+
+Generate a text report or the perf-provided interactive flame graph inside the
+same sidecar:
+
+```bash
+docker compose -p sinomo-dfs-test \
+  -f docker/docker-compose.dev.yml \
+  -f docker/docker-compose.profile.yml \
+  exec profiler perf report --stdio -i /profiles/node4-rpc.data
+docker compose -p sinomo-dfs-test \
+  -f docker/docker-compose.dev.yml \
+  -f docker/docker-compose.profile.yml \
+  exec profiler sh -lc \
+    'cd /profiles && ln -sf node4-rpc.data perf.data && \
+     perf script -s /usr/lib/perf/scripts/python/flamegraph.py -- \
+       --allow-download -f html -o node4-rpc.html'
+```
+
+The override grants `PERFMON` and `SYS_PTRACE`, exposes host PIDs, and relaxes
+seccomp for the profiler only. Remove the sidecar when profiling is complete:
+
+```bash
+docker compose -p sinomo-dfs-test \
+  -f docker/docker-compose.dev.yml \
+  -f docker/docker-compose.profile.yml \
+  rm -sf profiler
+```
+
 ## Topology
 
 ```
