@@ -50,6 +50,19 @@ struct ClusterRouteGraphLiveEndpointIndex {
 }
 
 impl ClusterRouteGraphLiveEndpointIndex {
+    fn try_from_directory_snapshot(
+        directory: &crate::DirectorySnapshot,
+    ) -> Result<Self, NetworkError> {
+        let mut index = Self::default();
+        for node in directory.nodes().values() {
+            index.try_insert_known_node(&node.node_id, "index routing snapshot nodes")?;
+            for endpoint in &node.endpoints {
+                index.try_insert_endpoint(endpoint, "index routing snapshot endpoints")?;
+            }
+        }
+        Ok(index)
+    }
+
     fn try_insert_known_node(
         &mut self,
         node_id: &NodeId,
@@ -438,6 +451,64 @@ pub(crate) fn read_cluster_connectivity_graph_for_state(
         Some(state),
         &crate::connectivity::DirectoryConnectivityRecordQuery,
     )
+}
+
+/// Builds the connectivity graph against membership, endpoints, and KV
+/// evidence captured from one directory generation.
+///
+/// Local source-owned observations remain an allowed bootstrap overlay, but
+/// the directory/KV half of the graph cannot cross a materialization boundary
+/// and accidentally filter every first hop from a still-connected node.
+pub(crate) fn read_cluster_connectivity_graph_for_routing_snapshot(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    directory: &crate::DirectorySnapshot,
+    directory_records: Vec<ClusterConnectivityRecord>,
+) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
+    let now = OffsetDateTime::now_utc();
+    let live_endpoint_index =
+        ClusterRouteGraphLiveEndpointIndex::try_from_directory_snapshot(directory)?;
+    let mut records_by_key = ClusterRouteGraphRecordIndex::default();
+    for record in directory_records.into_iter().filter(|record| {
+        route_graph_record_is_usable(
+            record,
+            Some(&state.cluster_id),
+            Some(&live_endpoint_index),
+            now,
+        )
+    }) {
+        records_by_key.try_insert(record, "index routing snapshot connectivity records")?;
+    }
+    if !records_by_key.is_empty() {
+        overlay_local_bootstrap_records(
+            paths,
+            Some(&state.cluster_id),
+            Some(&live_endpoint_index),
+            now,
+            Some(&state.local_node_id),
+            &mut records_by_key,
+        )?;
+        let mut records = records_by_key.into_records();
+        sort_cluster_connectivity_records(&mut records);
+        return Ok(records);
+    }
+
+    for record in read_local_cluster_connectivity_records(paths)?
+        .into_iter()
+        .filter(|record| {
+            route_graph_record_is_usable(
+                record,
+                Some(&state.cluster_id),
+                Some(&live_endpoint_index),
+                now,
+            )
+        })
+    {
+        records_by_key.try_insert(record, "index routing snapshot bootstrap records")?;
+    }
+    let mut records = records_by_key.into_records();
+    sort_cluster_connectivity_records(&mut records);
+    Ok(records)
 }
 
 fn read_cluster_connectivity_graph_with_bootstrap_and_query<Q>(

@@ -69,6 +69,27 @@ pub(super) fn live_online_remote_main_test_targets(
     data_dir: &SinomoDataDir,
     state: &ClusterBootstrapState,
 ) -> Result<Vec<NodeId>, SinomoTestError> {
+    remote_main_test_targets_from_cluster_health(data_dir, state, false)
+}
+
+/// Returns every authorized remote main daemon in the current cluster-health
+/// membership projection, including nodes whose liveness is not yet known.
+///
+/// Network readiness uses this mode to avoid a circular gate where a node has
+/// to be reachable before the probe responsible for proving its route will
+/// attempt it.
+pub(super) fn authorized_remote_main_test_targets(
+    data_dir: &SinomoDataDir,
+    state: &ClusterBootstrapState,
+) -> Result<Vec<NodeId>, SinomoTestError> {
+    remote_main_test_targets_from_cluster_health(data_dir, state, true)
+}
+
+fn remote_main_test_targets_from_cluster_health(
+    data_dir: &SinomoDataDir,
+    state: &ClusterBootstrapState,
+    include_unobserved: bool,
+) -> Result<Vec<NodeId>, SinomoTestError> {
     let (health_state, rows) =
         super::cluster_health_rows_for_data_dir(data_dir).map_err(|error| {
             SinomoTestError::failed(format!(
@@ -87,6 +108,18 @@ pub(super) fn live_online_remote_main_test_targets(
         )));
     }
 
+    let mut candidates = rows
+        .iter()
+        .filter(|row| {
+            row.member.node_id != state.local_node_id
+                && row.member.state.is_authorized()
+                && cluster_member_expected_daemon_process(&row.member)
+                    == Some(DAEMON_MAIN_CLUSTER_ROLE)
+        })
+        .map(|row| row.member.node_id.clone())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
     let online = rows
         .into_iter()
         .filter(|row| {
@@ -94,18 +127,22 @@ pub(super) fn live_online_remote_main_test_targets(
         })
         .map(|row| row.member.node_id)
         .collect::<BTreeSet<_>>();
-    let mut candidates = state
-        .members
-        .iter()
-        .filter(|member| {
-            member.node_id != state.local_node_id
-                && member.state.is_authorized()
-                && cluster_member_expected_daemon_process(member) == Some(DAEMON_MAIN_CLUSTER_ROLE)
-        })
-        .map(|member| member.node_id.clone())
-        .collect::<Vec<_>>();
-    candidates.sort();
-    Ok(retain_live_online_test_targets(candidates, &online))
+    Ok(select_remote_test_targets(
+        candidates,
+        &online,
+        include_unobserved,
+    ))
+}
+
+fn select_remote_test_targets(
+    candidates: Vec<NodeId>,
+    online: &BTreeSet<NodeId>,
+    include_unobserved: bool,
+) -> Vec<NodeId> {
+    if include_unobserved {
+        return candidates;
+    }
+    retain_live_online_test_targets(candidates, online)
 }
 
 fn retain_live_online_test_targets(
@@ -642,6 +679,28 @@ mod tests {
         );
 
         assert_eq!(selected, vec![online_with_broken_route]);
+    }
+
+    #[test]
+    fn authorized_target_mode_keeps_unknown_nodes_for_network_readiness() {
+        let online = NodeId::from_legacy_named("node_acceptance_online").expect("node");
+        let route_unproven =
+            NodeId::from_legacy_named("node_acceptance_route_unproven").expect("node");
+        let candidates = vec![online.clone(), route_unproven.clone()];
+
+        assert_eq!(
+            select_remote_test_targets(
+                candidates.clone(),
+                &BTreeSet::from([online.clone()]),
+                false,
+            ),
+            vec![online]
+        );
+        assert_eq!(
+            select_remote_test_targets(candidates.clone(), &BTreeSet::new(), true),
+            candidates,
+            "the readiness probe must attempt every authorized target so it proves the route"
+        );
     }
 
     #[test]

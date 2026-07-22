@@ -1,10 +1,7 @@
 use crate::keyspace::cluster_endpoint_prefix;
 #[allow(unused_imports)]
 use crate::kv_local_store::kv_err;
-use crate::kv_local_store::{
-    read_cluster_kv_cached_snapshot_if_present, read_cluster_kv_current_snapshot_arc,
-    read_cluster_kv_latest_observed_snapshot_arc_if_present,
-};
+use crate::kv_local_store::read_cluster_kv_latest_observed_snapshot_arc_if_present;
 use sinomo_base::{
     ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord, ClusterNodeStatusRecord,
 };
@@ -92,13 +89,12 @@ pub fn read_cluster_endpoints_from_kv(
 fn read_cluster_kv_current_or_cached_snapshot_arc_if_present(
     paths: &ClusterPaths,
 ) -> Result<Option<std::sync::Arc<KvSnapshot>>, NetworkError> {
-    match read_cluster_kv_current_snapshot_arc(paths) {
-        Ok(snapshot) => Ok(Some(snapshot)),
-        Err(current_error) => match read_cluster_kv_cached_snapshot_if_present(paths)? {
-            Some(snapshot) => Ok(Some(snapshot)),
-            None => Err(current_error),
-        },
-    }
+    // Directory and discovery readers must consume the same max-revision
+    // projection advertised by `KvClusterDirectory::version`. A follower's
+    // local Raft state can briefly trail an accepted/imported snapshot after a
+    // join; preferring any readable local snapshot hid the newly admitted
+    // member while reporting the newer directory generation.
+    read_cluster_kv_latest_observed_snapshot_arc_if_present(paths)
 }
 
 fn read_cluster_member_endpoints_from_snapshot(
@@ -212,6 +208,12 @@ pub fn read_cluster_connectivity_graph_from_kv(
     let Some(snapshot) = read_cluster_kv_latest_observed_snapshot_arc_if_present(paths)? else {
         return Ok(Vec::new());
     };
+    read_cluster_connectivity_graph_from_snapshot(snapshot.as_ref())
+}
+
+fn read_cluster_connectivity_graph_from_snapshot(
+    snapshot: &KvSnapshot,
+) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
     let now = OffsetDateTime::now_utc();
     let mut records: Vec<ClusterConnectivityRecord> = Vec::new();
     for entry in snapshot
@@ -297,13 +299,62 @@ impl sinomo_network::ClusterDirectory for KvClusterDirectory {
                 .unwrap_or(0),
         ))
     }
+
+    fn records_snapshot(&self) -> Result<sinomo_network::DirectoryRecordsSnapshot, NetworkError> {
+        let Some(snapshot) = read_cluster_kv_latest_observed_snapshot_arc_if_present(&self.paths)?
+        else {
+            return Ok(sinomo_network::DirectoryRecordsSnapshot::new(
+                sinomo_network::DirectoryVersion(0),
+                Vec::new(),
+                Vec::new(),
+            ));
+        };
+        let members = read_cluster_members_from_snapshot(snapshot.as_ref())?;
+        let endpoints = read_cluster_endpoints_from_snapshot(snapshot.as_ref())?
+            .into_values()
+            .flatten()
+            .collect();
+        Ok(sinomo_network::DirectoryRecordsSnapshot::new(
+            sinomo_network::DirectoryVersion(snapshot.revision.0),
+            members,
+            endpoints,
+        ))
+    }
+
+    fn routing_records_snapshot(
+        &self,
+    ) -> Result<sinomo_network::DirectoryRoutingRecordsSnapshot, NetworkError> {
+        let Some(snapshot) = read_cluster_kv_latest_observed_snapshot_arc_if_present(&self.paths)?
+        else {
+            return Ok(sinomo_network::DirectoryRoutingRecordsSnapshot::new(
+                sinomo_network::DirectoryVersion(0),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ));
+        };
+        let members = read_cluster_members_from_snapshot(snapshot.as_ref())?;
+        let endpoints = read_cluster_endpoints_from_snapshot(snapshot.as_ref())?
+            .into_values()
+            .flatten()
+            .collect();
+        let connectivity_records =
+            read_cluster_connectivity_graph_from_snapshot(snapshot.as_ref())?;
+        Ok(sinomo_network::DirectoryRoutingRecordsSnapshot::new(
+            sinomo_network::DirectoryVersion(snapshot.revision.0),
+            members,
+            endpoints,
+            connectivity_records,
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::keyspace::{cluster_endpoint_key, cluster_member_key};
-    use sinomo_kv::InProcessKvStore;
+    use sinomo_kv::{InProcessKvStore, KvCommand, KvOp};
+    use sinomo_network::ClusterDirectory as _;
     use sinomo_node::ClusterId;
 
     #[test]
@@ -344,5 +395,76 @@ mod tests {
 
         let endpoints = read_cluster_endpoints_from_snapshot(&snapshot).expect("read endpoints");
         assert_eq!(endpoints.get(&node_id), Some(&vec![public]));
+    }
+
+    #[test]
+    fn kv_read_model_prefers_newer_imported_membership_over_stale_local_raft_view() {
+        let root = sinomo_testdir::TestDir::new("kv-read-model-latest-observed-membership");
+        let data_dir = sinomo_local::SinomoDataDir::new(root.path());
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_kv_read_model_latest").expect("cluster");
+        let local = NodeId::from_legacy_named("node_kv_read_model_latest_local").expect("local");
+        let joined = NodeId::from_legacy_named("node_kv_read_model_latest_joined").expect("joined");
+        let state = sinomo_base::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "latest observed directory",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        crate::write_cluster_state(&paths, &state).expect("cluster state");
+        let local_member = state.members[0].clone();
+        let stale_current = crate::append_cluster_raft_command(
+            &paths,
+            &local,
+            KvCommand::Op(
+                KvOp::put_serde(cluster_member_key(&local), &local_member, None)
+                    .expect("local member op"),
+            ),
+        )
+        .expect("stale local raft snapshot");
+        let mut joined_member = ClusterMemberRecord::pending_learner(
+            cluster_id,
+            joined.clone(),
+            "joined",
+            "pk-joined",
+            now,
+        );
+        joined_member.state = sinomo_base::ClusterMemberState::Learner;
+        let mut accepted = InProcessKvStore::restore(stale_current).expect("accepted store");
+        accepted
+            .put_serde(cluster_member_key(&joined), &joined_member, None)
+            .expect("joined member");
+        let accepted = accepted.try_snapshot().expect("accepted snapshot");
+        crate::write_imported_cluster_kv_snapshot_if_changed(&paths, &accepted)
+            .expect("import accepted snapshot");
+
+        let local_current = crate::read_cluster_kv_current_snapshot(&paths)
+            .expect("local raft snapshot remains readable");
+        assert!(
+            local_current.get(&cluster_member_key(&joined)).is_none(),
+            "the regression requires local Raft materialization to trail the imported acceptance"
+        );
+        let members = read_cluster_members_from_kv(&paths).expect("latest observed members");
+        assert!(
+            members.iter().any(|member| member.node_id == joined),
+            "the directory read model must expose the newer accepted member"
+        );
+        let records = KvClusterDirectory::new(paths.clone())
+            .records_snapshot()
+            .expect("transactional directory records");
+        let (version, members, _) = records.into_parts();
+        assert_eq!(
+            version,
+            sinomo_network::DirectoryVersion(accepted.revision.0)
+        );
+        assert!(
+            members.iter().any(|member| member.node_id == joined),
+            "the transactional routing snapshot must use that same accepted revision"
+        );
     }
 }

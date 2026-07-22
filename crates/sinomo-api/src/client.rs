@@ -1,14 +1,12 @@
 //! Typed client for the running daemon's control API.
 
-#[cfg(test)]
-use crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE;
 use crate::{
-    DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE, DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
-    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE, DaemonApiError,
-    DaemonLocalConnectivityReloadRequest, DaemonLocalConnectivityReloadResponse,
-    DaemonObjectRpcForwardDeliveryState, DaemonObjectRpcForwardRequest,
-    DaemonObjectRpcForwardResponse, DaemonPaths, DaemonProbeStatus, DaemonStatus,
-    probe_daemon_status,
+    DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
+    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
+    DAEMON_STATUS_ROUTE, DaemonApiError, DaemonLocalConnectivityReloadRequest,
+    DaemonLocalConnectivityReloadResponse, DaemonObjectRpcForwardDeliveryState,
+    DaemonObjectRpcForwardRequest, DaemonObjectRpcForwardResponse, DaemonPaths, DaemonProbeStatus,
+    DaemonStatus, probe_daemon_status,
 };
 use sinomo_config::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_RPC_CATEGORY, CONFIG_SET_ROUTE,
@@ -283,6 +281,7 @@ impl DaemonApiClient {
         send_daemon_object_rpc_session_async(
             data_dir,
             &self.address,
+            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
             target_node_id,
             call,
             connect_timeout,
@@ -326,6 +325,7 @@ impl DaemonApiClient {
         send_daemon_object_rpc_session_async(
             data_dir,
             &self.address,
+            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
             target_node_id,
             call,
             connect_timeout,
@@ -375,6 +375,7 @@ impl DaemonApiClient {
             let result = send_daemon_object_rpc_session_async(
                 data_dir,
                 &address,
+                DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
                 &target_node_id,
                 call,
                 options.connect_timeout,
@@ -769,6 +770,7 @@ async fn call_daemon_address_session_async(
 async fn send_daemon_object_rpc_session_async(
     data_dir: SinomoDataDir,
     address: &str,
+    forward_route: &'static str,
     target_node_id: &NodeId,
     call: ObjectRpcSessionCall,
     connect_timeout: Duration,
@@ -801,7 +803,7 @@ async fn send_daemon_object_rpc_session_async(
         .await;
     }
     let forward_request = object_rpc_forward_request(
-        DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+        forward_route,
         target_node_id,
         &call.request,
         connect_timeout,
@@ -881,6 +883,7 @@ impl DaemonDfsPeerTransport {
         send_daemon_object_rpc_session_async(
             self.data_dir.clone(),
             &self.address,
+            DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
             target_node_id,
             call,
             options.connect_timeout,
@@ -1965,6 +1968,36 @@ mod tests {
         (root, data_dir)
     }
 
+    async fn serve_test_stream_native_service<F, Fut>(
+        stream: sinomo_core::network::AsyncDaemonControlStream,
+        handler: F,
+    ) -> Result<(), sinomo_core::network::NetworkError>
+    where
+        F: FnOnce(
+            sinomo_core::network::ObjectRpcSessionRequest,
+            sinomo_core::network::__object_rpc_stream_contract::RpcPeerContext,
+        ) -> Fut,
+        Fut: std::future::Future<
+                Output = Result<
+                    sinomo_core::network::ObjectRpcSessionResponse,
+                    sinomo_core::network::NetworkError,
+                >,
+            >,
+    {
+        let mut stream = stream.into_inner();
+        let context = sinomo_core::network::__object_rpc_stream_contract::read_local_object_rpc_stream_prelude(
+            &mut stream,
+        )
+        .await?;
+        sinomo_core::network::__object_rpc_stream_contract::serve_service_rpc_stream(
+            stream,
+            &context,
+            sinomo_core::network::ObjectFrameIoOptions::default(),
+            handler,
+        )
+        .await
+    }
+
     #[test]
     fn canonical_root_cache_is_bounded_and_evicts_lru() {
         let mut cache = DaemonApiCanonicalRootCache::default();
@@ -2015,25 +2048,6 @@ mod tests {
             .remove(&key)
         {
             entry.close_if_ready("test cleanup");
-        }
-    }
-
-    fn mark_test_channel_unsupported(
-        data_dir: &SinomoDataDir,
-        address: &str,
-        runtime: &tokio::runtime::Handle,
-    ) {
-        let key = test_channel_pool_key(data_dir, address, runtime);
-        let mut pool = daemon_api_channel_pool().lock().expect("channel pool");
-        let sequence = pool.next_sequence();
-        if let Some(entry) = pool.entries.insert(
-            key,
-            DaemonApiChannelPoolEntry::Unsupported {
-                retry_after: Instant::now() + Duration::from_secs(30),
-                last_used: sequence,
-            },
-        ) {
-            entry.close_if_ready("replace test channel pool entry");
         }
     }
 
@@ -2129,7 +2143,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn repeated_forwarded_ready_path_calls_do_not_reopen_cluster_state() {
+    async fn repeated_forwarded_stream_native_calls_do_not_reopen_cluster_state() {
         const CALLS: usize = 3;
         let (_root, data_dir) = test_channel_data_dir("sinomo-api-forward-local-id-cache");
         let identity = sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
@@ -2149,51 +2163,39 @@ mod tests {
             .await
             .expect("listener");
         let address = listener.local_addr_string().expect("address");
-        let server_data_dir = data_dir.clone();
         let expected_target = remote_node.clone();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let server_accepts = Arc::clone(&accepts);
         let server = tokio::spawn(async move {
-            let stream = listener.accept().await.expect("accept local channel");
-            let accepted = sinomo_core::network::accept_local_object_rpc_channel_async(
-                stream,
-                &server_data_dir,
-            )
-            .await
-            .expect("accept authenticated local channel");
-            let sinomo_core::network::AcceptedLocalObjectRpcChannel {
-                mut server,
-                transport,
-            } = accepted;
             for _ in 0..CALLS {
-                let inbound = server.accept().await.expect("forwarded request");
-                assert_eq!(
-                    inbound.request.request.route,
-                    DAEMON_OBJECT_RPC_FORWARD_ROUTE
-                );
-                let forward = inbound
-                    .request
-                    .request
-                    .decode_body::<DaemonObjectRpcForwardRequest>()
-                    .expect("forward request");
-                assert_eq!(forward.target_node_id, expected_target);
-                let response = ObjectRpcResponse::encode_body(
-                    DAEMON_OBJECT_RPC_FORWARD_ROUTE,
-                    &DaemonObjectRpcForwardResponse::Success {
-                        response: ObjectRpcResponse::encode_body(
-                            forward.request.route,
-                            &"pong".to_string(),
-                        )
-                        .expect("inner response"),
-                    },
-                )
-                .expect("forward response");
-                inbound
-                    .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
+                let stream = listener.accept().await.expect("accept service stream");
+                server_accepts.fetch_add(1, Ordering::SeqCst);
+                let expected_target = expected_target.clone();
+                serve_test_stream_native_service(stream, move |inbound, _peer| async move {
+                    assert_eq!(inbound.request.route, DAEMON_OBJECT_RPC_FORWARD_ROUTE);
+                    let forward = inbound
+                        .request
+                        .decode_body::<DaemonObjectRpcForwardRequest>()
+                        .expect("forward request");
+                    assert_eq!(forward.target_node_id, expected_target);
+                    let response = ObjectRpcResponse::encode_body(
+                        DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+                        &DaemonObjectRpcForwardResponse::Success {
+                            response: ObjectRpcResponse::encode_body(
+                                forward.request.route,
+                                &"pong".to_string(),
+                            )
+                            .expect("inner response"),
+                        },
+                    )
+                    .expect("forward response");
+                    Ok(sinomo_core::network::ObjectRpcSessionResponse::value(
                         response,
                     ))
-                    .await
-                    .expect("respond");
+                })
+                .await
+                .expect("serve stream-native forwarded request");
             }
-            transport
         });
 
         let runtime = tokio::runtime::Handle::current();
@@ -2207,6 +2209,7 @@ mod tests {
             let result = send_daemon_object_rpc_session_async(
                 data_dir.clone(),
                 &address,
+                DAEMON_OBJECT_RPC_FORWARD_ROUTE,
                 &remote_node,
                 ObjectRpcSessionCall::value(request.clone()),
                 Duration::from_secs(2),
@@ -2234,116 +2237,73 @@ mod tests {
         assert_eq!(
             daemon_api_cluster_state_read_count(&data_dir),
             reads_after_first,
-            "repeated calls over a ready local carrier must perform zero cluster-state reads"
+            "repeated calls over ready stream-native carriers must perform zero cluster-state reads"
+        );
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            CALLS,
+            "each migrated call must open exactly one stream-native service connection"
         );
 
-        let server_transport = server.await.expect("server task");
-        server_transport.close("test complete");
-        remove_test_channel_pool_entry(&data_dir, &address, &runtime);
+        server.await.expect("server task");
         remove_test_local_node_id_cache(&data_dir);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cluster_control_join_over_warmed_loopback_channel_outlives_idle_window() {
+    async fn cluster_control_join_stream_native_call_outlives_idle_window() {
         const CALL_IDLE_TIMEOUT: Duration = Duration::from_millis(50);
         const JOIN_HANDLER_DELAY: Duration = Duration::from_millis(150);
 
-        let (_root, data_dir) = test_channel_data_dir("sinomo-api-warmed-channel-cluster-join");
+        let (_root, data_dir) = test_channel_data_dir("sinomo-api-stream-native-cluster-join");
         let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
             .await
             .expect("listener");
         let address = listener.local_addr_string().expect("address");
         let expected = ClusterControlJoinResponse {
             cluster_id: sinomo_core::node::ClusterId::from_legacy_named(
-                "cluster_api_warmed_channel_join",
+                "cluster_api_stream_native_join",
             )
             .expect("cluster id"),
-            node_id: NodeId::from_legacy_named("node_api_warmed_channel_join").expect("node id"),
+            node_id: NodeId::from_legacy_named("node_api_stream_native_join").expect("node id"),
             accepted_endpoint: Some("bridge.test:21353".to_string()),
             migration: None,
         };
         let server_expected = expected.clone();
-        let server_data_dir = data_dir.clone();
         let server = tokio::spawn(async move {
-            let stream = listener.accept().await.expect("accept local channel");
-            let accepted = sinomo_core::network::accept_local_object_rpc_channel_async(
-                stream,
-                &server_data_dir,
-            )
-            .await
-            .expect("accept authenticated local channel");
-            let sinomo_core::network::AcceptedLocalObjectRpcChannel {
-                mut server,
-                transport,
-            } = accepted;
-
-            let warmup = server.accept().await.expect("warmup request");
-            assert_eq!(
-                warmup.request.request.route,
-                "/test/warm-cluster-control-channel"
-            );
-            warmup
-                .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
+            let warmup_stream = listener
+                .accept()
+                .await
+                .expect("accept warmup service stream");
+            serve_test_stream_native_service(warmup_stream, |warmup, _peer| async move {
+                assert_eq!(warmup.request.route, "/test/warm-cluster-control-channel");
+                Ok(sinomo_core::network::ObjectRpcSessionResponse::value(
                     ObjectRpcResponse::encode_body(
                         "/test/warm-cluster-control-channel",
                         &"warm".to_string(),
                     )
                     .expect("warmup response"),
                 ))
-                .await
-                .expect("respond to warmup");
+            })
+            .await
+            .expect("serve warmup service stream");
 
-            tokio::select! {
-                join = server.accept() => {
-                    let join = join.expect("join request on warmed channel");
-                    assert_eq!(
-                        join.request.request.route,
-                        sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE
-                    );
-                    tokio::time::sleep(JOIN_HANDLER_DELAY).await;
-                    let payload = sinomo_core::cluster::cluster_control_join_response_rpc_payload(
-                        &server_expected,
-                    )
-                    .expect("join response payload");
-                    join
-                        .responder()
-                        .respond_and_wait_written(
-                            sinomo_core::network::ObjectRpcSessionResponse::value(
-                            ObjectRpcResponse::from_encoded_body(payload.route, payload.body),
-                            ),
-                        )
-                        .await
-                        .expect("write response on warmed channel before closing transport");
-                }
-                stream = listener.accept() => {
-                    let stream = stream.expect("accept dedicated join session");
-                    let (incoming, responder) =
-                        sinomo_core::network::accept_object_rpc_server_session(
-                            Box::new(stream.into_inner()),
-                            server_data_dir.clone(),
-                            sinomo_core::network::NetworkCallPolicy::default(),
-                            |_request, _node_id, _public_key| Ok(()),
-                        )
-                        .await
-                        .expect("accept dedicated join session");
-                    assert_eq!(
-                        incoming.request.route,
-                        sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE
-                    );
-                    tokio::time::sleep(JOIN_HANDLER_DELAY).await;
-                    let payload = sinomo_core::cluster::cluster_control_join_response_rpc_payload(
-                        &server_expected,
-                    )
-                    .expect("join response payload");
-                    responder
-                        .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
-                            ObjectRpcResponse::from_encoded_body(payload.route, payload.body),
-                        ))
-                        .await
-                        .expect("respond on dedicated join session");
-                }
-            }
-            transport.close("warmed cluster join test complete");
+            let join_stream = listener.accept().await.expect("accept join service stream");
+            serve_test_stream_native_service(join_stream, move |join, _peer| async move {
+                assert_eq!(
+                    join.request.route,
+                    sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE
+                );
+                tokio::time::sleep(JOIN_HANDLER_DELAY).await;
+                let payload = sinomo_core::cluster::cluster_control_join_response_rpc_payload(
+                    &server_expected,
+                )
+                .expect("join response payload");
+                Ok(sinomo_core::network::ObjectRpcSessionResponse::value(
+                    ObjectRpcResponse::from_encoded_body(payload.route, payload.body),
+                ))
+            })
+            .await
+            .expect("serve join service stream");
         });
 
         let runtime = tokio::runtime::Handle::current();
@@ -2363,7 +2323,7 @@ mod tests {
             &runtime,
         )
         .await
-        .expect("warm local channel");
+        .expect("warm stream-native service path");
         assert_eq!(
             warmup_result
                 .response
@@ -2374,7 +2334,7 @@ mod tests {
 
         let payload =
             sinomo_core::cluster::cluster_control_join_rpc_payload(&ClusterControlJoinRequest {
-                invite: "sinomo-join://test-warmed-channel".to_string(),
+                invite: "sinomo-join://test-stream-native".to_string(),
                 node_display_name: Some("candidate".to_string()),
                 node_role: None,
             })
@@ -2395,10 +2355,8 @@ mod tests {
         .await;
 
         server.await.expect("server task");
-        remove_test_channel_pool_entry(&data_dir, &address, &runtime);
-        let result = join_result.expect(
-            "a healthy warmed daemon channel must not turn a long cluster join into a per-call idle timeout",
-        );
+        let result = join_result
+            .expect("stream-native liveness must preserve a healthy long-running cluster join");
         let actual = sinomo_core::cluster::decode_cluster_control_join_rpc_response_body(
             &result.response.body,
         )
@@ -2407,89 +2365,81 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_cluster_control_joins_are_isolated_on_one_warmed_channel() {
+    async fn concurrent_cluster_control_joins_are_isolated_on_stream_native_connections() {
         const JOINERS: usize = 2;
         let (_root, data_dir) =
-            test_channel_data_dir("sinomo-api-concurrent-warmed-channel-cluster-join");
+            test_channel_data_dir("sinomo-api-concurrent-stream-native-cluster-join");
         let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
             .await
             .expect("listener");
         let address = listener.local_addr_string().expect("address");
-        let server_data_dir = data_dir.clone();
-        let (responses_observed_tx, responses_observed_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            let stream = listener.accept().await.expect("accept local channel");
-            let accepted = sinomo_core::network::accept_local_object_rpc_channel_async(
-                stream,
-                &server_data_dir,
-            )
-            .await
-            .expect("accept authenticated local channel");
-            let sinomo_core::network::AcceptedLocalObjectRpcChannel {
-                mut server,
-                transport,
-            } = accepted;
-
-            let warmup = server.accept().await.expect("warmup request");
-            warmup
-                .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
-                    ObjectRpcResponse::encode_body(
-                        warmup.request.request.route.clone(),
-                        &"warm".to_string(),
-                    )
-                    .expect("warmup response"),
-                ))
+            let warmup_stream = listener
+                .accept()
                 .await
-                .expect("respond to warmup");
+                .expect("accept warmup service stream");
+            serve_test_stream_native_service(warmup_stream, |warmup, _peer| async move {
+                Ok(sinomo_core::network::ObjectRpcSessionResponse::value(
+                    ObjectRpcResponse::encode_body(warmup.request.route, &"warm".to_string())
+                        .expect("warmup response"),
+                ))
+            })
+            .await
+            .expect("serve warmup service stream");
 
             let mut responders = Vec::with_capacity(JOINERS);
             for _ in 0..JOINERS {
-                let inbound = server.accept().await.expect("concurrent join request");
-                assert_eq!(
-                    inbound.request.request.route,
-                    sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE
-                );
-                let request = sinomo_core::cluster::decode_cluster_control_join_rpc_request_body(
-                    &inbound.request.request.body,
-                )
-                .expect("join request");
-                let suffix = request
-                    .node_display_name
-                    .as_deref()
-                    .expect("candidate name")
-                    .to_string();
+                let stream = listener
+                    .accept()
+                    .await
+                    .expect("accept concurrent join stream");
                 responders.push(tokio::spawn(async move {
-                    if suffix.ends_with('a') {
-                        tokio::time::sleep(Duration::from_millis(30)).await;
-                    }
-                    let response = ClusterControlJoinResponse {
-                        cluster_id: sinomo_core::node::ClusterId::from_legacy_named(
-                            "cluster_api_concurrent_join",
-                        )
-                        .expect("cluster id"),
-                        node_id: NodeId::from_legacy_named(format!(
-                            "node_api_concurrent_join_{suffix}"
-                        ))
-                        .expect("node id"),
-                        accepted_endpoint: Some("bridge.test:21353".to_string()),
-                        migration: None,
-                    };
-                    let payload =
-                        sinomo_core::cluster::cluster_control_join_response_rpc_payload(&response)
+                    serve_test_stream_native_service(stream, |inbound, _peer| async move {
+                        assert_eq!(
+                            inbound.request.route,
+                            sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE
+                        );
+                        let request =
+                            sinomo_core::cluster::decode_cluster_control_join_rpc_request_body(
+                                &inbound.request.body,
+                            )
+                            .expect("join request");
+                        let suffix = request
+                            .node_display_name
+                            .as_deref()
+                            .expect("candidate name")
+                            .to_string();
+                        if suffix.ends_with('a') {
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                        }
+                        let response = ClusterControlJoinResponse {
+                            cluster_id: sinomo_core::node::ClusterId::from_legacy_named(
+                                "cluster_api_concurrent_join",
+                            )
+                            .expect("cluster id"),
+                            node_id: NodeId::from_legacy_named(format!(
+                                "node_api_concurrent_join_{suffix}"
+                            ))
+                            .expect("node id"),
+                            accepted_endpoint: Some("bridge.test:21353".to_string()),
+                            migration: None,
+                        };
+                        let payload =
+                            sinomo_core::cluster::cluster_control_join_response_rpc_payload(
+                                &response,
+                            )
                             .expect("join response payload");
-                    inbound
-                        .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
+                        Ok(sinomo_core::network::ObjectRpcSessionResponse::value(
                             ObjectRpcResponse::from_encoded_body(payload.route, payload.body),
                         ))
-                        .await
-                        .expect("respond to concurrent join");
+                    })
+                    .await
+                    .expect("serve concurrent join stream");
                 }));
             }
             for responder in responders {
                 responder.await.expect("join responder");
             }
-            let _ = responses_observed_rx.await;
-            transport.close("concurrent warmed cluster join test complete");
         });
 
         let runtime = tokio::runtime::Handle::current();
@@ -2507,7 +2457,7 @@ mod tests {
             &runtime,
         )
         .await
-        .expect("warm local channel");
+        .expect("warm stream-native service path");
 
         let calls = ["candidate-a", "candidate-b"].map(|candidate| {
             let data_dir = data_dir.clone();
@@ -2542,8 +2492,7 @@ mod tests {
         });
         let [first_call, second_call] = calls;
         let (first, second) = tokio::join!(first_call, second_call);
-        let _ = responses_observed_tx.send(());
-        for result in [first, second] {
+        for (result, expected_candidate) in [(first, "candidate-a"), (second, "candidate-b")] {
             let result = result.expect("concurrent join call");
             let response = sinomo_core::cluster::decode_cluster_control_join_rpc_response_body(
                 &result.response.body,
@@ -2553,10 +2502,14 @@ mod tests {
                 response.accepted_endpoint.as_deref(),
                 Some("bridge.test:21353")
             );
+            assert_eq!(
+                response.node_id,
+                NodeId::from_legacy_named(format!("node_api_concurrent_join_{expected_candidate}"))
+                    .expect("expected node id")
+            );
         }
 
         server.await.expect("server task");
-        remove_test_channel_pool_entry(&data_dir, &address, &runtime);
     }
 
     fn synchronous_test_channel_call(
@@ -2792,7 +2745,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_channel_rejection_is_the_only_negative_cached_outcome() {
+    async fn explicit_channel_rejection_is_transient_and_not_negative_cached() {
         let (_root, data_dir) = test_channel_data_dir("sinomo-api-channel-rejection");
         let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
             .await
@@ -2806,14 +2759,14 @@ mod tests {
                 sinomo_core::network::local_object_rpc_channel_wire_prefix_matches(&request[..4])
             );
             let mut rejection = [0_u8; 8];
-            rejection[..4].copy_from_slice(b"SXS4");
+            rejection[..4].copy_from_slice(b"SXS1");
             stream
                 .write_all(&rejection)
                 .await
                 .expect("explicit rejection");
         });
         let runtime = tokio::runtime::Handle::current();
-        let result = pooled_loopback_object_rpc_channel(
+        let result = match pooled_loopback_object_rpc_channel(
             &data_dir,
             &address,
             sinomo_core::network::NetworkHealthPolicy::new(
@@ -2823,18 +2776,23 @@ mod tests {
             &runtime,
         )
         .await
-        .expect("rejected negotiation");
-        assert!(result.is_none());
-        let key = test_channel_pool_key(&data_dir, &address, &runtime);
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a loopback peer rejecting protocol v1 must fail"),
+        };
         assert!(matches!(
-            daemon_api_channel_pool()
+            result,
+            sinomo_core::network::NetworkError::Serialization { .. }
+        ));
+        let key = test_channel_pool_key(&data_dir, &address, &runtime);
+        assert!(
+            !daemon_api_channel_pool()
                 .lock()
                 .expect("channel pool")
                 .entries
-                .get(&key),
-            Some(DaemonApiChannelPoolEntry::Unsupported { .. })
-        ));
-        remove_test_channel_pool_entry(&data_dir, &address, &runtime);
+                .contains_key(&key),
+            "protocol rejection must not install a legacy negative-cache fallback"
+        );
         server.await.expect("server task");
     }
 
@@ -2981,8 +2939,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn legacy_daemon_close_falls_back_to_canonical_session_without_pool_poison() {
-        let root = sinomo_testdir::TestDir::new("sinomo-api-legacy-channel-fallback");
+    async fn loopback_service_call_uses_one_stream_native_connection_without_legacy_probe() {
+        let root = sinomo_testdir::TestDir::new("sinomo-api-stream-native-no-legacy-probe");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("data dir layout");
         sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
@@ -2993,48 +2951,36 @@ mod tests {
         let address = listener.local_addr_string().expect("address");
         let accepts = Arc::new(AtomicUsize::new(0));
         let server_accepts = Arc::clone(&accepts);
-        let server_data_dir = data_dir.clone();
         let server = tokio::spawn(async move {
-            let mut negotiation = listener
-                .accept()
-                .await
-                .expect("negotiation accept")
-                .into_inner();
+            let stream = listener.accept().await.expect("service stream accept");
             server_accepts.fetch_add(1, Ordering::SeqCst);
-            let mut request = [0_u8; 8];
-            negotiation
-                .read_exact(&mut request)
-                .await
-                .expect("channel negotiation");
-            assert!(
-                sinomo_core::network::local_object_rpc_channel_wire_prefix_matches(&request[..4])
+            let mut prefix = [0_u8; 4];
+            assert_eq!(
+                stream.peek_prefix(&mut prefix).await.expect("peek prelude"),
+                4
             );
-            drop(negotiation);
-
-            let stream = listener.accept().await.expect("canonical accept");
-            server_accepts.fetch_add(1, Ordering::SeqCst);
-            let (_request, responder) = sinomo_core::network::accept_object_rpc_server_session(
-                Box::new(stream.into_inner()),
-                server_data_dir,
-                sinomo_core::network::NetworkCallPolicy::default(),
-                |_request, _node_id, _public_key| Ok(()),
-            )
-            .await
-            .expect("canonical session");
-            responder
-                .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
+            assert!(
+                sinomo_core::network::__object_rpc_stream_contract::local_object_rpc_stream_prelude_prefix_matches(
+                    &prefix,
+                ),
+                "the first connection must begin with the Stage-E local stream prelude"
+            );
+            serve_test_stream_native_service(stream, |request, _peer| async move {
+                assert_eq!(request.request.route, "/test/stream-native-no-legacy-probe");
+                Ok(sinomo_core::network::ObjectRpcSessionResponse::value(
                     ObjectRpcResponse::encode_body(
-                        "/test/legacy-channel-fallback",
-                        &"canonical".to_string(),
+                        "/test/stream-native-no-legacy-probe",
+                        &"stream-native".to_string(),
                     )
                     .expect("response"),
                 ))
-                .await
-                .expect("canonical response");
+            })
+            .await
+            .expect("serve stream-native request");
         });
         let runtime = tokio::runtime::Handle::current();
         let request = ObjectRpcRequest::encode_body(
-            "/test/legacy-channel-fallback",
+            "/test/stream-native-no-legacy-probe",
             "test",
             &"request".to_string(),
         )
@@ -3047,15 +2993,19 @@ mod tests {
             &runtime,
         )
         .await
-        .expect("canonical fallback");
+        .expect("stream-native call");
         assert_eq!(
             result
                 .response
                 .decode_body::<String>()
                 .expect("response body"),
-            "canonical"
+            "stream-native"
         );
-        assert_eq!(accepts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "the migrated loopback path must not probe or fall back to a legacy protocol"
+        );
         let key = test_channel_pool_key(&data_dir, &address, &runtime);
         assert!(
             !daemon_api_channel_pool()
@@ -3063,7 +3013,7 @@ mod tests {
                 .expect("channel pool")
                 .entries
                 .contains_key(&key),
-            "legacy close must not poison future channel negotiation"
+            "the migrated loopback path must not touch the legacy channel pool"
         );
         server.await.expect("server task");
     }
@@ -3284,30 +3234,23 @@ mod tests {
             .expect("listener");
         let address = listener.local_addr_string().expect("listener address");
         let runtime = tokio::runtime::Handle::current();
-        mark_test_channel_unsupported(&data_dir, &address, &runtime);
         let response_body = vec![0x5a_u8; 173_219];
         let server_body = response_body.clone();
-        let server_data_dir = data_dir.clone();
         let server = tokio::spawn(async move {
-            let stream = listener.accept().await.expect("accept loopback session");
-            let (request, responder) = sinomo_core::network::accept_object_rpc_server_session(
-                Box::new(stream.into_inner()),
-                server_data_dir,
-                sinomo_core::network::NetworkCallPolicy::default(),
-                |_request, _node_id, _public_key| Ok(()),
-            )
-            .await
-            .expect("accept object RPC session");
-            assert_eq!(request.request.route, "/test/long-loopback-response");
-            tokio::time::sleep(Duration::from_secs(12)).await;
-            let response =
-                ObjectRpcResponse::from_encoded_body("/test/long-loopback-response", server_body);
-            responder
-                .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
+            let stream = listener.accept().await.expect("accept service stream");
+            serve_test_stream_native_service(stream, move |request, _peer| async move {
+                assert_eq!(request.request.route, "/test/long-loopback-response");
+                tokio::time::sleep(Duration::from_secs(12)).await;
+                let response = ObjectRpcResponse::from_encoded_body(
+                    "/test/long-loopback-response",
+                    server_body,
+                );
+                Ok(sinomo_core::network::ObjectRpcSessionResponse::value(
                     response,
                 ))
-                .await
-                .expect("respond with value");
+            })
+            .await
+            .expect("serve long stream-native request");
         });
         let request = ObjectRpcRequest::encode_body("/test/long-loopback-response", "test", &())
             .expect("request");
@@ -3320,10 +3263,9 @@ mod tests {
             &runtime,
         )
         .await
-        .expect("authenticated keepalives preserve the long loopback RPC");
+        .expect("stream-native liveness preserves the long loopback RPC");
         let response = decode_object_rpc_value_response(result).expect("decode response value");
         server.await.expect("server task");
-        remove_test_channel_pool_entry(&data_dir, &address, &runtime);
 
         assert_eq!(response.body, response_body);
     }
@@ -3351,30 +3293,31 @@ mod tests {
             .expect("listener");
         let address = listener.local_addr_string().expect("listener address");
         let runtime = tokio::runtime::Handle::current();
-        mark_test_channel_unsupported(&data_dir, &address, &runtime);
-        let server_data_dir = data_dir.clone();
         let server = tokio::spawn(async move {
-            let stream = listener.accept().await.expect("accept loopback session");
-            let (incoming, responder) = sinomo_core::network::accept_object_rpc_server_session(
-                Box::new(stream.into_inner()),
-                server_data_dir,
-                sinomo_core::network::NetworkCallPolicy::default(),
-                |_request, _node_id, _public_key| Ok(()),
-            )
-            .await
-            .expect("accept object RPC session");
-            assert_eq!(incoming.request.route, DAEMON_OBJECT_RPC_FORWARD_ROUTE);
-            let payload: DaemonObjectRpcForwardRequest = incoming
-                .request
-                .decode_body()
-                .expect("forward request payload");
-            assert_eq!(payload.overall_timeout_millis, Some(5_000));
+            let stream = listener.accept().await.expect("accept service stream");
+            let _ = serve_test_stream_native_service(stream, |incoming, _peer| async move {
+                assert_eq!(incoming.request.route, DAEMON_OBJECT_RPC_FORWARD_ROUTE);
+                let payload: DaemonObjectRpcForwardRequest = incoming
+                    .request
+                    .decode_body()
+                    .expect("forward request payload");
+                assert_eq!(payload.overall_timeout_millis, Some(5_000));
 
-            // Holding the responder keeps authenticated health pings flowing.
-            // Those pings must preserve transport health without refreshing
-            // the caller's operation-wide deadline.
-            tokio::time::sleep(Duration::from_secs(12)).await;
-            drop(responder);
+                // Stream liveness preserves transport health without extending
+                // the caller's operation-wide deadline.
+                tokio::time::sleep(Duration::from_secs(12)).await;
+                Ok(sinomo_core::network::ObjectRpcSessionResponse::value(
+                    ObjectRpcResponse::encode_body(
+                        DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+                        &DaemonObjectRpcForwardResponse::NetworkError {
+                            detail: "response after caller deadline".to_string(),
+                            delivery_state: None,
+                        },
+                    )
+                    .expect("late response"),
+                ))
+            })
+            .await;
         });
         let request =
             ObjectRpcRequest::encode_body("/test/forward-outer-deadline", "test", &"request")
@@ -3385,6 +3328,7 @@ mod tests {
         let error = send_daemon_object_rpc_session_async(
             data_dir.clone(),
             &address,
+            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
             &target_node,
             ObjectRpcSessionCall::value(request),
             Duration::from_secs(2),
@@ -3418,12 +3362,11 @@ mod tests {
         );
 
         server.await.expect("server task");
-        remove_test_channel_pool_entry(&data_dir, &address, &runtime);
         remove_test_local_node_id_cache(&data_dir);
     }
 
-    /// Opt-in loopback probe for TCP connect plus the ordinary canonical
-    /// object-RPC API. It intentionally has no timing assertion because CI
+    /// Opt-in loopback probe for TCP connect plus the stream-native object-RPC
+    /// API. It intentionally has no timing assertion because CI
     /// hosts are not stable benchmark environments.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "diagnostic microbenchmark; run explicitly with --ignored --nocapture"]
@@ -3447,29 +3390,21 @@ mod tests {
             .expect("listener");
         let address = listener.local_addr_string().expect("listener address");
         let runtime = tokio::runtime::Handle::current();
-        mark_test_channel_unsupported(&data_dir, &address, &runtime);
-        let server_data_dir = data_dir.clone();
         let server = tokio::spawn(async move {
             for _ in 0..WARMUP + ITERATIONS {
                 let stream = listener.accept().await.expect("accept diagnostic loopback");
-                let (_request, responder) = sinomo_core::network::accept_object_rpc_server_session(
-                    Box::new(stream.into_inner()),
-                    server_data_dir.clone(),
-                    sinomo_core::network::NetworkCallPolicy::default(),
-                    |_request, _node_id, _public_key| Ok(()),
-                )
-                .await
-                .expect("accept diagnostic object RPC session");
-                responder
-                    .respond(sinomo_core::network::ObjectRpcSessionResponse::value(
+                serve_test_stream_native_service(stream, |request, _peer| async move {
+                    assert_eq!(request.request.route, "/test/loopback-cost-diagnostic");
+                    Ok(sinomo_core::network::ObjectRpcSessionResponse::value(
                         ObjectRpcResponse::encode_body(
                             "/test/loopback-cost-diagnostic",
                             &"small response",
                         )
                         .expect("diagnostic response"),
                     ))
-                    .await
-                    .expect("diagnostic response write");
+                })
+                .await
+                .expect("serve diagnostic stream-native RPC");
             }
         });
         let request = ObjectRpcRequest::encode_body(
@@ -3496,7 +3431,6 @@ mod tests {
             }
         }
         server.await.expect("diagnostic loopback server");
-        remove_test_channel_pool_entry(&data_dir, &address, &runtime);
         latency_us.sort_unstable();
         let percentile = |percent: usize| {
             let rank = latency_us.len().saturating_mul(percent).saturating_add(99) / 100;
@@ -3535,6 +3469,85 @@ mod tests {
         assert_eq!(payload.idle_timeout_millis, Some(9_000));
         assert_eq!(payload.overall_timeout_millis, Some(30_000));
         assert!(payload.observe_connectivity);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_dfs_peer_transport_sends_the_dfs_forward_route() {
+        let (_root, data_dir) = test_channel_data_dir("sinomo-api-dfs-forward-route");
+        let local_node =
+            NodeId::from_legacy_named("node_api_dfs_forward_local").expect("local node");
+        let target_node =
+            NodeId::from_legacy_named("node_api_dfs_forward_target").expect("target node");
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("listener address");
+        let expected_target = target_node.clone();
+        let server = tokio::spawn(async move {
+            let mut stream = listener
+                .accept()
+                .await
+                .expect("accept local stream")
+                .into_inner();
+            let context = sinomo_core::network::__object_rpc_stream_contract::read_local_object_rpc_stream_prelude(
+                &mut stream,
+            )
+            .await
+            .expect("read stream-native local prelude");
+            sinomo_core::network::__object_rpc_stream_contract::serve_service_rpc_stream(
+                stream,
+                &context,
+                sinomo_core::network::ObjectFrameIoOptions::default(),
+                move |inbound, _peer| async move {
+                    assert_eq!(
+                        inbound.request.route,
+                        DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+                        "the real DFS peer transport must not fall back to the generic daemon forward route"
+                    );
+                    let forward = inbound
+                        .request
+                        .decode_body::<DaemonObjectRpcForwardRequest>()
+                        .expect("forward request");
+                    assert_eq!(forward.target_node_id, expected_target);
+                    let inner = ObjectRpcResponse::encode_body(forward.request.route, &"dfs-pong")
+                        .expect("inner response");
+                    let response = ObjectRpcResponse::encode_body(
+                        DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+                        &DaemonObjectRpcForwardResponse::Success { response: inner },
+                    )
+                    .expect("forward response");
+                    Ok(sinomo_core::network::ObjectRpcSessionResponse::value(
+                        response,
+                    ))
+                },
+            )
+            .await
+            .expect("serve stream-native DFS forward session");
+        });
+
+        let transport =
+            DaemonDfsPeerTransport::at_address(data_dir.clone(), address.clone(), local_node);
+        let request = ObjectRpcRequest::encode_body("/dfs/test/actual-forward", "dfs", &())
+            .expect("DFS request");
+        let result = transport
+            .call_session_inner(
+                &target_node,
+                ObjectRpcSessionCall::value(request),
+                sinomo_dfs::DfsObjectRpcSendOptions::new(Duration::from_secs(2))
+                    .with_overall_timeout(Duration::from_secs(2)),
+                &tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("DFS forwarded call");
+        assert_eq!(
+            result
+                .response
+                .decode_body::<String>()
+                .expect("inner response"),
+            "dfs-pong"
+        );
+        server.await.expect("server task");
+        remove_test_channel_pool_entry(&data_dir, &address, &tokio::runtime::Handle::current());
     }
 
     #[test]
@@ -3753,40 +3766,29 @@ mod tests {
             .await
             .expect("listener");
         let address = listener.local_addr_string().expect("listener address");
-        let runtime = tokio::runtime::Handle::current();
-        mark_test_channel_unsupported(&data_dir, &address, &runtime);
         let request_body = vec![0x41_u8; 512 * 1024 + 31];
         let response_body = vec![0x52_u8; 768 * 1024 + 47];
         let expected_request = request_body.clone();
         let server_response = response_body.clone();
-        let server_data_dir = data_dir.clone();
         let server = tokio::spawn(async move {
             let stream = listener
                 .accept()
                 .await
-                .expect("accept local daemon session");
-            let (incoming, responder) = sinomo_core::network::accept_object_rpc_server_session(
-                Box::new(stream.into_inner()),
-                server_data_dir,
-                sinomo_core::network::NetworkCallPolicy::default(),
-                |_request, _node_id, _public_key| Ok(()),
-            )
-            .await
-            .expect("accept authenticated session");
-            assert_eq!(
-                incoming.request.route,
-                sinomo_core::kv::CLUSTER_KV_TXN_ROUTE
-            );
-            assert_eq!(
-                incoming
-                    .body
-                    .collect_to_vec(1024 * 1024)
-                    .await
-                    .expect("local request body"),
-                expected_request
-            );
-            responder
-                .respond(sinomo_core::network::ObjectRpcSessionResponse {
+                .expect("accept local service stream");
+            serve_test_stream_native_service(stream, move |incoming, _peer| async move {
+                assert_eq!(
+                    incoming.request.route,
+                    sinomo_core::kv::CLUSTER_KV_TXN_ROUTE
+                );
+                assert_eq!(
+                    incoming
+                        .body
+                        .collect_to_vec(1024 * 1024)
+                        .await
+                        .expect("local request body"),
+                    expected_request
+                );
+                Ok(sinomo_core::network::ObjectRpcSessionResponse {
                     response: ObjectRpcResponse::encode_body(
                         sinomo_core::kv::CLUSTER_KV_TXN_ROUTE,
                         &"local-ok",
@@ -3794,8 +3796,9 @@ mod tests {
                     .expect("local response head"),
                     body: sinomo_core::network::ObjectRpcBodySource::bytes(server_response),
                 })
-                .await
-                .expect("local response");
+            })
+            .await
+            .expect("serve local stream-native request");
         });
 
         let transport = DaemonDfsPeerTransport::at_address(
@@ -3822,7 +3825,6 @@ mod tests {
         .await
         .expect("local target RPC");
         server.await.expect("server task");
-        remove_test_channel_pool_entry(&data_dir, &address, &runtime);
 
         assert_eq!(
             result

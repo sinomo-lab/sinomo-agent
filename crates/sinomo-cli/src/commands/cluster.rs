@@ -1965,7 +1965,7 @@ pub(crate) fn cluster_status() -> Result<(), CliError> {
             println!("kv revision: {}", state.kv_revision);
             println!("kv snapshot: {}", paths.kv_paths().snapshot.display());
             println!("members: {}", state.members.len());
-            if let Some(rows) = try_fetch_daemon_cluster_health_rows()? {
+            if let Some(rows) = try_fetch_daemon_cluster_health_snapshot_rows()? {
                 let count = |availability: ClusterNodeAvailability| {
                     rows.iter()
                         .filter(|row| row.availability == availability)
@@ -1993,7 +1993,7 @@ pub(crate) fn cluster_status() -> Result<(), CliError> {
 
 pub(crate) fn cluster_health() -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
-    if let Some(rows) = try_fetch_daemon_cluster_health_rows()? {
+    if let Some(rows) = try_fetch_daemon_cluster_health_snapshot_rows()? {
         print_cluster_health_rows(rows);
         return Ok(());
     }
@@ -2333,6 +2333,20 @@ fn try_fetch_daemon_cluster_health_rows() -> Result<Option<Vec<ClusterHealthRow>
     Ok(client
         .with_timeout(CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT)
         .cluster_health_with_peer_views()
+        .ok())
+}
+
+/// Read the daemon's already-published KV health view without triggering a
+/// foreground peer sweep. Ordinary status/health commands are read-model
+/// consumers; `cluster doctor` owns the explicit live diagnostic pass.
+fn try_fetch_daemon_cluster_health_snapshot_rows() -> Result<Option<Vec<ClusterHealthRow>>, CliError>
+{
+    let Some(client) = reachable_cluster_control_daemon()? else {
+        return Ok(None);
+    };
+    Ok(client
+        .with_timeout(CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT)
+        .cluster_health()
         .ok())
 }
 

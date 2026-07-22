@@ -24022,7 +24022,7 @@ fn cluster_state_load_drops_remote_members_removed_from_kv() {
 }
 
 #[test]
-fn cluster_read_view_falls_back_to_snapshot_when_local_raft_state_is_corrupt() {
+fn cluster_read_view_fails_closed_when_local_raft_state_is_corrupt() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-cluster-corrupt-read-view");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -24044,10 +24044,14 @@ fn cluster_read_view_falls_back_to_snapshot_when_local_raft_state_is_corrupt() {
 
     let wal_paths = cluster_raft_wal_paths(&paths, &node_id);
     std::fs::write(&wal_paths.hard_state, b"\0\0\0").expect("corrupt hard state");
-    let members = read_cluster_members_from_kv(&paths).expect("members from snapshot fallback");
+    let error = read_cluster_members_from_kv(&paths)
+        .expect_err("corrupt Raft state must not fall back to a stale materialized snapshot");
 
-    assert_eq!(members.len(), 1);
-    assert_eq!(members[0].node_id, node_id);
+    assert!(matches!(
+        error,
+        NetworkError::Directory { detail }
+            if detail.contains("hard-state.sobj") && detail.contains("unexpected end of input")
+    ));
 }
 
 #[test]

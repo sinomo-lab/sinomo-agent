@@ -7635,6 +7635,7 @@ struct RecordedCliStateAuthorityProbe {
 struct RecordingCliDaemonTargetRpc {
     probes: Arc<Mutex<Vec<RecordedCliStateAuthorityProbe>>>,
     reachable: bool,
+    failures_before_success: usize,
 }
 
 impl CliDaemonTargetRpc for RecordingCliDaemonTargetRpc {
@@ -7646,24 +7647,28 @@ impl CliDaemonTargetRpc for RecordingCliDaemonTargetRpc {
         overall_timeout: Option<Duration>,
         observe_connectivity: bool,
     ) -> Result<network::ObjectRpcResponse, ()> {
-        self.probes
-            .lock()
-            .expect("record CLI state-authority probe")
-            .push(RecordedCliStateAuthorityProbe {
+        let attempt = {
+            let mut probes = self
+                .probes
+                .lock()
+                .expect("record CLI state-authority probe");
+            probes.push(RecordedCliStateAuthorityProbe {
                 target_node_id: target_node_id.clone(),
                 route: request.route.clone(),
                 connect_timeout,
                 overall_timeout,
                 observe_connectivity,
             });
-        self.reachable
+            probes.len()
+        };
+        (self.reachable && attempt > self.failures_before_success)
             .then(|| network::ObjectRpcResponse::from_encoded_body(request.route.clone(), vec![]))
             .ok_or(())
     }
 }
 
 #[test]
-fn replica_quorum_admission_probes_remote_voter_through_local_daemon_with_total_budget() {
+fn replica_quorum_admission_retries_remote_voter_through_local_daemon_with_total_budget() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-replica-quorum-daemon-probe");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     paths.ensure().expect("cluster paths");
@@ -7698,18 +7703,23 @@ fn replica_quorum_admission_probes_remote_voter_through_local_daemon_with_total_
     )];
     state.members.push(remote);
 
-    for reachable in [true, false] {
+    for (reachable, failures_before_success) in [(true, 0), (false, usize::MAX), (true, 1)] {
         let probes = Arc::new(Mutex::new(Vec::new()));
         let mut host =
             CliClusterStateAuthorityReachabilityHost::with_daemon(RecordingCliDaemonTargetRpc {
                 probes: Arc::clone(&probes),
                 reachable,
+                failures_before_success,
             });
+        let mut options = cli_cluster_state_authority_reachability_options();
+        if !reachable {
+            // A permanently unavailable fake must still prove the deadline is
+            // bounded without making the unit test wait for the production
+            // foreground budget.
+            options.timeout = Duration::from_millis(1);
+        }
         let status = sinomo_runtime::cluster::cluster_state_authority_quorum_status_with_host(
-            &paths,
-            &state,
-            cli_cluster_state_authority_reachability_options(),
-            &mut host,
+            &paths, &state, options, &mut host,
         )
         .expect("project committed quorum state");
 
@@ -7717,11 +7727,18 @@ fn replica_quorum_admission_probes_remote_voter_through_local_daemon_with_total_
         assert_eq!(status.reachable, usize::from(reachable));
         assert_eq!(status.has_quorum(), reachable);
         let probes = probes.lock().expect("read recorded probes");
-        assert_eq!(probes.len(), 1);
-        assert_eq!(probes[0].target_node_id, remote_node_id);
-        assert_eq!(probes[0].route, sinomo_runtime::daemon::DAEMON_STATUS_ROUTE);
-        assert_eq!(probes[0].overall_timeout, Some(probes[0].connect_timeout));
-        assert!(!probes[0].observe_connectivity);
+        if reachable {
+            assert_eq!(probes.len(), failures_before_success + 1);
+        } else {
+            assert!(!probes.is_empty());
+        }
+        for probe in probes.iter() {
+            assert_eq!(probe.target_node_id, remote_node_id);
+            assert_eq!(probe.route, sinomo_runtime::daemon::DAEMON_STATUS_ROUTE);
+            assert_eq!(probe.overall_timeout, Some(probe.connect_timeout));
+            assert!(probe.connect_timeout <= Duration::from_secs(1));
+            assert!(!probe.observe_connectivity);
+        }
     }
 }
 
