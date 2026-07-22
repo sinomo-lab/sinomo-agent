@@ -798,8 +798,8 @@ mod tests {
         );
         assert!(
             ids.iter()
-                .any(|candidate| candidate == "cluster.agent.sandbox-cancel-route"),
-            "missing cluster.agent.sandbox-cancel-route"
+                .any(|candidate| candidate == "cluster.agent.simple-sandbox-active-cancel"),
+            "missing cluster.agent.simple-sandbox-active-cancel"
         );
         assert!(
             ids.iter()
@@ -810,11 +810,6 @@ mod tests {
             ids.iter()
                 .any(|candidate| candidate == "cluster.agent.module-native-dylib-active-cancel"),
             "missing cluster.agent.module-native-dylib-active-cancel"
-        );
-        assert!(
-            ids.iter()
-                .any(|candidate| candidate == "cluster.agent.sandbox-active-cancel"),
-            "missing cluster.agent.sandbox-active-cancel"
         );
     }
 }

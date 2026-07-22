@@ -1,3 +1,4 @@
+use crate::tools::local_workspace::provision_default_agent_session_sandbox;
 use crate::{
     AGENT_DEFINITION_SIFS_ROOT, AGENT_OBJECT_RPC_ROUTES, AGENT_RPC_CATEGORY,
     AGENT_RUNTIME_CONTROL_OBJECT_RPC_ROUTES, AGENT_SESSION_FOLLOW_UP_ROUTE,
@@ -8,15 +9,15 @@ use crate::{
     AgentDefinitionValidationError, AgentItem, AgentLoopInput, AgentLoopResponseMode,
     AgentModelDecisionSource, AgentModelEvent, AgentModuleToolProjection, AgentOp,
     AgentOutputFormat, AgentPackageProvenance, AgentPackageSource, AgentPlacementMetadata,
-    AgentRemoteObjectRpcFuture, AgentRemoteObjectRpcTool, AgentRemoteObjectRpcTransport, AgentRole,
-    AgentRun, AgentRunContext, AgentRuntimeControlError, AgentRuntimeControlHost,
-    AgentRuntimeControlRegistry, AgentSession, AgentSessionControlEventCursor,
-    AgentSessionControlResponse, AgentSessionControlResult, AgentSessionControlSnapshot,
-    AgentSessionFollowUpRequest, AgentSessionInspectRequest, AgentSessionInspectResponse,
-    AgentSessionInterruptRequest, AgentSessionProgressRequest, AgentSessionProgressResponse,
-    AgentSessionReattachState, AgentSessionRemoveQueuedInputRequest, AgentSessionResumeRequest,
-    AgentSessionResumeResponse, AgentSessionRuntime, AgentSessionSnapshot,
-    AgentSessionSteerRequest, AgentSessionStore, AgentSessionStoreRecord,
+    AgentProcessLifecycleStatus, AgentRemoteObjectRpcFuture, AgentRemoteObjectRpcTool,
+    AgentRemoteObjectRpcTransport, AgentRole, AgentRun, AgentRunContext, AgentRuntimeControlError,
+    AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentSession,
+    AgentSessionControlEventCursor, AgentSessionControlResponse, AgentSessionControlResult,
+    AgentSessionControlSnapshot, AgentSessionFollowUpRequest, AgentSessionInspectRequest,
+    AgentSessionInspectResponse, AgentSessionInterruptRequest, AgentSessionProgressRequest,
+    AgentSessionProgressResponse, AgentSessionReattachState, AgentSessionRemoveQueuedInputRequest,
+    AgentSessionResumeRequest, AgentSessionResumeResponse, AgentSessionRuntime,
+    AgentSessionSnapshot, AgentSessionSteerRequest, AgentSessionStore, AgentSessionStoreRecord,
     AgentSessionStoreRecordKind, AgentSessionTerminalResultsRequest,
     AgentSessionTerminalResultsResponse, AgentSkillPlan, AgentStopReason, AgentTaskLifecycleStatus,
     AgentTaskRef, AgentTaskSnapshot, AgentToolCall, AgentToolCapability, AgentToolEvidence,
@@ -138,6 +139,7 @@ pub fn run_local_agent_readiness_gate(workspace_root: impl Into<PathBuf>) -> Age
     checks.push(check_git_diff_large_output_disclosure_smoke());
     checks.push(check_tool_cancellation_boundary_smoke(&workspace_root));
     checks.push(check_version_control_active_cancellation_smoke());
+    checks.push(run_agent_simple_sandbox_active_cancellation_readiness());
     checks.push(check_sandbox_container_active_cancellation_smoke());
     checks.push(check_host_gateway_active_cancellation_smoke());
     checks.push(check_remote_object_rpc_active_cancellation_smoke());
@@ -2805,6 +2807,210 @@ fn check_version_control_active_cancellation_smoke() -> AgentReadinessCheck {
     passed(
         "version_control_active_cancellation_smoke",
         "version-control active subprocess cancellation smoke is not available on this platform",
+        serde_json::json!({ "platform": std::env::consts::OS }),
+    )
+}
+
+#[cfg(unix)]
+pub fn run_agent_simple_sandbox_active_cancellation_readiness() -> AgentReadinessCheck {
+    const CHECK_ID: &str = "agent_simple_sandbox_active_cancellation_smoke";
+    let readiness_root = std::env::temp_dir().join(format!(
+        "sinomo-agent-simple-sandbox-cancel-readiness-{}",
+        TaskId::generate()
+    ));
+    let workspace_root = readiness_root.join("workspace");
+    let runtime_root = readiness_root.join("sandbox-runtime");
+    if let Err(error) = fs::create_dir_all(&workspace_root) {
+        return failed(
+            CHECK_ID,
+            "failed to create the simple-sandbox readiness workspace",
+            serde_json::json!({ "error": error.to_string() }),
+        );
+    }
+
+    let session = readiness_session();
+    let sandbox_id = sinomo_runtime::sandbox::SandboxId::derived(
+        "sinomo-agent-simple-sandbox-cancellation-readiness",
+        TaskId::generate().to_string().as_bytes(),
+    );
+    let config = LocalWorkspaceAgentConfig::new(&workspace_root)
+        .with_sandbox_runtime_root(&runtime_root)
+        .with_sandbox_instance_id(sandbox_id.clone())
+        .allowing_unenforced_simple_sandbox(true)
+        .allowing_shell_commands(true);
+    if let Err(error) = provision_default_agent_session_sandbox(&config, Vec::new()) {
+        return failed(
+            CHECK_ID,
+            "failed to provision the simple-sandbox readiness instance",
+            serde_json::json!({
+                "error": error,
+                "sandbox_id": sandbox_id,
+            }),
+        );
+    }
+
+    let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(&runtime_root);
+    let layout = match store.load(&sandbox_id) {
+        Ok((_manifest, layout)) => layout,
+        Err(error) => {
+            return failed(
+                CHECK_ID,
+                "failed to load the provisioned simple-sandbox readiness instance",
+                serde_json::json!({
+                    "error": error.to_string(),
+                    "sandbox_id": sandbox_id,
+                }),
+            );
+        }
+    };
+    let started_marker = layout.work.join("readiness-started");
+    let progress_marker = layout.work.join("readiness-progress");
+    let registry = fixed_command_readiness_registry(config);
+    let cancellation_token = AgentCancellationToken::new();
+    let token_for_run = cancellation_token.clone();
+    let lifecycle = Arc::new(Mutex::new(Vec::<AgentProcessLifecycleStatus>::new()));
+    let lifecycle_for_sink = Arc::clone(&lifecycle);
+    let progress_sink = AgentToolProgressSink::new(move |event| {
+        let process = match event {
+            AgentToolProgressEvent::ProcessStarted { process }
+            | AgentToolProgressEvent::ProcessCompleted { process } => Some(process),
+            AgentToolProgressEvent::ProcessOutput { .. }
+            | AgentToolProgressEvent::Message { .. } => None,
+        };
+        if let Some(process) = process
+            && let Ok(mut lifecycle) = lifecycle_for_sink.lock()
+        {
+            lifecycle.push(process.status);
+        }
+    });
+    let call = AgentToolCall {
+        call_id: None,
+        tool: "run_command".to_string(),
+        input: serde_json::json!({
+            "command": "printf ready > \"$SINOMO_WORK/readiness-started\"; while :; do printf x >> \"$SINOMO_WORK/readiness-progress\"; sleep 0.02; done",
+            "timeout_ms": 8_000,
+        }),
+        r#async: false,
+        summary: "readiness cancel active simple-sandbox work".to_string(),
+    };
+    let (outcome_sender, outcome_receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let outcome = registry.execute_with_cancellation_and_progress(
+            &session,
+            0,
+            0,
+            &call,
+            token_for_run,
+            progress_sink,
+        );
+        let _ = outcome_sender.send(outcome);
+    });
+
+    let start_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while (!started_marker.exists()
+        || fs::metadata(&progress_marker).map_or(0, |metadata| metadata.len()) == 0)
+        && std::time::Instant::now() < start_deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let command_became_active = started_marker.exists()
+        && fs::metadata(&progress_marker).map_or(0, |metadata| metadata.len()) > 0;
+    let cancelled_at = std::time::Instant::now();
+    cancellation_token.cancel();
+    let outcome = outcome_receiver.recv_timeout(std::time::Duration::from_secs(10));
+    let worker_joined = worker.join().is_ok();
+    let cancellation_duration_ms = cancelled_at.elapsed().as_millis() as u64;
+    let progress_bytes_after_cancel =
+        fs::metadata(&progress_marker).map_or(0, |metadata| metadata.len());
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let progress_bytes_after_settle =
+        fs::metadata(&progress_marker).map_or(0, |metadata| metadata.len());
+    let lifecycle = lifecycle
+        .lock()
+        .map_or_else(|_| Vec::new(), |lifecycle| lifecycle.clone());
+    let manifest = store.load(&sandbox_id).map(|(manifest, _layout)| manifest);
+
+    let Ok(outcome) = outcome else {
+        return failed(
+            CHECK_ID,
+            "simple-sandbox command did not settle after cancellation",
+            serde_json::json!({
+                "command_became_active": command_became_active,
+                "worker_joined": worker_joined,
+                "cancellation_duration_ms": cancellation_duration_ms,
+                "lifecycle": lifecycle,
+            }),
+        );
+    };
+    let (manifest_stopped, active_process_count) =
+        manifest.map_or((false, usize::MAX), |manifest| {
+            (
+                manifest.lifecycle.status
+                    == sinomo_runtime::sandbox::SandboxInstanceLifecycleStatus::Stopped,
+                manifest.active_processes.len(),
+            )
+        });
+    let observed_running = lifecycle.contains(&AgentProcessLifecycleStatus::Running);
+    let observed_cancelled = lifecycle.contains(&AgentProcessLifecycleStatus::Cancelled);
+    let cancelled = outcome.status == AgentToolStatus::Cancelled
+        && outcome
+            .output
+            .get("cancelled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && outcome
+            .output
+            .get("cleanup_pending")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+    let process_stopped = progress_bytes_after_cancel == progress_bytes_after_settle;
+    let bounded = cancellation_duration_ms < 3_000;
+    let evidence = serde_json::json!({
+        "sandbox_id": sandbox_id,
+        "command_became_active": command_became_active,
+        "cancelled": cancelled,
+        "worker_joined": worker_joined,
+        "cancellation_duration_ms": cancellation_duration_ms,
+        "observed_running": observed_running,
+        "observed_cancelled": observed_cancelled,
+        "manifest_stopped": manifest_stopped,
+        "active_process_count": active_process_count,
+        "progress_bytes_after_cancel": progress_bytes_after_cancel,
+        "progress_bytes_after_settle": progress_bytes_after_settle,
+        "process_stopped": process_stopped,
+        "bounded": bounded,
+        "status": outcome.status,
+        "output": outcome.output,
+    });
+    if command_became_active
+        && cancelled
+        && worker_joined
+        && bounded
+        && observed_running
+        && observed_cancelled
+        && manifest_stopped
+        && active_process_count == 0
+        && process_stopped
+    {
+        passed(
+            CHECK_ID,
+            "agent simple-sandbox work is cancellable after the child process becomes active",
+            evidence,
+        )
+    } else {
+        failed(
+            CHECK_ID,
+            "agent simple-sandbox active cancellation failed",
+            evidence,
+        )
+    }
+}
+
+#[cfg(not(unix))]
+pub fn run_agent_simple_sandbox_active_cancellation_readiness() -> AgentReadinessCheck {
+    passed(
+        "agent_simple_sandbox_active_cancellation_smoke",
+        "agent simple-sandbox active cancellation readiness is not available on this platform",
         serde_json::json!({ "platform": std::env::consts::OS }),
     )
 }
@@ -7498,6 +7704,12 @@ mod tests {
                 .checks
                 .iter()
                 .any(|check| check.id == "local_command_evidence_smoke")
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.id == "agent_simple_sandbox_active_cancellation_smoke")
         );
         assert!(
             report
