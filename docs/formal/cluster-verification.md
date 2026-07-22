@@ -38,12 +38,10 @@ The model inventory is split by subsystem:
   replay, and KV-state replay. `models/kv/raft_protocol.qnt` complements it with
   bounded per-node term, vote, log, replication, commit, and durable restart
   state. Their invariant entrypoints live under `checks/kv/`.
-- `models/network/` contains the base network mechanism, endpoint selection,
-  route planning, routing-table cache invalidation, delivery retry, endpoint
-  attempt-budget, timed transport, and timed delivery-retry models. Matching
-  invariant entrypoints live under `checks/network/`, and
-  `scenarios/network/timed_delivery_smoke.qnt` composes
-  the timed transport and retry layers for randomized exploration.
+- `models/network/` contains the transport-independent base network mechanism,
+  endpoint selection, and timed transport model. Matching invariant entrypoints
+  live under `checks/network/`. Route planning and routed-stream realization are
+  currently covered by their executable Rust refinement tests.
 - `models/membership/` contains standalone membership authority, the
   membership/KV bridge over the abstract committed-prefix contract, and a
   focused Raft configuration-transition slice for promotion, safe voter-set
@@ -258,75 +256,14 @@ command-style main-daemon candidate surface first; data-plane and rollout
 purpose-specific selectors still deserve separate refinements if their ranking
 rules diverge.
 
-The `network_route_planning_safety.safety` invariant combines these properties:
-
-- selected routes avoid already visited nodes;
-- selected routes use no failed edge;
-- selected routes use only usable edges;
-- identity-mismatch edges are never selected;
-- relay routes require a complete proven path from local to relay to target;
-- direct routes require a usable direct edge;
-- a no-more-expensive direct route is preferred over a relay route;
-- after direct edge failure, a compatible relay route is selected when one
-  exists;
-- `NoRoute` is returned only when no compatible direct or relay path exists;
-- selected paths contain no loop.
-
-This maps to `ClusterDeliveryRouteGraph`, `cluster_delivery_route_candidates`,
-`cluster_delivery_select_route_candidate`,
-`cluster_delivery_route_candidate_is_compatible`,
-`cluster_delivery_shortest_path`, and the connectivity cost helpers in
-`route.rs`. It preserves an implementation nuance: an ordinary unreachable
-direct target endpoint can remain as a high-cost last-resort fallback, but
-identity-mismatch evidence and unreachable relay edges are excluded.
-
-The `network_route_cache_safety.safety` invariant refines the production
-routing-table cache boundary:
-
-- reuse requires equality of the cluster-state mark, committed directory
-  version, local-connectivity file mark and content generation, and enabled
-  module-dialer snapshot;
-- an unknown directory version disables both reuse and publication;
-- the cached table's cluster and local-node identities must still match the
-  caller;
-- a table is not reused at or after its earliest connectivity expiry;
-- committed membership removal changes the directory mark before an old target
-  plan can be reused;
-- endpoint identity mismatch eagerly invalidates the cache; and
-- a table built while its before/after validity mark changes is discarded.
-
-This maps to `ClusterDeliveryRoutingTableCacheMark`,
-`cluster_delivery_route_plan_from_cached_routing_table`,
-`cluster_delivery_routing_table_cache_mark`, the before/after build check in
-`cluster_delivery_route_plan_from_routing_table_async`, and
-`record_cluster_delivery_endpoint_identity_mismatch`. Named witnesses keep each
-mark input, identity check, expiry path, membership removal, and build race
-reachable. The slice proves safe reuse, not cache hit rate, eviction policy, or
-fresh-route construction after a miss.
-
-The `network_delivery_retry_safety.safety` invariant combines these properties:
-
-- a delivered response requires a successful endpoint attempt;
-- primary and fallback attempts preserve the caller's stable operation identity;
-- each endpoint attempt uses a fresh authentication nonce;
-- retry may dispatch the same domain operation more than once, but the number of
-  dispatches remains bounded by the endpoint attempts;
-- failed and suppressed endpoints were attempted;
-- identity-mismatch endpoint failures are suppressed and recorded as
-  identity-mismatch feedback;
-- endpoint feedback matches the observed attempt result;
-- deadline and TTL terminal failures cannot produce a delivered response;
-- a primary failure with a configured fallback and remaining budget cannot
-  terminally fail with `AllEndpointsFailed` before attempting the fallback;
-- delivered states are terminal and carry no terminal error.
-
-This maps to the target/relay send retry paths in `route.rs`, including
-`ClusterDeliveryFailedEdges`, `record_cluster_delivery_endpoint_identity_mismatch`,
-the per-endpoint attempt loop, and `RelayEnvelope`'s stable inner request. It
-does not claim generic network-level exactly-once delivery: generic object RPC
-may duplicate a side-effecting request. Domain protocols such as DFS and KV must
-enforce idempotency with the stable operation identity, while every concrete
-endpoint attempt receives fresh transport authentication.
+The former route-cache, delivery-retry, endpoint-budget, persistent-tunnel, and
+body-spool proof slices were refinements of the removed delivery executor and
+its carriers. They were deleted with the implementation rather
+than retained as misleading verification. The current deterministic planner,
+candidate ordering, loop prevention, capability filtering, multi-hop
+realization, identity checks, and bounded candidate attempts are exercised in
+`crates/sinomo-network/src/routing.rs`. A future formal routing slice must refine
+`plan_routes` and `MultiHopRoutedConnector` directly.
 
 The `network_timed_transport_safety.safety` invariant combines these
 properties:
@@ -344,66 +281,9 @@ properties:
 - duplicate copies cannot exist before the original and preserve the original
   packet expiry.
 
-The `network_tcp_tunnel_stream_backpressure_safety.safety` companion refines
-bounded receive admission inside one multiplexed persistent TCP-tunnel stream.
-The physical reader may hold the single frame it has already decoded when the
-per-stream or aggregate byte window is full, but it does not reset an otherwise
-healthy stream. Application consumption releases capacity, the held head frame
-then enters the queue in order, and an exact healthy transfer can complete.
-Queue bytes plus the one decoded head remain bounded; explicit peer
-cancellation is the only modeled reset cause. Reverse-direction ACK and
-keepalive progress is independent because the tunnel is full duplex. The Rust
-refinement is `TcpTunnelHandle::deliver_stream_data`: byte-permit acquisition
-and bounded-channel admission must apply backpressure asynchronously instead
-of treating temporary saturation as corruption. This finite one-stream slice
-abstracts multi-stream fairness, socket buffer sizing, frame payload bytes, and
-wall-clock liveness.
-
-The `network_object_rpc_body_direct_delivery_safety.safety` companion refines
-the next receive boundary, where a decoded object-RPC body frame enters its
-bounded application queue. A full queue retains that one frame in memory for a
-finite grace instead of immediately selecting whole-body disk spooling.
-Consumer progress during the grace admits the frame directly; grace expiry
-retains the spool as the deadlock escape hatch for ignored or mutually blocked
-full-duplex bodies, and consumer close terminates without spooling. The model
-proves bounded queue and wait state, a single terminal frame outcome, and that
-direct delivery, spill, and close obey those guards. The Rust refinement is
-`IncomingBodySender::deliver_with_grace`: the unsaturated `try_send` path is
-unchanged, while only transient saturation awaits channel capacity under the
-bounded timeout. Wall-clock scheduler fairness, adaptive grace selection, and
-multi-session fairness remain performance and liveness obligations.
-
-The `network_timed_delivery_retry_safety.safety` invariant combines these
-properties:
-
-- request time and global deadline stay inside the bounded logical clock;
-- the request deadline is derived from the request start rather than model
-  initialization;
-- endpoint attempts require a prepared stable delivery key;
-- each response due time is derived from that endpoint's attempt start;
-- per-attempt timeout and accepted-attempt timeout never extend the global
-  deadline;
-- primary and fallback attempts reuse the original stable delivery key while
-  using distinct transport attempt nonces;
-- accepted responses arrive before both the global deadline and the current
-  attempt timeout;
-- accepted responses were due, came from an attempted endpoint, and came from an
-  endpoint configured to respond;
-- late responses do not dispatch the request;
-- terminal `TimedDeadlineExpired` requires the logical clock to have reached the
-  global deadline;
-- `TimedAllEndpointsFailed` cannot skip a usable fallback while time remains;
-- failed, timed-out, and suppressed endpoints were attempted;
-- identity-mismatch endpoint failures suppress the endpoint;
-- observed duplicate responses refer to an attempted endpoint without creating
-  a generic exactly-once guarantee.
-
-These timed models are still finite and safety-oriented. They model bounded
-logical time, packet loss, delay, duplication, per-attempt timeout, late
-responses, and fallback behavior. The timed smoke scenario couples attempt
-start to packet creation, advances both clocks together, and requires packet
-delivery before a response decision. It does not yet prove unbounded real-time
-fairness or scheduler progress.
+The timed transport model remains finite and safety-oriented. It models packet
+loss, delay, duplication, and expiry independently of any removed RPC carrier;
+it does not prove unbounded real-time fairness or scheduler progress.
 
 The full-system smoke model is intentionally different from the focused proof
 modules. `system_base` owns one shared cross-layer state vocabulary, and
@@ -685,7 +565,7 @@ or namespace mutation, and a duplicate application attempt leaves the one
 atomic result unchanged.
 
 The Rust refinement is the composition of a `DfsRoutedCall` attachment with the
-single `ObjectRpcSessionCall` contract. The sender carries a typed
+single `ObjectRpcCall` contract. The sender carries a typed
 `CommitLocalEventualBatch` descriptor and its encoded namespace transaction as
 the semantic request attachment. The receiver validates the attachment, the
 authenticated caller-owned file transitions, their expected base versions,
@@ -1820,7 +1700,7 @@ that registry omits a `checks/**/*_safety.qnt` file. Select one or more cases
 without editing the script:
 
 ```bash
-QUINT_CASE_FILTER=network-timed-delivery,dfs-pending-requests \
+QUINT_CASE_FILTER=network-timed-transport,dfs-pending-requests \
   bash scripts/formal/check-quint.sh verify-full
 ```
 
@@ -1829,7 +1709,7 @@ witness predicates; coverage mode raises the sample count and fails if any
 registered witness is not reached:
 
 ```bash
-QUINT_CASE_FILTER=raft-kv,raft-protocol,network-route-cache,network-delivery,network-attempt-budget,network-timed-delivery,membership-raft-config,dfs-posix-cross-shard,dfs-posix-advisory-locks,dfs-posix-fsync,dfs-posix-partitioned-operation,dfs-local-first-file-gateway-composition,dfs-local-first-namespace-gateway-composition,dfs-pending-requests,dfs-namespace-command-replay \
+QUINT_CASE_FILTER=raft-kv,raft-protocol,network-endpoint,network-timed-transport,membership-raft-config,dfs-posix-cross-shard,dfs-posix-advisory-locks,dfs-posix-fsync,dfs-posix-partitioned-operation,dfs-local-first-file-gateway-composition,dfs-local-first-namespace-gateway-composition,dfs-pending-requests,dfs-namespace-command-replay \
   QUINT_COVERAGE_MAX_SAMPLES=5000 \
   bash scripts/formal/check-quint.sh coverage
 ```
@@ -1859,22 +1739,18 @@ while IFS= read -r -d '' file; do
 done < <(find specs/quint -name '*.qnt' -print0 | sort -z)
 
 quint run specs/quint/checks/kv/raft_kv_safety.qnt --main=raft_kv_safety --invariant=safety --step=coverageStep --max-steps=20 --max-samples=50 --witnesses witnessBrokenNoQuorumNoEffectCounterexample --verbosity=1
-quint run specs/quint/checks/network/route_planning_safety.qnt --main=network_route_planning_safety --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
-quint run specs/quint/checks/network/timed_delivery_retry_safety.qnt --main=network_timed_delivery_retry_safety --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
-quint run specs/quint/scenarios/network/timed_delivery_smoke.qnt --main=network_timed_delivery_smoke --invariant=safety --max-steps=80 --max-samples=500 --verbosity=1
+quint run specs/quint/checks/network/timed_transport_safety.qnt --main=network_timed_transport_safety --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
 quint run specs/quint/checks/dfs/posix_namespace_safety.qnt --main=dfs_posix_namespace_safety --invariant=safety --max-steps=20 --max-samples=50 --verbosity=1
 quint run specs/quint/scenarios/system/smoke.qnt --main=system_smoke --invariant=safety --max-steps=80 --max-samples=500 --verbosity=1
 
 quint verify specs/quint/checks/kv/raft_kv_safety.qnt --main=raft_kv_safety --invariant=safety --step=step --max-steps=5 --backend=apalache --apalache-version=0.56.1 --server-endpoint=localhost:8822 --verbosity=1
-quint verify specs/quint/checks/network/route_planning_safety.qnt --main=network_route_planning_safety --invariant=safety --max-steps=4 --verbosity=1
-quint verify specs/quint/checks/network/timed_delivery_retry_safety.qnt --main=network_timed_delivery_retry_safety --invariant=safety --max-steps=7 --verbosity=1
+quint verify specs/quint/checks/network/timed_transport_safety.qnt --main=network_timed_transport_safety --invariant=safety --max-steps=5 --verbosity=1
 quint verify specs/quint/checks/dfs/posix_namespace_safety.qnt --main=dfs_posix_namespace_safety --invariant=safety --max-steps=2 --verbosity=1
 ```
 
 `check-quint.sh` repeats this `checks/<subsystem>/*_safety.qnt` run/verify
-pattern for every focused invariant suite, runs the timed network smoke
-scenario from `scenarios/network/timed_delivery_smoke.qnt`, and runs the
-full-system smoke scenario from `scenarios/system/smoke.qnt`.
+pattern for every focused invariant suite and runs the full-system smoke
+scenario from `scenarios/system/smoke.qnt`.
 
 The Docker refinement gate is deliberately stricter than per-node DFS
 readiness. Before correctness or performance scenarios run,

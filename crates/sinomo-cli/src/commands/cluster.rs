@@ -1913,7 +1913,7 @@ async fn send_join_endpoint_rpc_async(
         .call_endpoint(
             state,
             endpoint,
-            network::ObjectRpcSessionCall::value(request.clone()),
+            network::ObjectRpcCall::value(request.clone()),
             options,
         )
         .await?;
@@ -2991,12 +2991,11 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
                 Some(state.cluster_id.clone()),
                 "cluster kv snapshot refresh signing",
             );
-            let mut client =
-                network::ClusterObjectRpcClient::routed(&mut host, runtime.handle(), &self.paths);
+            let mut client = network::ClusterObjectRpcClient::routed(&mut host, &self.paths);
             let result = runtime.block_on(client.call_target(
                 state,
                 target_node_id,
-                network::ObjectRpcSessionCall::value(request.clone()),
+                network::ObjectRpcCall::value(request.clone()),
                 network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
             ));
             runtime.shutdown_timeout(Duration::from_millis(250));

@@ -1,153 +1,102 @@
 # Network Data-Path Reference
 
-This developer reference records the current private carrier mechanics behind
-Sinomo object RPC at the start of the network-layer separation. It is an
-implementation reference, not the target interface. The normative direct-link,
-connectivity, routed-stream, object-RPC, retry, and authority contracts are in
-the [network architecture](../network-architecture.md); the migration and
-deletion gates are in the
-[network layer separation plan](../plans/network-layer-separation.md). The
+This page maps the current stream-native network implementation. The normative
+contracts are in the [network architecture](../network-architecture.md); the
 public binary object encoding is specified by the
 [Sinomo Object format](../sinomo-object-format.md).
 
-The separation is internal to the existing `sinomo-network` crate. This
-reference and plan do not propose additional networking workspace crates.
+All layers remain inside `crates/sinomo-network`. There is one production path:
 
-The constants and carrier version below describe the current consolidated v1
-implementation. That implementation still has both a canonical bulk session
-and a persistent multiplexed channel. These are migration inputs, not the
-future routed-session or object-RPC protocol versions. Do not copy their carrier
-selection or payload bounds into the new layer contracts.
+```text
+sinomo-service registry
+        |
+typed request/response head plus optional body
+        |
+object_rpc_stream.rs -- one call per authenticated duplex stream
+        |
+routing.rs -- direct or multi-hop routed stream
+        |
+direct_link.rs and transport modules
+```
 
-While this implementation remains in production, a wire change must update its
-code, tests, and this reference together. Refactoring implementation code alone
-does not justify incrementing protocol v1.
+No payload-size branch selects another carrier. Relayed and direct calls use the
+same object-RPC protocol, and relays forward opaque routed-stream bytes.
 
-## Semantic Boundary
+## Call and Body Contracts
 
-Applications see a SOBJ request head and SOBJ response head, with an optional
-streaming attachment in either direction. Ordinary RPC values remain one SOBJ
-value even when the network temporarily carries a large encoded body out of
-line and restores it before dispatch. Attachments stay attached to the same
-call. The private distinction between control and Data frames does not expose
-frame boundaries or require callers to choose a transport shape.
+`rpc_body.rs` owns the application-facing values:
 
-Object-frame heads use one `SOF2` prefix with an unsigned 64-bit length for
-every frame. Compact forms and extended-length sentinels are not part of v1.
+- `ObjectRpcCall` and `ObjectRpcResult` pair a typed SOBJ head with an optional
+  body;
+- `ObjectRpcIncomingRequest` and `ObjectRpcOutgoingResponse` are the server-side
+  equivalents; and
+- `ObjectRpcBodySource` and `ObjectRpcIncomingBody` provide bounded streaming
+  producers and consumers.
 
-## Canonical Bulk Session
+An ordinary value remains a single SOBJ value regardless of encoded size. If
+it exceeds the inline allowance, the codec moves its bytes through the body
+stream and restores them before typed dispatch. A semantic attachment stays an
+attachment. Callers do not observe transport frames or choose a carrier.
 
-Transfer chunk size and receive credit are independently negotiated. A
-canonical bulk session negotiates 1--4 MiB chunks and starts with 16--64 MiB of
-receive credit. Starting credit is twice the measured bandwidth-delay product
-(BDP), clamped to that range; a path without enough observations starts at
-16 MiB.
+`service_rpc_stream.rs` encodes the typed service head into the application-head
+slot of the object-RPC protocol. It does not implement routing or keep a service
+catalog. The single method registry, route policy, concurrency admission,
+readiness, and final handler dispatch live in `sinomo-service`.
 
-`sinomo-network` exposes a transport-neutral path estimator for reuse by other
-crates. Callers supply RTT samples and delivered-byte intervals keyed by a
-stable path identity, then consume smoothed RTT, delivery bandwidth, BDP, or a
-resource-bounded recommended window. Object RPC supplies handshake RTT and
-cumulative transfer delivery through the same interface. Its process-shared
-registry is bounded; object RPC currently keys observations and receive-credit
-accounting by the authenticated immediate peer.
+## Routed Streams
 
-Receivers return cumulative credit after 8--16 MiB of progress, or when the
-1--10 ms path-derived progress timer becomes due, rather than acknowledging
-every chunk. Completion flushes the final progress. Active receive credit is
-bounded to 64 MiB per transfer and 256 MiB in aggregate per immediate peer.
-Credit is an admission bound rather than a preallocated buffer. The bounded
-reader queue and spill path separately control resident body memory.
-Unknown-length attachments enter this BDP-tuned session; known-size attachments
-use the persistent channel described below.
+`routing.rs` is the only production node-routing executor. A
+`MultiHopRoutedConnector` plans against one immutable connectivity snapshot and
+realizes either a direct stream or a relay chain. The routed-session handshake
+binds source, destination, session identity, and channel binding before
+application bytes are accepted.
 
-## Persistent Multiplexed Channel
+Intermediate nodes run `accept_or_relay_routed_session`. They authenticate the
+adjacent links, validate the routed envelope, and copy opaque bytes between the
+two bounded streams. They do not decode SOBJ heads, inspect service methods, or
+select an RPC implementation.
 
-The persistent channel keeps request and response heads, body descriptors,
-completion, cancellation, and flow-control messages as ordinary SOBJ control
-documents. Only attachment and out-of-line value payload bytes use the private
-fixed Data representation.
+`route.rs` composes routing with object RPC through `ClusterObjectRpcClient`.
+It selects endpoints only while opening the routed stream. Once application
+bytes have entered a stream, routing does not replay them on another path.
 
-`SCDF` version 1 places a 32-byte header in front of the existing payload
-allocation. The header contains its magic and version, request/response
-direction, flags, call ID, ordered body offset, payload length, and reserved
-bytes. A carrier validates the complete header, including direction, nonzero
-call ID, offset range, reserved fields, and the 256 KiB payload bound before
-acquiring a receive buffer. Sending uses one partial-write-safe vectored loop
-over the header and payload.
+## Object-RPC Framing and Backpressure
 
-### Flow Control and Fairness
+`object_rpc_stream.rs` implements `sinomo.object-rpc.stream.v1`. One duplex
+stream carries exactly one request and one response. The current resource
+bounds are:
 
-The channel frame quantum and per-call flow window are independent. Protocol
-version 1 uses a 256 KiB maximum Data frame and a fixed 8 MiB per-call window.
-Eight concurrent body-bearing calls therefore expose 64 MiB of aggregate
-flight, but one call does not yet derive its window from the shared BDP
-estimate. Any future adaptive per-call credit must keep both request and
-response credit receiver-owned; relaxing the v1 checks would let a response
-sender exceed receiver-owned memory policy.
+- 256 KiB maximum request or response head;
+- 8 KiB inline-body allowance;
+- 64 KiB maximum data frame; and
+- 256 KiB receive window.
 
-A receiver advertises the cumulative received offset after at least 1 MiB of
-additional progress or after 2 ms with unreported progress; it does not send
-one credit message per frame.
+These are resident-resource bounds, not total payload limits. Receive credit
+and bounded channels apply backpressure across direct and relayed calls. The
+network layer does not spool application bodies to temporary files.
 
-Queue admission can reserve a completed batch of up to four frames and 1 MiB
-with one exact byte-and-frame reservation. The egress scheduler still writes at
-most one frame from a call lane before rotating to another ready lane.
+Authenticated progress frames distinguish transport health from application
+silence. Dropping an incoming body cancels or drains the same call; it does not
+switch to another protocol. Request and response completion remain bound to the
+peer context and verified body transcript.
 
-### Liveness
+## Retry Boundary
 
-Long-running handlers use a private call-scoped liveness exchange on the same
-control lane. A probe is sent halfway through an otherwise idle health window.
-The local write is not progress; only the peer's matching response refreshes
-that call's transport-health deadline. Independent multiplexed calls therefore
-remain isolated, absolute operation deadlines are preserved, and a blackholed
-carrier is still detected within the configured idle interval.
+Object RPC reports whether an attempt was definitely not sent, completed, or
+possibly applied. Route selection may try another path only before returning a
+stream. A domain may retry a possibly applied operation only when it owns a
+stable operation identity and an idempotency or outcome contract.
 
-### Memory Ownership and Relay Forwarding
+## Implementation Boundaries
 
-Each physical carrier owns a bounded pool of reusable 256 KiB `BytesMut`
-receive slabs. With 64 admitted calls, the active bound is 32.25 MiB: two
-retained slabs per call plus one slab for the physical reader. Released slabs
-have a separate 16 MiB idle-cache bound. An ownership-bearing received `Bytes`
-keeps both its slab and the pool permit alive through clones and zero-copy
-slices, so the slab cannot be reused while a downstream consumer still
-references it. File, reader, and other non-contiguous producers read through
-bounded reusable buffers.
-Contiguous producers retain their data as `Bytes` and emit slices without
-allocating a `Vec` for each frame.
+The compile-adjacent checks in `layer_boundary_tests.rs` enforce the dependency
+direction:
 
-Applications consume incoming attachments through the public asynchronous
-reader adapter. A crate-private relay adapter instead moves received `Bytes`
-directly into the next-hop producer, splitting only with zero-copy slices when
-carrier frame sizes differ. Transport chunk boundaries remain private while
-relays avoid an incoming-read/outgoing-write copy cycle.
+- direct links do not import connectivity, routing, or RPC;
+- connectivity snapshots do not import routing or RPC;
+- routing does not import SOBJ, service methods, or the object-RPC codec; and
+- object RPC does not import connectivity or route planning.
 
-### Slow or Dropped Consumers
-
-Ordered body frames first move through a bounded in-memory reader channel. If
-the application falls behind, the session lazily spills only the remaining
-suffix to a temporary file. A reader that deliberately drops a request body
-switches the session to bounded discard so transport acknowledgements and an
-early response can still complete.
-
-Normal completion and cancellation remove spill files. Crash-orphan collection
-is not transfer resume state and must use process-ownership proof rather than
-deleting files by age.
-
-## Protocol v1
-
-Local persistent channels and cluster TCP tunnels require protocol version 1.
-Both use SOBJ control frames and fixed `SCDF` body-data frames. Negotiation is
-exact: any other version is rejected, and there is no alternate tunnel stream
-dialect or nested SOBJ Data representation.
-
-## Maintaining This Reference
-
-When the current carrier changes, update this page together with the owning
-source, protocol tests, and any benchmark or experiment manifest that depends
-on the old constants. When a carrier is deleted by the separation plan, delete
-its obsolete section here; do not relabel current mechanics as the new
-architecture. A change to the normative contracts requires a separate review of
-the [network architecture](../network-architecture.md).
-
-Performance claims must also follow the developer
+When the data path changes, update this reference with the owning code and its
+conformance tests. Performance claims must follow the developer
 [experimental reproducibility guide](experimental-reproducibility.md).

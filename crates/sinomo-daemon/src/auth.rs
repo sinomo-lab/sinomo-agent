@@ -317,17 +317,28 @@ pub fn authorize_authenticated_daemon_command(
         }
         return Err(DaemonError::AuthDenied);
     }
-    if let Some(surface) = sinomo_core::network::NETWORK_OBJECT_RPC_TOOL_SURFACES
-        .iter()
-        .find(|surface| surface.route == route)
-    {
-        if daemon_signer_authorizes_network_module_route(&authenticated.signer, surface.auth) {
+    if matches!(
+        route,
+        sinomo_core::network::CLUSTER_HEALTH_ROUTE
+            | sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE
+            | sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE
+    ) {
+        if matches!(
+            authenticated.signer,
+            DaemonSignerAuthority::Local
+                | DaemonSignerAuthority::Voter
+                | DaemonSignerAuthority::Member
+        ) {
             return Ok(());
         }
         return Err(DaemonError::AuthDenied);
     }
-    if let Some(policy) = sinomo_core::network::network_modules_rpc_route_policy(route) {
-        if daemon_signer_authorizes_network_module_route(&authenticated.signer, policy.auth) {
+    if matches!(
+        route,
+        crate::service_adapter::NETWORK_MODULES_LIST_ROUTE
+            | crate::service_adapter::NETWORK_MODULES_SET_ENABLED_ROUTE
+    ) {
+        if authenticated.signer.can_run_admin_command() {
             return Ok(());
         }
         return Err(DaemonError::AuthDenied);
@@ -501,24 +512,6 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        route if route == sinomo_core::network::CLUSTER_RELAY_ROUTE => {
-            // A relay envelope is forwarded on behalf of another node by any authenticated
-            // cluster member (e.g. a bridge learner relaying a joiner's challenge toward a
-            // voter). The wrapped inner request carries its own signature/invite-proof and is
-            // authorized independently when it is finally delivered and dispatched locally.
-            matches!(
-                authenticated.signer,
-                DaemonSignerAuthority::Local
-                    | DaemonSignerAuthority::Voter
-                    | DaemonSignerAuthority::Member
-            )
-        }
-        route if route == sinomo_core::network::CLUSTER_TCP_TUNNEL_OPEN_ROUTE => matches!(
-            authenticated.signer,
-            DaemonSignerAuthority::Local
-                | DaemonSignerAuthority::Voter
-                | DaemonSignerAuthority::Member
-        ),
         _ => false,
     };
     if allowed {
@@ -547,25 +540,6 @@ fn daemon_signer_authorizes_cluster_kv_route(
                 DaemonSignerAuthority::Local | DaemonSignerAuthority::Voter
             )
         }
-    }
-}
-
-fn daemon_signer_authorizes_network_module_route(
-    signer: &DaemonSignerAuthority,
-    auth: sinomo_core::network::NetworkModuleRouteAuth,
-) -> bool {
-    match auth {
-        sinomo_core::network::NetworkModuleRouteAuth::LocalCommand => {
-            signer.can_run_local_command()
-        }
-        sinomo_core::network::NetworkModuleRouteAuth::LocalOrClusterMember
-        | sinomo_core::network::NetworkModuleRouteAuth::ClusterMember => matches!(
-            signer,
-            DaemonSignerAuthority::Local
-                | DaemonSignerAuthority::Voter
-                | DaemonSignerAuthority::Member
-        ),
-        sinomo_core::network::NetworkModuleRouteAuth::Admin => signer.can_run_admin_command(),
     }
 }
 
@@ -727,11 +701,6 @@ fn authorize_daemon_signer(
     ) {
         return Ok(authority);
     }
-    if let Some(authority) =
-        authorize_join_relay_signer_from_local_state(paths, request, envelope, &envelope_public_key)
-    {
-        return Ok(authority);
-    }
     Err(DaemonError::AuthDenied)
 }
 
@@ -813,45 +782,6 @@ fn authorize_daemon_signer_after_membership_refresh(
         envelope_public_key,
         require_exact_member_identity,
     )
-}
-
-fn authorize_join_relay_signer_from_local_state(
-    paths: &DaemonPaths,
-    request: &sinomo_core::network::ObjectRpcRequest,
-    envelope: &SignedDaemonCommand,
-    envelope_public_key: &str,
-) -> Option<DaemonSignerAuthority> {
-    if request.route != sinomo_core::network::CLUSTER_RELAY_ROUTE {
-        return None;
-    }
-    let inner_route = sinomo_core::network::relay_request_inner_route(request).ok()?;
-    if !matches!(
-        inner_route.as_str(),
-        route if route == sinomo_core::network::CLUSTER_JOIN_CHALLENGE_ROUTE
-            || route == sinomo_core::network::CLUSTER_JOIN_REGISTER_ROUTE
-    ) {
-        return None;
-    }
-    let data_dir = paths.root.parent()?;
-    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
-    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths).ok()?;
-    if sinomo_core::network::cluster_state_needs_join_registration(&state) {
-        return None;
-    }
-    state
-        .members
-        .iter()
-        .find(|member| {
-            member.state.is_authorized()
-                && member.node_id.to_string() == envelope.node_id
-                && member.node_public_key == envelope_public_key
-        })
-        .or_else(|| {
-            state.members.iter().find(|member| {
-                member.state.is_authorized() && member.node_public_key == envelope_public_key
-            })
-        })
-        .map(signer_authority_for_member)
 }
 
 fn load_uncached_daemon_auth_verifier_context(
@@ -1606,10 +1536,11 @@ mod tests {
 
     #[test]
     fn network_object_rpc_routes_authorize_cluster_members_for_inspection() {
-        for route in sinomo_core::network::NETWORK_OBJECT_RPC_TOOL_SURFACES
-            .iter()
-            .map(|surface| surface.route)
-        {
+        for route in [
+            sinomo_core::network::CLUSTER_HEALTH_ROUTE,
+            sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
+            sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE,
+        ] {
             for signer in [
                 DaemonSignerAuthority::Local,
                 DaemonSignerAuthority::Voter,
@@ -1675,8 +1606,8 @@ mod tests {
     #[test]
     fn network_module_control_routes_authorize_admin_signers() {
         for route in [
-            sinomo_core::network::NETWORK_MODULES_LIST_ROUTE,
-            sinomo_core::network::NETWORK_MODULES_SET_ENABLED_ROUTE,
+            crate::service_adapter::NETWORK_MODULES_LIST_ROUTE,
+            crate::service_adapter::NETWORK_MODULES_SET_ENABLED_ROUTE,
         ] {
             for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {
                 let authenticated = authenticated_command(route.to_string(), signer);
@@ -1860,99 +1791,6 @@ mod tests {
             ),
             Err(DaemonError::AuthDenied)
         ));
-    }
-
-    #[test]
-    fn join_relay_local_state_fallback_authorizes_join_challenge_bridge_member() {
-        let data_root = unique_auth_test_root("sinomo-daemon-auth-join-challenge-relay");
-        let data_dir = SinomoDataDir::new(&data_root);
-        let daemon_paths = DaemonPaths::with_root(data_root.join("daemon"));
-        let local_identity = load_or_create_main_node_identity(&data_root).expect("local identity");
-        let peer_root = unique_auth_test_root("sinomo-daemon-auth-join-challenge-relay-peer");
-        let peer_identity = load_or_create_main_node_identity(&peer_root).expect("peer identity");
-        let peer_public_key =
-            daemon_auth_decode_public_key(&peer_identity.public_key).expect("peer public key");
-        let cluster_id =
-            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_auth_join_relay")
-                .expect("cluster id");
-        let local_node = sinomo_core::Id::from_legacy_named("node_daemon_auth_join_relay_local")
-            .expect("local node");
-        let peer_node = sinomo_core::Id::from_legacy_named("node_daemon_auth_join_relay_peer")
-            .expect("peer node");
-        let now = OffsetDateTime::now_utc();
-        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "auth-join-relay",
-            local_node.clone(),
-            "local",
-            local_identity.public_key,
-            now,
-        );
-        let mut peer = ClusterMemberRecord::pending_learner(
-            cluster_id.clone(),
-            peer_node.clone(),
-            "peer",
-            peer_identity.public_key.clone(),
-            now,
-        );
-        peer.state = ClusterMemberState::Learner;
-        state.members.push(peer);
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
-            .expect("write accepted state");
-
-        let inner = sinomo_core::network::ObjectRpcRequest::encode_body(
-            sinomo_core::network::CLUSTER_JOIN_CHALLENGE_ROUTE,
-            sinomo_core::network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
-            &(),
-        )
-        .expect("join challenge request");
-        #[derive(serde::Serialize)]
-        struct TestRelayEnvelope {
-            cluster_id: sinomo_core::node::ClusterId,
-            target_node_id: sinomo_core::node::NodeId,
-            ttl: u8,
-            visited: Vec<sinomo_core::node::NodeId>,
-            planned_path: Vec<sinomo_core::node::NodeId>,
-            target_endpoints: Vec<sinomo_core::ClusterEndpointRecord>,
-            max_hop_timeout_ms: Option<u64>,
-            inner: sinomo_core::network::ObjectRpcRequest,
-        }
-
-        let request = sinomo_core::network::ObjectRpcRequest::encode_body(
-            sinomo_core::network::CLUSTER_RELAY_ROUTE,
-            sinomo_core::network::CLUSTER_ROUTING_RPC_CATEGORY,
-            &TestRelayEnvelope {
-                cluster_id,
-                target_node_id: local_node,
-                ttl: 8,
-                visited: Vec::new(),
-                planned_path: Vec::new(),
-                target_endpoints: Vec::new(),
-                max_hop_timeout_ms: None,
-                inner,
-            },
-        )
-        .expect("relay request");
-        let envelope = SignedDaemonCommand {
-            protocol: DAEMON_AUTH_PROTOCOL.to_string(),
-            node_id: peer_node.to_string(),
-            public_key: peer_public_key,
-            timestamp: now.format(&Rfc3339).expect("timestamp"),
-            nonce: "join-challenge-relay".to_string(),
-            rpc_body_sha256: None,
-            signature: Vec::new(),
-        };
-
-        assert_eq!(
-            authorize_join_relay_signer_from_local_state(
-                &daemon_paths,
-                &request,
-                &envelope,
-                &peer_identity.public_key,
-            ),
-            Some(DaemonSignerAuthority::Member)
-        );
     }
 
     #[test]

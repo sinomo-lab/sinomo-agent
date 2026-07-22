@@ -545,13 +545,13 @@ mod tests {
         let event = NetworkTimelineEvent {
             trace_id: [0xab; 16],
             span_id: [0xcd; 8],
-            stage: sinomo_core::network::network_timeline_stage::TX_QUEUE_WAIT,
+            stage: sinomo_core::network::network_timeline_stage::ENDPOINT_OPEN,
             ..NetworkTimelineEvent::default()
         };
         let record = event_record(event);
         assert_eq!(record.trace_id, "abababababababababababababababab");
         assert_eq!(record.span_id, "cdcdcdcdcdcdcdcd");
-        assert_eq!(record.stage_name, "channel.tx-queue-wait");
+        assert_eq!(record.stage_name, "route.endpoint-open");
     }
 
     #[test]

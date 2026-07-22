@@ -303,9 +303,8 @@ or gate it with
 ## Automated routing scenario
 
 `docker/test-routing-scenario.sh` runs the three-node segmented/forwarded-endpoint
-gate, including endpoint-error fallback, stalled persistent-tunnel fallback,
-stale direct-endpoint demotion, routed payload throughput, cross-segment DFS,
-one-node outage, and restart recovery:
+gate, including endpoint-error handling, stale direct-endpoint demotion, routed
+payload throughput, cross-segment DFS, one-node outage, and restart recovery:
 
 ```bash
 docker/test-routing-scenario.sh

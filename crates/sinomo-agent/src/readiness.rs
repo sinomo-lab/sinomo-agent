@@ -43,8 +43,8 @@ use sinomo_lm::{
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{
-    ObjectRpcCancelRequest, ObjectRpcIncomingBody, ObjectRpcRequest, ObjectRpcResponse,
-    ObjectRpcSessionCall, ObjectRpcSessionResponse, ObjectRpcSessionResult,
+    ObjectRpcCall, ObjectRpcCancelRequest, ObjectRpcIncomingBody, ObjectRpcOutgoingResponse,
+    ObjectRpcRequest, ObjectRpcResponse, ObjectRpcResult,
 };
 use sinomo_runtime::node::{LocalNodePermission, NodeId};
 use sinomo_runtime::service::{
@@ -3325,7 +3325,7 @@ struct ReadinessRemoteObjectRpcTransport {
 }
 
 impl AgentRemoteObjectRpcTransport for ReadinessRemoteObjectRpcTransport {
-    fn call<'a>(&'a self, call: ObjectRpcSessionCall) -> AgentRemoteObjectRpcFuture<'a> {
+    fn call<'a>(&'a self, call: ObjectRpcCall) -> AgentRemoteObjectRpcFuture<'a> {
         Box::pin(async move {
             if !call.body.is_empty() {
                 return Err("readiness transport received an unexpected attachment".to_string());
@@ -3367,7 +3367,7 @@ impl AgentRemoteObjectRpcTransport for ReadinessRemoteObjectRpcTransport {
                 }
                 other => return Err(format!("unexpected route {other}")),
             };
-            Ok(ObjectRpcSessionResult::value(response))
+            Ok(ObjectRpcResult::value(response))
         })
     }
 }
@@ -5434,7 +5434,7 @@ impl ReadinessResponseSink {
 }
 
 impl ResponseSink for ReadinessResponseSink {
-    fn send(self: Box<Self>, response: ObjectRpcSessionResponse) -> Result<(), ServiceError> {
+    fn send(self: Box<Self>, response: ObjectRpcOutgoingResponse) -> Result<(), ServiceError> {
         if !response.body.is_empty() {
             return Err(ServiceError::Service(
                 "agent readiness sink received an unexpected response body".to_string(),
@@ -5468,7 +5468,7 @@ where
     );
     let request = ObjectRpcRequest::encode_body(route, AGENT_RPC_CATEGORY, body)
         .map_err(|error| error.to_string())?;
-    block_on_readiness_future(registry.dispatch_direct(ctx, request))
+    block_on_readiness_future(registry.dispatch(ctx, request))
         .map_err(|error| error.to_string())?;
     let frames = sink.frames();
     if frames.len() != 1 {

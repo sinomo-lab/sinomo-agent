@@ -11,7 +11,7 @@ use sinomo_core::local::SinomoDataDir;
 #[cfg(test)]
 use sinomo_core::network::ObjectRpcResponse;
 use sinomo_core::network::{
-    ClusterPaths, NetworkError, ObjectRpcRequest, ObjectRpcSessionCall, ObjectRpcSessionResult,
+    ClusterPaths, NetworkError, ObjectRpcCall, ObjectRpcRequest, ObjectRpcResult,
 };
 use sinomo_core::node::NodeId;
 use std::path::PathBuf;
@@ -344,9 +344,9 @@ mod tests {
         fn call_object_rpc(
             &self,
             target_node_id: &NodeId,
-            call: ObjectRpcSessionCall,
+            call: ObjectRpcCall,
             _options: DfsObjectRpcSendOptions,
-        ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+        ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
             self.targets
                 .lock()
                 .expect("targets")
@@ -385,7 +385,7 @@ mod tests {
                 },
             )
             .expect("txn response payload");
-            Ok(ObjectRpcSessionResult::value(
+            Ok(ObjectRpcResult::value(
                 ObjectRpcResponse::from_encoded_body(payload.route, payload.body),
             ))
         }
@@ -800,7 +800,7 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
             .peer_transport
             .call_object_rpc(
                 &state.local_node_id,
-                ObjectRpcSessionCall::value(request),
+                ObjectRpcCall::value(request),
                 DfsObjectRpcSendOptions::default(),
             )
             .map_err(|source| mounted_sifs_kv_io_error(&self.cluster_paths, source))?;
@@ -876,20 +876,17 @@ impl MountedSifsPeerTransport {
     async fn call_object_rpc_async_inner(
         &self,
         target_node_id: &NodeId,
-        call: ObjectRpcSessionCall,
+        call: ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
         runtime: &tokio::runtime::Handle,
-    ) -> Result<ObjectRpcSessionResult, NetworkError> {
+    ) -> Result<ObjectRpcResult, NetworkError> {
         let state = sinomo_core::cluster::read_cluster_state(&self.cluster_paths)?;
         let mut host = MountedSifsObjectRpcHost {
             data_dir: self.data_dir.clone(),
             runtime: runtime.clone(),
         };
-        let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(
-            &mut host,
-            runtime,
-            &self.cluster_paths,
-        );
+        let mut client =
+            sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &self.cluster_paths);
         let result = client
             .call_target(&state, target_node_id, call, options.cluster_rpc_options())
             .await?;
@@ -902,9 +899,9 @@ impl DfsPeerTransport for MountedSifsPeerTransport {
     fn call_object_rpc(
         &self,
         target_node_id: &NodeId,
-        call: ObjectRpcSessionCall,
+        call: ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
-    ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+    ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             return if matches!(
                 handle.runtime_flavor(),
@@ -945,9 +942,9 @@ impl AsyncDfsPeerTransport for MountedSifsPeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
         target_node_id: &'a NodeId,
-        call: ObjectRpcSessionCall,
+        call: ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
-    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcSessionResult, DfsPeerTransportError>> {
+    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>> {
         Box::pin(async move {
             let runtime = tokio::runtime::Handle::try_current()
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;

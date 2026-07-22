@@ -121,9 +121,9 @@ claim one kernel syscall. Variable record lengths, allocation failure,
 concurrent appenders, filesystem ordering, and concrete Rust byte-conformance
 tests remain refinement obligations.
 
-Revised 2026-07-16: the namespace-transaction session-transport slice proves
+Revised 2026-07-16: the namespace-transaction body-transport slice proves
 that one same-shard transaction travels through the single authenticated
-object-RPC session contract with a semantic attachment, independent of its
+object-RPC call contract with a semantic attachment, independent of its
 encoded byte count. The model contains no control-head limit, size threshold,
 inline fallback, compatibility route, or alternate RPC API. A complete valid
 attachment reconstructs the exact transaction identity and file/file/parent

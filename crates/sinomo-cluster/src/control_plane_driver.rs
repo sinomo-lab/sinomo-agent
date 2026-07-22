@@ -185,12 +185,8 @@ fn cluster_kv_object_rpc_request(payload: ClusterKvRpcPayload) -> ObjectRpcReque
 }
 
 fn cluster_raft_append_object_rpc_request(payload: ClusterKvRpcPayload) -> ObjectRpcRequest {
-    // AppendEntries is idempotent for an identical Raft request. Preserve the
-    // 30s control-plane budget for snapshot and catch-up responses while the
-    // transport still enforces shorter connect and no-progress timeouts.
-    cluster_kv_object_rpc_request(payload)
-        .with_response_retry_safe()
-        .with_full_response_budget()
+    // AppendEntries is idempotent for an identical Raft request.
+    cluster_kv_object_rpc_request(payload).with_response_retry_safe()
 }
 
 fn cluster_raft_vote_object_rpc_request(payload: ClusterKvRpcPayload) -> ObjectRpcRequest {
@@ -266,17 +262,14 @@ mod tests {
     }
 
     #[test]
-    fn raft_requests_have_operation_specific_retry_and_budget_markers() {
+    fn raft_requests_have_operation_specific_retry_markers() {
         let append =
             cluster_raft_append_object_rpc_request(test_payload("/test/cluster/raft/append"));
         let vote = cluster_raft_vote_object_rpc_request(test_payload("/test/cluster/raft/vote"));
         let general = cluster_kv_object_rpc_request(test_payload("/test/cluster/kv"));
 
         assert!(append.is_response_retry_safe());
-        assert!(append.uses_full_response_budget());
         assert!(vote.is_response_retry_safe());
-        assert!(!vote.uses_full_response_budget());
         assert!(!general.is_response_retry_safe());
-        assert!(!general.uses_full_response_budget());
     }
 }

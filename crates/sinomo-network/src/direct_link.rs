@@ -405,7 +405,7 @@ pub struct AuthenticatedDirectStream {
     pub stream_id: Id,
     /// Transport exporter shared by both ends of the authenticated link.
     ///
-    /// Routing uses this to identify the authenticated adjacent carrier.
+    /// Routing uses this to identify the authenticated adjacent link.
     /// End-to-end routed-session key agreement and bindings remain independent
     /// so intermediate links cannot derive endpoint stream keys.
     pub link_channel_binding: [u8; 32],

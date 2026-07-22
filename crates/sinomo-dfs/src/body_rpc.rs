@@ -2,7 +2,7 @@
 //!
 //! DFS uses an attachment only when the domain operation provides a semantic
 //! attachment source, such as a reader-backed object transfer. Ordinary DFS values,
-//! regardless of encoded size, stay on the canonical object-RPC value path.
+//! regardless of encoded size, stay on the stream-native object-RPC value path.
 
 use crate::{
     DfsMessageCommand, DfsMessageResponse, DfsNamespaceOperation, DfsNamespaceTransaction,

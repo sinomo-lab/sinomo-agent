@@ -82,12 +82,10 @@ pub mod r1 {
 
     pub mod modules {
         pub use sinomo_daemon::registry::{
-            InternalModuleTable, MODULE_REGISTRY_SNAPSHOT_VERSION_OBSERVABILITY_KEY,
-            ModuleRegistration, ModuleRegistry, ModuleRegistryError, ModuleRegistrySnapshot,
-            ModuleRegistrySnapshotStore, NativeRustModuleBinding,
-            install_module_registry_snapshot_routes, internal_module_registry,
-            internal_module_table, internal_native_rust_module_bindings,
-            module_object_rpc_route_descriptor_to_network,
+            InternalModuleTable, ModuleRegistration, ModuleRegistry, ModuleRegistryError,
+            ModuleRegistrySnapshot, ModuleRegistrySnapshotStore, NativeRustModuleBinding,
+            internal_module_registry, internal_module_table, internal_native_rust_module_bindings,
+            module_object_rpc_route_descriptor_to_service,
             module_registration_object_rpc_route_descriptors,
             module_registry_object_rpc_route_descriptors,
             module_registry_snapshot_object_rpc_route_descriptors,
@@ -111,8 +109,7 @@ pub use r1::{
 #[cfg(test)]
 mod tests {
     use super::modules::{
-        MODULE_REGISTRY_SNAPSHOT_VERSION_OBSERVABILITY_KEY,
-        install_module_registry_snapshot_routes, internal_module_registry, internal_module_table,
+        internal_module_registry, internal_module_table,
         module_registry_object_rpc_route_descriptors, native_rust_binding_for_registration,
     };
     use super::storage::{StorageCoverage, StoragePathOwner, sinomo_data_dir_layout};
@@ -324,10 +321,7 @@ mod tests {
             registration.surfaces.storage_owners,
             vec![network::SINOMO_NETWORK_MODULE_OWNER.to_string()]
         );
-        assert_eq!(
-            registration.surfaces.object_rpc_routes.len(),
-            network::NETWORK_OBJECT_RPC_ROUTES.len()
-        );
+        assert_eq!(registration.surfaces.object_rpc_routes.len(), 3);
         assert!(
             registration
                 .surfaces
@@ -497,186 +491,6 @@ mod tests {
                     .iter()
                     .any(|capability| capability == "rollout.build.apply")
         }));
-
-        let mut builder = network::ObjectRpcRouteRegistry::builder();
-        for descriptor in descriptors {
-            builder = builder
-                .try_register_route(descriptor, |request| async move {
-                    network::ObjectRpcResponse::encode_body(request.request.route, &())
-                        .map(network::ObjectRpcSessionResponse::value)
-                })
-                .expect("register module descriptor in network registry");
-        }
-        let snapshot = builder
-            .try_build()
-            .expect("module descriptors should validate as a network route snapshot");
-        assert!(snapshot.version() >= 1);
-        assert!(
-            snapshot
-                .catalog()
-                .routes
-                .contains_key(network::CLUSTER_HEALTH_ROUTE)
-        );
-        assert!(
-            snapshot
-                .catalog()
-                .routes
-                .contains_key(rollout::ROLLOUT_BUILD_ROUTE)
-        );
-    }
-
-    #[test]
-    fn runtime_installs_module_snapshot_routes_into_network_router_snapshot() {
-        let module_id =
-            module::ModuleId::from_legacy_named("module.runtime.snapshot").expect("module");
-        let route = "/module/runtime/snapshot";
-        let registration = module::ModuleRegistration::native_rust(
-            module_id.clone(),
-            "0.1.0",
-            "runtime-snapshot-module",
-            "runtime-snapshot-module",
-            "runtime-snapshot-module-v1",
-            core::TrustRing::R1TrustedRuntime,
-            "runtime-snapshot-module",
-        )
-        .with_surfaces(
-            module::ModuleSurfaces::default()
-                .with_object_rpc_route(module::ModuleObjectRpcRoute::new(
-                    route,
-                    "runtime-snapshot",
-                    "runtime.snapshot.read",
-                    module::ModuleRouteAuth::LocalOrClusterMember,
-                ))
-                .with_capability_export(
-                    core::CapabilityName::new("runtime.snapshot.read").expect("capability"),
-                ),
-        );
-        let registry = module::ModuleRegistry::builder()
-            .register(registration)
-            .expect("register")
-            .try_build()
-            .expect("registry");
-        let store = module::ModuleRegistrySnapshotStore::new(registry).expect("snapshot store");
-        let module_snapshot = store.active_snapshot().expect("module snapshot");
-        let router = network::ObjectRpcRouter::new();
-        let old_network_snapshot = router.route_registry_snapshot();
-
-        let installed = install_module_registry_snapshot_routes(
-            &router,
-            &module_snapshot,
-            |request| async move { network::ObjectRpcResponse::encode_body(request.route, &()) },
-        )
-        .expect("install module routes");
-
-        assert!(installed.version() > old_network_snapshot.version());
-        assert!(!old_network_snapshot.catalog().routes.contains_key(route));
-        let active = router.route_registry_snapshot();
-        let descriptor = active
-            .catalog()
-            .routes
-            .get(route)
-            .expect("installed module route");
-        assert_eq!(descriptor.category, "runtime-snapshot");
-        let expected_snapshot_version = module_snapshot.version().to_string();
-        assert_eq!(
-            descriptor
-                .observability
-                .get("module.registry.snapshot_version")
-                .map(String::as_str),
-            Some(expected_snapshot_version.as_str())
-        );
-        assert!(
-            descriptor
-                .required_capabilities
-                .contains(&"runtime.snapshot.read".to_string())
-        );
-    }
-
-    #[test]
-    fn runtime_module_snapshot_route_install_replaces_previous_module_routes() {
-        fn registration(
-            module_name: &str,
-            route: &str,
-            capability: &str,
-        ) -> module::ModuleRegistration {
-            let module_id = module::ModuleId::from_legacy_named(module_name).expect("module");
-            module::ModuleRegistration::native_rust(
-                module_id,
-                "0.1.0",
-                module_name,
-                module_name,
-                "runtime-snapshot-module-v1",
-                core::TrustRing::R1TrustedRuntime,
-                module_name,
-            )
-            .with_surfaces(
-                module::ModuleSurfaces::default()
-                    .with_object_rpc_route(module::ModuleObjectRpcRoute::new(
-                        route,
-                        "runtime-snapshot",
-                        capability,
-                        module::ModuleRouteAuth::LocalOrClusterMember,
-                    ))
-                    .with_capability_export(
-                        core::CapabilityName::new(capability).expect("capability"),
-                    ),
-            )
-        }
-
-        let first_route = "/module/runtime/snapshot/first";
-        let second_route = "/module/runtime/snapshot/second";
-        let first_registry = module::ModuleRegistry::builder()
-            .register(registration(
-                "module.runtime.snapshot.first",
-                first_route,
-                "runtime.snapshot.first.read",
-            ))
-            .expect("register first")
-            .try_build()
-            .expect("first registry");
-        let store =
-            module::ModuleRegistrySnapshotStore::new(first_registry).expect("snapshot store");
-        let router = network::ObjectRpcRouter::new();
-        let first_snapshot = store.active_snapshot().expect("first snapshot");
-
-        install_module_registry_snapshot_routes(&router, &first_snapshot, |request| async move {
-            network::ObjectRpcResponse::encode_body(request.route.clone(), &request.route)
-        })
-        .expect("install first snapshot");
-        assert!(router.catalog().routes.contains_key(first_route));
-
-        let second_registry = module::ModuleRegistry::builder()
-            .register(registration(
-                "module.runtime.snapshot.second",
-                second_route,
-                "runtime.snapshot.second.read",
-            ))
-            .expect("register second")
-            .try_build()
-            .expect("second registry");
-        let second_snapshot = store
-            .replace_registry(second_registry)
-            .expect("replace module registry");
-        install_module_registry_snapshot_routes(&router, &second_snapshot, |request| async move {
-            network::ObjectRpcResponse::encode_body(request.route.clone(), &request.route)
-        })
-        .expect("install second snapshot");
-
-        let active = router.route_registry_snapshot();
-        assert!(!active.catalog().routes.contains_key(first_route));
-        let second_descriptor = active
-            .catalog()
-            .routes
-            .get(second_route)
-            .expect("second route installed");
-        let expected_snapshot_version = second_snapshot.version().to_string();
-        assert_eq!(
-            second_descriptor
-                .observability
-                .get(MODULE_REGISTRY_SNAPSHOT_VERSION_OBSERVABILITY_KEY)
-                .map(String::as_str),
-            Some(expected_snapshot_version.as_str())
-        );
     }
 
     #[test]

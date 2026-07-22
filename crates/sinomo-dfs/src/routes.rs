@@ -396,36 +396,6 @@ pub fn dfs_message_is_read_only_request(command: &DfsMessageCommand) -> bool {
     dfs_network_message_is_read_only_request(&command.routed_message.message)
 }
 
-fn dfs_network_message_uses_full_response_budget(message: &DfsNetworkMessage) -> bool {
-    matches!(
-        message,
-        DfsNetworkMessage::ReadRequest(_)
-            | DfsNetworkMessage::ReadResponse(_)
-            | DfsNetworkMessage::BulkReadRequest(_)
-            | DfsNetworkMessage::BulkReadResponse(_)
-            | DfsNetworkMessage::WriteRequest(_)
-            | DfsNetworkMessage::WriteResponse(_)
-            | DfsNetworkMessage::DistributedWriteRequest(_)
-            | DfsNetworkMessage::ExclusiveCreateRequest(_)
-            | DfsNetworkMessage::DistributedWriteResponse(_)
-            | DfsNetworkMessage::NamespaceRequest(_)
-            | DfsNetworkMessage::NamespaceResponse(_)
-            | DfsNetworkMessage::StageBlob(_)
-            | DfsNetworkMessage::StagePatch(_)
-            | DfsNetworkMessage::StageBlobResponse(_)
-            | DfsNetworkMessage::CommitVersion(_)
-            | DfsNetworkMessage::CommitVersionResponse(_)
-            | DfsNetworkMessage::RepairReplica(_)
-            | DfsNetworkMessage::RepairReplicaResponse(_)
-            | DfsNetworkMessage::FetchBlob(_)
-            | DfsNetworkMessage::FetchBlobResponse(_)
-            | DfsNetworkMessage::MetadataJournalBatch(_)
-            | DfsNetworkMessage::MetadataJournalBatchResponse(_)
-            | DfsNetworkMessage::MetadataSnapshotInstall(_)
-            | DfsNetworkMessage::MetadataSnapshotInstallResponse(_)
-    )
-}
-
 fn dfs_network_message_response_retry_safe(message: &DfsNetworkMessage) -> bool {
     matches!(
         message,
@@ -434,10 +404,6 @@ fn dfs_network_message_response_retry_safe(message: &DfsNetworkMessage) -> bool 
             | DfsNetworkMessage::CommitVersion(_)
             | DfsNetworkMessage::RepairReplica(_)
     )
-}
-
-pub fn dfs_message_uses_full_response_budget(command: &DfsMessageCommand) -> bool {
-    dfs_network_message_uses_full_response_budget(&command.routed_message.message)
 }
 
 fn dfs_network_message_requires_full_metadata_hydrate(message: &DfsNetworkMessage) -> bool {
@@ -507,10 +473,7 @@ pub fn decode_dfs_smoke_rpc_response(
 pub fn dfs_metadata_journal_batch_rpc_request(
     command: &DfsMetadataJournalBatchCommand,
 ) -> Result<ObjectRpcRequest, NetworkError> {
-    Ok(
-        ObjectRpcRequest::encode_body(DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_RPC_CATEGORY, command)?
-            .with_full_response_budget(),
-    )
+    ObjectRpcRequest::encode_body(DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_RPC_CATEGORY, command)
 }
 
 pub fn decode_dfs_metadata_journal_batch_rpc_response(
@@ -522,12 +485,11 @@ pub fn decode_dfs_metadata_journal_batch_rpc_response(
 pub fn dfs_metadata_snapshot_install_rpc_request(
     command: &DfsMetadataSnapshotInstallCommand,
 ) -> Result<ObjectRpcRequest, NetworkError> {
-    Ok(ObjectRpcRequest::encode_body(
+    ObjectRpcRequest::encode_body(
         DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
         DFS_RPC_CATEGORY,
         command,
-    )?
-    .with_full_response_budget())
+    )
 }
 
 pub fn decode_dfs_metadata_snapshot_install_rpc_response(
@@ -547,9 +509,6 @@ pub fn dfs_message_rpc_request(
 ) -> Result<ObjectRpcRequest, NetworkError> {
     let mut request =
         ObjectRpcRequest::encode_body(dfs_message_route(command), DFS_RPC_CATEGORY, command)?;
-    if dfs_message_uses_full_response_budget(command) {
-        request = request.with_full_response_budget();
-    }
     if dfs_network_message_response_retry_safe(&command.routed_message.message) {
         // Ordinary distributed writes carry a stable request identity and their outcome
         // is durably reconciled at the metadata primary. Their completed

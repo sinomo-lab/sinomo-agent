@@ -2212,12 +2212,10 @@ impl sinomo_runtime::dfs::DfsPeerTransport for CliDfsPeerTransport {
     fn call_object_rpc(
         &self,
         target_node_id: &sinomo_runtime::node::NodeId,
-        call: sinomo_runtime::network::ObjectRpcSessionCall,
+        call: sinomo_runtime::network::ObjectRpcCall,
         options: sinomo_runtime::dfs::DfsObjectRpcSendOptions,
-    ) -> Result<
-        sinomo_runtime::network::ObjectRpcSessionResult,
-        sinomo_runtime::dfs::DfsPeerTransportError,
-    > {
+    ) -> Result<sinomo_runtime::network::ObjectRpcResult, sinomo_runtime::dfs::DfsPeerTransportError>
+    {
         daemon_dfs_object_rpc_to_target(target_node_id, call, options)
             .map_err(|error| sinomo_runtime::dfs::DfsPeerTransportError::new(error.to_string()))
     }
@@ -2225,15 +2223,15 @@ impl sinomo_runtime::dfs::DfsPeerTransport for CliDfsPeerTransport {
 
 fn daemon_dfs_object_rpc_to_target(
     target_node_id: &sinomo_runtime::node::NodeId,
-    call: sinomo_runtime::network::ObjectRpcSessionCall,
+    call: sinomo_runtime::network::ObjectRpcCall,
     options: sinomo_runtime::dfs::DfsObjectRpcSendOptions,
-) -> Result<sinomo_runtime::network::ObjectRpcSessionResult, CliError> {
+) -> Result<sinomo_runtime::network::ObjectRpcResult, CliError> {
     let status = default_main_daemon_status()?.ok_or_else(|| CliError::Network {
         address: target_node_id.to_string(),
         detail: "DFS cluster object RPC requires the local daemon to be running".to_string(),
     })?;
     let client = DaemonApiClient::at_address(status.address);
-    let send = client.object_rpc_session_to_target_with_deadline_async(
+    let send = client.object_rpc_call_to_target_with_deadline_async(
         target_node_id,
         call,
         options.connect_timeout,
@@ -2776,7 +2774,7 @@ fn fetch_dfs_status_from_node_blocking(
     }
     let response = daemon_dfs_object_rpc_to_target(
         node_id,
-        sinomo_runtime::network::ObjectRpcSessionCall::value(rpc_request),
+        sinomo_runtime::network::ObjectRpcCall::value(rpc_request),
         sinomo_runtime::dfs::DfsObjectRpcSendOptions::default().with_overall_timeout(timeout),
     );
     if trace {

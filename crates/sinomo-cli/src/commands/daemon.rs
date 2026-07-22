@@ -675,10 +675,8 @@ impl CliClusterControlPlaneTransport {
     }
 
     /// Delegate node-routed calls to the daemon that owns this cluster state.
-    /// Synthetic `tcp-tunnel://` endpoints are daemon-local route evidence and
-    /// cannot be dialed by a standalone CLI transport. `None` means daemon
-    /// discovery failed before the request was sent, so the caller may retain
-    /// the direct routed fallback used by daemon-down/bootstrap workflows.
+    /// `None` means daemon discovery failed before the request was sent, so
+    /// bootstrap workflows may use their direct endpoint path.
     fn call_node_object_rpc_via_matching_daemon(
         &self,
         target_node_id: &NodeId,
@@ -725,15 +723,11 @@ impl CliClusterControlPlaneTransport {
             host = host.with_data_dir(data_dir);
         }
         let options = network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout);
-        let mut client = network::ClusterObjectRpcClient::routed(
-            &mut host,
-            runtime.handle(),
-            &self.cluster_paths,
-        );
+        let mut client = network::ClusterObjectRpcClient::routed(&mut host, &self.cluster_paths);
         let result = runtime.block_on(client.call_target(
             state,
             target_node_id,
-            network::ObjectRpcSessionCall::value(request.clone()),
+            network::ObjectRpcCall::value(request.clone()),
             options,
         ));
         runtime.shutdown_timeout(Duration::from_millis(250));
@@ -816,15 +810,11 @@ impl cluster::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
             host = host.with_data_dir(data_dir);
         }
         let options = network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout);
-        let mut client = network::ClusterObjectRpcClient::routed(
-            &mut host,
-            runtime.handle(),
-            &self.cluster_paths,
-        );
+        let mut client = network::ClusterObjectRpcClient::routed(&mut host, &self.cluster_paths);
         let result = runtime.block_on(client.call_endpoint(
             &state,
             endpoint,
-            network::ObjectRpcSessionCall::value(request.clone()),
+            network::ObjectRpcCall::value(request.clone()),
             options,
         ));
         runtime.shutdown_timeout(Duration::from_millis(250));

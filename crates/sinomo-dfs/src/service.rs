@@ -664,13 +664,13 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct VecSink {
-        frames: Arc<Mutex<Vec<sinomo_core::network::ObjectRpcSessionResponse>>>,
+        frames: Arc<Mutex<Vec<sinomo_core::network::ObjectRpcOutgoingResponse>>>,
     }
 
     impl ResponseSink for VecSink {
         fn send(
             self: Box<Self>,
-            response: sinomo_core::network::ObjectRpcSessionResponse,
+            response: sinomo_core::network::ObjectRpcOutgoingResponse,
         ) -> Result<(), ServiceError> {
             self.frames.lock().expect("sink lock").push(response);
             Ok(())
@@ -789,7 +789,7 @@ mod tests {
         registry: &ServiceRegistry,
         data_dir: Arc<SinomoDataDir>,
         request: ObjectRpcRequest,
-    ) -> sinomo_core::network::ObjectRpcSessionResponse {
+    ) -> sinomo_core::network::ObjectRpcOutgoingResponse {
         let sink = VecSink::default();
         let frames = Arc::clone(&sink.frames);
         let ctx = ServiceContext::new(
@@ -800,7 +800,7 @@ mod tests {
             Box::new(sink),
         );
         registry
-            .dispatch_direct(ctx, request)
+            .dispatch(ctx, request)
             .await
             .expect("body dispatch");
         frames.lock().expect("frames").pop().expect("response")

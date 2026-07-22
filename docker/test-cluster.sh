@@ -308,11 +308,6 @@ RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 ARTIFACTS="${SINOMO_TEST_ARTIFACTS:-$SINOMO_ROOT/target/cluster-test-artifacts/$RUN_ID}"
 BINARY="${SINOMO_TEST_BINARY:-$SINOMO_ROOT/target/debug/sinomo}"
 export SINOMO_DOCKER_BINARY="${SINOMO_DOCKER_BINARY:-$BINARY}"
-# A latency acceptance run is not valid while per-packet trace logging is on.
-# Force fresh containers off and separately reject reused containers whose
-# immutable environment still has tracing enabled.
-NETWORK_PERF_TRACE_REQUESTED="${SINOMO_NETWORK_PERF_TRACE:-0}"
-export SINOMO_NETWORK_PERF_TRACE=0
 COMPOSE_FILES=(-f "$COMPOSE_FILE")
 if [ -n "$COMPOSE_OVERRIDE_FILE" ]; then
   COMPOSE_FILES+=(-f "$COMPOSE_OVERRIDE_FILE")
@@ -447,21 +442,6 @@ container_config_env_value() {
   [ -n "$container" ] || return 1
   docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
     | awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }'
-}
-
-verify_network_perf_trace_disabled() {
-  local node value rc=0
-  if [ "$NETWORK_PERF_TRACE_REQUESTED" != 0 ]; then
-    log "network-realtime gate: forcing SINOMO_NETWORK_PERF_TRACE=0 (requested $NETWORK_PERF_TRACE_REQUESTED)"
-  fi
-  for node in $NODES; do
-    value="$(container_config_env_value "$node" SINOMO_NETWORK_PERF_TRACE)" || value=""
-    if [ "$value" != 0 ]; then
-      log "network-realtime gate: $node has SINOMO_NETWORK_PERF_TRACE=${value:-<unset>}; recreate it with tracing disabled"
-      rc=1
-    fi
-  done
-  return $rc
 }
 
 container_network_set() {
@@ -3150,11 +3130,6 @@ if [ "${SINOMO_TEST_REUSE:-0}" != 1 ]; then
   fi
 else
   PROJECT_OWNED=1
-fi
-
-if ! verify_network_perf_trace_disabled; then
-  FAILED_SCENARIOS="network-trace-disabled"
-  exit 1
 fi
 
 if ! wait_for_cluster_ready "formation"; then

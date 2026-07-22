@@ -1235,62 +1235,6 @@ pub(crate) fn remember_cluster_endpoint_command_auth_denied(
     publish_command_connectivity_if_needed(paths, state, &record, runtime);
 }
 
-pub(crate) fn remember_cluster_tunnel_connectivity(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    endpoint: &ClusterEndpointRecord,
-    connectivity_state: sinomo_core::network::ClusterConnectivityState,
-    runtime: Option<&tokio::runtime::Handle>,
-) {
-    let now = OffsetDateTime::now_utc();
-    let timestamp = now
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "unknown".to_string());
-    let (latency_ms, consecutive_failures, last_success_at, last_failure_at, ttl_seconds) =
-        match &connectivity_state {
-            sinomo_core::network::ClusterConnectivityState::Healthy => (
-                Some(0),
-                0,
-                Some(timestamp.clone()),
-                None,
-                sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
-            ),
-            sinomo_core::network::ClusterConnectivityState::Degraded => (
-                None,
-                1,
-                None,
-                Some(timestamp.clone()),
-                sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
-            ),
-            sinomo_core::network::ClusterConnectivityState::Unreachable => (
-                None,
-                sinomo_core::network::CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
-                None,
-                Some(timestamp),
-                sinomo_core::network::CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
-            ),
-        };
-    let record = sinomo_core::network::cluster_connectivity_record(
-        state,
-        endpoint,
-        connectivity_state,
-        latency_ms,
-        consecutive_failures,
-        last_success_at,
-        last_failure_at,
-        now,
-        ttl_seconds,
-    );
-    match sinomo_core::network::write_local_cluster_connectivity_records(
-        paths,
-        &state.local_node_id,
-        std::slice::from_ref(&record),
-    ) {
-        Ok(()) => publish_command_connectivity_if_needed(paths, state, &record, runtime),
-        Err(error) => tracing::warn!("sinomo daemon tunnel connectivity write failed: {error}"),
-    }
-}
-
 fn remember_cluster_endpoint_command_connectivity_with_failure_grace(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -1916,7 +1860,7 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost
             .observe_signed_endpoint_rpc_async(endpoint, observation)
     }
 
-    fn open_object_rpc_session_stream_async<'a>(
+    fn open_object_rpc_stream_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
         health: sinomo_core::network::NetworkHealthPolicy,
@@ -1925,7 +1869,7 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost
         Box<dyn sinomo_core::network::NetworkDuplexStream>,
     > {
         self.object_rpc_host
-            .open_object_rpc_session_stream_async(endpoint, health)
+            .open_object_rpc_stream_async(endpoint, health)
     }
 }
 
@@ -2062,14 +2006,14 @@ pub(crate) async fn forward_cluster_invite_challenge_to_cluster_state_authority_
     ));
     let mut failures = Vec::new();
     let mut client =
-        sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, runtime, &cluster_paths);
+        sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &cluster_paths);
     for target in &authority_targets {
         let started = Instant::now();
         match client
             .call_target(
                 &state,
                 &target.node_id,
-                sinomo_core::network::ObjectRpcSessionCall::value(rpc_request.clone()),
+                sinomo_core::network::ObjectRpcCall::value(rpc_request.clone()),
                 sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(
                     sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
                 ),
@@ -2111,18 +2055,15 @@ pub(crate) async fn forward_cluster_invite_challenge_to_cluster_state_authority_
         }
     }
     {
-        let mut direct_client = sinomo_core::network::ClusterObjectRpcClient::routed(
-            &mut host,
-            runtime,
-            &cluster_paths,
-        );
+        let mut direct_client =
+            sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &cluster_paths);
         for endpoint in &authority_targets {
             let started = Instant::now();
             match direct_client
                 .call_endpoint(
                     &state,
                     endpoint,
-                    sinomo_core::network::ObjectRpcSessionCall::value(rpc_request.clone()),
+                    sinomo_core::network::ObjectRpcCall::value(rpc_request.clone()),
                     sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(
                         sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
                     ),
@@ -2193,14 +2134,13 @@ fn call_node_object_rpc_on_runtime(
         detail: "cluster paths are unavailable for node object RPC".to_string(),
     })?;
     let mut host = DaemonSignedObjectRpcAsyncHost::new(runtime, true).with_cluster_paths(&paths);
-    let mut client =
-        sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, runtime, &paths);
+    let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &paths);
     block_on_cluster_network_future_on_owner_runtime(
         runtime,
         client.call_target(
             state,
             target_node_id,
-            sinomo_core::network::ObjectRpcSessionCall::value(rpc_request.clone()),
+            sinomo_core::network::ObjectRpcCall::value(rpc_request.clone()),
             options,
         ),
     )
@@ -4072,7 +4012,7 @@ impl ClusterNetworkMaintenance {
             && !connectivity_publish_scheduled
         {
             // A claimed exact retry must never disappear silently if planning
-            // produced no carrier operation.
+            // produced no network operation.
             self.record_connectivity_publish_failure();
         }
         for publish in member_publishes {
@@ -5663,13 +5603,12 @@ async fn fetch_peer_connectivity_records_from_endpoint_async(
             DaemonClusterRpcMode::new(runtime.clone()),
             cluster_control_plane_timeouts(),
         );
-        let mut client =
-            sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &runtime, &paths);
+        let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &paths);
         let response = client
             .call_endpoint(
                 &state,
                 &endpoint,
-                sinomo_core::network::ObjectRpcSessionCall::value(request),
+                sinomo_core::network::ObjectRpcCall::value(request),
                 sinomo_core::network::ClusterObjectRpcOptions::default()
                     .with_overall_timeout(timeout),
             )
@@ -5902,7 +5841,7 @@ async fn fetch_daemon_status_from_endpoint_direct_async(
         .call_endpoint(
             state,
             endpoint,
-            sinomo_core::network::ObjectRpcSessionCall::value(request),
+            sinomo_core::network::ObjectRpcCall::value(request),
             // Status probing owns this semantic operation deadline; transport
             // phase timeouts remain separate inside sinomo-network.
             sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
@@ -6745,13 +6684,12 @@ async fn call_member_object_rpc_target_async(
     operation: &str,
 ) -> Result<Option<sinomo_core::network::ObjectRpcResponse>, DaemonError> {
     let mut host = DaemonSignedObjectRpcAsyncHost::new(runtime, true).with_cluster_paths(paths);
-    let mut client =
-        sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, runtime, paths);
+    let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, paths);
     match client
         .call_target(
             state,
             &member.node_id,
-            sinomo_core::network::ObjectRpcSessionCall::value(request.clone()),
+            sinomo_core::network::ObjectRpcCall::value(request.clone()),
             sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
         )
         .await
@@ -8250,12 +8188,8 @@ fn cluster_kv_object_rpc_request(
 fn cluster_raft_append_object_rpc_request(
     payload: sinomo_core::kv::ClusterKvRpcPayload,
 ) -> ObjectRpcRequest {
-    // Retrying identical AppendEntries is safe under Raft. Preserve the 30s
-    // control-plane budget for snapshot and catch-up responses while transport
-    // connect and no-progress waits remain independently bounded.
-    cluster_kv_object_rpc_request(payload)
-        .with_response_retry_safe()
-        .with_full_response_budget()
+    // Retrying identical AppendEntries is safe under Raft.
+    cluster_kv_object_rpc_request(payload).with_response_retry_safe()
 }
 
 fn cluster_raft_vote_object_rpc_request(
@@ -8307,13 +8241,12 @@ async fn send_cluster_raft_append_routed_async(
         })?,
     );
     let mut host = DaemonSignedObjectRpcAsyncHost::new(runtime, true).with_cluster_paths(paths);
-    let mut client =
-        sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, runtime, paths);
+    let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, paths);
     let response = client
         .call_target(
             &request.state,
             target_node_id,
-            sinomo_core::network::ObjectRpcSessionCall::value(rpc_request),
+            sinomo_core::network::ObjectRpcCall::value(rpc_request),
             sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
         )
         .await?;
@@ -8349,13 +8282,12 @@ async fn send_cluster_raft_vote_routed_async(
         })?,
     );
     let mut host = DaemonSignedObjectRpcAsyncHost::new(runtime, true).with_cluster_paths(paths);
-    let mut client =
-        sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, runtime, paths);
+    let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, paths);
     let response = client
         .call_target(
             &request.state,
             target_node_id,
-            sinomo_core::network::ObjectRpcSessionCall::value(rpc_request),
+            sinomo_core::network::ObjectRpcCall::value(rpc_request),
             sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
         )
         .await?;
@@ -8775,7 +8707,6 @@ impl sinomo_core::cluster::ClusterStateAuthorityReachabilityAsyncHost
         timeout: Duration,
     ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, bool> {
         let paths = self.cluster_paths_for_routed_control_rpc();
-        let runtime = self.rpc_mode.runtime().clone();
         Box::pin(async move {
             let Some(paths) = paths else {
                 return Ok(false);
@@ -8789,13 +8720,12 @@ impl sinomo_core::cluster::ClusterStateAuthorityReachabilityAsyncHost
                 operation: "encode routed daemon status probe".to_string(),
                 detail: source.to_string(),
             })?;
-            let mut client =
-                sinomo_core::network::ClusterObjectRpcClient::routed(self, &runtime, &paths);
+            let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(self, &paths);
             Ok(client
                 .call_target(
                     state,
                     target_node_id,
-                    sinomo_core::network::ObjectRpcSessionCall::value(request),
+                    sinomo_core::network::ObjectRpcCall::value(request),
                     sinomo_core::network::ClusterObjectRpcOptions::default()
                         .with_overall_timeout(timeout),
                 )
@@ -8887,7 +8817,7 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonClusterCont
         })
     }
 
-    fn open_object_rpc_session_stream_async<'a>(
+    fn open_object_rpc_stream_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
         health: sinomo_core::network::NetworkHealthPolicy,
@@ -8902,8 +8832,7 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonClusterCont
             if let Some(paths) = cluster_paths.as_ref() {
                 host = host.with_cluster_paths(paths);
             }
-            host.open_object_rpc_session_stream_async(endpoint, health)
-                .await
+            host.open_object_rpc_stream_async(endpoint, health).await
         })
     }
 }
@@ -9141,7 +9070,6 @@ impl sinomo_core::cluster::ClusterKvCommittedFanoutAsyncHost
         request: &'a ClusterKvWatchEventsRequest,
         timeout: Duration,
     ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, ClusterKvWatchEventsResponse> {
-        let runtime = self.rpc_mode.runtime().clone();
         let paths = self.cluster_paths_for_routed_control_rpc();
         Box::pin(async move {
             if let Some(response) = sinomo_core::kv::cluster_kv_watch_events_noop_response(request)
@@ -9163,13 +9091,12 @@ impl sinomo_core::cluster::ClusterKvCommittedFanoutAsyncHost
             )?;
             let rpc_request =
                 ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
-            let mut client =
-                sinomo_core::network::ClusterObjectRpcClient::routed(self, &runtime, &paths);
+            let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(self, &paths);
             let response = client
                 .call_target(
                     state,
                     target_node_id,
-                    sinomo_core::network::ObjectRpcSessionCall::value(rpc_request),
+                    sinomo_core::network::ObjectRpcCall::value(rpc_request),
                     sinomo_core::network::ClusterObjectRpcOptions::default()
                         .with_overall_timeout(timeout),
                 )
@@ -9972,7 +9899,7 @@ mod tests {
     }
 
     #[test]
-    fn routed_raft_requests_have_operation_specific_retry_and_budget_markers() {
+    fn routed_raft_requests_have_operation_specific_retry_markers() {
         let append = cluster_raft_append_object_rpc_request(sinomo_core::kv::ClusterKvRpcPayload {
             route: "/test/daemon/raft/append",
             category: "test.cluster.kv",
@@ -9990,11 +9917,8 @@ mod tests {
         });
 
         assert!(append.is_response_retry_safe());
-        assert!(append.uses_full_response_budget());
         assert!(vote.is_response_retry_safe());
-        assert!(!vote.uses_full_response_budget());
         assert!(!general.is_response_retry_safe());
-        assert!(!general.uses_full_response_budget());
     }
 
     fn test_cluster_node_status(
@@ -14609,7 +14533,7 @@ mod tests {
             blackhole_address.to_string(),
             10,
         );
-        // Canonical object-RPC sessions authenticate the expected responder
+        // Canonical object-RPC calls authenticate the expected responder
         // before opening the stream. Keep this fixture cryptographically
         // well-formed so the probe reaches the intentionally stalled peer.
         let remote_public_key = sinomo_core::network::daemon_auth_encode_public_key(&[7_u8; 32]);

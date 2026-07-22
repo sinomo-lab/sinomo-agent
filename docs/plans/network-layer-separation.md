@@ -1,8 +1,13 @@
 # Network Layer Separation Plan
 
-Status: active architecture migration.
+Status: completed.
 
-Last reviewed: 2026-07-21.
+Last reviewed: 2026-07-22.
+
+Stage G completed on 2026-07-22. The production path now has one routed-stream
+executor, one stream-native object-RPC protocol, and one service registry. The
+staged sections below are retained as implementation history and acceptance
+criteria.
 
 ## Goal
 
@@ -256,7 +261,7 @@ same method.
 
 After the final production caller migrates:
 
-- delete the canonical object-RPC session carrier;
+- delete the canonical object-RPC call carrier;
 - delete the persistent object-RPC channel carrier;
 - delete RPC-aware relay envelopes and carrier selection;
 - delete duplicate network service-method catalogs;

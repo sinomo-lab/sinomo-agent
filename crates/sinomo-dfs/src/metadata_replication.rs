@@ -11,9 +11,8 @@ use serde::{Deserialize, Serialize};
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
-    ClusterConnectivityGraph, ClusterConnectivityState, ClusterPaths, NetworkError,
-    ObjectRpcResponse, ObjectRpcSessionCall, ObjectRpcSessionResult, cluster_directory_for,
-    cluster_route_next_hop,
+    ClusterConnectivityGraph, ClusterConnectivityState, ClusterPaths, NetworkError, ObjectRpcCall,
+    ObjectRpcResponse, ObjectRpcResult, cluster_directory_for, cluster_route_next_hop,
 };
 use sinomo_core::node::NodeId;
 use sinomo_core::{ClusterBootstrapState, ClusterEndpointRecord};
@@ -756,7 +755,7 @@ fn refresh_cluster_dfs_kv_snapshot_with_peer_transport_for_state(
             let response = peer_transport
                 .call_object_rpc(
                     target_node_id,
-                    ObjectRpcSessionCall::value(request.clone()),
+                    ObjectRpcCall::value(request.clone()),
                     DfsObjectRpcSendOptions::default()
                         .with_overall_timeout(timeout)
                         .with_observe_connectivity(false),
@@ -8382,7 +8381,7 @@ pub type AsyncDfsMetadataSnapshotInstallSender = Arc<
 >;
 
 fn dfs_metadata_value_response(
-    result: ObjectRpcSessionResult,
+    result: ObjectRpcResult,
 ) -> Result<ObjectRpcResponse, DfsMetadataPeerTransportError> {
     let (response, body) = result.into_parts();
     if !body.is_empty() {
@@ -8405,7 +8404,7 @@ pub(crate) fn async_dfs_metadata_journal_batch_sender_from_peer_transport(
             let response = peer_transport
                 .call_object_rpc_async(
                     target_node_id,
-                    ObjectRpcSessionCall::value(request),
+                    ObjectRpcCall::value(request),
                     DfsObjectRpcSendOptions::default().with_overall_timeout(operation_timeout),
                 )
                 .await
@@ -8428,7 +8427,7 @@ pub(crate) fn async_dfs_metadata_snapshot_install_sender_from_peer_transport(
             let response = peer_transport
                 .call_object_rpc_async(
                     target_node_id,
-                    ObjectRpcSessionCall::value(request),
+                    ObjectRpcCall::value(request),
                     DfsObjectRpcSendOptions::default().with_overall_timeout(operation_timeout),
                 )
                 .await
@@ -8449,7 +8448,7 @@ pub(crate) fn dfs_metadata_journal_batch_sender_from_peer_transport(
         let response = peer_transport
             .call_object_rpc(
                 target_node_id,
-                ObjectRpcSessionCall::value(request),
+                ObjectRpcCall::value(request),
                 DfsObjectRpcSendOptions::default().with_overall_timeout(operation_timeout),
             )
             .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;
@@ -8468,7 +8467,7 @@ pub(crate) fn dfs_metadata_snapshot_install_sender_from_peer_transport(
         let response = peer_transport
             .call_object_rpc(
                 target_node_id,
-                ObjectRpcSessionCall::value(request),
+                ObjectRpcCall::value(request),
                 DfsObjectRpcSendOptions::default().with_overall_timeout(operation_timeout),
             )
             .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))?;

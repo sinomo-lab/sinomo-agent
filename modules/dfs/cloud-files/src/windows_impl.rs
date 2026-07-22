@@ -1309,8 +1309,8 @@ impl DfsCloudFilesEndpointTransport {
                 node_id: target_node_id.clone(),
             });
         }
-        let (_, call) = dfs::dfs_routed_call_rpc_session_call(call)?;
-        let response = send_dfs_session_call(
+        let (_, call) = dfs::dfs_routed_call_rpc_call(call)?;
+        let response = send_dfs_rpc_call(
             &self.cluster_paths,
             target_node_id,
             call,
@@ -1353,10 +1353,10 @@ impl DfsMessageTransport for DfsCloudFilesEndpointTransport {
     }
 }
 
-fn send_dfs_session_call(
+fn send_dfs_rpc_call(
     cluster_paths: &network::ClusterPaths,
     target_node_id: &NodeId,
-    call: network::ObjectRpcSessionCall,
+    call: network::ObjectRpcCall,
     timeouts: network::DaemonRpcTimeouts,
 ) -> std::result::Result<DfsMessageResponse, NetworkError> {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -1367,7 +1367,7 @@ fn send_dfs_session_call(
             let runtime = handle.clone();
             let runtime_for_future = runtime.clone();
             tokio::task::block_in_place(|| {
-                runtime.block_on(send_dfs_session_call_async(
+                runtime.block_on(send_dfs_rpc_call_async(
                     cluster_paths,
                     target_node_id,
                     call,
@@ -1377,7 +1377,7 @@ fn send_dfs_session_call(
             })
         } else {
             Err(NetworkError::Io {
-                operation: "send Cloud Files DFS session".to_string(),
+                operation: "send Cloud Files DFS RPC".to_string(),
                 detail: "Cloud Files DFS sync transport cannot run inside a current-thread Tokio runtime"
                     .to_string(),
             })
@@ -1390,7 +1390,7 @@ fn send_dfs_session_call(
             operation: "create Cloud Files DFS client runtime".to_string(),
             detail: source.to_string(),
         })?;
-    let output = runtime.block_on(send_dfs_session_call_async(
+    let output = runtime.block_on(send_dfs_rpc_call_async(
         cluster_paths,
         target_node_id,
         call,
@@ -1401,14 +1401,14 @@ fn send_dfs_session_call(
     output
 }
 
-async fn send_dfs_session_call_async(
+async fn send_dfs_rpc_call_async(
     cluster_paths: &network::ClusterPaths,
     target_node_id: &NodeId,
-    call: network::ObjectRpcSessionCall,
+    call: network::ObjectRpcCall,
     timeouts: network::DaemonRpcTimeouts,
     runtime: &tokio::runtime::Handle,
 ) -> std::result::Result<DfsMessageResponse, NetworkError> {
-    let result = daemon::send_object_rpc_session_to_target_async_with_cluster_paths_and_options(
+    let result = daemon::send_object_rpc_call_to_target_async_with_cluster_paths_and_options(
         cluster_paths,
         target_node_id,
         call,
@@ -1421,7 +1421,7 @@ async fn send_dfs_session_call_async(
         operation: format!("send Cloud Files DFS call to {target_node_id}"),
         detail: source.to_string(),
     })?;
-    dfs::dfs_message_response_from_rpc_session_result(result)
+    dfs::dfs_message_response_from_rpc_result(result)
         .await
         .map_err(|source| NetworkError::Io {
             operation: format!("decode Cloud Files DFS response from {target_node_id}"),

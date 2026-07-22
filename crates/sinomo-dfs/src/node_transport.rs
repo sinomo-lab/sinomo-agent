@@ -15,8 +15,8 @@ use sinomo_core::local::SinomoDataDir;
 #[cfg(test)]
 use sinomo_core::network::ClusterPaths;
 use sinomo_core::network::{
-    NetworkError, ObjectRpcBodySource, ObjectRpcIncomingBody, ObjectRpcRequest, ObjectRpcResponse,
-    ObjectRpcSessionCall, ObjectRpcSessionResult, SinomoObjectCodec,
+    NetworkError, ObjectRpcBodySource, ObjectRpcCall, ObjectRpcIncomingBody, ObjectRpcRequest,
+    ObjectRpcResponse, ObjectRpcResult, SinomoObjectCodec,
 };
 use sinomo_core::node::NodeId;
 
@@ -30,7 +30,7 @@ use crate::{
     DfsRoutedSendOutcome, DfsTransportIdentity, DistributedRepairJob, NetworkedDfsService,
     NetworkedDfsServiceEvent, decode_dfs_message_rpc_response,
     decode_dfs_metadata_journal_batch_rpc_response, dfs_direct_read_request_from_read_request,
-    dfs_direct_read_response_from_rpc_session_result, dfs_direct_read_rpc_request,
+    dfs_direct_read_response_from_rpc_result, dfs_direct_read_rpc_request,
     dfs_message_is_read_only_request, dfs_message_rpc_request,
     dfs_metadata_journal_batch_rpc_request, dfs_network_message_allows_write_repair_progress,
     dfs_perf_trace, dfs_perf_trace_enabled, dfs_rejection_is_commit_content_repair_pending,
@@ -184,9 +184,9 @@ pub trait DfsPeerTransport: Send + Sync {
     fn call_object_rpc(
         &self,
         target_node_id: &NodeId,
-        call: ObjectRpcSessionCall,
+        call: ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
-    ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError>;
+    ) -> Result<ObjectRpcResult, DfsPeerTransportError>;
 }
 
 fn collect_dfs_attachment_source_sync(
@@ -225,9 +225,9 @@ pub trait AsyncDfsPeerTransport: Send + Sync {
     fn call_object_rpc_async<'a>(
         &'a self,
         target_node_id: &'a NodeId,
-        call: ObjectRpcSessionCall,
+        call: ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
-    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcSessionResult, DfsPeerTransportError>>;
+    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>>;
 }
 
 pub(crate) type AsyncDfsMessageSender = Arc<
@@ -252,19 +252,19 @@ pub(crate) fn async_dfs_message_sender_from_peer_transport(
             let response = peer_transport
                 .call_object_rpc_async(
                     target_node_id,
-                    ObjectRpcSessionCall::value(request),
+                    ObjectRpcCall::value(request),
                     options.with_observe_connectivity(!dfs_message_is_read_only_request(command)),
                 )
                 .await?;
-            dfs_message_response_from_rpc_session_result(response).await
+            dfs_message_response_from_rpc_result(response).await
         })
     })
 }
 
 /// Asynchronously decodes a canonical DFS session response while its network
 /// runtime remains active, including a streamed response attachment.
-pub async fn dfs_message_response_from_rpc_session_result(
-    result: ObjectRpcSessionResult,
+pub async fn dfs_message_response_from_rpc_result(
+    result: ObjectRpcResult,
 ) -> Result<DfsMessageResponse, DfsPeerTransportError> {
     let (response, attachment) = result.into_parts();
     if attachment.is_empty() {
@@ -286,13 +286,13 @@ pub async fn dfs_message_response_from_rpc_session_result(
         .map_err(|source| DfsPeerTransportError::new(source.to_string()))
 }
 
-/// Encodes one routed DFS call as the canonical object-RPC session call.
+/// Encodes one routed DFS call as a stream-native object-RPC call.
 ///
 /// Attachment sources remain streaming bodies owned by the network layer; this
 /// helper only encodes the request head and never materializes their bytes.
-pub fn dfs_routed_call_rpc_session_call(
+pub fn dfs_routed_call_rpc_call(
     call: DfsRoutedCall,
-) -> Result<(DfsMessageCommand, ObjectRpcSessionCall), NetworkError> {
+) -> Result<(DfsMessageCommand, ObjectRpcCall), NetworkError> {
     let DfsRoutedCall {
         message,
         attachment,
@@ -302,22 +302,22 @@ pub fn dfs_routed_call_rpc_session_call(
         routed_message: message,
     };
     let request = dfs_message_rpc_request(&command)?;
-    let session_call = match attachment {
+    let rpc_call = match attachment {
         Some(attachment) => {
             let request = crate::body_rpc::encode_dfs_attachment_message_rpc_request(
                 &request,
                 command.clone(),
                 attachment.descriptor,
             )?;
-            ObjectRpcSessionCall::new(request, attachment.source)
+            ObjectRpcCall::new(request, attachment.source)
         }
-        None => ObjectRpcSessionCall::value(request),
+        None => ObjectRpcCall::value(request),
     };
-    Ok((command, session_call))
+    Ok((command, rpc_call))
 }
 
-fn value_response_from_session_result(
-    result: ObjectRpcSessionResult,
+fn value_response_from_rpc_result(
+    result: ObjectRpcResult,
 ) -> Result<ObjectRpcResponse, DfsPeerTransportError> {
     let (response, attachment) = result.into_parts();
     if !attachment.is_empty() {
@@ -331,8 +331,8 @@ fn value_response_from_session_result(
 
 /// Decodes a canonical DFS session response, including a streamed response
 /// attachment when the response head declares one.
-pub fn dfs_message_response_from_rpc_session_result_sync(
-    result: ObjectRpcSessionResult,
+pub fn dfs_message_response_from_rpc_result_sync(
+    result: ObjectRpcResult,
 ) -> Result<DfsMessageResponse, DfsPeerTransportError> {
     let (response, attachment) = result.into_parts();
     if attachment.is_empty() {
@@ -387,13 +387,9 @@ pub(crate) fn async_dfs_direct_read_sender_from_peer_transport(
             let rpc_request = dfs_direct_read_rpc_request(request)
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
             let response = peer_transport
-                .call_object_rpc_async(
-                    target_node_id,
-                    ObjectRpcSessionCall::value(rpc_request),
-                    options,
-                )
+                .call_object_rpc_async(target_node_id, ObjectRpcCall::value(rpc_request), options)
                 .await?;
-            dfs_direct_read_response_from_rpc_session_result(response)
+            dfs_direct_read_response_from_rpc_result(response)
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))
         })
     })
@@ -407,10 +403,10 @@ pub(crate) fn dfs_message_sender_from_peer_transport(
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
         let response = peer_transport.call_object_rpc(
             target_node_id,
-            ObjectRpcSessionCall::value(request),
+            ObjectRpcCall::value(request),
             options.with_observe_connectivity(!dfs_message_is_read_only_request(command)),
         )?;
-        dfs_message_response_from_rpc_session_result_sync(response)
+        dfs_message_response_from_rpc_result_sync(response)
     })
 }
 
@@ -422,10 +418,10 @@ pub(crate) fn dfs_direct_read_sender_from_peer_transport(
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
         let result = peer_transport.call_object_rpc(
             target_node_id,
-            ObjectRpcSessionCall::value(rpc_request),
+            ObjectRpcCall::value(rpc_request),
             options,
         )?;
-        let response = dfs_direct_read_response_from_rpc_session_result(result)
+        let response = dfs_direct_read_response_from_rpc_result(result)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
         collect_dfs_direct_read_response_sync(response)
     })
@@ -694,7 +690,7 @@ struct DfsPreparedMetadataJournalBatchRpc {
 impl DfsPreparedMetadataJournalBatchRpc {
     fn finish(
         self,
-        rpc_response: Result<ObjectRpcSessionResult, DfsPeerTransportError>,
+        rpc_response: Result<ObjectRpcResult, DfsPeerTransportError>,
     ) -> Result<(NodeId, DfsMetadataJournalBatchResponse), NetworkError> {
         let rpc_response = rpc_response.map_err(|source| NetworkError::Io {
             operation: format!(
@@ -703,15 +699,14 @@ impl DfsPreparedMetadataJournalBatchRpc {
             ),
             detail: source.to_string(),
         })?;
-        let rpc_response = value_response_from_session_result(rpc_response).map_err(|source| {
-            NetworkError::Io {
+        let rpc_response =
+            value_response_from_rpc_result(rpc_response).map_err(|source| NetworkError::Io {
                 operation: format!(
                     "decode direct DFS metadata journal response from {}",
                     self.target_node_id
                 ),
                 detail: source.to_string(),
-            }
-        })?;
+            })?;
         let response = decode_dfs_metadata_journal_batch_rpc_response(&rpc_response)?;
         if response.request_id != self.request_id
             || response.shard_id != self.shard_id
@@ -1470,10 +1465,8 @@ impl DfsNodeTransport {
                     .to_string(),
             });
         };
-        let (command, call) = dfs_routed_call_rpc_session_call(DfsRoutedCall::with_attachment(
-            routed_message,
-            attachment,
-        ))?;
+        let (command, call) =
+            dfs_routed_call_rpc_call(DfsRoutedCall::with_attachment(routed_message, attachment))?;
         let options =
             self.current_send_options(format!("send DFS attachment to {target_node_id}"))?;
         let result = peer_transport
@@ -1486,13 +1479,12 @@ impl DfsNodeTransport {
                 operation: format!("send DFS attachment to {target_node_id}"),
                 detail: source.to_string(),
             })?;
-        let returned =
-            dfs_message_response_from_rpc_session_result_sync(result).map_err(|source| {
-                NetworkError::Io {
-                    operation: format!("decode DFS attachment response from {target_node_id}"),
-                    detail: source.to_string(),
-                }
-            })?;
+        let returned = dfs_message_response_from_rpc_result_sync(result).map_err(|source| {
+            NetworkError::Io {
+                operation: format!("decode DFS attachment response from {target_node_id}"),
+                detail: source.to_string(),
+            }
+        })?;
         for message in returned.outbound_messages {
             let target = message.target_node_id.clone();
             self.send_routed_message_to_peer(&target, message, false)?;
@@ -2244,10 +2236,8 @@ impl DfsNodeTransport {
                     .to_string(),
             });
         };
-        let (command, call) = dfs_routed_call_rpc_session_call(DfsRoutedCall::with_attachment(
-            routed_message,
-            attachment,
-        ))?;
+        let (command, call) =
+            dfs_routed_call_rpc_call(DfsRoutedCall::with_attachment(routed_message, attachment))?;
         let options =
             self.current_send_options(format!("send DFS attachment to {target_node_id}"))?;
         let result = peer_transport
@@ -2261,7 +2251,7 @@ impl DfsNodeTransport {
                 operation: format!("send DFS attachment to {target_node_id}"),
                 detail: source.to_string(),
             })?;
-        let returned = dfs_message_response_from_rpc_session_result(result)
+        let returned = dfs_message_response_from_rpc_result(result)
             .await
             .map_err(|source| NetworkError::Io {
                 operation: format!("decode DFS attachment response from {target_node_id}"),
@@ -2657,7 +2647,7 @@ async fn send_direct_metadata_journal_fanout_async(
                 let rpc_response = peer_transport
                     .call_object_rpc_async(
                         &prepared.target_node_id,
-                        ObjectRpcSessionCall::value(prepared.request.clone()),
+                        ObjectRpcCall::value(prepared.request.clone()),
                         prepared.options,
                     )
                     .await;
@@ -2765,7 +2755,7 @@ fn send_direct_metadata_journal_fanout_blocking(
                     };
                     let rpc_response = peer_transport.call_object_rpc(
                         &prepared.target_node_id,
-                        ObjectRpcSessionCall::value(prepared.request.clone()),
+                        ObjectRpcCall::value(prepared.request.clone()),
                         prepared.options,
                     );
                     let outcome = prepared.finish(rpc_response);
@@ -2916,17 +2906,13 @@ impl DfsMessageTransport for DfsNodeTransport {
             "send direct DFS metadata journal batch to {target_node_id}"
         ))?;
         let response = peer_transport
-            .call_object_rpc(
-                target_node_id,
-                ObjectRpcSessionCall::value(request),
-                options,
-            )
+            .call_object_rpc(target_node_id, ObjectRpcCall::value(request), options)
             .map_err(|source| NetworkError::Io {
                 operation: format!("send direct DFS metadata journal batch to {target_node_id}"),
                 detail: source.to_string(),
             })?;
         let response =
-            value_response_from_session_result(response).map_err(|source| NetworkError::Io {
+            value_response_from_rpc_result(response).map_err(|source| NetworkError::Io {
                 operation: format!(
                     "decode direct DFS metadata journal response from {target_node_id}"
                 ),
@@ -3270,13 +3256,13 @@ mod tests {
     }
 
     #[test]
-    fn routed_call_session_builder_preserves_value_and_attachment_body_intent() {
+    fn routed_call_builder_preserves_value_and_attachment_body_intent() {
         let source = node_id("session_builder_source");
         let target = node_id("session_builder_target");
 
         let value_message = test_message(&source, &target, 6);
         let (value_command, value_call) =
-            dfs_routed_call_rpc_session_call(DfsRoutedCall::value(value_message))
+            dfs_routed_call_rpc_call(DfsRoutedCall::value(value_message))
                 .expect("value session call");
         assert!(value_call.body.is_empty());
         assert_eq!(
@@ -3290,8 +3276,7 @@ mod tests {
         let attachment_bytes = vec![7_u8; 64];
         let attachment_send = test_stage_attachment_send(&source, &target, 7, "stage-request");
         let (attachment_command, attachment_call) =
-            dfs_routed_call_rpc_session_call(attachment_send.call)
-                .expect("attachment session call");
+            dfs_routed_call_rpc_call(attachment_send.call).expect("attachment RPC call");
         assert!(!attachment_call.body.is_empty());
         let head =
             crate::body_rpc::decode_dfs_attachment_message_rpc_request(&attachment_call.request)
@@ -3306,10 +3291,10 @@ mod tests {
     }
 
     fn stage_attachment_rpc_response(
-        call: &ObjectRpcSessionCall,
+        call: &ObjectRpcCall,
         calls: &Mutex<Vec<(NodeId, String)>>,
         target_node_id: &NodeId,
-    ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+    ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
         let request = &call.request;
         let command = if call.body.is_empty() {
             request
@@ -3339,7 +3324,7 @@ mod tests {
                 outbound_messages: Vec::new(),
             },
         )
-        .map(ObjectRpcSessionResult::value)
+        .map(ObjectRpcResult::value)
         .map_err(|source| DfsPeerTransportError::new(source.to_string()))
     }
 
@@ -3356,9 +3341,9 @@ mod tests {
         fn call_object_rpc(
             &self,
             target_node_id: &NodeId,
-            call: ObjectRpcSessionCall,
+            call: ObjectRpcCall,
             _options: DfsObjectRpcSendOptions,
-        ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+        ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
             stage_attachment_rpc_response(&call, &self.calls, target_node_id)
         }
     }
@@ -3367,10 +3352,9 @@ mod tests {
         fn call_object_rpc_async<'a>(
             &'a self,
             target_node_id: &'a NodeId,
-            call: ObjectRpcSessionCall,
+            call: ObjectRpcCall,
             _options: DfsObjectRpcSendOptions,
-        ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcSessionResult, DfsPeerTransportError>>
-        {
+        ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>> {
             Box::pin(async move {
                 let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
                 self.max_active.fetch_max(active, Ordering::SeqCst);
@@ -3403,9 +3387,9 @@ mod tests {
         fn call_object_rpc(
             &self,
             target_node_id: &NodeId,
-            call: ObjectRpcSessionCall,
+            call: ObjectRpcCall,
             _options: DfsObjectRpcSendOptions,
-        ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+        ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active, Ordering::SeqCst);
             if target_node_id == &self.failed_target || target_node_id == &self.paired_target {
@@ -3434,10 +3418,9 @@ mod tests {
         fn call_object_rpc_async<'a>(
             &'a self,
             target_node_id: &'a NodeId,
-            call: ObjectRpcSessionCall,
+            call: ObjectRpcCall,
             options: DfsObjectRpcSendOptions,
-        ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcSessionResult, DfsPeerTransportError>>
-        {
+        ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>> {
             Box::pin(async move { self.call_object_rpc(target_node_id, call, options) })
         }
     }
@@ -3590,8 +3573,8 @@ mod tests {
         fn finish_call(
             &self,
             target_node_id: &NodeId,
-            call: ObjectRpcSessionCall,
-        ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+            call: ObjectRpcCall,
+        ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
             if self.failed_target.as_ref() == Some(target_node_id) {
                 return Err(DfsPeerTransportError::new(format!(
                     "injected metadata fan-out failure for {target_node_id}"
@@ -3613,7 +3596,7 @@ mod tests {
                     result: crate::DfsMetadataJournalBatchResult::Applied,
                 },
             )
-            .map(ObjectRpcSessionResult::value)
+            .map(ObjectRpcResult::value)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))
         }
     }
@@ -3622,9 +3605,9 @@ mod tests {
         fn call_object_rpc(
             &self,
             target_node_id: &NodeId,
-            call: ObjectRpcSessionCall,
+            call: ObjectRpcCall,
             _options: DfsObjectRpcSendOptions,
-        ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+        ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
             let _active = self.enter();
             std::thread::sleep(self.delay_for(target_node_id));
             self.finish_call(target_node_id, call)
@@ -3635,10 +3618,9 @@ mod tests {
         fn call_object_rpc_async<'a>(
             &'a self,
             target_node_id: &'a NodeId,
-            call: ObjectRpcSessionCall,
+            call: ObjectRpcCall,
             _options: DfsObjectRpcSendOptions,
-        ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcSessionResult, DfsPeerTransportError>>
-        {
+        ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>> {
             Box::pin(async move {
                 let _active = self.enter();
                 tokio::time::sleep(self.delay_for(target_node_id)).await;
@@ -3880,7 +3862,7 @@ mod tests {
         assert_eq!(
             observed.as_slice(),
             &[DfsObjectRpcSendOptions::default(); 3],
-            "canonical sessions keep transport health independently of application silence"
+            "stream-native calls keep transport health independently of application silence"
         );
     }
 

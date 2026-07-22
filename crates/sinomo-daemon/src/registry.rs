@@ -54,7 +54,6 @@ pub use sinomo_module::{
     ModuleRegistrySnapshotStore,
 };
 use std::collections::BTreeSet;
-use std::future::Future;
 use std::sync::Arc;
 
 pub struct NativeRustModuleBinding {
@@ -123,10 +122,10 @@ pub fn internal_module_registry() -> Result<ModuleRegistry, ModuleRegistryError>
     Ok(registry)
 }
 
-pub fn module_object_rpc_route_descriptor_to_network(
+pub fn module_object_rpc_route_descriptor_to_service(
     descriptor: &sinomo_module::ModuleObjectRpcRouteDescriptor,
-) -> sinomo_core::network::ObjectRouteDescriptor {
-    let mut route = sinomo_core::network::ObjectRouteDescriptor::new(
+) -> sinomo_core::service::ServiceRoute {
+    let mut route = sinomo_core::service::ServiceRoute::describe(
         descriptor.route.clone(),
         descriptor.category.clone(),
         format!(
@@ -144,41 +143,41 @@ pub fn module_object_rpc_route_descriptor_to_network(
     for permission in &descriptor.required_local_permissions {
         route = route.require_local_permission(permission);
     }
-    route.request_body_mode = native_module_body_mode_to_network(descriptor.request_body_mode);
-    route.response_body_mode = native_module_body_mode_to_network(descriptor.response_body_mode);
+    route.request_body_mode = native_module_body_mode_to_service(descriptor.request_body_mode);
+    route.response_body_mode = native_module_body_mode_to_service(descriptor.response_body_mode);
     route
 }
 
-fn native_module_body_mode_to_network(
+fn native_module_body_mode_to_service(
     mode: sinomo_module_api::NativeModuleBodyMode,
-) -> sinomo_core::network::ObjectRpcBodyMode {
+) -> sinomo_core::service::ServiceBodyMode {
     match mode {
         sinomo_module_api::NativeModuleBodyMode::None => {
-            sinomo_core::network::ObjectRpcBodyMode::None
+            sinomo_core::service::ServiceBodyMode::None
         }
         sinomo_module_api::NativeModuleBodyMode::Optional => {
-            sinomo_core::network::ObjectRpcBodyMode::Optional
+            sinomo_core::service::ServiceBodyMode::Optional
         }
         sinomo_module_api::NativeModuleBodyMode::Required => {
-            sinomo_core::network::ObjectRpcBodyMode::Required
+            sinomo_core::service::ServiceBodyMode::Required
         }
     }
 }
 
 pub fn module_registration_object_rpc_route_descriptors(
     registration: &ModuleRegistration,
-) -> Result<Vec<sinomo_core::network::ObjectRouteDescriptor>, sinomo_module::ModuleSurfaceError> {
+) -> Result<Vec<sinomo_core::service::ServiceRoute>, sinomo_module::ModuleSurfaceError> {
     Ok(registration
         .surfaces
         .object_rpc_route_descriptors()?
         .iter()
-        .map(module_object_rpc_route_descriptor_to_network)
+        .map(module_object_rpc_route_descriptor_to_service)
         .collect::<Vec<_>>())
 }
 
 pub fn module_registry_object_rpc_route_descriptors(
     registry: &ModuleRegistry,
-) -> Result<Vec<sinomo_core::network::ObjectRouteDescriptor>, sinomo_module::ModuleSurfaceError> {
+) -> Result<Vec<sinomo_core::service::ServiceRoute>, sinomo_module::ModuleSurfaceError> {
     let mut seen_routes = BTreeSet::new();
     let mut descriptors = Vec::new();
     for registration in registry.registrations() {
@@ -196,72 +195,8 @@ pub fn module_registry_object_rpc_route_descriptors(
 
 pub fn module_registry_snapshot_object_rpc_route_descriptors(
     snapshot: &ModuleRegistrySnapshot,
-) -> Result<Vec<sinomo_core::network::ObjectRouteDescriptor>, sinomo_module::ModuleSurfaceError> {
+) -> Result<Vec<sinomo_core::service::ServiceRoute>, sinomo_module::ModuleSurfaceError> {
     module_registry_object_rpc_route_descriptors(snapshot.registry())
-}
-
-pub const MODULE_REGISTRY_SNAPSHOT_VERSION_OBSERVABILITY_KEY: &str =
-    "module.registry.snapshot_version";
-
-pub fn install_module_registry_snapshot_routes<F, Fut>(
-    router: &sinomo_core::network::ObjectRpcRouter,
-    snapshot: &ModuleRegistrySnapshot,
-    handler: F,
-) -> Result<Arc<sinomo_core::network::ObjectRpcRouteRegistry>, sinomo_core::network::NetworkError>
-where
-    F: Fn(sinomo_core::network::ObjectRpcRequest) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<
-            Output = Result<
-                sinomo_core::network::ObjectRpcResponse,
-                sinomo_core::network::NetworkError,
-            >,
-        > + Send
-        + 'static,
-{
-    let snapshot_version = snapshot.version().to_string();
-    let descriptors = module_registry_snapshot_object_rpc_route_descriptors(snapshot)
-        .map_err(module_surface_error_to_network_error)?
-        .into_iter()
-        .map(|descriptor| {
-            descriptor.observable(
-                MODULE_REGISTRY_SNAPSHOT_VERSION_OBSERVABILITY_KEY,
-                snapshot_version.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let handler = move |request: sinomo_core::network::ObjectRpcSessionRequest| {
-        let handler = handler.clone();
-        async move {
-            if !request.body.is_empty() {
-                return Err(sinomo_core::network::NetworkError::Serialization {
-                    detail: format!(
-                        "module route {} does not accept a request attachment",
-                        request.request.route
-                    ),
-                });
-            }
-            handler(request.request)
-                .await
-                .map(sinomo_core::network::ObjectRpcSessionResponse::value)
-        }
-    };
-    router.replace_route_set(
-        |descriptor| {
-            descriptor
-                .observability
-                .contains_key(MODULE_REGISTRY_SNAPSHOT_VERSION_OBSERVABILITY_KEY)
-        },
-        descriptors,
-        handler,
-    )
-}
-
-fn module_surface_error_to_network_error(
-    error: sinomo_module::ModuleSurfaceError,
-) -> sinomo_core::network::NetworkError {
-    sinomo_core::network::NetworkError::Serialization {
-        detail: error.to_string(),
-    }
 }
 
 pub fn internal_native_rust_module_bindings() -> &'static [NativeRustModuleBinding] {
@@ -310,16 +245,38 @@ pub fn network_module_surfaces() -> sinomo_module::ModuleSurfaces {
     let mut surfaces = sinomo_module::ModuleSurfaces::default()
         .with_storage_owner(sinomo_core::network::SINOMO_NETWORK_MODULE_OWNER);
 
-    for tool in sinomo_core::network::NETWORK_OBJECT_RPC_TOOL_SURFACES {
+    for (route, category, operation, request_body_mode, response_body_mode) in [
+        (
+            sinomo_core::network::CLUSTER_HEALTH_ROUTE,
+            sinomo_core::network::CLUSTER_HEALTH_RPC_CATEGORY,
+            sinomo_core::network::CLUSTER_HEALTH_READ_CAPABILITY,
+            sinomo_module_api::NativeModuleBodyMode::None,
+            sinomo_module_api::NativeModuleBodyMode::None,
+        ),
+        (
+            sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
+            sinomo_core::network::CLUSTER_NETWORK_RPC_CATEGORY,
+            sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_READ_CAPABILITY,
+            sinomo_module_api::NativeModuleBodyMode::None,
+            sinomo_module_api::NativeModuleBodyMode::None,
+        ),
+        (
+            sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE,
+            sinomo_core::network::CLUSTER_NETWORK_RPC_CATEGORY,
+            sinomo_core::network::CLUSTER_NETWORK_PING_CAPABILITY,
+            sinomo_module_api::NativeModuleBodyMode::Optional,
+            sinomo_module_api::NativeModuleBodyMode::Optional,
+        ),
+    ] {
         surfaces = surfaces.with_object_rpc_route(
             sinomo_module::ModuleObjectRpcRoute::new(
-                tool.route,
-                tool.category,
-                tool.operation,
-                module_route_auth(tool.auth),
+                route,
+                category,
+                operation,
+                sinomo_module::ModuleRouteAuth::LocalOrClusterMember,
             )
-            .with_request_body_mode(network_body_mode_to_native_module(tool.request_body_mode))
-            .with_response_body_mode(network_body_mode_to_native_module(tool.response_body_mode)),
+            .with_request_body_mode(request_body_mode)
+            .with_response_body_mode(response_body_mode),
         );
     }
 
@@ -376,41 +333,6 @@ pub fn network_module_capabilities() -> sinomo_core::ModuleCapabilities {
             .iter()
             .map(|capability| network_capability(capability))
             .collect(),
-    }
-}
-
-fn module_route_auth(
-    auth: sinomo_core::network::NetworkModuleRouteAuth,
-) -> sinomo_module::ModuleRouteAuth {
-    match auth {
-        sinomo_core::network::NetworkModuleRouteAuth::LocalCommand => {
-            sinomo_module::ModuleRouteAuth::LocalCommand
-        }
-        sinomo_core::network::NetworkModuleRouteAuth::LocalOrClusterMember => {
-            sinomo_module::ModuleRouteAuth::LocalOrClusterMember
-        }
-        sinomo_core::network::NetworkModuleRouteAuth::ClusterMember => {
-            sinomo_module::ModuleRouteAuth::ClusterMember
-        }
-        sinomo_core::network::NetworkModuleRouteAuth::Admin => {
-            sinomo_module::ModuleRouteAuth::Admin
-        }
-    }
-}
-
-fn network_body_mode_to_native_module(
-    mode: sinomo_core::network::ObjectRpcBodyMode,
-) -> sinomo_module_api::NativeModuleBodyMode {
-    match mode {
-        sinomo_core::network::ObjectRpcBodyMode::None => {
-            sinomo_module_api::NativeModuleBodyMode::None
-        }
-        sinomo_core::network::ObjectRpcBodyMode::Optional => {
-            sinomo_module_api::NativeModuleBodyMode::Optional
-        }
-        sinomo_core::network::ObjectRpcBodyMode::Required => {
-            sinomo_module_api::NativeModuleBodyMode::Required
-        }
     }
 }
 
@@ -714,7 +636,7 @@ mod tests {
         .descriptor()
         .expect("module route descriptor");
 
-        let network = module_object_rpc_route_descriptor_to_network(&descriptor);
+        let network = module_object_rpc_route_descriptor_to_service(&descriptor);
 
         assert_eq!(
             network.required_local_permissions,
@@ -722,11 +644,11 @@ mod tests {
         );
         assert_eq!(
             network.request_body_mode,
-            sinomo_core::network::ObjectRpcBodyMode::Optional
+            sinomo_core::service::ServiceBodyMode::Optional
         );
         assert_eq!(
             network.response_body_mode,
-            sinomo_core::network::ObjectRpcBodyMode::Required
+            sinomo_core::service::ServiceBodyMode::Required
         );
     }
 
@@ -783,10 +705,7 @@ mod tests {
             registration.surfaces.storage_owners,
             vec![sinomo_core::network::SINOMO_NETWORK_MODULE_OWNER.to_string()]
         );
-        assert_eq!(
-            registration.surfaces.object_rpc_routes.len(),
-            sinomo_core::network::NETWORK_OBJECT_RPC_ROUTES.len()
-        );
+        assert_eq!(registration.surfaces.object_rpc_routes.len(), 3);
         assert!(
             registration
                 .surfaces

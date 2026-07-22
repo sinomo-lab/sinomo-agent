@@ -67,11 +67,10 @@ the crate that owns the route semantics. The daemon may decode the daemon wire
 command, create a `ServiceContext`, dispatch to the registry, and encode the
 response. It should not implement the route's domain algorithm inline.
 
-Hardcoded fallback routes in daemon control code are migration debt. They are
-acceptable only when a route is still being moved to a service implementation or
-when the route is inherently stream-coupled, process-coupled, or daemon-local.
-Adding a new hardcoded route should be treated as exceptional and should include
-a clear reason in code or tests.
+All ordinary object-RPC methods dispatch through the `sinomo-service` registry.
+Daemon control may recognize transport preludes and bootstrap-only handshakes,
+but it must pass a decoded service request to that same registry rather than
+maintaining another route table.
 
 When direct service implementation in the owning crate would create a dependency
 cycle, keep the pure domain logic in the owning crate and add only a narrow
@@ -221,9 +220,10 @@ crates over time. The largest areas are:
 - `dfs.rs`: DFS peer transport fan-out, metadata publishing adapters,
   maintenance adapters, and default bootstrap host adapters.
 - `rollout.rs`: binary rollout process glue mixed with rollout-state behavior.
-- `control.rs`: hardcoded route fallbacks after service registry dispatch.
-- `service_adapter.rs`: temporary bridge from synchronous daemon command
-  handling to service-owned asynchronous route handlers.
+- `control.rs`: listener lifecycle, bootstrap handshakes, and daemon process
+  coordination around service-registry dispatch.
+- `service_adapter.rs`: daemon context and process-state adapters for
+  service-owned asynchronous route handlers.
 
 Refactors should reduce these files by moving domain logic to the owning crate
 or to a focused R1 crate, while keeping daemon adapters small and mechanical.

@@ -5,8 +5,8 @@ use sinomo_core::events::EventId;
 use sinomo_core::kv::{InProcessKvStore, KvEntry, KvError, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
-    AsyncInProcessNetwork, ClusterPaths, InProcessNetwork, NetworkError, ObjectRpcIncomingBody,
-    ObjectRpcRequest, ObjectRpcResponse, ObjectRpcSessionCall, ObjectRpcSessionResult,
+    AsyncInProcessNetwork, ClusterPaths, InProcessNetwork, NetworkError, ObjectRpcCall,
+    ObjectRpcIncomingBody, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcResult,
 };
 use sinomo_core::object::Value;
 use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
@@ -436,10 +436,10 @@ impl CanonicalDfsMessagePeerTransport {
     async fn call_object_rpc_inner(
         &self,
         target_node_id: &NodeId,
-        call: ObjectRpcSessionCall,
+        call: ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
-    ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
-        let ObjectRpcSessionCall { request, body } = call;
+    ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+        let ObjectRpcCall { request, body } = call;
         if !dfs_route_is_message_data_plane(&request.route) {
             return Err(DfsPeerTransportError::new(format!(
                 "unexpected DFS message peer route {}",
@@ -466,7 +466,7 @@ impl CanonicalDfsMessagePeerTransport {
         };
         let response = (self.sender)(target_node_id, &command, options)?;
         ObjectRpcResponse::encode_body(&request.route, &response)
-            .map(ObjectRpcSessionResult::value)
+            .map(ObjectRpcResult::value)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))
     }
 }
@@ -475,9 +475,9 @@ impl DfsPeerTransport for CanonicalDfsMessagePeerTransport {
     fn call_object_rpc(
         &self,
         target_node_id: &NodeId,
-        call: ObjectRpcSessionCall,
+        call: ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
-    ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+    ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -492,9 +492,9 @@ impl AsyncDfsPeerTransport for CanonicalDfsMessagePeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
         target_node_id: &'a NodeId,
-        call: ObjectRpcSessionCall,
+        call: ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
-    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcSessionResult, DfsPeerTransportError>> {
+    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>> {
         Box::pin(self.call_object_rpc_inner(target_node_id, call, options))
     }
 }
@@ -2143,9 +2143,9 @@ impl DfsPeerTransport for RecordingPeerTransport {
     fn call_object_rpc(
         &self,
         target_node_id: &NodeId,
-        call: ObjectRpcSessionCall,
+        call: ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
-    ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+    ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
         if !call.body.is_empty() {
             return Err(DfsPeerTransportError::new(
                 "recording peer does not accept an attachment",
@@ -2182,7 +2182,7 @@ impl DfsPeerTransport for RecordingPeerTransport {
                     "rpc:{}:{}:{}",
                     request.route, target_node_id, command.request_id
                 ));
-                return dfs_direct_read_rpc_session_result(DfsReadResponse {
+                return dfs_direct_read_rpc_result(DfsReadResponse {
                     request_id: command.request_id,
                     object_id: command.object_id.clone(),
                     result: DfsReadResult::Found(DfsReadData {
@@ -2241,7 +2241,7 @@ impl DfsPeerTransport for RecordingPeerTransport {
                 "unexpected DFS object RPC route {other}"
             ))),
         }?;
-        Ok(ObjectRpcSessionResult::value(response))
+        Ok(ObjectRpcResult::value(response))
     }
 }
 
@@ -2249,9 +2249,9 @@ impl AsyncDfsPeerTransport for RecordingPeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
         target_node_id: &'a NodeId,
-        call: ObjectRpcSessionCall,
+        call: ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
-    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcSessionResult, DfsPeerTransportError>> {
+    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>> {
         Box::pin(async move { self.call_object_rpc(target_node_id, call, options) })
     }
 }
@@ -2266,9 +2266,9 @@ impl DfsPeerTransport for ConcurrentMetadataPeerTransport {
     fn call_object_rpc(
         &self,
         _target_node_id: &NodeId,
-        call: ObjectRpcSessionCall,
+        call: ObjectRpcCall,
         _options: DfsObjectRpcSendOptions,
-    ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+    ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
         if !call.body.is_empty() {
             return Err(DfsPeerTransportError::new(
                 "metadata peer does not accept an attachment",
@@ -2302,7 +2302,7 @@ impl DfsPeerTransport for ConcurrentMetadataPeerTransport {
                 result: DfsMetadataJournalBatchResult::Applied,
             },
         )
-        .map(ObjectRpcSessionResult::value)
+        .map(ObjectRpcResult::value)
         .map_err(|source| DfsPeerTransportError::new(source.to_string()))
     }
 }
@@ -2737,10 +2737,6 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         dfs_metadata_journal_batch_rpc_request(&journal_command).expect("journal request");
     assert_eq!(journal_request.route, DFS_METADATA_JOURNAL_BATCH_ROUTE);
     assert_eq!(journal_request.category, DFS_RPC_CATEGORY);
-    assert!(
-        journal_request.uses_full_response_budget(),
-        "metadata journal apply may perform bounded durable work before responding"
-    );
     assert_eq!(
         journal_request
             .decode_body::<DfsMetadataJournalBatchCommand>()
@@ -2785,10 +2781,6 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         dfs_metadata_snapshot_install_rpc_request(&snapshot_command).expect("snapshot request");
     assert_eq!(snapshot_request.route, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE);
     assert_eq!(snapshot_request.category, DFS_RPC_CATEGORY);
-    assert!(
-        snapshot_request.uses_full_response_budget(),
-        "metadata snapshot install may perform bounded durable work before responding"
-    );
     assert_eq!(
         snapshot_request
             .decode_body::<DfsMetadataSnapshotInstallCommand>()
@@ -2835,10 +2827,6 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
     let message_request = dfs_message_rpc_request(&message_command).expect("message request");
     assert_eq!(message_request.route, DFS_DATA_READ_ROUTE);
     assert_eq!(message_request.category, DFS_RPC_CATEGORY);
-    assert!(
-        message_request.uses_full_response_budget(),
-        "DFS read data-plane message RPCs need the full verified final-hop response budget"
-    );
     assert_eq!(
         message_request
             .decode_body::<DfsMessageCommand>()
@@ -2880,10 +2868,6 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
     let namespace_request =
         dfs_message_rpc_request(&namespace_command).expect("namespace message request");
     assert_eq!(namespace_request.route, DFS_DATA_NAMESPACE_ROUTE);
-    assert!(
-        namespace_request.uses_full_response_budget(),
-        "DFS namespace message RPCs need the full verified final-hop response budget"
-    );
     assert!(
         !namespace_request.is_response_retry_safe(),
         "namespace mutations lack durable replay tracking and must not be redispatched"
@@ -3066,16 +3050,15 @@ async fn direct_read_rpc_keeps_blob_in_the_session_attachment() {
         .await
         .expect("read attachment");
     assert_eq!(received, bytes);
-    let decoded = dfs_direct_read_response_from_rpc_session_result(
-        sinomo_core::network::ObjectRpcSessionResult::new(
+    let decoded =
+        dfs_direct_read_response_from_rpc_result(sinomo_core::network::ObjectRpcResult::new(
             attachment_response.response,
             sinomo_core::network::ObjectRpcIncomingBody::bytes(received),
-        ),
-    )
-    .expect("decode")
-    .collect_to_read_response()
-    .await
-    .expect("collect direct read");
+        ))
+        .expect("decode")
+        .collect_to_read_response()
+        .await
+        .expect("collect direct read");
     let DfsReadResult::Found(data) = decoded.result else {
         panic!("expected found response");
     };
@@ -13873,14 +13856,14 @@ impl StatelessPrimaryPeerTransport {
     async fn call_object_rpc_inner(
         &self,
         target_node_id: &NodeId,
-        call: ObjectRpcSessionCall,
-    ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+        call: ObjectRpcCall,
+    ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
         if target_node_id != &self.primary_node_id {
             return Err(DfsPeerTransportError::new(format!(
                 "unexpected stateless DFS target {target_node_id}"
             )));
         }
-        let ObjectRpcSessionCall { request, body } = call;
+        let ObjectRpcCall { request, body } = call;
         let command = if body.is_empty() {
             decode_dfs_message_rpc_request(&request)
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
@@ -13944,13 +13927,13 @@ impl StatelessPrimaryPeerTransport {
                 attachment.descriptor,
             )
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-            return Ok(ObjectRpcSessionResult::new(
+            return Ok(ObjectRpcResult::new(
                 response,
                 ObjectRpcIncomingBody::bytes(bytes),
             ));
         }
         ObjectRpcResponse::encode_body(&request.route, &result.response)
-            .map(ObjectRpcSessionResult::value)
+            .map(ObjectRpcResult::value)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))
     }
 }
@@ -13959,9 +13942,9 @@ impl DfsPeerTransport for StatelessPrimaryPeerTransport {
     fn call_object_rpc(
         &self,
         target_node_id: &NodeId,
-        call: ObjectRpcSessionCall,
+        call: ObjectRpcCall,
         _options: DfsObjectRpcSendOptions,
-    ) -> Result<ObjectRpcSessionResult, DfsPeerTransportError> {
+    ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -13976,9 +13959,9 @@ impl AsyncDfsPeerTransport for StatelessPrimaryPeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
         target_node_id: &'a NodeId,
-        call: ObjectRpcSessionCall,
+        call: ObjectRpcCall,
         _options: DfsObjectRpcSendOptions,
-    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcSessionResult, DfsPeerTransportError>> {
+    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>> {
         Box::pin(self.call_object_rpc_inner(target_node_id, call))
     }
 }

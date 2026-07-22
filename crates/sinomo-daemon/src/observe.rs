@@ -216,7 +216,7 @@ fn register_observe_metric_descriptors() {
         ),
         (
             "sinomo.network.rpc.total.us",
-            "End-to-end canonical object RPC latency, including route selection and retries.",
+            "End-to-end stream-native object RPC latency, including route selection and retries.",
         ),
         (
             "sinomo.network.endpoint.open.us",

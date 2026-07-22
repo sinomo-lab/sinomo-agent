@@ -13,9 +13,6 @@
 //! here.
 
 mod builtin_link;
-mod channel;
-mod channel_transport;
-mod channel_wire;
 mod connectivity;
 mod connectivity_snapshot;
 mod connectivity_store;
@@ -47,51 +44,19 @@ mod routed_identity;
 mod routed_stream_pool;
 mod routing;
 mod rpc;
+mod rpc_body;
 mod rpc_future;
 mod service_rpc_stream;
-mod session;
-mod tcp_tunnel;
 mod timeline;
-// Framing and transfer state stay private beneath the canonical session API so
-// higher-level crates cannot assemble protocol frames themselves.
+// Framing and transfer state stay private so higher-level crates cannot
+// assemble protocol frames themselves.
 #[cfg(test)]
 mod layer_boundary_tests;
-mod transfer;
+mod policy;
 
 pub use builtin_link::{
     BuiltinTcpLinkProvider, ClusterLinkProvider, verify_builtin_authenticated_transport_metadata,
 };
-pub use channel::{
-    OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES, OBJECT_RPC_CHANNEL_INLINE_VALUE_BYTES,
-    OBJECT_RPC_CHANNEL_MAX_CALLS, OBJECT_RPC_CHANNEL_MAX_MATERIALIZED_VALUE_BYTES,
-    OBJECT_RPC_CHANNEL_MAX_QUEUED_BYTES, ObjectRpcChannelBodyDescriptor,
-    ObjectRpcChannelBodyDirection, ObjectRpcChannelBodyKind, ObjectRpcChannelCallId,
-    ObjectRpcChannelClient, ObjectRpcChannelConfig, ObjectRpcChannelEgress,
-    ObjectRpcChannelEndpoint, ObjectRpcChannelInboundRequest, ObjectRpcChannelIngress,
-    ObjectRpcChannelPendingCall, ObjectRpcChannelQueueSnapshot, ObjectRpcChannelResponder,
-    ObjectRpcChannelRole, ObjectRpcChannelServer, ObjectRpcChannelWireFrame,
-    ObjectRpcChannelWriteTimeline,
-};
-pub use channel_transport::{
-    AcceptedLocalObjectRpcChannel, ConnectedLocalObjectRpcChannel,
-    LOCAL_OBJECT_RPC_CHANNEL_PROTOCOL_VERSION, LocalObjectRpcChannelTransport,
-    accept_local_object_rpc_channel_async, connect_local_object_rpc_channel_async,
-    local_object_rpc_channel_wire_prefix_matches,
-};
-/// Carrier-only surface needed by the daemon crate through the R0 facade.
-/// This is not a second application RPC API.
-#[doc(hidden)]
-pub mod __channel_carrier {
-    pub use super::channel_wire::{
-        OBJECT_RPC_CHANNEL_DATA_HEADER_BYTES, OBJECT_RPC_CHANNEL_DATA_MAGIC,
-        OBJECT_RPC_CHANNEL_DATA_VERSION, OBJECT_RPC_CHANNEL_RECEIVE_BUFFER_BYTES,
-        ObjectRpcChannelDataFrame, ObjectRpcChannelDataHeader, ObjectRpcChannelReceiveBufferPool,
-        ObjectRpcChannelTransportFrame, read_object_rpc_channel_transport_frame_async,
-        read_object_rpc_channel_transport_frame_async_timed,
-        write_object_rpc_channel_data_frame_async, write_object_rpc_channel_transport_frame_async,
-        write_object_rpc_channel_transport_frame_async_timed,
-    };
-}
 /// Internal generation-fenced local connectivity-store boundary used by the
 /// daemon's reactive projection owner.
 #[doc(hidden)]
@@ -249,14 +214,10 @@ pub use network_info::{
     cluster_network_info_publish_record_matches,
 };
 pub use network_module::{
-    NETWORK_MODULES_ADMIN_CAPABILITY, NETWORK_MODULES_LIST_ROUTE, NETWORK_MODULES_RPC_CATEGORY,
-    NETWORK_MODULES_RPC_ROUTE_POLICIES, NETWORK_MODULES_RPC_ROUTES,
-    NETWORK_MODULES_SET_ENABLED_ROUTE, NetworkFuture, NetworkModule, NetworkModuleContext,
-    NetworkModuleDescriptor, NetworkModuleEndpointRole, NetworkModuleListResponse,
-    NetworkModuleRegistry, NetworkModuleRoutePolicy, NetworkModuleSetEnabledRequest,
-    NetworkModuleSetEnabledResponse, NetworkModuleStatus, RegisteredNetworkModuleLinkProvider,
-    authenticated_transport_metadata_matches_endpoint, network_module_registry,
-    network_modules_rpc_route_policy, set_network_module_registry,
+    NetworkFuture, NetworkModule, NetworkModuleContext, NetworkModuleDescriptor,
+    NetworkModuleEndpointRole, NetworkModuleRegistry, NetworkModuleStatus,
+    RegisteredNetworkModuleLinkProvider, authenticated_transport_metadata_matches_endpoint,
+    network_module_registry, set_network_module_registry,
 };
 pub use network_module_abi::FfiNetworkModule;
 pub use object::try_clone_id;
@@ -269,9 +230,9 @@ pub use object_file_store::{
 pub use path_metrics::{
     NetworkPathEstimate, NetworkPathEstimator, NetworkPathKey, shared_network_path_estimator,
 };
+pub use policy::{NetworkCallPolicy, NetworkHealthPolicy};
 pub use route::cluster_healthy_route_next_hop;
 pub use route::cluster_route_next_hop;
-pub use route::invalidate_cluster_delivery_routing_table_cache;
 pub use route_graph_read_model::invalidate_cluster_route_graph_cache;
 pub use route_graph_read_model::{
     read_cluster_connectivity_graph, read_cluster_connectivity_graph_with_query,
@@ -292,40 +253,20 @@ pub use rpc::{
     CLUSTER_HEALTH_INCLUDE_PEER_VIEWS_METADATA_KEY, CLUSTER_HEALTH_SCOPE_LOCAL,
     CLUSTER_HEALTH_SCOPE_METADATA_KEY,
 };
-pub use transfer::{NetworkCallPolicy, NetworkHealthPolicy};
-// Unconditional since stage C: dylib network modules reuse the object frame
-// codec through the sinomo-core facade.
+// Dylib network modules reuse the object-frame codec through the sinomo-core
+// facade.
+pub use object::write_object_frame_async;
 pub use object::{
     AsyncDaemonControlListener, AsyncDaemonControlStream, DEFAULT_NETWORK_TIMEOUT,
-    DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts,
-    MAX_OBJECT_RPC_CHANNEL_WIRE_FRAME_BYTES, ObjectFrameIoOptions, ObjectFrameReadTiming,
-    ObjectFrameReadinessProbe, ObjectFrameWriteTiming, SinomoObjectCodec,
-    write_borrowed_object_frame_async,
+    DaemonControlRequest, DaemonControlResponse, DaemonRpcTimeouts, ObjectFrameIoOptions,
+    SinomoObjectCodec, write_borrowed_object_frame_async,
 };
-pub use object::{
-    read_object_frame_async, read_object_frame_async_with_max_bytes,
-    read_object_frame_async_with_max_bytes_after_first_byte,
-    read_object_frame_async_with_max_bytes_after_first_byte_timed,
-};
-pub use object::{write_object_frame_async, write_object_frame_async_timed};
-// Unconditional since stage C: see read_object_frame_async above.
 pub use object::{decode_single_object_frame_from_slice, encode_object_frame_to_vec};
-/// Stream-native object-RPC contract and the temporary service-catalog adapter
-/// used during bounded Stage-F migration.
-#[doc(hidden)]
-pub mod __object_rpc_stream_contract {
-    pub use super::object_rpc_stream::{
-        OBJECT_RPC_STREAM_INLINE_BODY_BYTES, OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES,
-        OBJECT_RPC_STREAM_MAX_HEAD_BYTES, OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES,
-        ObjectRpcBodyVerification, ObjectRpcStreamBody, ObjectRpcStreamBodyVerifier,
-        ObjectRpcStreamCall, ObjectRpcStreamIncomingBody, ObjectRpcStreamIncomingCall,
-        ObjectRpcStreamReply, ObjectRpcStreamResponse, RpcDeliveryOutcome, RpcPeerContext,
-        RpcPeerIdentity, call_object_rpc_stream, local_object_rpc_stream_prelude_prefix_matches,
-        read_local_object_rpc_stream_prelude, serve_object_rpc_stream,
-        write_local_object_rpc_stream_prelude,
-    };
-    pub use super::service_rpc_stream::{call_service_rpc_stream, serve_service_rpc_stream};
-}
+pub use object::{read_object_frame_async, read_object_frame_async_with_max_bytes};
+pub use object_rpc_stream::{
+    RpcPeerContext, RpcPeerIdentity, local_object_rpc_stream_prelude_prefix_matches,
+    read_local_object_rpc_stream_prelude,
+};
 pub use paths::ClusterPaths;
 pub use peer::{
     AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions, InProcessNetwork,
@@ -333,55 +274,37 @@ pub use peer::{
 };
 pub use roaming::open_daemon_rpc_stream_to_cluster_endpoint_async;
 pub use route::{
-    CLUSTER_RELAY_ORIGIN_NODE_ID_METADATA_KEY, CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY,
-    CLUSTER_ROUTING_RPC_ROUTE_METADATA, ClusterObjectRpcClient, ClusterObjectRpcOptions,
-    ClusterRelaySessionRequestAction, ClusterSignedObjectRpcAsyncHost,
-    ClusterSignedObjectRpcFuture, ClusterSignedObjectRpcObservation, RelayEnvelope,
-    cluster_relay_session_request_action, relay_request_inner_route,
-    relay_response_is_routing_error,
+    ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterSignedObjectRpcAsyncHost,
+    ClusterSignedObjectRpcFuture, ClusterSignedObjectRpcObservation,
 };
 pub use rpc::{
-    CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_HEALTH_RPC_ROUTE_METADATA,
-    CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE,
-    CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY,
-    CLUSTER_MEMBERSHIP_RPC_ROUTE_METADATA, CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
-    CLUSTER_NETWORK_PING_ROUTE, CLUSTER_NETWORK_RPC_CATEGORY, CLUSTER_NETWORK_RPC_ROUTE_METADATA,
-    OBJECT_RPC_ERROR_DETAIL_METADATA_KEY, OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY,
-    OBJECT_RPC_TRACEPARENT_METADATA_KEY, OBJECT_RPC_TRACESTATE_METADATA_KEY, ObjectRouteDescriptor,
-    ObjectRpcAuthorizationContext, ObjectRpcAuthorizationLayer, ObjectRpcBodyMode,
-    ObjectRpcCancelRequest, ObjectRpcCancelResponse, ObjectRpcCategoryDefinition, ObjectRpcRequest,
-    ObjectRpcResponse, ObjectRpcRouteCatalog, ObjectRpcRoutePolicyLayer, ObjectRpcRouteReadiness,
-    ObjectRpcRouteRegistry, ObjectRpcRouteRegistryBuilder, ObjectRpcRouter, ObjectRpcSessionFuture,
-    ServiceCatalog, ServiceCatalogSnapshot, ServiceCategory, call_object_rpc_session_service_async,
+    CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_INVITE_PUBLISH_ROUTE,
+    CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE, CLUSTER_MEMBER_PUBLISH_ROUTE,
+    CLUSTER_MEMBERSHIP_RPC_CATEGORY, CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
+    CLUSTER_NETWORK_PING_ROUTE, CLUSTER_NETWORK_RPC_CATEGORY, OBJECT_RPC_ERROR_DETAIL_METADATA_KEY,
+    OBJECT_RPC_OBSERVE_SAMPLED_METADATA_KEY, OBJECT_RPC_TRACEPARENT_METADATA_KEY,
+    OBJECT_RPC_TRACESTATE_METADATA_KEY, ObjectRpcCancelRequest, ObjectRpcCancelResponse,
+    ObjectRpcRequest, ObjectRpcResponse,
+};
+pub use rpc_body::{
+    ObjectRpcBodySource, ObjectRpcCall, ObjectRpcIncomingBody, ObjectRpcIncomingRequest,
+    ObjectRpcOutgoingResponse, ObjectRpcResult,
 };
 pub use rpc_future::ClusterMembershipRpcFuture;
-pub use session::{
-    ObjectRpcBodySource, ObjectRpcIncomingBody, ObjectRpcSessionCall, ObjectRpcSessionRequest,
-    ObjectRpcSessionResponder, ObjectRpcSessionResponse, ObjectRpcSessionResult,
-    accept_object_rpc_server_session, object_rpc_session_wire_prefix_matches,
-};
+pub use service_rpc_stream::serve_service_rpc_stream;
 #[cfg(any(test, feature = "test-support"))]
 pub use sinomo_node::upsert_member_record;
-pub use tcp_tunnel::{
-    CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX, CLUSTER_TCP_TUNNEL_HANDSHAKE_PROTOCOL,
-    CLUSTER_TCP_TUNNEL_OPEN_ROUTE, CLUSTER_TCP_TUNNEL_PROTOCOL_VERSION,
-    CLUSTER_TCP_TUNNEL_RPC_CATEGORY, ClusterTcpTunnelFrame, ClusterTcpTunnelHandshakeProof,
-    ClusterTcpTunnelHandshakeTranscript, ClusterTcpTunnelOpenRequest, ClusterTcpTunnelOpenResponse,
-    negotiate_cluster_tcp_tunnel_protocol, sign_cluster_tcp_tunnel_handshake_from_data_dir,
-    verify_cluster_tcp_tunnel_handshake,
-};
 pub use timeline::{
     NETWORK_TIMELINE_DEFAULT_MAX_EVENTS, NETWORK_TIMELINE_EVENT_BYTES,
     NETWORK_TIMELINE_MAX_CAPTURE_BYTES, NETWORK_TIMELINE_MAX_ENDPOINT_IDENTITIES,
     NetworkTimelineCaptureError, NetworkTimelineEndpointIdentity, NetworkTimelineEvent,
     NetworkTimelineSnapshot, NetworkTimelineTraceContext, NetworkTimelineTraceparentError,
-    network_timeline_capture_is_active, network_timeline_channel_lookup_outcome,
-    network_timeline_flag, network_timeline_monotonic_ns, network_timeline_stage,
-    network_timeline_stage_name, network_timeline_trace_context_for_request,
-    parse_network_timeline_traceparent, record_network_timeline_event,
-    record_network_timeline_event_now, register_network_timeline_endpoint,
-    snapshot_network_timeline_capture, start_network_timeline_capture,
-    stop_network_timeline_capture,
+    network_timeline_capture_is_active, network_timeline_flag, network_timeline_monotonic_ns,
+    network_timeline_stage, network_timeline_stage_name,
+    network_timeline_trace_context_for_request, parse_network_timeline_traceparent,
+    record_network_timeline_event, record_network_timeline_event_now,
+    register_network_timeline_endpoint, snapshot_network_timeline_capture,
+    start_network_timeline_capture, stop_network_timeline_capture,
 };
 
 pub type ClusterEndpointId = sinomo_base::Id;
@@ -390,11 +313,6 @@ pub const NETWORK_PROTOCOL: &str = "sinomo.network.v1";
 pub const SINOMO_NETWORK_MODULE_ID: &str = "module.network";
 pub const SINOMO_NETWORK_MODULE_OWNER: &str = "sinomo-network";
 pub const SINOMO_NETWORK_NATIVE_REGISTRATION_KEY: &str = "sinomo-network";
-pub const NETWORK_OBJECT_RPC_ROUTES: &[&str] = &[
-    CLUSTER_HEALTH_ROUTE,
-    CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
-    CLUSTER_NETWORK_PING_ROUTE,
-];
 pub const CLUSTER_HEALTH_READ_CAPABILITY: &str = "cluster.health.read";
 pub const CLUSTER_NETWORK_CONNECTIVITY_READ_CAPABILITY: &str = "cluster.network.connectivity.read";
 pub const CLUSTER_NETWORK_PING_CAPABILITY: &str = "cluster.network.ping";
@@ -435,62 +353,6 @@ Inspect the current Sinomo cluster network state with the native network module
 health route. Summarize reachable and unreachable nodes, stale observations,
 route or endpoint symptoms, and the narrowest next diagnostic command or tool.
 "#;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NetworkModuleRouteAuth {
-    LocalCommand,
-    LocalOrClusterMember,
-    ClusterMember,
-    Admin,
-}
-
-impl NetworkModuleRouteAuth {
-    pub fn as_scope(self) -> &'static str {
-        match self {
-            Self::LocalCommand => "local-command",
-            Self::LocalOrClusterMember => "local-or-cluster-member",
-            Self::ClusterMember => "cluster-member",
-            Self::Admin => "admin",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NetworkObjectRpcToolSurface {
-    pub route: &'static str,
-    pub category: &'static str,
-    pub operation: &'static str,
-    pub auth: NetworkModuleRouteAuth,
-    pub request_body_mode: ObjectRpcBodyMode,
-    pub response_body_mode: ObjectRpcBodyMode,
-}
-
-pub const NETWORK_OBJECT_RPC_TOOL_SURFACES: &[NetworkObjectRpcToolSurface] = &[
-    NetworkObjectRpcToolSurface {
-        route: CLUSTER_HEALTH_ROUTE,
-        category: CLUSTER_HEALTH_RPC_CATEGORY,
-        operation: CLUSTER_HEALTH_READ_CAPABILITY,
-        auth: NetworkModuleRouteAuth::LocalOrClusterMember,
-        request_body_mode: ObjectRpcBodyMode::None,
-        response_body_mode: ObjectRpcBodyMode::None,
-    },
-    NetworkObjectRpcToolSurface {
-        route: CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
-        category: CLUSTER_NETWORK_RPC_CATEGORY,
-        operation: CLUSTER_NETWORK_CONNECTIVITY_READ_CAPABILITY,
-        auth: NetworkModuleRouteAuth::LocalOrClusterMember,
-        request_body_mode: ObjectRpcBodyMode::None,
-        response_body_mode: ObjectRpcBodyMode::None,
-    },
-    NetworkObjectRpcToolSurface {
-        route: CLUSTER_NETWORK_PING_ROUTE,
-        category: CLUSTER_NETWORK_RPC_CATEGORY,
-        operation: CLUSTER_NETWORK_PING_CAPABILITY,
-        auth: NetworkModuleRouteAuth::LocalOrClusterMember,
-        request_body_mode: ObjectRpcBodyMode::Optional,
-        response_body_mode: ObjectRpcBodyMode::Optional,
-    },
-];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkDeclarativeResourceKind {
@@ -572,12 +434,8 @@ pub(crate) mod prelude {
         ClusterTransportKind,
     };
     pub(crate) use sinomo_events::EventStoreError;
-    #[cfg(test)]
-    pub(crate) use sinomo_local::SinomoDataDir;
     pub(crate) use sinomo_node::ClusterId;
     pub(crate) use sinomo_node::NodeId;
-    #[cfg(test)]
-    pub(crate) use sinomo_node::main_daemon_capabilities;
     pub(crate) use std::collections::{BTreeMap, BTreeSet, VecDeque};
     pub(crate) use std::io;
     pub(crate) use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -713,20 +571,5 @@ pub use roaming::WebRtcSignalMessage;
 pub use roaming::WebRtcSignalingEnvelope;
 #[cfg(any(test, feature = "test-support"))]
 pub use roaming::configure_daemon_control_stream_idle_timeout;
-#[cfg(any(test, feature = "test-support"))]
-#[cfg(any(test, feature = "test-support"))]
-pub use route::ClusterDeliveryFailedEdges;
-#[cfg(any(test, feature = "test-support"))]
-pub use route::ClusterDeliveryRouteGraph;
-#[cfg(any(test, feature = "test-support"))]
-pub use route::cluster_delivery_build_routing_table;
-#[cfg(any(test, feature = "test-support"))]
-pub use route::cluster_delivery_route_plan;
-#[cfg(any(test, feature = "test-support"))]
-pub use route::cluster_delivery_route_plan_async;
-#[cfg(any(test, feature = "test-support"))]
-pub use route::cluster_delivery_routing_table_cache_mark;
-#[cfg(any(test, feature = "test-support"))]
-pub use route::cluster_delivery_shortest_path_next_hop;
 #[cfg(any(test, feature = "test-support"))]
 pub use route_graph_read_model::cluster_route_graph_cache_mark;

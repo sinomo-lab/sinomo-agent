@@ -27,13 +27,13 @@
 //! The entry symbol names the authenticated-link ABI. The table is self-describing,
 //! and every callback slot is nullable until the host validates it.
 
+use crate::NetworkHealthPolicy;
 use crate::direct_link::{AuthenticatedLink, AuthenticatedTransportMetadata, BoxedNetworkStream};
 use crate::error::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
 use crate::network_module::{
     NetworkFuture, NetworkModule, NetworkModuleContext, NetworkModuleDescriptor,
     NetworkModuleEndpointRole,
 };
-use crate::transfer::NetworkHealthPolicy;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sinomo_base::{ClusterEndpointRecord, Id};

@@ -1,7 +1,7 @@
-use crate::transfer::TransferId;
 use crate::{ClusterPaths, NetworkError, ObjectRpcRequest, SinomoObjectCodec};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::digest;
+#[cfg(test)]
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sinomo_local::SinomoDataDir;
@@ -17,10 +17,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 pub const DAEMON_AUTH_PROTOCOL: &str = "sinomo.daemon-auth.v1";
-pub(crate) const RESPONSE_IDENTITY_PROOF_PROTOCOL: &str = "sinomo.rpc-response-identity.v1";
-
 const DAEMON_RPC_REQUEST_DIGEST_DOMAIN: &[u8] = b"sinomo.daemon-rpc-request\0";
-const LOCAL_CHANNEL_AUTH_PROTOCOL: &[u8] = b"sinomo.local-object-rpc-channel.v1\0";
 const DAEMON_SIGNING_IDENTITY_MAX_AGE: Duration = Duration::from_secs(1);
 
 static DAEMON_SIGNING_IDENTITIES: OnceLock<Mutex<HashMap<PathBuf, CachedDaemonSigningIdentity>>> =
@@ -40,144 +37,6 @@ struct CachedDaemonSigningIdentity {
     identity_mark: Option<crate::file_mark::ClusterFileMark>,
     cluster_state_mark: Option<crate::file_mark::ClusterFileMark>,
     checked_at: Instant,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LocalChannelProofRole {
-    Server,
-    Client,
-}
-
-impl LocalChannelProofRole {
-    fn domain_byte(self) -> u8 {
-        match self {
-            Self::Server => 1,
-            Self::Client => 2,
-        }
-    }
-}
-
-/// Process-cached daemon principal captured once for a physical local channel.
-///
-/// Keeping the key pair private to this module prevents the transport from
-/// accidentally growing per-call signing. The channel uses this handle only
-/// during its nonce-bound connection handshake.
-#[derive(Clone)]
-pub(crate) struct LocalChannelAuthIdentity {
-    identity: CachedDaemonSigningIdentity,
-}
-
-impl LocalChannelAuthIdentity {
-    pub(crate) fn from_data_dir(data_dir: &SinomoDataDir) -> Result<Self, NetworkError> {
-        Ok(Self {
-            identity: cached_daemon_signing_identity(data_dir)?,
-        })
-    }
-
-    pub(crate) fn binding(&self) -> [u8; 32] {
-        let mut payload = Vec::with_capacity(
-            LOCAL_CHANNEL_AUTH_PROTOCOL.len()
-                + self.identity.node_id.len()
-                + self.identity.public_key.len()
-                + 32,
-        );
-        payload.extend_from_slice(LOCAL_CHANNEL_AUTH_PROTOCOL);
-        payload.extend_from_slice(b"identity\0");
-        local_channel_append_bytes(&mut payload, self.identity.node_id.as_bytes());
-        local_channel_append_bytes(&mut payload, &self.identity.public_key);
-        let digest = digest::digest(&digest::SHA256, &payload);
-        digest
-            .as_ref()
-            .try_into()
-            .expect("SHA-256 daemon identity binding")
-    }
-
-    pub(crate) fn sign(&self, role: LocalChannelProofRole, transcript: &[u8]) -> Vec<u8> {
-        let payload = local_channel_proof_payload(
-            role,
-            &self.identity.node_id,
-            &self.identity.public_key,
-            transcript,
-        );
-        self.identity.key_pair.sign(&payload).as_ref().to_vec()
-    }
-
-    pub(crate) fn verify(
-        &self,
-        role: LocalChannelProofRole,
-        transcript: &[u8],
-        signature: &[u8],
-    ) -> Result<(), NetworkError> {
-        let payload = local_channel_proof_payload(
-            role,
-            &self.identity.node_id,
-            &self.identity.public_key,
-            transcript,
-        );
-        UnparsedPublicKey::new(&ED25519, &self.identity.public_key)
-            .verify(&payload, signature)
-            .map_err(|_| NetworkError::AuthDenied)
-    }
-}
-
-fn local_channel_proof_payload(
-    role: LocalChannelProofRole,
-    node_id: &str,
-    public_key: &[u8],
-    transcript: &[u8],
-) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(
-        LOCAL_CHANNEL_AUTH_PROTOCOL.len()
-            + node_id.len()
-            + public_key.len()
-            + transcript.len()
-            + 32,
-    );
-    payload.extend_from_slice(LOCAL_CHANNEL_AUTH_PROTOCOL);
-    payload.push(role.domain_byte());
-    local_channel_append_bytes(&mut payload, node_id.as_bytes());
-    local_channel_append_bytes(&mut payload, public_key);
-    local_channel_append_bytes(&mut payload, transcript);
-    payload
-}
-
-fn local_channel_append_bytes(payload: &mut Vec<u8>, bytes: &[u8]) {
-    payload.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-    payload.extend_from_slice(bytes);
-}
-
-/// Session-local identity signer loaded once when a duplex stream is established.
-///
-/// The signer attests that the expected node produced a response for a logical
-/// session. It deliberately does not sign response content or transport data.
-#[derive(Clone)]
-pub(crate) struct SessionIdentitySigner {
-    identity: CachedDaemonSigningIdentity,
-}
-
-impl SessionIdentitySigner {
-    pub(crate) fn from_data_dir(data_dir: &SinomoDataDir) -> Result<Self, NetworkError> {
-        Ok(Self {
-            identity: cached_daemon_signing_identity(data_dir)?,
-        })
-    }
-
-    pub(crate) fn sign_response_identity(
-        &self,
-        input: ResponseIdentityProofInput,
-    ) -> SignedResponseIdentityProof {
-        let identity = &self.identity;
-        let payload =
-            response_identity_signing_payload(&identity.node_id, &identity.public_key, &input);
-        let signature = identity.key_pair.sign(&payload);
-        SignedResponseIdentityProof {
-            protocol: RESPONSE_IDENTITY_PROOF_PROTOCOL.to_string(),
-            signer_node_id: identity.node_id.clone(),
-            public_key: identity.public_key.clone(),
-            input,
-            signature: signature.as_ref().to_vec(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -203,74 +62,6 @@ pub struct SignedDaemonCommand {
         deserialize_with = "crate::fallible_serde::deserialize_bytes"
     )]
     pub signature: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct ResponseIdentityProofInput {
-    pub session_id: TransferId,
-}
-
-/// Target identity attestation carried in a response head. The proof is bound
-/// only to the logical session, not to response or body content.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SignedResponseIdentityProof {
-    pub protocol: String,
-    pub signer_node_id: String,
-    #[serde(
-        serialize_with = "crate::fallible_serde::serialize_bytes",
-        deserialize_with = "crate::fallible_serde::deserialize_bytes"
-    )]
-    pub public_key: Vec<u8>,
-    pub input: ResponseIdentityProofInput,
-    #[serde(
-        serialize_with = "crate::fallible_serde::serialize_bytes",
-        deserialize_with = "crate::fallible_serde::deserialize_bytes"
-    )]
-    pub signature: Vec<u8>,
-}
-
-fn session_frame_append_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
-    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    output.extend_from_slice(&len.to_be_bytes());
-    output.extend_from_slice(bytes);
-}
-
-fn response_identity_signing_payload(
-    signer_node_id: &str,
-    public_key: &[u8],
-    input: &ResponseIdentityProofInput,
-) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(
-        RESPONSE_IDENTITY_PROOF_PROTOCOL.len()
-            + signer_node_id.len()
-            + public_key.len()
-            + input.session_id.as_str().len()
-            + 32,
-    );
-    payload.extend_from_slice(RESPONSE_IDENTITY_PROOF_PROTOCOL.as_bytes());
-    payload.push(0);
-    session_frame_append_bytes(&mut payload, signer_node_id.as_bytes());
-    session_frame_append_bytes(&mut payload, public_key);
-    session_frame_append_bytes(&mut payload, input.session_id.as_str().as_bytes());
-    payload
-}
-
-pub(crate) fn verify_response_identity_proof(
-    proof: &SignedResponseIdentityProof,
-    expected_public_key: &[u8],
-    expected_session_id: &TransferId,
-) -> Result<(), NetworkError> {
-    if proof.protocol != RESPONSE_IDENTITY_PROOF_PROTOCOL
-        || proof.public_key != expected_public_key
-        || &proof.input.session_id != expected_session_id
-    {
-        return Err(NetworkError::AuthDenied);
-    }
-    let payload =
-        response_identity_signing_payload(&proof.signer_node_id, expected_public_key, &proof.input);
-    UnparsedPublicKey::new(&ED25519, expected_public_key)
-        .verify(&payload, &proof.signature)
-        .map_err(|_| NetworkError::AuthDenied)
 }
 
 pub fn sign_daemon_rpc_request_for_local_node(
@@ -347,10 +138,7 @@ pub fn try_sign_daemon_rpc_request_digest_from_cached_data_dir(
 pub fn daemon_rpc_body_sha256(request: &ObjectRpcRequest) -> Vec<u8> {
     let mut digest = digest::Context::new(&digest::SHA256);
     digest.update(DAEMON_RPC_REQUEST_DIGEST_DOMAIN);
-    daemon_rpc_digest_update_bytes(
-        &mut digest,
-        crate::session::daemon_auth_request_head_body(request),
-    );
+    daemon_rpc_digest_update_bytes(&mut digest, &request.body);
     daemon_rpc_digest_update_len(&mut digest, request.metadata.len());
     for (key, value) in &request.metadata {
         daemon_rpc_digest_update_bytes(&mut digest, key.as_bytes());
@@ -990,27 +778,5 @@ mod tests {
                 .is_none(),
             "the rejected fill must leave the transitioned data directory uncached"
         );
-    }
-
-    #[test]
-    fn response_identity_proof_binds_the_expected_node_and_session() {
-        let root = sinomo_testdir::TestDir::new("sinomo-network-response-identity-proof");
-        let data_dir = SinomoDataDir::new(root.path());
-        let session_id = TransferId::generate();
-        let proof = SessionIdentitySigner::from_data_dir(&data_dir)
-            .expect("identity signer")
-            .sign_response_identity(ResponseIdentityProofInput {
-                session_id: session_id.clone(),
-            });
-        verify_response_identity_proof(&proof, &proof.public_key, &session_id)
-            .expect("valid response identity proof");
-        assert!(matches!(
-            verify_response_identity_proof(&proof, &[0_u8; 32], &session_id),
-            Err(NetworkError::AuthDenied)
-        ));
-        assert!(matches!(
-            verify_response_identity_proof(&proof, &proof.public_key, &TransferId::generate()),
-            Err(NetworkError::AuthDenied)
-        ));
     }
 }

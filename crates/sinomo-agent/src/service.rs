@@ -841,7 +841,7 @@ mod tests {
     };
     use sinomo_lm::{LanguageModelError, LanguageModelRequest, LanguageModelResponse};
     use sinomo_runtime::local::SinomoDataDir;
-    use sinomo_runtime::network::{ObjectRpcIncomingBody, ObjectRpcSessionResponse};
+    use sinomo_runtime::network::{ObjectRpcIncomingBody, ObjectRpcOutgoingResponse};
     use sinomo_runtime::service::{ResponseSink, ServiceRegistry, ServiceSigner};
     use std::future::Future;
     use std::pin::Pin;
@@ -860,7 +860,7 @@ mod tests {
     }
 
     impl ResponseSink for TestSink {
-        fn send(self: Box<Self>, response: ObjectRpcSessionResponse) -> Result<(), ServiceError> {
+        fn send(self: Box<Self>, response: ObjectRpcOutgoingResponse) -> Result<(), ServiceError> {
             if !response.body.is_empty() {
                 return Err(ServiceError::Service(
                     "agent test sink received an unexpected response body".to_string(),
@@ -1043,7 +1043,7 @@ mod tests {
         )
         .expect("request");
 
-        block_on_ready(registry.dispatch_direct(ctx, request)).expect("dispatch");
+        block_on_ready(registry.dispatch(ctx, request)).expect("dispatch");
 
         let frames = sink.frames();
         assert_eq!(frames.len(), 1);
@@ -1114,7 +1114,7 @@ mod tests {
         )
         .expect("request");
 
-        block_on_ready(registry.dispatch_direct(ctx, request)).expect("dispatch");
+        block_on_ready(registry.dispatch(ctx, request)).expect("dispatch");
 
         assert_eq!(host.calls(), vec!["steer"]);
         let frames = sink.frames();
@@ -1151,7 +1151,7 @@ mod tests {
         )
         .expect("request");
 
-        block_on_ready(registry.dispatch_direct(ctx, request)).expect("dispatch");
+        block_on_ready(registry.dispatch(ctx, request)).expect("dispatch");
 
         assert_eq!(host.calls(), vec!["resume"]);
         let frames = sink.frames();
@@ -1223,7 +1223,7 @@ mod tests {
         )
         .expect("request");
 
-        block_on_ready(registry.dispatch_direct(ctx, request)).expect("dispatch");
+        block_on_ready(registry.dispatch(ctx, request)).expect("dispatch");
 
         let frames = sink.frames();
         assert_eq!(frames.len(), 1);
@@ -1300,7 +1300,7 @@ mod tests {
         )
         .expect("request");
 
-        block_on_ready(registry.dispatch_direct(ctx, request)).expect("dispatch");
+        block_on_ready(registry.dispatch(ctx, request)).expect("dispatch");
 
         let frames = sink.frames();
         assert_eq!(frames.len(), 1);
@@ -1377,7 +1377,7 @@ mod tests {
         )
         .expect("request");
 
-        block_on_ready(registry.dispatch_direct(ctx, request)).expect("dispatch");
+        block_on_ready(registry.dispatch(ctx, request)).expect("dispatch");
 
         let frames = sink.frames();
         assert_eq!(frames.len(), 1);

@@ -10,13 +10,11 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 const RTT_NEW_SAMPLE_WEIGHT: u64 = 8;
 const BANDWIDTH_NEW_SAMPLE_WEIGHT: u64 = 4;
 const SHARED_NETWORK_PATH_CAPACITY: usize = 4_096;
 const SHARED_NETWORK_PATH_OVERFLOW_BUCKETS: usize = 64;
-pub(crate) const NETWORK_PEER_RECEIVE_CREDIT_BYTES: usize = 256 * 1024 * 1024;
 
 /// Stable key for measurements shared by users of `sinomo-network`.
 ///
@@ -212,97 +210,20 @@ fn ewma(previous: Option<u64>, sample: u64, new_sample_weight: u64) -> u64 {
     .unwrap_or(u64::MAX)
 }
 
-#[derive(Debug)]
-struct NetworkPeerReceiveCredit {
-    semaphore: Arc<Semaphore>,
-    limit_bytes: usize,
-}
-
-impl NetworkPeerReceiveCredit {
-    fn new(limit_bytes: usize) -> Self {
-        Self {
-            semaphore: Arc::new(Semaphore::new(limit_bytes)),
-            limit_bytes,
-        }
-    }
-
-    async fn reserve(
-        &self,
-        bytes: u64,
-    ) -> Result<NetworkPeerReceiveCreditLease, crate::NetworkError> {
-        let bytes = usize::try_from(bytes).map_err(|_| crate::NetworkError::ResourceExhausted {
-            operation: "reserve peer receive credit".to_string(),
-            requested_bytes: usize::MAX,
-        })?;
-        if bytes == 0 || bytes > self.limit_bytes || bytes > u32::MAX as usize {
-            return Err(crate::NetworkError::ResourceExhausted {
-                operation: "reserve peer receive credit".to_string(),
-                requested_bytes: bytes,
-            });
-        }
-        let permit = Arc::clone(&self.semaphore)
-            .acquire_many_owned(bytes as u32)
-            .await
-            .map_err(|_| crate::NetworkError::Io {
-                operation: "reserve peer receive credit".to_string(),
-                detail: "peer receive credit budget is closed".to_string(),
-            })?;
-        Ok(NetworkPeerReceiveCreditLease {
-            semaphore: Arc::clone(&self.semaphore),
-            permits: vec![permit],
-            reserved_bytes: bytes as u64,
-            limit_bytes: self.limit_bytes as u64,
-        })
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct NetworkPeerReceiveCreditLease {
-    semaphore: Arc<Semaphore>,
-    permits: Vec<OwnedSemaphorePermit>,
-    reserved_bytes: u64,
-    limit_bytes: u64,
-}
-
-impl NetworkPeerReceiveCreditLease {
-    pub(crate) fn try_grow_to(&mut self, desired_bytes: u64) -> u64 {
-        let desired_bytes = desired_bytes.min(self.limit_bytes);
-        let additional = desired_bytes.saturating_sub(self.reserved_bytes);
-        let Ok(additional) = u32::try_from(additional) else {
-            return self.reserved_bytes;
-        };
-        if additional == 0 {
-            return self.reserved_bytes;
-        }
-        match Arc::clone(&self.semaphore).try_acquire_many_owned(additional) {
-            Ok(permit) => {
-                self.permits.push(permit);
-                self.reserved_bytes = self.reserved_bytes.saturating_add(u64::from(additional));
-            }
-            Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {}
-        }
-        self.reserved_bytes
-    }
-}
-
 #[derive(Clone, Debug)]
 struct SharedNetworkPathResources {
     estimator: NetworkPathEstimator,
-    receive_credit: Arc<NetworkPeerReceiveCredit>,
 }
 
 impl SharedNetworkPathResources {
     fn new() -> Self {
         Self {
             estimator: NetworkPathEstimator::new(),
-            receive_credit: Arc::new(NetworkPeerReceiveCredit::new(
-                NETWORK_PEER_RECEIVE_CREDIT_BYTES,
-            )),
         }
     }
 
     fn registry_only(&self) -> bool {
-        self.estimator.registry_only() && Arc::strong_count(&self.receive_credit) == 1
+        self.estimator.registry_only()
     }
 }
 
@@ -387,16 +308,6 @@ fn shared_network_path_resources(key: &NetworkPathKey) -> SharedNetworkPathResou
 /// Returns the process-shared estimator for a stable network path key.
 pub fn shared_network_path_estimator(key: &NetworkPathKey) -> NetworkPathEstimator {
     shared_network_path_resources(key).estimator
-}
-
-pub(crate) async fn reserve_shared_network_peer_receive_credit(
-    key: &NetworkPathKey,
-    bytes: u64,
-) -> Result<NetworkPeerReceiveCreditLease, crate::NetworkError> {
-    shared_network_path_resources(key)
-        .receive_credit
-        .reserve(bytes)
-        .await
 }
 
 #[cfg(test)]
@@ -496,27 +407,5 @@ mod tests {
             second.snapshot().round_trip_time,
             Some(Duration::from_millis(7))
         );
-    }
-
-    #[tokio::test]
-    async fn peer_receive_credit_bounds_aggregate_outstanding_windows() {
-        let budget = NetworkPeerReceiveCredit::new(64 * 1024 * 1024);
-        let first = budget.reserve(48 * 1024 * 1024).await.expect("first lease");
-        let second = budget
-            .reserve(16 * 1024 * 1024)
-            .await
-            .expect("second lease");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(5), budget.reserve(16 * 1024 * 1024),)
-                .await
-                .is_err(),
-            "aggregate credit must wait at the peer cap"
-        );
-        drop(first);
-        budget
-            .reserve(16 * 1024 * 1024)
-            .await
-            .expect("released peer credit is reusable");
-        drop(second);
     }
 }

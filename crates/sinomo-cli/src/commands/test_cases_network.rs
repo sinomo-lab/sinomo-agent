@@ -30,9 +30,8 @@ use time::OffsetDateTime;
 const DEFAULT_REQUESTS_PER_TARGET: usize = 100;
 // Warm the authenticated route, directory, and daemon execution paths before
 // starting the timed window, but keep that untimed work explicitly bounded
-// instead of coupling it to the larger measurement sample. Stage E uses one
-// independent logical stream per call; this warmup must not imply or select the
-// legacy persistent object-RPC carrier.
+// instead of coupling it to the larger measurement sample. Each call uses one
+// independent logical stream.
 const DEFAULT_WARMUP_REQUESTS_PER_TARGET: usize = 20;
 // Keep the acceptance default below the daemon's saturation point so the
 // latency gates measure healthy interactive RPC service rather than queueing
@@ -58,16 +57,11 @@ const MAX_CLIENT_TIMELINE_EVENTS: usize = 4 * 1024;
 // A sampled bodyless call currently emits 13 client-side events. Leave room
 // for lifecycle/error events as the recorder evolves.
 const CLIENT_TIMELINE_BASE_EVENTS_PER_SAMPLE: usize = 32;
-// One streamed payload quantum produces a data frame and its flow-control
-// frame. Each physical frame can emit four client-side phase events; reserve
-// twice that current cost so diagnostic additions do not immediately make the
-// benchmark capture lossy again.
-const CLIENT_TIMELINE_EVENTS_PER_PAYLOAD_QUANTUM: usize = 16;
 // Exercise the ordinary RPC interface with a substantial request and response.
 // This is a test fixture size, not a protocol boundary.
 const ARBITRARY_MESSAGE_PAYLOAD_BYTES: usize = 1024 * 1024;
-// Exercise one complete 8 MiB per-call flow window in each direction without
-// embedding the bytes in either SOBJ head.
+// Exercise a large attachment in each direction without embedding the bytes in
+// either SOBJ head.
 const SEMANTIC_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BENCHMARK_REQUESTS_PER_TARGET: usize = 10_000;
 const MAX_BENCHMARK_CONCURRENCY: usize = 1_024;
@@ -191,7 +185,6 @@ pub fn register_network_cluster_test_cases(
         .register(network_state_hygiene())
         .register(network_state_hygiene_dirty_fixture())
         .register(network_endpoint_error_fallback())
-        .register(network_tcp_tunnel_stale_fallback())
         .register(network_stale_direct_timeout_demotion())
 }
 
@@ -263,18 +256,6 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_network_endpoint_error_fallback(ctx)
-        }
-    }
-}
-
-sinomo_runtime::test::sinomo_test_case! {
-    pub fn network_tcp_tunnel_stale_fallback(ctx) {
-        id: "cluster.network.tcp-tunnel-stale-fallback",
-        summary: "A stale persistent TCP tunnel on a real endpoint falls back to direct RPC",
-        tags: ["cluster-network", "probe", "routing", "failure-mode"],
-        requirements: [SinomoTestRequirement::ClusterRuntime],
-        run: {
-            run_network_tcp_tunnel_stale_fallback(ctx)
         }
     }
 }
@@ -583,21 +564,9 @@ fn should_sample_network_timeline(
         != job_index.saturating_sub(1).saturating_mul(sample_count) / total_jobs
 }
 
-fn benchmark_client_timeline_capacity(
-    timeline_sample_count: usize,
-    request_payload_bytes: usize,
-    response_payload_bytes: usize,
-) -> usize {
-    let payload_quanta = request_payload_bytes
-        .div_ceil(network::OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES)
-        .saturating_add(
-            response_payload_bytes.div_ceil(network::OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES),
-        );
-    let events_per_sample = payload_quanta
-        .saturating_mul(CLIENT_TIMELINE_EVENTS_PER_PAYLOAD_QUANTUM)
-        .saturating_add(CLIENT_TIMELINE_BASE_EVENTS_PER_SAMPLE);
+fn benchmark_client_timeline_capacity(timeline_sample_count: usize) -> usize {
     timeline_sample_count
-        .saturating_mul(events_per_sample)
+        .saturating_mul(CLIENT_TIMELINE_BASE_EVENTS_PER_SAMPLE)
         .clamp(1, MAX_CLIENT_TIMELINE_EVENTS)
 }
 
@@ -965,11 +934,7 @@ fn run_network_ping_with_defaults(
         )));
     }
 
-    let client_timeline_capacity = benchmark_client_timeline_capacity(
-        timeline_sample_count,
-        payload_bytes,
-        response_payload_bytes,
-    );
+    let client_timeline_capacity = benchmark_client_timeline_capacity(timeline_sample_count);
     if timeline_sample_count > 0 {
         network::start_network_timeline_capture(client_timeline_capacity).map_err(|error| {
             SinomoTestError::failed(format!(
@@ -1470,99 +1435,6 @@ fn reload_local_daemon_connectivity_for_fixture(action: &str) -> Result<(), Sino
     Ok(())
 }
 
-fn run_network_tcp_tunnel_stale_fallback(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    let target_name = ctx.required_parameter("target-name")?.trim().to_string();
-    let stall_endpoint_address = ctx
-        .required_parameter("stall-endpoint-address")?
-        .trim()
-        .to_string();
-    if target_name.is_empty() {
-        return Err(SinomoTestError::InvalidParameter {
-            name: "target-name".to_string(),
-            detail: "must not be empty".to_string(),
-        });
-    }
-    if stall_endpoint_address.is_empty() {
-        return Err(SinomoTestError::InvalidParameter {
-            name: "stall-endpoint-address".to_string(),
-            detail: "must not be empty".to_string(),
-        });
-    }
-    let timeout_ms = optional_u64_parameter(ctx, "timeout-ms", DEFAULT_TIMEOUT_MS)?;
-
-    let data_dir = SinomoDataDir::new(ctx.data_dir());
-    let cluster_paths = ClusterPaths::new(&data_dir);
-    super::refresh_cluster_kv_from_local_daemon(&cluster_paths).map_err(|error| {
-        SinomoTestError::failed(format!(
-            "cannot refresh cluster snapshot before tcp tunnel stale fallback probe: {error}"
-        ))
-    })?;
-    let cluster_state = cluster::read_cluster_state(&cluster_paths)
-        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
-    let target = cluster_state
-        .members
-        .iter()
-        .find(|member| {
-            member.display_name == target_name
-                && member.state.is_authorized()
-                && member_has_main_daemon(member)
-        })
-        .or_else(|| {
-            cluster_state.members.iter().find(|member| {
-                member.state.is_authorized()
-                    && member_has_main_daemon(member)
-                    && member
-                        .endpoints
-                        .iter()
-                        .any(|endpoint| endpoint.address == stall_endpoint_address)
-            })
-        })
-        .ok_or_else(|| {
-            SinomoTestError::failed(format!(
-                "cannot find authorized main daemon target named {target_name} or advertising stale direct endpoint {stall_endpoint_address}"
-            ))
-        })?;
-    let stall_endpoint = target
-        .endpoints
-        .iter()
-        .find(|endpoint| endpoint.address == stall_endpoint_address)
-        .cloned()
-        .ok_or_else(|| {
-            let addresses = target
-                .endpoints
-                .iter()
-                .map(|endpoint| endpoint.address.clone())
-                .collect::<Vec<_>>();
-            SinomoTestError::failed(format!(
-                "target {target_name} does not advertise stall endpoint {stall_endpoint_address}; addresses={addresses:?}"
-            ))
-        })?;
-
-    let probe_outcome = run_network_tcp_tunnel_stale_fallback_probe(
-        target,
-        &stall_endpoint,
-        &stall_endpoint_address,
-        timeout_ms,
-    )?;
-    if !matches!(
-        probe_outcome.status,
-        sinomo_runtime::test::SinomoTestStatus::Passed
-    ) {
-        return Ok(probe_outcome);
-    }
-
-    ctx.record("target_name", target_name);
-    ctx.record("target_node_id", target.node_id.to_string());
-    ctx.record("stall_endpoint_address", stall_endpoint_address);
-    ctx.record(
-        "seeded_stall_endpoint_id",
-        stall_endpoint.endpoint_id.to_string(),
-    );
-    Ok(SinomoTestOutcome::passed(
-        "routed RPC recovered from a stalled tcp tunnel by using direct RPC on the same endpoint",
-    ))
-}
-
 fn run_network_stale_direct_timeout_demotion(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let target_name = ctx.required_parameter("target-name")?.trim().to_string();
     let stall_endpoint_address = ctx
@@ -1967,50 +1839,6 @@ fn run_network_endpoint_error_fallback_probe(
     Ok(SinomoTestOutcome::passed(""))
 }
 
-fn run_network_tcp_tunnel_stale_fallback_probe(
-    target: &ClusterMemberRecord,
-    stall_endpoint: &sinomo_runtime::core::ClusterEndpointRecord,
-    stall_endpoint_address: &str,
-    timeout_ms: u64,
-) -> SinomoTestResult {
-    let nonce = format!(
-        "tcp-tunnel-stale-fallback-{}-{}",
-        current_millis(),
-        std::process::id()
-    );
-    let request = cluster::cluster_network_ping_rpc_request_with_response_payload(&nonce, 0, 0)
-        .map_err(|source| {
-            SinomoTestError::failed(format!(
-                "cannot prepare tcp tunnel stale fallback ping request: {source}"
-            ))
-        })?;
-    let response = sinomo_runtime::daemon::send_daemon_rpc_to_endpoint(
-        stall_endpoint,
-        &request,
-        Duration::from_millis(timeout_ms),
-    )
-        .map_err(|source| {
-            SinomoTestError::failed(format!(
-                "tcp tunnel stale fallback endpoint RPC failed through {stall_endpoint_address}: {source}"
-            ))
-        })?;
-    let response = cluster::decode_cluster_network_ping_rpc_response(&response)
-        .map_err(|source| SinomoTestError::failed(source.to_string()))?;
-    if response.nonce != nonce {
-        return Ok(SinomoTestOutcome::failed(format!(
-            "nonce mismatch: got {}, expected {}",
-            response.nonce, nonce
-        )));
-    }
-    if response.responder_node_id != target.node_id {
-        return Ok(SinomoTestOutcome::failed(format!(
-            "responder mismatch: got {}, expected {}",
-            response.responder_node_id, target.node_id
-        )));
-    }
-    Ok(SinomoTestOutcome::passed(""))
-}
-
 #[cfg(test)]
 fn network_ping_targets_from_state(
     paths: &ClusterPaths,
@@ -2331,15 +2159,6 @@ fn collect_connectivity_record_hygiene_findings(
             ));
         }
         let Some(endpoint) = endpoints.get(&record.endpoint_id) else {
-            if connectivity_record_is_synthetic_tcp_tunnel(record) {
-                if !synthetic_tcp_tunnel_record_targets_peer(record) {
-                    findings.push(format!(
-                        "{scope} synthetic tcp tunnel record {} -> {} has mismatched address {}",
-                        record.source_node_id, record.target_node_id, record.address
-                    ));
-                }
-                continue;
-            }
             findings.push(format!(
                 "{scope} connectivity record {} -> {} references unadvertised endpoint {} at {}",
                 record.source_node_id, record.target_node_id, record.endpoint_id, record.address
@@ -2382,22 +2201,6 @@ fn collect_connectivity_record_hygiene_findings(
             ));
         }
     }
-}
-
-fn connectivity_record_is_synthetic_tcp_tunnel(
-    record: &network::ClusterConnectivityRecord,
-) -> bool {
-    record.transport == ClusterTransportKind::LanTcp
-        && record
-            .address
-            .starts_with(network::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX)
-}
-
-fn synthetic_tcp_tunnel_record_targets_peer(record: &network::ClusterConnectivityRecord) -> bool {
-    record
-        .address
-        .strip_prefix(network::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX)
-        == Some(record.target_node_id.as_str())
 }
 
 fn collect_active_route_hygiene_findings(
@@ -2549,12 +2352,12 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
                     );
                 }
             };
-            let call = network::ObjectRpcSessionCall::new(
+            let call = network::ObjectRpcCall::new(
                 job.request.clone(),
                 network::ObjectRpcBodySource::zeroes(request_attachment_bytes),
             );
             let result = match client
-                .object_rpc_session_to_target_with_deadline_async(
+                .object_rpc_call_to_target_with_deadline_async(
                     &job.target_node_id,
                     call,
                     job.timeout,
@@ -2910,23 +2713,8 @@ mod tests {
 
     #[test]
     fn client_timeline_capacity_conservatively_covers_small_payloads() {
-        assert_eq!(benchmark_client_timeline_capacity(1, 256, 64), 64);
-        assert_eq!(benchmark_client_timeline_capacity(128, 256, 64), 4096);
-    }
-
-    #[test]
-    fn client_timeline_capacity_covers_one_mib_full_duplex_payloads() {
-        let payload_quanta = 2 * ARBITRARY_MESSAGE_PAYLOAD_BYTES
-            .div_ceil(network::OBJECT_RPC_CHANNEL_DATA_QUANTUM_BYTES);
-        assert_eq!(
-            benchmark_client_timeline_capacity(
-                1,
-                ARBITRARY_MESSAGE_PAYLOAD_BYTES,
-                ARBITRARY_MESSAGE_PAYLOAD_BYTES,
-            ),
-            payload_quanta * CLIENT_TIMELINE_EVENTS_PER_PAYLOAD_QUANTUM
-                + CLIENT_TIMELINE_BASE_EVENTS_PER_SAMPLE
-        );
+        assert_eq!(benchmark_client_timeline_capacity(1), 32);
+        assert_eq!(benchmark_client_timeline_capacity(128), 4096);
     }
 
     #[test]
@@ -3089,36 +2877,6 @@ mod tests {
         )
     }
 
-    fn test_synthetic_tcp_tunnel_record(
-        state: &ClusterBootstrapState,
-        target: &NodeId,
-    ) -> network::ClusterConnectivityRecord {
-        let now = OffsetDateTime::now_utc();
-        network::ClusterConnectivityRecord {
-            cluster_id: state.cluster_id.clone(),
-            source_node_id: state.local_node_id.clone(),
-            target_node_id: target.clone(),
-            endpoint_id: network::ClusterEndpointId::derived(
-                "sinomo.test.synthetic.tcp-tunnel",
-                format!("{}\0{}", state.local_node_id.as_str(), target.as_str()),
-            ),
-            transport: ClusterTransportKind::LanTcp,
-            address: format!(
-                "{}{}",
-                network::CLUSTER_TCP_TUNNEL_ENDPOINT_ADDRESS_PREFIX,
-                target.as_str()
-            ),
-            state: network::ClusterConnectivityState::Healthy,
-            latency_ms: Some(1),
-            consecutive_failures: 0,
-            last_success_at: Some(now.to_string()),
-            last_failure_at: None,
-            failure_reason: None,
-            observed_at: now,
-            expires_at: now + time::Duration::seconds(network::CLUSTER_CONNECTIVITY_TTL_SECONDS),
-        }
-    }
-
     #[test]
     fn network_hygiene_flags_remote_local_only_endpoint() {
         let mut state = test_state();
@@ -3200,23 +2958,6 @@ mod tests {
         );
         let record = test_connectivity_record(&state, &endpoint);
         state.members[remote_index].endpoints.push(endpoint);
-
-        let findings = network_hygiene_findings(
-            &state,
-            &[record.clone()],
-            &[],
-            &[record],
-            NetworkHygieneOptions::unscoped(true),
-        );
-
-        assert!(findings.is_empty(), "{findings:?}");
-    }
-
-    #[test]
-    fn network_hygiene_accepts_synthetic_tcp_tunnel_connectivity() {
-        let state = test_state();
-        let target = state.members[1].node_id.clone();
-        let record = test_synthetic_tcp_tunnel_record(&state, &target);
 
         let findings = network_hygiene_findings(
             &state,
@@ -3656,48 +3397,6 @@ mod tests {
         assert!(
             targets.contains(&target),
             "degraded direct connectivity must stay targetable when the graph has a healthy route: {targets:?}"
-        );
-    }
-
-    #[test]
-    fn network_ping_targets_include_degraded_main_with_healthy_synthetic_tunnel() {
-        let root = sinomo_testdir::TestDir::new("sinomo-network-ping-target-synthetic-tunnel-main");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("root layout");
-        let paths = ClusterPaths::new(&data_dir);
-        let mut state = test_state();
-        let target = state.members[1].node_id.clone();
-        let main_endpoint = test_endpoint(
-            &target,
-            "endpoint_network_ping_synthetic_tunnel_main",
-            "target.example.test:21353",
-        );
-        state.members[1].endpoints = vec![main_endpoint.clone()];
-        let now = OffsetDateTime::now_utc();
-        let degraded_main = network::cluster_connectivity_record(
-            &state,
-            &main_endpoint,
-            network::ClusterConnectivityState::Degraded,
-            Some(80),
-            2,
-            Some(now.to_string()),
-            None,
-            now,
-            network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
-        );
-        let synthetic_tunnel = test_synthetic_tcp_tunnel_record(&state, &target);
-        network::write_local_cluster_connectivity_records(
-            &paths,
-            &state.local_node_id,
-            &[degraded_main, synthetic_tunnel],
-        )
-        .expect("write local connectivity");
-
-        let targets = network_ping_targets_from_state(&paths, &state).expect("targets");
-
-        assert!(
-            targets.contains(&target),
-            "degraded direct connectivity must stay targetable when a healthy synthetic tunnel exists: {targets:?}"
         );
     }
 
