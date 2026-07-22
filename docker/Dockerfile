@@ -8,7 +8,7 @@
 #
 # The Rust toolchain + source are kept in the image because `rollout apply` /
 # `rollout cluster` build the new binary from the managed source repo in-container.
-FROM rust:1.90-bookworm
+FROM rust:1.95-bookworm
 
 ARG SINOMO_BENCH_DEPS=0
 
