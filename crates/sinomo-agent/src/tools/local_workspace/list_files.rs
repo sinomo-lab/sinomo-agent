@@ -78,7 +78,7 @@ impl AgentTool for ListFilesTool {
 }
 
 pub(super) fn descriptor() -> AgentToolDescriptor {
-    AgentToolDescriptor::new(spec_for_kind(AgentToolKind::ListFiles))
+    descriptor_for_kind(AgentToolKind::ListFiles)
         .with_capabilities([AgentToolCapability::ReadWorkspace])
         .with_input_schema(serde_json::json!({
             "type": "object",

@@ -72,7 +72,7 @@ impl AgentTool for EditFileTool {
 }
 
 pub(super) fn descriptor() -> AgentToolDescriptor {
-    AgentToolDescriptor::new(spec_for_kind(AgentToolKind::EditFile))
+    descriptor_for_kind(AgentToolKind::EditFile)
         .with_capabilities([AgentToolCapability::WriteWorkspace])
         .with_input_schema(serde_json::json!({
             "type": "object",

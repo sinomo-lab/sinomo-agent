@@ -7922,6 +7922,14 @@ where
         self.runtime_control_registry.clone()
     }
 
+    pub(crate) fn tool_registry(&self) -> sinomo_agent::AgentToolRegistry {
+        self.tool_registry.clone()
+    }
+
+    pub(crate) fn agent_definition(&self) -> &AgentDefinition {
+        &self.agent_definition
+    }
+
     pub(crate) fn with_runtime_control_registry(
         mut self,
         registry: sinomo_agent::AgentRuntimeControlRegistry,

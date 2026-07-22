@@ -25,18 +25,21 @@ use sinomo_agent::{
     AgentChannelMessageKind, AgentChannelParticipant, AgentChannelRuntime,
     AgentChannelRuntimeEvent, AgentChannelSource, AgentChannelSpeakDecision, AgentChannelStore,
     AgentChannelStoreError, AgentChannelTurn, AgentChannelTurnExecutor, AgentContextAttachment,
-    AgentDefinition, AgentEvent, AgentEventPayload, AgentItem, AgentModelEvent,
+    AgentDefinition, AgentEvent, AgentEventPayload, AgentItem, AgentModelEvent, AgentRunContext,
     AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentRuntimeEvent,
     AgentRuntimeEventPayload, AgentSession, AgentSessionControlResult, AgentSessionFollowUpRequest,
     AgentSessionInterruptRequest, AgentSessionReattachState, AgentSessionRemoveQueuedInputRequest,
     AgentSessionResumeRequest, AgentSessionResumeResponse, AgentSessionSnapshot,
     AgentSessionSteerRequest, AgentSessionStore, AgentTaskLifecycleStatus, AgentTaskSnapshot,
-    AgentToolProgressEvent, ContextAssemblyReport, FileAgentSessionStore, InteractionOutput,
-    InteractionSession, InteractionSurface, InteractionSurfaceKind, SkillActivationScope,
-    SkillCatalogEntry, SkillCatalogSifsStore, SkillCatalogSource, SkillCatalogStore,
-    SkillCatalogWrite, TaskId, WorkspaceRef, channel_message_agent_item_id,
-    mark_participant_message_observed, render_common_skill_markdown,
-    safe_agent_channel_attachment_file_name, sync_participant_session,
+    AgentToolCall, AgentToolDescriptor, AgentToolEvidence, AgentToolInvocationMode,
+    AgentToolOrchestrator, AgentToolOutcome, AgentToolPlan, AgentToolPlanner,
+    AgentToolProgressEvent, AgentToolRegistry, AgentToolStatus, AgentToolSurface,
+    ContextAssemblyReport, FileAgentSessionStore, InteractionOutput, InteractionSession,
+    InteractionSurface, InteractionSurfaceKind, SkillActivationScope, SkillCatalogEntry,
+    SkillCatalogSifsStore, SkillCatalogSource, SkillCatalogStore, SkillCatalogWrite, TaskId,
+    WorkspaceRef, channel_message_agent_item_id, mark_participant_message_observed,
+    render_common_skill_markdown, safe_agent_channel_attachment_file_name,
+    sync_participant_session,
 };
 use sinomo_lm::{
     AnthropicConfig, CLAUDE_DEFAULT_MODEL, ClaudeCodeConfig, CodexCliConfig, GeminiConfig,
@@ -3447,6 +3450,109 @@ fn app_agent_item_id(item: &AgentItem) -> TaskId {
     }
 }
 
+/// Shared executor view used by model-facing adapters such as realtime voice.
+///
+/// Cloning this value keeps the same [`AgentToolRegistry`] implementation
+/// instances and final authority checks; only the model transport and result
+/// delivery differ from the regular turn-based agent loop.
+#[derive(Clone)]
+pub struct AgentChatToolContext {
+    registry: AgentToolRegistry,
+    session: InteractionSession,
+    plan: AgentToolPlan,
+    surface: AgentToolSurface,
+    run_context: AgentRunContext,
+    descriptors: Vec<AgentToolDescriptor>,
+}
+
+impl AgentChatToolContext {
+    fn new(
+        registry: AgentToolRegistry,
+        session: InteractionSession,
+        definition: AgentDefinition,
+        provider: &str,
+        model: &str,
+    ) -> Self {
+        let config = sinomo_agent::AgentConfig::new(provider, model)
+            .with_agent_definition(definition.clone());
+        let plan = AgentToolPlanner::plan(
+            registry.descriptors(),
+            &config.module_tool_projection,
+            std::iter::empty(),
+            config.definition.tools.clone(),
+            true,
+            config.visible_toolsets.clone(),
+            registry.generation(),
+        )
+        .for_invocation_mode(AgentToolInvocationMode::Realtime);
+        let surface = AgentToolSurface::for_definition(&definition);
+        let executable_descriptors = plan
+            .entries
+            .iter()
+            .filter(|entry| entry.executable && plan.is_model_visible(&entry.descriptor.spec.name))
+            .map(|entry| entry.descriptor.clone())
+            .collect();
+        let (descriptors, _) = surface.filter_tool_descriptors(executable_descriptors);
+        Self {
+            registry,
+            session,
+            plan,
+            surface,
+            run_context: AgentRunContext::default(),
+            descriptors,
+        }
+    }
+
+    pub fn descriptors(&self) -> &[AgentToolDescriptor] {
+        &self.descriptors
+    }
+
+    pub fn execute(
+        &self,
+        call_index: usize,
+        call: &AgentToolCall,
+        cancellation_token: sinomo_agent::AgentCancellationToken,
+    ) -> AgentToolOutcome {
+        if !self
+            .descriptors
+            .iter()
+            .any(|descriptor| descriptor.spec.name == call.tool)
+        {
+            let summary = format!(
+                "tool `{}` is not exposed to the realtime model interaction",
+                call.tool
+            );
+            let output = serde_json::json!({
+                "error": "tool_not_available_for_invocation_mode",
+                "invocation_mode": "realtime",
+                "tool": call.tool,
+            });
+            return AgentToolOutcome {
+                call_id: TaskId::generate(),
+                step_index: 0,
+                call_index,
+                call: call.clone(),
+                status: AgentToolStatus::Blocked,
+                summary: summary.clone(),
+                output: output.clone(),
+                event_id: None,
+                evidence: AgentToolEvidence::availability_only(false, summary)
+                    .with_output_value(&output, false),
+            };
+        }
+        AgentToolOrchestrator::new(&self.surface, None, &self.run_context)
+            .execute_with_cancellation(
+                &self.registry,
+                &self.session,
+                &self.plan,
+                0,
+                call_index,
+                call,
+                cancellation_token,
+            )
+    }
+}
+
 /// One running chat conversation backed by the main-agent runtime.
 pub struct AgentChat {
     data_dir: SinomoDataDir,
@@ -3888,6 +3994,18 @@ impl AgentChat {
 
     pub fn tool_runtime(&self) -> ChatToolRuntimeSelection {
         self.tool_runtime.clone()
+    }
+
+    pub fn tool_context(&self) -> AgentChatToolContext {
+        let handler = self.runtime.handler();
+        let info = tui::app_runtime_info(handler);
+        AgentChatToolContext::new(
+            handler.tool_registry(),
+            self.runtime.session().clone(),
+            handler.agent_definition().clone(),
+            &info.provider,
+            &info.model,
+        )
     }
 
     pub fn workspaces(&self) -> Vec<sinomo_agent::WorkspaceRef> {

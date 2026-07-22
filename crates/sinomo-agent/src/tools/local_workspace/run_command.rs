@@ -42,7 +42,7 @@ fn permission_gated_descriptor() -> AgentToolDescriptor {
 }
 
 fn base_descriptor() -> AgentToolDescriptor {
-    AgentToolDescriptor::new(spec_for_kind(AgentToolKind::RunShellCommand))
+    descriptor_for_kind(AgentToolKind::RunShellCommand)
         .with_capabilities([AgentToolCapability::ExecuteProcess])
         .with_input_schema(serde_json::json!({
             "type": "object",

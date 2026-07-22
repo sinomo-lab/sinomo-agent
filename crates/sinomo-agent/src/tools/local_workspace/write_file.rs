@@ -59,7 +59,7 @@ impl AgentTool for WriteFileTool {
 }
 
 pub(super) fn descriptor() -> AgentToolDescriptor {
-    AgentToolDescriptor::new(spec_for_kind(AgentToolKind::WriteFile))
+    descriptor_for_kind(AgentToolKind::WriteFile)
         .with_capabilities([AgentToolCapability::WriteWorkspace])
         .with_input_schema(serde_json::json!({
             "type": "object",

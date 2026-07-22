@@ -107,7 +107,7 @@ impl AgentTool for ReadFileTool {
 }
 
 pub(super) fn descriptor() -> AgentToolDescriptor {
-    AgentToolDescriptor::new(spec_for_kind(AgentToolKind::ReadFile))
+    descriptor_for_kind(AgentToolKind::ReadFile)
         .with_capabilities([AgentToolCapability::ReadWorkspace])
         .with_input_schema(serde_json::json!({
             "type": "object",

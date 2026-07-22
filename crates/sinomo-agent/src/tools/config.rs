@@ -1,6 +1,6 @@
 use super::{
-    AgentTool, AgentToolCapability, AgentToolDescriptor, AgentToolEvidence, AgentToolRequest,
-    AgentToolResult,
+    AgentTool, AgentToolCapability, AgentToolDescriptor, AgentToolEvidence,
+    AgentToolInvocationMode, AgentToolRequest, AgentToolResult,
 };
 use crate::{AgentToolCall, AgentToolKind, AgentToolSpec};
 use sinomo_runtime::config::{
@@ -236,6 +236,7 @@ fn config_search_descriptor() -> AgentToolDescriptor {
         "Search registered Sinomo configuration keys by key, owner, or description.",
         false,
     ))
+    .with_invocation_modes(AgentToolInvocationMode::all())
     .with_capabilities([AgentToolCapability::ManageConfig])
     .with_input_schema(serde_json::json!({
         "type": "object",
@@ -259,6 +260,7 @@ fn config_get_descriptor() -> AgentToolDescriptor {
         "Read a registered Sinomo configuration value through the shared config resolver.",
         false,
     ))
+    .with_invocation_modes(AgentToolInvocationMode::all())
     .with_capabilities([AgentToolCapability::ManageConfig])
     .with_input_schema(serde_json::json!({
         "type": "object",
@@ -279,6 +281,7 @@ fn config_set_descriptor() -> AgentToolDescriptor {
         "Update a registered Sinomo configuration value through the shared config resolver.",
         true,
     ))
+    .with_invocation_modes(AgentToolInvocationMode::all())
     .with_capabilities([AgentToolCapability::ManageConfig])
     .with_input_schema(serde_json::json!({
         "type": "object",

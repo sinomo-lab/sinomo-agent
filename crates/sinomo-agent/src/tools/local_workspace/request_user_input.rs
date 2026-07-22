@@ -24,7 +24,7 @@ impl AgentTool for RequestUserInputTool {
 }
 
 pub(super) fn descriptor() -> AgentToolDescriptor {
-    AgentToolDescriptor::new(spec_for_kind(AgentToolKind::RequestUserInput))
+    descriptor_for_kind(AgentToolKind::RequestUserInput)
         .with_capabilities([AgentToolCapability::PromptUser])
         .with_input_schema(serde_json::json!({
             "type": "object",

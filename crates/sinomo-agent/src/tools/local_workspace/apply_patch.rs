@@ -112,7 +112,7 @@ impl AgentTool for ApplyPatchTool {
 }
 
 pub(super) fn descriptor() -> AgentToolDescriptor {
-    AgentToolDescriptor::new(spec_for_kind(AgentToolKind::ApplyPatch))
+    descriptor_for_kind(AgentToolKind::ApplyPatch)
         .with_capabilities([AgentToolCapability::WriteWorkspace])
         .with_toolsets(["provider_specific", "coding_advanced"])
         .with_input_schema(serde_json::json!({

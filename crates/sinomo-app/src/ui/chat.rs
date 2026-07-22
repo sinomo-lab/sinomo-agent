@@ -37,9 +37,13 @@
 //! `Select`s live in the model popup above the field.
 
 use std::cell::{Cell, RefCell};
+#[cfg(not(test))]
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::{Path as FsPath, PathBuf};
 use std::rc::Rc;
+#[cfg(not(test))]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -69,10 +73,14 @@ use sui::{
 
 #[cfg(test)]
 use sinomo_agent::AGENT_CHANNEL_APP_USER_ID;
+#[cfg(not(test))]
+use sinomo_agent::AgentCancellationToken;
 use sinomo_agent::{
     AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT, AgentChannel, AgentChannelAuthor, AgentChannelKind,
-    AgentChannelMessageKind, AgentChannelSource, AgentChannelStore, TaskId,
+    AgentChannelMessageKind, AgentChannelSource, AgentChannelStore, AgentToolCall, TaskId,
 };
+#[cfg(not(test))]
+use sinomo_cli::app_api::AgentChatToolContext;
 use sinomo_cli::app_api::{
     AgentChannelMessagePage, AgentChannelMessageReconciliation, AgentChannelTimelineOverview,
     AgentChannelTimelineSegment, AgentChatSifsStorage, AgentSummary, ChatAttachmentInput,
@@ -572,6 +580,8 @@ struct ChatMediaDeviceTransition {
 const CHAT_MEDIA_AUDIO_SEND_QUEUE_CAPACITY: usize = 4;
 #[cfg(not(test))]
 const CHAT_MEDIA_SESSION_EVENT_QUEUE_CAPACITY: usize = 64;
+#[cfg(not(test))]
+const CHAT_MEDIA_TOOL_RESULT_QUEUE_CAPACITY: usize = 8;
 
 /// Bounded-by-construction handoff for remote video. Local preview publication
 /// never waits for the websocket; a slow sender consumes the newest frame and
@@ -899,14 +909,26 @@ enum ChatRealtimeSessionEvent {
     Realtime(sinomo_lm::RealtimeAudioEvent),
     AudioSent,
     VideoSent,
+    ToolResultSent { tool: String, summary: String },
     Error(String),
+}
+
+#[cfg(not(test))]
+struct ChatRealtimeToolResult {
+    call_id: String,
+    tool: String,
+    output: String,
+    summary: String,
 }
 
 #[cfg(not(test))]
 struct ChatRealtimeSessionRuntime {
     audio_tx: tokio::sync::mpsc::Sender<sinomo_lm::RealtimeAudioInputChunk>,
     event_rx: tokio::sync::mpsc::Receiver<ChatRealtimeSessionEvent>,
+    tool_result_tx: tokio::sync::mpsc::Sender<ChatRealtimeToolResult>,
     latest_video: Arc<ChatMediaLatestVideoSlot<Arc<sinomo_video::NativeVideoSurfaceFrame>>>,
+    tool_cancellations: Arc<Mutex<BTreeMap<String, AgentCancellationToken>>>,
+    next_tool_call_index: AtomicUsize,
     stop: Arc<AtomicBool>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -917,6 +939,8 @@ impl ChatRealtimeSessionRuntime {
         let (audio_tx, audio_rx) = tokio::sync::mpsc::channel(CHAT_MEDIA_AUDIO_SEND_QUEUE_CAPACITY);
         let (event_tx, event_rx) =
             tokio::sync::mpsc::channel(CHAT_MEDIA_SESSION_EVENT_QUEUE_CAPACITY);
+        let (tool_result_tx, tool_result_rx) =
+            tokio::sync::mpsc::channel(CHAT_MEDIA_TOOL_RESULT_QUEUE_CAPACITY);
         let latest_video = Arc::new(ChatMediaLatestVideoSlot::default());
         let worker_video = latest_video.clone();
         let stop = Arc::new(AtomicBool::new(false));
@@ -930,6 +954,7 @@ impl ChatRealtimeSessionRuntime {
         let task = tokio::spawn(run_chat_realtime_session_pump(
             session,
             audio_rx,
+            tool_result_rx,
             worker_video,
             event_tx,
             worker_stop,
@@ -938,7 +963,10 @@ impl ChatRealtimeSessionRuntime {
         Self {
             audio_tx,
             event_rx,
+            tool_result_tx,
             latest_video,
+            tool_cancellations: Arc::new(Mutex::new(BTreeMap::new())),
+            next_tool_call_index: AtomicUsize::new(0),
             stop,
             task: Some(task),
         }
@@ -965,8 +993,73 @@ impl ChatRealtimeSessionRuntime {
         }
     }
 
+    fn dispatch_tool_call(
+        &self,
+        context: AgentChatToolContext,
+        call_id: String,
+        name: String,
+        arguments: String,
+    ) -> Result<(), String> {
+        let call = match realtime_agent_tool_call(&call_id, &name, &arguments) {
+            Ok(call) => call,
+            Err(detail) => {
+                return self
+                    .tool_result_tx
+                    .try_send(ChatRealtimeToolResult {
+                        call_id,
+                        tool: name,
+                        output: serde_json::json!({
+                            "status": "failed",
+                            "summary": "invalid realtime tool arguments",
+                            "output": { "error": "invalid_tool_arguments", "detail": detail },
+                        })
+                        .to_string(),
+                        summary: "realtime tool call had invalid arguments".to_string(),
+                    })
+                    .map_err(|error| format!("queue invalid realtime tool result: {error}"));
+            }
+        };
+        let cancellation_token = AgentCancellationToken::new();
+        self.tool_cancellations
+            .lock()
+            .map_err(|_| "realtime tool cancellation lock poisoned".to_string())?
+            .insert(call_id.clone(), cancellation_token.clone());
+        let cancellations = self.tool_cancellations.clone();
+        let result_tx = self.tool_result_tx.clone();
+        let call_index = self.next_tool_call_index.fetch_add(1, Ordering::Relaxed);
+        tokio::task::spawn_blocking(move || {
+            let outcome = context.execute(call_index, &call, cancellation_token);
+            let output = serde_json::json!({
+                "status": &outcome.status,
+                "summary": &outcome.summary,
+                "output": &outcome.output,
+            })
+            .to_string();
+            let summary = outcome.summary.clone();
+            if let Ok(mut cancellations) = cancellations.lock() {
+                cancellations.remove(&call_id);
+            }
+            let _ = result_tx.blocking_send(ChatRealtimeToolResult {
+                call_id,
+                tool: name,
+                output,
+                summary,
+            });
+        });
+        Ok(())
+    }
+
+    fn cancel_tools(&self) {
+        if let Ok(cancellations) = self.tool_cancellations.lock() {
+            for cancellation in cancellations.values() {
+                cancellation.cancel();
+            }
+        }
+    }
+
     async fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.cancel_tools();
         let Some(mut task) = self.task.take() else {
             return;
         };
@@ -984,10 +1077,65 @@ impl ChatRealtimeSessionRuntime {
 impl Drop for ChatRealtimeSessionRuntime {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.cancel_tools();
         if let Some(task) = self.task.take() {
             task.abort();
         }
     }
+}
+
+#[cfg(not(test))]
+fn realtime_audio_tool_definitions(
+    context: &AgentChatToolContext,
+) -> Vec<sinomo_lm::RealtimeAudioToolDefinition> {
+    context
+        .descriptors()
+        .iter()
+        .map(|descriptor| {
+            let parameters = if descriptor.input_schema.is_object() {
+                descriptor.input_schema.clone()
+            } else {
+                serde_json::json!({ "type": "object", "properties": {} })
+            };
+            let mut tool = sinomo_lm::RealtimeAudioToolDefinition::new(
+                descriptor.spec.name.clone(),
+                parameters,
+            );
+            if !descriptor.spec.description.trim().is_empty() {
+                tool.description = Some(descriptor.spec.description.clone());
+            }
+            tool
+        })
+        .collect()
+}
+
+fn realtime_agent_tool_call(
+    call_id: &str,
+    name: &str,
+    arguments: &str,
+) -> Result<AgentToolCall, String> {
+    if call_id.trim().is_empty() {
+        return Err("realtime tool call is missing its provider call id".to_string());
+    }
+    if name.trim().is_empty() {
+        return Err("realtime tool call is missing its tool name".to_string());
+    }
+    let input = if arguments.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(arguments)
+            .map_err(|error| format!("tool `{name}` arguments are not valid JSON: {error}"))?
+    };
+    if !input.is_object() {
+        return Err(format!("tool `{name}` arguments must be a JSON object"));
+    }
+    Ok(AgentToolCall {
+        call_id: Some(call_id.to_string()),
+        tool: name.to_string(),
+        input,
+        r#async: false,
+        summary: format!("realtime model called `{name}`"),
+    })
 }
 
 fn chat_media_requested_input_available(
@@ -4759,6 +4907,7 @@ impl ChatState {
                 ),
             };
             let sifs_daemon = self.sifs_daemon.clone();
+            let tool_context = self.handle.tool_context();
             let (event_tx, event_rx) = mpsc::channel();
             let (control_tx, control_rx) = mpsc::channel();
             let snapshots = Arc::new(Mutex::new(ChatMediaSnapshots::default()));
@@ -4789,6 +4938,7 @@ impl ChatState {
                         worker_camera_enabled,
                         camera_surface,
                         stable_chat,
+                        tool_context,
                         sifs_daemon,
                         worker_waker,
                     );
@@ -7776,6 +7926,7 @@ fn run_chat_media_call_worker(
     camera_requested: Arc<AtomicBool>,
     camera_surface: Arc<sinomo_video::NativeVideoSurface>,
     stable_chat: StableRealtimeChatTarget,
+    tool_context: Option<AgentChatToolContext>,
     sifs_daemon: Option<SifsDaemonAccess>,
     waker: Option<sui::UiHandle>,
 ) {
@@ -7835,6 +7986,7 @@ fn run_chat_media_call_worker(
             microphone_requested,
             camera_requested,
             camera_surface,
+            tool_context,
             stable_projection,
             waker.clone(),
         ))
@@ -8005,6 +8157,7 @@ where
 async fn run_chat_realtime_session_pump(
     mut session: sinomo_lm::RealtimeAudioSession,
     mut audio_rx: tokio::sync::mpsc::Receiver<sinomo_lm::RealtimeAudioInputChunk>,
+    mut tool_result_rx: tokio::sync::mpsc::Receiver<ChatRealtimeToolResult>,
     latest_video: Arc<ChatMediaLatestVideoSlot<Arc<sinomo_video::NativeVideoSurfaceFrame>>>,
     event_tx: tokio::sync::mpsc::Sender<ChatRealtimeSessionEvent>,
     stop: Arc<AtomicBool>,
@@ -8012,6 +8165,34 @@ async fn run_chat_realtime_session_pump(
 ) {
     let mut video_cadence = ChatMediaRemoteVideoCadence::new(video_frame_interval);
     while !stop.load(Ordering::Acquire) {
+        for _ in 0..4 {
+            let result = match tool_result_rx.try_recv() {
+                Ok(result) => result,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            };
+            if let Err(error) = session
+                .send_tool_result(&result.call_id, &result.output, true)
+                .await
+            {
+                let _ = event_tx
+                    .send(ChatRealtimeSessionEvent::Error(format!(
+                        "send realtime tool result failed: {error}"
+                    )))
+                    .await;
+                return;
+            }
+            if event_tx
+                .send(ChatRealtimeSessionEvent::ToolResultSent {
+                    tool: result.tool,
+                    summary: result.summary,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
         for _ in 0..4 {
             let input = match audio_rx.try_recv() {
                 Ok(input) => input,
@@ -8111,6 +8292,7 @@ async fn run_chat_media_call_async(
     microphone_requested: Arc<AtomicBool>,
     camera_requested: Arc<AtomicBool>,
     camera_surface: Arc<sinomo_video::NativeVideoSurface>,
+    tool_context: Option<AgentChatToolContext>,
     mut stable_projection: StableRealtimeChatProjection,
     waker: Option<sui::UiHandle>,
 ) -> Result<(), String> {
@@ -8129,6 +8311,17 @@ async fn run_chat_media_call_async(
     let mut config = sinomo_lm::RealtimeAudioSessionConfig::new(provider, model);
     config.turn_detection = sinomo_lm::RealtimeAudioTurnDetection::SemanticVad;
     config.api_key = chat_media_realtime_api_key(&data_dir, provider)?;
+    let tool_context = if provider == sinomo_lm::RealtimeAudioProvider::OpenAi {
+        tool_context
+    } else {
+        None
+    };
+    if let Some(context) = tool_context.as_ref() {
+        config.tools = realtime_audio_tool_definitions(context);
+        if !config.tools.is_empty() {
+            config.tool_choice = Some("auto".to_string());
+        }
+    }
 
     if cancelled.load(Ordering::Acquire) {
         return Ok(());
@@ -8562,6 +8755,21 @@ async fn run_chat_media_call_async(
             progressed = true;
             match event {
                 ChatRealtimeSessionEvent::Realtime(event) => {
+                    if let sinomo_lm::RealtimeAudioEvent::ToolCallCompleted {
+                        call_id,
+                        name,
+                        arguments,
+                        ..
+                    } = &event
+                        && let Some(context) = tool_context.as_ref()
+                    {
+                        realtime_session.dispatch_tool_call(
+                            context.clone(),
+                            call_id.clone(),
+                            name.clone(),
+                            arguments.clone(),
+                        )?;
+                    }
                     let handled = handle_chat_media_realtime_event(
                         event,
                         speaker.as_ref(),
@@ -8597,6 +8805,13 @@ async fn run_chat_media_call_async(
                         snapshots.input_video_frames =
                             snapshots.input_video_frames.saturating_add(1);
                     });
+                }
+                ChatRealtimeSessionEvent::ToolResultSent { tool, summary } => {
+                    publish_chat_media_notice(
+                        &snapshots,
+                        &waker,
+                        format!("tool {tool} completed: {summary}"),
+                    );
                 }
                 ChatRealtimeSessionEvent::Error(detail) => {
                     report_stable_realtime_projection_notice(
@@ -8971,9 +9186,15 @@ fn handle_chat_media_realtime_event(
         sinomo_lm::RealtimeAudioEvent::Error { code, message } => {
             Err(format!("realtime error {code}: {message}"))
         }
-        sinomo_lm::RealtimeAudioEvent::ToolCallStarted { .. }
-        | sinomo_lm::RealtimeAudioEvent::ToolCallArgumentsDelta { .. }
-        | sinomo_lm::RealtimeAudioEvent::ToolCallCompleted { .. }
+        sinomo_lm::RealtimeAudioEvent::ToolCallStarted { name, .. } => {
+            publish_chat_media_notice(snapshots, waker, format!("running tool {name}"));
+            Ok(false)
+        }
+        sinomo_lm::RealtimeAudioEvent::ToolCallCompleted { name, .. } => {
+            publish_chat_media_notice(snapshots, waker, format!("tool {name} dispatched"));
+            Ok(false)
+        }
+        sinomo_lm::RealtimeAudioEvent::ToolCallArgumentsDelta { .. }
         | sinomo_lm::RealtimeAudioEvent::ResponseCancelled { .. }
         | sinomo_lm::RealtimeAudioEvent::OutputTruncated { .. } => Ok(false),
         sinomo_lm::RealtimeAudioEvent::Raw { .. } => Ok(false),
@@ -23856,6 +24077,23 @@ mod tests {
         assert_eq!(taken.microphone_level, Some(0.5));
         assert_eq!(taken.notice.as_deref(), Some("latest notice"));
         assert!(snapshots.is_empty());
+    }
+
+    #[test]
+    fn realtime_tool_calls_use_standard_agent_call_shape() {
+        let call = realtime_agent_tool_call(
+            "call-7",
+            "edit_file",
+            r#"{"path":"notes.md","old_text":"before","new_text":"after"}"#,
+        )
+        .expect("valid realtime tool call");
+
+        assert_eq!(call.call_id.as_deref(), Some("call-7"));
+        assert_eq!(call.tool, "edit_file");
+        assert_eq!(call.input["path"], "notes.md");
+        assert!(!call.r#async);
+        assert!(realtime_agent_tool_call("call-8", "edit_file", "[]").is_err());
+        assert!(realtime_agent_tool_call("call-9", "edit_file", "not-json").is_err());
     }
 
     #[test]

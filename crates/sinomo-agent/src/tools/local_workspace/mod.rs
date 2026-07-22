@@ -12,8 +12,8 @@ mod write_file;
 use super::{
     AGENT_CODING_EVIDENCE_KIND, AgentCodingToolEvidence, AgentCommandOutput, AgentTool,
     AgentToolArtifactRef, AgentToolCapability, AgentToolDescriptor, AgentToolEvidence,
-    AgentToolProgressEvent, AgentToolProgressSink, AgentToolProviderSpec, AgentToolRegistry,
-    AgentToolResult, AgentToolStatus,
+    AgentToolInvocationMode, AgentToolProgressEvent, AgentToolProgressSink, AgentToolProviderSpec,
+    AgentToolRegistry, AgentToolResult, AgentToolStatus,
 };
 use crate::{
     AgentCancellationToken, AgentProcessLifecycleStatus, AgentProcessManager, AgentProcessSnapshot,
@@ -428,6 +428,16 @@ fn spec_for_kind(kind: AgentToolKind) -> AgentToolSpec {
         .chain(hidden_local_workspace_tool_specs())
         .find(|spec| spec.kind == kind)
         .expect("default coding tool spec exists")
+}
+
+fn descriptor_for_kind(kind: AgentToolKind) -> AgentToolDescriptor {
+    let realtime_compatible = kind != AgentToolKind::RequestUserInput;
+    let descriptor = AgentToolDescriptor::new(spec_for_kind(kind));
+    if realtime_compatible {
+        descriptor.with_invocation_modes(AgentToolInvocationMode::all())
+    } else {
+        descriptor
+    }
 }
 
 fn hidden_local_workspace_tool_specs() -> Vec<AgentToolSpec> {
@@ -2526,6 +2536,24 @@ fn truncate_utf8_lossy(bytes: &[u8], max_bytes: usize) -> TruncatedText {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_tools_share_implementations_with_realtime_except_ui_prompting() {
+        for descriptor in default_local_workspace_tool_descriptors() {
+            let expected_realtime = descriptor.spec.kind != AgentToolKind::RequestUserInput;
+            assert_eq!(
+                descriptor.supports_invocation_mode(AgentToolInvocationMode::Realtime),
+                expected_realtime,
+                "{}",
+                descriptor.spec.name
+            );
+            assert!(
+                descriptor.supports_invocation_mode(AgentToolInvocationMode::TurnBased),
+                "{}",
+                descriptor.spec.name
+            );
+        }
+    }
 
     fn with_remote_management_for_test(registry: AgentToolRegistry) -> AgentToolRegistry {
         registry.with_local_permission_checker(
