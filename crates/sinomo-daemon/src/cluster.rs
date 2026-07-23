@@ -1469,7 +1469,7 @@ pub(crate) async fn handle_daemon_cluster_kv_request_async_on_runtime_with_timeo
     timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
 ) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
     handle_daemon_cluster_kv_request_async_with_forwarding_and_timeouts(
-        paths, request, true, None, runtime, timeouts,
+        paths, request, true, runtime, timeouts,
     )
     .await
 }
@@ -1479,8 +1479,7 @@ pub(crate) async fn handle_daemon_cluster_kv_request_async_on_runtime(
     request: sinomo_core::kv::KvTxnRequest,
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
-    handle_daemon_cluster_kv_request_async_with_forwarding(paths, request, true, None, runtime)
-        .await
+    handle_daemon_cluster_kv_request_async_with_forwarding(paths, request, true, runtime).await
 }
 
 pub(crate) async fn handle_daemon_cluster_kv_authoritative_snapshot_request_async_on_runtime(
@@ -1558,31 +1557,21 @@ pub(crate) async fn handle_daemon_cluster_kv_request_outcome_request_async_on_ru
 pub(crate) async fn handle_forwarded_daemon_cluster_kv_txn_request_async_on_runtime(
     paths: &DaemonPaths,
     request: sinomo_core::kv::KvTxnRequest,
-    forwarding_node_id: NodeId,
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
-    handle_daemon_cluster_kv_request_async_with_forwarding(
-        paths,
-        request,
-        false,
-        Some(forwarding_node_id),
-        runtime,
-    )
-    .await
+    handle_daemon_cluster_kv_request_async_with_forwarding(paths, request, false, runtime).await
 }
 
 async fn handle_daemon_cluster_kv_request_async_with_forwarding(
     paths: &DaemonPaths,
     request: sinomo_core::kv::KvTxnRequest,
     allow_forwarding: bool,
-    required_replication_node_id: Option<NodeId>,
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
     handle_daemon_cluster_kv_request_async_with_forwarding_and_timeouts(
         paths,
         request,
         allow_forwarding,
-        required_replication_node_id,
         runtime,
         cluster_control_plane_timeouts(),
     )
@@ -1593,7 +1582,6 @@ async fn handle_daemon_cluster_kv_request_async_with_forwarding_and_timeouts(
     paths: &DaemonPaths,
     request: sinomo_core::kv::KvTxnRequest,
     allow_forwarding: bool,
-    required_replication_node_id: Option<NodeId>,
     runtime: &tokio::runtime::Handle,
     timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
 ) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
@@ -1608,7 +1596,6 @@ async fn handle_daemon_cluster_kv_request_async_with_forwarding_and_timeouts(
             &cluster_paths,
             request,
             allow_forwarding,
-            required_replication_node_id,
             &task_runtime,
             timeouts,
         )
@@ -1647,7 +1634,6 @@ pub(crate) async fn handle_cluster_kv_txn_request_with_cluster_paths_async_on_ru
         cluster_paths,
         sinomo_core::kv::KvTxnRequest::generated(txn),
         allow_forwarding,
-        None,
         runtime,
         cluster_control_plane_timeouts(),
     )
@@ -1659,7 +1645,6 @@ async fn handle_cluster_kv_request_with_cluster_paths_async_on_runtime_with_time
     cluster_paths: &ClusterPaths,
     request: sinomo_core::kv::KvTxnRequest,
     allow_forwarding: bool,
-    required_replication_node_id: Option<NodeId>,
     runtime: &tokio::runtime::Handle,
     timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
 ) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
@@ -1667,7 +1652,6 @@ async fn handle_cluster_kv_request_with_cluster_paths_async_on_runtime_with_time
         DaemonClusterRpcMode::from_handle(runtime),
         timeouts,
     );
-    host.required_replication_node_id = required_replication_node_id;
     sinomo_core::cluster::handle_cluster_kv_txn_request_async_with_host(
         runtime,
         cluster_paths,
@@ -8414,7 +8398,6 @@ pub(crate) struct DaemonClusterControlPlaneTransport {
     timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
     active_cluster_paths: Option<ClusterPaths>,
     join_rpc_context: Option<DaemonClusterJoinRpcContext>,
-    required_replication_node_id: Option<NodeId>,
 }
 
 #[derive(Clone, Debug)]
@@ -8440,7 +8423,6 @@ impl DaemonClusterControlPlaneTransport {
             timeouts,
             active_cluster_paths: None,
             join_rpc_context: None,
-            required_replication_node_id: None,
         }
     }
 
@@ -8757,10 +8739,6 @@ impl sinomo_core::cluster::ClusterStateAuthorityReachabilityAsyncHost
 }
 
 impl sinomo_core::cluster::ClusterKvTxnQuorumAsyncHost for DaemonClusterControlPlaneTransport {
-    fn required_kv_replication_node_id(&self) -> Option<NodeId> {
-        self.required_replication_node_id.clone()
-    }
-
     fn request_kv_state_authority_vote_async<'a>(
         &'a mut self,
         _state: &'a ClusterBootstrapState,

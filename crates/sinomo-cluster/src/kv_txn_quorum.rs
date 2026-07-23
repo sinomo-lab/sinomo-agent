@@ -183,16 +183,6 @@ pub trait ClusterKvTxnQuorumAsyncHost:
     + ClusterStateAuthorityReachabilityAsyncHost
     + Send
 {
-    /// A remote voter that must durably receive this forwarded transaction
-    /// before the leader returns its compact commit response.
-    ///
-    /// Requiring the forwarding voter as the quorum peer guarantees that its
-    /// local Raft snapshot can materialize the response without transferring
-    /// the complete cluster KV snapshot back over object RPC.
-    fn required_kv_replication_node_id(&self) -> Option<NodeId> {
-        None
-    }
-
     fn request_kv_state_authority_vote_async<'a>(
         &'a mut self,
         state: &'a ClusterBootstrapState,
@@ -846,7 +836,6 @@ where
         let runtime = self.runtime;
         let paths = self.paths;
         let options = self.options;
-        let required_replication_node_id = self.host.required_kv_replication_node_id();
         let host = &mut *self.host;
         Box::pin(async move {
             commit_cluster_raft_command_with_quorum_async_with_host(
@@ -858,7 +847,6 @@ where
                     timeout: options.raft_append_timeout,
                 },
                 options.raft_append_replication_options,
-                required_replication_node_id,
                 host,
             )
             .await
@@ -1067,7 +1055,6 @@ where
             timeout: options.raft_append_timeout,
         },
         options.raft_append_replication_options,
-        None,
         host,
     )
     .await?;

@@ -20277,7 +20277,6 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
                     public_foreground_attempt_timeout: Duration::from_secs(1),
                     iroh_foreground_attempt_timeout: Duration::from_secs(1),
                 },
-                None,
                 &mut host,
             ),
         )
@@ -20522,7 +20521,6 @@ fn async_cluster_raft_quorum_commit_races_voters_and_returns_at_quorum() {
                     public_foreground_attempt_timeout: Duration::from_secs(1),
                     iroh_foreground_attempt_timeout: Duration::from_secs(1),
                 },
-                None,
                 &mut host,
             ),
         )
@@ -20556,13 +20554,17 @@ fn async_cluster_raft_quorum_commit_races_voters_and_returns_at_quorum() {
         .zip([
             Duration::from_millis(5),
             Duration::from_millis(10),
-            Duration::from_millis(80),
+            Duration::from_secs(1),
             Duration::from_millis(15),
         ])
         .collect();
     host.connectivity_records.clear();
     started.store(0, std::sync::atomic::Ordering::Relaxed);
-    let required_replication_node = remotes[2].clone();
+    // Model the voter that forwarded a write as the slow peer. Its identity is
+    // intentionally absent from the Raft commit API: any majority may commit,
+    // while forwarded-response materialization independently fetches an
+    // authoritative snapshot when the forwarding voter's local view trails.
+    let forwarding_voter = remotes[2].clone();
     let began = std::time::Instant::now();
     runtime
         .block_on(
@@ -20571,7 +20573,7 @@ fn async_cluster_raft_quorum_commit_races_voters_and_returns_at_quorum() {
                 &paths,
                 &mut state,
                 KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
-                    key: "/test/required-forwarding-voter".to_string(),
+                    key: "/test/forwarding-voter-is-not-a-quorum-gate".to_string(),
                     value: b"ok".to_vec(),
                     lease_id: None,
                 })),
@@ -20587,28 +20589,28 @@ fn async_cluster_raft_quorum_commit_races_voters_and_returns_at_quorum() {
                     public_foreground_attempt_timeout: Duration::from_secs(1),
                     iroh_foreground_attempt_timeout: Duration::from_secs(1),
                 },
-                Some(required_replication_node.clone()),
                 &mut host,
             ),
         )
-        .expect("required forwarding voter quorum commit");
+        .expect("quorum commit without the forwarding voter");
     assert!(
-        began.elapsed() >= Duration::from_millis(70),
-        "quorum returned before the required forwarding voter acknowledged: {:?}",
+        began.elapsed() < Duration::from_millis(500),
+        "quorum commit waited for the slow forwarding voter: {:?}",
         began.elapsed()
     );
     assert!(
-        host.connectivity_records
+        !host
+            .connectivity_records
             .iter()
-            .any(|(node_id, state)| node_id == &required_replication_node
+            .any(|(node_id, state)| node_id == &forwarding_voter
                 && state == &ClusterConnectivityState::Healthy),
-        "required forwarding voter was not part of the accepted quorum: {:?}",
+        "slow forwarding voter unexpectedly gated the accepted quorum: {:?}",
         host.connectivity_records
     );
     assert_eq!(
         started.load(std::sync::atomic::Ordering::Relaxed),
-        remotes.len() + 1,
-        "required forwarding voter should receive a post-commit confirmation append"
+        remotes.len(),
+        "all voters should race once without a duplicate forwarding-voter append"
     );
 
     locked_set_cluster_raft_leader(&paths, &local, 3).expect("restore leader");
@@ -20648,7 +20650,6 @@ fn async_cluster_raft_quorum_commit_races_voters_and_returns_at_quorum() {
                     public_foreground_attempt_timeout: Duration::from_secs(1),
                     iroh_foreground_attempt_timeout: Duration::from_secs(1),
                 },
-                None,
                 &mut host,
             ),
         )

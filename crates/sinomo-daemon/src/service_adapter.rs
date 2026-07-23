@@ -1057,7 +1057,7 @@ impl Service for ClusterKvService {
                             )
                             .await
                         }
-                        ServiceSigner::Remote { node_id, .. } => {
+                        ServiceSigner::Remote { .. } => {
                             let cluster_paths_for_task = cluster_paths.clone();
                             // The authorization rows are appended to the submitted
                             // transaction as value-and-revision compares. Evaluating
@@ -1081,19 +1081,8 @@ impl Service for ClusterKvService {
                                 &ctx.signer,
                                 request,
                             )?;
-                            let forwarding_node_id = sinomo_core::node::NodeId::new(
-                                node_id.clone(),
-                            )
-                            .map_err(|source| {
-                                ServiceError::Service(format!(
-                                    "authenticated forwarding node ID is invalid: {source}"
-                                ))
-                            })?;
                             handle_forwarded_daemon_cluster_kv_txn_request_async_on_runtime(
-                                &txn_paths,
-                                request,
-                                forwarding_node_id,
-                                runtime,
+                                &txn_paths, request, runtime,
                             )
                             .await
                         }

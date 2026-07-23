@@ -1277,18 +1277,6 @@ pub trait ClusterKvRaftQuorumCommitAsyncHost: Send {
         index: u64,
     ) -> ClusterKvRaftQuorumFuture<'a, ClusterKvRaftCommitResult, Self::Error>;
 
-    /// Confirms the leader's advanced commit index to a request-specific
-    /// replication target. The default is a no-op; network hosts use this for
-    /// forwarded writes whose compact response must be materializable from the
-    /// forwarding voter's local Raft snapshot.
-    fn confirm_required_replication_target_async<'a>(
-        &'a mut self,
-        _state: &'a ClusterBootstrapState,
-        _timeout: Duration,
-    ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
-        Box::pin(async { Ok(()) })
-    }
-
     fn remote_voter_targets_async<'a>(
         &'a mut self,
         state: &'a ClusterBootstrapState,
@@ -1869,22 +1857,6 @@ where
         host.commit_cluster_raft_index_with_events_async(entry.index)
             .await?
     };
-    {
-        let _phase = KvCommandPhaseMetricGuard::start("required_replication_commit_confirm");
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .unwrap_or_default();
-        if !remaining.is_zero() {
-            // The commit is already durable at this point. Confirmation is a
-            // response-materialization optimization: failure leaves the
-            // caller's authoritative-snapshot fallback responsible for
-            // convergence and must not turn a committed request into an
-            // ordinary retryable error.
-            let _ = host
-                .confirm_required_replication_target_async(state, remaining)
-                .await;
-        }
-    }
     command_metrics.finish("committed");
     for target in targets {
         if fanout_node_ids
