@@ -366,6 +366,9 @@ pub enum AgentToolKind {
     SkillActivate,
     SkillUpdate,
     ModuleObjectRpc,
+    McpCall,
+    WebSearch,
+    ImageGeneration,
     ReadSifs,
     WriteSifs,
     ListSifs,
@@ -673,6 +676,11 @@ impl AgentPlacementDefinition {
 pub struct AgentToolRuntimeDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_node_id: Option<String>,
+    /// Streamable HTTP MCP servers whose tools are projected through the
+    /// regular Sinomo tool registry. Authentication values remain node-local:
+    /// definitions contain environment-variable names, never secret values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<AgentMcpServerDefinition>,
 }
 
 impl AgentToolRuntimeDefinition {
@@ -684,6 +692,135 @@ impl AgentToolRuntimeDefinition {
         self.sandbox_node_id = Some(sandbox_node_id.into());
         self
     }
+
+    pub fn with_mcp_server(mut self, server: AgentMcpServerDefinition) -> Self {
+        self.mcp_servers.push(server);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentMcpServerDefinition {
+    pub name: String,
+    pub url: String,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    /// When true, an unavailable server prevents the agent tool registry from
+    /// being configured. Optional servers are skipped with an operator warning.
+    #[serde(default)]
+    pub required: bool,
+    /// Optional allow-list over the server's original MCP tool names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
+    /// Node-local secret reference. To prevent distributed definitions from
+    /// reading unrelated process secrets, the name must start with
+    /// `SINOMO_MCP_`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token_env: Option<String>,
+    /// HTTP header name to environment-variable name. Header values are read
+    /// only on the node that opens the MCP transport.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers_from_env: BTreeMap<String, String>,
+    #[serde(default = "default_mcp_startup_timeout_ms")]
+    pub startup_timeout_ms: u64,
+    #[serde(default = "default_mcp_tool_timeout_ms")]
+    pub tool_timeout_ms: u64,
+}
+
+impl AgentMcpServerDefinition {
+    pub fn streamable_http(name: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            url: url.into(),
+            enabled: true,
+            required: false,
+            allowed_tools: Vec::new(),
+            bearer_token_env: None,
+            headers_from_env: BTreeMap::new(),
+            startup_timeout_ms: default_mcp_startup_timeout_ms(),
+            tool_timeout_ms: default_mcp_tool_timeout_ms(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.is_empty()
+            || self.name.len() > 64
+            || !self.name.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
+        {
+            return Err("name must contain only ASCII letters, numbers, '-' or '_'".to_string());
+        }
+        let url =
+            reqwest::Url::parse(&self.url).map_err(|source| format!("URL is invalid: {source}"))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err("URL must be an absolute http or https endpoint".to_string());
+        }
+        if url.scheme() == "http"
+            && !url.host_str().is_some_and(|host| {
+                host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|address| address.is_loopback())
+            })
+        {
+            return Err("non-loopback MCP endpoints must use https".to_string());
+        }
+        if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+            return Err("URL must not contain credentials or a fragment".to_string());
+        }
+        if self.startup_timeout_ms == 0 || self.startup_timeout_ms > 600_000 {
+            return Err("startup_timeout_ms must be between 1 and 600000".to_string());
+        }
+        if self.tool_timeout_ms == 0 || self.tool_timeout_ms > 600_000 {
+            return Err("tool_timeout_ms must be between 1 and 600000".to_string());
+        }
+        if let Some(variable) = self.bearer_token_env.as_deref() {
+            validate_mcp_env_name(variable)?;
+        }
+        let mut normalized_headers = BTreeSet::new();
+        for (header, variable) in &self.headers_from_env {
+            let header_name = reqwest::header::HeaderName::from_bytes(header.as_bytes())
+                .map_err(|source| format!("header `{header}` is invalid: {source}"))?;
+            if mcp_header_name_is_transport_controlled(header_name.as_str()) {
+                return Err(format!(
+                    "header `{header}` is controlled by the MCP transport"
+                ));
+            }
+            if !normalized_headers.insert(header_name.as_str().to_string()) {
+                return Err(format!("header `{header}` duplicates another header name"));
+            }
+            validate_mcp_env_name(variable)?;
+        }
+        let mut allowed = BTreeSet::new();
+        for tool in &self.allowed_tools {
+            if tool.trim().is_empty() || tool.len() > 128 || tool.chars().any(char::is_control) {
+                return Err(format!(
+                    "allowed tool name `{tool}` is empty, too long, or contains control characters"
+                ));
+            }
+            if !allowed.insert(tool) {
+                return Err(format!("allowed tool name `{tool}` is duplicated"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn default_mcp_startup_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_mcp_tool_timeout_ms() -> u64 {
+    60_000
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1085,6 +1222,14 @@ pub enum AgentDefinitionValidationError {
     },
     #[error("agent definition `{id}` has invalid sandbox runtime node id `{node_id}`")]
     InvalidSandboxRuntimeNodeId { id: String, node_id: String },
+    #[error("agent definition `{id}` has invalid MCP server `{server}`: {detail}")]
+    InvalidMcpServer {
+        id: String,
+        server: String,
+        detail: String,
+    },
+    #[error("agent definition `{id}` declares a colliding MCP server namespace for `{server}`")]
+    DuplicateMcpServer { id: String, server: String },
     #[error("agent definition `{id}` has invalid home server node id `{node_id}`")]
     InvalidHomeServerNodeId { id: String, node_id: String },
     #[error("agent definition `{id}` module provenance is missing module id")]
@@ -1309,6 +1454,24 @@ impl AgentDefinitionValidator {
                 },
             );
         }
+        let mut mcp_server_namespaces = BTreeSet::new();
+        for server in &definition.tool_runtime.mcp_servers {
+            validate_agent_mcp_server(id, server)?;
+            let namespace = server
+                .name
+                .chars()
+                .map(|character| match character {
+                    '-' | '_' => '_',
+                    character => character.to_ascii_lowercase(),
+                })
+                .collect::<String>();
+            if !mcp_server_namespaces.insert(namespace) {
+                return Err(AgentDefinitionValidationError::DuplicateMcpServer {
+                    id: id.to_string(),
+                    server: server.name.clone(),
+                });
+            }
+        }
         if let Some(node_id) = definition.placement.home_server_node_id.as_deref()
             && !is_valid_agent_sandbox_runtime_node_id(node_id)
         {
@@ -1337,6 +1500,55 @@ impl AgentDefinitionValidator {
         }
         Ok(())
     }
+}
+
+fn validate_agent_mcp_server(
+    agent_id: &str,
+    server: &AgentMcpServerDefinition,
+) -> Result<(), AgentDefinitionValidationError> {
+    server
+        .validate()
+        .map_err(|detail| AgentDefinitionValidationError::InvalidMcpServer {
+            id: agent_id.to_string(),
+            server: server.name.clone(),
+            detail,
+        })
+}
+
+pub(crate) fn mcp_header_name_is_transport_controlled(value: &str) -> bool {
+    matches!(
+        value,
+        "accept"
+            | "authorization"
+            | "connection"
+            | "content-length"
+            | "content-type"
+            | "host"
+            | "mcp-protocol-version"
+            | "mcp-session-id"
+            | "transfer-encoding"
+            | "user-agent"
+    )
+}
+
+pub(crate) fn validate_mcp_env_name(value: &str) -> Result<(), String> {
+    let mut characters = value.chars();
+    let Some(first) = characters.next() else {
+        return Err("environment-variable name must not be empty".to_string());
+    };
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return Err(format!(
+            "environment-variable name `{value}` contains unsupported characters"
+        ));
+    }
+    if !value.starts_with("SINOMO_MCP_") {
+        return Err(format!(
+            "environment-variable name `{value}` must use the dedicated `SINOMO_MCP_` prefix"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_tool_surface_entry(
@@ -2668,6 +2880,7 @@ mod tests {
                 default_model: "probe".to_string(),
                 invocation: sinomo_lm::LanguageModelInvocation::InProcess,
                 host_access: sinomo_lm::LanguageModelHostAccess::Bounded,
+                capabilities: sinomo_lm::LanguageModelProviderCapabilities::default(),
                 supports_json_object: false,
                 supports_tool_permissions: false,
             }
@@ -3303,6 +3516,104 @@ mod tests {
             round_trip.placement.home_server_node_id.as_deref(),
             Some("home-node")
         );
+    }
+
+    #[test]
+    fn agent_definition_round_trips_validated_mcp_server_references() {
+        let mut server = AgentMcpServerDefinition::streamable_http(
+            "project_docs",
+            "https://mcp.example.test/v1",
+        );
+        server.required = true;
+        server.allowed_tools = vec!["search".to_string(), "fetch".to_string()];
+        server.bearer_token_env = Some("SINOMO_MCP_TEST_TOKEN".to_string());
+        server.headers_from_env.insert(
+            "x-tenant-id".to_string(),
+            "SINOMO_MCP_TEST_TENANT".to_string(),
+        );
+        let definition = AgentDefinition::custom("mcp-agent", AgentRole::Main, "Use project docs.")
+            .with_tool_runtime(AgentToolRuntimeDefinition::default().with_mcp_server(server));
+
+        definition.validate().expect("MCP definition validates");
+        let value = serde_json::to_value(&definition).expect("serialize definition");
+        assert_eq!(
+            value["tool_runtime"]["mcp_servers"][0]["bearer_token_env"],
+            "SINOMO_MCP_TEST_TOKEN"
+        );
+        assert!(
+            value["tool_runtime"]["mcp_servers"][0]
+                .get("bearer_token")
+                .is_none()
+        );
+        let round_trip: AgentDefinition =
+            serde_json::from_value(value).expect("deserialize definition");
+        assert_eq!(round_trip, definition);
+    }
+
+    #[test]
+    fn agent_definition_rejects_invalid_and_duplicate_mcp_servers() {
+        let invalid_url = AgentDefinition::custom("mcp-agent", AgentRole::Main, "Use tools.")
+            .with_tool_runtime(AgentToolRuntimeDefinition::default().with_mcp_server(
+                AgentMcpServerDefinition::streamable_http("docs", "file:///tmp/mcp.sock"),
+            ));
+        assert!(matches!(
+            invalid_url.validate(),
+            Err(AgentDefinitionValidationError::InvalidMcpServer { .. })
+        ));
+
+        let mut invalid_env =
+            AgentMcpServerDefinition::streamable_http("docs", "https://mcp.example.test");
+        invalid_env.bearer_token_env = Some("AWS_SECRET_ACCESS_KEY".to_string());
+        let invalid_env = AgentDefinition::custom("mcp-agent", AgentRole::Main, "Use tools.")
+            .with_tool_runtime(AgentToolRuntimeDefinition::default().with_mcp_server(invalid_env));
+        assert!(matches!(
+            invalid_env.validate(),
+            Err(AgentDefinitionValidationError::InvalidMcpServer { .. })
+        ));
+
+        let mut invalid_header =
+            AgentMcpServerDefinition::streamable_http("docs", "https://mcp.example.test");
+        invalid_header.headers_from_env.insert(
+            "mcp-session-id".to_string(),
+            "SINOMO_MCP_SESSION".to_string(),
+        );
+        let invalid_header = AgentDefinition::custom("mcp-agent", AgentRole::Main, "Use tools.")
+            .with_tool_runtime(
+                AgentToolRuntimeDefinition::default().with_mcp_server(invalid_header),
+            );
+        assert!(matches!(
+            invalid_header.validate(),
+            Err(AgentDefinitionValidationError::InvalidMcpServer { .. })
+        ));
+
+        let server = AgentMcpServerDefinition::streamable_http("docs", "https://mcp.example.test");
+        let duplicate = AgentDefinition::custom("mcp-agent", AgentRole::Main, "Use tools.")
+            .with_tool_runtime(
+                AgentToolRuntimeDefinition::default()
+                    .with_mcp_server(server.clone())
+                    .with_mcp_server(server),
+            );
+        assert!(matches!(
+            duplicate.validate(),
+            Err(AgentDefinitionValidationError::DuplicateMcpServer { .. })
+        ));
+
+        let colliding = AgentDefinition::custom("mcp-agent", AgentRole::Main, "Use tools.")
+            .with_tool_runtime(
+                AgentToolRuntimeDefinition::default()
+                    .with_mcp_server(AgentMcpServerDefinition::streamable_http(
+                        "project-docs",
+                        "https://one.example.test",
+                    ))
+                    .with_mcp_server(AgentMcpServerDefinition::streamable_http(
+                        "project_docs",
+                        "https://two.example.test",
+                    )),
+            );
+        assert!(matches!(
+            colliding.validate(),
+            Err(AgentDefinitionValidationError::DuplicateMcpServer { .. })
+        ));
     }
 
     #[test]

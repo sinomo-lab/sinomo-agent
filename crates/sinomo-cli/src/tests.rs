@@ -6346,6 +6346,12 @@ fn agent_inspection_renders_package_surface_and_prompt() {
         .with_skill("rust.coding")
         .with_package_version("2.0.0")
         .with_sandbox_runtime_node_id("worker-node");
+    definition.tool_runtime.mcp_servers.push(
+        sinomo_agent::AgentMcpServerDefinition::streamable_http(
+            "docs",
+            "https://mcp.example.test/v1",
+        ),
+    );
     definition.temperature = Some(0.3);
     definition.max_output_tokens = Some(321);
 
@@ -6366,6 +6372,7 @@ fn agent_inspection_renders_package_surface_and_prompt() {
     assert!(text.contains("max model repair attempts: unbounded"));
     assert!(text.contains("tool runtime:"));
     assert!(text.contains("sandbox node: worker-node"));
+    assert!(text.contains("docs: https://mcp.example.test/v1 (enabled, optional)"));
     assert!(text.contains("system prompt:"));
     assert_eq!(json["id"], "coding-agent");
     assert_eq!(json["package"]["version"], "2.0.0");
@@ -6376,6 +6383,7 @@ fn agent_inspection_renders_package_surface_and_prompt() {
     assert!((temperature - 0.3).abs() < 0.000001);
     assert_eq!(json["effective_model_policy"]["max_output_tokens"], 321);
     assert_eq!(json["tool_runtime"]["sandbox_node_id"], "worker-node");
+    assert_eq!(json["tool_runtime"]["mcp_servers"][0]["name"], "docs");
 
     definition.runtime_limits.max_steps = Some(12);
     definition.runtime_limits.max_tool_calls_per_step = Some(3);
@@ -6384,6 +6392,44 @@ fn agent_inspection_renders_package_surface_and_prompt() {
     assert!(capped_text.contains("max steps: 12"));
     assert!(capped_text.contains("max tool calls per step: 3"));
     assert!(capped_text.contains("max model repair attempts: 2"));
+}
+
+#[test]
+fn agent_mcp_registry_requires_explicit_local_authority_before_network_discovery() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-mcp-local-authority");
+    let data_dir = SinomoDataDir::new(root.to_path_buf());
+    let server = sinomo_agent::AgentMcpServerDefinition::streamable_http(
+        "unreachable",
+        "http://127.0.0.1:1/mcp",
+    );
+    let optional = sinomo_agent::AgentDefinition::custom(
+        "optional-mcp-agent",
+        sinomo_agent::AgentRole::Main,
+        "Use MCP when locally allowed.",
+    )
+    .with_tool_runtime(
+        sinomo_agent::AgentToolRuntimeDefinition::default().with_mcp_server(server.clone()),
+    );
+
+    let registry = super::agent_mcp_tool_registry(&data_dir, &optional)
+        .expect("optional MCP server stays disabled without local grant");
+    assert!(registry.descriptors().is_empty());
+
+    let mut required_server = server;
+    required_server.required = true;
+    let required = sinomo_agent::AgentDefinition::custom(
+        "required-mcp-agent",
+        sinomo_agent::AgentRole::Main,
+        "Require MCP.",
+    )
+    .with_tool_runtime(
+        sinomo_agent::AgentToolRuntimeDefinition::default().with_mcp_server(required_server),
+    );
+    let error = match super::agent_mcp_tool_registry(&data_dir, &required) {
+        Ok(_) => panic!("required MCP server must fail without local grant"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("external-integrations"));
 }
 
 #[test]
@@ -15274,6 +15320,43 @@ fn model_list_parser_accepts_optional_provider() {
         parse_models_args(&["list", "github-copilot"]),
         Err(CliParseError::InvalidUsage { .. })
     ));
+}
+
+#[test]
+fn local_model_lifecycle_parser_accepts_only_local_providers() {
+    assert_eq!(
+        parse_models_args(&[
+            "pull",
+            "--provider",
+            "ollama",
+            "--account",
+            "desktop",
+            "--model",
+            "gpt-oss:20b",
+        ])
+        .expect("ollama pull"),
+        ModelsCliCommand::Pull(super::LocalModelActionOptions {
+            provider: "ollama".to_string(),
+            account: "desktop".to_string(),
+            model: "gpt-oss:20b".to_string(),
+        })
+    );
+    assert_eq!(
+        parse_models_args(&[
+            "load",
+            "--provider",
+            "lm-studio",
+            "--model",
+            "openai/gpt-oss-20b",
+        ])
+        .expect("LM Studio load"),
+        ModelsCliCommand::Load(super::LocalModelActionOptions {
+            provider: "lmstudio".to_string(),
+            account: "default".to_string(),
+            model: "openai/gpt-oss-20b".to_string(),
+        })
+    );
+    assert!(parse_models_args(&["load", "--provider", "openai", "--model", "gpt-5.6",]).is_err());
 }
 
 #[test]

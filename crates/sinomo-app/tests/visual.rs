@@ -890,12 +890,14 @@ fn seed_chat_providers(shared: &sinomo_app::state::Shared) {
             account: "default".to_string(),
             name: "OpenAI".to_string(),
             models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
+            capabilities: sinomo_lm::provider_capabilities("openai"),
         },
         ProviderSummary {
             id: "anthropic".to_string(),
             account: "default".to_string(),
             name: "Anthropic".to_string(),
             models: vec!["claude-opus".to_string(), "claude-sonnet".to_string()],
+            capabilities: sinomo_lm::provider_capabilities("anthropic"),
         },
     ];
     chat.provider_idx = 0;
@@ -1819,6 +1821,7 @@ fn capture_chat_composed() {
                     "claude-sonnet-4".to_string(),
                     "claude-haiku-4".to_string(),
                 ],
+                capabilities: sinomo_lm::provider_capabilities("anthropic"),
             }];
             chat.provider_idx = 0;
             chat.model_idx = 0;

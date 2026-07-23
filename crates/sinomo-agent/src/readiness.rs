@@ -1326,6 +1326,8 @@ fn agent_definition_validation_error_kind(error: &AgentDefinitionValidationError
         AgentDefinitionValidationError::InvalidSandboxRuntimeNodeId { .. } => {
             "InvalidSandboxRuntimeNodeId"
         }
+        AgentDefinitionValidationError::InvalidMcpServer { .. } => "InvalidMcpServer",
+        AgentDefinitionValidationError::DuplicateMcpServer { .. } => "DuplicateMcpServer",
         AgentDefinitionValidationError::InvalidHomeServerNodeId { .. } => "InvalidHomeServerNodeId",
         AgentDefinitionValidationError::MissingProvenanceModuleId { .. } => {
             "MissingProvenanceModuleId"

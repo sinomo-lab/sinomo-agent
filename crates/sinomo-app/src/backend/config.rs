@@ -12,10 +12,11 @@ use serde_json::Value;
 use sinomo_cli::app_api::ProviderSummary;
 use sinomo_lm::{
     DEFAULT_PROVIDER_ACCOUNT, LM_PROVIDER_CONFIG_KEY, LM_PROVIDER_HEALTH_CONFIG_KEY,
-    LanguageModelProviderHealthConfig, LanguageModelProviderHealthSnapshot,
-    LanguageModelProviderOptions, ModelConfig, ProviderAccountConfig, ProviderReasoningEffort,
-    ProviderTextVerbosity, model_supports_reasoning_effort, normalize_model_provider,
-    normalize_provider_account_name, provider_health_account_key, upsert_provider_account_config,
+    LM_STUDIO_PROVIDER_ID, LanguageModelProviderHealthConfig, LanguageModelProviderHealthSnapshot,
+    LanguageModelProviderOptions, ModelConfig, OLLAMA_PROVIDER_ID, ProviderAccountConfig,
+    ProviderReasoningEffort, ProviderTextVerbosity, model_supports_reasoning_effort,
+    normalize_model_provider, normalize_provider_account_name, provider_health_account_key,
+    upsert_provider_account_config,
 };
 use sinomo_runtime::config::{
     ConfigClient, ConfigClusterMode, ConfigSchema, ConfigStore, ConfigValueSource, ConfigValueType,
@@ -220,6 +221,7 @@ pub fn cluster_provider_summaries(client: &dyn ConfigClient) -> Vec<ProviderSumm
             models: vec![account.default_model.clone().unwrap_or_else(|| {
                 sinomo_lm::effective_model_name(&provider, sinomo_lm::PROVIDER_DEFAULT_MODEL)
             })],
+            capabilities: sinomo_lm::provider_capabilities(&provider),
         });
     }
     summaries
@@ -329,6 +331,44 @@ mod tests {
                 sinomo_lm::DEEPSEEK_V4_FLASH_MODEL.to_string(),
                 sinomo_lm::DEEPSEEK_V4_PRO_MODEL.to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn local_responses_providers_need_no_api_key_and_are_visible_to_the_app() {
+        let (client, _root) = test_client("local-responses");
+
+        for provider in [OLLAMA_PROVIDER_ID, LM_STUDIO_PROVIDER_ID] {
+            add_provider_account(
+                &client,
+                provider,
+                DEFAULT_PROVIDER_ACCOUNT,
+                "",
+                &provider_default_model(provider),
+                "",
+            )
+            .expect("add local Responses provider");
+        }
+
+        let forms = provider_forms(&client);
+        for provider in [OLLAMA_PROVIDER_ID, LM_STUDIO_PROVIDER_ID] {
+            let form = forms
+                .iter()
+                .find(|form| form.provider == provider)
+                .expect("local provider form");
+            assert!(!provider_requires_api_key(&form.provider));
+            assert!(!form.uses_device_login);
+            assert!(form.signed_in);
+            assert!(!form.has_api_key);
+        }
+        assert_eq!(provider_display_name(OLLAMA_PROVIDER_ID), "Ollama");
+        assert_eq!(provider_display_name(LM_STUDIO_PROVIDER_ID), "LM Studio");
+        assert!(
+            load_provider_config(&client)
+                .expect("provider config")
+                .accounts
+                .iter()
+                .all(|account| account.api_key.is_none())
         );
     }
 
@@ -548,6 +588,8 @@ pub fn provider_display_name(id: &str) -> String {
         "codex-cli" => "Codex (CLI)",
         "github-copilot" => "GitHub Copilot",
         "github-copilot-cli" => "GitHub Copilot (CLI)",
+        OLLAMA_PROVIDER_ID => "Ollama",
+        LM_STUDIO_PROVIDER_ID => "LM Studio",
         other => other,
     }
     .to_string()
@@ -571,7 +613,7 @@ fn provider_account_display_name(provider: &str, account: &str, provider_count: 
 }
 
 /// The providers shown in the Providers settings form. Some use API keys; `codex` and
-/// `github-copilot` use the OAuth device-login flow instead.
+/// `github-copilot` use OAuth device login, while local Responses runtimes need no credential.
 pub const CONFIGURABLE_PROVIDERS: &[&str] = &[
     "anthropic",
     "openai",
@@ -580,7 +622,18 @@ pub const CONFIGURABLE_PROVIDERS: &[&str] = &[
     "nvidia",
     "codex",
     "github-copilot",
+    OLLAMA_PROVIDER_ID,
+    LM_STUDIO_PROVIDER_ID,
 ];
+
+pub fn provider_requires_api_key(provider: &str) -> bool {
+    let Some(provider) = normalize_model_provider(provider) else {
+        return true;
+    };
+    provider != OLLAMA_PROVIDER_ID
+        && provider != LM_STUDIO_PROVIDER_ID
+        && !sinomo_cli::provider_uses_device_login(&provider)
+}
 
 /// A provider's editable configuration, flattened for the Settings UI.
 #[derive(Clone, Debug, PartialEq)]
@@ -636,6 +689,7 @@ pub fn provider_forms(client: &dyn ConfigClient) -> Vec<ProviderForm> {
         let account_name = normalize_provider_account_name(Some(&account.account));
         let default_model = account.default_model.clone().unwrap_or_default();
         let uses_device_login = sinomo_cli::provider_uses_device_login(&provider);
+        let requires_api_key = provider_requires_api_key(&provider);
         let has_inline_api_key = account
             .api_key
             .as_deref()
@@ -643,8 +697,10 @@ pub fn provider_forms(client: &dyn ConfigClient) -> Vec<ProviderForm> {
         let has_api_key = has_inline_api_key;
         let signed_in = if uses_device_login {
             sinomo_cli::provider_signed_in(&provider)
-        } else {
+        } else if requires_api_key {
             has_api_key
+        } else {
+            true
         };
         forms.push(ProviderForm {
             provider: provider.clone(),
@@ -1145,9 +1201,9 @@ pub fn add_provider_account(
 ) -> Result<(), String> {
     let provider = normalize_configurable_provider(provider)?;
     let account_name = normalize_provider_account_name(Some(account));
-    let uses_device_login = sinomo_cli::provider_uses_device_login(&provider);
+    let requires_api_key = provider_requires_api_key(&provider);
     let api_key = api_key.trim().to_string();
-    if !uses_device_login && api_key.is_empty() {
+    if requires_api_key && api_key.is_empty() {
         return Err("API key cannot be empty".to_string());
     }
 
@@ -1168,7 +1224,7 @@ pub fn add_provider_account(
         account: account_name.clone(),
         default_model: optional_trimmed(model),
         api_base_url: optional_trimmed(api_base_url),
-        api_key: (!uses_device_login).then_some(api_key),
+        api_key: requires_api_key.then_some(api_key),
         enabled: true,
         options: LanguageModelProviderOptions::default(),
         model_options: Vec::new(),

@@ -14,6 +14,7 @@ ring = "r2"
 [dependencies]
 base64.workspace = true
 blake3.workspace = true
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true

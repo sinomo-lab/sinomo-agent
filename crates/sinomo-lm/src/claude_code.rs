@@ -131,6 +131,7 @@ impl LanguageModelProvider for ClaudeCodeProvider {
             default_model: self.config.model.clone(),
             invocation: LanguageModelInvocation::Process,
             host_access: crate::LanguageModelHostAccess::Unrestricted,
+            capabilities: crate::LanguageModelProviderCapabilities::default(),
             supports_json_object: false,
             supports_tool_permissions: true,
         }
