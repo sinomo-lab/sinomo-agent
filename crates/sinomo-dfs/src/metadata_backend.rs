@@ -1627,10 +1627,7 @@ impl LocalSobjMetadataBackend {
         };
         let lock = backend.metadata_write_lock()?;
         if let Some(freeze) = backend.membership_handoff_write_freeze()? {
-            let permit_is_at_or_after_activated_generation = freeze
-                .activated_epoch
-                .is_some_and(|activated_epoch| permit.source_epoch() >= activated_epoch);
-            if !permit_is_at_or_after_activated_generation {
+            if !permit.admits_write_freeze(&freeze) {
                 return Err(MetadataBackendError::MembershipHandoffFrozen {
                     shard_id: backend.shard_id.clone(),
                     handoff_id: freeze.handoff_id,
@@ -2915,10 +2912,7 @@ impl LocalSobjMetadataBackend {
         }
         let lock = self.metadata_write_lock()?;
         if let Some(freeze) = self.membership_handoff_write_freeze()? {
-            let permit_is_at_or_after_activated_generation = freeze
-                .activated_epoch
-                .is_some_and(|activated_epoch| permit.source_epoch() >= activated_epoch);
-            if !permit_is_at_or_after_activated_generation {
+            if !permit.admits_write_freeze(&freeze) {
                 return Err(MetadataBackendError::MembershipHandoffFrozen {
                     shard_id: self.shard_id.clone(),
                     handoff_id: freeze.handoff_id,

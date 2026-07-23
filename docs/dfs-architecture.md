@@ -58,18 +58,27 @@ the current assignment with a fresh acknowledgement from every configured
 metadata-shard replica that durably applied and verified that exact prepare.
 The prepare carries the pending intent and `W` receipts and, for namespace
 changes, the complete transaction without making it visible. If the complete
-shard cannot acknowledge, only an operation-bound cluster-quorum certificate
-for that assignment and epoch may replace the full-shard proof. This prevents a
-partition with only the content receipt threshold `W` from creating a second
-visible history while allowing the quorum side to change membership safely.
+shard cannot acknowledge, the operation may continue only after its
+purpose-specific DFS recovery quorum is satisfied and cluster Raft commits an
+operation-bound permit for that exact prepare, assignment, and epoch. A
+partition with only the content receipt threshold `W` is therefore
+insufficient.
+
+This is intentionally not a second DFS election or commit-index protocol.
+Cluster KV already provides quorum election, a linearizable log, and
+compare-and-swap fencing. Reusing it for one bounded per-shard operation floor
+and exact head watermark avoids duplicating Raft inside DFS. KV never stores
+paths, intents, receipts, namespace transactions, journals, snapshots, object
+metadata, content bytes, or repair queues; those remain exclusively in DFS.
 
 Reconfiguration commitment is not itself authority activation. A direct shard
 CAS cannot activate a changed configuration. A proof-carrying handoff may
 either change membership while retaining the primary, or rotate the primary to
 an existing replica while preserving the exact member ring; mixed primary and
 membership changes are rejected. Either form advances exactly one epoch and
-compares the bounded quorum-operation floor. The resulting pending handoff is
-not itself a retiring-primary fence because an isolated primary may not have
+atomically captures the highest Raft-committed DFS operation floor and head
+watermark. The resulting pending handoff is not itself a retiring-primary
+fence because an isolated primary may not have
 observed it and may still complete a valid write. Once the retiring primary
 reconnects, it takes the same publication guard used by canonical commits,
 installs a durable shard-local backend write freeze, and acknowledges the exact
@@ -81,11 +90,11 @@ Activation transfers that immutable fenced prefix across the union of the
 retiring and desired metadata assignments and requires a joint-consensus
 certificate: a majority of each assignment plus explicit acknowledgements from
 both the retiring and desired primaries. The completion proof must equal the
-retiring primary's fence; a watermark taken only when the quorum side created
-the pending record is insufficient. This permits a configured replica to be
-offline without freezing a healthy shard while ensuring the successor starts
-with a durable majority and neither side of a reconfiguration can activate
-alone. For same-primary membership changes, the completing backend instance
+retiring primary's fence and may not precede the captured operation floor or
+exact watermark. This permits a configured replica to be offline during a
+fenced configuration handoff while ensuring the successor starts with a
+durable majority and neither side of a reconfiguration can activate alone. For
+same-primary membership changes, the completing backend instance
 advances its local marker and explicitly rebinds. For a primary rotation, the
 retiring instance records completion without binding the successor epoch and
 therefore remains fenced. Before its exact-prefix acknowledgement can count,
@@ -100,12 +109,13 @@ prefix cannot bind. Independently opened instances remain fenced until they
 perform the same proof. Thus the quorum side may record replacement replicas
 while the old shard is isolated, but it cannot activate a replacement writer
 until the retiring primary has handed off every write completed before its
-local fence. Healthy full-shard writes remain off Raft; exceptional quorum-
-authorized prepares advance only one bounded per-shard transfer floor in KV.
+local fence. Healthy full-shard writes remain off Raft. Degraded operations
+advance only a bounded per-shard permit/floor or watermark, and the next
+handoff carries that fence forward.
 
 Membership-handoff synchronization is therefore a joint-quorum operation, not
-an ordinary metadata quorum barrier. It must not take the ordinary POSIX
-cluster-quorum fallback based only on a majority of the union: a desired-only
+an ordinary publication barrier. It must not take the ordinary degraded
+operation fallback based only on a majority of the union: a desired-only
 quorum is not valid evidence for a retiring-epoch prefix, and a retiring-only
 quorum does not make the successor durable. Progress stays pending and
 retry-enabled until both assignment majorities and both primaries acknowledge,
@@ -191,8 +201,8 @@ The commit path must preserve these properties:
 3. Content is durable on the nodes required by policy.
 4. Matching receipts exist before the visible version advances.
 5. The exact hidden intent/receipt/namespace prepare is durable on every
-   configured metadata-shard replica, or the exceptional quorum fallback has
-   authorized that same operation.
+   configured metadata-shard replica, or the purpose-specific DFS recovery
+   quorum has been fenced by an operation-bound cluster-Raft permit.
 6. The metadata commit revalidates the typed authorization and compares the
    current version, path occupants, and write intent
    atomically.
@@ -200,18 +210,15 @@ The commit path must preserve these properties:
 
 A stale-base writer retries or fails. A write that cannot reach authority stays
 pending or fails according to policy; it does not create a second visible
-history. Any normal quorum-backed path that creates a conflict record is a
-correctness bug.
-
-Conflict records are reserved for a separate split-cluster recovery mode. That
-mode remains disabled until a reconciliation algorithm is specified and
-verified.
+history. The current canonical DFS has no conflict-record path. Conflict
+classification belongs only to the unimplemented local-first extension
+described later in this document.
 
 ## Layered Model
 
 | Layer | Authority and responsibility |
 |---|---|
-| Cluster KV | Filesystem configuration, metadata-shard placement, primary epochs, compact policies, bounded placement-workflow coordination and activity projections, and service discovery. |
+| Cluster KV | Filesystem configuration, metadata-shard placement, primary epochs, compact policies, service discovery, and bounded per-shard Raft permits, floors, watermarks, and handoff records. |
 | Metadata shards | Paths, object identity, versions, write intents, receipts, namespace transactions, durable jobs, and journals. |
 | Content stores | Immutable blobs, extent manifests, staging data, local quotas, and garbage collection. |
 | Network data plane | Bounded metadata batches, manifests, ranges, chunks, receipts, and repair traffic. |
@@ -220,7 +227,8 @@ verified.
 The cluster KV is small enough to replicate to every control-plane participant.
 Per-path and per-version state remains in metadata shards, and bytes remain in
 content stores. This keeps large namespaces and objects out of Raft while using
-Raft to fence the authorities that own them.
+the existing cluster consensus to order configuration, authority changes, and
+the exact degraded DFS prefixes that failover must preserve.
 
 ## Metadata Authority
 
@@ -320,8 +328,9 @@ Replicated-eventual and replicated-confirmed writes use this logical sequence:
 6. Journal the hidden intent/receipt prepare in DFS metadata, including the
    namespace transaction when this is first publication.
 7. Replicate and verify that exact prepare on every configured metadata-shard
-   replica; if any is unavailable or stale, obtain the operation-bound
-   cluster-quorum fallback certificate instead.
+   replica. If a member is unavailable, require the DFS recovery quorum and
+   commit an operation-bound cluster-Raft permit for the same digest, sequence,
+   assignment, and epoch.
 8. Atomically compare the authority epoch, base version, intent state, and
    receipt threshold.
 9. Advance the visible version and schedule any remaining repair.
@@ -601,7 +610,8 @@ stable object's metadata primary; lock aggregates are journaled, replicated to
 every committed shard member on the healthy path, epoch-fenced, leased,
 renewed by mounted clients, and moved atomically with a cross-shard object
 adoption. A partial metadata recovery quorum may complete only after publishing
-an exact operation-bound head watermark through the cluster-quorum fallback.
+an exact operation-bound head watermark through cluster Raft. The watermark
+fences authority; it does not replace the DFS prefix or its acknowledgements.
 Blocking waits run outside the FUSE dispatch lane, and exact close/cancel
 transitions plus finite leases keep abandoned waiters from becoming protocol
 deadlocks. Partial byte ranges remain unsupported, and a conflicting blocking
@@ -664,14 +674,16 @@ response is retained independently, and late siblings are aborted and dropped
 at the budget. The blocking compatibility path has the same two-worker cap and
 returns at the budget; a foreign blocking call already entered may outlive that
 return, so a per-transport worker-slot bound prevents repeated calls from
-accumulating detached threads. Direct fan-out is only an accelerator: quorum
-fallback and later catch-up retain correctness when a peer is slow or rejected.
+accumulating detached threads. Direct fan-out is only an accelerator: the DFS
+recovery quorum, Raft fence, and later catch-up retain correctness when a peer
+is slow or rejected.
 
 This is not yet a full refinement of the combined partition model. Rust can
 continue when the complete committed metadata shard acknowledges even if Raft
-is unavailable; when neither that full-shard proof nor the cluster-quorum
-fallback is available, new grants, renewals, and sync completion fail or wait
-rather than using the model's complete-holder permit. Explicit caller-selected durable sync ids, byte-range locks,
+is unavailable. When the complete shard does not acknowledge, the degraded
+path also requires cluster-Raft quorum; without either authorization, new
+grants, renewals, and sync completion fail or wait. Explicit caller-selected
+durable sync ids, byte-range locks,
 application-level wait-cycle detection, open-unlinked lifetime, and directory
 open-handle identity remain target hardening. FUSE data I/O now targets the
 stable object id and fails closed if the pathname has been replaced; it does
@@ -845,7 +857,7 @@ reconnect.
 
 | Condition | Required behavior |
 |---|---|
-| KV quorum unavailable | KV-backed placement and authority changes cannot commit. A shard primary may continue from its latest valid assignment; stronger quorum fencing is planned hardening. |
+| KV quorum unavailable | Placement and authority changes cannot commit. A shard primary may continue from its latest valid assignment only when the complete configured DFS shard acknowledges; degraded partial-shard publication fails or waits. |
 | Metadata primary unavailable | Writes wait, reroute after an authorized authority change, or fail explicitly. |
 | Local-owned owner offline | Writes queue or fail; ownership does not move automatically. |
 | Commit threshold unavailable | Intent remains pending or rejects without weakening policy. |
@@ -908,9 +920,10 @@ must not require unbounded scans in the foreground write path.
 
 Benchmarks and integration tests are the source of truth for supported scale and
 performance. Formal models cover authority, routing freshness, namespace
-publication, receipt policy, quorum-aware replica fan-out and response
-scheduling, repair authorization, content validation, and the rule that normal
-operation does not create conflict histories. Network-session framing and body
+publication, receipt policy, full-shard and cluster-quorum authorization,
+replica fan-out and response scheduling, repair authorization, content
+validation, and the single-visible-history invariant.
+Network-session framing and body
 attestation are implementation-tested rather than modeled by the DFS specs. See
 the [formal verification guide](formal/cluster-verification.md).
 

@@ -151,10 +151,13 @@ const CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT: Duration =
     CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT;
 const CLUSTER_NETWORK_PENDING_SERVICE_PUBLISH_TIMEOUT: Duration =
     CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT;
-// Preserve enough phase budget for one complete default transport attempt by
-// status/member/snapshot/service work after an early connectivity probe.
-const CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE: Duration =
-    sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+// A stale node-status publication can itself depend on the route that this
+// maintenance generation must repair. Bound that publication early enough to
+// leave one complete direct probe plus local projection overhead; otherwise a
+// restarted public node can remain unreachable forever while every tick spends
+// its whole budget trying to publish through the missing route.
+const CLUSTER_NETWORK_PENDING_CONNECTIVITY_RECOVERY_RESERVE: Duration =
+    Duration::from_millis(2_500);
 
 #[cfg(test)]
 fn cluster_network_info_key(node_id: &NodeId) -> String {
@@ -3951,24 +3954,20 @@ impl ClusterNetworkMaintenance {
         // fresh local observation that can repair their routes.
         let connectivity_probe_scheduled = connectivity_probe.is_some();
         let connectivity_publish_scheduled = connectivity_publish.is_some();
-        let connectivity_probe_deadline = if connectivity_probe_scheduled
-            && (!member_publishes.is_empty()
-                || !node_status_refreshes.is_empty()
-                || !low_priority_node_status_refreshes.is_empty()
-                || service_instance_publish.is_some())
-        {
+        let node_status_deadline = if connectivity_probe_scheduled {
             cluster_network_deadline_with_tail_reserve(
                 deadline,
-                CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE,
+                CLUSTER_NETWORK_PENDING_CONNECTIVITY_RECOVERY_RESERVE,
             )
         } else {
             deadline
         };
+        let connectivity_probe_deadline = deadline;
         for refresh in node_status_refreshes {
             publish_succeeded &= cluster_network_pending_step_with_deadline(
                 "node status refresh",
                 CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT,
-                deadline,
+                node_status_deadline,
                 self.run_pending_node_status_refresh_async(refresh, runtime.clone()),
             )
             .await
@@ -14616,7 +14615,7 @@ mod tests {
             pending,
             runtime.handle().clone(),
             Instant::now()
-                + CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE
+                + CLUSTER_NETWORK_PENDING_CONNECTIVITY_RECOVERY_RESERVE
                 + Duration::from_millis(250),
         ));
         let probe_was_stalled = accepted_rx.recv_timeout(Duration::from_secs(1)).is_ok();
@@ -14628,7 +14627,7 @@ mod tests {
             "probe must connect and stall in the test peer"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < Duration::from_secs(4),
             "the probe must yield at its bounded deadline after the presence publish"
         );
         let statuses = sinomo_core::cluster::read_cluster_node_statuses_from_kv(&cluster_paths)
@@ -15096,27 +15095,26 @@ mod tests {
     }
 
     #[test]
-    fn cluster_network_deadline_with_tail_reserve_preserves_followup_budget() {
-        assert_eq!(
-            CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE,
-            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-            "follow-up work must retain one complete default transport attempt"
+    fn cluster_network_deadline_with_tail_reserve_preserves_connectivity_recovery_budget() {
+        assert!(
+            CLUSTER_NETWORK_PENDING_CONNECTIVITY_RECOVERY_RESERVE > CLUSTER_HEALTH_PROBE_TIMEOUT,
+            "connectivity recovery must retain a complete endpoint probe plus projection overhead"
         );
         let deadline = Instant::now() + Duration::from_secs(10);
         let reserved = cluster_network_deadline_with_tail_reserve(
             Some(deadline),
-            CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE,
+            CLUSTER_NETWORK_PENDING_CONNECTIVITY_RECOVERY_RESERVE,
         )
         .expect("reserved deadline");
         let tail = deadline.duration_since(reserved);
         assert!(
-            tail >= CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE,
-            "connectivity work must leave one full default attempt for status/service publish"
+            tail >= CLUSTER_NETWORK_PENDING_CONNECTIVITY_RECOVERY_RESERVE,
+            "status publication must leave the connectivity recovery reserve intact"
         );
 
         let already_expired = cluster_network_deadline_with_tail_reserve(
             Some(Instant::now() + Duration::from_millis(500)),
-            CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE,
+            CLUSTER_NETWORK_PENDING_CONNECTIVITY_RECOVERY_RESERVE,
         )
         .expect("expired reserved deadline");
         assert!(

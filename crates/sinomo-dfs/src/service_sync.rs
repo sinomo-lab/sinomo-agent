@@ -6,8 +6,8 @@
 //! path obtains a fresh exact-prefix acknowledgement from every configured
 //! shard member without touching Raft. If a member is unavailable, the
 //! existing recovery-quorum requirements still apply and a compact,
-//! operation-bound cluster-quorum head watermark fences membership movement
-//! before the prefix is certified.
+//! operation-bound cluster-quorum head watermark fences failover and membership
+//! movement before the prefix is certified.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -33,9 +33,9 @@ use crate::{
 pub const DEFAULT_DFS_POSIX_SYNC_TIMEOUT: Duration = Duration::from_secs(45);
 
 const DFS_POSIX_SYNC_IDLE_WAIT: Duration = Duration::from_millis(10);
-/// Give healthy WAN replicas one normal round trip to answer before taking the
-/// Raft-backed partition fallback. A caller's shorter timeout remains the
-/// upper bound.
+/// Give every member of a healthy shard one normal round trip to answer before
+/// evaluating the purpose-specific DFS recovery quorum and, for ordinary
+/// durability, the Raft-backed partition fence.
 const DFS_POSIX_FULL_SHARD_ACK_GRACE: Duration = Duration::from_millis(250);
 /// Two canonical routed probes may run at once so one unavailable shard member
 /// cannot prevent every later reachable quorum member from being attempted.
@@ -231,6 +231,34 @@ pub(crate) fn rebind_completed_metadata_shard_membership_handoff(
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// Rebind a cached service lane only when the stamped shard is locally
+    /// fenced by a durable membership-handoff marker.
+    ///
+    /// A target can receive replica traffic before it becomes the committed
+    /// primary, so its long-lived service handle may predate handoff
+    /// completion. The local marker check keeps ordinary routed mutations on
+    /// the no-refresh path; exact control-plane proof is consulted only for a
+    /// lane that cannot yet perform authoritative writes.
+    pub(crate) fn rebind_completed_local_metadata_shard_membership_handoff_if_frozen(
+        &mut self,
+        expected: &DfsMetadataShardConfig,
+    ) -> Result<bool, DfsError> {
+        if expected.primary_node_id != self.node_id {
+            return Ok(false);
+        }
+        let shard_id = DfsMetadataShardId::new(expected.shard_id.clone());
+        let Some(backend) = self.metadata_backend.as_deref() else {
+            return Ok(false);
+        };
+        let locally_frozen = backend.metadata_shard_authoritative_writes_frozen(&shard_id)?;
+        if !locally_frozen {
+            return Ok(false);
+        }
+        Ok(self
+            .rebind_completed_local_metadata_shard_membership_handoffs(&expected.file_system_id)?
+            > 0)
+    }
+
     /// Rebinds only completed, exact-proof SIFS metadata handoffs for a newly
     /// opened service lane.
     ///
@@ -364,6 +392,34 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
         let mut completed = 0;
         for handoff in pending {
+            let shard_id = DfsMetadataShardId::new(handoff.retiring_shard.shard_id.clone());
+            let cancelled_for_prepare_drain = if handoff.retiring_primary_fence.is_none()
+                && self.has_recoverable_standalone_namespace_prepare_on_shard(&shard_id)?
+            {
+                // Handoff creation can race recovery of a prepare that was
+                // already durable under the retiring assignment. Until the
+                // retiring-primary fence exists, the assignment has not
+                // changed and no successor can activate. Withdraw that exact
+                // decision under the publication guard, drain the prepare
+                // through normal canonical authorization, and let placement
+                // propose a fresh handoff from the resulting head.
+                let _publication_guard = crate::service_replica::metadata_shard_publication_guard(
+                    &handoff.retiring_shard.file_system_id,
+                    &handoff.retiring_shard.shard_id,
+                );
+                self.refresh_control_plane_latest()?;
+                let Some(control_plane) = self.control_plane.as_mut() else {
+                    return Ok(completed);
+                };
+                DfsControlPlaneStore::new(control_plane.as_mut())
+                    .cancel_unfenced_metadata_shard_membership_handoff(&handoff)?
+            } else {
+                false
+            };
+            if cancelled_for_prepare_drain {
+                self.recover_durable_namespace_prepares()?;
+                continue;
+            }
             if self.reconcile_metadata_shard_membership_handoff(&handoff, timeout)? {
                 completed += 1;
             }
@@ -419,9 +475,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if observed.handoff_id != requested_handoff.handoff_id
                     || observed.retiring_shard != requested_handoff.retiring_shard
                     || observed.desired_shard != requested_handoff.desired_shard
-                    || observed.required_prepared_sequence
-                        != requested_handoff.required_prepared_sequence
-                    || observed.required_head_watermark != requested_handoff.required_head_watermark
                 {
                     return Ok(false);
                 }
@@ -445,9 +498,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             else {
                 return Ok(false);
             };
-            if write_freeze.journal_sequence < observed_handoff.required_prepared_sequence {
-                return Ok(false);
-            }
             let proposed_fence = DfsMetadataShardMembershipHandoffFence {
                 handoff_id: observed_handoff.handoff_id.clone(),
                 primary_node_id: self.node_id.clone(),
@@ -541,7 +591,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
         // Hold the retiring-primary guard across the final exact local-state
         // check and activation CAS. The control-plane transaction also
-        // compares the immutable fence acknowledgement and operation floor.
+        // compares the immutable DFS fence acknowledgement.
         let publication_guard = crate::service_replica::metadata_shard_publication_guard(
             &retiring.file_system_id,
             &retiring.shard_id,
@@ -1026,6 +1076,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &probe_barrier_id,
                 &rejected_nodes,
                 &mut pending_checkpoint_snapshots,
+                purpose,
             )?;
             self.send_metadata_sync_catchup_batches(&target, &probe_barrier_id)?;
             let mut rejected_nodes = self.send_metadata_sync_prefix_probes(
@@ -1067,6 +1118,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &probe_barrier_id,
                 &rejected_nodes,
                 &mut pending_checkpoint_snapshots,
+                purpose,
             )?;
             // A loopback/in-process transport can acknowledge the catch-up
             // batch during the process pass above. Drive the newly eligible
@@ -1113,6 +1165,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &probe_barrier_id,
                 &rejected_nodes,
                 &mut pending_checkpoint_snapshots,
+                purpose,
             )?;
 
             let progress =
@@ -1605,6 +1658,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         probe_barrier_id: &str,
         rejected_node_ids: &BTreeSet<NodeId>,
         pending_checkpoint_snapshots: &mut BTreeMap<String, MetadataCheckpointSnapshotAttempt>,
+        purpose: &MetadataQuorumSyncPurpose,
     ) -> Result<(), DfsError> {
         let attempts = rejected_node_ids
             .iter()
@@ -1669,6 +1723,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 source_node_id: self.node_id.clone(),
                 file_system_id: Some(target.file_system_id.clone()),
                 authority_epoch: target.authority_epoch,
+                primary_handoff_id: purpose
+                    .primary_handoff_id_for(&target_node_id)
+                    .map(str::to_string),
                 shard_id: target.shard_id.clone(),
                 next_after_sequence: target.journal_sequence,
                 snapshot: checkpoint_snapshot.clone(),
@@ -1720,10 +1777,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     /// Partition fallback for an exact prefix that already satisfies its
-    /// purpose-specific durability certificate. Ordinary sync publishes one
-    /// bounded per-shard head watermark. Membership handoff instead requires
-    /// joint majorities plus both primaries and stores that evidence only in
-    /// the activation proof.
+    /// purpose-specific DFS durability certificate. Ordinary sync publishes
+    /// one bounded per-shard head watermark through cluster Raft. Membership
+    /// handoff instead requires joint majorities plus both primaries and stores
+    /// that evidence in its activation proof.
     fn try_finalize_metadata_quorum_sync_fallback(
         &mut self,
         target: &DfsMetadataQuorumSyncTarget,
@@ -1754,10 +1811,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(expected_shard) = target.expected_shard.as_ref() else {
             return Ok(None);
         };
-        // An ordinary quorum watermark is valid only for the exact active
-        // assignment it names. A wider or narrower target could publish an
-        // unconfigured node, so only an exact active-assignment target may take
-        // this control-plane fallback.
+        // The fallback is valid only for the exact active assignment. A wider
+        // or narrower target could otherwise certify an unconfigured node.
         let expected_node_ids = std::iter::once(expected_shard.primary_node_id.clone())
             .chain(expected_shard.replica_node_ids.iter().cloned())
             .collect::<BTreeSet<_>>();
@@ -1790,8 +1845,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let published = DfsControlPlaneStore::new(control_plane.as_mut())
             .publish_metadata_shard_head_watermark(expected_shard, &watermark)?;
         if !published {
-            // Distinguish a concurrently changed assignment from a temporarily
-            // unavailable cluster quorum before the caller retries.
             self.revalidate_metadata_quorum_sync_authority(target)?;
             return Ok(None);
         }
@@ -3081,7 +3134,7 @@ mod tests {
             1
         );
 
-        let (active, pending, proof, watermark) = fixture.control_plane.with_client(|kv| {
+        let (active, pending, proof) = fixture.control_plane.with_client(|kv| {
             let store = DfsControlPlaneStore::new(kv);
             (
                 store
@@ -3100,10 +3153,6 @@ mod tests {
                     )
                     .expect("handoff proof")
                     .expect("durable handoff proof"),
-                store
-                    .get_metadata_shard_head_watermark(&desired.file_system_id, &desired.shard_id)
-                    .expect("activated watermark")
-                    .expect("activated watermark value"),
             )
         });
         assert_eq!(active, Some(desired.clone()));
@@ -3121,19 +3170,6 @@ mod tests {
         );
         assert!(proof.journal_sequence > 0);
         assert!(!proof.state_fingerprint.is_empty());
-        assert_eq!(watermark.epoch, desired.epoch);
-        assert_eq!(watermark.journal_sequence, proof.journal_sequence);
-        assert_eq!(watermark.state_fingerprint, proof.state_fingerprint);
-        assert_eq!(
-            watermark
-                .acknowledged_node_ids
-                .iter()
-                .cloned()
-                .collect::<BTreeSet<_>>(),
-            std::iter::once(desired.primary_node_id)
-                .chain([new_replica])
-                .collect()
-        );
     }
 
     #[test]
@@ -3446,10 +3482,10 @@ mod tests {
             .expect_err("a desired-only quorum must remain pending");
         assert!(
             matches!(error, DfsError::Network { ref message } if message.contains("2/3 acknowledgements")),
-            "the joint-quorum attempt must time out cleanly instead of publishing an invalid retiring-epoch watermark: {error}"
+            "the joint-quorum attempt must time out cleanly without activating partial DFS state: {error}"
         );
 
-        let (active, pending, proof, watermark) = fixture.control_plane.with_client(|kv| {
+        let (active, pending, proof) = fixture.control_plane.with_client(|kv| {
             let store = DfsControlPlaneStore::new(kv);
             (
                 store
@@ -3467,9 +3503,6 @@ mod tests {
                         &retiring.shard_id,
                     )
                     .expect("handoff proof"),
-                store
-                    .get_metadata_shard_head_watermark(&retiring.file_system_id, &retiring.shard_id)
-                    .expect("head watermark"),
             )
         });
         assert_eq!(active, Some(retiring.clone()));
@@ -3482,7 +3515,6 @@ mod tests {
             "the exact retiring-primary fence remains durable for retry"
         );
         assert!(proof.is_none());
-        assert!(watermark.is_none());
         assert_eq!(
             fixture
                 .service
@@ -4503,6 +4535,7 @@ mod tests {
                 "unroutable-checkpoint",
                 &rejected,
                 &mut attempts,
+                &MetadataQuorumSyncPurpose::OrdinaryDurability,
             )
             .expect("first unroutable attempt is best effort");
         fixture
@@ -4512,6 +4545,7 @@ mod tests {
                 "unroutable-checkpoint",
                 &rejected,
                 &mut attempts,
+                &MetadataQuorumSyncPurpose::OrdinaryDurability,
             )
             .expect("identical unroutable attempt remains settled");
 
@@ -4547,6 +4581,7 @@ mod tests {
                 "unroutable-checkpoint-next-head",
                 &rejected,
                 &mut attempts,
+                &MetadataQuorumSyncPurpose::OrdinaryDurability,
             )
             .expect("changed exact head permits one new repair attempt");
 

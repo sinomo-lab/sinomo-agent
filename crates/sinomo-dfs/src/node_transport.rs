@@ -48,8 +48,8 @@ const DFS_SERVED_MESSAGE_REPAIR_MAX_JOBS: usize = 2;
 /// Refinement of `PromotionFanoutCap` in `replica_quorum_fanout.qnt`.
 const DFS_COMMIT_PROMOTION_MAX_INFLIGHT: usize = 2;
 /// Refinement of the bounded metadata-checkpoint fan-out model. Direct
-/// checkpoint RPCs are best-effort accelerators: quorum fallback and later
-/// catch-up retain correctness when a sibling is slow or unavailable.
+/// checkpoint RPCs are best-effort accelerators: later catch-up retains
+/// correctness when a sibling is slow or unavailable.
 const DFS_METADATA_JOURNAL_DIRECT_MAX_INFLIGHT: usize = 2;
 /// Keep one slow checkpoint replica from holding a served mutation lane. The
 /// operation-wide deadline, when shorter, is folded into each RPC below.

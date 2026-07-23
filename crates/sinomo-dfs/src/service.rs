@@ -5,9 +5,9 @@
 //! `sinomo-network` APIs, so DFS runs with no daemon and no live cluster (limited to
 //! whatever is materialized locally on disk). Route names are owned by `sinomo-dfs`;
 //! `sinomo-network` only provides the object-RPC framing. Cluster-replica routes bind the
-//! authenticated service signer to the claimed metadata source and read the local cluster-KV
-//! snapshot to validate the exact shard role and epoch. They fail closed without that cluster
-//! context.
+//! authenticated service signer to the claimed metadata source and establish an authoritative
+//! cluster-KV read before validating the exact shard role and epoch. They fail closed without that
+//! cluster context.
 //!
 //! Covers the host-agnostic DFS control-plane routes. Smoke and typed message
 //! data-plane routes bind to a [`DfsDataPlaneHost`], so `sinomo-dfs` still owns
@@ -26,22 +26,23 @@ use crate::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_SERVICE_ROUTES, DFS_DIRECT_READ_ROUTE,
     DFS_INSPECTION_ROUTE, DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
     DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse,
-    DfsMessageCommand, DfsMessageResponse, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
-    DfsMetadataJournalBatchResponse, DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand,
-    DfsMetadataSnapshotInstallResponse, DfsOperatorInspector, DfsOperatorStatus,
-    DfsOutboundAttachment, DfsSmokeReport, LocalContentStore, decode_dfs_message_rpc_request,
-    default_dfs_metadata_root, default_dfs_metadata_shards_root, dfs_module_surfaces,
-    dfs_route_is_message_data_plane, inspect_cluster_aware_dfs_status, metadata_shards_prefix,
-    open_local_sharded_metadata_backend, open_root_local_metadata_backend, resolve_dfs_conflicts,
-    sifs_file_system_id, use_dfs_conflict_version,
+    DfsFileSystemId, DfsMessageCommand, DfsMessageResponse, DfsMetadataBackend,
+    DfsMetadataJournalBatchCommand, DfsMetadataReplicaShardContext, DfsMetadataShardConfig,
+    DfsMetadataShardId, DfsMetadataShardMembershipHandoff, DfsMetadataSnapshotInstallCommand,
+    DfsOperatorInspector, DfsOperatorStatus, DfsOutboundAttachment, DfsSmokeReport,
+    LocalContentStore, decode_dfs_message_rpc_request, default_dfs_metadata_root,
+    default_dfs_metadata_shards_root, dfs_module_surfaces, dfs_route_is_message_data_plane,
+    inspect_cluster_aware_dfs_status, metadata_shard_key, metadata_shard_membership_handoff_key,
+    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
+    resolve_dfs_conflicts, sifs_file_system_id, use_dfs_conflict_version,
 };
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{ClusterPaths, ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_core::node::NodeId;
 
 use sinomo_core::service::{
-    Service, ServiceBodyMode, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
-    ServiceRegistryBuilder, ServiceRoute,
+    ClusterAccess, Service, ServiceBodyMode, ServiceContext, ServiceDisposition, ServiceError,
+    ServiceFuture, ServiceRegistryBuilder, ServiceRoute,
 };
 
 const DFS_DEFAULT_ROUTE_CONCURRENCY_LIMIT: usize = 8;
@@ -277,18 +278,29 @@ impl Service for DfsService {
                         &ctx,
                         DFS_METADATA_JOURNAL_BATCH_ROUTE,
                     )?;
+                    let context = authoritative_metadata_replica_shard_context(
+                        ctx.cluster.clone(),
+                        Arc::clone(&ctx.data_dir),
+                        command.file_system_id.clone(),
+                        command.batch.shard_id.clone(),
+                        authenticated_source_node_id.clone(),
+                        command.authority_epoch,
+                    )
+                    .await?;
                     let data_dir = Arc::clone(&ctx.data_dir);
                     let response = tokio::task::spawn_blocking(move || {
-                        dfs_metadata_journal_batch(
+                        crate::metadata_replication::process_cluster_dfs_metadata_journal_batch_with_context(
                             &data_dir,
                             &authenticated_source_node_id,
                             command,
+                            context,
                         )
                     })
                     .await
                     .map_err(|source| {
                         ServiceError::Service(format!("DFS metadata journal task failed: {source}"))
-                    })??;
+                    })?
+                    .map_err(service_error)?;
                     ObjectRpcResponse::encode_body(DFS_METADATA_JOURNAL_BATCH_ROUTE, &response)?
                 }
                 DFS_METADATA_SNAPSHOT_INSTALL_ROUTE => {
@@ -297,12 +309,22 @@ impl Service for DfsService {
                         &ctx,
                         DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
                     )?;
+                    let context = authoritative_metadata_replica_shard_context(
+                        ctx.cluster.clone(),
+                        Arc::clone(&ctx.data_dir),
+                        command.file_system_id.clone(),
+                        command.shard_id.clone(),
+                        authenticated_source_node_id.clone(),
+                        command.authority_epoch,
+                    )
+                    .await?;
                     let data_dir = Arc::clone(&ctx.data_dir);
                     let response = tokio::task::spawn_blocking(move || {
-                        dfs_metadata_snapshot_install(
+                        crate::metadata_replication::process_cluster_dfs_metadata_snapshot_install_with_context(
                             &data_dir,
                             &authenticated_source_node_id,
                             command,
+                            context,
                         )
                     })
                     .await
@@ -310,7 +332,8 @@ impl Service for DfsService {
                         ServiceError::Service(format!(
                             "DFS metadata snapshot task failed: {source}"
                         ))
-                    })??;
+                    })?
+                    .map_err(service_error)?;
                     ObjectRpcResponse::encode_body(DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, &response)?
                 }
                 DFS_INSPECTION_ROUTE => {
@@ -596,34 +619,89 @@ fn dfs_inspection(
     Ok(response)
 }
 
-fn dfs_metadata_journal_batch(
-    data_dir: &SinomoDataDir,
-    authenticated_source_node_id: &NodeId,
-    command: DfsMetadataJournalBatchCommand,
-) -> Result<DfsMetadataJournalBatchResponse, ServiceError> {
-    let cluster_paths = ClusterPaths::new(data_dir);
-    crate::process_cluster_dfs_metadata_journal_batch(
-        data_dir,
-        &cluster_paths,
-        authenticated_source_node_id,
-        command,
-    )
-    .map_err(service_error)
+async fn authoritative_metadata_replica_shard_context(
+    cluster: Option<Arc<dyn ClusterAccess>>,
+    data_dir: Arc<SinomoDataDir>,
+    file_system_id: Option<DfsFileSystemId>,
+    shard_id: DfsMetadataShardId,
+    source_node_id: NodeId,
+    authority_epoch: Option<u64>,
+) -> Result<Option<DfsMetadataReplicaShardContext>, ServiceError> {
+    let Some(file_system_id) = file_system_id else {
+        return Ok(None);
+    };
+    let local_data_dir = Arc::clone(&data_dir);
+    let local_shard_id = shard_id.clone();
+    let local_context = tokio::task::spawn_blocking(move || {
+        crate::metadata_replication::cluster_dfs_metadata_replica_shard_context(
+            &ClusterPaths::new(local_data_dir.as_ref()),
+            &local_shard_id,
+        )
+    })
+    .await
+    .map_err(|source| {
+        ServiceError::Service(format!(
+            "DFS metadata replica authority read task failed: {source}"
+        ))
+    })?
+    .map_err(service_error)?;
+    if local_context.as_ref().is_some_and(|context| {
+        metadata_replica_context_matches_authority(
+            context,
+            &file_system_id,
+            &shard_id,
+            &source_node_id,
+            authority_epoch,
+        )
+    }) {
+        return Ok(local_context);
+    }
+    let Some(cluster) = cluster else {
+        return Ok(local_context);
+    };
+    let shard_key = metadata_shard_key(&file_system_id, &shard_id.0);
+    let shard = cluster
+        .kv_get_authoritative_async(&shard_key)
+        .await?
+        .value
+        .map(|entry| entry.decode::<DfsMetadataShardConfig>())
+        .transpose()?;
+    let Some(shard) = shard else {
+        return Ok(None);
+    };
+    let handoff_key = metadata_shard_membership_handoff_key(&shard.file_system_id, &shard.shard_id);
+    let pending_membership_handoff = cluster
+        .kv_get_authoritative_async(&handoff_key)
+        .await?
+        .value
+        .map(|entry| entry.decode::<DfsMetadataShardMembershipHandoff>())
+        .transpose()?
+        .filter(|handoff| {
+            handoff.retiring_shard == shard
+                && handoff.desired_shard.file_system_id == shard.file_system_id
+                && handoff.desired_shard.shard_id == shard.shard_id
+                && handoff.desired_shard.epoch == shard.epoch.saturating_add(1)
+        });
+    let state =
+        sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(data_dir.as_ref()))?;
+    Ok(Some(DfsMetadataReplicaShardContext {
+        local_node_id: state.local_node_id,
+        shard,
+        pending_membership_handoff,
+    }))
 }
 
-fn dfs_metadata_snapshot_install(
-    data_dir: &SinomoDataDir,
-    authenticated_source_node_id: &NodeId,
-    command: DfsMetadataSnapshotInstallCommand,
-) -> Result<DfsMetadataSnapshotInstallResponse, ServiceError> {
-    let cluster_paths = ClusterPaths::new(data_dir);
-    crate::process_cluster_dfs_metadata_snapshot_install(
-        data_dir,
-        &cluster_paths,
-        authenticated_source_node_id,
-        command,
-    )
-    .map_err(service_error)
+fn metadata_replica_context_matches_authority(
+    context: &DfsMetadataReplicaShardContext,
+    file_system_id: &DfsFileSystemId,
+    shard_id: &DfsMetadataShardId,
+    source_node_id: &NodeId,
+    authority_epoch: Option<u64>,
+) -> bool {
+    context.shard.file_system_id == *file_system_id
+        && context.shard.shard_id == shard_id.0
+        && context.shard.primary_node_id == *source_node_id
+        && authority_epoch == Some(context.shard.epoch)
 }
 
 fn authenticated_dfs_cluster_source_node_id(
@@ -648,8 +726,9 @@ mod tests {
     use crate::{DFS_OBJECT_RPC_ROUTES, DFS_RPC_CATEGORY};
     use crate::{
         DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsFileSystem,
-        DfsMetadataJournalBatch, DfsMetadataJournalReplicationReport, DfsMetadataShardAssignment,
-        DfsMetadataShardId, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
+        DfsMetadataJournalBatch, DfsMetadataJournalBatchResponse,
+        DfsMetadataJournalReplicationReport, DfsMetadataShardAssignment, DfsMetadataShardId,
+        DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
         DfsMetadataSnapshotInstallResult, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
         DfsObjectVersionRecord, DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsSmokeAttempt,
         DfsVersion, DfsWriteIntentRecord, DfsWriteIntentStatus, LocalSobjMetadataBackend,
@@ -743,6 +822,55 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-service-dfs");
         let data_dir = Arc::new(SinomoDataDir::new(&root));
         (root, data_dir)
+    }
+
+    #[test]
+    fn metadata_replica_local_context_fast_path_requires_exact_authority() {
+        let file_system_id =
+            DfsFileSystemId::from_legacy_named("filesystem_dfs_service_replica_fast_path")
+                .expect("filesystem id");
+        let shard_id = DfsMetadataShardId::new("root");
+        let primary_node_id =
+            NodeId::from_legacy_named("node_dfs_service_replica_fast_path_primary")
+                .expect("primary node");
+        let local_node_id = NodeId::from_legacy_named("node_dfs_service_replica_fast_path_local")
+            .expect("local node");
+        let context = DfsMetadataReplicaShardContext {
+            local_node_id: local_node_id.clone(),
+            shard: DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: shard_id.0.clone(),
+                primary_node_id: primary_node_id.clone(),
+                replica_node_ids: vec![local_node_id],
+                epoch: 64,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+            pending_membership_handoff: None,
+        };
+
+        assert!(metadata_replica_context_matches_authority(
+            &context,
+            &file_system_id,
+            &shard_id,
+            &primary_node_id,
+            Some(64),
+        ));
+        assert!(!metadata_replica_context_matches_authority(
+            &context,
+            &file_system_id,
+            &shard_id,
+            &primary_node_id,
+            Some(63),
+        ));
+        assert!(!metadata_replica_context_matches_authority(
+            &context,
+            &file_system_id,
+            &shard_id,
+            &NodeId::from_legacy_named("node_dfs_service_replica_fast_path_stale")
+                .expect("stale node"),
+            Some(64),
+        ));
     }
 
     async fn dispatch_local<B: serde::Serialize>(
@@ -1148,6 +1276,7 @@ mod tests {
                 .expect("source node"),
             file_system_id: None,
             authority_epoch: None,
+            primary_handoff_id: None,
             shard_id: DfsMetadataShardId::new("shard-snapshot-local"),
             next_after_sequence: 7,
             snapshot,
@@ -1223,6 +1352,7 @@ mod tests {
             source_node_id: claimed.clone(),
             file_system_id: None,
             authority_epoch: None,
+            primary_handoff_id: None,
             shard_id: DfsMetadataShardId::new("root"),
             next_after_sequence: 0,
             snapshot: snapshot_backend.export_table_snapshot(),

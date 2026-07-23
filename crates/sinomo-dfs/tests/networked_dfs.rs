@@ -9,15 +9,15 @@ use sinomo_dfs::{
     DfsDistributedWriteResult, DfsError, DfsFetchBlobResponse, DfsFetchBlobResult, DfsFileSystem,
     DfsFileSystemId, DfsMessageTransport, DfsMetadataBackend, DfsMetadataMutation,
     DfsMetadataReplicationOutcome, DfsMetadataShardAssignment, DfsMetadataShardConfig,
-    DfsMetadataShardHeadWatermark, DfsMetadataShardId, DfsNetworkMessage, DfsNodeAdvertisement,
-    DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsObjectVersionRecord, DfsReadData,
-    DfsReadResponse, DfsReadResult, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
-    DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsRoutedCall, DfsRoutedMessage,
-    DfsStageBlobCommand, DfsStageBlobResponse, DfsVersion, DfsWriteIntentState,
-    DfsWriteIntentStatus, LocalSobjMetadataBackend, NetworkedDfsReadFreshness,
-    NetworkedDfsReadOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
-    NetworkedDfsWriteOutcome, SharedDfsControlPlaneKvClient, file_system_config_key,
-    metadata_shard_key, placement_reconciliation_activity_index_key, sifs_node_files_path,
+    DfsMetadataShardId, DfsNetworkMessage, DfsNodeAdvertisement, DfsObjectId, DfsObjectKind,
+    DfsObjectMetadata, DfsObjectVersionRecord, DfsReadData, DfsReadResponse, DfsReadResult,
+    DfsRepairReplicaCommand, DfsRepairReplicaResponse, DfsReplicaReceiptRecord,
+    DfsReplicationPolicy, DfsRoutedCall, DfsRoutedMessage, DfsStageBlobCommand,
+    DfsStageBlobResponse, DfsVersion, DfsWriteIntentState, DfsWriteIntentStatus,
+    LocalSobjMetadataBackend, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
+    NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
+    SharedDfsControlPlaneKvClient, file_system_config_key, metadata_shard_key,
+    placement_reconciliation_activity_index_key, sifs_node_files_path,
 };
 use std::fs;
 use std::io::{Read, Result as IoResult};
@@ -10849,25 +10849,6 @@ fn networked_dfs_owner_handoff_requires_latest_content_and_routes_old_owner() {
     // use the canonical distributed write path.
     owner_dfs = owner_dfs.with_control_plane(control_plane.clone());
     candidate_dfs = candidate_dfs.with_control_plane(control_plane.clone());
-    control_plane.with_client(|kv| {
-        assert!(
-            DfsControlPlaneStore::new(kv)
-                .publish_metadata_shard_head_watermark(
-                    &shard,
-                    &DfsMetadataShardHeadWatermark {
-                        file_system_id: file_system_id.clone(),
-                        shard_id: "root".to_string(),
-                        primary_node_id: owner.clone(),
-                        epoch: shard.epoch,
-                        journal_sequence: 1,
-                        state_fingerprint: "blake3:networked-owner-handoff-root-v1".to_string(),
-                        acknowledged_node_ids: vec![owner.clone(), candidate.clone()],
-                    },
-                )
-                .expect("publish handoff watermark")
-        );
-    });
-
     let handoff_error = candidate_dfs
         .handoff_object_owner(&object_id, "root", 7)
         .expect_err("KV-only owner handoff must fail closed");
@@ -11008,26 +10989,6 @@ fn networked_dfs_owner_handoff_uses_backend_current_metadata() {
         })
         .expect("backend current object");
     candidate_dfs = candidate_dfs.with_control_plane(control_plane.clone());
-    control_plane.with_client(|kv| {
-        assert!(
-            DfsControlPlaneStore::new(kv)
-                .publish_metadata_shard_head_watermark(
-                    &shard,
-                    &DfsMetadataShardHeadWatermark {
-                        file_system_id: file_system_id.clone(),
-                        shard_id: "root".to_string(),
-                        primary_node_id: owner.clone(),
-                        epoch: shard.epoch,
-                        journal_sequence: 1,
-                        state_fingerprint: "blake3:networked-owner-handoff-backend-root-v1"
-                            .to_string(),
-                        acknowledged_node_ids: vec![owner.clone(), candidate.clone()],
-                    },
-                )
-                .expect("publish backend-current handoff watermark")
-        );
-    });
-
     let handoff_error = candidate_dfs
         .handoff_object_owner(&object_id, "root", 11)
         .expect_err("KV-only owner handoff must fail closed");

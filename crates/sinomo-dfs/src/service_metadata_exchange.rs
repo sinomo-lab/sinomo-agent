@@ -170,6 +170,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             source_node_id: self.node_id.clone(),
             file_system_id: Some(shard.file_system_id),
             authority_epoch: Some(shard.epoch),
+            primary_handoff_id: None,
             shard_id: shard_id.clone(),
             next_after_sequence,
             snapshot,
@@ -234,6 +235,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let request_id = command.request_id.clone();
         let shard_id = command.shard_id.clone();
         let next_after_sequence = command.next_after_sequence;
+        // Snapshot authority is checked against the exact committed shard
+        // assignment below. Refresh even for ordinary replica repair: a
+        // receiver may have remained online with an older cached KV snapshot
+        // while the shard epoch advanced without changing its membership.
+        self.refresh_control_plane_latest()?;
         let authority_shard = if command.source_node_id != source_node_id {
             Err("metadata snapshot source does not match transport source".to_string())
         } else if self.control_plane.is_none() {
@@ -286,19 +292,56 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         };
         let (permit, rejection) = match authority_shard {
-            Ok(shard) => (
-                Some(DfsMetadataReplicaIngestPermit::new_validated(
-                    shard.file_system_id.clone(),
-                    shard_id.clone(),
-                    source_node_id.clone(),
-                    shard.epoch,
-                )),
-                None,
-            ),
+            Ok(shard) => {
+                let pending_membership_handoff = if command.primary_handoff_id.is_some() {
+                    let control_plane = self
+                        .control_plane
+                        .as_mut()
+                        .expect("snapshot control plane checked above");
+                    DfsControlPlaneStore::new(control_plane.as_mut())
+                        .get_metadata_shard_membership_handoff(
+                            &shard.file_system_id,
+                            &shard.shard_id,
+                        )?
+                } else {
+                    None
+                };
+                let context = crate::metadata_replication::DfsMetadataReplicaShardContext {
+                    local_node_id: self.node_id.clone(),
+                    shard: shard.clone(),
+                    pending_membership_handoff,
+                };
+                match crate::metadata_replication::validated_pending_primary_handoff_snapshot_id(
+                    &context, &command,
+                ) {
+                    Ok(Some(handoff_id)) => (
+                        Some(
+                            DfsMetadataReplicaIngestPermit::new_validated_pending_primary_handoff(
+                                shard.file_system_id.clone(),
+                                shard_id.clone(),
+                                source_node_id.clone(),
+                                shard.epoch,
+                                handoff_id,
+                            ),
+                        ),
+                        None,
+                    ),
+                    Ok(None) => (
+                        Some(DfsMetadataReplicaIngestPermit::new_validated(
+                            shard.file_system_id.clone(),
+                            shard_id.clone(),
+                            source_node_id.clone(),
+                            shard.epoch,
+                        )),
+                        None,
+                    ),
+                    Err(reason) => (None, Some(reason)),
+                }
+            }
             Err(reason) => (None, Some(reason)),
         };
         let rejection = if rejection.is_none() {
-            self.validate_metadata_snapshot_against_durable_watermark(&command)?
+            self.validate_metadata_snapshot_against_local_state(&command)?
         } else {
             rejection
         };
@@ -369,7 +412,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
     }
 
-    fn validate_metadata_snapshot_against_durable_watermark(
+    fn validate_metadata_snapshot_against_local_state(
         &mut self,
         command: &DfsMetadataSnapshotInstallCommand,
     ) -> Result<Option<String>, DfsError> {
@@ -380,46 +423,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )?
         {
             return Ok(Some(reason));
-        }
-        if self.control_plane.is_none() {
-            return Ok(None);
-        }
-        let Some(shard) = self.metadata_shard_config_for_shard_id(&command.shard_id)? else {
-            return Ok(None);
-        };
-        let control_plane = self
-            .control_plane
-            .as_mut()
-            .expect("control plane checked above");
-        let watermark = DfsControlPlaneStore::new(control_plane.as_mut())
-            .get_metadata_shard_head_watermark(&shard.file_system_id, &shard.shard_id)?;
-        let Some(watermark) = watermark else {
-            return Ok(None);
-        };
-        if command.next_after_sequence < watermark.journal_sequence {
-            return Ok(Some(format!(
-                "metadata snapshot sequence {} would roll shard {} behind durable watermark {}",
-                command.next_after_sequence, command.shard_id.0, watermark.journal_sequence
-            )));
-        }
-        if command.next_after_sequence == watermark.journal_sequence {
-            let matches = crate::metadata_records::dfs_metadata_table_snapshot_matches_checkpoint(
-                &command.snapshot,
-                command.next_after_sequence,
-                &watermark.state_fingerprint,
-            )
-            .map_err(|source| DfsError::Serialization {
-                message: format!(
-                    "encode metadata snapshot watermark check for {}: {source}",
-                    command.shard_id.0
-                ),
-            })?;
-            if !matches {
-                return Ok(Some(format!(
-                    "metadata snapshot state does not match durable watermark for shard {} sequence {}",
-                    command.shard_id.0, command.next_after_sequence
-                )));
-            }
         }
         Ok(None)
     }
@@ -932,6 +935,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "metadata journal batch source does not match transport source".to_string(),
             ));
         }
+        // Do not reject a current primary from a stale cached KV snapshot.
+        // The permit minted below is an authority boundary, so it must use a
+        // freshly committed control-plane view on every ingest attempt.
+        self.refresh_control_plane_latest()?;
         let Some(control_plane) = self.control_plane.as_mut() else {
             return Ok(Err(
                 "metadata journal ingest requires a committed control-plane shard view".to_string(),

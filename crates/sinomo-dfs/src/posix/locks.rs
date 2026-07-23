@@ -30,11 +30,10 @@ const POSIX_LOCK_REMOTE_RESPONSE_MARGIN: Duration = Duration::from_secs(1);
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Apply one idempotent advisory-lock command to the stable object visible
-    /// at `path`. The current metadata primary replicates the resulting lock
-    /// journal prefix to every reachable committed shard member. A healthy
-    /// full-shard acknowledgement avoids Raft; a partial recovery quorum must
-    /// obtain an operation-bound cluster-quorum fence before any outcome is
-    /// exposed.
+    /// at `path`. The current metadata primary durably prepares the resulting
+    /// lock journal prefix in DFS. Visibility requires either exact
+    /// acknowledgement by the complete shard or the DFS recovery quorum plus
+    /// an operation-bound cluster-Raft permit.
     pub fn posix_advisory_lock(
         &mut self,
         path: &str,
@@ -186,10 +185,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.ensure_resolved_path_not_in_cross_shard_flight(&object.path)?;
         }
 
-        // Capture the committed epoch without a Raft write. The exact-prefix
-        // barrier below is the authorization point: every shard member must
-        // acknowledge the operation, or the partial-replica path must obtain
-        // an operation-bound cluster-quorum floor.
+        // Capture the committed configuration epoch without a Raft write. The
+        // exact-prefix barrier below is the authorization point: every
+        // configured shard member must acknowledge the operation.
         let authority_epoch = self.local_metadata_owner_epoch_hint_for_object(&object)?;
         let context = DfsAdvisoryLockTransitionContext {
             authority_epoch,

@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 #[cfg(test)]
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use sinomo_agent::{
     AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentSessionControlResult,
@@ -139,6 +140,13 @@ pub enum ChatCommand {
     FetchModels {
         provider: String,
     },
+    /// Run a voice-originated delegation through the regular chat/agent
+    /// runtime and return its final visible text to the realtime frontend.
+    RealtimeHandoff {
+        session_id: String,
+        input: String,
+        response_tx: Sender<Result<String, String>>,
+    },
     Shutdown,
 }
 
@@ -257,6 +265,28 @@ pub struct ChatHandle {
     worker: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+pub struct ChatRealtimeHandoff {
+    tx: Sender<ChatCommand>,
+    session_id: String,
+}
+
+impl ChatRealtimeHandoff {
+    pub fn run(&self, input: String) -> Result<String, String> {
+        let (response_tx, response_rx) = channel();
+        self.tx
+            .send(ChatCommand::RealtimeHandoff {
+                session_id: self.session_id.clone(),
+                input,
+                response_tx,
+            })
+            .map_err(|_| "regular chat runtime is unavailable".to_string())?;
+        response_rx
+            .recv_timeout(Duration::from_secs(10 * 60))
+            .map_err(|_| "regular chat handoff timed out".to_string())?
+    }
+}
+
 impl ChatHandle {
     /// Spawn the worker. The runtime is built inside the thread.
     pub fn spawn(
@@ -336,6 +366,13 @@ impl ChatHandle {
 
     pub fn tool_context(&self) -> Option<AgentChatToolContext> {
         self.tool_context.read().ok()?.clone()
+    }
+
+    pub fn realtime_handoff(&self, session_id: impl Into<String>) -> ChatRealtimeHandoff {
+        ChatRealtimeHandoff {
+            tx: self.tx.clone(),
+            session_id: session_id.into(),
+        }
     }
 
     /// Drain all currently-available events without blocking.
@@ -747,72 +784,7 @@ fn worker(
                 let tx = evt_tx.clone();
                 let event_session_id = session_id.clone();
                 let result = chat.send_with_attachments(&text, &attachments, &mut |event| {
-                    let mapped = match event {
-                        ChatStreamEvent::Token(text) => Some(ChatEvent::Token {
-                            session_id: event_session_id.clone(),
-                            text,
-                        }),
-                        ChatStreamEvent::AgentToken { speaker, text } => {
-                            Some(ChatEvent::AgentToken {
-                                session_id: speaker.channel_id.clone(),
-                                speaker,
-                                text,
-                            })
-                        }
-                        ChatStreamEvent::Notice(notice) if !notice.is_empty() => {
-                            Some(ChatEvent::Notice {
-                                session_id: event_session_id.clone(),
-                                notice,
-                            })
-                        }
-                        ChatStreamEvent::ChannelSystem {
-                            channel_id,
-                            kind,
-                            text,
-                            ..
-                        } => Some(ChatEvent::SystemMessage {
-                            session_id: channel_id,
-                            kind,
-                            text,
-                        }),
-                        ChatStreamEvent::Context(context) => Some(ChatEvent::Context {
-                            session_id: event_session_id.clone(),
-                            context,
-                        }),
-                        ChatStreamEvent::ToolCallStarted(call) => {
-                            Some(ChatEvent::ToolCallStarted {
-                                session_id: event_session_id.clone(),
-                                call,
-                            })
-                        }
-                        ChatStreamEvent::ToolCallDelta {
-                            step_index,
-                            call_id,
-                            tool,
-                            arguments_delta,
-                        } => Some(ChatEvent::ToolCallDelta {
-                            session_id: event_session_id.clone(),
-                            step_index,
-                            call_id,
-                            tool,
-                            arguments_delta,
-                        }),
-                        ChatStreamEvent::ToolCallCompleted(call) => {
-                            Some(ChatEvent::ToolCallCompleted {
-                                session_id: event_session_id.clone(),
-                                call,
-                            })
-                        }
-                        ChatStreamEvent::Process(process) => Some(ChatEvent::Process {
-                            session_id: event_session_id.clone(),
-                            process,
-                        }),
-                        ChatStreamEvent::Usage(usage) => Some(ChatEvent::Usage {
-                            session_id: event_session_id.clone(),
-                            usage,
-                        }),
-                        ChatStreamEvent::Notice(_) => None,
-                    };
+                    let mapped = map_chat_stream_event(event, &event_session_id);
                     if let Some(event) = mapped {
                         let _ = tx.send(event);
                     }
@@ -823,6 +795,67 @@ fn worker(
                         error: format!("turn failed: {error}"),
                     });
                 }
+                let _ = evt_tx.send(ChatEvent::TurnDone { session_id });
+            }
+            ChatCommand::RealtimeHandoff {
+                session_id,
+                input,
+                response_tx,
+            } => {
+                let session_id = if session_id.trim().is_empty() {
+                    chat.session_id()
+                } else if chat.session_id() == session_id {
+                    session_id
+                } else {
+                    match chat.resume_session(&session_id, &[]) {
+                        Ok(()) => {
+                            log_resume_sync_warnings(&mut chat, &session_id);
+                            set_active_session_id(&active_session_id, &evt_tx, &session_id);
+                            session_id
+                        }
+                        Err(error) => {
+                            let detail = format!("resume failed before realtime handoff: {error}");
+                            let _ = response_tx.send(Err(detail.clone()));
+                            let _ = evt_tx.send(ChatEvent::Error {
+                                session_id: Some(session_id),
+                                error: detail,
+                            });
+                            continue;
+                        }
+                    }
+                };
+                let tx = evt_tx.clone();
+                let event_session_id = session_id.clone();
+                let mut answer = String::new();
+                let result = chat.send(&input, &mut |event| {
+                    match &event {
+                        ChatStreamEvent::Token(text) | ChatStreamEvent::AgentToken { text, .. } => {
+                            answer.push_str(text)
+                        }
+                        _ => {}
+                    }
+                    if let Some(event) = map_chat_stream_event(event, &event_session_id) {
+                        let _ = tx.send(event);
+                    }
+                });
+                let response = result
+                    .map_err(|error| format!("regular agent handoff failed: {error}"))
+                    .and_then(|()| {
+                        let answer = answer.trim().to_string();
+                        if answer.is_empty() {
+                            Err("regular agent handoff completed without visible output"
+                                .to_string())
+                        } else {
+                            Ok(answer)
+                        }
+                    });
+                if let Err(detail) = &response {
+                    let _ = evt_tx.send(ChatEvent::Error {
+                        session_id: Some(session_id.clone()),
+                        error: detail.clone(),
+                    });
+                }
+                let _ = response_tx.send(response);
                 let _ = evt_tx.send(ChatEvent::TurnDone { session_id });
             }
             ChatCommand::Steer { message, .. } => match chat.steer(message) {
@@ -1026,6 +1059,67 @@ fn worker(
             ChatCommand::Shutdown => break,
         }
         refresh_tool_context(&tool_context, &chat);
+    }
+}
+
+fn map_chat_stream_event(event: ChatStreamEvent, session_id: &str) -> Option<ChatEvent> {
+    match event {
+        ChatStreamEvent::Token(text) => Some(ChatEvent::Token {
+            session_id: session_id.to_string(),
+            text,
+        }),
+        ChatStreamEvent::AgentToken { speaker, text } => Some(ChatEvent::AgentToken {
+            session_id: speaker.channel_id.clone(),
+            speaker,
+            text,
+        }),
+        ChatStreamEvent::Notice(notice) if !notice.is_empty() => Some(ChatEvent::Notice {
+            session_id: session_id.to_string(),
+            notice,
+        }),
+        ChatStreamEvent::ChannelSystem {
+            channel_id,
+            kind,
+            text,
+            ..
+        } => Some(ChatEvent::SystemMessage {
+            session_id: channel_id,
+            kind,
+            text,
+        }),
+        ChatStreamEvent::Context(context) => Some(ChatEvent::Context {
+            session_id: session_id.to_string(),
+            context,
+        }),
+        ChatStreamEvent::ToolCallStarted(call) => Some(ChatEvent::ToolCallStarted {
+            session_id: session_id.to_string(),
+            call,
+        }),
+        ChatStreamEvent::ToolCallDelta {
+            step_index,
+            call_id,
+            tool,
+            arguments_delta,
+        } => Some(ChatEvent::ToolCallDelta {
+            session_id: session_id.to_string(),
+            step_index,
+            call_id,
+            tool,
+            arguments_delta,
+        }),
+        ChatStreamEvent::ToolCallCompleted(call) => Some(ChatEvent::ToolCallCompleted {
+            session_id: session_id.to_string(),
+            call,
+        }),
+        ChatStreamEvent::Process(process) => Some(ChatEvent::Process {
+            session_id: session_id.to_string(),
+            process,
+        }),
+        ChatStreamEvent::Usage(usage) => Some(ChatEvent::Usage {
+            session_id: session_id.to_string(),
+            usage,
+        }),
+        ChatStreamEvent::Notice(_) => None,
     }
 }
 

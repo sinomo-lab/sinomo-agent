@@ -54,6 +54,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // are admitted through the daemon's global compatibility lane.
             return Ok(());
         };
+        self.rebind_completed_local_metadata_shard_membership_handoff_if_frozen(expected)?;
         let Some(object) = command.object_metadata.as_ref() else {
             return Err(DfsError::Distributed {
                 message: format!(

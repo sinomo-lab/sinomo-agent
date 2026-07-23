@@ -9,17 +9,17 @@ use super::{
     ClusterJoinOptions, ClusterMigrateCommand, ClusterMigrationPlanOptions, ClusterPaths,
     ClusterRemoveOptions, ClusterRenameOptions, ClusterRoleOptions, ClusterRolloutBuildRequest,
     ClusterStateAuthorityOptions, DaemonCliCommand, DaemonClusterStatus, DaemonPaths,
-    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DfsCliCommand, DfsCommonOptions,
-    DfsConflictResolveOptions, DfsConflictSaveVersionOptions, DfsConflictUseVersionOptions,
-    DfsConflictVersionsOptions, DfsFilterOptions, DfsMetadataShardTransferPrimaryOptions,
-    DfsMountOptions, DfsPinCliCommand, DfsPlacementAuthorityClearOptions,
-    DfsPlacementAuthorityCliCommand, DfsPlacementAuthorityInspectOptions,
-    DfsPlacementAuthorityRecovery, InstallLayout, InstallOptions, InteractionModel,
-    InteractionRuntime, InteractionSession, InteractionSurface, InteractionSurfaceKind,
-    ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions, ModelOptionsTarget,
-    ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand,
-    ProviderCommandOptions, ProviderName, RolloutAdvanceOptions, RolloutCliCommand,
-    RolloutMainActivation, RolloutModuleNativeDylibOptions, RolloutOptions,
+    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DaemonStatusOptions, DfsCliCommand,
+    DfsCommonOptions, DfsConflictResolveOptions, DfsConflictSaveVersionOptions,
+    DfsConflictUseVersionOptions, DfsConflictVersionsOptions, DfsFilterOptions,
+    DfsMetadataShardTransferPrimaryOptions, DfsMountOptions, DfsPinCliCommand,
+    DfsPlacementAuthorityClearOptions, DfsPlacementAuthorityCliCommand,
+    DfsPlacementAuthorityInspectOptions, DfsPlacementAuthorityRecovery, InstallLayout,
+    InstallOptions, InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
+    InteractionSurfaceKind, ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions,
+    ModelOptionsTarget, ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand,
+    ProviderCliCommand, ProviderCommandOptions, ProviderName, RolloutAdvanceOptions,
+    RolloutCliCommand, RolloutMainActivation, RolloutModuleNativeDylibOptions, RolloutOptions,
     RolloutProgressExpectation, RolloutProgressTiming, RolloutTarget,
     RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler, SelfRolloutPaths,
     SkillActivateOptions, SkillExportOptions, SkillImportOptions, SkillListOptions,
@@ -6346,6 +6346,12 @@ fn agent_inspection_renders_package_surface_and_prompt() {
         .with_skill("rust.coding")
         .with_package_version("2.0.0")
         .with_sandbox_runtime_node_id("worker-node");
+    definition.tool_runtime.mcp_servers.push(
+        sinomo_agent::AgentMcpServerDefinition::streamable_http(
+            "docs",
+            "https://mcp.example.test/v1",
+        ),
+    );
     definition.temperature = Some(0.3);
     definition.max_output_tokens = Some(321);
 
@@ -6366,6 +6372,7 @@ fn agent_inspection_renders_package_surface_and_prompt() {
     assert!(text.contains("max model repair attempts: unbounded"));
     assert!(text.contains("tool runtime:"));
     assert!(text.contains("sandbox node: worker-node"));
+    assert!(text.contains("docs: https://mcp.example.test/v1 (enabled, optional)"));
     assert!(text.contains("system prompt:"));
     assert_eq!(json["id"], "coding-agent");
     assert_eq!(json["package"]["version"], "2.0.0");
@@ -6376,6 +6383,7 @@ fn agent_inspection_renders_package_surface_and_prompt() {
     assert!((temperature - 0.3).abs() < 0.000001);
     assert_eq!(json["effective_model_policy"]["max_output_tokens"], 321);
     assert_eq!(json["tool_runtime"]["sandbox_node_id"], "worker-node");
+    assert_eq!(json["tool_runtime"]["mcp_servers"][0]["name"], "docs");
 
     definition.runtime_limits.max_steps = Some(12);
     definition.runtime_limits.max_tool_calls_per_step = Some(3);
@@ -6384,6 +6392,44 @@ fn agent_inspection_renders_package_surface_and_prompt() {
     assert!(capped_text.contains("max steps: 12"));
     assert!(capped_text.contains("max tool calls per step: 3"));
     assert!(capped_text.contains("max model repair attempts: 2"));
+}
+
+#[test]
+fn agent_mcp_registry_requires_explicit_local_authority_before_network_discovery() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-mcp-local-authority");
+    let data_dir = SinomoDataDir::new(root.to_path_buf());
+    let server = sinomo_agent::AgentMcpServerDefinition::streamable_http(
+        "unreachable",
+        "http://127.0.0.1:1/mcp",
+    );
+    let optional = sinomo_agent::AgentDefinition::custom(
+        "optional-mcp-agent",
+        sinomo_agent::AgentRole::Main,
+        "Use MCP when locally allowed.",
+    )
+    .with_tool_runtime(
+        sinomo_agent::AgentToolRuntimeDefinition::default().with_mcp_server(server.clone()),
+    );
+
+    let registry = super::agent_mcp_tool_registry(&data_dir, &optional)
+        .expect("optional MCP server stays disabled without local grant");
+    assert!(registry.descriptors().is_empty());
+
+    let mut required_server = server;
+    required_server.required = true;
+    let required = sinomo_agent::AgentDefinition::custom(
+        "required-mcp-agent",
+        sinomo_agent::AgentRole::Main,
+        "Require MCP.",
+    )
+    .with_tool_runtime(
+        sinomo_agent::AgentToolRuntimeDefinition::default().with_mcp_server(required_server),
+    );
+    let error = match super::agent_mcp_tool_registry(&data_dir, &required) {
+        Ok(_) => panic!("required MCP server must fail without local grant"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("external-integrations"));
 }
 
 #[test]
@@ -13293,6 +13339,91 @@ fn dfs_cluster_status_skips_members_without_healthy_connectivity() {
 }
 
 #[test]
+fn dfs_cluster_status_probes_members_in_a_reverse_observed_healthy_component() {
+    crate::ensure_cluster_directory_installed();
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-dfs-status-reverse-component");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    data_dir.ensure_root_layout().expect("data dir");
+
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_dfs_status_reverse_component").expect("cluster");
+    let local_node_id =
+        NodeId::from_legacy_named("node_dfs_status_reverse_component_local").expect("local node");
+    let remote_node_id =
+        NodeId::from_legacy_named("node_dfs_status_reverse_component_remote").expect("remote node");
+    let now = OffsetDateTime::now_utc();
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "dfs status reverse component",
+        local_node_id.clone(),
+        "local",
+        "local-public-key",
+        now,
+    );
+    let remote_endpoint =
+        daemon_lan_endpoint(&remote_node_id, "198.51.100.42:21353".to_string(), 0);
+    let mut remote = ClusterMemberRecord::local_voter(
+        cluster_id,
+        remote_node_id.clone(),
+        "remote",
+        "remote-public-key",
+        now,
+    );
+    remote.capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
+    remote.allowed_capabilities = remote.capabilities.clone();
+    remote.endpoints = vec![remote_endpoint.clone()];
+    state.members.push(remote);
+    sinomo_runtime::cluster::write_cluster_state(&paths, &state).expect("write state");
+    sinomo_runtime::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+        .expect("sync state");
+
+    let direct_unreachable = sinomo_runtime::network::cluster_connectivity_record(
+        &state,
+        &remote_endpoint,
+        sinomo_runtime::network::ClusterConnectivityState::Unreachable,
+        None,
+        3,
+        None,
+        Some(now.to_string()),
+        now,
+        120,
+    );
+    sinomo_runtime::cluster::sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &local_node_id,
+        vec![direct_unreachable.clone()],
+    )
+    .expect("sync local connectivity");
+
+    let local_endpoint = daemon_lan_endpoint(&local_node_id, "203.0.113.11:21353".to_string(), 0);
+    let mut remote_view = state.clone();
+    remote_view.local_node_id = remote_node_id.clone();
+    let reverse_healthy = sinomo_runtime::network::cluster_connectivity_record(
+        &remote_view,
+        &local_endpoint,
+        sinomo_runtime::network::ClusterConnectivityState::Healthy,
+        Some(42),
+        0,
+        Some(now.to_string()),
+        None,
+        now,
+        120,
+    );
+    let route_graph = sinomo_runtime::network::ClusterConnectivityGraph::from_records(
+        local_node_id.clone(),
+        [direct_unreachable, reverse_healthy],
+    );
+
+    assert_eq!(
+        crate::dfs_cluster_status_unavailable_reason(&paths, &state, &route_graph, &remote_node_id,),
+        None,
+        "a healthy full-duplex relationship observed by either endpoint keeps both nodes in the routed component"
+    );
+}
+
+#[test]
 fn rollout_target_uses_main_endpoint_when_shadow_is_unreachable() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-main-fallback");
     let data_dir = SinomoDataDir::new(&root);
@@ -14193,9 +14324,12 @@ fn daemon_parser_supports_shadow_daemon_on_separate_default_port() {
     assert_eq!(
         parse_daemon_schema_for_test(&["shadow".to_string(), "status".to_string()])
             .expect("shadow"),
-        DaemonCliCommand::ShadowStatus(DaemonRunOptions {
-            host: "127.0.0.1".to_string(),
-            port: 21_354,
+        DaemonCliCommand::ShadowStatus(DaemonStatusOptions {
+            endpoint: DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port: 21_354,
+            },
+            explicit_address: false,
         })
     );
     assert_eq!(
@@ -14228,9 +14362,29 @@ fn daemon_parser_uses_port_21353_by_default() {
     );
     assert_eq!(
         parse_daemon_schema_for_test(&["status".to_string()]).expect("daemon status"),
-        DaemonCliCommand::Status(DaemonRunOptions {
-            host: "127.0.0.1".to_string(),
-            port: 21_353,
+        DaemonCliCommand::Status(DaemonStatusOptions {
+            endpoint: DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port: 21_353,
+            },
+            explicit_address: false,
+        })
+    );
+    assert_eq!(
+        parse_daemon_schema_for_test(&[
+            "status".to_string(),
+            "--host".to_string(),
+            "10.14.5.15".to_string(),
+            "--port".to_string(),
+            "21354".to_string(),
+        ])
+        .expect("daemon status custom"),
+        DaemonCliCommand::Status(DaemonStatusOptions {
+            endpoint: DaemonRunOptions {
+                host: "10.14.5.15".to_string(),
+                port: 21_354,
+            },
+            explicit_address: true,
         })
     );
     assert_eq!(
@@ -15166,6 +15320,43 @@ fn model_list_parser_accepts_optional_provider() {
         parse_models_args(&["list", "github-copilot"]),
         Err(CliParseError::InvalidUsage { .. })
     ));
+}
+
+#[test]
+fn local_model_lifecycle_parser_accepts_only_local_providers() {
+    assert_eq!(
+        parse_models_args(&[
+            "pull",
+            "--provider",
+            "ollama",
+            "--account",
+            "desktop",
+            "--model",
+            "gpt-oss:20b",
+        ])
+        .expect("ollama pull"),
+        ModelsCliCommand::Pull(super::LocalModelActionOptions {
+            provider: "ollama".to_string(),
+            account: "desktop".to_string(),
+            model: "gpt-oss:20b".to_string(),
+        })
+    );
+    assert_eq!(
+        parse_models_args(&[
+            "load",
+            "--provider",
+            "lm-studio",
+            "--model",
+            "openai/gpt-oss-20b",
+        ])
+        .expect("LM Studio load"),
+        ModelsCliCommand::Load(super::LocalModelActionOptions {
+            provider: "lmstudio".to_string(),
+            account: "default".to_string(),
+            model: "openai/gpt-oss-20b".to_string(),
+        })
+    );
+    assert!(parse_models_args(&["load", "--provider", "openai", "--model", "gpt-5.6",]).is_err());
 }
 
 #[test]

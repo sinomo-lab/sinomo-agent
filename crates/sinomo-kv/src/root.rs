@@ -359,6 +359,7 @@ pub use rpc::{
     ClusterKvAuthoritativeWatchStartRequest, ClusterKvLocalReadWatchHost,
     ClusterKvReplicationRequest, ClusterKvReplicationResponse, ClusterKvRequestOutcomeRequest,
     ClusterKvRpcPayload, ClusterKvStateAuthorityVoteRequest, ClusterKvStateAuthorityVoteResponse,
+    ClusterKvTxnRpcResponse,
     ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, ClusterRaftAppendRequest,
     ClusterRaftAppendResponse, ClusterRaftVoteRequest, ClusterRaftVoteResponse,
     cluster_kv_authoritative_range_prefix_response_rpc_payload,

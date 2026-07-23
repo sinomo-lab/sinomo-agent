@@ -6,9 +6,7 @@ use sinomo_cli_registry::{
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::events::EventStore;
-#[cfg(test)]
-use sinomo_core::kv::KvTxnResponse;
-use sinomo_core::kv::{ClusterKvTxnCommitResult, KvSnapshot, KvTxnRequest};
+use sinomo_core::kv::{ClusterKvTxnCommitResult, KvSnapshot, KvTxnRequest, KvTxnResponse};
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network;
 use sinomo_core::network::ClusterPaths;
@@ -4253,7 +4251,7 @@ fn commit_sandbox_policy_cluster_request(
 ) -> Result<(), CliError> {
     let host = current_sandbox_cli_host();
     if let Some(result) = host.commit_cluster_kv_request_for_test(data_dir, &request) {
-        return require_sandbox_policy_cluster_commit(result?);
+        return require_sandbox_policy_cluster_commit(result?.txn_response);
     }
     let Some(address) = host.default_main_daemon_address()? else {
         return Err(CliError::DaemonNotRunning {
@@ -4269,12 +4267,14 @@ fn commit_sandbox_policy_cluster_request(
     response.error_detail().map_err(CliError::from)?;
     let commit = sinomo_core::kv::decode_cluster_kv_txn_rpc_body(&response.body)
         .map_err(SandboxCliError::Kv)?;
-    require_sandbox_policy_cluster_commit(commit)
+    require_sandbox_policy_cluster_commit(commit.txn_response)
 }
 
 #[cfg(not(test))]
-fn require_sandbox_policy_cluster_commit(commit: ClusterKvTxnCommitResult) -> Result<(), CliError> {
-    if commit.txn_response.is_none() {
+fn require_sandbox_policy_cluster_commit(
+    txn_response: Option<KvTxnResponse>,
+) -> Result<(), CliError> {
+    if txn_response.is_none() {
         return Err(CliError::Parse {
             detail: "cluster KV returned a barrier result for a sandbox policy transaction"
                 .to_string(),

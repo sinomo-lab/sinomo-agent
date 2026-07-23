@@ -12,6 +12,29 @@ use crate::metadata_table_store::metadata_tables_from_table_snapshot;
 use crate::*;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    pub(crate) fn has_recoverable_standalone_namespace_prepare_on_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<bool, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(false);
+        };
+        let tables = metadata_tables_from_table_snapshot(
+            backend.export_table_snapshot()?,
+            "DFS membership handoff prepare drain",
+        )?;
+        let write_prepare_ids = tables
+            .intents
+            .values()
+            .map(|intent| format!("namespace:create:{}", intent.intent_id))
+            .collect::<BTreeSet<_>>();
+        Ok(tables.namespace_prepares.values().any(|prepare| {
+            prepare.shard_id == *shard_id
+                && prepare.status == DfsNamespacePrepareStatus::Prepared
+                && !write_prepare_ids.contains(&prepare.operation_id)
+        }))
+    }
+
     fn certified_local_recovery_shard(
         &mut self,
         object: &DfsObjectMetadata,
@@ -123,76 +146,126 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         prepares.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
 
         for prepare in prepares {
-            let Some(authority_object) = self.namespace_prepare_authority_object(&prepare)? else {
-                continue;
-            };
-            let Some(shard) = self.certified_local_recovery_shard(
-                &authority_object,
-                &prepare.shard_id,
-                prepare.owner_epoch,
-            )?
-            else {
-                continue;
-            };
-            let (prepared, prepare_entry) = if shard.epoch == prepare.owner_epoch {
-                let entry = self
-                    .metadata_backend
-                    .as_mut()
-                    .expect("metadata backend exists during hydration")
-                    .prepare_namespace_transaction(&prepare)?;
-                (prepare, entry)
-            } else {
-                let mut rebound = prepare.clone();
-                rebound.owner_epoch = shard.epoch;
-                rebound.status = DfsNamespacePrepareStatus::Prepared;
-                rebound.operation_digest =
-                    crate::service_replica::metadata_namespace_prepare_payload_digest(&rebound)?;
-                let entry = self
-                    .metadata_backend
-                    .as_mut()
-                    .expect("metadata backend exists during hydration")
-                    .rebind_prepared_namespace_transaction(
-                        &prepare.operation_id,
-                        &prepare.operation_digest,
-                        prepare.owner_epoch,
-                        &rebound,
-                    )?;
-                (rebound, entry)
-            };
-            if prepare_entry.shard_id != prepared.shard_id {
-                return Err(DfsError::Metadata {
-                    message: format!(
-                        "recovered namespace prepare {} was journaled on shard {}, expected {}",
-                        prepared.operation_id, prepare_entry.shard_id.0, prepared.shard_id.0
-                    ),
-                });
-            }
-            let prepare_sequence = prepare_entry.sequence;
-            let prepared_batch = DfsMetadataJournalBatch {
-                shard_id: prepared.shard_id.clone(),
-                entries: vec![prepare_entry],
-                next_after_sequence: prepare_sequence,
-            };
-            let operation =
-                crate::service_replica::metadata_authority_operation_for_namespace_prepare(
-                    &prepared,
-                    prepare_sequence,
-                )?;
-            let authorization =
-                self.authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)?;
-            let publication_guard =
-                self.validate_canonical_authorization(&authorization, &operation)?;
-            self.metadata_backend
-                .as_mut()
-                .expect("metadata backend exists during hydration")
-                .commit_prepared_namespace_transaction(
-                    &prepared.operation_id,
-                    &prepared.operation_digest,
-                    prepared.owner_epoch,
-                )?;
-            drop(publication_guard);
+            self.recover_one_durable_namespace_prepare(prepare)?;
         }
         Ok(())
+    }
+
+    /// Finish request-owned prepares before replaying their namespace command.
+    /// The durable prepare already contains the exact transaction and completed
+    /// request record. Replanning a mkdir or rename can regenerate timestamps
+    /// or versions and must not be mistaken for an idempotent retry.
+    pub(crate) fn recover_durable_namespace_prepares_for_requests(
+        &mut self,
+        request_keys: &BTreeSet<(NodeId, String)>,
+        max_prepares: usize,
+    ) -> Result<usize, DfsError> {
+        if request_keys.is_empty() || max_prepares == 0 || self.control_plane.is_none() {
+            return Ok(0);
+        }
+        let snapshot = self
+            .metadata_backend
+            .as_ref()
+            .expect("metadata backend exists during request recovery")
+            .export_table_snapshot()?;
+        let tables =
+            metadata_tables_from_table_snapshot(snapshot, "DFS request-owned prepare recovery")?;
+        let mut prepares = tables
+            .namespace_prepares
+            .into_values()
+            .filter(|prepare| prepare.status == DfsNamespacePrepareStatus::Prepared)
+            .filter(|prepare| {
+                prepare.completed_request.as_ref().is_some_and(|request| {
+                    request_keys.contains(&(
+                        request.requester_node_id.clone(),
+                        request.request_id.clone(),
+                    ))
+                })
+            })
+            .collect::<Vec<_>>();
+        prepares.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+
+        let mut recovered = 0usize;
+        for prepare in prepares.into_iter().take(max_prepares) {
+            if self.recover_one_durable_namespace_prepare(prepare)? {
+                recovered = recovered.saturating_add(1);
+            }
+        }
+        Ok(recovered)
+    }
+
+    fn recover_one_durable_namespace_prepare(
+        &mut self,
+        prepare: DfsNamespacePrepareRecord,
+    ) -> Result<bool, DfsError> {
+        let Some(authority_object) = self.namespace_prepare_authority_object(&prepare)? else {
+            return Ok(false);
+        };
+        let Some(shard) = self.certified_local_recovery_shard(
+            &authority_object,
+            &prepare.shard_id,
+            prepare.owner_epoch,
+        )?
+        else {
+            return Ok(false);
+        };
+        let (prepared, prepare_entry) = if shard.epoch == prepare.owner_epoch {
+            let entry = self
+                .metadata_backend
+                .as_mut()
+                .expect("metadata backend exists during hydration")
+                .prepare_namespace_transaction(&prepare)?;
+            (prepare, entry)
+        } else {
+            let mut rebound = prepare.clone();
+            rebound.owner_epoch = shard.epoch;
+            rebound.status = DfsNamespacePrepareStatus::Prepared;
+            rebound.operation_digest =
+                crate::service_replica::metadata_namespace_prepare_payload_digest(&rebound)?;
+            let entry = self
+                .metadata_backend
+                .as_mut()
+                .expect("metadata backend exists during hydration")
+                .rebind_prepared_namespace_transaction(
+                    &prepare.operation_id,
+                    &prepare.operation_digest,
+                    prepare.owner_epoch,
+                    &rebound,
+                )?;
+            (rebound, entry)
+        };
+        if prepare_entry.shard_id != prepared.shard_id {
+            return Err(DfsError::Metadata {
+                message: format!(
+                    "recovered namespace prepare {} was journaled on shard {}, expected {}",
+                    prepared.operation_id, prepare_entry.shard_id.0, prepared.shard_id.0
+                ),
+            });
+        }
+        let prepare_sequence = prepare_entry.sequence;
+        let prepared_batch = DfsMetadataJournalBatch {
+            shard_id: prepared.shard_id.clone(),
+            entries: vec![prepare_entry],
+            next_after_sequence: prepare_sequence,
+        };
+        let operation = crate::service_replica::metadata_authority_operation_for_namespace_prepare(
+            &prepared,
+            prepare_sequence,
+        )?;
+        let authorization =
+            self.authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)?;
+        let publication_guard =
+            self.validate_canonical_authorization(&authorization, &operation)?;
+        self.metadata_backend
+            .as_mut()
+            .expect("metadata backend exists during hydration")
+            .commit_prepared_namespace_transaction(
+                &prepared.operation_id,
+                &prepared.operation_digest,
+                prepared.owner_epoch,
+            )?;
+        drop(publication_guard);
+        Ok(true)
     }
 
     /// Map each durable write intent to the exact local metadata shard that
@@ -365,6 +438,7 @@ mod tests {
     use sinomo_core::kv::InProcessKvStore;
     use sinomo_core::network::InProcessNetwork;
     use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt};
+    use std::time::Duration;
 
     fn node(value: &str) -> NodeId {
         NodeId::from_legacy_named(value).expect("node id")
@@ -558,6 +632,240 @@ mod tests {
                 .metadata_backend()
                 .expect("backend")
                 .get_namespace_request(&old_primary, &pending_request.request_id)
+                .expect("request")
+                .expect("durable request"),
+            completed_request
+        );
+    }
+
+    #[test]
+    fn pending_request_recovery_commits_its_existing_hidden_prepare() {
+        let root = sinomo_testdir::TestDir::new("dfs-request-owned-prepare-recovery");
+        let primary = node("node_request_owned_prepare_primary");
+        let requester = node("node_request_owned_prepare_requester");
+        let file_system = recovery_file_system(&primary);
+        let current = recovery_object(&primary, version("version_request_owned_prepare_1"));
+        let mut committed = current.clone();
+        committed.version = version("version_request_owned_prepare_2");
+        committed.mode = 0o600;
+        committed.changed_at_unix_nanos += 1;
+        let operation = DfsNamespaceOperation::SetMode {
+            path: current.path.clone(),
+            mode: committed.mode,
+        };
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let pending_request = DfsNamespaceRequestRecord {
+            file_system_id: current.file_system_id.clone(),
+            requester_node_id: requester.clone(),
+            request_id: "request-owned-prepare".to_string(),
+            operation_id: "req-request-owned-prepare".to_string(),
+            authority_shard_id: DfsMetadataShardId::new("root"),
+            operation,
+            command_digest: "blake3:request-owned-prepare".to_string(),
+            status: DfsNamespaceRequestStatus::Pending,
+            result: None,
+            posix_coordination_result: None,
+            recovery_attempts: 0,
+            last_recovery_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut completed_request = pending_request.clone();
+        completed_request.status = DfsNamespaceRequestStatus::Completed;
+        completed_request.result = Some(DfsNamespaceResult::Applied);
+        let mut prepare = namespace_prepare_for_recovery(&current, committed.clone(), 1);
+        prepare.operation_id = format!(
+            "namespace-request:{}:{}",
+            pending_request.operation_id, prepare.transaction.transaction_id
+        );
+        prepare.completed_request = Some(completed_request.clone());
+        prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+                .expect("request-owned prepare digest");
+
+        let metadata_root = root.join("metadata");
+        let mut backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &metadata_root)
+                .expect("backend");
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        let shard = recovery_shard(&primary, 1);
+        let control_plane = recovery_control_plane(&file_system, &shard);
+        let network = InProcessNetwork::new();
+        let mut service = NetworkedDfsService::new(
+            network.add_node(primary),
+            LocalContentStore::new(root.join("content")).expect("content"),
+        )
+        .with_control_plane(control_plane)
+        .with_metadata_backend(backend)
+        .expect("attach metadata backend before request is admitted");
+
+        let backend = service
+            .metadata_backend
+            .as_mut()
+            .expect("attached metadata backend");
+        backend
+            .put_namespace_request_on_shard(&DfsMetadataShardId::new("root"), &pending_request)
+            .expect("pending request");
+        backend
+            .prepare_namespace_transaction(&prepare)
+            .expect("durable hidden prepare");
+
+        let report = service
+            .recover_pending_namespace_requests_bounded(1)
+            .expect("recover exact request-owned prepare");
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.resolved, 1);
+        assert_eq!(report.remaining, 0);
+        assert!(report.failures.is_empty());
+        assert_eq!(
+            service
+                .metadata_backend()
+                .expect("backend")
+                .get_object(&current.object_id)
+                .expect("object"),
+            Some(committed),
+            "recovery must materialize the persisted transaction, not replan it"
+        );
+        let durable_prepare = service
+            .metadata_backend()
+            .expect("backend")
+            .get_namespace_prepare(&prepare.operation_id)
+            .expect("prepare")
+            .expect("durable prepare");
+        assert_eq!(durable_prepare.status, DfsNamespacePrepareStatus::Committed);
+        assert_eq!(durable_prepare.transaction, prepare.transaction);
+        assert_eq!(
+            service
+                .metadata_backend()
+                .expect("backend")
+                .get_namespace_request(&requester, &pending_request.request_id)
+                .expect("request")
+                .expect("durable request"),
+            completed_request
+        );
+    }
+
+    #[test]
+    fn unfenced_handoff_yields_to_existing_request_owned_prepare() {
+        let root = sinomo_testdir::TestDir::new("dfs-handoff-request-prepare-drain");
+        let primary = node("node_handoff_prepare_primary");
+        let requester = node("node_handoff_prepare_requester");
+        let replica = node("node_handoff_prepare_replica");
+        let file_system = recovery_file_system(&primary);
+        let current = recovery_object(&primary, version("version_handoff_prepare_1"));
+        let mut committed = current.clone();
+        committed.version = version("version_handoff_prepare_2");
+        committed.mode = 0o600;
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let pending_request = DfsNamespaceRequestRecord {
+            file_system_id: current.file_system_id.clone(),
+            requester_node_id: requester.clone(),
+            request_id: "request-handoff-prepare".to_string(),
+            operation_id: "req-handoff-prepare".to_string(),
+            authority_shard_id: DfsMetadataShardId::new("root"),
+            operation: DfsNamespaceOperation::SetMode {
+                path: current.path.clone(),
+                mode: committed.mode,
+            },
+            command_digest: "blake3:handoff-prepare".to_string(),
+            status: DfsNamespaceRequestStatus::Pending,
+            result: None,
+            posix_coordination_result: None,
+            recovery_attempts: 0,
+            last_recovery_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut completed_request = pending_request.clone();
+        completed_request.status = DfsNamespaceRequestStatus::Completed;
+        completed_request.result = Some(DfsNamespaceResult::Applied);
+        let mut prepare = namespace_prepare_for_recovery(&current, committed.clone(), 1);
+        prepare.operation_id = format!(
+            "namespace-request:{}:{}",
+            pending_request.operation_id, prepare.transaction.transaction_id
+        );
+        prepare.completed_request = Some(completed_request.clone());
+        prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+                .expect("request-owned prepare digest");
+
+        let mut backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+                .expect("backend");
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        let shard = recovery_shard(&primary, 1);
+        let control_plane = recovery_control_plane(&file_system, &shard);
+        let network = InProcessNetwork::new();
+        let mut service = NetworkedDfsService::new(
+            network.add_node(primary),
+            LocalContentStore::new(root.join("content")).expect("content"),
+        )
+        .with_control_plane(control_plane)
+        .with_metadata_backend(backend)
+        .expect("service");
+        let backend = service.metadata_backend.as_mut().expect("metadata backend");
+        backend
+            .put_namespace_request_on_shard(&DfsMetadataShardId::new("root"), &pending_request)
+            .expect("pending request");
+        backend
+            .prepare_namespace_transaction(&prepare)
+            .expect("durable prepare");
+
+        let desired = DfsMetadataShardConfig {
+            replica_node_ids: vec![replica],
+            epoch: shard.epoch + 1,
+            ..shard.clone()
+        };
+        let handoff = DfsControlPlaneStore::new(
+            service
+                .control_plane
+                .as_mut()
+                .expect("control plane")
+                .as_mut(),
+        )
+        .begin_metadata_shard_membership_handoff(&shard, &desired)
+        .expect("begin handoff")
+        .expect("pending handoff");
+
+        assert_eq!(
+            service
+                .reconcile_pending_metadata_shard_membership_handoffs(
+                    std::slice::from_ref(&shard),
+                    Duration::from_millis(100),
+                )
+                .expect("cancel handoff and drain prepare"),
+            0
+        );
+        let store = DfsControlPlaneStore::new(
+            service
+                .control_plane
+                .as_mut()
+                .expect("control plane")
+                .as_mut(),
+        );
+        assert!(
+            store
+                .get_metadata_shard_membership_handoff(&shard.file_system_id, &shard.shard_id)
+                .expect("handoff state")
+                .is_none(),
+            "the exact unfenced handoff must be withdrawn before recovery"
+        );
+        assert!(handoff.retiring_primary_fence.is_none());
+        assert_eq!(
+            service
+                .metadata_backend()
+                .expect("backend")
+                .get_object(&current.object_id)
+                .expect("object"),
+            Some(committed)
+        );
+        assert_eq!(
+            service
+                .metadata_backend()
+                .expect("backend")
+                .get_namespace_request(&requester, &pending_request.request_id)
                 .expect("request")
                 .expect("durable request"),
             completed_request

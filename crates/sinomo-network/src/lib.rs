@@ -231,19 +231,17 @@ pub use path_metrics::{
     NetworkPathEstimate, NetworkPathEstimator, NetworkPathKey, shared_network_path_estimator,
 };
 pub use policy::{NetworkCallPolicy, NetworkHealthPolicy};
-pub use route::cluster_healthy_route_next_hop;
 pub use route::cluster_route_next_hop;
+pub use route::{cluster_healthy_route_next_hop, cluster_nodes_share_healthy_component};
 pub use route_graph_read_model::invalidate_cluster_route_graph_cache;
 pub use route_graph_read_model::{
     read_cluster_connectivity_graph, read_cluster_connectivity_graph_with_query,
 };
 pub use routed_identity::DaemonRoutedSessionIdentity;
 pub use routed_stream_pool::{
-    RoutedStreamAcceptor, accept_local_object_rpc_stream_carrier, accept_routed_stream_carrier,
-    local_object_rpc_carrier_prelude_prefix_matches, open_pooled_local_object_rpc_stream,
-    open_pooled_routed_stream, read_local_object_rpc_carrier_prelude, retire_pooled_routed_streams,
-    serve_local_object_rpc_stream_carrier, serve_routed_stream_carrier,
-    write_local_object_rpc_carrier_prelude,
+    RoutedStreamAcceptor, RoutedStreamIncoming, accept_pooled_routed_stream_carrier,
+    accept_routed_stream_carrier, open_pooled_routed_stream, pooled_routed_relationship_is_active,
+    register_routed_stream_incoming, retire_pooled_routed_streams,
 };
 pub use routing::{
     CandidatePath, ConnectOptions, DirectRoutedConnector, MAX_ROUTE_CANDIDATES,
@@ -268,7 +266,7 @@ pub use object::{decode_single_object_frame_from_slice, encode_object_frame_to_v
 pub use object::{read_object_frame_async, read_object_frame_async_with_max_bytes};
 pub use object_rpc_stream::{
     RpcPeerContext, RpcPeerIdentity, local_object_rpc_stream_prelude_prefix_matches,
-    read_local_object_rpc_stream_prelude, write_local_object_rpc_stream_prelude,
+    read_local_object_rpc_stream_prelude,
 };
 pub use paths::ClusterPaths;
 pub use peer::{
@@ -279,6 +277,7 @@ pub use roaming::open_daemon_rpc_stream_to_cluster_endpoint_async;
 pub use route::{
     ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterSignedObjectRpcAsyncHost,
     ClusterSignedObjectRpcFuture, ClusterSignedObjectRpcObservation,
+    stream_native_service_route_constraints,
 };
 pub use rpc::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_INVITE_PUBLISH_ROUTE,

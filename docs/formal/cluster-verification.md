@@ -424,9 +424,12 @@ ordinary, non-local-first canonical write gate:
   conflict records.
 
 This is a current-behavior refinement of the canonical publication decision,
-not a model of storing file metadata in KV. Cluster KV supplies only committed
-DFS configuration facts and the quorum authority fallback used when the exact
-metadata shard cannot all acknowledge the operation. The bounded partition
+not a model of storing file metadata in KV. Cluster KV supplies committed DFS
+configuration facts plus the bounded operation permit and head watermark used
+when the exact metadata shard cannot all acknowledge the operation. This
+reuses the cluster's existing Raft election, commit index, and linearizable log;
+DFS does not implement a second quorum-election protocol, and the DFS prepare,
+journal, snapshot, and object state remain outside KV. The bounded partition
 cases deliberately set `W=1`, below cluster quorum, so the unsafe minority-side
 case remains reachable. POSIX fsync/lock and all local-first models are kept
 unchanged and outside this slice.

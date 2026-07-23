@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 
 use sinomo_agent::{
     AgentCatalog, AgentDefinition, AgentDefinitionSifsStore, AgentDefinitionStore,
-    AgentPackageProvenance, AgentPackageSource, AgentRole,
+    AgentPackageProvenance, AgentPackageSource, AgentRole, AgentToolRegistry,
+    register_mcp_server_tools,
 };
+use sinomo_runtime::node::LocalNodePermissionStore;
 
 use crate::backend::Backend;
 
@@ -29,6 +31,7 @@ pub struct AgentConfigSummary {
     pub readiness: AgentReadiness,
     pub editable: bool,
     pub tool_count: usize,
+    pub mcp_server_count: usize,
     pub skill_count: usize,
     pub default_model: String,
     pub home_server_node_id: Option<String>,
@@ -306,6 +309,64 @@ impl Backend {
             passed: skills_ready,
             detail: skills_detail,
         });
+
+        let enabled_mcp_servers = definition
+            .tool_runtime
+            .mcp_servers
+            .iter()
+            .filter(|server| server.enabled)
+            .collect::<Vec<_>>();
+        if !enabled_mcp_servers.is_empty() {
+            let permission = LocalNodePermissionStore::new(self.data_dir.root())
+                .load()
+                .map_err(|error| error.to_string())?;
+            let integrations_allowed = permission.external_integrations_enabled();
+            report.checks.push(AgentValidationCheck {
+                name: "External integrations permission".to_string(),
+                passed: integrations_allowed,
+                detail: if integrations_allowed {
+                    "This node allows configured MCP integrations".to_string()
+                } else {
+                    "Allow external integrations on this node before MCP tools can run".to_string()
+                },
+            });
+            if integrations_allowed {
+                for server in enabled_mcp_servers {
+                    let registry = AgentToolRegistry::new();
+                    let result = register_mcp_server_tools(&registry, server);
+                    let (passed, detail) = match result {
+                        Ok(registration) => {
+                            let tools = registration.tools;
+                            let detail = if tools.is_empty() {
+                                "Connected successfully; the configured allow-list exposes no tools"
+                                    .to_string()
+                            } else {
+                                format!(
+                                    "Connected and discovered {}: {}",
+                                    if tools.len() == 1 {
+                                        "1 tool".to_string()
+                                    } else {
+                                        format!("{} tools", tools.len())
+                                    },
+                                    tools.join(", ")
+                                )
+                            };
+                            (true, detail)
+                        }
+                        Err(error) if !server.required => (
+                            true,
+                            format!("Optional server is currently unavailable: {error}"),
+                        ),
+                        Err(error) => (false, error.to_string()),
+                    };
+                    report.checks.push(AgentValidationCheck {
+                        name: format!("MCP · {}", server.name),
+                        passed,
+                        detail,
+                    });
+                }
+            }
+        }
         Ok(report)
     }
 
@@ -339,6 +400,7 @@ impl AgentConfigSummary {
             },
             editable: agent_definition_is_editable(definition),
             tool_count: definition.tools.len(),
+            mcp_server_count: definition.tool_runtime.mcp_servers.len(),
             skill_count: definition.skills.len(),
             default_model: agent_default_model_label(definition),
             home_server_node_id: definition.placement.home_server_node_id.clone(),
@@ -448,7 +510,7 @@ fn agent_definition_sort_group(definition: &AgentDefinition) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_agent::{AgentDefinition, AgentPackageDefinition};
+    use sinomo_agent::{AgentDefinition, AgentMcpServerDefinition, AgentPackageDefinition};
 
     #[test]
     fn backend_saves_and_deletes_custom_agent_definitions() {
@@ -555,10 +617,17 @@ mod tests {
     fn summary_exposes_version_provenance_and_readiness() {
         let mut definition = AgentDefinition::main();
         definition.package = AgentPackageDefinition::built_in();
+        let mut mcp = AgentMcpServerDefinition::streamable_http(
+            "workspace",
+            "https://mcp.example.test/tools",
+        );
+        mcp.enabled = false;
+        definition.tool_runtime.mcp_servers.push(mcp);
         let summary = AgentConfigSummary::from_definition(&definition);
 
         assert_eq!(summary.package_version, definition.package.version);
         assert_eq!(summary.provenance, "Bundled with Sinomo");
         assert_eq!(summary.readiness, AgentReadiness::Ready);
+        assert_eq!(summary.mcp_server_count, 1);
     }
 }

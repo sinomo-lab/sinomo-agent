@@ -1106,10 +1106,17 @@ where
             },
             other => other,
         })?;
-    read_cluster_kv_authoritative_snapshot_async_with_host(
+    let read = read_cluster_kv_authoritative_snapshot_async_with_host(
         runtime, paths, &mut state, options, host,
     )
-    .await
+    .await?;
+    // A follower's local Raft materialization can intentionally trail the
+    // leader even after it has accepted the committed log. Preserve the exact
+    // quorum-confirmed view returned by an authoritative read so local readers
+    // (including DFS replica authority validation) can converge without a
+    // separate mutation or operator-triggered snapshot refresh.
+    write_imported_cluster_kv_snapshot_if_changed_async(runtime, paths, &read.value).await?;
+    Ok(read)
 }
 
 #[cfg(test)]

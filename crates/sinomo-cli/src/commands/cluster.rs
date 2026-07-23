@@ -2930,11 +2930,11 @@ pub(crate) fn refresh_cluster_kv_from_local_daemon(paths: &ClusterPaths) -> Resu
     let Some(status) = default_main_daemon_status()? else {
         return refresh_cluster_kv_from_reachable_voters(paths);
     };
-    match daemon_fetch_cluster_kv_local_snapshot(&status.address, DAEMON_PROBE_TIMEOUT) {
-        Ok(read) => {
-            write_imported_cluster_kv_snapshot(paths, &read.value)?;
-            Ok(())
-        }
+    match daemon_fetch_cluster_kv_authoritative_snapshot(&status.address, DAEMON_PROBE_TIMEOUT) {
+        // The daemon owns both local Raft and its materialized projection. The
+        // barrier request makes that projection current; the CLI must not
+        // import a second plain snapshot into the same data directory.
+        Ok(_) => Ok(()),
         Err(_) => refresh_cluster_kv_from_reachable_voters(paths),
     }
 }
@@ -2950,11 +2950,8 @@ pub(crate) fn refresh_cluster_kv_from_local_daemon_for_data_dir(
     let Some(status) = main_daemon_status_for_data_dir(data_dir)? else {
         return refresh_cluster_kv_from_reachable_voters(paths);
     };
-    match daemon_fetch_cluster_kv_local_snapshot(&status.address, DAEMON_PROBE_TIMEOUT) {
-        Ok(read) => {
-            write_imported_cluster_kv_snapshot(paths, &read.value)?;
-            Ok(())
-        }
+    match daemon_fetch_cluster_kv_authoritative_snapshot(&status.address, DAEMON_PROBE_TIMEOUT) {
+        Ok(_) => Ok(()),
         Err(_) => refresh_cluster_kv_from_reachable_voters(paths),
     }
 }

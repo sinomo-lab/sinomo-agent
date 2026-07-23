@@ -1546,10 +1546,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_record.object_metadata = Some(committed_object.clone());
         // In clustered mode, durably journal the pending intent and exact
         // receipt set before collecting authority. The healthy fast path then
-        // replicates this hidden prepare to every configured metadata replica;
-        // a promoted replica therefore retains the same base/target
-        // reservation instead of learning only that the old primary was once
-        // reachable.
+        // replicates this hidden prepare to every configured metadata replica.
+        // If the shard is incomplete, the DFS recovery quorum remains
+        // authoritative only after cluster Raft fences this exact prepare, so
+        // a promoted replica cannot omit a committed base/target reservation.
         let canonical_authorization = if self.control_plane.is_some() {
             let shard = self
                 .select_metadata_shard_for_object(base_object)?

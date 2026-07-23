@@ -429,6 +429,7 @@ mod tests {
 
         let txn_response = ClusterKvTxnCommitResult {
             request_id: KvRequestId::generate(),
+            command_digest: KvCommandDigest([7; 32]),
             snapshot: snapshot.clone(),
             txn_response: Some(KvTxnResponse {
                 succeeded: true,
@@ -452,7 +453,13 @@ mod tests {
         assert_eq!(txn_response_payload.category, CLUSTER_KV_RPC_CATEGORY);
         assert_eq!(
             decode_cluster_kv_txn_rpc_body(&txn_response_payload.body).expect("txn response body"),
-            txn_response
+            ClusterKvTxnRpcResponse {
+                request_id: txn_response.request_id,
+                command_digest: txn_response.command_digest,
+                txn_response: txn_response.txn_response,
+                authority: txn_response.authority,
+                replayed_committed_request: txn_response.replayed_committed_request,
+            }
         );
 
         let range_payload =
@@ -1658,6 +1665,29 @@ mod tests {
         assert!(cluster_kv_key_can_defer_materialized_snapshot(
             "/cluster/endpoints/node-a/endpoint-a"
         ));
+        assert_eq!(
+            cluster_kv_keyspace_class("/dfs/filesystems/fs-a/metadata-authority-barriers/services"),
+            ClusterKvKeyspaceClass::Operational
+        );
+        assert!(cluster_kv_key_can_defer_materialized_snapshot(
+            "/dfs/filesystems/fs-a/metadata-authority-barriers/root"
+        ));
+        for critical_key in [
+            "/dfs/filesystems/fs-a/metadata-shards/root",
+            "/dfs/filesystems/fs-a/metadata-operation-floors/root",
+            "/dfs/filesystems/fs-a/metadata-membership-handoffs/root",
+            "/dfs/filesystems/fs-a/metadata-head-watermarks/root",
+            "/dfs/filesystems/fs-a/metadata-authority-barriers",
+            "/dfs/filesystems/fs-a/metadata-authority-barriers/",
+            "/dfs/filesystems/fs-a/metadata-authority-barriers/root/extra",
+            "/dfs/filesystems//metadata-authority-barriers/root",
+        ] {
+            assert_eq!(
+                cluster_kv_keyspace_class(critical_key),
+                ClusterKvKeyspaceClass::Critical,
+                "DFS control key {critical_key} must fail closed"
+            );
+        }
         assert_eq!(
             cluster_kv_keyspace_class("/cluster/members/node-a"),
             ClusterKvKeyspaceClass::Critical
@@ -8196,6 +8226,11 @@ mod tests {
         });
         let forwarded = ClusterKvTxnCommitResult {
             request_id: request.request_id.clone(),
+            command_digest: request
+                .clone()
+                .into_command_request()
+                .digest()
+                .expect("request digest"),
             snapshot: store.snapshot().expect("snapshot"),
             txn_response: Some(txn_response),
             authority: KvAuthorityProof {
@@ -8231,6 +8266,74 @@ mod tests {
     }
 
     #[test]
+    fn kv_txn_quorum_driver_accepts_exact_proof_for_leader_fenced_command() {
+        let local = NodeId::from_legacy_named("node_txn_driver_fenced_learner").expect("local");
+        let remote = NodeId::from_legacy_named("node_txn_driver_fenced_voter").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        state.members[0].role = ClusterMemberRole::Learner;
+        state.members[0].state = ClusterMemberState::Learner;
+        let request = KvTxnRequest::generated(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Put {
+                key: "/kv/txn-driver/fenced".to_string(),
+                value: b"fenced".to_vec(),
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        });
+        let mut store = InProcessKvStore::new();
+        let txn_response = store.txn(request.txn.clone()).expect("seed response");
+        let mut snapshot = store.snapshot().expect("snapshot");
+        let command_digest = KvCommandDigest([42; 32]);
+        assert_ne!(
+            command_digest,
+            request
+                .clone()
+                .into_command_request()
+                .digest()
+                .expect("logical request digest")
+        );
+        snapshot.committed_requests.push(KvCommittedRequestRecord {
+            request_id: request.request_id.clone(),
+            command_digest,
+            term: 1,
+            log_index: 7,
+            revision: snapshot.revision,
+            txn_response: Some(txn_response.clone()),
+        });
+        let forwarded = ClusterKvTxnCommitResult {
+            request_id: request.request_id.clone(),
+            command_digest,
+            snapshot,
+            txn_response: Some(txn_response),
+            authority: KvAuthorityProof {
+                term: 1,
+                commit_index: 7,
+                revision: store.revision(),
+                basis: KvAuthorityBasis::ExactCommittedRequest,
+            },
+            replayed_committed_request: true,
+        };
+        let mut host = TxnQuorumDriverTestHost {
+            forwarded: Some(forwarded.clone()),
+            reachable_voters: 1,
+            ..TxnQuorumDriverTestHost::default()
+        };
+
+        let result = commit_cluster_kv_txn_with_quorum_with_host(
+            &mut state,
+            request,
+            ClusterKvTxnQuorumDriverOptions {
+                allow_forwarding: true,
+            },
+            &mut host,
+        )
+        .expect("accept exact proof for leader-fenced command");
+
+        assert_eq!(result, forwarded);
+    }
+
+    #[test]
     fn kv_txn_quorum_async_driver_validates_forwarded_learner_response_off_worker_stack() {
         let local = NodeId::from_legacy_named("node_txn_async_learner").expect("local");
         let remote = NodeId::from_legacy_named("node_txn_async_voter").expect("remote");
@@ -8252,6 +8355,11 @@ mod tests {
             .expect("seed forwarded response");
         let forwarded = ClusterKvTxnCommitResult {
             request_id: request.request_id.clone(),
+            command_digest: request
+                .clone()
+                .into_command_request()
+                .digest()
+                .expect("request digest"),
             snapshot: store.snapshot().expect("snapshot"),
             txn_response: Some(txn_response),
             authority: KvAuthorityProof {
@@ -8356,6 +8464,11 @@ mod tests {
             let mut host = TxnQuorumDriverTestHost {
                 forwarded: Some(ClusterKvTxnCommitResult {
                     request_id: request.request_id.clone(),
+                    command_digest: request
+                        .clone()
+                        .into_command_request()
+                        .digest()
+                        .expect("request digest"),
                     snapshot: snapshot.clone(),
                     txn_response: Some(txn_response.clone()),
                     authority,
@@ -8876,7 +8989,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_kv_raft_append_replication_repairs_same_index_divergence_via_snapshot() {
+    fn cluster_kv_raft_append_replication_refuses_committed_same_index_divergence() {
         let leader_root = temp_raft_root("sinomo-kv-replication-divergence-leader");
         let follower_root = temp_raft_root("sinomo-kv-replication-divergence-follower");
         let leader_id =
@@ -8967,39 +9080,41 @@ mod tests {
             },
             &mut host,
         )
-        .expect("replicate through same-index divergence");
+        .expect("attempt replication against impossible committed divergence");
 
-        assert!(outcome.response.accepted);
-        assert_eq!(host.requested_next_indices, vec![3, 2, 1]);
-        assert_eq!(host.sent_snapshot_flags, vec![false, false, true]);
+        assert!(
+            !outcome.response.accepted,
+            "a snapshot must not overwrite a follower's already committed entry at the same index"
+        );
+        assert_eq!(host.requested_next_indices, vec![3, 2, 1, 1]);
+        assert_eq!(host.sent_snapshot_flags, vec![false, false, true, true]);
         assert_eq!(host.follower.applied_index(), 1);
         assert_eq!(host.follower.hard_state().commit_index, 1);
-        assert_eq!(host.follower.term_at(1), Some(2));
-        assert_eq!(host.follower.last_log_index(), 2);
+        assert_eq!(host.follower.term_at(1), Some(1));
+        assert_eq!(host.follower.last_log_index(), 1);
+        assert_eq!(host.follower.store().revision().0, 1);
         assert_eq!(
-            host.follower.store().revision(),
-            leader_snapshot.kv.revision
-        );
-        assert!(
             host.follower
                 .store()
                 .get("/config/replication-divergence")
-                .is_none()
+                .map(|entry| entry.value.as_slice()),
+            Some(b"stale-local-value".as_slice())
         );
         drop(host);
 
         let reopened =
-            DurableRaftKvNode::open(follower_id, follower_paths).expect("reopen repaired follower");
+            DurableRaftKvNode::open(follower_id, follower_paths).expect("reopen refused follower");
         assert_eq!(reopened.applied_index(), 1);
         assert_eq!(reopened.hard_state().commit_index, 1);
-        assert_eq!(reopened.term_at(1), Some(2));
-        assert_eq!(reopened.last_log_index(), 2);
-        assert_eq!(reopened.store().revision(), leader_snapshot.kv.revision);
-        assert!(
+        assert_eq!(reopened.term_at(1), Some(1));
+        assert_eq!(reopened.last_log_index(), 1);
+        assert_eq!(reopened.store().revision().0, 1);
+        assert_eq!(
             reopened
                 .store()
                 .get("/config/replication-divergence")
-                .is_none()
+                .map(|entry| entry.value.as_slice()),
+            Some(b"stale-local-value".as_slice())
         );
     }
 
@@ -11651,13 +11766,13 @@ mod tests {
     }
 
     #[test]
-    fn optional_snapshot_append_repairs_same_index_committed_divergence() {
-        let leader_root = temp_raft_root("sinomo-kv-same-index-repair-leader");
-        let follower_root = temp_raft_root("sinomo-kv-same-index-repair-follower");
+    fn optional_snapshot_append_refuses_same_index_committed_overwrite() {
+        let leader_root = temp_raft_root("sinomo-kv-same-index-refusal-leader");
+        let follower_root = temp_raft_root("sinomo-kv-same-index-refusal-follower");
         let leader_id =
-            NodeId::from_legacy_named("node_same_index_repair_leader").expect("leader node");
+            NodeId::from_legacy_named("node_same_index_refusal_leader").expect("leader node");
         let follower_id =
-            NodeId::from_legacy_named("node_same_index_repair_follower").expect("follower node");
+            NodeId::from_legacy_named("node_same_index_refusal_follower").expect("follower node");
         let follower_paths = KvWalPaths::new(&follower_root);
 
         let leader_snapshot = {
@@ -11703,7 +11818,7 @@ mod tests {
             assert_eq!(follower.term_at(follower.applied_index()), Some(1));
             assert!(
                 leader_snapshot.kv.revision < follower.store().revision(),
-                "the authoritative snapshot must repair a follower whose divergent command produced a higher revision"
+                "fixture requires distinct committed materialized states at one index"
             );
 
             let authority_heartbeat = follower
@@ -11732,17 +11847,24 @@ mod tests {
                         leader_commit: leader_snapshot.last_included_index,
                     },
                 )
-                .expect("repair same-index divergence");
+                .expect("reject same-index mismatch without overwriting committed state");
 
-            assert!(outcome.response.success);
-            assert!(outcome.snapshot_restored);
-            assert_eq!(follower.term_at(follower.applied_index()), Some(2));
-            assert_eq!(follower.store().revision(), leader_snapshot.kv.revision);
-            assert!(follower.store().get("/config/divergent").is_none());
+            assert!(!outcome.response.success);
+            assert!(!outcome.snapshot_restored);
+            assert_eq!(follower.term_at(follower.applied_index()), Some(1));
+            assert_ne!(follower.store().revision(), leader_snapshot.kv.revision);
+            assert_eq!(
+                follower
+                    .store()
+                    .get("/config/divergent")
+                    .expect("committed local value remains")
+                    .value,
+                b"stale-local-value"
+            );
         }
 
         let reopened =
-            DurableRaftKvNode::open(follower_id, follower_paths).expect("reopen repaired follower");
+            DurableRaftKvNode::open(follower_id, follower_paths).expect("reopen follower");
         assert_eq!(
             reopened.applied_index(),
             leader_snapshot.last_included_index
@@ -11753,9 +11875,16 @@ mod tests {
         );
         assert_eq!(reopened.hard_state().current_term, 3);
         assert_eq!(reopened.hard_state().leader_id.as_ref(), Some(&leader_id));
-        assert_eq!(reopened.term_at(reopened.applied_index()), Some(2));
-        assert_eq!(reopened.store().revision(), leader_snapshot.kv.revision);
-        assert!(reopened.store().get("/config/divergent").is_none());
+        assert_eq!(reopened.term_at(reopened.applied_index()), Some(1));
+        assert_ne!(reopened.store().revision(), leader_snapshot.kv.revision);
+        assert_eq!(
+            reopened
+                .store()
+                .get("/config/divergent")
+                .expect("committed local value remains after reopen")
+                .value,
+            b"stale-local-value"
+        );
     }
 
     #[test]

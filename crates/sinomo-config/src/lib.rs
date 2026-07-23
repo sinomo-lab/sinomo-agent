@@ -2123,8 +2123,8 @@ impl From<ConfigError> for ServiceError {
 mod tests {
     use super::*;
     use sinomo_core::kv::{
-        ClusterKvTxnCommitResult, KvAuthoritativeRead, KvAuthorityBasis, KvAuthorityProof, KvEntry,
-        KvLocalRead, KvRevision, KvSnapshot, KvTxnResponse, KvVersion,
+        ClusterKvTxnCommitResult, KvAuthoritativeRead, KvAuthorityBasis, KvAuthorityProof,
+        KvCommandDigest, KvEntry, KvLocalRead, KvRevision, KvSnapshot, KvTxnResponse, KvVersion,
     };
     use sinomo_core::network::{ObjectRpcIncomingBody, ObjectRpcOutgoingResponse};
     use sinomo_core::service::ResponseSink;
@@ -2931,6 +2931,7 @@ mod tests {
                     .collect();
                 Ok(ClusterKvTxnCommitResult {
                     request_id,
+                    command_digest: KvCommandDigest([0; 32]),
                     snapshot: KvSnapshot {
                         revision: KvRevision(1),
                         compacted_revision: KvRevision::ZERO,

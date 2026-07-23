@@ -1302,6 +1302,7 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
         changed_at_unix_nanos: 0,
         version: base_version,
         policy: DfsObjectPolicy::ReplicatedEventual,
+        tombstone_provenance: None,
         created_by_event_id: None,
         last_modified_by_event_id: None,
     };
@@ -2569,6 +2570,7 @@ fn tree_file_metadata(
         changed_at_unix_nanos: index as u64,
         version: DfsVersion::from_legacy_named(format!("dfsbench{label}ver{index:016x}"))?,
         policy: DfsObjectPolicy::ReplicatedEventual,
+        tombstone_provenance: None,
         created_by_event_id: None,
         last_modified_by_event_id: None,
     })
@@ -2641,6 +2643,7 @@ fn file_metadata(
         changed_at_unix_nanos: index as u64,
         version: DfsVersion::from_legacy_named(format!("dfsbenchver{index:016x}"))?,
         policy: DfsObjectPolicy::ReplicatedEventual,
+        tombstone_provenance: None,
         created_by_event_id: None,
         last_modified_by_event_id: None,
     })

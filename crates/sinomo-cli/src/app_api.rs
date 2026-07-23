@@ -814,12 +814,14 @@ pub struct SkillMutationResult {
 }
 
 /// A selectable language-model provider with a small starter model list.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ProviderSummary {
     pub id: String,
     pub account: String,
     pub name: String,
     pub models: Vec<String>,
+    #[serde(default)]
+    pub capabilities: sinomo_lm::LanguageModelProviderCapabilities,
 }
 
 /// The app's current local cluster state, as plain strings.
@@ -6802,6 +6804,7 @@ pub fn provider_summaries() -> Vec<ProviderSummary> {
                 "claude-sonnet-4-6".to_string(),
                 "claude-haiku-4-5".to_string(),
             ]),
+            capabilities: sinomo_lm::provider_capabilities("anthropic"),
         },
         ProviderSummary {
             id: "claude".to_string(),
@@ -6813,6 +6816,7 @@ pub fn provider_summaries() -> Vec<ProviderSummary> {
                 "claude-sonnet-4-6".to_string(),
                 "claude-haiku-4-5".to_string(),
             ]),
+            capabilities: sinomo_lm::provider_capabilities("claude"),
         },
         ProviderSummary {
             id: "openai".to_string(),
@@ -6820,9 +6824,11 @@ pub fn provider_summaries() -> Vec<ProviderSummary> {
             name: "OpenAI".to_string(),
             models: dedup(vec![
                 OpenAiConfig::default().default_model,
-                "gpt-5".to_string(),
-                "o4-mini".to_string(),
+                "gpt-5.6-sol".to_string(),
+                "gpt-5.6-terra".to_string(),
+                "gpt-5.6-luna".to_string(),
             ]),
+            capabilities: sinomo_lm::provider_capabilities("openai"),
         },
         ProviderSummary {
             id: "gemini".to_string(),
@@ -6833,24 +6839,42 @@ pub fn provider_summaries() -> Vec<ProviderSummary> {
                 "gemini-2.5-pro".to_string(),
                 "gemini-2.5-flash".to_string(),
             ]),
+            capabilities: sinomo_lm::provider_capabilities("gemini"),
         },
         ProviderSummary {
             id: "claude-code".to_string(),
             account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "Claude Code (CLI)".to_string(),
             models: dedup(vec![ClaudeCodeConfig::default().model]),
+            capabilities: sinomo_lm::provider_capabilities("claude-code"),
         },
         ProviderSummary {
             id: "codex-cli".to_string(),
             account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "Codex (CLI)".to_string(),
             models: dedup(vec![CodexCliConfig::default().model]),
+            capabilities: sinomo_lm::provider_capabilities("codex-cli"),
         },
         ProviderSummary {
             id: "github-copilot".to_string(),
             account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "GitHub Copilot".to_string(),
             models: dedup(vec![GitHubCopilotConfig::default().default_model]),
+            capabilities: sinomo_lm::provider_capabilities("github-copilot"),
+        },
+        ProviderSummary {
+            id: sinomo_lm::OLLAMA_PROVIDER_ID.to_string(),
+            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            name: "Ollama (local)".to_string(),
+            models: vec![sinomo_lm::OLLAMA_DEFAULT_MODEL.to_string()],
+            capabilities: sinomo_lm::provider_capabilities(sinomo_lm::OLLAMA_PROVIDER_ID),
+        },
+        ProviderSummary {
+            id: sinomo_lm::LM_STUDIO_PROVIDER_ID.to_string(),
+            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            name: "LM Studio (local)".to_string(),
+            models: vec![sinomo_lm::LM_STUDIO_DEFAULT_MODEL.to_string()],
+            capabilities: sinomo_lm::provider_capabilities(sinomo_lm::LM_STUDIO_PROVIDER_ID),
         },
     ]
 }

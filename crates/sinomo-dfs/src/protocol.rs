@@ -833,7 +833,8 @@ pub struct DfsMetadataPrefixProbe {
 /// The operation identity prevents replay across mutations; `prepared_prefix`
 /// additionally binds an acknowledgement to the primary's complete exact
 /// history through that operation. Older peers omit the prefix-bound response
-/// identity and therefore force the safe cluster-quorum fallback.
+/// identity and therefore cannot contribute to the full-shard publication
+/// proof.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataAuthorityProbe {
     pub probe_id: String,
@@ -886,6 +887,12 @@ pub enum DfsCanonicalAuthorization {
         acknowledged_node_ids: Vec<NodeId>,
         prepare_sequence: u64,
     },
+    /// A compact Raft-committed fence for the exact prepared operation.
+    ///
+    /// DFS still owns and replicates the prepare and all filesystem state.
+    /// This permit only reuses cluster KV's existing consensus log to prevent
+    /// a partial DFS acknowledgement from racing authority or membership
+    /// failover.
     ClusterQuorum {
         operation_digest: String,
         expected_shard: DfsMetadataShardConfig,
@@ -920,6 +927,10 @@ pub struct DfsMetadataSnapshotInstallCommand {
     pub file_system_id: Option<DfsFileSystemId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_epoch: Option<u64>,
+    /// Exact pending primary handoff that authorizes a frozen promoted replica
+    /// to accept this checkpoint repair from the retiring primary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_handoff_id: Option<String>,
     pub shard_id: DfsMetadataShardId,
     pub next_after_sequence: u64,
     pub snapshot: DfsMetadataTableSnapshot,

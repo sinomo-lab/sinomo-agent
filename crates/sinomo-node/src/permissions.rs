@@ -27,12 +27,16 @@ pub enum LocalNodePermission {
     /// Allows remote management as well as other explicitly marked,
     /// unrestricted host-control tools.
     RemoteManagement,
+    /// Allows configured external MCP integrations to receive tool arguments
+    /// and perform the operations exposed by their remote servers.
+    ExternalIntegrations,
 }
 
 impl LocalNodePermission {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::RemoteManagement => "remote-management",
+            Self::ExternalIntegrations => "external-integrations",
         }
     }
 }
@@ -43,6 +47,7 @@ impl TryFrom<&str> for LocalNodePermission {
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
             "remote-management" => Ok(Self::RemoteManagement),
+            "external-integrations" => Ok(Self::ExternalIntegrations),
             _ => Err(ParseLocalNodePermissionError {
                 value: value.to_string(),
             }),
@@ -118,6 +123,10 @@ impl LocalNodePermissions {
         self.is_granted(LocalNodePermission::RemoteManagement)
     }
 
+    pub fn external_integrations_enabled(&self) -> bool {
+        self.is_granted(LocalNodePermission::ExternalIntegrations)
+    }
+
     pub fn set_permission(&mut self, permission: LocalNodePermission, granted: bool) -> bool {
         if granted {
             self.grants.insert(permission)
@@ -128,6 +137,10 @@ impl LocalNodePermissions {
 
     pub fn set_remote_management_enabled(&mut self, enabled: bool) -> bool {
         self.set_permission(LocalNodePermission::RemoteManagement, enabled)
+    }
+
+    pub fn set_external_integrations_enabled(&mut self, enabled: bool) -> bool {
+        self.set_permission(LocalNodePermission::ExternalIntegrations, enabled)
     }
 
     pub fn resource_operation_exposed(&self, resource_id: &str, operation: &str) -> bool {
@@ -342,6 +355,10 @@ impl LocalNodePermissionStore {
         self.permission_granted(LocalNodePermission::RemoteManagement)
     }
 
+    pub fn external_integrations_enabled(&self) -> bool {
+        self.permission_granted(LocalNodePermission::ExternalIntegrations)
+    }
+
     pub fn try_resource_operation_exposed(
         &self,
         resource_id: &str,
@@ -508,6 +525,14 @@ mod tests {
             "remote-management".parse(),
             Ok(LocalNodePermission::RemoteManagement)
         );
+        assert_eq!(
+            LocalNodePermission::ExternalIntegrations.as_str(),
+            "external-integrations"
+        );
+        assert_eq!(
+            "external-integrations".parse(),
+            Ok(LocalNodePermission::ExternalIntegrations)
+        );
         assert!(LocalNodePermission::try_from("RemoteManagement").is_err());
         assert!(LocalNodePermission::try_from(" remote-management").is_err());
         assert!(LocalNodePermission::try_from("unknown").is_err());
@@ -520,6 +545,7 @@ mod tests {
         let mut permissions = LocalNodePermissions::new();
 
         assert!(permissions.set_remote_management_enabled(true));
+        assert!(permissions.set_external_integrations_enabled(true));
         assert!(
             permissions
                 .expose_resource_operation("android:camera:front", "observe")
@@ -540,6 +566,7 @@ mod tests {
         let loaded = store.load().expect("load permissions");
         assert_eq!(loaded, permissions);
         assert!(store.remote_management_enabled());
+        assert!(store.external_integrations_enabled());
         assert!(store.resource_operation_exposed("android:camera:front", "capture-raw"));
         assert!(!store.resource_operation_exposed("android:camera:front", "emit-output"));
         assert!(!store.resource_operation_exposed("android:camera:rear", "capture-raw"));
@@ -555,6 +582,7 @@ mod tests {
                 .expect("hide device")
         );
         assert!(permissions.set_remote_management_enabled(false));
+        assert!(permissions.set_external_integrations_enabled(false));
         store.save(&permissions).expect("replace permissions");
 
         assert!(!store.remote_management_enabled());

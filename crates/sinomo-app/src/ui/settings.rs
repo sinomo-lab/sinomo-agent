@@ -25,8 +25,10 @@ use std::time::Duration;
 
 use serde_json::Value;
 use sinomo_agent::{
-    AgentDefinition, AgentOutputFormat, AgentPackageDefinition, AgentRole, AgentToolSpec,
-    agent_home_sifs_path_for_id, default_agent_tool_descriptors,
+    AgentDefinition, AgentMcpServerDefinition, AgentOutputFormat, AgentPackageDefinition,
+    AgentRole, AgentToolDescriptor, AgentToolInvocationMode, AgentToolSpec,
+    agent_home_sifs_path_for_id, default_agent_tool_descriptors, image_generation_descriptor,
+    web_search_descriptor,
 };
 use sinomo_cli::app_api::{
     AgentSummary, ProviderSummary, SkillDetail, SkillMutationResult, SkillSummary, agent_summaries,
@@ -61,14 +63,16 @@ use crate::backend::config::{
     CONFIGURABLE_PROVIDERS, ConfigEditKind, ConfigItem, ProviderForm, REASONING_EFFORT_OPTIONS,
     TEXT_VERBOSITY_OPTIONS, add_provider_account, cluster_provider_summaries, load_provider_health,
     mark_provider_health_stale, provider_default_model, provider_display_name, provider_forms,
-    reasoning_effort_index, remove_provider_account, remove_provider_health, resolve_items,
-    run_provider_device_login, set_bool, set_provider_api_key, set_provider_base_url,
-    set_provider_chat_default, set_provider_effort, set_provider_enabled, set_provider_model,
-    set_provider_reasoning_budget, set_provider_text_verbosity, set_provider_vendor_options,
-    set_value, test_provider_connection, text_verbosity_index,
+    provider_requires_api_key, reasoning_effort_index, remove_provider_account,
+    remove_provider_health, resolve_items, run_provider_device_login, set_bool,
+    set_provider_api_key, set_provider_base_url, set_provider_chat_default, set_provider_effort,
+    set_provider_enabled, set_provider_model, set_provider_reasoning_budget,
+    set_provider_text_verbosity, set_provider_vendor_options, set_value, test_provider_connection,
+    text_verbosity_index,
 };
 use crate::backend::modules::{ModuleConfigSnapshot, ModuleObservedState, module_ids_match};
 use crate::backend::remote_management::{
+    EXTERNAL_INTEGRATIONS_ALLOW_COMMAND, EXTERNAL_INTEGRATIONS_DENY_COMMAND,
     REMOTE_MANAGEMENT_ALLOW_COMMAND, REMOTE_MANAGEMENT_DENY_COMMAND,
     RemoteManagementSettingsSnapshot,
 };
@@ -276,6 +280,9 @@ pub struct SettingsState {
     pub remote_management_module_error: Option<String>,
     pub remote_management_module_status: Option<String>,
     pub remote_management_enable_confirming: bool,
+    pub external_integrations_permission_error: Option<String>,
+    pub external_integrations_permission_status: Option<String>,
+    pub external_integrations_enable_confirming: bool,
     pub skills: Vec<SkillSummary>,
     pub skill_detail: Option<SkillDetail>,
     pub skill_selected: Option<(String, String)>,
@@ -443,6 +450,12 @@ struct SettingsAgentsStructure {
     validation_report: Option<AgentValidationReport>,
     editor_previous_id: Option<String>,
     editor_tools: Vec<AgentToolSpec>,
+    editor_mcp_servers: Vec<(u64, bool, bool)>,
+    external_integrations_enabled: bool,
+    external_integrations_error: Option<String>,
+    external_integrations_status: Option<String>,
+    external_integrations_confirming: bool,
+    external_integrations_pending: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -623,6 +636,17 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
             validation_report: settings.agent_validation_report.clone(),
             editor_previous_id: settings.agent_form.previous_id.clone(),
             editor_tools: settings.agent_form.definition.tools.clone(),
+            editor_mcp_servers: settings
+                .agent_form
+                .mcp_servers
+                .iter()
+                .map(|server| (server.ui_id, server.enabled, server.required))
+                .collect(),
+            external_integrations_enabled: settings.remote_management.external_integrations_enabled,
+            external_integrations_error: settings.external_integrations_permission_error.clone(),
+            external_integrations_status: settings.external_integrations_permission_status.clone(),
+            external_integrations_confirming: settings.external_integrations_enable_confirming,
+            external_integrations_pending: settings.external_integrations_permission_pending(),
         };
         let snapshot = &settings.module_snapshot;
         let modules = SettingsModulesStructure {
@@ -832,6 +856,7 @@ enum SettingsOperationScope {
     Modules,
     RemoteManagementRefresh,
     RemoteManagementPermission,
+    ExternalIntegrationsPermission,
     RemoteManagementModule,
     Skills,
     Cluster,
@@ -846,6 +871,7 @@ impl SettingsOperationScope {
             Self::Modules => SettingsOperationDomain::Modules,
             Self::RemoteManagementRefresh
             | Self::RemoteManagementPermission
+            | Self::ExternalIntegrationsPermission
             | Self::RemoteManagementModule => SettingsOperationDomain::RemoteManagement,
             Self::Skills => SettingsOperationDomain::Skills,
             Self::Cluster => SettingsOperationDomain::Cluster,
@@ -973,6 +999,9 @@ enum SettingsOperation {
     },
     RefreshRemoteManagement,
     SetRemoteManagementPermission {
+        enabled: bool,
+    },
+    SetExternalIntegrationsPermission {
         enabled: bool,
     },
     SetRemoteManagementModuleOverride {
@@ -1113,6 +1142,7 @@ enum RemoteManagementOperationSuccess {
     },
     PermissionChanged {
         permissions: LocalNodePermissions,
+        target: LocalPermissionTarget,
         message: String,
     },
     ModuleChanged {
@@ -1120,6 +1150,12 @@ enum RemoteManagementOperationSuccess {
         local_module_snapshot: ModuleConfigSnapshot,
         message: String,
     },
+}
+
+#[derive(Clone, Copy)]
+enum LocalPermissionTarget {
+    RemoteManagement,
+    ExternalIntegrations,
 }
 
 struct SkillOperationSuccess {
@@ -1172,8 +1208,70 @@ pub struct AgentForm {
     max_model_repair_attempts: String,
     home_server_node_id: String,
     sandbox_node_id: String,
+    mcp_servers: Vec<AgentMcpServerForm>,
+    next_mcp_server_ui_id: u64,
     tool_add_index: usize,
     output_format_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct AgentMcpServerForm {
+    ui_id: u64,
+    name: String,
+    url: String,
+    enabled: bool,
+    required: bool,
+    allowed_tools_text: String,
+    bearer_token_env: String,
+    headers_from_env_text: String,
+    startup_timeout_ms: String,
+    tool_timeout_ms: String,
+}
+
+impl AgentMcpServerForm {
+    fn from_definition(ui_id: u64, server: &AgentMcpServerDefinition) -> Self {
+        Self {
+            ui_id,
+            name: server.name.clone(),
+            url: server.url.clone(),
+            enabled: server.enabled,
+            required: server.required,
+            allowed_tools_text: server.allowed_tools.join("\n"),
+            bearer_token_env: server.bearer_token_env.clone().unwrap_or_default(),
+            headers_from_env_text: server
+                .headers_from_env
+                .iter()
+                .map(|(header, variable)| format!("{header}: {variable}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            startup_timeout_ms: server.startup_timeout_ms.to_string(),
+            tool_timeout_ms: server.tool_timeout_ms.to_string(),
+        }
+    }
+
+    fn to_definition(&self) -> Result<AgentMcpServerDefinition, String> {
+        let startup_timeout_ms = self
+            .startup_timeout_ms
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| format!("invalid MCP startup timeout: {error}"))?;
+        let tool_timeout_ms = self
+            .tool_timeout_ms
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| format!("invalid MCP tool timeout: {error}"))?;
+        Ok(AgentMcpServerDefinition {
+            name: self.name.trim().to_string(),
+            url: self.url.trim().to_string(),
+            enabled: self.enabled,
+            required: self.required,
+            allowed_tools: parse_agent_list(&self.allowed_tools_text),
+            bearer_token_env: optional_trimmed_string(&self.bearer_token_env),
+            headers_from_env: parse_mcp_headers(&self.headers_from_env_text)?,
+            startup_timeout_ms,
+            tool_timeout_ms,
+        })
+    }
 }
 
 /// A text-editable field of a provider in the Providers section.
@@ -1301,6 +1399,14 @@ impl AgentForm {
         let model = definition.model_policy.model.clone().unwrap_or_default();
         let role_index = role_index(&definition.role);
         let output_format_index = output_format_index(&definition.output_format);
+        let mcp_servers = definition
+            .tool_runtime
+            .mcp_servers
+            .iter()
+            .enumerate()
+            .map(|(index, server)| AgentMcpServerForm::from_definition(index as u64, server))
+            .collect::<Vec<_>>();
+        let next_mcp_server_ui_id = mcp_servers.len() as u64;
         Self {
             previous_id,
             id: definition.key().to_string(),
@@ -1341,6 +1447,8 @@ impl AgentForm {
                 .sandbox_node_id
                 .clone()
                 .unwrap_or_default(),
+            mcp_servers,
+            next_mcp_server_ui_id,
             tool_add_index: 0,
             output_format_index,
             definition,
@@ -1375,6 +1483,11 @@ impl AgentForm {
         definition.placement.home_server_node_id =
             optional_trimmed_string(&self.home_server_node_id);
         definition.tool_runtime.sandbox_node_id = optional_trimmed_string(&self.sandbox_node_id);
+        definition.tool_runtime.mcp_servers = self
+            .mcp_servers
+            .iter()
+            .map(AgentMcpServerForm::to_definition)
+            .collect::<Result<Vec<_>, _>>()?;
         definition.output_format = output_format_for_index(self.output_format_index);
         definition.validate().map_err(|error| error.to_string())?;
         Ok(definition)
@@ -1520,6 +1633,9 @@ impl SettingsState {
             remote_management_module_error: None,
             remote_management_module_status: None,
             remote_management_enable_confirming: false,
+            external_integrations_permission_error: None,
+            external_integrations_permission_status: None,
+            external_integrations_enable_confirming: false,
             skills,
             skill_detail,
             skill_selected,
@@ -1632,6 +1748,9 @@ impl SettingsState {
             remote_management_module_error: None,
             remote_management_module_status: None,
             remote_management_enable_confirming: false,
+            external_integrations_permission_error: None,
+            external_integrations_permission_status: None,
+            external_integrations_enable_confirming: false,
             skills: Vec::new(),
             skill_detail: None,
             skill_selected: None,
@@ -1723,9 +1842,13 @@ impl SettingsState {
         let retry_message = "Connection changed while the action was in flight; verify refreshed state before retrying.";
         self.operation_epoch.fetch_add(1, Ordering::AcqRel);
         let pending_scopes = self.pending_operations.keys().cloned().collect::<Vec<_>>();
-        let preserve_permission_write = self
-            .pending_operations
-            .contains_key(&SettingsOperationScope::RemoteManagementPermission);
+        let preserve_permission_write = self.pending_operations.keys().any(|scope| {
+            matches!(
+                scope,
+                SettingsOperationScope::RemoteManagementPermission
+                    | SettingsOperationScope::ExternalIntegrationsPermission
+            )
+        });
         for scope in &pending_scopes {
             match scope {
                 SettingsOperationScope::ConfigField(key) => {
@@ -1749,6 +1872,11 @@ impl SettingsState {
                     self.remote_management_permission_status =
                         Some("Finishing the node-local permission change…".to_string());
                 }
+                SettingsOperationScope::ExternalIntegrationsPermission => {
+                    self.external_integrations_permission_error = None;
+                    self.external_integrations_permission_status =
+                        Some("Finishing the node-local permission change…".to_string());
+                }
                 SettingsOperationScope::RemoteManagementModule => {
                     self.remote_management_module_error = Some(retry_message.to_string());
                     self.remote_management_module_status = None;
@@ -1758,6 +1886,8 @@ impl SettingsState {
                     self.remote_management_permission_status = None;
                     self.remote_management_module_error = Some(retry_message.to_string());
                     self.remote_management_module_status = None;
+                    self.external_integrations_permission_error = Some(retry_message.to_string());
+                    self.external_integrations_permission_status = None;
                 }
                 SettingsOperationScope::Skills => {
                     self.skill_action_error = Some(retry_message.to_string());
@@ -1769,8 +1899,13 @@ impl SettingsState {
             }
         }
         if preserve_permission_write {
-            self.pending_operations
-                .retain(|scope, _| *scope == SettingsOperationScope::RemoteManagementPermission);
+            self.pending_operations.retain(|scope, _| {
+                matches!(
+                    scope,
+                    SettingsOperationScope::RemoteManagementPermission
+                        | SettingsOperationScope::ExternalIntegrationsPermission
+                )
+            });
         } else {
             self.pending_operations.clear();
             self.operation_lane = None;
@@ -1901,6 +2036,11 @@ impl SettingsState {
 
     fn remote_management_permission_pending(&self) -> bool {
         self.operation_pending(&SettingsOperationScope::RemoteManagementPermission)
+            || self.operation_pending(&SettingsOperationScope::RemoteManagementRefresh)
+    }
+
+    fn external_integrations_permission_pending(&self) -> bool {
+        self.operation_pending(&SettingsOperationScope::ExternalIntegrationsPermission)
             || self.operation_pending(&SettingsOperationScope::RemoteManagementRefresh)
     }
 
@@ -2083,6 +2223,8 @@ impl SettingsState {
                 self.remote_management_permission_status = None;
                 self.remote_management_module_error = None;
                 self.remote_management_module_status = None;
+                self.external_integrations_permission_error = None;
+                self.external_integrations_permission_status = None;
             }
             SettingsOperation::SetRemoteManagementPermission { enabled } => {
                 self.remote_management_permission_error = None;
@@ -2090,6 +2232,14 @@ impl SettingsState {
                     "Allowing remote management…".to_string()
                 } else {
                     "Revoking remote management…".to_string()
+                });
+            }
+            SettingsOperation::SetExternalIntegrationsPermission { enabled } => {
+                self.external_integrations_permission_error = None;
+                self.external_integrations_permission_status = Some(if *enabled {
+                    "Allowing external integrations…".to_string()
+                } else {
+                    "Revoking external integrations…".to_string()
                 });
             }
             SettingsOperation::SetRemoteManagementModuleOverride { .. } => {
@@ -2152,6 +2302,10 @@ impl SettingsState {
                     self.remote_management_permission_error = Some(error);
                     self.remote_management_permission_status = None;
                 }
+                SettingsOperationScope::ExternalIntegrationsPermission => {
+                    self.external_integrations_permission_error = Some(error);
+                    self.external_integrations_permission_status = None;
+                }
                 SettingsOperationScope::RemoteManagementModule => {
                     self.remote_management_module_error = Some(error);
                     self.remote_management_module_status = None;
@@ -2159,8 +2313,10 @@ impl SettingsState {
                 SettingsOperationScope::RemoteManagementRefresh => {
                     self.remote_management_permission_error = Some(error.clone());
                     self.remote_management_permission_status = None;
-                    self.remote_management_module_error = Some(error);
+                    self.remote_management_module_error = Some(error.clone());
                     self.remote_management_module_status = None;
+                    self.external_integrations_permission_error = Some(error);
+                    self.external_integrations_permission_status = None;
                 }
                 _ => unreachable!("remote-management domain has a remote-management scope"),
             },
@@ -2408,11 +2564,14 @@ impl SettingsState {
                         self.apply_local_module_snapshot_if_selected(local_module_snapshot);
                         self.remote_management_permission_error = None;
                         self.remote_management_permission_status = None;
+                        self.external_integrations_permission_error = None;
+                        self.external_integrations_permission_status = None;
                         self.remote_management_module_error = None;
                         self.remote_management_module_status = None;
                     }
                     RemoteManagementOperationSuccess::PermissionChanged {
                         permissions,
+                        target,
                         message,
                     } => {
                         self.server_generations.remote_management_permission = self
@@ -2421,9 +2580,18 @@ impl SettingsState {
                             .wrapping_add(1);
                         self.remote_management
                             .replace_permission_document(&permissions);
-                        self.remote_management_permission_error = None;
-                        self.remote_management_permission_status = Some(message);
-                        self.remote_management_enable_confirming = false;
+                        match target {
+                            LocalPermissionTarget::RemoteManagement => {
+                                self.remote_management_permission_error = None;
+                                self.remote_management_permission_status = Some(message);
+                                self.remote_management_enable_confirming = false;
+                            }
+                            LocalPermissionTarget::ExternalIntegrations => {
+                                self.external_integrations_permission_error = None;
+                                self.external_integrations_permission_status = Some(message);
+                                self.external_integrations_enable_confirming = false;
+                            }
+                        }
                     }
                     RemoteManagementOperationSuccess::ModuleChanged {
                         snapshot,
@@ -2546,6 +2714,18 @@ impl SettingsState {
 
     fn cancel_remote_management_enable(&mut self) {
         self.remote_management_enable_confirming = false;
+        self.mark_draft_changed(SettingsOperationDomain::RemoteManagement);
+    }
+
+    fn confirm_external_integrations_enable(&mut self) {
+        self.external_integrations_enable_confirming = true;
+        self.external_integrations_permission_error = None;
+        self.external_integrations_permission_status = None;
+        self.mark_draft_changed(SettingsOperationDomain::RemoteManagement);
+    }
+
+    fn cancel_external_integrations_enable(&mut self) {
+        self.external_integrations_enable_confirming = false;
         self.mark_draft_changed(SettingsOperationDomain::RemoteManagement);
     }
 
@@ -2814,6 +2994,64 @@ impl SettingsState {
         self.agent_action_status = None;
     }
 
+    fn add_agent_mcp_server(&mut self) {
+        let ui_id = self.agent_form.next_mcp_server_ui_id;
+        self.agent_form.next_mcp_server_ui_id = ui_id.wrapping_add(1);
+        let mut suffix = self.agent_form.mcp_servers.len() + 1;
+        let name = loop {
+            let candidate = format!("mcp-{suffix}");
+            if !self
+                .agent_form
+                .mcp_servers
+                .iter()
+                .any(|server| server.name == candidate)
+            {
+                break candidate;
+            }
+            suffix += 1;
+        };
+        self.agent_form
+            .mcp_servers
+            .push(AgentMcpServerForm::from_definition(
+                ui_id,
+                &AgentMcpServerDefinition::streamable_http(name, "http://127.0.0.1:3000/mcp"),
+            ));
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
+        self.agent_action_error = None;
+        self.agent_action_status = Some("Added MCP server draft".to_string());
+    }
+
+    fn update_agent_mcp_server(
+        &mut self,
+        ui_id: u64,
+        update: impl FnOnce(&mut AgentMcpServerForm),
+    ) {
+        let Some(server) = self
+            .agent_form
+            .mcp_servers
+            .iter_mut()
+            .find(|server| server.ui_id == ui_id)
+        else {
+            return;
+        };
+        update(server);
+        self.mark_draft_changed(SettingsOperationDomain::Agents);
+        self.agent_action_error = None;
+        self.agent_action_status = None;
+    }
+
+    fn remove_agent_mcp_server(&mut self, ui_id: u64) {
+        let previous_len = self.agent_form.mcp_servers.len();
+        self.agent_form
+            .mcp_servers
+            .retain(|server| server.ui_id != ui_id);
+        if self.agent_form.mcp_servers.len() != previous_len {
+            self.mark_draft_changed(SettingsOperationDomain::Agents);
+            self.agent_action_error = None;
+            self.agent_action_status = Some("Removed MCP server draft".to_string());
+        }
+    }
+
     fn set_agent_output_format_index(&mut self, index: usize) {
         self.agent_form.output_format_index =
             index.min(AGENT_OUTPUT_FORMAT_OPTIONS.len().saturating_sub(1));
@@ -2957,8 +3195,12 @@ impl SettingsState {
         sinomo_cli::provider_uses_device_login(self.provider_add_provider())
     }
 
+    fn provider_add_requires_api_key(&self) -> bool {
+        provider_requires_api_key(self.provider_add_provider())
+    }
+
     fn provider_add_can_submit(&self) -> bool {
-        self.provider_add_uses_device_login() || !self.provider_add_api_key.trim().is_empty()
+        !self.provider_add_requires_api_key() || !self.provider_add_api_key.trim().is_empty()
     }
 
     fn set_provider_add_provider(&mut self, index: usize) {
@@ -3541,6 +3783,7 @@ fn settings_operation_request_is_current(request: &SettingsOperationRequest) -> 
     matches!(
         &request.scope,
         SettingsOperationScope::RemoteManagementPermission
+            | SettingsOperationScope::ExternalIntegrationsPermission
     ) || request.operation_epoch_source.load(Ordering::Acquire) == request.operation_epoch
 }
 
@@ -3886,6 +4129,23 @@ fn execute_settings_operation(
                 };
                 Ok(RemoteManagementOperationSuccess::PermissionChanged {
                     permissions: mutation.permissions,
+                    target: LocalPermissionTarget::RemoteManagement,
+                    message: message.to_string(),
+                })
+            })())
+        }
+        SettingsOperation::SetExternalIntegrationsPermission { enabled } => {
+            SettingsOperationPayload::RemoteManagement((|| {
+                let mutation = backend.set_local_external_integrations_permission(enabled)?;
+                let message = match (enabled, mutation.changed) {
+                    (true, true) => "External integrations are now allowed on this node",
+                    (true, false) => "External integrations were already allowed on this node",
+                    (false, true) => "External integrations were revoked on this node",
+                    (false, false) => "External integrations were already denied on this node",
+                };
+                Ok(RemoteManagementOperationSuccess::PermissionChanged {
+                    permissions: mutation.permissions,
+                    target: LocalPermissionTarget::ExternalIntegrations,
                     message: message.to_string(),
                 })
             })())
@@ -4567,6 +4827,37 @@ fn parse_agent_list(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_mcp_headers(value: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut headers = BTreeMap::new();
+    for (index, line) in value.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((header, variable)) = line.split_once(':').or_else(|| line.split_once('=')) else {
+            return Err(format!(
+                "invalid MCP header on line {}: use `Header: SINOMO_MCP_VARIABLE`",
+                index + 1
+            ));
+        };
+        let header = header.trim();
+        let variable = variable.trim();
+        if header.is_empty() || variable.is_empty() {
+            return Err(format!(
+                "invalid MCP header on line {}: header and environment variable are required",
+                index + 1
+            ));
+        }
+        if headers
+            .insert(header.to_string(), variable.to_string())
+            .is_some()
+        {
+            return Err(format!("duplicate MCP header `{header}`"));
+        }
+    }
+    Ok(headers)
+}
+
 fn parse_optional_f32(label: &str, value: &str) -> Result<Option<f32>, String> {
     let Some(value) = optional_trimmed_string(value) else {
         return Ok(None);
@@ -4668,6 +4959,11 @@ fn agent_summary_line(agent: &AgentConfigSummary) -> String {
     } else if agent.tool_count > 1 {
         parts.push(format!("{} tools", agent.tool_count));
     }
+    if agent.mcp_server_count == 1 {
+        parts.push("1 MCP server".to_string());
+    } else if agent.mcp_server_count > 1 {
+        parts.push(format!("{} MCP servers", agent.mcp_server_count));
+    }
     if agent.skill_count == 1 {
         parts.push("1 skill".to_string());
     } else if agent.skill_count > 1 {
@@ -4711,12 +5007,18 @@ fn agent_catalog_row(shared: &Shared, agent: &AgentConfigSummary) -> TrailingSlo
         .gap(8.0)
 }
 
+fn configurable_agent_tool_descriptors() -> Vec<AgentToolDescriptor> {
+    let mut descriptors = default_agent_tool_descriptors();
+    descriptors.extend([web_search_descriptor(), image_generation_descriptor()]);
+    descriptors
+}
+
 fn available_agent_tool_specs(selected: &[AgentToolSpec]) -> Vec<AgentToolSpec> {
     let selected_names = selected
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<HashSet<_>>();
-    let mut tools = default_agent_tool_descriptors()
+    let mut tools = configurable_agent_tool_descriptors()
         .into_iter()
         .map(|descriptor| descriptor.spec)
         .filter(|tool| !selected_names.contains(tool.name.as_str()))
@@ -4790,11 +5092,51 @@ fn provider_model_label(form: &ProviderForm) -> String {
     }
 }
 
+fn provider_capabilities_summary(provider: &str) -> String {
+    let capabilities = sinomo_lm::provider_capabilities(provider);
+    let mut labels = Vec::new();
+    if capabilities.responses_http {
+        labels.push("Responses API");
+    }
+    if capabilities.responses_websocket {
+        labels.push("Responses WebSocket");
+    }
+    if capabilities.realtime_websocket || capabilities.realtime_webrtc {
+        labels.push("Realtime voice");
+    }
+    if capabilities.web_search {
+        labels.push("Web search");
+    }
+    if capabilities.image_generation {
+        labels.push(if capabilities.image_editing {
+            "Image generation + editing"
+        } else {
+            "Image generation"
+        });
+    }
+    if capabilities.transcription {
+        labels.push("Transcription");
+    }
+    if capabilities.local_model_management {
+        labels.push("Local model discovery");
+    }
+    if capabilities.mcp {
+        labels.push("MCP API");
+    }
+    if labels.is_empty() {
+        "Standard chat".to_string()
+    } else {
+        labels.join(" · ")
+    }
+}
+
 fn provider_credential_note(form: &ProviderForm) -> &'static str {
     if form.uses_device_login {
         "sign-in required"
-    } else {
+    } else if provider_requires_api_key(&form.provider) {
         "API key required"
+    } else {
+        "local service unavailable"
     }
 }
 
@@ -7091,6 +7433,14 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
             .inline()
             .theme_when(clone_reader(reader)),
     );
+    body = body.with_child(
+        FormRow::new(
+            "Capabilities",
+            muted_label(shared, provider_capabilities_summary(&form.provider)),
+        )
+        .inline()
+        .theme_when(clone_reader(reader)),
+    );
 
     let mut model_options = form.known_models.clone();
     model_options.extend(health.models.iter().cloned());
@@ -7228,7 +7578,7 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
                     .stacked()
                     .theme_when(clone_reader(reader)),
             );
-        } else {
+        } else if provider_requires_api_key(&form.provider) {
             let placeholder = if form.has_api_key {
                 "Configured"
             } else {
@@ -7267,6 +7617,13 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
                         }
                     }
                 },
+            ));
+        } else {
+            body = body.with_child(value_row(
+                shared,
+                reader,
+                "Authentication",
+                "No credentials required; the app connects to the configured local service.",
             ));
         }
 
@@ -7779,6 +8136,8 @@ fn provider_auth_summary(form: &ProviderForm) -> &'static str {
         } else {
             "Sign-in required"
         }
+    } else if !provider_requires_api_key(&form.provider) {
+        "No credentials required"
     } else if form.has_api_key {
         "API key stored"
     } else {
@@ -8267,11 +8626,12 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
 }
 
 fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (selected_index, uses_device_login) = {
+    let (selected_index, uses_device_login, requires_api_key) = {
         let settings = shared.settings();
         (
             settings.provider_add_provider_index,
             settings.provider_add_uses_device_login(),
+            settings.provider_add_requires_api_key(),
         )
     };
     let provider_labels: Vec<String> = CONFIGURABLE_PROVIDERS
@@ -8319,7 +8679,7 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
             "Authentication",
             "Device login after add",
         ));
-    } else {
+    } else if requires_api_key {
         body = body
             .with_child(password_row(
                 reader,
@@ -8338,6 +8698,13 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
                 "Requirement",
                 "API key required before adding.",
             ));
+    } else {
+        body = body.with_child(value_row(
+            shared,
+            reader,
+            "Authentication",
+            "No credentials required; make sure the local service is running.",
+        ));
     }
 
     body = body
@@ -8479,13 +8846,20 @@ fn agents_section_key(shared: &Shared) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "selected:{:?};detail:{};delete:{:?};report:{:?};editor:{:?};tools:{:?}\n{agents}",
+        "selected:{:?};detail:{};delete:{:?};report:{:?};editor:{:?};tools:{:?};mcp:{:?};external:{}\n{agents}",
         settings.agent_selected_id,
         settings.agent_detail_open,
         settings.agent_delete_confirming,
         settings.agent_validation_report,
         settings.agent_form.previous_id,
         settings.agent_form.definition.tools,
+        settings
+            .agent_form
+            .mcp_servers
+            .iter()
+            .map(|server| (server.ui_id, server.enabled, server.required))
+            .collect::<Vec<_>>(),
+        settings.remote_management.external_integrations_enabled,
     )
 }
 
@@ -9119,6 +9493,12 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             "tool id per line",
             76.0,
             |settings, value| settings.set_agent_deny_tools_text(value),
+        ))
+        .with_child(value_row(
+            shared,
+            reader,
+            "Realtime handoff",
+            "Voice sessions can delegate coding, research, and longer work to this regular agent while preserving the conversation context.",
         ));
 
     let runtime = FieldGroup::new()
@@ -9217,6 +9597,9 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                 )
                 .theme_when(clone_reader(reader)),
         )
+        .with_child(agent_external_integrations_sections(
+            shared, reader, &form,
+        ))
         .with_child(
             FormSection::new("Runtime", runtime)
                 .description(
@@ -9233,11 +9616,435 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         )
 }
 
-fn agent_tool_editor_row(shared: &Shared, reader: &ThemeReader, tool: AgentToolSpec) -> FormRow {
-    let description = if tool.async_default {
-        format!("{} Runs asynchronously by default.", tool.description)
+fn agent_external_integrations_sections(
+    shared: &Shared,
+    reader: &ThemeReader,
+    form: &AgentForm,
+) -> impl Widget + use<> {
+    let (
+        permission_loading,
+        permission_enabled,
+        permission_error,
+        action_error,
+        action_status,
+        confirming,
+        pending,
+    ) = {
+        let settings = shared.settings();
+        (
+            settings.remote_management.permission_loading,
+            settings.remote_management.external_integrations_enabled,
+            settings.remote_management.permission_error.clone(),
+            settings.external_integrations_permission_error.clone(),
+            settings.external_integrations_permission_status.clone(),
+            settings.external_integrations_enable_confirming,
+            settings.external_integrations_permission_pending(),
+        )
+    };
+
+    let permission_status = if permission_loading {
+        module_lifecycle_value(
+            shared,
+            reader,
+            "Loading",
+            SemanticTone::Neutral,
+            "Reading the node-local permission document",
+        )
+    } else if permission_error.is_some() {
+        module_lifecycle_value(
+            shared,
+            reader,
+            "Unavailable",
+            SemanticTone::Danger,
+            "Permission state could not be read, so MCP calls remain blocked",
+        )
+    } else if permission_enabled {
+        module_lifecycle_value(
+            shared,
+            reader,
+            "Allowed",
+            SemanticTone::Warning,
+            "Configured MCP tools may send arguments to external servers",
+        )
     } else {
-        tool.description.clone()
+        module_lifecycle_value(
+            shared,
+            reader,
+            "Denied",
+            SemanticTone::Neutral,
+            "MCP tools remain visible in definitions but cannot execute on this node",
+        )
+    };
+
+    let permission_control = if pending {
+        WidgetPod::new(
+            FormRow::new(
+                "Allow external integrations",
+                Stack::horizontal()
+                    .spacing(8.0)
+                    .with_child(
+                        Spinner::new("external-integrations-permission-pending")
+                            .theme_when(clone_reader(reader)),
+                    )
+                    .with_child(muted_label(shared, "Applying local permission…")),
+            )
+            .inline()
+            .theme_when(clone_reader(reader)),
+        )
+    } else if permission_loading || permission_error.is_some() {
+        let s = shared.clone();
+        let refresh = sui::Button::new("Refresh")
+            .icon(IconGlyph::Redo)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .on_press(move || {
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::RemoteManagementRefresh,
+                    SettingsOperation::RefreshRemoteManagement,
+                );
+            });
+        WidgetPod::new(
+            FormRow::new("Permission", Stack::horizontal().with_child(refresh))
+                .inline()
+                .theme_when(clone_reader(reader)),
+        )
+    } else if permission_enabled {
+        let s = shared.clone();
+        let control = Switch::new("Allow external integrations")
+            .on(true)
+            .theme_when(clone_reader(reader))
+            .on_toggle(move |enabled| {
+                if !enabled {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::ExternalIntegrationsPermission,
+                        SettingsOperation::SetExternalIntegrationsPermission { enabled: false },
+                    );
+                }
+            });
+        WidgetPod::new(
+            FormRow::new("Permission", control)
+                .inline()
+                .theme_when(clone_reader(reader)),
+        )
+    } else {
+        let s = shared.clone();
+        let allow = sui::Button::new("Allow external integrations…")
+            .icon(IconGlyph::Lock)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Warning)
+            .on_press(move || s.settings_mut().confirm_external_integrations_enable());
+        WidgetPod::new(
+            FormRow::new("Permission", Stack::horizontal().with_child(allow))
+                .inline()
+                .theme_when(clone_reader(reader)),
+        )
+    };
+
+    let mut permission_body = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(
+            FormRow::new("Node-local authority", permission_status)
+                .stacked()
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(PodHost::new(permission_control));
+    if confirming && !permission_enabled && !pending {
+        let confirm = {
+            let s = shared.clone();
+            sui::Button::new("Confirm allow")
+                .icon(IconGlyph::Lock)
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Filled)
+                .tone(SemanticTone::Danger)
+                .on_press(move || {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::ExternalIntegrationsPermission,
+                        SettingsOperation::SetExternalIntegrationsPermission { enabled: true },
+                    );
+                })
+        };
+        let cancel = {
+            let s = shared.clone();
+            sui::Button::new("Cancel")
+                .icon(IconGlyph::Close)
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
+                .on_press(move || s.settings_mut().cancel_external_integrations_enable())
+        };
+        let confirmation = Stack::vertical()
+            .spacing(7.0)
+            .alignment(Alignment::Stretch)
+            .with_child(muted_label(
+                shared,
+                "MCP servers receive model-generated tool arguments and may access network services or perform external actions. Tool execution still applies the agent's allow/deny surface and server allow-list.",
+            ))
+            .with_child(
+                Flex::horizontal()
+                    .wrap(FlexWrap::Wrap)
+                    .gap(8.0)
+                    .with_child(confirm)
+                    .with_child(cancel),
+            );
+        permission_body = permission_body.with_child(
+            SemanticRegion::new(
+                "Allow external integrations confirmation",
+                FormRow::new("Confirm access", confirmation)
+                    .stacked()
+                    .theme_when(clone_reader(reader)),
+            )
+            .description("Confirmation is required before enabling MCP execution on this node")
+            .role(SemanticsRole::Dialog),
+        );
+    }
+    if let Some(error) = permission_error {
+        permission_body = permission_body.with_child(copyable_area_row(
+            reader,
+            "external-integrations-permission-error",
+            "Permission error",
+            error,
+        ));
+    }
+    if let Some(error) = action_error {
+        permission_body = permission_body.with_child(value_row(shared, reader, "Error", error));
+    } else if let Some(status) = action_status {
+        permission_body = permission_body.with_child(value_row(shared, reader, "Status", status));
+    }
+    permission_body = permission_body
+        .with_child(copyable_text_row(
+            reader,
+            "external-integrations-allow-command",
+            "Allow from CLI",
+            EXTERNAL_INTEGRATIONS_ALLOW_COMMAND,
+        ))
+        .with_child(copyable_text_row(
+            reader,
+            "external-integrations-deny-command",
+            "Deny from CLI",
+            EXTERNAL_INTEGRATIONS_DENY_COMMAND,
+        ));
+
+    let permission_section = FormSection::new("External integrations", permission_body)
+        .description(
+            "This host-local grant is required at the final MCP execution boundary and applies immediately to both chat and voice sessions.",
+        )
+        .theme_when(clone_reader(reader));
+
+    let add_server = {
+        let s = shared.clone();
+        sui::Button::new("Add MCP server")
+            .icon(IconGlyph::Add)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .on_press(move || s.settings_mut().add_agent_mcp_server())
+    };
+    let server_summary = if form.mcp_servers.is_empty() {
+        "No MCP servers configured".to_string()
+    } else {
+        let enabled = form
+            .mcp_servers
+            .iter()
+            .filter(|server| server.enabled)
+            .count();
+        format!(
+            "{} configured · {enabled} enabled · tools are shared by chat and voice",
+            form.mcp_servers.len()
+        )
+    };
+    let overview = FormSection::new(
+        "MCP servers",
+        FieldGroup::new()
+            .spacing(8.0)
+            .with_child(value_row(
+                shared,
+                reader,
+                "Transport",
+                "Streamable HTTP · Chat + voice",
+            ))
+            .with_child(value_row(shared, reader, "Servers", server_summary))
+            .with_child(
+                FormRow::new("Actions", Stack::horizontal().with_child(add_server))
+                    .inline()
+                    .theme_when(clone_reader(reader)),
+            ),
+    )
+    .description(
+        "Each server is stored in this agent package. Secrets remain node-local environment variables beginning with SINOMO_MCP_. Save the agent, then run its readiness test to connect and discover exposed tools.",
+    )
+    .theme_when(clone_reader(reader));
+
+    let mut sections = Stack::vertical()
+        .spacing(14.0)
+        .alignment(Alignment::Stretch)
+        .with_child(permission_section)
+        .with_child(overview);
+    for server in form.mcp_servers.iter().cloned() {
+        sections = sections.with_child(agent_mcp_server_section(shared, reader, server));
+    }
+    sections
+}
+
+fn agent_mcp_server_section(
+    shared: &Shared,
+    reader: &ThemeReader,
+    server: AgentMcpServerForm,
+) -> FormSection {
+    let ui_id = server.ui_id;
+    let input_name = |field: &str| format!("agent-mcp-{ui_id}-{field}");
+    let enabled = {
+        let s = shared.clone();
+        switch_row(reader, "Enabled", server.enabled, move |enabled| {
+            s.settings_mut()
+                .update_agent_mcp_server(ui_id, |server| server.enabled = enabled);
+        })
+    };
+    let required = {
+        let s = shared.clone();
+        switch_row(
+            reader,
+            "Required at startup",
+            server.required,
+            move |required| {
+                s.settings_mut()
+                    .update_agent_mcp_server(ui_id, |server| server.required = required);
+            },
+        )
+    };
+    let remove = {
+        let s = shared.clone();
+        sui::Button::new("Remove server")
+            .icon(IconGlyph::Trash)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Filled)
+            .tone(SemanticTone::Danger)
+            .on_press(move || s.settings_mut().remove_agent_mcp_server(ui_id))
+    };
+    let mut body = FieldGroup::new()
+        .fill_width()
+        .spacing(8.0)
+        .with_child(agent_text_row(
+            shared,
+            reader,
+            &input_name("name"),
+            "Server name",
+            server.name.clone(),
+            "filesystem",
+            move |settings, value| {
+                settings.update_agent_mcp_server(ui_id, |server| server.name = value)
+            },
+        ));
+    let url_id = server.ui_id;
+    body = body
+        .with_child(agent_text_row(
+            shared,
+            reader,
+            &input_name("url"),
+            "Endpoint",
+            server.url.clone(),
+            "https://example.com/mcp",
+            move |settings, value| {
+                settings.update_agent_mcp_server(url_id, |server| server.url = value)
+            },
+        ))
+        .with_child(enabled)
+        .with_child(required);
+    let allowed_id = server.ui_id;
+    body = body.with_child(agent_area_row(
+        shared,
+        reader,
+        &input_name("allowed-tools"),
+        "Allowed tools",
+        server.allowed_tools_text.clone(),
+        "one original MCP tool name per line; empty exposes all",
+        76.0,
+        move |settings, value| {
+            settings.update_agent_mcp_server(allowed_id, |server| server.allowed_tools_text = value)
+        },
+    ));
+    let token_id = server.ui_id;
+    body = body.with_child(agent_text_row(
+        shared,
+        reader,
+        &input_name("bearer-token-env"),
+        "Bearer token variable",
+        server.bearer_token_env.clone(),
+        "SINOMO_MCP_FILES_TOKEN",
+        move |settings, value| {
+            settings.update_agent_mcp_server(token_id, |server| server.bearer_token_env = value)
+        },
+    ));
+    let headers_id = server.ui_id;
+    body = body.with_child(agent_area_row(
+        shared,
+        reader,
+        &input_name("headers"),
+        "Headers from environment",
+        server.headers_from_env_text.clone(),
+        "X-Api-Key: SINOMO_MCP_FILES_KEY",
+        76.0,
+        move |settings, value| {
+            settings
+                .update_agent_mcp_server(headers_id, |server| server.headers_from_env_text = value)
+        },
+    ));
+    let startup_id = server.ui_id;
+    body = body.with_child(agent_text_row(
+        shared,
+        reader,
+        &input_name("startup-timeout"),
+        "Startup timeout (ms)",
+        server.startup_timeout_ms.clone(),
+        "10000",
+        move |settings, value| {
+            settings.update_agent_mcp_server(startup_id, |server| server.startup_timeout_ms = value)
+        },
+    ));
+    let timeout_id = server.ui_id;
+    body = body
+        .with_child(agent_text_row(
+            shared,
+            reader,
+            &input_name("tool-timeout"),
+            "Tool timeout (ms)",
+            server.tool_timeout_ms.clone(),
+            "60000",
+            move |settings, value| {
+                settings
+                    .update_agent_mcp_server(timeout_id, |server| server.tool_timeout_ms = value)
+            },
+        ))
+        .with_child(
+            FormRow::new("Actions", Stack::horizontal().with_child(remove))
+                .inline()
+                .theme_when(clone_reader(reader)),
+        );
+    let title = if server.name.trim().is_empty() {
+        "MCP server".to_string()
+    } else {
+        format!("MCP · {}", server.name)
+    };
+    FormSection::new(title, body)
+        .description(
+            "The server's discovered tools use the same implementation in regular chat and realtime voice. Non-loopback endpoints must use HTTPS.",
+        )
+        .theme_when(clone_reader(reader))
+}
+
+fn agent_tool_editor_row(shared: &Shared, reader: &ThemeReader, tool: AgentToolSpec) -> FormRow {
+    let mode = agent_tool_invocation_mode_label(&tool.name);
+    let description = if tool.async_default {
+        format!(
+            "{mode} · {} Runs asynchronously by default.",
+            tool.description
+        )
+    } else {
+        format!("{mode} · {}", tool.description)
     };
     let remove = {
         let s = shared.clone();
@@ -9260,6 +10067,23 @@ fn agent_tool_editor_row(shared: &Shared, reader: &ThemeReader, tool: AgentToolS
     )
     .inline()
     .theme_when(clone_reader(reader))
+}
+
+fn agent_tool_invocation_mode_label(tool_name: &str) -> &'static str {
+    let descriptor = configurable_agent_tool_descriptors()
+        .into_iter()
+        .find(|descriptor| descriptor.spec.name == tool_name);
+    let turn_based = descriptor.as_ref().is_some_and(|descriptor| {
+        descriptor.supports_invocation_mode(AgentToolInvocationMode::TurnBased)
+    });
+    let realtime = descriptor.as_ref().is_some_and(|descriptor| {
+        descriptor.supports_invocation_mode(AgentToolInvocationMode::Realtime)
+    });
+    match (turn_based, realtime) {
+        (true, true) => "Chat + voice",
+        (false, true) => "Voice",
+        _ => "Chat",
+    }
 }
 
 fn agent_home_folder_row(
@@ -9498,6 +10322,12 @@ fn agent_readonly_section(
         .with_child(value_row(
             shared,
             reader,
+            "MCP servers",
+            agent_mcp_servers_summary(&definition),
+        ))
+        .with_child(value_row(
+            shared,
+            reader,
             "Model policy",
             agent_model_summary(&definition),
         ))
@@ -9726,6 +10556,31 @@ fn agent_tools_summary(definition: &AgentDefinition) -> String {
         parts.push(format!("{skills} skills"));
     }
     parts.join(" · ")
+}
+
+fn agent_mcp_servers_summary(definition: &AgentDefinition) -> String {
+    if definition.tool_runtime.mcp_servers.is_empty() {
+        return "None configured".to_string();
+    }
+    definition
+        .tool_runtime
+        .mcp_servers
+        .iter()
+        .map(|server| {
+            let state = if server.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            let requirement = if server.required {
+                "required"
+            } else {
+                "optional"
+            };
+            format!("{} ({state}, {requirement})", server.name)
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn agent_model_summary(definition: &AgentDefinition) -> String {
@@ -14337,6 +15192,7 @@ mod tests {
                 payload: SettingsOperationPayload::RemoteManagement(Ok(
                     RemoteManagementOperationSuccess::PermissionChanged {
                         permissions: mutation.permissions,
+                        target: LocalPermissionTarget::RemoteManagement,
                         message: "Remote management is now allowed on this node".to_string(),
                     },
                 )),
@@ -15170,6 +16026,71 @@ mod tests {
     }
 
     #[test]
+    fn agent_form_round_trips_mcp_server_configuration() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        state.create_agent();
+        state.add_agent_mcp_server();
+        let ui_id = state.agent_form.mcp_servers[0].ui_id;
+        state.update_agent_mcp_server(ui_id, |server| {
+            server.name = "workspace".to_string();
+            server.url = "https://mcp.example.test/tools".to_string();
+            server.required = true;
+            server.allowed_tools_text = "read_file\nedit_file".to_string();
+            server.bearer_token_env = "SINOMO_MCP_WORKSPACE_TOKEN".to_string();
+            server.headers_from_env_text = "X-Tenant: SINOMO_MCP_WORKSPACE_TENANT".to_string();
+            server.startup_timeout_ms = "2500".to_string();
+            server.tool_timeout_ms = "45000".to_string();
+        });
+
+        let definition = state.agent_form.to_definition().expect("MCP definition");
+        let server = definition
+            .tool_runtime
+            .mcp_servers
+            .first()
+            .expect("MCP server");
+        assert_eq!(server.name, "workspace");
+        assert_eq!(server.url, "https://mcp.example.test/tools");
+        assert!(server.enabled);
+        assert!(server.required);
+        assert_eq!(server.allowed_tools, ["read_file", "edit_file"]);
+        assert_eq!(
+            server.bearer_token_env.as_deref(),
+            Some("SINOMO_MCP_WORKSPACE_TOKEN")
+        );
+        assert_eq!(
+            server.headers_from_env.get("X-Tenant").map(String::as_str),
+            Some("SINOMO_MCP_WORKSPACE_TENANT")
+        );
+        assert_eq!(server.startup_timeout_ms, 2500);
+        assert_eq!(server.tool_timeout_ms, 45000);
+
+        state.remove_agent_mcp_server(ui_id);
+        assert!(state.agent_form.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn tool_mode_labels_expose_shared_chat_and_voice_implementations() {
+        assert_eq!(
+            agent_tool_invocation_mode_label("read_file"),
+            "Chat + voice"
+        );
+        assert_eq!(
+            agent_tool_invocation_mode_label("request_user_input"),
+            "Chat"
+        );
+        for hosted_tool in ["web_search", "image_generation"] {
+            assert_eq!(
+                agent_tool_invocation_mode_label(hosted_tool),
+                "Chat + voice"
+            );
+        }
+        let available = available_agent_tool_specs(&[]);
+        assert!(available.iter().any(|tool| tool.name == "web_search"));
+        assert!(available.iter().any(|tool| tool.name == "image_generation"));
+    }
+
+    #[test]
     fn agent_settings_state_imports_exports_and_reports_readiness() {
         let backend = Backend::local_fallback();
         let package_path = backend.data_dir.root().join("settings-agent.json");
@@ -15247,6 +16168,13 @@ mod tests {
         let mut definition =
             AgentDefinition::custom("render-agent", AgentRole::Main, "Render settings detail.");
         definition.description = "Rendered custom agent".to_string();
+        let mut mcp = AgentMcpServerDefinition::streamable_http(
+            "workspace",
+            "https://mcp.example.test/tools",
+        );
+        mcp.required = true;
+        mcp.allowed_tools = vec!["read_file".to_string(), "edit_file".to_string()];
+        definition.tool_runtime.mcp_servers.push(mcp);
         backend
             .save_custom_agent_definition(&definition, None)
             .expect("seed custom agent");
@@ -15307,7 +16235,7 @@ mod tests {
             .expect("render agent summary");
         assert_eq!(
             agent_summary_line(&render_summary),
-            "main · Cluster default · 4 tools · custom",
+            "main · Cluster default · 4 tools · 1 MCP server · custom",
             "the agent menu detail should expose role, model policy, and source"
         );
         window
@@ -15378,6 +16306,37 @@ mod tests {
             .with_name("Add tool")
             .expect()
             .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("agent-mcp-0-name")
+            .expect()
+            .to_have_value("workspace")?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("agent-mcp-0-url")
+            .expect()
+            .to_have_value("https://mcp.example.test/tools")?;
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Add MCP server")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Allow external integrations…")
+                .count()?,
+            1
+        );
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Copy Allow from CLI")
+                .count()?,
+            1
+        );
 
         window
             .get_by_role(sui::SemanticsRole::Button)
@@ -15391,6 +16350,63 @@ mod tests {
             crate::ui::files::FilesSourceKind::Sifs
         );
         assert_eq!(shared.files().path, "/sinomo/agents/render-agent/home");
+
+        Ok(())
+    }
+
+    #[test]
+    fn agent_external_integrations_control_requires_explicit_confirmation() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let reader: ThemeReader = {
+            let s = shared.clone();
+            Rc::new(move || s.theme())
+        };
+        shared.settings_mut().create_agent();
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Agent external integrations")
+                    .root(ScrollView::vertical(agent_details_host(&shared, &reader))),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Allow external integrations…")
+            .expect()
+            .to_have_count(1)?;
+        shared.settings_mut().confirm_external_integrations_enable();
+        window.run_until_idle()?;
+        window
+            .get_by_role(sui::SemanticsRole::Dialog)
+            .with_name("Allow external integrations confirmation")
+            .expect()
+            .to_have_count(1)?;
+        assert!(shared.settings().external_integrations_enable_confirming);
+        assert!(
+            !shared
+                .settings()
+                .remote_management
+                .external_integrations_enabled
+        );
+
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Cancel")
+            .expect()
+            .to_have_count(1)?;
+        shared.settings_mut().cancel_external_integrations_enable();
+        window.run_until_idle()?;
+        assert!(!shared.settings().external_integrations_enable_confirming);
+        assert!(
+            !shared
+                .settings()
+                .remote_management
+                .external_integrations_enabled
+        );
 
         Ok(())
     }
@@ -16161,7 +17177,7 @@ mod tests {
         state.set_provider_add_provider(
             CONFIGURABLE_PROVIDERS
                 .iter()
-                .position(|provider| !sinomo_cli::provider_uses_device_login(provider))
+                .position(|provider| provider_requires_api_key(provider))
                 .expect("api-key provider"),
         );
 
@@ -16185,6 +17201,32 @@ mod tests {
         assert!(
             state.provider_add_can_submit(),
             "device-login providers collect credentials after the account is added"
+        );
+
+        state.set_provider_add_provider(
+            CONFIGURABLE_PROVIDERS
+                .iter()
+                .position(|provider| *provider == sinomo_lm::OLLAMA_PROVIDER_ID)
+                .expect("Ollama provider"),
+        );
+        assert!(
+            state.provider_add_can_submit(),
+            "local Responses providers should not require an API key"
+        );
+    }
+
+    #[test]
+    fn provider_capabilities_surface_hosted_realtime_and_local_features() {
+        let openai = provider_capabilities_summary("openai");
+        assert!(openai.contains("Responses API"));
+        assert!(openai.contains("Realtime voice"));
+        assert!(openai.contains("Web search"));
+        assert!(openai.contains("Image generation + editing"));
+        assert!(openai.contains("MCP API"));
+
+        assert_eq!(
+            provider_capabilities_summary(sinomo_lm::OLLAMA_PROVIDER_ID),
+            "Responses API · Local model discovery"
         );
     }
 
@@ -16283,6 +17325,43 @@ mod tests {
             SettingsOperation::SetRemoteManagementPermission { enabled: false },
         );
         assert!(!state.remote_management.permission_enabled);
+    }
+
+    #[test]
+    fn external_integrations_permission_requires_confirmation_and_revokes_immediately() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        assert!(!state.remote_management.external_integrations_enabled);
+
+        state.confirm_external_integrations_enable();
+        assert!(state.external_integrations_enable_confirming);
+        state.cancel_external_integrations_enable();
+        assert!(!state.external_integrations_enable_confirming);
+        assert!(
+            !backend
+                .remote_management_settings_snapshot()
+                .external_integrations_enabled,
+            "cancelling confirmation must not grant MCP authority"
+        );
+
+        state.confirm_external_integrations_enable();
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::ExternalIntegrationsPermission,
+            SettingsOperation::SetExternalIntegrationsPermission { enabled: true },
+        );
+        assert!(state.remote_management.external_integrations_enabled);
+        assert!(!state.external_integrations_enable_confirming);
+        assert!(!state.remote_management.permission_enabled);
+
+        apply_test_operation(
+            &mut state,
+            &backend,
+            SettingsOperationScope::ExternalIntegrationsPermission,
+            SettingsOperation::SetExternalIntegrationsPermission { enabled: false },
+        );
+        assert!(!state.remote_management.external_integrations_enabled);
     }
 
     #[test]

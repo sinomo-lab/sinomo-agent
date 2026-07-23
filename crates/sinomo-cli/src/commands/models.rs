@@ -25,11 +25,20 @@ pub(crate) enum ModelsCliCommand {
     Default(ModelDefaultOptions),
     Options(ModelOptionsCliCommand),
     Runtime(ModelRuntimeCliCommand),
+    Pull(LocalModelActionOptions),
+    Load(LocalModelActionOptions),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModelListOptions {
     pub(crate) provider: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalModelActionOptions {
+    pub(crate) provider: String,
+    pub(crate) account: String,
+    pub(crate) model: String,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -305,6 +314,25 @@ pub(crate) fn models_cli_spec() -> CliCommandSpec {
                 ]),
         ]);
 
+    let local_model_action_options = || {
+        [
+            CliOptionSpec::value(
+                "--provider",
+                "local model provider",
+                CliValueSpec::new("ollama|lmstudio", "local model provider")
+                    .with_choices([
+                        choice(OLLAMA_PROVIDER_ID, "Ollama local runtime"),
+                        choice(LM_STUDIO_PROVIDER_ID, "LM Studio local runtime"),
+                        choice("lm-studio", "LM Studio local runtime alias"),
+                    ])
+                    .restricted(),
+            )
+            .required(),
+            account_option(),
+            model_option().required(),
+        ]
+    };
+
     CliCommandSpec::new(
         MODELS_COMMAND_NAME,
         "show the current default model and model commands",
@@ -322,6 +350,10 @@ pub(crate) fn models_cli_spec() -> CliCommandSpec {
             ]),
         options,
         runtime,
+        CliCommandSpec::new("pull", "download a model into a managed local runtime")
+            .with_options(local_model_action_options()),
+        CliCommandSpec::new("load", "load or warm a model in a local runtime")
+            .with_options(local_model_action_options()),
     ])
     .with_after_help(
         std::iter::once("Providers:".to_string()).chain(
@@ -363,10 +395,35 @@ pub(crate) fn parse_models_command(args: &[String]) -> Result<ModelsCliCommand, 
         ["models", "runtime", "set"] => Ok(ModelsCliCommand::Runtime(ModelRuntimeCliCommand::Set(
             parse_model_runtime_set_matches(&matches)?,
         ))),
+        ["models", "pull"] => Ok(ModelsCliCommand::Pull(parse_local_model_action_matches(
+            &matches,
+        )?)),
+        ["models", "load"] => Ok(ModelsCliCommand::Load(parse_local_model_action_matches(
+            &matches,
+        )?)),
         _ => Err(CliParseError::Parse {
             detail: format!("unhandled models command path `{}`", path.join(" ")),
         }),
     }
+}
+
+fn parse_local_model_action_matches(
+    matches: &CliCommandMatches,
+) -> Result<LocalModelActionOptions, CliParseError> {
+    let raw_provider = required_match_value(matches, "--provider")?;
+    let provider = normalize_model_provider(raw_provider).ok_or_else(|| CliParseError::Parse {
+        detail: format!("unknown provider `{raw_provider}`"),
+    })?;
+    if provider != OLLAMA_PROVIDER_ID && provider != LM_STUDIO_PROVIDER_ID {
+        return Err(CliParseError::Parse {
+            detail: format!("provider `{provider}` is not a local model runtime"),
+        });
+    }
+    Ok(LocalModelActionOptions {
+        provider,
+        account: normalize_provider_account_name(matches.value("--account")),
+        model: required_match_value(matches, "--model")?.trim().to_string(),
+    })
 }
 
 fn parse_models_list_matches(matches: &CliCommandMatches) -> ModelListOptions {
@@ -653,8 +710,43 @@ fn run_models_cli_command(
         ModelsCliCommand::Default(options) => models_default(options),
         ModelsCliCommand::Options(command) => models_options(command),
         ModelsCliCommand::Runtime(command) => models_runtime(command),
+        ModelsCliCommand::Pull(options) => models_local_action(options, true),
+        ModelsCliCommand::Load(options) => models_local_action(options, false),
     };
     result.map_err(|error| CliCommandError::new(error.to_string()))
+}
+
+fn models_local_action(options: LocalModelActionOptions, pull: bool) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let (model_config, _) = load_model_config_for_node(&data_dir)?;
+    let account = provider_account_config(
+        &model_config,
+        &options.provider,
+        Some(options.account.as_str()),
+    );
+    let runtime = if options.provider == OLLAMA_PROVIDER_ID {
+        LocalResponsesRuntime::Ollama
+    } else {
+        LocalResponsesRuntime::LmStudio
+    };
+    let mut config = LocalResponsesConfig::new(runtime);
+    if let Some(base_url) = account
+        .and_then(|account| account.api_base_url.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        config.api_base_url = base_url.to_string();
+    }
+    config.default_model = options.model.clone();
+    let provider = LocalResponsesProvider::new(config);
+    if pull {
+        provider.pull_model(&options.model)?;
+        println!("pulled {} model: {}", options.provider, options.model);
+    } else {
+        provider.load_model(&options.model)?;
+        println!("loaded {} model: {}", options.provider, options.model);
+    }
+    Ok(())
 }
 
 fn write_models_overview(context: &mut CliCommandContext<'_>) -> Result<(), CliCommandError> {

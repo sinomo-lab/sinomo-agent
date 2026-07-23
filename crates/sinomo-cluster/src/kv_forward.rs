@@ -1,8 +1,13 @@
 #[allow(unused_imports)]
-use crate::kv_local_store::kv_err;
-use crate::kv_local_store::locked_kv_state_authority_id_async;
+use crate::kv_local_store::{
+    kv_err, locked_kv_state_authority_id_async,
+    read_cluster_kv_latest_observed_snapshot_arc_if_present,
+};
 use sinomo_base::ClusterBootstrapState;
-use sinomo_kv::{ClusterKvTxnCommitResult, KvAuthoritativeRead, KvSnapshot, KvTxnRequest};
+use sinomo_kv::{
+    ClusterKvTxnCommitResult, ClusterKvTxnRpcResponse, KvAuthoritativeRead, KvAuthorityBasis,
+    KvAuthorityProof, KvSnapshot, KvTxnRequest,
+};
 use sinomo_network::ClusterPaths;
 use sinomo_network::{
     ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector,
@@ -126,6 +131,7 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
             break;
         }
         match forward_cluster_kv_txn_to_state_authority_node_with_host(
+            paths,
             state,
             target,
             request,
@@ -241,6 +247,7 @@ pub fn forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
 }
 
 fn forward_cluster_kv_txn_to_state_authority_node_with_host(
+    paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     target_node_id: &NodeId,
     request: &KvTxnRequest,
@@ -258,7 +265,15 @@ fn forward_cluster_kv_txn_to_state_authority_node_with_host(
         .error_detail()
         .map_err(|error| verified_cluster_non_leader_error(target_node_id, error))?;
     let response = sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body).map_err(kv_err)?;
-    validate_forwarded_cluster_kv_txn_response(request, response)
+    materialize_forwarded_cluster_kv_txn_response(
+        request,
+        response,
+        read_cluster_kv_latest_observed_snapshot_arc_if_present(paths)
+            .ok()
+            .flatten()
+            .map(|snapshot| (*snapshot).clone()),
+        || fetch_cluster_kv_snapshot_from_node_with_host(state, target_node_id, timeout, host),
+    )
 }
 
 pub async fn forward_cluster_kv_txn_to_state_authority_async_with_host<H>(
@@ -542,29 +557,208 @@ where
         .error_detail()
         .map_err(|error| verified_cluster_non_leader_error(target_node_id, error))?;
     let response = sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body).map_err(kv_err)?;
-    validate_forwarded_cluster_kv_txn_response(request, response)
+    if response.request_id != request.request_id {
+        return Err(forwarded_cluster_kv_request_id_mismatch(
+            request,
+            &response.request_id,
+        ));
+    }
+    let local_paths = paths.clone();
+    let local_snapshot = tokio::task::spawn_blocking(move || {
+        read_cluster_kv_latest_observed_snapshot_arc_if_present(&local_paths)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .flatten()
+    .map(|snapshot| (*snapshot).clone());
+    if let Some(result) =
+        try_materialize_forwarded_cluster_kv_txn_response(request, &response, local_snapshot)?
+    {
+        return Ok(result);
+    }
+    let snapshot = fetch_cluster_kv_snapshot_from_node_async_with_host(
+        paths,
+        state,
+        target_node_id,
+        timeout,
+        host,
+    )
+    .await?;
+    materialize_forwarded_cluster_kv_txn_response_from_snapshot(request, response, snapshot)
 }
 
-fn validate_forwarded_cluster_kv_txn_response(
+fn forwarded_cluster_kv_request_id_mismatch(
     request: &KvTxnRequest,
-    response: ClusterKvTxnCommitResult,
-) -> Result<ClusterKvTxnCommitResult, NetworkError> {
+    response_request_id: &sinomo_kv::KvRequestId,
+) -> NetworkError {
+    NetworkError::Serialization {
+        detail: format!(
+            "forwarded cluster KV response request ID {response_request_id} does not match submitted request ID {}",
+            request.request_id
+        ),
+    }
+}
+
+fn try_materialize_forwarded_cluster_kv_txn_response(
+    request: &KvTxnRequest,
+    response: &ClusterKvTxnRpcResponse,
+    snapshot: Option<KvSnapshot>,
+) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
     if response.request_id != request.request_id {
+        return Err(forwarded_cluster_kv_request_id_mismatch(
+            request,
+            &response.request_id,
+        ));
+    }
+    let Some(snapshot) = snapshot else {
+        return Ok(None);
+    };
+    if matches!(
+        response.authority.basis,
+        KvAuthorityBasis::CurrentTermQuorum { .. }
+    ) && snapshot.revision == response.authority.revision
+    {
+        return Ok(Some(ClusterKvTxnCommitResult {
+            request_id: response.request_id.clone(),
+            command_digest: response.command_digest,
+            snapshot,
+            txn_response: response.txn_response.clone(),
+            authority: response.authority.clone(),
+            replayed_committed_request: response.replayed_committed_request,
+        }));
+    }
+    let Some(record) = snapshot
+        .committed_requests
+        .iter()
+        .find(|record| record.request_id == request.request_id)
+    else {
+        return Ok(None);
+    };
+    let record_term = record.term;
+    let record_log_index = record.log_index;
+    let record_revision = record.revision;
+    let record_txn_response = record.txn_response.clone();
+    if record.command_digest != response.command_digest {
         return Err(NetworkError::Serialization {
             detail: format!(
-                "forwarded cluster KV response request ID {} does not match submitted request ID {}",
-                response.request_id, request.request_id
+                "forwarded cluster KV response digest does not match replicated request {}",
+                request.request_id
             ),
         });
     }
-    Ok(response)
+    Ok(Some(ClusterKvTxnCommitResult {
+        request_id: response.request_id.clone(),
+        command_digest: response.command_digest,
+        snapshot,
+        txn_response: record_txn_response,
+        authority: KvAuthorityProof {
+            term: record_term,
+            commit_index: record_log_index,
+            revision: record_revision,
+            basis: KvAuthorityBasis::ExactCommittedRequest,
+        },
+        replayed_committed_request: true,
+    }))
+}
+
+fn materialize_forwarded_cluster_kv_txn_response_from_snapshot(
+    request: &KvTxnRequest,
+    response: ClusterKvTxnRpcResponse,
+    snapshot: KvSnapshot,
+) -> Result<ClusterKvTxnCommitResult, NetworkError> {
+    try_materialize_forwarded_cluster_kv_txn_response(request, &response, Some(snapshot))?
+        .ok_or_else(|| NetworkError::Serialization {
+            detail: format!(
+                "authoritative cluster KV snapshot omitted committed request {}",
+                request.request_id
+            ),
+        })
+}
+
+fn materialize_forwarded_cluster_kv_txn_response(
+    request: &KvTxnRequest,
+    response: ClusterKvTxnRpcResponse,
+    local_snapshot: Option<KvSnapshot>,
+    fetch_authoritative_snapshot: impl FnOnce() -> Result<KvSnapshot, NetworkError>,
+) -> Result<ClusterKvTxnCommitResult, NetworkError> {
+    if let Some(result) =
+        try_materialize_forwarded_cluster_kv_txn_response(request, &response, local_snapshot)?
+    {
+        return Ok(result);
+    }
+    materialize_forwarded_cluster_kv_txn_response_from_snapshot(
+        request,
+        response,
+        fetch_authoritative_snapshot()?,
+    )
+}
+
+fn fetch_cluster_kv_snapshot_from_node_with_host(
+    state: &ClusterBootstrapState,
+    target_node_id: &NodeId,
+    timeout: Duration,
+    host: &mut impl ClusterKvTxnForwardHost,
+) -> Result<KvSnapshot, NetworkError> {
+    let payload = sinomo_kv::cluster_kv_authoritative_snapshot_rpc_payload().map_err(kv_err)?;
+    let request =
+        ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
+            .with_response_retry_safe();
+    let response = host.call_node_object_rpc(state, target_node_id, &request, timeout)?;
+    response
+        .error_detail()
+        .map_err(|error| verified_cluster_non_leader_error(target_node_id, error))?;
+    sinomo_kv::decode_cluster_kv_authoritative_snapshot_rpc_body(&response.body)
+        .map(|read| read.value)
+        .map_err(kv_err)
+}
+
+async fn fetch_cluster_kv_snapshot_from_node_async_with_host<H>(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    target_node_id: &NodeId,
+    timeout: Duration,
+    host: &mut H,
+) -> Result<KvSnapshot, NetworkError>
+where
+    H: ClusterSignedObjectRpcAsyncHost + Send,
+{
+    let payload = sinomo_kv::cluster_kv_authoritative_snapshot_rpc_payload().map_err(kv_err)?;
+    let request =
+        ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
+            .with_response_retry_safe();
+    let mut client = ClusterObjectRpcClient::routed(host, paths);
+    let response = client
+        .call_target(
+            state,
+            target_node_id,
+            ObjectRpcCall::value(request),
+            ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
+        )
+        .await?;
+    if !response.body.is_empty() {
+        return Err(NetworkError::Serialization {
+            detail: "cluster KV authoritative snapshot returned an unexpected attachment"
+                .to_string(),
+        });
+    }
+    let response = response.response;
+    response
+        .error_detail()
+        .map_err(|error| verified_cluster_non_leader_error(target_node_id, error))?;
+    sinomo_kv::decode_cluster_kv_authoritative_snapshot_rpc_body(&response.body)
+        .map(|read| read.value)
+        .map_err(kv_err)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use sinomo_base::{CapabilityName, ClusterMemberRecord, ClusterMemberState};
-    use sinomo_kv::{KvAuthorityBasis, KvAuthorityProof, KvRevision, KvTxn, KvTxnResponse};
+    use sinomo_kv::{
+        KvAuthorityBasis, KvAuthorityProof, KvCommittedRequestRecord, KvRevision, KvTxn,
+        KvTxnResponse,
+    };
     use sinomo_node::{ClusterId, DAEMON_MAIN_RUN_CAPABILITY};
     use time::OffsetDateTime;
 
@@ -727,8 +921,12 @@ mod tests {
                         request_id: if self.mismatch_request_id {
                             sinomo_kv::KvRequestId::generate()
                         } else {
-                            submitted.request_id
+                            submitted.request_id.clone()
                         },
+                        command_digest: submitted
+                            .into_command_request()
+                            .digest()
+                            .expect("transaction digest"),
                         snapshot,
                         txn_response: Some(KvTxnResponse {
                             succeeded: true,
@@ -920,7 +1118,23 @@ mod tests {
 
     #[test]
     fn kv_forward_returns_complete_committed_response_without_second_snapshot_rpc() {
-        let (_root, state) = forward_test_state(false);
+        let (root, state) = forward_test_state(false);
+        let data_dir = sinomo_local::SinomoDataDir::new(root.path());
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        crate::kv_local_store::write_cluster_kv_snapshot(
+            &paths,
+            &KvSnapshot {
+                revision: KvRevision(1),
+                compacted_revision: KvRevision::ZERO,
+                entries: Vec::new(),
+                leases: Vec::new(),
+                events: Vec::new(),
+                committed_requests: Vec::new(),
+                expired_requests: Vec::new(),
+            },
+        )
+        .expect("local replicated snapshot");
         let target = state.members[1].node_id.clone();
         let mut host = CommittedResponseHost {
             calls: 0,
@@ -929,6 +1143,7 @@ mod tests {
         let request = KvTxnRequest::generated(test_txn());
 
         let result = forward_cluster_kv_txn_to_state_authority_node_with_host(
+            &paths,
             &state,
             &target,
             &request,
@@ -952,7 +1167,10 @@ mod tests {
 
     #[test]
     fn kv_forward_rejects_response_for_a_different_request_id() {
-        let (_root, state) = forward_test_state(false);
+        let (root, state) = forward_test_state(false);
+        let data_dir = sinomo_local::SinomoDataDir::new(root.path());
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
         let target = state.members[1].node_id.clone();
         let mut host = CommittedResponseHost {
             calls: 0,
@@ -961,6 +1179,7 @@ mod tests {
         let request = KvTxnRequest::generated(test_txn());
 
         let error = forward_cluster_kv_txn_to_state_authority_node_with_host(
+            &paths,
             &state,
             &target,
             &request,
@@ -974,6 +1193,136 @@ mod tests {
             NetworkError::Serialization { detail }
                 if detail.contains("does not match submitted request ID")
         ));
+    }
+
+    #[test]
+    fn kv_forward_materializes_an_ahead_replicated_snapshot_as_exact_commit_proof() {
+        let request = KvTxnRequest::generated(test_txn());
+        let txn_response = KvTxnResponse {
+            succeeded: true,
+            revision: KvRevision(1),
+            responses: Vec::new(),
+        };
+        let response = ClusterKvTxnRpcResponse {
+            request_id: request.request_id.clone(),
+            command_digest: request
+                .clone()
+                .into_command_request()
+                .digest()
+                .expect("request digest"),
+            txn_response: Some(txn_response.clone()),
+            authority: KvAuthorityProof {
+                term: 7,
+                commit_index: 11,
+                revision: KvRevision(1),
+                basis: KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks: 2,
+                    required_quorum: 2,
+                },
+            },
+            replayed_committed_request: false,
+        };
+        let snapshot = KvSnapshot {
+            revision: KvRevision(2),
+            compacted_revision: KvRevision::ZERO,
+            entries: Vec::new(),
+            leases: Vec::new(),
+            events: Vec::new(),
+            committed_requests: vec![KvCommittedRequestRecord {
+                request_id: request.request_id.clone(),
+                command_digest: request
+                    .clone()
+                    .into_command_request()
+                    .digest()
+                    .expect("request digest"),
+                term: 7,
+                log_index: 11,
+                revision: KvRevision(1),
+                txn_response: Some(txn_response),
+            }],
+            expired_requests: Vec::new(),
+        };
+
+        let result =
+            try_materialize_forwarded_cluster_kv_txn_response(&request, &response, Some(snapshot))
+                .expect("materialization")
+                .expect("replicated exact commit");
+
+        assert_eq!(result.snapshot.revision, KvRevision(2));
+        assert!(result.replayed_committed_request);
+        assert_eq!(result.authority.term, 7);
+        assert_eq!(result.authority.commit_index, 11);
+        assert_eq!(result.authority.revision, KvRevision(1));
+        assert_eq!(
+            result.authority.basis,
+            KvAuthorityBasis::ExactCommittedRequest
+        );
+    }
+
+    #[test]
+    fn kv_forward_exact_commit_uses_the_durable_record_transaction_result() {
+        let request = KvTxnRequest::generated(test_txn());
+        let committed_command_digest = sinomo_kv::KvCommandDigest([42; 32]);
+        assert_ne!(
+            committed_command_digest,
+            request
+                .clone()
+                .into_command_request()
+                .digest()
+                .expect("logical request digest")
+        );
+        let durable_txn_response = KvTxnResponse {
+            succeeded: true,
+            revision: KvRevision(1),
+            responses: Vec::new(),
+        };
+        let response = ClusterKvTxnRpcResponse {
+            request_id: request.request_id.clone(),
+            command_digest: committed_command_digest,
+            txn_response: Some(KvTxnResponse {
+                succeeded: false,
+                revision: KvRevision(99),
+                responses: Vec::new(),
+            }),
+            authority: KvAuthorityProof {
+                term: 7,
+                commit_index: 11,
+                revision: KvRevision(1),
+                basis: KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks: 2,
+                    required_quorum: 2,
+                },
+            },
+            replayed_committed_request: false,
+        };
+        let snapshot = KvSnapshot {
+            revision: KvRevision(2),
+            compacted_revision: KvRevision::ZERO,
+            entries: Vec::new(),
+            leases: Vec::new(),
+            events: Vec::new(),
+            committed_requests: vec![KvCommittedRequestRecord {
+                request_id: request.request_id.clone(),
+                command_digest: committed_command_digest,
+                term: 7,
+                log_index: 11,
+                revision: KvRevision(1),
+                txn_response: Some(durable_txn_response.clone()),
+            }],
+            expired_requests: Vec::new(),
+        };
+
+        let result =
+            try_materialize_forwarded_cluster_kv_txn_response(&request, &response, Some(snapshot))
+                .expect("materialization")
+                .expect("replicated exact commit");
+
+        assert_eq!(result.txn_response, Some(durable_txn_response));
+        assert!(result.replayed_committed_request);
+        assert_eq!(
+            result.authority.basis,
+            KvAuthorityBasis::ExactCommittedRequest
+        );
     }
 
     #[test]
@@ -1050,7 +1399,9 @@ mod tests {
         .expect("forward after verified rejection")
         .expect("committed response");
 
-        assert_eq!(host.calls, 2);
+        // One rejected voter, one compact commit response, then one snapshot
+        // fetch because this non-voter has no replicated local commit.
+        assert_eq!(host.calls, 3);
         assert_eq!(response.request_id, request.request_id);
     }
 

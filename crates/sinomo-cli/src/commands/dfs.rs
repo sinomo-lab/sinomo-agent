@@ -2579,7 +2579,7 @@ pub(crate) fn inspect_cluster_dfs_status_with_data_dir(
     Ok(DfsClusterStatusReport { nodes })
 }
 
-fn dfs_cluster_status_unavailable_reason(
+pub(crate) fn dfs_cluster_status_unavailable_reason(
     cluster_paths: &ClusterPaths,
     state: &sinomo_runtime::core::ClusterBootstrapState,
     route_graph: &network::ClusterConnectivityGraph,
@@ -2595,9 +2595,11 @@ fn dfs_cluster_status_unavailable_reason(
         connectivity,
         network::ClusterMemberMainDaemonConnectivity::Healthy
             | network::ClusterMemberMainDaemonConnectivity::Unknown
-    ) || network::cluster_healthy_route_next_hop(route_graph, &state.local_node_id, node_id)
-        .is_some()
-    {
+    ) || network::cluster_nodes_share_healthy_component(
+        route_graph,
+        &state.local_node_id,
+        node_id,
+    ) {
         return None;
     }
     match connectivity {

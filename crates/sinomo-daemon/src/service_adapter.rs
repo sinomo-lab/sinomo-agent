@@ -732,7 +732,7 @@ fn deny_remote_cluster_kv_txn_authority(reason: &str) -> ServiceError {
 }
 
 /// Bind a remote transaction to the exact membership and capability-policy
-/// entries observed behind the leader's current-term quorum barrier.
+/// entries observed by the receiving voter.
 ///
 /// Remote transactions deliberately reject failure-branch mutations. A flat
 /// KV transaction cannot distinguish a caller compare failure from an
@@ -804,7 +804,7 @@ fn fence_remote_cluster_kv_txn_request(
         .txn
         .compares
         .len()
-        .checked_add(2)
+        .checked_add(4)
         .unwrap_or(usize::MAX);
     if compare_count > sinomo_core::kv::MAX_KV_TXN_COMPARES {
         return Err(KvError::TxnLimit {
@@ -819,7 +819,7 @@ fn fence_remote_cluster_kv_txn_request(
     request
         .txn
         .compares
-        .try_reserve(2)
+        .try_reserve(4)
         .map_err(|_| KvError::ResourceExhausted {
             operation: "remote cluster KV authorization fence compares".to_string(),
             requested_bytes: compare_count
@@ -828,9 +828,23 @@ fn fence_remote_cluster_kv_txn_request(
     request
         .txn
         .compares
+        .push(sinomo_core::kv::KvCompare::ModifyRevisionEquals {
+            key: member_key.clone(),
+            revision: member_entry.modify_revision,
+        });
+    request
+        .txn
+        .compares
         .push(sinomo_core::kv::KvCompare::ValueEquals {
             key: member_key,
             value: member_entry.value.clone(),
+        });
+    request
+        .txn
+        .compares
+        .push(sinomo_core::kv::KvCompare::ModifyRevisionEquals {
+            key: policy_key.clone(),
+            revision: policy_entry.modify_revision,
         });
     request
         .txn
@@ -1059,23 +1073,26 @@ impl Service for ClusterKvService {
                             .await
                         }
                         ServiceSigner::Remote { .. } => {
-                            let barrier =
-                                sinomo_core::kv::cluster_kv_authoritative_snapshot_rpc_payload()?;
-                            // The leader that will commit the request must establish
-                            // this barrier itself. Forwarding it would validate the
-                            // origin against another node's snapshot and reopen the
-                            // revocation race before the local commit.
-                            let authoritative =
-                                handle_daemon_cluster_kv_authoritative_snapshot_request_async_on_runtime(
-                                    &txn_paths,
-                                    &barrier.body,
-                                    false,
-                                    runtime,
-                                )
-                                .await
-                                .map_err(daemon_error)?;
+                            let cluster_paths_for_task = cluster_paths.clone();
+                            // The authorization rows are appended to the submitted
+                            // transaction as value-and-revision compares. Evaluating
+                            // them in the same Raft command is the linearization
+                            // point: a stale local view fails closed at commit, so a
+                            // separate quorum barrier here would only double the
+                            // number of consensus rounds for every forwarded write.
+                            let authorization_snapshot = run_blocking_service_task(
+                                route.clone(),
+                                "cluster kv remote authorization snapshot",
+                                move || {
+                                    sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(
+                                        &cluster_paths_for_task,
+                                    )
+                                    .map_err(ServiceError::from)
+                                },
+                            )
+                            .await?;
                             let request = fence_remote_cluster_kv_txn_request(
-                                &authoritative.value,
+                                &authorization_snapshot,
                                 &ctx.signer,
                                 request,
                             )?;
@@ -7037,10 +7054,18 @@ mod tests {
         )
         .expect("authorized request");
 
-        assert_eq!(request.txn.compares.len(), 2);
+        assert_eq!(request.txn.compares.len(), 4);
+        assert!(request.txn.compares.iter().any(|compare| {
+            matches!(compare, sinomo_core::kv::KvCompare::ModifyRevisionEquals { key, .. }
+                if key == &sinomo_core::node::cluster_member_key(&member.node_id))
+        }));
         assert!(request.txn.compares.iter().any(|compare| {
             matches!(compare, sinomo_core::kv::KvCompare::ValueEquals { key, .. }
                 if key == &sinomo_core::node::cluster_member_key(&member.node_id))
+        }));
+        assert!(request.txn.compares.iter().any(|compare| {
+            matches!(compare, sinomo_core::kv::KvCompare::ModifyRevisionEquals { key, .. }
+                if key == &sinomo_core::node::cluster_capability_policy_key(&member.node_id))
         }));
         assert!(request.txn.compares.iter().any(|compare| {
             matches!(compare, sinomo_core::kv::KvCompare::ValueEquals { key, .. }
@@ -7144,6 +7169,44 @@ mod tests {
         assert!(
             !response.succeeded,
             "revocation must fail the authority CAS"
+        );
+        assert!(store.get("/test/remote-authorized").is_none());
+    }
+
+    #[test]
+    fn remote_cluster_kv_txn_policy_aba_race_fails_revision_guard() {
+        let (mut store, signer, member, policy) = remote_cluster_kv_auth_fixture();
+        let request = fence_remote_cluster_kv_txn_request(
+            &store.snapshot().expect("authority snapshot"),
+            &signer,
+            remote_cluster_kv_test_request(),
+        )
+        .expect("authorized request");
+
+        let policy_key = sinomo_core::node::cluster_capability_policy_key(&member.node_id);
+        let mut revoked = policy.clone();
+        revoked.allowed_capabilities.retain(|capability| {
+            capability.as_str() != sinomo_core::kv::CLUSTER_KV_WRITE_CAPABILITY
+        });
+        store
+            .put(
+                policy_key.clone(),
+                sinomo_core::kv::encode_kv_value(&revoked).expect("encode revoked policy"),
+                None,
+            )
+            .expect("commit policy revocation");
+        store
+            .put(
+                policy_key,
+                sinomo_core::kv::encode_kv_value(&policy).expect("encode restored policy"),
+                None,
+            )
+            .expect("commit policy restoration");
+
+        let response = store.txn(request.txn).expect("evaluate fenced transaction");
+        assert!(
+            !response.succeeded,
+            "an authorization revoke-and-restore cycle must invalidate an older request"
         );
         assert!(store.get("/test/remote-authorized").is_none());
     }

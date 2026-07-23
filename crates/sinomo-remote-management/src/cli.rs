@@ -287,6 +287,12 @@ enum NodePermissionsCliCommand {
     DenyRemoteManagement {
         json: bool,
     },
+    AllowExternalIntegrations {
+        json: bool,
+    },
+    DenyExternalIntegrations {
+        json: bool,
+    },
     Expose {
         resource: String,
         operation: String,
@@ -469,6 +475,8 @@ fn node_permissions_cli_help() -> CliCommandHelp {
             "  sinomo node permissions show [--json]",
             "  sinomo node permissions allow remote-management [--json]",
             "  sinomo node permissions deny remote-management [--json]",
+            "  sinomo node permissions allow external-integrations [--json]",
+            "  sinomo node permissions deny external-integrations [--json]",
             "  sinomo node permissions expose <resource> <operation> [--json]",
             "  sinomo node permissions hide <resource> [operation] [--json]",
             "",
@@ -487,20 +495,32 @@ fn node_permissions_cli_autocomplete() -> CliAutocompleteSpec {
                 .with_values([CliAutocompleteValue::new(
                     "permission",
                     "local permission",
-                    [CliAutocompleteChoice::new(
-                        "remote-management",
-                        "allow remote management and unbounded host-control tools",
-                    )],
+                    [
+                        CliAutocompleteChoice::new(
+                            "remote-management",
+                            "allow remote management and unbounded host-control tools",
+                        ),
+                        CliAutocompleteChoice::new(
+                            "external-integrations",
+                            "allow configured external MCP integrations",
+                        ),
+                    ],
                 )])
                 .with_options([json.clone()]),
             CliAutocompleteSpec::new("deny", "deny a local permission")
                 .with_values([CliAutocompleteValue::new(
                     "permission",
                     "local permission",
-                    [CliAutocompleteChoice::new(
-                        "remote-management",
-                        "deny remote management and unbounded host-control tools",
-                    )],
+                    [
+                        CliAutocompleteChoice::new(
+                            "remote-management",
+                            "deny remote management and unbounded host-control tools",
+                        ),
+                        CliAutocompleteChoice::new(
+                            "external-integrations",
+                            "deny configured external MCP integrations",
+                        ),
+                    ],
                 )])
                 .with_options([json.clone()]),
             CliAutocompleteSpec::new("expose", "expose one local resource operation")
@@ -889,6 +909,12 @@ fn parse_node_permissions_command(
         }
         "deny" if values == ["remote-management"] => {
             Ok(NodePermissionsCliCommand::DenyRemoteManagement { json })
+        }
+        "allow" if values == ["external-integrations"] => {
+            Ok(NodePermissionsCliCommand::AllowExternalIntegrations { json })
+        }
+        "deny" if values == ["external-integrations"] => {
+            Ok(NodePermissionsCliCommand::DenyExternalIntegrations { json })
         }
         "expose" if values.len() == 2 => Ok(NodePermissionsCliCommand::Expose {
             resource: values[0].clone(),
@@ -1813,6 +1839,18 @@ fn run_node_permissions_command(
                 .map_err(command_error)?;
             print_local_permissions(context, &permissions, Some(changed), json)
         }
+        NodePermissionsCliCommand::AllowExternalIntegrations { json } => {
+            let (permissions, changed) = store
+                .mutate(|permissions| Ok(permissions.set_external_integrations_enabled(true)))
+                .map_err(command_error)?;
+            print_local_permissions(context, &permissions, Some(changed), json)
+        }
+        NodePermissionsCliCommand::DenyExternalIntegrations { json } => {
+            let (permissions, changed) = store
+                .mutate(|permissions| Ok(permissions.set_external_integrations_enabled(false)))
+                .map_err(command_error)?;
+            print_local_permissions(context, &permissions, Some(changed), json)
+        }
         NodePermissionsCliCommand::Expose {
             resource,
             operation,
@@ -1865,6 +1903,14 @@ fn print_local_permissions(
     context.stdout_line(format_args!(
         "remote-management: {}",
         if permissions.remote_management_enabled() {
+            "allowed"
+        } else {
+            "denied"
+        }
+    ))?;
+    context.stdout_line(format_args!(
+        "external-integrations: {}",
+        if permissions.external_integrations_enabled() {
             "allowed"
         } else {
             "denied"
@@ -2396,11 +2442,17 @@ mod tests {
         let (stdout, _) =
             run_handler(&handler, &["permissions", "show"]).expect("show default permissions");
         assert!(stdout.contains("remote-management: denied"));
+        assert!(stdout.contains("external-integrations: denied"));
         assert!(!store.remote_management_enabled());
+        assert!(!store.external_integrations_enabled());
 
         run_handler(&handler, &["permissions", "allow", "remote-management"])
             .expect("allow locally");
         assert!(store.remote_management_enabled());
+
+        run_handler(&handler, &["permissions", "allow", "external-integrations"])
+            .expect("allow external integrations locally");
+        assert!(store.external_integrations_enabled());
 
         run_handler(
             &handler,
@@ -2445,6 +2497,13 @@ mod tests {
         )
         .expect("deny locally");
         assert!(!store.remote_management_enabled());
+
+        run_handler(
+            &handler,
+            &["permissions", "deny", "external-integrations", "--json"],
+        )
+        .expect("deny external integrations locally");
+        assert!(!store.external_integrations_enabled());
     }
 
     #[test]
