@@ -14,9 +14,11 @@ use serde::Serialize;
 use sinomo_core::local::SinomoDataDir;
 #[cfg(test)]
 use sinomo_core::network::ClusterPaths;
+#[cfg(test)]
+use sinomo_core::network::ObjectRpcRequest;
 use sinomo_core::network::{
-    NetworkError, ObjectRpcBodySource, ObjectRpcCall, ObjectRpcIncomingBody, ObjectRpcRequest,
-    ObjectRpcResponse, ObjectRpcResult, SinomoObjectCodec,
+    NetworkError, ObjectRpcBodySource, ObjectRpcCall, ObjectRpcIncomingBody, ObjectRpcResponse,
+    ObjectRpcResult, SinomoObjectCodec,
 };
 use sinomo_core::node::NodeId;
 
@@ -30,9 +32,9 @@ use crate::{
     DfsRoutedSendOutcome, DfsTransportIdentity, DistributedRepairJob, NetworkedDfsService,
     NetworkedDfsServiceEvent, decode_dfs_message_rpc_response,
     decode_dfs_metadata_journal_batch_rpc_response, dfs_direct_read_request_from_read_request,
-    dfs_direct_read_response_from_rpc_result, dfs_direct_read_rpc_request,
-    dfs_message_is_read_only_request, dfs_message_rpc_request,
-    dfs_metadata_journal_batch_rpc_request, dfs_network_message_allows_write_repair_progress,
+    dfs_direct_read_response_from_rpc_result, dfs_direct_read_rpc_call,
+    dfs_message_is_read_only_request, dfs_message_rpc_call, dfs_message_rpc_request,
+    dfs_metadata_journal_batch_rpc_call, dfs_network_message_allows_write_repair_progress,
     dfs_perf_trace, dfs_perf_trace_enabled, dfs_rejection_is_commit_content_repair_pending,
     dfs_rejection_is_replica_not_desired, retained_networked_dfs_service_events,
 };
@@ -218,6 +220,53 @@ fn collect_dfs_attachment_source_sync(
     result
 }
 
+/// Materializes an ordinary outgoing value call for synchronous compatibility
+/// adapters and in-process transport doubles.
+///
+/// Production network transports consume the owned body source directly. This
+/// helper deliberately rejects semantic attachments so a non-empty owned value
+/// body cannot be mistaken for one.
+#[cfg(test)]
+pub(crate) async fn materialize_dfs_value_call(
+    mut call: ObjectRpcCall,
+    max_bytes: usize,
+) -> Result<ObjectRpcRequest, DfsPeerTransportError> {
+    if call.has_streamed_value_body() {
+        call.request.body = call
+            .body
+            .collect_to_vec(max_bytes)
+            .await
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        return Ok(call.request);
+    }
+    if !call.body.is_empty() {
+        return Err(DfsPeerTransportError::new(format!(
+            "DFS route {} carries a semantic attachment, not an ordinary value",
+            call.request.route
+        )));
+    }
+    Ok(call.request)
+}
+
+/// Synchronous form of [`materialize_dfs_value_call`].
+#[cfg(test)]
+pub(crate) fn materialize_dfs_value_call_sync(
+    mut call: ObjectRpcCall,
+    max_bytes: usize,
+) -> Result<ObjectRpcRequest, DfsPeerTransportError> {
+    if call.has_streamed_value_body() {
+        call.request.body = collect_dfs_attachment_source_sync(call.body, max_bytes)?;
+        return Ok(call.request);
+    }
+    if !call.body.is_empty() {
+        return Err(DfsPeerTransportError::new(format!(
+            "DFS route {} carries a semantic attachment, not an ordinary value",
+            call.request.route
+        )));
+    }
+    Ok(call.request)
+}
+
 pub type DfsPeerTransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Asynchronous form of the same size-independent DFS peer RPC contract.
@@ -247,12 +296,12 @@ pub(crate) fn async_dfs_message_sender_from_peer_transport(
     Arc::new(move |target_node_id, command, options| {
         let peer_transport = Arc::clone(&peer_transport);
         Box::pin(async move {
-            let request = dfs_message_rpc_request(command)
+            let call = dfs_message_rpc_call(command)
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
             let response = peer_transport
                 .call_object_rpc_async(
                     target_node_id,
-                    ObjectRpcCall::value(request),
+                    call,
                     options.with_observe_connectivity(!dfs_message_is_read_only_request(command)),
                 )
                 .await?;
@@ -266,6 +315,12 @@ pub(crate) fn async_dfs_message_sender_from_peer_transport(
 pub async fn dfs_message_response_from_rpc_result(
     result: ObjectRpcResult,
 ) -> Result<DfsMessageResponse, DfsPeerTransportError> {
+    if result.has_streamed_value() {
+        return result
+            .decode_body::<DfsMessageResponse>()
+            .await
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()));
+    }
     let (response, attachment) = result.into_parts();
     if attachment.is_empty() {
         return decode_dfs_message_rpc_response(&response)
@@ -301,9 +356,9 @@ pub fn dfs_routed_call_rpc_call(
         request_id: format!("dfs_message_{}", message.frame_id),
         routed_message: message,
     };
-    let request = dfs_message_rpc_request(&command)?;
     let rpc_call = match attachment {
         Some(attachment) => {
+            let request = dfs_message_rpc_request(&command)?;
             let request = crate::body_rpc::encode_dfs_attachment_message_rpc_request(
                 &request,
                 command.clone(),
@@ -311,16 +366,24 @@ pub fn dfs_routed_call_rpc_call(
             )?;
             ObjectRpcCall::new(request, attachment.source)
         }
-        None => ObjectRpcCall::value(request),
+        None => dfs_message_rpc_call(&command)?,
     };
     Ok((command, rpc_call))
 }
 
-fn value_response_from_rpc_result(
+pub(crate) fn value_response_from_rpc_result(
     result: ObjectRpcResult,
 ) -> Result<ObjectRpcResponse, DfsPeerTransportError> {
-    let (response, attachment) = result.into_parts();
-    if !attachment.is_empty() {
+    let streamed_value = result.has_streamed_value();
+    let (mut response, body) = result.into_parts();
+    if streamed_value {
+        response
+            .error_detail()
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        response.body = collect_dfs_incoming_body_sync(body, usize::MAX)?;
+        return Ok(response);
+    }
+    if !body.is_empty() {
         return Err(DfsPeerTransportError::new(format!(
             "DFS route {} returned an unexpected attachment",
             response.route
@@ -334,6 +397,11 @@ fn value_response_from_rpc_result(
 pub fn dfs_message_response_from_rpc_result_sync(
     result: ObjectRpcResult,
 ) -> Result<DfsMessageResponse, DfsPeerTransportError> {
+    if result.has_streamed_value() {
+        let response = value_response_from_rpc_result(result)?;
+        return decode_dfs_message_rpc_response(&response)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()));
+    }
     let (response, attachment) = result.into_parts();
     if attachment.is_empty() {
         return decode_dfs_message_rpc_response(&response)
@@ -351,7 +419,7 @@ pub fn dfs_message_response_from_rpc_result_sync(
         .map_err(|source| DfsPeerTransportError::new(source.to_string()))
 }
 
-fn collect_dfs_incoming_body_sync(
+pub(crate) fn collect_dfs_incoming_body_sync(
     body: ObjectRpcIncomingBody,
     max_bytes: usize,
 ) -> Result<Vec<u8>, DfsPeerTransportError> {
@@ -384,10 +452,10 @@ pub(crate) fn async_dfs_direct_read_sender_from_peer_transport(
     Arc::new(move |target_node_id, request, options| {
         let peer_transport = Arc::clone(&peer_transport);
         Box::pin(async move {
-            let rpc_request = dfs_direct_read_rpc_request(request)
+            let rpc_call = dfs_direct_read_rpc_call(request)
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
             let response = peer_transport
-                .call_object_rpc_async(target_node_id, ObjectRpcCall::value(rpc_request), options)
+                .call_object_rpc_async(target_node_id, rpc_call, options)
                 .await?;
             dfs_direct_read_response_from_rpc_result(response)
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))
@@ -399,11 +467,11 @@ pub(crate) fn dfs_message_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsMessageSender {
     Arc::new(move |target_node_id, command, options| {
-        let request = dfs_message_rpc_request(command)
+        let call = dfs_message_rpc_call(command)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
         let response = peer_transport.call_object_rpc(
             target_node_id,
-            ObjectRpcCall::value(request),
+            call,
             options.with_observe_connectivity(!dfs_message_is_read_only_request(command)),
         )?;
         dfs_message_response_from_rpc_result_sync(response)
@@ -414,13 +482,9 @@ pub(crate) fn dfs_direct_read_sender_from_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
 ) -> DfsDirectReadSender {
     Arc::new(move |target_node_id, request, options| {
-        let rpc_request = dfs_direct_read_rpc_request(request)
+        let rpc_call = dfs_direct_read_rpc_call(request)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-        let result = peer_transport.call_object_rpc(
-            target_node_id,
-            ObjectRpcCall::value(rpc_request),
-            options,
-        )?;
+        let result = peer_transport.call_object_rpc(target_node_id, rpc_call, options)?;
         let response = dfs_direct_read_response_from_rpc_result(result)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
         collect_dfs_direct_read_response_sync(response)
@@ -683,11 +747,15 @@ struct DfsPreparedMetadataJournalBatchRpc {
     request_id: String,
     shard_id: crate::DfsMetadataShardId,
     next_after_sequence: u64,
-    request: ObjectRpcRequest,
+    command: DfsMetadataJournalBatchCommand,
     options: DfsObjectRpcSendOptions,
 }
 
 impl DfsPreparedMetadataJournalBatchRpc {
+    fn call(&self) -> Result<ObjectRpcCall, NetworkError> {
+        dfs_metadata_journal_batch_rpc_call(&self.command)
+    }
+
     fn finish(
         self,
         rpc_response: Result<ObjectRpcResult, DfsPeerTransportError>,
@@ -2644,12 +2712,9 @@ async fn send_direct_metadata_journal_fanout_async(
             };
             let peer_transport = Arc::clone(&peer_transport);
             workers.spawn(async move {
+                let call = prepared.call()?;
                 let rpc_response = peer_transport
-                    .call_object_rpc_async(
-                        &prepared.target_node_id,
-                        ObjectRpcCall::value(prepared.request.clone()),
-                        prepared.options,
-                    )
+                    .call_object_rpc_async(&prepared.target_node_id, call, prepared.options)
                     .await;
                 prepared.finish(rpc_response)
             });
@@ -2753,12 +2818,17 @@ fn send_direct_metadata_journal_fanout_blocking(
                     let Some(prepared) = prepared else {
                         break;
                     };
-                    let rpc_response = peer_transport.call_object_rpc(
-                        &prepared.target_node_id,
-                        ObjectRpcCall::value(prepared.request.clone()),
-                        prepared.options,
-                    );
-                    let outcome = prepared.finish(rpc_response);
+                    let outcome = match prepared.call() {
+                        Ok(call) => {
+                            let rpc_response = peer_transport.call_object_rpc(
+                                &prepared.target_node_id,
+                                call,
+                                prepared.options,
+                            );
+                            prepared.finish(rpc_response)
+                        }
+                        Err(error) => Err(error),
+                    };
                     if canceled.load(AtomicOrdering::Acquire) || Instant::now() >= deadline {
                         break;
                     }
@@ -2901,12 +2971,12 @@ impl DfsMessageTransport for DfsNodeTransport {
         let Some(peer_transport) = self.peer_transport.as_ref().cloned() else {
             return Ok(None);
         };
-        let request = dfs_metadata_journal_batch_rpc_request(command)?;
+        let call = dfs_metadata_journal_batch_rpc_call(command)?;
         let options = self.current_send_options(format!(
             "send direct DFS metadata journal batch to {target_node_id}"
         ))?;
         let response = peer_transport
-            .call_object_rpc(target_node_id, ObjectRpcCall::value(request), options)
+            .call_object_rpc(target_node_id, call, options)
             .map_err(|source| NetworkError::Io {
                 operation: format!("send direct DFS metadata journal batch to {target_node_id}"),
                 detail: source.to_string(),
@@ -2967,7 +3037,7 @@ impl DfsMessageTransport for DfsNodeTransport {
                 request_id: command.request_id.clone(),
                 shard_id: command.batch.shard_id.clone(),
                 next_after_sequence: command.batch.next_after_sequence,
-                request: dfs_metadata_journal_batch_rpc_request(command)?,
+                command: command.clone(),
                 options,
             });
         }
@@ -3264,10 +3334,11 @@ mod tests {
         let (value_command, value_call) =
             dfs_routed_call_rpc_call(DfsRoutedCall::value(value_message))
                 .expect("value session call");
-        assert!(value_call.body.is_empty());
+        assert!(value_call.has_streamed_value_body());
+        let value_request = materialize_dfs_value_call_sync(value_call, usize::MAX)
+            .expect("materialize value call at compatibility test boundary");
         assert_eq!(
-            value_call
-                .request
+            value_request
                 .decode_body::<DfsMessageCommand>()
                 .expect("value command"),
             value_command
@@ -3580,12 +3651,12 @@ mod tests {
                     "injected metadata fan-out failure for {target_node_id}"
                 )));
             }
-            let command: DfsMetadataJournalBatchCommand = call
-                .request
+            let request = materialize_dfs_value_call_sync(call, usize::MAX)?;
+            let command: DfsMetadataJournalBatchCommand = request
                 .decode_body()
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
             ObjectRpcResponse::encode_body(
-                &call.request.route,
+                &request.route,
                 &DfsMetadataJournalBatchResponse {
                     request_id: command.request_id,
                     shard_id: command.batch.shard_id,

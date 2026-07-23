@@ -474,9 +474,40 @@ impl SinomoObjectCodec {
             .map_err(NetworkError::object)
     }
 
+    pub(crate) fn append_to_output<T, O>(
+        self,
+        out: &mut O,
+        value: &T,
+    ) -> Result<std::ops::Range<usize>, NetworkError>
+    where
+        T: serde::Serialize + ?Sized,
+        O: sinomo_object::serde_ext::SobjOutput + ?Sized,
+    {
+        serde_ext::append_bytes_to_output(out, value, self.version_id, self.length_mode)
+            .map_err(NetworkError::object)
+    }
+
     pub fn decode<T: serde::de::DeserializeOwned>(self, bytes: &[u8]) -> Result<T, NetworkError> {
         serde_ext::from_bytes_with_options(bytes, self.decode_options(bytes.len())?)
             .map_err(NetworkError::object)
+    }
+
+    pub(crate) fn decode_chunks<T, I, B>(
+        self,
+        chunks: I,
+        document_bytes: usize,
+    ) -> Result<T, NetworkError>
+    where
+        T: serde::de::DeserializeOwned,
+        I: IntoIterator<Item = sinomo_object::Result<B>>,
+        B: AsRef<[u8]>,
+    {
+        serde_ext::from_chunk_iter_with_options(
+            chunks,
+            document_bytes,
+            self.decode_options(document_bytes)?,
+        )
+        .map_err(NetworkError::object)
     }
 
     pub fn decode_borrowed<'de, T>(self, bytes: &'de [u8]) -> Result<T, NetworkError>

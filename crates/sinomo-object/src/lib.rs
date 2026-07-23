@@ -11,6 +11,8 @@ use thiserror::Error;
 
 #[cfg(feature = "serde")]
 pub mod serde_ext;
+#[cfg(feature = "serde")]
+mod stream_serde;
 pub mod text;
 
 pub const MAGIC: &[u8; 4] = b"SOBJ";

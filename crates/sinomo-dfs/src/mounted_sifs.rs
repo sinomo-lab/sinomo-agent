@@ -18,11 +18,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::node_transport::value_response_from_rpc_result;
 use crate::{
     AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsError, DfsNodeAdvertisement, DfsNodeId,
     DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
     DfsPeerTransportFuture, DfsPosixError, NetworkedDfsService, cluster_dfs_peer_node_ids,
-    content_services_prefix, fallback_dfs_node_id, object_rpc_request_from_kv_payload,
+    content_services_prefix, fallback_dfs_node_id,
     open_cluster_dfs_service_with_peer_transports_for_nodes,
 };
 
@@ -352,9 +353,10 @@ mod tests {
                 .expect("targets")
                 .push(target_node_id.clone());
             assert_eq!(call.request.route, sinomo_core::kv::CLUSTER_KV_TXN_ROUTE);
-            let submitted =
-                sinomo_core::kv::decode_cluster_kv_txn_rpc_request_body(&call.request.body)
-                    .expect("transaction request");
+            let request = crate::node_transport::materialize_dfs_value_call_sync(call, usize::MAX)
+                .expect("materialize transaction request");
+            let submitted = sinomo_core::kv::decode_cluster_kv_txn_rpc_request_body(&request.body)
+                .expect("transaction request");
             let payload = sinomo_core::kv::cluster_kv_txn_response_rpc_payload(
                 &sinomo_core::kv::ClusterKvTxnCommitResult {
                     request_id: submitted.request_id.clone(),
@@ -792,29 +794,22 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
         let state = sinomo_core::cluster::read_cluster_state(&self.cluster_paths)
             .map_err(|source| mounted_sifs_kv_io_error(&self.cluster_paths, source))?;
         let request = sinomo_core::kv::KvTxnRequest::generated(txn);
-        let rpc_payload =
-            sinomo_core::kv::cluster_kv_txn_rpc_payload(&request).map_err(|source| {
-                KvError::Io {
-                    path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
-                    detail: source.to_string(),
-                }
-            })?;
-        let request = object_rpc_request_from_kv_payload(rpc_payload);
+        let call = ObjectRpcCall::encode_value(
+            sinomo_core::kv::CLUSTER_KV_TXN_ROUTE,
+            sinomo_core::kv::CLUSTER_KV_RPC_CATEGORY,
+            request,
+        )
+        .map_err(|source| mounted_sifs_kv_io_error(&self.cluster_paths, source))?;
         let response = self
             .peer_transport
             .call_object_rpc(
                 &state.local_node_id,
-                ObjectRpcCall::value(request),
+                call,
                 DfsObjectRpcSendOptions::default(),
             )
             .map_err(|source| mounted_sifs_kv_io_error(&self.cluster_paths, source))?;
-        if !response.body.is_empty() {
-            return Err(KvError::Io {
-                path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
-                detail: "cluster KV transaction returned an unexpected attachment".to_string(),
-            });
-        }
-        let response = response.response;
+        let response = value_response_from_rpc_result(response)
+            .map_err(|source| mounted_sifs_kv_io_error(&self.cluster_paths, source))?;
         response
             .error_detail()
             .map_err(|source| mounted_sifs_kv_io_error(&self.cluster_paths, source))?;
@@ -941,14 +936,21 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for MountedSifsObject
     fn sign_object_rpc_request_async<'a>(
         &'a mut self,
         request: &'a ObjectRpcRequest,
+        request_digest_sha256: [u8; 32],
     ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
         let data_dir = self.data_dir.clone();
-        let request = request.clone();
+        let route = request.route.clone();
+        let category = request.category.clone();
         let runtime = self.runtime.clone();
         Box::pin(async move {
             runtime
                 .spawn_blocking(move || {
-                    sinomo_core::network::sign_daemon_rpc_request_from_data_dir(&data_dir, &request)
+                    sinomo_core::network::sign_daemon_rpc_request_digest_from_data_dir(
+                        &data_dir,
+                        &route,
+                        &category,
+                        request_digest_sha256.to_vec(),
+                    )
                 })
                 .await
                 .map_err(|source| NetworkError::Io {

@@ -426,47 +426,47 @@ where
         if remaining.is_zero() {
             break;
         }
-        let payload = sinomo_kv::cluster_kv_authoritative_snapshot_rpc_payload().map_err(kv_err)?;
-        let request =
-            ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
-                .with_response_retry_safe();
+        let mut call = ObjectRpcCall::encode_value(
+            sinomo_kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE,
+            sinomo_kv::CLUSTER_KV_RPC_CATEGORY,
+            sinomo_kv::ClusterKvAuthoritativeSnapshotRequest,
+        )?;
+        call.request = call.request.with_response_retry_safe();
         let timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
         let mut client = ClusterObjectRpcClient::routed(host, paths);
         match client
             .call_target(
                 state,
                 target,
-                ObjectRpcCall::value(request),
+                call,
                 ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
             )
             .await
         {
-            Ok(response) if response.body.is_empty() => {
-                if let Err(error) = response
-                    .response
-                    .error_detail()
-                    .map_err(|error| verified_cluster_non_leader_error(target, error))
+            Ok(result) => {
+                let read = match result
+                    .decode_body::<KvAuthoritativeRead<KvSnapshot>>()
+                    .await
                 {
-                    failures.push(format!("node {target} failed: {error}"));
-                    if verified_non_leader_rejects_preferred_authority(
-                        &error,
-                        preferred_authority_id.as_ref(),
-                        target,
-                    ) || !cluster_kv_forward_error_allows_next_authority(&error, target)
-                    {
-                        return Err(error);
+                    Ok(read) => read,
+                    Err(error) => {
+                        let error = verified_cluster_non_leader_error(target, error);
+                        failures.push(format!("node {target} failed: {error}"));
+                        if verified_non_leader_rejects_preferred_authority(
+                            &error,
+                            preferred_authority_id.as_ref(),
+                            target,
+                        ) || !cluster_kv_forward_error_allows_next_authority(&error, target)
+                        {
+                            return Err(error);
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                let read = sinomo_kv::decode_cluster_kv_authoritative_snapshot_rpc_body(
-                    &response.response.body,
-                )
-                .map_err(kv_err)?;
+                };
+                sinomo_kv::validate_cluster_kv_authoritative_snapshot_read(&read)
+                    .map_err(kv_err)?;
                 return Ok(Some(read));
             }
-            Ok(_) => failures.push(format!(
-                "node {target} returned an unexpected authoritative-read attachment"
-            )),
             Err(error) => failures.push(format!("node {target} failed: {error}")),
         }
     }
@@ -532,31 +532,23 @@ async fn forward_cluster_kv_txn_to_state_authority_node_async_with_host<H>(
 where
     H: ClusterSignedObjectRpcAsyncHost + Send,
 {
-    let txn_payload = sinomo_kv::cluster_kv_txn_rpc_payload(request).map_err(kv_err)?;
-    let txn_request = ObjectRpcRequest::from_encoded_body(
-        txn_payload.route,
-        txn_payload.category,
-        txn_payload.body,
-    );
     let mut client = ClusterObjectRpcClient::routed(host, paths);
     let txn_response = client
         .call_target(
             state,
             target_node_id,
-            ObjectRpcCall::value(txn_request),
+            ObjectRpcCall::encode_borrowed_value(
+                sinomo_kv::CLUSTER_KV_TXN_ROUTE,
+                sinomo_kv::CLUSTER_KV_RPC_CATEGORY,
+                request,
+            )?,
             ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
         )
         .await?;
-    if !txn_response.body.is_empty() {
-        return Err(NetworkError::Serialization {
-            detail: "cluster KV transaction returned an unexpected attachment".to_string(),
-        });
-    }
-    let txn_response = txn_response.response;
-    txn_response
-        .error_detail()
+    let response = txn_response
+        .decode_body::<ClusterKvTxnRpcResponse>()
+        .await
         .map_err(|error| verified_cluster_non_leader_error(target_node_id, error))?;
-    let response = sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body).map_err(kv_err)?;
     if response.request_id != request.request_id {
         return Err(forwarded_cluster_kv_request_id_mismatch(
             request,
@@ -723,32 +715,26 @@ async fn fetch_cluster_kv_snapshot_from_node_async_with_host<H>(
 where
     H: ClusterSignedObjectRpcAsyncHost + Send,
 {
-    let payload = sinomo_kv::cluster_kv_authoritative_snapshot_rpc_payload().map_err(kv_err)?;
-    let request =
-        ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
-            .with_response_retry_safe();
+    let mut call = ObjectRpcCall::encode_value(
+        sinomo_kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE,
+        sinomo_kv::CLUSTER_KV_RPC_CATEGORY,
+        sinomo_kv::ClusterKvAuthoritativeSnapshotRequest,
+    )?;
+    call.request = call.request.with_response_retry_safe();
     let mut client = ClusterObjectRpcClient::routed(host, paths);
-    let response = client
+    let read = client
         .call_target(
             state,
             target_node_id,
-            ObjectRpcCall::value(request),
+            call,
             ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
         )
-        .await?;
-    if !response.body.is_empty() {
-        return Err(NetworkError::Serialization {
-            detail: "cluster KV authoritative snapshot returned an unexpected attachment"
-                .to_string(),
-        });
-    }
-    let response = response.response;
-    response
-        .error_detail()
+        .await?
+        .decode_body::<KvAuthoritativeRead<KvSnapshot>>()
+        .await
         .map_err(|error| verified_cluster_non_leader_error(target_node_id, error))?;
-    sinomo_kv::decode_cluster_kv_authoritative_snapshot_rpc_body(&response.body)
-        .map(|read| read.value)
-        .map_err(kv_err)
+    sinomo_kv::validate_cluster_kv_authoritative_snapshot_read(&read).map_err(kv_err)?;
+    Ok(read.value)
 }
 
 #[cfg(test)]

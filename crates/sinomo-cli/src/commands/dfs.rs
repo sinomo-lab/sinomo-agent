@@ -2231,19 +2231,74 @@ fn daemon_dfs_object_rpc_to_target(
         detail: "DFS cluster object RPC requires the local daemon to be running".to_string(),
     })?;
     let client = DaemonApiClient::at_address(status.address);
-    let send = client.object_rpc_call_to_target_with_deadline_async(
-        target_node_id,
-        call,
-        options.connect_timeout,
-        options.overall_timeout,
-        options.observe_connectivity,
-    );
+    let send = async {
+        let mut result = client
+            .object_rpc_call_to_target_with_deadline_async(
+                target_node_id,
+                call,
+                options.connect_timeout,
+                options.overall_timeout,
+                options.observe_connectivity,
+            )
+            .await
+            .map_err(CliError::from)?;
+        // This function is the synchronous CLI compatibility boundary. Keep a
+        // semantic attachment stream-native, but gather an ordinary typed
+        // value before a temporary runtime can be dropped.
+        result
+            .materialize_value_body(usize::MAX)
+            .await
+            .map_err(CliError::from)?;
+        Ok::<_, CliError>(result)
+    };
+    block_on_daemon_dfs_rpc(target_node_id, send)
+}
+
+fn daemon_dfs_value_rpc_to_target<Req, Resp>(
+    target_node_id: &sinomo_runtime::node::NodeId,
+    route: &'static str,
+    category: &'static str,
+    value: Req,
+    options: sinomo_runtime::dfs::DfsObjectRpcSendOptions,
+) -> Result<Resp, CliError>
+where
+    Req: serde::Serialize + Send + 'static,
+    Resp: serde::de::DeserializeOwned + Send + 'static,
+{
+    let status = default_main_daemon_status()?.ok_or_else(|| CliError::Network {
+        address: target_node_id.to_string(),
+        detail: "DFS cluster object RPC requires the local daemon to be running".to_string(),
+    })?;
+    let client = DaemonApiClient::at_address(status.address);
+    let call = sinomo_runtime::network::ObjectRpcCall::encode_value(route, category, value)?;
+    let send = async {
+        client
+            .object_rpc_call_to_target_with_deadline_async(
+                target_node_id,
+                call,
+                options.connect_timeout,
+                options.overall_timeout,
+                options.observe_connectivity,
+            )
+            .await
+            .map_err(CliError::from)?
+            .decode_body::<Resp>()
+            .await
+            .map_err(CliError::from)
+    };
+    block_on_daemon_dfs_rpc(target_node_id, send)
+}
+
+fn block_on_daemon_dfs_rpc<T>(
+    target_node_id: &sinomo_runtime::node::NodeId,
+    send: impl std::future::Future<Output = Result<T, CliError>>,
+) -> Result<T, CliError> {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         return if matches!(
             handle.runtime_flavor(),
             tokio::runtime::RuntimeFlavor::MultiThread
         ) {
-            tokio::task::block_in_place(|| handle.block_on(send)).map_err(CliError::from)
+            tokio::task::block_in_place(|| handle.block_on(send))
         } else {
             Err(CliError::Network {
                 address: target_node_id.to_string(),
@@ -2258,7 +2313,7 @@ fn daemon_dfs_object_rpc_to_target(
             address: target_node_id.to_string(),
             detail: source.to_string(),
         })?;
-    runtime.block_on(send).map_err(CliError::from)
+    runtime.block_on(send)
 }
 
 fn publish_dfs_metadata_journal_from_data_dir(
@@ -2761,7 +2816,6 @@ fn fetch_dfs_status_from_node_blocking(
 ) -> Result<sinomo_runtime::dfs::DfsOperatorStatus, CliError> {
     let trace = dfs_cluster_status_trace_enabled();
     let started_at = std::time::Instant::now();
-    let rpc_request = sinomo_runtime::dfs::dfs_status_rpc_request()?;
     if trace {
         eprintln!(
             "sinomo dfs cluster status node={node_id} +{}ms: request built",
@@ -2774,9 +2828,11 @@ fn fetch_dfs_status_from_node_blocking(
             started_at.elapsed().as_millis()
         );
     }
-    let response = daemon_dfs_object_rpc_to_target(
+    let response = daemon_dfs_value_rpc_to_target(
         node_id,
-        sinomo_runtime::network::ObjectRpcCall::value(rpc_request),
+        sinomo_runtime::dfs::DFS_STATUS_ROUTE,
+        sinomo_runtime::dfs::DFS_RPC_CATEGORY,
+        (),
         sinomo_runtime::dfs::DfsObjectRpcSendOptions::default().with_overall_timeout(timeout),
     );
     if trace {
@@ -2786,15 +2842,7 @@ fn fetch_dfs_status_from_node_blocking(
             started_at.elapsed().as_millis()
         );
     }
-    let response = response.map_err(CliError::from)?;
-    if !response.body.is_empty() {
-        return Err(CliError::Network {
-            address: node_id.to_string(),
-            detail: "DFS status value response unexpectedly contained an attachment".to_string(),
-        });
-    }
-    let decoded =
-        sinomo_runtime::dfs::decode_dfs_status_rpc_response(&response.response).map_err(Into::into);
+    let decoded = response;
     if trace {
         let outcome = if decoded.is_ok() { "ok" } else { "error" };
         eprintln!(

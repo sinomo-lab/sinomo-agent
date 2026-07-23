@@ -11,7 +11,7 @@ use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_HEALTH_SCOPE_LOCAL,
     CLUSTER_HEALTH_SCOPE_METADATA_KEY, CLUSTER_NETWORK_PING_ROUTE, CLUSTER_NETWORK_RPC_CATEGORY,
-    ObjectRpcRequest, ObjectRpcResponse,
+    ObjectRpcCall, ObjectRpcRequest, ObjectRpcResponse,
 };
 use sinomo_network::{
     ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState,
@@ -414,19 +414,48 @@ pub fn cluster_network_ping_rpc_request_with_response_payload(
     payload_bytes: usize,
     response_payload_bytes: usize,
 ) -> Result<ObjectRpcRequest, NetworkError> {
+    let request = cluster_network_ping_request(nonce, payload_bytes, response_payload_bytes)?;
     ObjectRpcRequest::encode_body(
         CLUSTER_NETWORK_PING_ROUTE,
         CLUSTER_NETWORK_RPC_CATEGORY,
-        &ClusterNetworkPingRequest {
-            nonce: nonce.into(),
-            payload: sinomo_network::try_zeroed_vec(payload_bytes, "cluster network ping payload")?,
-            response_payload_bytes,
-            payload_mode: ClusterNetworkPingPayloadMode::EmbeddedSobj,
-            request_attachment_bytes: 0,
-            response_attachment_bytes: 0,
-        },
+        &request,
     )
     .map(ObjectRpcRequest::with_response_retry_safe)
+}
+
+/// Builds an embedded-value ping directly as transport-shaped SOBJ chunks.
+///
+/// Unlike [`cluster_network_ping_rpc_request_with_response_payload`], this is
+/// the canonical benchmark path: the potentially large typed value never
+/// occupies the bounded object-RPC control head.
+pub fn cluster_network_ping_rpc_call_with_response_payload(
+    nonce: impl Into<String>,
+    payload_bytes: usize,
+    response_payload_bytes: usize,
+) -> Result<ObjectRpcCall, NetworkError> {
+    let request = cluster_network_ping_request(nonce, payload_bytes, response_payload_bytes)?;
+    let mut call = ObjectRpcCall::encode_value(
+        CLUSTER_NETWORK_PING_ROUTE,
+        CLUSTER_NETWORK_RPC_CATEGORY,
+        request,
+    )?;
+    call.request = call.request.with_response_retry_safe();
+    Ok(call)
+}
+
+fn cluster_network_ping_request(
+    nonce: impl Into<String>,
+    payload_bytes: usize,
+    response_payload_bytes: usize,
+) -> Result<ClusterNetworkPingRequest, NetworkError> {
+    Ok(ClusterNetworkPingRequest {
+        nonce: nonce.into(),
+        payload: sinomo_network::try_zeroed_vec(payload_bytes, "cluster network ping payload")?,
+        response_payload_bytes,
+        payload_mode: ClusterNetworkPingPayloadMode::EmbeddedSobj,
+        request_attachment_bytes: 0,
+        response_attachment_bytes: 0,
+    })
 }
 
 /// Builds the small SOBJ request head for a ping whose bulk bytes travel as a
@@ -613,6 +642,103 @@ pub async fn handle_cluster_health_rpc_request_async<P: ClusterStatusAsyncProbe 
     result
 }
 
+async fn cluster_health_rows_for_request_async_observed<P: ClusterStatusAsyncProbe + ?Sized>(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    probe: &P,
+    request: &ObjectRpcRequest,
+    observed_at: OffsetDateTime,
+    trace: &mut Option<ClusterHealthRequestTrace>,
+) -> Result<Vec<ClusterHealthRow>, NetworkError> {
+    let local_scope = cluster_health_rpc_request_is_local_scope(request);
+    let include_peer_views = cluster_health_rpc_request_includes_peer_views(request);
+    let live_probes = cluster_health_rpc_request_uses_live_probes(request);
+    let rows = if local_scope {
+        if trace.is_some() {
+            cluster_health_rows_with_async_probe_for_scope_with_budget_observed(
+                paths,
+                state,
+                probe,
+                false,
+                true,
+                observed_at,
+                CLUSTER_HEALTH_LIVE_TOTAL_BUDGET,
+                trace.as_ref(),
+            )
+            .await?
+        } else {
+            cluster_health_rows_with_async_probe_for_scope(
+                paths,
+                state,
+                probe,
+                false,
+                true,
+                observed_at,
+            )
+            .await?
+        }
+    } else if live_probes {
+        if trace.is_some() {
+            cluster_health_rows_with_async_probe_for_scope_with_budget_observed(
+                paths,
+                state,
+                probe,
+                false,
+                false,
+                observed_at,
+                CLUSTER_HEALTH_LIVE_TOTAL_BUDGET,
+                trace.as_ref(),
+            )
+            .await?
+        } else {
+            cluster_health_rows_with_async_probe(paths, state, probe, false, observed_at).await?
+        }
+    } else if !include_peer_views {
+        let phase = trace.as_ref().map(|trace| {
+            ClusterHealthPhaseTrace::new(
+                trace,
+                "cluster_health_stored_status_read",
+                "",
+                ClusterHealthTraceStats::default(),
+            )
+        });
+        match cluster_health_rows_from_stored_statuses_async(paths, state, false, observed_at).await
+        {
+            Ok(rows) => {
+                if let Some(phase) = phase {
+                    phase.finish("completed", ClusterHealthTraceStats::from_rows(&rows));
+                }
+                rows
+            }
+            Err(error) => {
+                if let Some(phase) = phase {
+                    phase.finish("error", ClusterHealthTraceStats::default());
+                }
+                return Err(error);
+            }
+        }
+    } else if trace.is_some() {
+        cluster_health_rows_with_async_probe_for_scope_with_budget_observed(
+            paths,
+            state,
+            probe,
+            include_peer_views,
+            false,
+            observed_at,
+            CLUSTER_HEALTH_LIVE_TOTAL_BUDGET,
+            trace.as_ref(),
+        )
+        .await?
+    } else {
+        cluster_health_rows_with_async_probe(paths, state, probe, include_peer_views, observed_at)
+            .await?
+    };
+    if let Some(trace) = trace.as_mut() {
+        trace.observe_rows(&rows);
+    }
+    Ok(rows)
+}
+
 async fn handle_cluster_health_rpc_request_async_observed<P: ClusterStatusAsyncProbe + ?Sized>(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -624,107 +750,15 @@ async fn handle_cluster_health_rpc_request_async_observed<P: ClusterStatusAsyncP
     match request.route.as_str() {
         CLUSTER_HEALTH_ROUTE => {
             let _: () = request.decode_body()?;
-            let local_scope = cluster_health_rpc_request_is_local_scope(&request);
-            let include_peer_views = cluster_health_rpc_request_includes_peer_views(&request);
-            let live_probes = cluster_health_rpc_request_uses_live_probes(&request);
-            let rows = if local_scope {
-                if trace.is_some() {
-                    cluster_health_rows_with_async_probe_for_scope_with_budget_observed(
-                        paths,
-                        state,
-                        probe,
-                        false,
-                        true,
-                        observed_at,
-                        CLUSTER_HEALTH_LIVE_TOTAL_BUDGET,
-                        trace.as_ref(),
-                    )
-                    .await?
-                } else {
-                    cluster_health_rows_with_async_probe_for_scope(
-                        paths,
-                        state,
-                        probe,
-                        false,
-                        true,
-                        observed_at,
-                    )
-                    .await?
-                }
-            } else if live_probes {
-                if trace.is_some() {
-                    cluster_health_rows_with_async_probe_for_scope_with_budget_observed(
-                        paths,
-                        state,
-                        probe,
-                        false,
-                        false,
-                        observed_at,
-                        CLUSTER_HEALTH_LIVE_TOTAL_BUDGET,
-                        trace.as_ref(),
-                    )
-                    .await?
-                } else {
-                    cluster_health_rows_with_async_probe(paths, state, probe, false, observed_at)
-                        .await?
-                }
-            } else if !include_peer_views {
-                let phase = trace.as_ref().map(|trace| {
-                    ClusterHealthPhaseTrace::new(
-                        trace,
-                        "cluster_health_stored_status_read",
-                        "",
-                        ClusterHealthTraceStats::default(),
-                    )
-                });
-                match cluster_health_rows_from_stored_statuses_async(
-                    paths,
-                    state,
-                    false,
-                    observed_at,
-                )
-                .await
-                {
-                    Ok(rows) => {
-                        if let Some(phase) = phase {
-                            phase.finish("completed", ClusterHealthTraceStats::from_rows(&rows));
-                        }
-                        rows
-                    }
-                    Err(error) => {
-                        if let Some(phase) = phase {
-                            phase.finish("error", ClusterHealthTraceStats::default());
-                        }
-                        return Err(error);
-                    }
-                }
-            } else {
-                if trace.is_some() {
-                    cluster_health_rows_with_async_probe_for_scope_with_budget_observed(
-                        paths,
-                        state,
-                        probe,
-                        include_peer_views,
-                        false,
-                        observed_at,
-                        CLUSTER_HEALTH_LIVE_TOTAL_BUDGET,
-                        trace.as_ref(),
-                    )
-                    .await?
-                } else {
-                    cluster_health_rows_with_async_probe(
-                        paths,
-                        state,
-                        probe,
-                        include_peer_views,
-                        observed_at,
-                    )
-                    .await?
-                }
-            };
-            if let Some(trace) = trace.as_mut() {
-                trace.observe_rows(&rows);
-            }
+            let rows = cluster_health_rows_for_request_async_observed(
+                paths,
+                state,
+                probe,
+                &request,
+                observed_at,
+                trace,
+            )
+            .await?;
             ObjectRpcResponse::encode_body(CLUSTER_HEALTH_ROUTE, &rows)
         }
         CLUSTER_NETWORK_PING_ROUTE => {
@@ -736,16 +770,11 @@ async fn handle_cluster_health_rpc_request_async_observed<P: ClusterStatusAsyncP
     }
 }
 
-pub async fn handle_current_cluster_health_rpc_request_async<
-    P: ClusterStatusAsyncProbe + ?Sized,
->(
+async fn read_current_cluster_health_state_observed(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
-    probe: &P,
-    request: ObjectRpcRequest,
-    observed_at: OffsetDateTime,
-) -> Result<ObjectRpcResponse, NetworkError> {
-    let mut trace = ClusterHealthRequestTrace::new(&request);
+    trace: &mut Option<ClusterHealthRequestTrace>,
+) -> Result<ClusterBootstrapState, NetworkError> {
     let state_read_started = std::time::Instant::now();
     if let Some(trace) = trace.as_ref() {
         trace.emit_instant(
@@ -788,6 +817,63 @@ pub async fn handle_current_cluster_health_rpc_request_async<
             return Err(error);
         }
     };
+    Ok(state)
+}
+
+pub async fn current_cluster_health_rows_for_decoded_request_async<
+    P: ClusterStatusAsyncProbe + ?Sized,
+>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    probe: &P,
+    request: &ObjectRpcRequest,
+    observed_at: OffsetDateTime,
+) -> Result<Vec<ClusterHealthRow>, NetworkError> {
+    if request.route != CLUSTER_HEALTH_ROUTE {
+        return Err(NetworkError::UnknownRoute {
+            route: request.route.clone(),
+        });
+    }
+    let mut trace = ClusterHealthRequestTrace::new(request);
+    let state = read_current_cluster_health_state_observed(runtime, paths, &mut trace).await?;
+    let result = cluster_health_rows_for_request_async_observed(
+        paths,
+        &state,
+        probe,
+        request,
+        observed_at,
+        &mut trace,
+    )
+    .await;
+    if let Some(trace) = trace.take() {
+        trace.finish(if result.is_ok() { "completed" } else { "error" });
+    }
+    result
+}
+
+pub async fn handle_current_cluster_health_rpc_request_async<
+    P: ClusterStatusAsyncProbe + ?Sized,
+>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    probe: &P,
+    request: ObjectRpcRequest,
+    observed_at: OffsetDateTime,
+) -> Result<ObjectRpcResponse, NetworkError> {
+    if request.route == CLUSTER_HEALTH_ROUTE {
+        let _: () = request.decode_body()?;
+        let rows = current_cluster_health_rows_for_decoded_request_async(
+            runtime,
+            paths,
+            probe,
+            &request,
+            observed_at,
+        )
+        .await?;
+        return ObjectRpcResponse::encode_body(CLUSTER_HEALTH_ROUTE, &rows);
+    }
+    let mut trace = ClusterHealthRequestTrace::new(&request);
+    let state = read_current_cluster_health_state_observed(runtime, paths, &mut trace).await?;
     if trace.is_none() {
         return handle_cluster_health_rpc_request_async(paths, &state, probe, request, observed_at)
             .await;
@@ -823,34 +909,45 @@ pub fn handle_cluster_network_ping_rpc_request_for_node(
     match request.route.as_str() {
         CLUSTER_NETWORK_PING_ROUTE => {
             let request: ClusterNetworkPingRequest = request.decode_body()?;
-            if request.payload_mode != ClusterNetworkPingPayloadMode::EmbeddedSobj
-                || request.request_attachment_bytes != 0
-                || request.response_attachment_bytes != 0
-            {
-                return Err(NetworkError::Serialization {
-                    detail: "cluster network ping semantic attachments require the session handler"
-                        .to_string(),
-                });
-            }
-            let response = ClusterNetworkPingResponse {
-                nonce: request.nonce,
-                responder_node_id: responder_node_id.clone(),
-                payload_bytes: request.payload.len(),
-                response_payload: sinomo_network::try_zeroed_vec(
-                    request.response_payload_bytes,
-                    "cluster network ping response payload",
-                )?,
-                payload_mode: ClusterNetworkPingPayloadMode::EmbeddedSobj,
-                request_attachment_bytes: 0,
-                response_attachment_bytes: 0,
-                observed_at,
-            };
+            let response =
+                cluster_network_ping_response_for_node(responder_node_id, request, observed_at)?;
             ObjectRpcResponse::encode_body(CLUSTER_NETWORK_PING_ROUTE, &response)
         }
         other => Err(NetworkError::UnknownRoute {
             route: other.to_string(),
         }),
     }
+}
+
+/// Builds the typed embedded-value ping response without first encoding it
+/// into a contiguous object-RPC response head.
+pub fn cluster_network_ping_response_for_node(
+    responder_node_id: &NodeId,
+    request: ClusterNetworkPingRequest,
+    observed_at: OffsetDateTime,
+) -> Result<ClusterNetworkPingResponse, NetworkError> {
+    if request.payload_mode != ClusterNetworkPingPayloadMode::EmbeddedSobj
+        || request.request_attachment_bytes != 0
+        || request.response_attachment_bytes != 0
+    {
+        return Err(NetworkError::Serialization {
+            detail: "cluster network ping semantic attachments require the session handler"
+                .to_string(),
+        });
+    }
+    Ok(ClusterNetworkPingResponse {
+        nonce: request.nonce,
+        responder_node_id: responder_node_id.clone(),
+        payload_bytes: request.payload.len(),
+        response_payload: sinomo_network::try_zeroed_vec(
+            request.response_payload_bytes,
+            "cluster network ping response payload",
+        )?,
+        payload_mode: ClusterNetworkPingPayloadMode::EmbeddedSobj,
+        request_attachment_bytes: 0,
+        response_attachment_bytes: 0,
+        observed_at,
+    })
 }
 
 pub fn cluster_network_ping_attachment_rpc_response_for_node(
@@ -2184,6 +2281,23 @@ mod tests {
         assert!(
             request.is_response_retry_safe(),
             "a read-only nonce ping can safely retry after an ambiguous response timeout"
+        );
+    }
+
+    #[test]
+    fn cluster_network_ping_call_keeps_large_value_out_of_control_head() {
+        let call =
+            cluster_network_ping_rpc_call_with_response_payload("owned-value", 512 * 1024, 64)
+                .expect("stream-native ping call");
+
+        assert!(call.request.is_response_retry_safe());
+        assert!(call.request.body.is_empty());
+        assert!(call.has_streamed_value_body());
+        assert!(
+            call.body
+                .total_bytes()
+                .is_some_and(|bytes| bytes > 512 * 1024),
+            "the encoded typed request should remain in the owned body source"
         );
     }
 

@@ -12,12 +12,52 @@ use serde::ser::{
 use crate::{
     AlignmentHint, Array, DecodeOptions, Document, ElementType, Error, Field, LengthMode, List,
     MAGIC, Object, OptionalValue, Reader, Result, TypeId, Value, duplicate_key_error,
-    encode_element_type, patch_length, read_document_header, read_element_type, read_schema,
-    try_box, try_extend_from_slice, try_hashset_with_capacity, try_push_vec, try_reserve_hashset,
-    try_string_from_str, try_vec_with_capacity, write_bytes, write_length, write_string, write_u16,
+    read_document_header, read_element_type, read_schema, try_box, try_extend_from_slice,
+    try_hashset_with_capacity, try_push_vec, try_reserve_hashset, try_string_from_str,
+    try_vec_with_capacity,
 };
 use std::collections::HashSet;
 use std::ops::Range;
+
+pub use crate::stream_serde::from_chunk_iter_with_options;
+
+/// Patchable output used by the SOBJ serde encoder.
+///
+/// SOBJ writes a small number of lengths and element tags before their values
+/// are known. A contiguous `Vec<u8>` can patch those bytes by indexing; an
+/// ownership-native transport can implement this trait over fixed-size chunks
+/// and patch the same logical offsets without ever joining the payload into one
+/// allocation.
+pub trait SobjOutput {
+    fn len(&self) -> usize;
+
+    fn append(&mut self, bytes: &[u8], context: &'static str) -> Result<()>;
+
+    fn patch(&mut self, offset: usize, bytes: &[u8]) -> Result<()>;
+
+    fn truncate(&mut self, len: usize);
+}
+
+impl SobjOutput for Vec<u8> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+
+    fn append(&mut self, bytes: &[u8], context: &'static str) -> Result<()> {
+        try_extend_from_slice(self, bytes, context)
+    }
+
+    fn patch(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        let end = offset.checked_add(bytes.len()).ok_or(Error::SizeOverflow)?;
+        let destination = self.get_mut(offset..end).ok_or(Error::UnexpectedEof)?;
+        destination.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn truncate(&mut self, len: usize) {
+        Vec::truncate(self, len);
+    }
+}
 
 pub fn to_value<T: Serialize + ?Sized>(value: &T) -> Result<Value> {
     value.serialize(ValueSerializer)
@@ -53,6 +93,23 @@ pub fn append_bytes<T: Serialize + ?Sized>(
     version_id: u16,
     length_mode: LengthMode,
 ) -> Result<Range<usize>> {
+    append_bytes_to_output(out, value, version_id, length_mode)
+}
+
+/// Appends one canonical SOBJ document to a patchable output.
+///
+/// The output may be contiguous or segmented. The returned range uses logical
+/// output offsets and covers only the newly encoded document.
+pub fn append_bytes_to_output<T, O>(
+    out: &mut O,
+    value: &T,
+    version_id: u16,
+    length_mode: LengthMode,
+) -> Result<Range<usize>>
+where
+    T: Serialize + ?Sized,
+    O: SobjOutput + ?Sized,
+{
     let start = out.len();
     if let Err(error) = append_bytes_inner(out, value, version_id, length_mode) {
         out.truncate(start);
@@ -61,32 +118,136 @@ pub fn append_bytes<T: Serialize + ?Sized>(
     Ok(start..out.len())
 }
 
-fn append_bytes_inner<T: Serialize + ?Sized>(
-    out: &mut Vec<u8>,
+fn append_bytes_inner<T, O>(
+    out: &mut O,
     value: &T,
     version_id: u16,
     length_mode: LengthMode,
-) -> Result<()> {
+) -> Result<()>
+where
+    T: Serialize + ?Sized,
+    O: SobjOutput + ?Sized,
+{
     let start = out.len();
-    try_extend_from_slice(out, MAGIC, "serde document magic")?;
-    write_u16(out, version_id)?;
-    try_push_vec(out, length_mode.code(), "serde document length mode")?;
-    try_push_vec(
+    out.append(MAGIC, "serde document magic")?;
+    output_write_u16(out, version_id, "serde document version")?;
+    output_write_u8(out, length_mode.code(), "serde document length mode")?;
+    output_write_u8(
         out,
         AlignmentHint::NotAligned.code(),
         "serde document alignment hint",
     )?;
     let length_offset = out.len();
-    write_length(out, length_mode, 0)?; // document length, patched below
-    write_length(out, length_mode, 0)?; // empty dynamic schema (0 types)
+    output_write_length(out, length_mode, 0)?; // document length, patched below
+    output_write_length(out, length_mode, 0)?; // empty dynamic schema (0 types)
     serialize_element_into(out, length_mode, value)?;
     let document_length = u64::try_from(out.len() - start).map_err(|_| Error::LengthTooLarge)?;
     length_mode.validate(document_length)?;
-    patch_length(
-        &mut out[length_offset..length_offset + length_mode.width()],
-        length_mode,
-        document_length,
+    output_patch_length(out, length_offset, length_mode, document_length)?;
+    Ok(())
+}
+
+fn output_write_u8<O: SobjOutput + ?Sized>(
+    out: &mut O,
+    value: u8,
+    context: &'static str,
+) -> Result<()> {
+    out.append(&[value], context)
+}
+
+fn output_write_u16<O: SobjOutput + ?Sized>(
+    out: &mut O,
+    value: u16,
+    context: &'static str,
+) -> Result<()> {
+    out.append(&value.to_le_bytes(), context)
+}
+
+fn output_length_bytes(mode: LengthMode, value: u64) -> Result<([u8; 8], usize)> {
+    mode.validate(value)?;
+    let mut bytes = [0_u8; 8];
+    let width = mode.width();
+    match mode {
+        LengthMode::U16 => bytes[..width].copy_from_slice(&(value as u16).to_le_bytes()),
+        LengthMode::U32 => bytes[..width].copy_from_slice(&(value as u32).to_le_bytes()),
+        LengthMode::U64 => bytes.copy_from_slice(&value.to_le_bytes()),
+    }
+    Ok((bytes, width))
+}
+
+fn output_write_length<O: SobjOutput + ?Sized>(
+    out: &mut O,
+    mode: LengthMode,
+    value: u64,
+) -> Result<()> {
+    let (bytes, width) = output_length_bytes(mode, value)?;
+    out.append(&bytes[..width], "length")
+}
+
+fn output_patch_length<O: SobjOutput + ?Sized>(
+    out: &mut O,
+    offset: usize,
+    mode: LengthMode,
+    value: u64,
+) -> Result<()> {
+    let (bytes, width) = output_length_bytes(mode, value)?;
+    out.patch(offset, &bytes[..width])
+}
+
+fn output_write_bytes<O: SobjOutput + ?Sized>(
+    out: &mut O,
+    mode: LengthMode,
+    value: &[u8],
+    context: &'static str,
+) -> Result<()> {
+    output_write_length(
+        out,
+        mode,
+        u64::try_from(value.len()).map_err(|_| Error::LengthTooLarge)?,
     )?;
+    out.append(value, context)
+}
+
+fn output_write_string<O: SobjOutput + ?Sized>(
+    out: &mut O,
+    mode: LengthMode,
+    value: &str,
+) -> Result<()> {
+    output_write_bytes(out, mode, value.as_bytes(), "string payload")
+}
+
+fn output_encode_element_type<O: SobjOutput + ?Sized>(
+    out: &mut O,
+    mode: LengthMode,
+    element_type: &ElementType,
+) -> Result<()> {
+    match element_type {
+        ElementType::Builtin(type_id) => {
+            output_write_u8(out, type_id.byte(), "element type")?;
+        }
+        ElementType::SchemaRef(id) => {
+            output_write_u8(out, 0x40, "schema element type")?;
+            output_write_u16(out, *id, "schema element type id")?;
+        }
+        ElementType::List(inner) => {
+            output_write_u8(out, 0x41, "list element type")?;
+            output_encode_element_type(out, mode, inner)?;
+        }
+        ElementType::Array(inner) => {
+            output_write_u8(out, 0x42, "array element type")?;
+            output_encode_element_type(out, mode, inner)?;
+        }
+        ElementType::Object => output_write_u8(out, 0x43, "object element type")?,
+        ElementType::Optional(inner) => {
+            output_write_u8(out, 0x44, "optional element type")?;
+            output_encode_element_type(out, mode, inner)?;
+        }
+        ElementType::Extension(extension) if extension.id >= 0x80 => {
+            output_write_u8(out, extension.id, "extension element type")?;
+            output_write_bytes(out, mode, &extension.data, "extension element type payload")?;
+        }
+        ElementType::Extension(extension) => return Err(Error::InvalidTypeId(extension.id)),
+    }
     Ok(())
 }
 
@@ -178,107 +339,130 @@ fn element_type_id(element_type: &ElementType) -> Result<u8> {
 }
 
 /// Writes a standalone element (`type_id` byte + value bytes) for `value` into `out`.
-fn serialize_element_into<T: Serialize + ?Sized>(
-    out: &mut Vec<u8>,
-    mode: LengthMode,
-    value: &T,
-) -> Result<()> {
+fn serialize_element_into<T, O>(out: &mut O, mode: LengthMode, value: &T) -> Result<()>
+where
+    T: Serialize + ?Sized,
+    O: SobjOutput + ?Sized,
+{
     let type_id_offset = out.len();
-    try_push_vec(out, 0, "serde element type id")?; // patched once the element type is known
+    output_write_u8(out, 0, "serde element type id")?; // patched once the type is known
     let element_type = value.serialize(ByteSerializer { out, mode })?;
-    out[type_id_offset] = element_type_id(&element_type)?;
+    out.patch(type_id_offset, &[element_type_id(&element_type)?])?;
     Ok(())
 }
 
 /// serde `Serializer` that writes a value's bytes straight into `out` and returns
 /// the value's `ElementType` (so a containing list/optional/element can frame it).
-struct ByteSerializer<'a> {
-    out: &'a mut Vec<u8>,
+struct ByteSerializer<'a, O: SobjOutput + ?Sized> {
+    out: &'a mut O,
     mode: LengthMode,
 }
 
-impl<'a> ByteSerializer<'a> {
+impl<'a, O: SobjOutput + ?Sized> ByteSerializer<'a, O> {
     fn builtin(
         self,
         type_id: TypeId,
-        write: impl FnOnce(&mut Vec<u8>) -> Result<()>,
+        write: impl FnOnce(&mut O) -> Result<()>,
     ) -> Result<ElementType> {
         write(self.out)?;
         Ok(ElementType::Builtin(type_id))
     }
 }
 
-impl<'a> ser::Serializer for ByteSerializer<'a> {
+#[derive(Default)]
+struct CountingOutput {
+    len: usize,
+}
+
+impl SobjOutput for CountingOutput {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn append(&mut self, bytes: &[u8], _context: &'static str) -> Result<()> {
+        self.len = self
+            .len
+            .checked_add(bytes.len())
+            .ok_or(Error::SizeOverflow)?;
+        Ok(())
+    }
+
+    fn patch(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        let end = offset.checked_add(bytes.len()).ok_or(Error::SizeOverflow)?;
+        if end > self.len {
+            return Err(Error::UnexpectedEof);
+        }
+        Ok(())
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+    }
+}
+
+fn probe_element_type<T: Serialize + ?Sized>(value: &T, mode: LengthMode) -> Result<ElementType> {
+    let mut output = CountingOutput::default();
+    value.serialize(ByteSerializer {
+        out: &mut output,
+        mode,
+    })
+}
+
+impl<'a, O: SobjOutput + ?Sized> ser::Serializer for ByteSerializer<'a, O> {
     type Ok = ElementType;
     type Error = Error;
-    type SerializeSeq = ByteSeqSerializer<'a>;
-    type SerializeTuple = ByteSeqSerializer<'a>;
-    type SerializeTupleStruct = ByteSeqSerializer<'a>;
-    type SerializeTupleVariant = ByteVariantSeqSerializer<'a>;
-    type SerializeMap = ByteMapSerializer<'a>;
-    type SerializeStruct = ByteStructSerializer<'a>;
-    type SerializeStructVariant = ByteVariantStructSerializer<'a>;
+    type SerializeSeq = ByteSeqSerializer<'a, O>;
+    type SerializeTuple = ByteSeqSerializer<'a, O>;
+    type SerializeTupleStruct = ByteSeqSerializer<'a, O>;
+    type SerializeTupleVariant = ByteVariantSeqSerializer<'a, O>;
+    type SerializeMap = ByteMapSerializer<'a, O>;
+    type SerializeStruct = ByteStructSerializer<'a, O>;
+    type SerializeStructVariant = ByteVariantStructSerializer<'a, O>;
 
     fn serialize_bool(self, v: bool) -> Result<ElementType> {
         self.builtin(TypeId::Boolean, |out| {
-            try_push_vec(out, u8::from(v), "bool")
+            output_write_u8(out, u8::from(v), "bool")
         })
     }
 
     fn serialize_i8(self, v: i8) -> Result<ElementType> {
-        self.builtin(TypeId::Int8, |out| try_push_vec(out, v as u8, "i8"))
+        self.builtin(TypeId::Int8, |out| output_write_u8(out, v as u8, "i8"))
     }
 
     fn serialize_i16(self, v: i16) -> Result<ElementType> {
-        self.builtin(TypeId::Int16, |out| {
-            try_extend_from_slice(out, &v.to_le_bytes(), "i16")
-        })
+        self.builtin(TypeId::Int16, |out| out.append(&v.to_le_bytes(), "i16"))
     }
 
     fn serialize_i32(self, v: i32) -> Result<ElementType> {
-        self.builtin(TypeId::Int32, |out| {
-            try_extend_from_slice(out, &v.to_le_bytes(), "i32")
-        })
+        self.builtin(TypeId::Int32, |out| out.append(&v.to_le_bytes(), "i32"))
     }
 
     fn serialize_i64(self, v: i64) -> Result<ElementType> {
-        self.builtin(TypeId::Int64, |out| {
-            try_extend_from_slice(out, &v.to_le_bytes(), "i64")
-        })
+        self.builtin(TypeId::Int64, |out| out.append(&v.to_le_bytes(), "i64"))
     }
 
     fn serialize_u8(self, v: u8) -> Result<ElementType> {
-        self.builtin(TypeId::Uint8, |out| try_push_vec(out, v, "u8"))
+        self.builtin(TypeId::Uint8, |out| output_write_u8(out, v, "u8"))
     }
 
     fn serialize_u16(self, v: u16) -> Result<ElementType> {
-        self.builtin(TypeId::Uint16, |out| {
-            try_extend_from_slice(out, &v.to_le_bytes(), "u16")
-        })
+        self.builtin(TypeId::Uint16, |out| out.append(&v.to_le_bytes(), "u16"))
     }
 
     fn serialize_u32(self, v: u32) -> Result<ElementType> {
-        self.builtin(TypeId::Uint32, |out| {
-            try_extend_from_slice(out, &v.to_le_bytes(), "u32")
-        })
+        self.builtin(TypeId::Uint32, |out| out.append(&v.to_le_bytes(), "u32"))
     }
 
     fn serialize_u64(self, v: u64) -> Result<ElementType> {
-        self.builtin(TypeId::Uint64, |out| {
-            try_extend_from_slice(out, &v.to_le_bytes(), "u64")
-        })
+        self.builtin(TypeId::Uint64, |out| out.append(&v.to_le_bytes(), "u64"))
     }
 
     fn serialize_f32(self, v: f32) -> Result<ElementType> {
-        self.builtin(TypeId::Float, |out| {
-            try_extend_from_slice(out, &v.to_le_bytes(), "f32")
-        })
+        self.builtin(TypeId::Float, |out| out.append(&v.to_le_bytes(), "f32"))
     }
 
     fn serialize_f64(self, v: f64) -> Result<ElementType> {
-        self.builtin(TypeId::Double, |out| {
-            try_extend_from_slice(out, &v.to_le_bytes(), "f64")
-        })
+        self.builtin(TypeId::Double, |out| out.append(&v.to_le_bytes(), "f64"))
     }
 
     fn serialize_char(self, v: char) -> Result<ElementType> {
@@ -286,20 +470,20 @@ impl<'a> ser::Serializer for ByteSerializer<'a> {
     }
 
     fn serialize_str(self, v: &str) -> Result<ElementType> {
-        write_string(self.out, self.mode, v)?;
+        output_write_string(self.out, self.mode, v)?;
         Ok(ElementType::Builtin(TypeId::String))
     }
 
     fn serialize_bytes(self, v: &[u8]) -> Result<ElementType> {
-        write_bytes(self.out, self.mode, v)?;
+        output_write_bytes(self.out, self.mode, v, "bytes payload")?;
         Ok(ElementType::Builtin(TypeId::Bytes))
     }
 
     fn serialize_none(self) -> Result<ElementType> {
         // Absent optional: element type defaults to `bytes`, presence byte 0.
         let inner = ElementType::Builtin(TypeId::Bytes);
-        encode_element_type(self.out, self.mode, &inner)?;
-        try_push_vec(self.out, 0, "optional presence")?;
+        output_encode_element_type(self.out, self.mode, &inner)?;
+        output_write_u8(self.out, 0, "optional presence")?;
         Ok(ElementType::Optional(try_box(
             inner,
             "optional element type",
@@ -307,16 +491,19 @@ impl<'a> ser::Serializer for ByteSerializer<'a> {
     }
 
     fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<ElementType> {
-        // The optional's element type prefixes its value, so serialize the inner
-        // value to a small scratch buffer to learn its type, then frame it.
-        let mut scratch = Vec::new();
-        let inner = value.serialize(ByteSerializer {
-            out: &mut scratch,
+        // Probe the type without retaining the encoded payload, then serialize
+        // directly into the destination. This keeps even a large optional
+        // value out of a temporary contiguous allocation.
+        let inner = probe_element_type(value, self.mode)?;
+        output_encode_element_type(self.out, self.mode, &inner)?;
+        output_write_u8(self.out, 1, "optional presence")?;
+        let actual = value.serialize(ByteSerializer {
+            out: self.out,
             mode: self.mode,
         })?;
-        encode_element_type(self.out, self.mode, &inner)?;
-        try_push_vec(self.out, 1, "optional presence")?;
-        try_extend_from_slice(self.out, &scratch, "optional payload")?;
+        if actual != inner {
+            return Err(Error::TypeMismatch);
+        }
         Ok(ElementType::Optional(try_box(
             inner,
             "optional element type",
@@ -356,17 +543,17 @@ impl<'a> ser::Serializer for ByteSerializer<'a> {
         value: &T,
     ) -> Result<ElementType> {
         // Encoded as a single-field object `{ variant: value }`.
-        write_length(self.out, self.mode, 1)?;
-        write_string(self.out, self.mode, variant)?;
+        output_write_length(self.out, self.mode, 1)?;
+        output_write_string(self.out, self.mode, variant)?;
         serialize_element_into(self.out, self.mode, value)?;
         Ok(ElementType::Object)
     }
 
-    fn serialize_seq(self, len: Option<usize>) -> Result<ByteSeqSerializer<'a>> {
+    fn serialize_seq(self, len: Option<usize>) -> Result<ByteSeqSerializer<'a, O>> {
         Ok(ByteSeqSerializer::new(self.out, self.mode, len))
     }
 
-    fn serialize_tuple(self, len: usize) -> Result<ByteSeqSerializer<'a>> {
+    fn serialize_tuple(self, len: usize) -> Result<ByteSeqSerializer<'a, O>> {
         self.serialize_seq(Some(len))
     }
 
@@ -374,7 +561,7 @@ impl<'a> ser::Serializer for ByteSerializer<'a> {
         self,
         _name: &'static str,
         len: usize,
-    ) -> Result<ByteSeqSerializer<'a>> {
+    ) -> Result<ByteSeqSerializer<'a, O>> {
         self.serialize_seq(Some(len))
     }
 
@@ -384,19 +571,19 @@ impl<'a> ser::Serializer for ByteSerializer<'a> {
         _variant_index: u32,
         variant: &'static str,
         _len: usize,
-    ) -> Result<ByteVariantSeqSerializer<'a>> {
+    ) -> Result<ByteVariantSeqSerializer<'a, O>> {
         // `{ variant: [ .. ] }`: outer object header, then the list value.
-        write_length(self.out, self.mode, 1)?;
-        write_string(self.out, self.mode, variant)?;
-        try_push_vec(self.out, TypeId::List.byte(), "tuple variant list type")?;
+        output_write_length(self.out, self.mode, 1)?;
+        output_write_string(self.out, self.mode, variant)?;
+        output_write_u8(self.out, TypeId::List.byte(), "tuple variant list type")?;
         Ok(ByteVariantSeqSerializer {
             inner: ByteSeqSerializer::new(self.out, self.mode, Some(_len)),
         })
     }
 
-    fn serialize_map(self, _len: Option<usize>) -> Result<ByteMapSerializer<'a>> {
+    fn serialize_map(self, _len: Option<usize>) -> Result<ByteMapSerializer<'a, O>> {
         let length_offset = self.out.len();
-        write_length(self.out, self.mode, 0)?; // patched in `end`
+        output_write_length(self.out, self.mode, 0)?; // patched in `end`
         let keys = try_hashset_with_capacity(_len.unwrap_or(0), "serde map keys")?;
         Ok(ByteMapSerializer {
             out: self.out,
@@ -408,8 +595,12 @@ impl<'a> ser::Serializer for ByteSerializer<'a> {
         })
     }
 
-    fn serialize_struct(self, _name: &'static str, len: usize) -> Result<ByteStructSerializer<'a>> {
-        write_length(self.out, self.mode, len as u64)?;
+    fn serialize_struct(
+        self,
+        _name: &'static str,
+        len: usize,
+    ) -> Result<ByteStructSerializer<'a, O>> {
+        output_write_length(self.out, self.mode, len as u64)?;
         Ok(ByteStructSerializer {
             out: self.out,
             mode: self.mode,
@@ -425,16 +616,16 @@ impl<'a> ser::Serializer for ByteSerializer<'a> {
         _variant_index: u32,
         variant: &'static str,
         len: usize,
-    ) -> Result<ByteVariantStructSerializer<'a>> {
+    ) -> Result<ByteVariantStructSerializer<'a, O>> {
         // `{ variant: { .. } }`: outer object header, then the inner object value.
-        write_length(self.out, self.mode, 1)?;
-        write_string(self.out, self.mode, variant)?;
-        try_push_vec(
+        output_write_length(self.out, self.mode, 1)?;
+        output_write_string(self.out, self.mode, variant)?;
+        output_write_u8(
             self.out,
             TypeId::Object.byte(),
             "struct variant object type",
         )?;
-        write_length(self.out, self.mode, len as u64)?;
+        output_write_length(self.out, self.mode, len as u64)?;
         Ok(ByteVariantStructSerializer {
             inner: ByteStructSerializer {
                 out: self.out,
@@ -447,20 +638,19 @@ impl<'a> ser::Serializer for ByteSerializer<'a> {
     }
 }
 
-/// Streams a homogeneous sequence into `out` as `list<element_type>`. Only the
-/// first element is staged in a scratch buffer (to discover the element type that
-/// must be written before any values); every later element is written straight
-/// into `out`. Memory stays O(serialized size) regardless of element count.
-struct ByteSeqSerializer<'a> {
-    out: &'a mut Vec<u8>,
+/// Streams a homogeneous sequence into `out` as `list<element_type>`. The first
+/// element is traversed once without retaining bytes to discover its type, then
+/// every value is written directly into `out`.
+struct ByteSeqSerializer<'a, O: SobjOutput + ?Sized> {
+    out: &'a mut O,
     mode: LengthMode,
     element_type: Option<ElementType>,
     length_offset: usize,
     count: u64,
 }
 
-impl<'a> ByteSeqSerializer<'a> {
-    fn new(out: &'a mut Vec<u8>, mode: LengthMode, _len: Option<usize>) -> Self {
+impl<'a, O: SobjOutput + ?Sized> ByteSeqSerializer<'a, O> {
+    fn new(out: &'a mut O, mode: LengthMode, _len: Option<usize>) -> Self {
         Self {
             out,
             mode,
@@ -473,15 +663,17 @@ impl<'a> ByteSeqSerializer<'a> {
     fn push<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<()> {
         match &self.element_type {
             None => {
-                let mut scratch = Vec::new();
-                let element_type = value.serialize(ByteSerializer {
-                    out: &mut scratch,
+                let element_type = probe_element_type(value, self.mode)?;
+                output_encode_element_type(self.out, self.mode, &element_type)?;
+                self.length_offset = self.out.len();
+                output_write_length(self.out, self.mode, 0)?; // patched in `finish`
+                let actual = value.serialize(ByteSerializer {
+                    out: &mut *self.out,
                     mode: self.mode,
                 })?;
-                encode_element_type(self.out, self.mode, &element_type)?;
-                self.length_offset = self.out.len();
-                write_length(self.out, self.mode, 0)?; // patched in `finish`
-                try_extend_from_slice(self.out, &scratch, "sequence first element")?;
+                if actual != element_type {
+                    return Err(Error::TypeMismatch);
+                }
                 self.element_type = Some(element_type);
                 self.count = 1;
             }
@@ -502,19 +694,14 @@ impl<'a> ByteSeqSerializer<'a> {
     fn finish(self) -> Result<ElementType> {
         let element_type = match self.element_type {
             Some(element_type) => {
-                let end = self.length_offset + self.mode.width();
-                patch_length(
-                    &mut self.out[self.length_offset..end],
-                    self.mode,
-                    self.count,
-                )?;
+                output_patch_length(self.out, self.length_offset, self.mode, self.count)?;
                 element_type
             }
             None => {
                 // Empty sequence: element type defaults to `bytes`, length 0.
                 let element_type = ElementType::Builtin(TypeId::Bytes);
-                encode_element_type(self.out, self.mode, &element_type)?;
-                write_length(self.out, self.mode, 0)?;
+                output_encode_element_type(self.out, self.mode, &element_type)?;
+                output_write_length(self.out, self.mode, 0)?;
                 element_type
             }
         };
@@ -525,7 +712,7 @@ impl<'a> ByteSeqSerializer<'a> {
     }
 }
 
-impl<'a> SerializeSeq for ByteSeqSerializer<'a> {
+impl<'a, O: SobjOutput + ?Sized> SerializeSeq for ByteSeqSerializer<'a, O> {
     type Ok = ElementType;
     type Error = Error;
 
@@ -538,7 +725,7 @@ impl<'a> SerializeSeq for ByteSeqSerializer<'a> {
     }
 }
 
-impl<'a> SerializeTuple for ByteSeqSerializer<'a> {
+impl<'a, O: SobjOutput + ?Sized> SerializeTuple for ByteSeqSerializer<'a, O> {
     type Ok = ElementType;
     type Error = Error;
 
@@ -551,7 +738,7 @@ impl<'a> SerializeTuple for ByteSeqSerializer<'a> {
     }
 }
 
-impl<'a> SerializeTupleStruct for ByteSeqSerializer<'a> {
+impl<'a, O: SobjOutput + ?Sized> SerializeTupleStruct for ByteSeqSerializer<'a, O> {
     type Ok = ElementType;
     type Error = Error;
 
@@ -565,11 +752,11 @@ impl<'a> SerializeTupleStruct for ByteSeqSerializer<'a> {
 }
 
 /// Tuple-enum-variant: a list value wrapped in a single-field object.
-struct ByteVariantSeqSerializer<'a> {
-    inner: ByteSeqSerializer<'a>,
+struct ByteVariantSeqSerializer<'a, O: SobjOutput + ?Sized> {
+    inner: ByteSeqSerializer<'a, O>,
 }
 
-impl<'a> SerializeTupleVariant for ByteVariantSeqSerializer<'a> {
+impl<'a, O: SobjOutput + ?Sized> SerializeTupleVariant for ByteVariantSeqSerializer<'a, O> {
     type Ok = ElementType;
     type Error = Error;
 
@@ -584,8 +771,8 @@ impl<'a> SerializeTupleVariant for ByteVariantSeqSerializer<'a> {
 }
 
 /// Streams a map into `out` as an object (`length` + `key + element` pairs).
-struct ByteMapSerializer<'a> {
-    out: &'a mut Vec<u8>,
+struct ByteMapSerializer<'a, O: SobjOutput + ?Sized> {
+    out: &'a mut O,
     mode: LengthMode,
     length_offset: usize,
     count: u64,
@@ -593,7 +780,7 @@ struct ByteMapSerializer<'a> {
     keys: HashSet<String>,
 }
 
-impl<'a> SerializeMap for ByteMapSerializer<'a> {
+impl<'a, O: SobjOutput + ?Sized> SerializeMap for ByteMapSerializer<'a, O> {
     type Ok = ElementType;
     type Error = Error;
 
@@ -611,7 +798,7 @@ impl<'a> SerializeMap for ByteMapSerializer<'a> {
             return Err(Error::DuplicateKey(key));
         }
         try_reserve_hashset(&mut self.keys, 1, "serde map keys")?;
-        write_string(self.out, self.mode, &key)?;
+        output_write_string(self.out, self.mode, &key)?;
         self.keys.insert(key);
         serialize_element_into(self.out, self.mode, value)?;
         self.count = self.count.checked_add(1).ok_or(Error::SizeOverflow)?;
@@ -619,12 +806,7 @@ impl<'a> SerializeMap for ByteMapSerializer<'a> {
     }
 
     fn end(self) -> Result<ElementType> {
-        let end = self.length_offset + self.mode.width();
-        patch_length(
-            &mut self.out[self.length_offset..end],
-            self.mode,
-            self.count,
-        )?;
+        output_patch_length(self.out, self.length_offset, self.mode, self.count)?;
         Ok(ElementType::Object)
     }
 }
@@ -682,15 +864,15 @@ impl<'a> InlineKeySet<'a> {
 
 /// Streams a struct into `out` as an object. The field count is known up front, so
 /// the object length is written immediately and each field is appended in place.
-struct ByteStructSerializer<'a> {
-    out: &'a mut Vec<u8>,
+struct ByteStructSerializer<'a, O: SobjOutput + ?Sized> {
+    out: &'a mut O,
     mode: LengthMode,
     expected_fields: usize,
     written_fields: usize,
     keys: InlineKeySet<'static>,
 }
 
-impl<'a> ByteStructSerializer<'a> {
+impl<'a, O: SobjOutput + ?Sized> ByteStructSerializer<'a, O> {
     fn field<T: Serialize + ?Sized>(&mut self, key: &'static str, value: &T) -> Result<()> {
         if self.written_fields >= self.expected_fields {
             return Err(Error::Serde(
@@ -700,7 +882,7 @@ impl<'a> ByteStructSerializer<'a> {
         if !self.keys.insert(key, "serde struct keys")? {
             return duplicate_key_error(key);
         }
-        write_string(self.out, self.mode, key)?;
+        output_write_string(self.out, self.mode, key)?;
         serialize_element_into(self.out, self.mode, value)?;
         self.written_fields += 1;
         Ok(())
@@ -717,7 +899,7 @@ impl<'a> ByteStructSerializer<'a> {
     }
 }
 
-impl<'a> SerializeStruct for ByteStructSerializer<'a> {
+impl<'a, O: SobjOutput + ?Sized> SerializeStruct for ByteStructSerializer<'a, O> {
     type Ok = ElementType;
     type Error = Error;
 
@@ -735,11 +917,11 @@ impl<'a> SerializeStruct for ByteStructSerializer<'a> {
 }
 
 /// Struct-enum-variant: an inner object wrapped in a single-field object.
-struct ByteVariantStructSerializer<'a> {
-    inner: ByteStructSerializer<'a>,
+struct ByteVariantStructSerializer<'a, O: SobjOutput + ?Sized> {
+    inner: ByteStructSerializer<'a, O>,
 }
 
-impl<'a> SerializeStructVariant for ByteVariantStructSerializer<'a> {
+impl<'a, O: SobjOutput + ?Sized> SerializeStructVariant for ByteVariantStructSerializer<'a, O> {
     type Ok = ElementType;
     type Error = Error;
 

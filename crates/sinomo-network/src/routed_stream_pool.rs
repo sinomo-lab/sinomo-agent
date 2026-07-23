@@ -4,62 +4,39 @@
 //! receive independently cancellable logical `PeerStream`s over that carrier;
 //! application protocols never participate in connection reuse.
 
-use crate::{
-    BoxedNetworkStream, NetworkDeliveryState, NetworkError, PeerStream, RouteConstraints,
-    RouteTrace,
+use crate::owned_chunk::{
+    AuthenticatedChunkReader, AuthenticatedChunkStream, AuthenticatedChunkWriter, ChunkAllocator,
+    ChunkClass, ChunkLease, ChunkStreamFuture, MUX_RECORD_HEADER_BYTES, OwnedChunk,
+    RPC_CONTROL_PAYLOAD_MAX, RPC_RECORD_HEADER_BYTES, ResetReason, SECURE_PLAINTEXT_MAX,
+    SECURE_RECORD_HEADER_BYTES,
 };
-use bytes::Bytes;
+use crate::owned_mux::{
+    IncomingLogicalStreamResolver, IncomingLogicalStreamSink, OwnedRoutedStreamAcceptor,
+    OwnedRoutedStreamClient, accept_owned_routed_stream_carrier,
+    owned_routed_stream_acceptor_and_client,
+};
+use crate::{
+    BoxedNetworkStream, NetworkError, PeerStream, RouteConstraints, RouteTrace, RpcPeerContext,
+    RpcPeerIdentity,
+};
+use ring::rand::{SecureRandom, SystemRandom};
 use sinomo_base::Id;
 use sinomo_node::NodeId;
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::pin::Pin;
-use std::sync::{
-    Arc, Mutex, OnceLock, Weak,
-    atomic::{AtomicBool, AtomicU64, Ordering},
-};
-use std::task::{Context, Poll};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::Poll;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Semaphore, mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::sync::mpsc;
 
-const ROUTED_STREAM_MUX_MAGIC: [u8; 4] = *b"SRM1";
-const ROUTED_STREAM_MUX_HEADER_BYTES: usize = 17;
-const ROUTED_STREAM_MUX_DATA_BYTES: usize = 64 * 1024;
-const ROUTED_STREAM_MUX_COMMANDS: usize = 64;
-const ROUTED_STREAM_MUX_INCOMING_FRAMES: usize = 8;
-const ROUTED_STREAM_MUX_ACCEPTED_STREAMS: usize = 32;
-const ROUTED_STREAM_MUX_INITIAL_WINDOW_FRAMES: usize = ROUTED_STREAM_MUX_INCOMING_FRAMES;
-const FRAME_OPEN: u8 = 1;
-const FRAME_ACCEPT: u8 = 2;
-const FRAME_DATA: u8 = 3;
-const FRAME_FINISH: u8 = 4;
-const FRAME_RESET: u8 = 5;
-const FRAME_WINDOW: u8 = 6;
-
-#[derive(Debug)]
-struct MuxFrame {
-    kind: u8,
-    stream_id: u64,
-    payload: Bytes,
-}
-
-impl MuxFrame {
-    fn control(kind: u8, stream_id: u64) -> Self {
-        Self {
-            kind,
-            stream_id,
-            payload: Bytes::new(),
-        }
-    }
-}
-
-#[derive(Debug)]
-enum LogicalInbound {
-    Data(Bytes),
-    Reset,
-}
+const LOCAL_OBJECT_RPC_CARRIER_PRELUDE_MAGIC: [u8; 4] = *b"SLC1";
+const LOCAL_OBJECT_RPC_RECORD_MAGIC: [u8; 4] = *b"SLR1";
+const LOCAL_OBJECT_RPC_RECORD_HEADER_BYTES: usize = 8;
+const LOCAL_OBJECT_RPC_RECORD_CONTROL_FLAG: u32 = 1 << 31;
+const LOCAL_OBJECT_RPC_RECORD_LENGTH_MASK: u32 = !LOCAL_OBJECT_RPC_RECORD_CONTROL_FLAG;
+const LOCAL_OBJECT_RPC_CARRIER_MAX_SESSION_ID_BYTES: usize = 128;
 
 fn mux_io_error(operation: &str, error: std::io::Error) -> NetworkError {
     NetworkError::Io {
@@ -68,770 +45,375 @@ fn mux_io_error(operation: &str, error: std::io::Error) -> NetworkError {
     }
 }
 
-async fn write_mux_frame<W>(writer: &mut W, frame: MuxFrame) -> Result<(), NetworkError>
+/// Identifies a loopback-only multiplexed carrier before any logical RPC is
+/// accepted. Each logical stream still carries its own per-call transcript and
+/// signed service request; this routing prelude grants no service authority.
+pub fn local_object_rpc_carrier_prelude_prefix_matches(prefix: &[u8]) -> bool {
+    prefix.len() <= LOCAL_OBJECT_RPC_CARRIER_PRELUDE_MAGIC.len()
+        && LOCAL_OBJECT_RPC_CARRIER_PRELUDE_MAGIC.starts_with(prefix)
+}
+
+pub async fn write_local_object_rpc_carrier_prelude<S>(
+    stream: &mut S,
+) -> Result<RpcPeerContext, NetworkError>
 where
-    W: AsyncWrite + Unpin,
+    S: AsyncWrite + Unpin + ?Sized,
 {
-    if frame.stream_id == 0 || frame.payload.len() > ROUTED_STREAM_MUX_DATA_BYTES {
+    let session_id = Id::generate();
+    let session_id_bytes = session_id.as_str().as_bytes();
+    if session_id_bytes.len() > LOCAL_OBJECT_RPC_CARRIER_MAX_SESSION_ID_BYTES {
         return Err(NetworkError::FrameTooLarge {
-            actual_bytes: frame.payload.len(),
-            max_bytes: ROUTED_STREAM_MUX_DATA_BYTES,
+            actual_bytes: session_id_bytes.len(),
+            max_bytes: LOCAL_OBJECT_RPC_CARRIER_MAX_SESSION_ID_BYTES,
         });
     }
-    if frame.kind != FRAME_DATA && !frame.payload.is_empty() {
-        return Err(NetworkError::Serialization {
-            detail: "routed stream mux control frame carried a payload".to_string(),
-        });
-    }
-    let payload_bytes =
-        u32::try_from(frame.payload.len()).map_err(|_| NetworkError::FrameTooLarge {
-            actual_bytes: frame.payload.len(),
-            max_bytes: ROUTED_STREAM_MUX_DATA_BYTES,
+    let session_id_len =
+        u16::try_from(session_id_bytes.len()).map_err(|_| NetworkError::FrameTooLarge {
+            actual_bytes: session_id_bytes.len(),
+            max_bytes: LOCAL_OBJECT_RPC_CARRIER_MAX_SESSION_ID_BYTES,
         })?;
-    let mut header = [0_u8; ROUTED_STREAM_MUX_HEADER_BYTES];
-    header[..4].copy_from_slice(&ROUTED_STREAM_MUX_MAGIC);
-    header[4] = frame.kind;
-    header[5..13].copy_from_slice(&frame.stream_id.to_be_bytes());
-    header[13..].copy_from_slice(&payload_bytes.to_be_bytes());
-    writer
-        .write_all(&header)
+    let mut channel_binding = [0_u8; 32];
+    SystemRandom::new()
+        .fill(&mut channel_binding)
+        .map_err(|_| NetworkError::Io {
+            operation: "generate local RPC carrier binding".to_string(),
+            detail: "system random failed".to_string(),
+        })?;
+    stream
+        .write_all(&LOCAL_OBJECT_RPC_CARRIER_PRELUDE_MAGIC)
         .await
-        .map_err(|error| mux_io_error("write routed stream mux header", error))?;
-    writer
-        .write_all(&frame.payload)
+        .map_err(|error| mux_io_error("write local RPC carrier prelude", error))?;
+    stream
+        .write_all(&channel_binding)
         .await
-        .map_err(|error| mux_io_error("write routed stream mux payload", error))?;
-    writer
+        .map_err(|error| mux_io_error("write local RPC carrier binding", error))?;
+    stream
+        .write_all(&session_id_len.to_be_bytes())
+        .await
+        .map_err(|error| mux_io_error("write local RPC carrier session length", error))?;
+    stream
+        .write_all(session_id_bytes)
+        .await
+        .map_err(|error| mux_io_error("write local RPC carrier session", error))?;
+    stream
         .flush()
         .await
-        .map_err(|error| mux_io_error("flush routed stream mux frame", error))
+        .map_err(|error| mux_io_error("flush local RPC carrier prelude", error))?;
+    Ok(RpcPeerContext::unauthenticated_local(
+        session_id,
+        channel_binding,
+    ))
 }
 
-async fn read_mux_frame<R>(reader: &mut R) -> Result<Option<MuxFrame>, NetworkError>
+pub async fn read_local_object_rpc_carrier_prelude<S>(
+    stream: &mut S,
+) -> Result<RpcPeerContext, NetworkError>
 where
-    R: AsyncRead + Unpin,
+    S: AsyncRead + Unpin + ?Sized,
 {
-    let mut header = [0_u8; ROUTED_STREAM_MUX_HEADER_BYTES];
-    let first = reader
-        .read(&mut header[..1])
+    let mut magic = [0_u8; 4];
+    stream
+        .read_exact(&mut magic)
         .await
-        .map_err(|error| mux_io_error("read routed stream mux header", error))?;
-    if first == 0 {
-        return Ok(None);
+        .map_err(|error| mux_io_error("read local RPC carrier prelude", error))?;
+    if magic != LOCAL_OBJECT_RPC_CARRIER_PRELUDE_MAGIC {
+        return Err(NetworkError::AuthDenied);
     }
-    reader
-        .read_exact(&mut header[1..])
+    let mut channel_binding = [0_u8; 32];
+    stream
+        .read_exact(&mut channel_binding)
         .await
-        .map_err(|error| mux_io_error("read routed stream mux header", error))?;
-    if header[..4] != ROUTED_STREAM_MUX_MAGIC {
-        return Err(NetworkError::Serialization {
-            detail: "invalid routed stream mux magic".to_string(),
-        });
+        .map_err(|error| mux_io_error("read local RPC carrier binding", error))?;
+    if channel_binding == [0; 32] {
+        return Err(NetworkError::AuthDenied);
     }
-    let kind = header[4];
-    if !matches!(
-        kind,
-        FRAME_OPEN | FRAME_ACCEPT | FRAME_DATA | FRAME_FINISH | FRAME_RESET | FRAME_WINDOW
-    ) {
-        return Err(NetworkError::Serialization {
-            detail: format!("unknown routed stream mux frame kind {kind}"),
-        });
-    }
-    let stream_id = u64::from_be_bytes(header[5..13].try_into().expect("eight-byte stream id"));
-    if stream_id == 0 {
-        return Err(NetworkError::Serialization {
-            detail: "routed stream mux stream id must be nonzero".to_string(),
-        });
-    }
-    let payload_bytes =
-        u32::from_be_bytes(header[13..].try_into().expect("four-byte payload length")) as usize;
-    if payload_bytes > ROUTED_STREAM_MUX_DATA_BYTES {
+    let session_id_len = stream
+        .read_u16()
+        .await
+        .map_err(|error| mux_io_error("read local RPC carrier session length", error))?
+        as usize;
+    if session_id_len == 0 || session_id_len > LOCAL_OBJECT_RPC_CARRIER_MAX_SESSION_ID_BYTES {
         return Err(NetworkError::FrameTooLarge {
-            actual_bytes: payload_bytes,
-            max_bytes: ROUTED_STREAM_MUX_DATA_BYTES,
+            actual_bytes: session_id_len,
+            max_bytes: LOCAL_OBJECT_RPC_CARRIER_MAX_SESSION_ID_BYTES,
         });
     }
-    if kind != FRAME_DATA && payload_bytes != 0 {
-        return Err(NetworkError::Serialization {
-            detail: "routed stream mux control frame declared a payload".to_string(),
-        });
-    }
-    let mut payload = Vec::new();
-    payload
-        .try_reserve_exact(payload_bytes)
-        .map_err(|_| NetworkError::ResourceExhausted {
-            operation: "allocate routed stream mux frame".to_string(),
-            requested_bytes: payload_bytes,
-        })?;
-    payload.resize(payload_bytes, 0);
-    reader
-        .read_exact(&mut payload)
+    let mut session_id = vec![0_u8; session_id_len];
+    stream
+        .read_exact(&mut session_id)
         .await
-        .map_err(|error| mux_io_error("read routed stream mux payload", error))?;
-    Ok(Some(MuxFrame {
-        kind,
-        stream_id,
-        payload: Bytes::from(payload),
-    }))
+        .map_err(|error| mux_io_error("read local RPC carrier session", error))?;
+    let session_id = std::str::from_utf8(&session_id)
+        .ok()
+        .and_then(|value| Id::from_str(value).ok())
+        .ok_or(NetworkError::AuthDenied)?;
+    Ok(RpcPeerContext::unauthenticated_local(
+        session_id,
+        channel_binding,
+    ))
 }
 
-async fn run_mux_writer<W>(
-    mut writer: W,
-    mut commands: mpsc::Receiver<MuxFrame>,
-) -> Result<(), NetworkError>
-where
-    W: AsyncWrite + Unpin,
-{
-    while let Some(frame) = commands.recv().await {
-        write_mux_frame(&mut writer, frame).await?;
-    }
-    writer
-        .shutdown()
-        .await
-        .map_err(|error| mux_io_error("close routed stream mux carrier", error))
-}
-
-fn logical_stream_metadata(
-    carrier_session_id: &Id,
-    carrier_binding: &[u8; 32],
-    stream_id: u64,
-) -> (Id, [u8; 32]) {
-    let mut id_hasher = blake3::Hasher::new();
-    id_hasher.update(carrier_session_id.as_str().as_bytes());
-    id_hasher.update(&stream_id.to_be_bytes());
-    let session_id = Id::derived(
-        "sinomo.network.routed-logical-stream",
-        id_hasher.finalize().as_bytes(),
-    );
-    let mut binding_hasher = blake3::Hasher::new();
-    binding_hasher.update(b"sinomo.network.routed-logical-stream.binding.v1\0");
-    binding_hasher.update(carrier_binding);
-    binding_hasher.update(&stream_id.to_be_bytes());
-    (session_id, *binding_hasher.finalize().as_bytes())
-}
-
-fn logical_stream_pair(
-    stream_id: u64,
-    commands: mpsc::Sender<MuxFrame>,
-    carrier_owner: Option<Arc<RoutedStreamClient>>,
-) -> (
-    BoxedNetworkStream,
-    mpsc::Sender<LogicalInbound>,
-    Weak<Semaphore>,
-    JoinHandle<()>,
-    JoinHandle<()>,
-) {
-    let (application, bridge) = tokio::io::duplex(ROUTED_STREAM_MUX_DATA_BYTES);
-    let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge);
-    let (incoming_sender, mut incoming_receiver) = mpsc::channel(ROUTED_STREAM_MUX_INCOMING_FRAMES);
-    let outbound_window = Arc::new(Semaphore::new(ROUTED_STREAM_MUX_INITIAL_WINDOW_FRAMES));
-    let outbound_window_weak = Arc::downgrade(&outbound_window);
-    let outgoing_commands = commands.clone();
-    let outgoing = tokio::spawn(async move {
-        async {
-            let mut buffer = Vec::new();
-            if buffer
-                .try_reserve_exact(ROUTED_STREAM_MUX_DATA_BYTES)
-                .is_err()
-            {
-                let _ = outgoing_commands
-                    .send(MuxFrame::control(FRAME_RESET, stream_id))
-                    .await;
-                return;
-            }
-            buffer.resize(ROUTED_STREAM_MUX_DATA_BYTES, 0);
-            loop {
-                let read = match bridge_read.read(&mut buffer).await {
-                    Ok(read) => read,
-                    Err(_) => {
-                        let _ = outgoing_commands
-                            .send(MuxFrame::control(FRAME_RESET, stream_id))
-                            .await;
-                        return;
-                    }
-                };
-                if read == 0 {
-                    let _ = outgoing_commands
-                        .send(MuxFrame::control(FRAME_FINISH, stream_id))
-                        .await;
-                    return;
-                }
-                let Ok(permit) = Arc::clone(&outbound_window).acquire_owned().await else {
-                    return;
-                };
-                permit.forget();
-                let mut payload = Vec::new();
-                if payload.try_reserve_exact(read).is_err() {
-                    let _ = outgoing_commands
-                        .send(MuxFrame::control(FRAME_RESET, stream_id))
-                        .await;
-                    return;
-                }
-                payload.extend_from_slice(&buffer[..read]);
-                if outgoing_commands
-                    .send(MuxFrame {
-                        kind: FRAME_DATA,
-                        stream_id,
-                        payload: Bytes::from(payload),
-                    })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        }
-        .await;
-        drop(carrier_owner);
-    });
-    let incoming_commands = commands;
-    let incoming = tokio::spawn(async move {
-        while let Some(message) = incoming_receiver.recv().await {
-            match message {
-                LogicalInbound::Data(payload) => {
-                    if bridge_write.write_all(&payload).await.is_err() {
-                        let _ = incoming_commands
-                            .send(MuxFrame::control(FRAME_RESET, stream_id))
-                            .await;
-                        return;
-                    }
-                    if incoming_commands
-                        .send(MuxFrame::control(FRAME_WINDOW, stream_id))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                LogicalInbound::Reset => return,
-            }
-        }
-        let _ = bridge_write.shutdown().await;
-    });
+fn local_object_rpc_carrier_node_ids() -> (NodeId, NodeId) {
     (
-        Box::new(application),
-        incoming_sender,
-        outbound_window_weak,
-        outgoing,
-        incoming,
+        NodeId::derived("sinomo.network.local-rpc-carrier", b"client"),
+        NodeId::derived("sinomo.network.local-rpc-carrier", b"daemon"),
     )
 }
 
-#[derive(Default)]
-struct ClientMuxState {
-    streams: BTreeMap<u64, mpsc::Sender<LogicalInbound>>,
-    outbound_windows: BTreeMap<u64, Weak<Semaphore>>,
-    pending_accepts: BTreeMap<u64, oneshot::Sender<Result<(), String>>>,
-}
-
-struct PendingLogicalOpen<'a> {
-    state: &'a Mutex<ClientMuxState>,
-    commands: mpsc::Sender<MuxFrame>,
-    stream_id: u64,
-    armed: bool,
-}
-
-impl PendingLogicalOpen<'_> {
-    fn disarm(&mut self) {
-        self.armed = false;
+fn local_object_rpc_carrier_route(context: &RpcPeerContext, client_side: bool) -> RouteTrace {
+    let (client_node_id, daemon_node_id) = local_object_rpc_carrier_node_ids();
+    let endpoint_id = Id::derived(
+        "sinomo.network.local-rpc-carrier.endpoint",
+        context.session_id.as_str().as_bytes(),
+    );
+    RouteTrace {
+        nodes: if client_side {
+            vec![client_node_id, daemon_node_id]
+        } else {
+            vec![daemon_node_id, client_node_id]
+        },
+        endpoint_ids: vec![endpoint_id],
     }
 }
 
-impl Drop for PendingLogicalOpen<'_> {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        state.pending_accepts.remove(&self.stream_id);
-        state.streams.remove(&self.stream_id);
-        if let Some(window) = state.outbound_windows.remove(&self.stream_id)
-            && let Some(window) = window.upgrade()
-        {
-            window.close();
-        }
-        drop(state);
-        let _ = self
-            .commands
-            .try_send(MuxFrame::control(FRAME_RESET, self.stream_id));
-    }
-}
-
-fn fail_client_mux(state: &Mutex<ClientMuxState>, closed: &AtomicBool, detail: impl Into<String>) {
-    closed.store(true, Ordering::Release);
-    let detail = detail.into();
-    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-    for (_, sender) in std::mem::take(&mut state.pending_accepts) {
-        let _ = sender.send(Err(detail.clone()));
-    }
-    for (_, sender) in std::mem::take(&mut state.streams) {
-        let _ = sender.try_send(LogicalInbound::Reset);
-    }
-    for (_, window) in std::mem::take(&mut state.outbound_windows) {
-        if let Some(window) = window.upgrade() {
-            window.close();
-        }
-    }
-}
-
-fn return_outbound_window(window: &Weak<Semaphore>) -> Result<(), NetworkError> {
-    let Some(window) = window.upgrade() else {
-        return Ok(());
-    };
-    if window.available_permits() >= ROUTED_STREAM_MUX_INITIAL_WINDOW_FRAMES {
-        return Err(NetworkError::Serialization {
-            detail: "routed stream mux received excess window credit".to_string(),
-        });
-    }
-    window.add_permits(1);
-    Ok(())
-}
-
-struct RoutedStreamClient {
-    local_node_id: NodeId,
-    peer_node_id: NodeId,
-    carrier_session_id: Id,
-    carrier_binding: [u8; 32],
-    route_trace: RouteTrace,
-    commands: mpsc::Sender<MuxFrame>,
-    state: Arc<Mutex<ClientMuxState>>,
-    closed: Arc<AtomicBool>,
-    next_stream_id: AtomicU64,
-    reader_task: Mutex<Option<JoinHandle<()>>>,
-    writer_task: Mutex<Option<JoinHandle<()>>>,
-}
-
-#[derive(Clone)]
-enum IncomingLogicalStreamSink {
-    Fixed(mpsc::Sender<Result<PeerStream, NetworkError>>),
-    Registered(NodeId),
-}
-
-impl IncomingLogicalStreamSink {
-    fn sender(&self) -> Option<mpsc::Sender<Result<PeerStream, NetworkError>>> {
-        match self {
-            Self::Fixed(sender) => Some(sender.clone()),
-            Self::Registered(local_node_id) => {
-                registered_routed_stream_incoming_sender(local_node_id)
-            }
-        }
-    }
-}
-
-struct PooledLogicalStream {
+fn local_object_rpc_peer_carrier(
     io: BoxedNetworkStream,
-    _carrier_owner: Arc<RoutedStreamClient>,
+    context: &RpcPeerContext,
+    client_side: bool,
+) -> Result<PeerStream, NetworkError> {
+    if !matches!(context.identity, RpcPeerIdentity::UnauthenticatedLocal) {
+        return Err(NetworkError::AuthDenied);
+    }
+    let (client_node_id, daemon_node_id) = local_object_rpc_carrier_node_ids();
+    let (local_node_id, peer_node_id) = if client_side {
+        (client_node_id, daemon_node_id)
+    } else {
+        (daemon_node_id, client_node_id)
+    };
+    PeerStream::new_owned(
+        local_object_rpc_chunk_stream(io)?,
+        local_node_id,
+        peer_node_id,
+        context.session_id.clone(),
+        context.channel_binding,
+        local_object_rpc_carrier_route(context, client_side),
+    )
 }
 
-impl AsyncRead for PooledLogicalStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut *self.io).poll_read(context, buffer)
+type LocalRecordReadHalf = Box<dyn AsyncRead + Unpin + Send>;
+type LocalRecordWriteHalf = Box<dyn AsyncWrite + Unpin + Send>;
+
+fn split_local_object_rpc_io(
+    io: BoxedNetworkStream,
+) -> (LocalRecordReadHalf, LocalRecordWriteHalf) {
+    if io.as_any().is::<tokio::net::TcpStream>() {
+        let io = io
+            .into_any()
+            .downcast::<tokio::net::TcpStream>()
+            .expect("checked local object-RPC TCP stream");
+        let (reader, writer) = (*io).into_split();
+        return (Box::new(reader), Box::new(writer));
     }
+    let (reader, writer) = tokio::io::split(io);
+    (Box::new(reader), Box::new(writer))
 }
 
-impl AsyncWrite for PooledLogicalStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut *self.io).poll_write(context, buffer)
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut *self.io).poll_flush(context)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut *self.io).poll_shutdown(context)
-    }
+struct LocalCarrierChunkReader {
+    reader: LocalRecordReadHalf,
+    allocator: ChunkAllocator,
+    closed: bool,
 }
 
-impl RoutedStreamClient {
-    fn new(
-        carrier: PeerStream,
-        next_stream_id: u64,
-        incoming_sink: IncomingLogicalStreamSink,
-    ) -> Arc<Self> {
-        debug_assert!(matches!(next_stream_id, 1 | 2));
-        let local_node_id = carrier.local_node_id.clone();
-        let peer_node_id = carrier.peer_node_id.clone();
-        let carrier_session_id = carrier.session_id.clone();
-        let carrier_binding = carrier.channel_binding;
-        let route_trace = carrier.route_trace.clone();
-        let (reader, writer) = tokio::io::split(carrier);
-        let (commands, command_receiver) = mpsc::channel(ROUTED_STREAM_MUX_COMMANDS);
-        let state = Arc::new(Mutex::new(ClientMuxState::default()));
-        let closed = Arc::new(AtomicBool::new(false));
-        let client = Arc::new(Self {
-            local_node_id: local_node_id.clone(),
-            peer_node_id: peer_node_id.clone(),
-            carrier_session_id: carrier_session_id.clone(),
-            carrier_binding,
-            route_trace: route_trace.clone(),
-            commands: commands.clone(),
-            state: Arc::clone(&state),
-            closed: Arc::clone(&closed),
-            next_stream_id: AtomicU64::new(next_stream_id),
-            reader_task: Mutex::new(None),
-            writer_task: Mutex::new(None),
-        });
-        let writer_state = Arc::clone(&state);
-        let writer_closed = Arc::clone(&closed);
-        let writer_task = tokio::spawn(async move {
-            if let Err(error) = run_mux_writer(writer, command_receiver).await {
-                fail_client_mux(&writer_state, &writer_closed, error.to_string());
-            }
-        });
-        *client
-            .writer_task
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(writer_task);
-        let reader_state = Arc::clone(&state);
-        let reader_closed = Arc::clone(&closed);
-        let reader_commands = commands.clone();
-        let reader_client = Arc::downgrade(&client);
-        let local_stream_parity = next_stream_id % 2;
-        let reader_task = tokio::spawn(async move {
-            let mut reader = reader;
-            loop {
-                let frame = match read_mux_frame(&mut reader).await {
-                    Ok(Some(frame)) => frame,
-                    Ok(None) => {
-                        fail_client_mux(
-                            &reader_state,
-                            &reader_closed,
-                            "routed stream mux carrier closed",
-                        );
-                        return;
-                    }
-                    Err(error) => {
-                        fail_client_mux(&reader_state, &reader_closed, error.to_string());
-                        return;
-                    }
-                };
-                match frame.kind {
-                    FRAME_ACCEPT => {
-                        let sender = reader_state
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .pending_accepts
-                            .remove(&frame.stream_id);
-                        if let Some(sender) = sender {
-                            let _ = sender.send(Ok(()));
-                        }
-                    }
-                    FRAME_DATA => {
-                        let sender = reader_state
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .streams
-                            .get(&frame.stream_id)
-                            .cloned();
-                        if let Some(sender) = sender {
-                            if sender
-                                .send(LogicalInbound::Data(frame.payload))
-                                .await
-                                .is_err()
-                            {
-                                reader_state
-                                    .lock()
-                                    .unwrap_or_else(|error| error.into_inner())
-                                    .streams
-                                    .remove(&frame.stream_id);
-                                let _ = reader_commands
-                                    .send(MuxFrame::control(FRAME_RESET, frame.stream_id))
-                                    .await;
-                            }
-                        } else {
-                            let _ = reader_commands
-                                .send(MuxFrame::control(FRAME_RESET, frame.stream_id))
-                                .await;
-                        }
-                    }
-                    FRAME_FINISH => {
-                        let sender = reader_state
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .streams
-                            .remove(&frame.stream_id);
-                        drop(sender);
-                    }
-                    FRAME_RESET => {
-                        let (sender, window) = {
-                            let mut state = reader_state
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner());
-                            (
-                                state.streams.remove(&frame.stream_id),
-                                state.outbound_windows.remove(&frame.stream_id),
-                            )
-                        };
-                        if let Some(sender) = sender {
-                            let _ = sender.send(LogicalInbound::Reset).await;
-                        }
-                        if let Some(window) = window.and_then(|window| window.upgrade()) {
-                            window.close();
-                        }
-                    }
-                    FRAME_WINDOW => {
-                        let window = reader_state
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .outbound_windows
-                            .get(&frame.stream_id)
-                            .cloned();
-                        if let Some(window) = window
-                            && let Err(error) = return_outbound_window(&window)
-                        {
-                            fail_client_mux(&reader_state, &reader_closed, error.to_string());
-                            return;
-                        }
-                    }
-                    FRAME_OPEN => {
-                        let collides = {
-                            let state = reader_state
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner());
-                            frame.stream_id % 2 == local_stream_parity
-                                || state.streams.contains_key(&frame.stream_id)
-                                || state
-                                    .outbound_windows
-                                    .get(&frame.stream_id)
-                                    .is_some_and(|window| window.strong_count() != 0)
-                        };
-                        if collides {
-                            fail_client_mux(
-                                &reader_state,
-                                &reader_closed,
-                                "routed stream mux received an invalid peer stream id",
-                            );
-                            return;
-                        }
-                        let Some(incoming) = incoming_sink.sender() else {
-                            let _ = reader_commands
-                                .send(MuxFrame::control(FRAME_RESET, frame.stream_id))
-                                .await;
-                            continue;
-                        };
-                        let permit = match incoming.reserve().await {
-                            Ok(permit) => permit,
-                            Err(_) => {
-                                let _ = reader_commands
-                                    .send(MuxFrame::control(FRAME_RESET, frame.stream_id))
-                                    .await;
-                                continue;
-                            }
-                        };
-                        let Some(carrier_owner) = reader_client.upgrade() else {
-                            return;
-                        };
-                        let (io, inbound, outbound_window, _outgoing_task, _incoming_task) =
-                            logical_stream_pair(
-                                frame.stream_id,
-                                reader_commands.clone(),
-                                Some(carrier_owner),
-                            );
-                        let (session_id, channel_binding) = logical_stream_metadata(
-                            &carrier_session_id,
-                            &carrier_binding,
-                            frame.stream_id,
-                        );
-                        let stream = match PeerStream::new(
-                            io,
-                            local_node_id.clone(),
-                            peer_node_id.clone(),
-                            session_id,
-                            channel_binding,
-                            route_trace.clone(),
-                        ) {
-                            Ok(stream) => stream,
-                            Err(error) => {
-                                permit.send(Err(error));
-                                fail_client_mux(
-                                    &reader_state,
-                                    &reader_closed,
-                                    "failed to materialize a peer-opened routed logical stream",
-                                );
-                                return;
-                            }
-                        };
-                        {
-                            let mut state = reader_state
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner());
-                            state
-                                .outbound_windows
-                                .retain(|_, window| window.strong_count() != 0);
-                            state.streams.insert(frame.stream_id, inbound);
-                            state
-                                .outbound_windows
-                                .insert(frame.stream_id, outbound_window);
-                        }
-                        if reader_commands
-                            .send(MuxFrame::control(FRAME_ACCEPT, frame.stream_id))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        permit.send(Ok(stream));
-                    }
-                    _ => unreachable!("validated mux frame kind"),
-                }
-            }
-        });
-        *client
-            .reader_task
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(reader_task);
-        client
-    }
-
-    fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
-    }
-
-    async fn open(self: &Arc<Self>, timeout: Duration) -> Result<PeerStream, NetworkError> {
-        if self.is_closed() {
-            return Err(NetworkError::delivery_failed(
-                "open pooled routed logical stream",
-                NetworkDeliveryState::DefinitelyNotSent,
-                "routed stream carrier is closed",
-            ));
+impl LocalCarrierChunkReader {
+    async fn recv_record(&mut self) -> Result<Option<ChunkLease>, NetworkError> {
+        if self.closed {
+            return Ok(None);
         }
-        let stream_id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
-        if stream_id == 0 || stream_id.checked_add(2).is_none() {
-            self.closed.store(true, Ordering::Release);
-            return Err(NetworkError::ResourceExhausted {
-                operation: "allocate routed logical stream id".to_string(),
-                requested_bytes: std::mem::size_of::<u64>(),
+        let mut header = [0_u8; LOCAL_OBJECT_RPC_RECORD_HEADER_BYTES];
+        self.reader
+            .read_exact(&mut header)
+            .await
+            .map_err(|error| mux_io_error("read local object-RPC record header", error))?;
+        if header[..4] != LOCAL_OBJECT_RPC_RECORD_MAGIC {
+            return Err(NetworkError::Serialization {
+                detail: "invalid local object-RPC owned-record prefix".to_string(),
             });
         }
-        let (io, incoming, outbound_window, _outgoing_task, _incoming_task) =
-            logical_stream_pair(stream_id, self.commands.clone(), None);
-        let (accept_sender, accept_receiver) = oneshot::channel();
-        {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            state
-                .outbound_windows
-                .retain(|_, window| window.strong_count() != 0);
-            state.streams.insert(stream_id, incoming);
-            state.outbound_windows.insert(stream_id, outbound_window);
-            state.pending_accepts.insert(stream_id, accept_sender);
-        }
-        let mut pending_open = PendingLogicalOpen {
-            state: &self.state,
-            commands: self.commands.clone(),
-            stream_id,
-            armed: true,
+        let encoded_length =
+            u32::from_be_bytes(header[4..].try_into().expect("local record length"));
+        let class = if encoded_length & LOCAL_OBJECT_RPC_RECORD_CONTROL_FLAG == 0 {
+            ChunkClass::Data
+        } else {
+            ChunkClass::Control
         };
-        let open_deadline = tokio::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| NetworkError::Serialization {
-                detail: "routed logical stream timeout exceeds the monotonic clock range"
-                    .to_string(),
-            })?;
-        match tokio::time::timeout_at(
-            open_deadline,
-            self.commands.send(MuxFrame::control(FRAME_OPEN, stream_id)),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                fail_client_mux(
-                    &self.state,
-                    &self.closed,
-                    "routed stream mux writer stopped",
-                );
-                return Err(NetworkError::delivery_failed(
-                    "open pooled routed logical stream",
-                    NetworkDeliveryState::DefinitelyNotSent,
-                    "routed stream mux writer stopped",
-                ));
+        let payload_bytes = usize::try_from(encoded_length & LOCAL_OBJECT_RPC_RECORD_LENGTH_MASK)
+            .expect("u32 length fits usize");
+        let class_max = match class {
+            ChunkClass::Data => SECURE_PLAINTEXT_MAX,
+            ChunkClass::Control => {
+                MUX_RECORD_HEADER_BYTES + RPC_RECORD_HEADER_BYTES + RPC_CONTROL_PAYLOAD_MAX
             }
-            Err(_) => {
-                return Err(NetworkError::timeout(
-                    "queue pooled routed logical stream open",
-                    crate::NetworkTimeoutPhase::Connect,
-                    timeout,
-                    NetworkDeliveryState::DefinitelyNotSent,
-                ));
-            }
+        };
+        if payload_bytes > class_max {
+            return Err(NetworkError::FrameTooLarge {
+                actual_bytes: payload_bytes,
+                max_bytes: class_max,
+            });
         }
-        match tokio::time::timeout_at(open_deadline, accept_receiver).await {
-            Ok(Ok(Ok(()))) => pending_open.disarm(),
-            Ok(Ok(Err(detail))) => {
-                return Err(NetworkError::delivery_failed(
-                    "open pooled routed logical stream",
-                    NetworkDeliveryState::DefinitelyNotSent,
-                    detail,
-                ));
+        if payload_bytes == 0 {
+            if class != ChunkClass::Control {
+                return Err(NetworkError::Serialization {
+                    detail: "local object-RPC final record used the data slab class".to_string(),
+                });
             }
-            Ok(Err(_)) => {
-                return Err(NetworkError::delivery_failed(
-                    "open pooled routed logical stream",
-                    NetworkDeliveryState::DefinitelyNotSent,
-                    "routed stream carrier closed before accepting the logical stream",
-                ));
-            }
-            Err(_) => {
-                return Err(NetworkError::timeout(
-                    "open pooled routed logical stream",
-                    crate::NetworkTimeoutPhase::Connect,
-                    timeout,
-                    NetworkDeliveryState::DefinitelyNotSent,
-                ));
-            }
+            self.closed = true;
+            return Ok(None);
         }
-        let (session_id, channel_binding) =
-            logical_stream_metadata(&self.carrier_session_id, &self.carrier_binding, stream_id);
-        PeerStream::new(
-            Box::new(PooledLogicalStream {
-                io,
-                _carrier_owner: Arc::clone(self),
-            }),
-            self.local_node_id.clone(),
-            self.peer_node_id.clone(),
-            session_id,
-            channel_binding,
-            self.route_trace.clone(),
-        )
+        let mut chunk = match class {
+            ChunkClass::Data => self.allocator.allocate_data(0).await?,
+            ChunkClass::Control => self.allocator.allocate_control(0).await?,
+        };
+        chunk.set_range(
+            SECURE_RECORD_HEADER_BYTES,
+            SECURE_RECORD_HEADER_BYTES.saturating_add(payload_bytes),
+        )?;
+        self.reader
+            .read_exact(chunk.as_mut_slice())
+            .await
+            .map_err(|error| mux_io_error("read local object-RPC owned record", error))?;
+        Ok(Some(chunk.into_lease()))
     }
 }
 
-impl Drop for RoutedStreamClient {
-    fn drop(&mut self) {
-        if let Some(task) = self
-            .reader_task
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
-            task.abort();
-        }
-        let writer_task = self
-            .writer_task
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        // Once every logical-stream bridge has released its carrier owner, the
-        // writer still owns a bounded queue of already accepted DATA/FINISH
-        // frames. Detach it so those frames drain before the write half closes.
-        drop(writer_task);
+impl AuthenticatedChunkReader for LocalCarrierChunkReader {
+    fn allocator(&self) -> &ChunkAllocator {
+        &self.allocator
+    }
+
+    fn max_payload_bytes(&self) -> usize {
+        SECURE_PLAINTEXT_MAX
+    }
+
+    fn recv_chunk(&mut self) -> ChunkStreamFuture<'_, Option<ChunkLease>> {
+        Box::pin(self.recv_record())
     }
 }
+
+struct LocalCarrierChunkWriter {
+    writer: LocalRecordWriteHalf,
+    allocator: ChunkAllocator,
+    closed: bool,
+}
+
+impl LocalCarrierChunkWriter {
+    async fn send_record(
+        &mut self,
+        mut chunk: OwnedChunk,
+        final_record: bool,
+    ) -> Result<(), NetworkError> {
+        if self.closed {
+            return Err(NetworkError::Io {
+                operation: "write local object-RPC owned record".to_string(),
+                detail: "write direction is closed".to_string(),
+            });
+        }
+        let payload_bytes = chunk.len();
+        if payload_bytes > SECURE_PLAINTEXT_MAX {
+            return Err(NetworkError::FrameTooLarge {
+                actual_bytes: payload_bytes,
+                max_bytes: SECURE_PLAINTEXT_MAX,
+            });
+        }
+        if final_record && payload_bytes != 0 {
+            return Err(NetworkError::Serialization {
+                detail: "local object-RPC final record carried payload".to_string(),
+            });
+        }
+        let payload_u32 =
+            u32::try_from(payload_bytes).map_err(|_| NetworkError::FrameTooLarge {
+                actual_bytes: payload_bytes,
+                max_bytes: SECURE_PLAINTEXT_MAX,
+            })?;
+        let class_flag = match chunk.class() {
+            ChunkClass::Data => 0,
+            ChunkClass::Control => LOCAL_OBJECT_RPC_RECORD_CONTROL_FLAG,
+        };
+        let mut header = [0_u8; LOCAL_OBJECT_RPC_RECORD_HEADER_BYTES];
+        header[..4].copy_from_slice(&LOCAL_OBJECT_RPC_RECORD_MAGIC);
+        header[4..].copy_from_slice(&(payload_u32 | class_flag).to_be_bytes());
+        chunk.prepend(&header)?;
+        self.writer
+            .write_all(chunk.as_slice())
+            .await
+            .map_err(|error| mux_io_error("write local object-RPC owned record", error))?;
+        if final_record {
+            self.closed = true;
+            self.writer
+                .shutdown()
+                .await
+                .map_err(|error| mux_io_error("half-close local object-RPC carrier", error))?;
+        }
+        Ok(())
+    }
+}
+
+impl AuthenticatedChunkWriter for LocalCarrierChunkWriter {
+    fn max_payload_bytes(&self) -> usize {
+        SECURE_PLAINTEXT_MAX
+    }
+
+    fn allocator(&self) -> &ChunkAllocator {
+        &self.allocator
+    }
+
+    fn send_chunk(&mut self, chunk: OwnedChunk) -> ChunkStreamFuture<'_, ()> {
+        Box::pin(self.send_record(chunk, false))
+    }
+
+    fn finish(&mut self) -> ChunkStreamFuture<'_, ()> {
+        Box::pin(async move {
+            if self.closed {
+                return Ok(());
+            }
+            let final_record = self.allocator.allocate_control(0).await?;
+            self.send_record(final_record, true).await
+        })
+    }
+
+    fn reset(&mut self, reason: ResetReason) -> ChunkStreamFuture<'_, ()> {
+        Box::pin(async move {
+            self.closed = true;
+            self.writer
+                .shutdown()
+                .await
+                .map_err(|error| NetworkError::Io {
+                    operation: format!("reset local object-RPC carrier: {}", reason.detail),
+                    detail: error.to_string(),
+                })
+        })
+    }
+}
+
+fn local_object_rpc_chunk_stream(
+    io: BoxedNetworkStream,
+) -> Result<AuthenticatedChunkStream, NetworkError> {
+    let allocator = ChunkAllocator::default();
+    let (reader, writer) = split_local_object_rpc_io(io);
+    AuthenticatedChunkStream::new(
+        Box::new(LocalCarrierChunkReader {
+            reader,
+            allocator: allocator.clone(),
+            closed: false,
+        }),
+        Box::new(LocalCarrierChunkWriter {
+            writer,
+            allocator,
+            closed: false,
+        }),
+    )
+}
+
+type PooledCarrier = OwnedRoutedStreamClient;
 
 struct RoutedStreamIncomingRegistration {
     token: Id,
@@ -900,7 +482,7 @@ pub fn register_routed_stream_incoming(
     local_node_id: NodeId,
 ) -> Result<RoutedStreamIncoming, NetworkError> {
     let token = Id::generate();
-    let (sender, incoming) = mpsc::channel(ROUTED_STREAM_MUX_ACCEPTED_STREAMS);
+    let (sender, incoming) = mpsc::channel(32);
     let mut registry = routed_stream_incoming_registry()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -973,14 +555,13 @@ impl PoolKey {
     }
 }
 
-static ROUTED_STREAM_POOL: OnceLock<
-    tokio::sync::Mutex<BTreeMap<PoolKey, Arc<RoutedStreamClient>>>,
-> = OnceLock::new();
+static ROUTED_STREAM_POOL: OnceLock<tokio::sync::Mutex<BTreeMap<PoolKey, Arc<PooledCarrier>>>> =
+    OnceLock::new();
 static ROUTED_STREAM_CONNECT_LOCKS: OnceLock<
     tokio::sync::Mutex<BTreeMap<PoolKey, Arc<tokio::sync::Mutex<()>>>>,
 > = OnceLock::new();
 
-fn routed_stream_pool() -> &'static tokio::sync::Mutex<BTreeMap<PoolKey, Arc<RoutedStreamClient>>> {
+fn routed_stream_pool() -> &'static tokio::sync::Mutex<BTreeMap<PoolKey, Arc<PooledCarrier>>> {
     ROUTED_STREAM_POOL.get_or_init(|| tokio::sync::Mutex::new(BTreeMap::new()))
 }
 
@@ -991,12 +572,6 @@ fn routed_stream_connect_locks()
 
 /// Reports whether this process currently owns a live routing carrier for the
 /// exact node relationship in `scope`.
-///
-/// Both initiated and accepted full-duplex carriers are published in the same
-/// pool, so this is routing-owned end-to-end reachability evidence rather than
-/// an inference from directed endpoint observations. `None` means the pool was
-/// concurrently locked; callers must treat that as unknown, never as proof of
-/// unavailability.
 pub fn pooled_routed_relationship_is_active(
     scope: &str,
     local_node_id: &NodeId,
@@ -1017,9 +592,9 @@ pub fn pooled_routed_relationship_is_active(
 }
 
 fn reusable_pooled_client(
-    pool: &mut BTreeMap<PoolKey, Arc<RoutedStreamClient>>,
+    pool: &mut BTreeMap<PoolKey, Arc<PooledCarrier>>,
     key: &PoolKey,
-) -> Option<Arc<RoutedStreamClient>> {
+) -> Option<Arc<PooledCarrier>> {
     pool.retain(|_, client| !client.is_closed());
     let client = pool.get(key).cloned().or_else(|| {
         pool.iter()
@@ -1027,12 +602,6 @@ fn reusable_pooled_client(
             .max_by_key(|(candidate, _)| candidate.directory_generation)
             .map(|(_, client)| Arc::clone(client))
     })?;
-
-    // The caller constructed `key` from its current, already-authorized
-    // directory snapshot. A live end-to-end authenticated carrier for the
-    // exact same identities and constraints remains valid when the two local
-    // snapshot readers temporarily observe different generations. Publish it
-    // under the caller's generation and retire the other lookup aliases.
     pool.insert(key.clone(), Arc::clone(&client));
     pool.retain(|candidate, _| !candidate.same_relationship(key) || candidate == key);
     Some(client)
@@ -1104,11 +673,14 @@ where
             {
                 return Err(NetworkError::AuthDenied);
             }
-            let client = RoutedStreamClient::new(
+            let incoming_node_id = key.local_node_id.clone();
+            let incoming: IncomingLogicalStreamResolver =
+                Arc::new(move || registered_routed_stream_incoming_sender(&incoming_node_id));
+            let client = Arc::new(PooledCarrier::new_with_incoming(
                 carrier,
                 1,
-                IncomingLogicalStreamSink::Registered(key.local_node_id.clone()),
-            );
+                IncomingLogicalStreamSink::Resolve(incoming),
+            )?);
             routed_stream_pool()
                 .lock()
                 .await
@@ -1132,6 +704,34 @@ where
     }
 }
 
+/// Opens one independently authenticated loopback RPC stream over a persistent
+/// local carrier. `establish` runs only when the address has no healthy
+/// carrier and must return a stream after exchanging the `SLC1` prelude.
+pub async fn open_pooled_local_object_rpc_stream<F>(
+    scope: String,
+    timeout: Duration,
+    establish: F,
+) -> Result<PeerStream, NetworkError>
+where
+    F: Future<Output = Result<(BoxedNetworkStream, RpcPeerContext), NetworkError>>,
+{
+    let (local_node_id, peer_node_id) = local_object_rpc_carrier_node_ids();
+    let carrier = async move {
+        let (io, context) = establish.await?;
+        local_object_rpc_peer_carrier(io, &context, true)
+    };
+    open_pooled_routed_stream(
+        format!("local-object-rpc:{scope}"),
+        0,
+        RouteConstraints::default(),
+        local_node_id,
+        peer_node_id,
+        timeout,
+        carrier,
+    )
+    .await
+}
+
 /// Retires every pooled routed carrier in one cluster/process scope.
 ///
 /// Daemon shutdown and tests use this explicit lifecycle boundary. Directory
@@ -1151,39 +751,36 @@ pub async fn retire_pooled_routed_streams(scope: &str) -> usize {
 
 /// Server side of one accepted routing-owned carrier.
 pub struct RoutedStreamAcceptor {
-    incoming: mpsc::Receiver<Result<PeerStream, NetworkError>>,
-    _carrier_owner: Arc<RoutedStreamClient>,
+    inner: Result<OwnedRoutedStreamAcceptor, Option<NetworkError>>,
 }
 
 impl RoutedStreamAcceptor {
     pub async fn accept(&mut self) -> Result<Option<PeerStream>, NetworkError> {
-        match self.incoming.recv().await {
-            Some(Ok(stream)) => Ok(Some(stream)),
-            Some(Err(error)) => Err(error),
-            None => Ok(None),
+        match &mut self.inner {
+            Ok(acceptor) => acceptor.accept().await,
+            Err(error) => match error.take() {
+                Some(error) => Err(error),
+                None => Ok(None),
+            },
         }
     }
 }
 
 fn routed_stream_acceptor_and_client(
     carrier: PeerStream,
-) -> (RoutedStreamAcceptor, Arc<RoutedStreamClient>) {
-    let (accepted, incoming) = mpsc::channel(ROUTED_STREAM_MUX_ACCEPTED_STREAMS);
-    let carrier_owner =
-        RoutedStreamClient::new(carrier, 2, IncomingLogicalStreamSink::Fixed(accepted));
-    (
+) -> Result<(RoutedStreamAcceptor, Arc<PooledCarrier>), NetworkError> {
+    let (acceptor, client) = owned_routed_stream_acceptor_and_client(carrier)?;
+    Ok((
         RoutedStreamAcceptor {
-            incoming,
-            _carrier_owner: Arc::clone(&carrier_owner),
+            inner: Ok(acceptor),
         },
-        carrier_owner,
-    )
+        client,
+    ))
 }
 
-/// Converts one accepted authenticated routed stream into a logical-stream
-/// acceptor and makes the same carrier available for reverse-direction opens.
-/// The first frame must be the routing mux protocol; no legacy application-
-/// stream fallback is retained.
+/// Converts one accepted authenticated routed stream into an owned logical-
+/// stream acceptor and publishes the same full-duplex carrier for reverse
+/// direction opens.
 pub async fn accept_pooled_routed_stream_carrier(
     scope: String,
     directory_generation: u64,
@@ -1197,7 +794,7 @@ pub async fn accept_pooled_routed_stream_carrier(
         carrier.local_node_id.clone(),
         carrier.peer_node_id.clone(),
     );
-    let (acceptor, client) = routed_stream_acceptor_and_client(carrier);
+    let (acceptor, client) = routed_stream_acceptor_and_client(carrier)?;
     let connect_lock = {
         let mut locks = routed_stream_connect_locks().lock().await;
         locks.retain(|lock_key, _| !lock_key.same_relationship(&key) || lock_key == &key);
@@ -1218,17 +815,112 @@ pub async fn accept_pooled_routed_stream_carrier(
     Ok(acceptor)
 }
 
-/// Converts one accepted authenticated routed stream into a logical-stream
-/// acceptor without publishing it into a routing pool. Tests and standalone
-/// adapters use this boundary when they do not own a directory generation.
+/// Converts one accepted authenticated routed stream into an owned logical-stream
+/// acceptor. Byte-oriented callers must enter through an explicit carrier adapter.
 pub fn accept_routed_stream_carrier(carrier: PeerStream) -> RoutedStreamAcceptor {
-    routed_stream_acceptor_and_client(carrier).0
+    match routed_stream_acceptor_and_client(carrier) {
+        Ok((acceptor, _)) => acceptor,
+        Err(error) => RoutedStreamAcceptor {
+            inner: Err(Some(error)),
+        },
+    }
+}
+
+/// Serves logical streams through the canonical owned-record carrier.
+pub async fn serve_routed_stream_carrier<F, Fut>(
+    carrier: PeerStream,
+    mut handler: F,
+) -> Result<bool, NetworkError>
+where
+    F: FnMut(PeerStream) -> Fut,
+    Fut: Future<Output = Result<bool, NetworkError>> + Send + 'static,
+{
+    let mut acceptor = accept_owned_routed_stream_carrier(carrier)?;
+    let mut handlers = tokio::task::JoinSet::new();
+    let mut accepting = true;
+    let mut stop = false;
+    while accepting || !handlers.is_empty() {
+        tokio::select! {
+            accepted = acceptor.accept(), if accepting => {
+                let Some(stream) = accepted? else {
+                    accepting = false;
+                    continue;
+                };
+                let mut future = Box::pin(handler(stream));
+                let immediate = std::future::poll_fn(|context| {
+                    Poll::Ready(match future.as_mut().poll(context) {
+                        Poll::Ready(result) => Some(result),
+                        Poll::Pending => None,
+                    })
+                })
+                .await;
+                match immediate {
+                    Some(Ok(true)) => {
+                        stop = true;
+                        accepting = false;
+                        handlers.abort_all();
+                    }
+                    Some(Ok(false)) => {}
+                    Some(Err(error)) => return Err(error),
+                    None => {
+                        handlers.spawn(future);
+                    }
+                }
+            }
+            joined = handlers.join_next(), if !handlers.is_empty() => {
+                match joined {
+                    Some(Ok(Ok(true))) => {
+                        stop = true;
+                        accepting = false;
+                        handlers.abort_all();
+                    }
+                    Some(Ok(Ok(false))) => {}
+                    Some(Ok(Err(error))) => return Err(error),
+                    Some(Err(error)) => {
+                        return Err(NetworkError::Io {
+                            operation: "join owned routed logical stream handler".to_string(),
+                            detail: error.to_string(),
+                        });
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    Ok(stop)
+}
+pub async fn serve_local_object_rpc_stream_carrier<F, Fut>(
+    carrier: BoxedNetworkStream,
+    context: &RpcPeerContext,
+    handler: F,
+) -> Result<bool, NetworkError>
+where
+    F: FnMut(PeerStream) -> Fut,
+    Fut: Future<Output = Result<bool, NetworkError>> + Send + 'static,
+{
+    serve_routed_stream_carrier(
+        local_object_rpc_peer_carrier(carrier, context, false)?,
+        handler,
+    )
+    .await
+}
+
+/// Accepts logical RPC streams from a loopback carrier after the daemon has
+/// independently checked socket locality and consumed its `SLC1` prelude.
+pub fn accept_local_object_rpc_stream_carrier(
+    carrier: BoxedNetworkStream,
+    context: &RpcPeerContext,
+) -> Result<RoutedStreamAcceptor, NetworkError> {
+    Ok(accept_routed_stream_carrier(local_object_rpc_peer_carrier(
+        carrier, context, false,
+    )?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::oneshot;
 
     fn node(name: &str) -> NodeId {
         NodeId::from_legacy_named(name).expect("node id")
@@ -1249,8 +941,8 @@ mod tests {
             endpoint_ids: client_route.endpoint_ids.clone(),
         };
         (
-            PeerStream::new(
-                Box::new(client),
+            PeerStream::new_owned(
+                local_object_rpc_chunk_stream(Box::new(client)).expect("client chunks"),
                 client_node,
                 server_node,
                 session_id.clone(),
@@ -1258,8 +950,8 @@ mod tests {
                 client_route,
             )
             .expect("client carrier"),
-            PeerStream::new(
-                Box::new(server),
+            PeerStream::new_owned(
+                local_object_rpc_chunk_stream(Box::new(server)).expect("server chunks"),
                 node("node_mux_server"),
                 node("node_mux_client"),
                 session_id,
@@ -1295,7 +987,7 @@ mod tests {
         });
 
         let count = Arc::clone(&establishments);
-        let first = open_pooled_routed_stream(
+        let mut first = open_pooled_routed_stream(
             scope.clone(),
             1,
             RouteConstraints::default(),
@@ -1310,7 +1002,7 @@ mod tests {
         .await
         .expect("first logical stream");
         let count = Arc::clone(&establishments);
-        let second = open_pooled_routed_stream(
+        let mut second = open_pooled_routed_stream(
             scope,
             1,
             RouteConstraints::default(),
@@ -1329,6 +1021,14 @@ mod tests {
         .expect("second logical stream");
 
         assert_ne!(first.session_id, second.session_id);
+        first
+            .write_all(b"a")
+            .await
+            .expect("publish first logical open");
+        second
+            .write_all(b"b")
+            .await
+            .expect("publish second logical open");
         let _ = server_done.send(());
         let (server_first, server_second) = server.await.expect("server task");
         assert_eq!(first.session_id, server_first);
@@ -1337,7 +1037,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_carrier_supports_reverse_direction_streams() {
+    async fn accepted_owned_carrier_supports_reverse_direction_streams() {
         let (client_carrier, server_carrier) = carrier_pair();
         let client_node = client_carrier.local_node_id.clone();
         let server_node = client_carrier.peer_node_id.clone();
@@ -1359,16 +1059,12 @@ mod tests {
             )
             .await
             .expect("accept pooled carrier");
-            assert_eq!(
-                pooled_routed_relationship_is_active(&server_scope, &server_local, &server_peer,),
-                Some(true),
-                "an accepted carrier must publish reverse-direction reachability",
-            );
             let mut initial = acceptor
                 .accept()
                 .await
                 .expect("accept initial stream")
                 .expect("initial stream");
+            assert!(initial.has_owned_chunks());
             let mut request = [0_u8; 4];
             initial
                 .read_exact(&mut request)
@@ -1380,16 +1076,15 @@ mod tests {
                 .await
                 .expect("write initial response");
 
-            let first_reverse_count = Arc::clone(&reverse_count);
             let mut reverse = open_pooled_routed_stream(
-                server_scope.clone(),
+                server_scope,
                 2,
                 constraints,
-                server_local.clone(),
-                server_peer.clone(),
+                server_local,
+                server_peer,
                 Duration::from_secs(1),
                 async move {
-                    first_reverse_count.fetch_add(1, Ordering::Relaxed);
+                    reverse_count.fetch_add(1, Ordering::Relaxed);
                     Err(NetworkError::Io {
                         operation: "unexpected reverse carrier establishment".to_string(),
                         detail: "the accepted carrier must be reusable in reverse".to_string(),
@@ -1398,6 +1093,7 @@ mod tests {
             )
             .await
             .expect("reverse logical stream");
+            assert!(reverse.has_owned_chunks());
             reverse
                 .write_all(b"back")
                 .await
@@ -1408,34 +1104,6 @@ mod tests {
                 .await
                 .expect("read reverse response");
             assert_eq!(&response, b"okay");
-
-            let mut reverse = open_pooled_routed_stream(
-                server_scope,
-                0,
-                constraints,
-                server_local,
-                server_peer,
-                Duration::from_secs(1),
-                async move {
-                    reverse_count.fetch_add(1, Ordering::Relaxed);
-                    Err(NetworkError::Io {
-                        operation: "unexpected reverse carrier establishment".to_string(),
-                        detail: "the accepted carrier must survive generation skew".to_string(),
-                    })
-                },
-            )
-            .await
-            .expect("reverse logical stream from older snapshot");
-            reverse
-                .write_all(b"past")
-                .await
-                .expect("write older-snapshot reverse request");
-            let mut response = [0_u8; 4];
-            reverse
-                .read_exact(&mut response)
-                .await
-                .expect("read older-snapshot reverse response");
-            assert_eq!(&response, b"safe");
         });
 
         let mut initial = open_pooled_routed_stream(
@@ -1449,11 +1117,7 @@ mod tests {
         )
         .await
         .expect("initial logical stream");
-        assert_eq!(
-            pooled_routed_relationship_is_active(&scope, &client_node, &server_node),
-            Some(true),
-            "an initiated carrier must publish forward-direction reachability",
-        );
+        assert!(initial.has_owned_chunks());
         initial
             .write_all(b"ping")
             .await
@@ -1470,6 +1134,7 @@ mod tests {
             .await
             .expect("accept reverse stream")
             .expect("reverse stream");
+        assert!(reverse.has_owned_chunks());
         let mut request = [0_u8; 4];
         reverse
             .read_exact(&mut request)
@@ -1480,21 +1145,6 @@ mod tests {
             .write_all(b"okay")
             .await
             .expect("write reverse response");
-        let mut reverse = client_incoming
-            .accept()
-            .await
-            .expect("accept older-snapshot reverse stream")
-            .expect("older-snapshot reverse stream");
-        let mut request = [0_u8; 4];
-        reverse
-            .read_exact(&mut request)
-            .await
-            .expect("read older-snapshot reverse request");
-        assert_eq!(&request, b"past");
-        reverse
-            .write_all(b"safe")
-            .await
-            .expect("write older-snapshot reverse response");
         server.await.expect("server task");
 
         assert_eq!(reverse_establishments.load(Ordering::Relaxed), 0);
@@ -1502,8 +1152,169 @@ mod tests {
         assert_eq!(
             pooled_routed_relationship_is_active(&scope, &client_node, &server_node),
             Some(false),
-            "retiring a scope must withdraw its routed reachability evidence",
         );
+    }
+
+    #[tokio::test]
+    async fn logical_open_does_not_wait_for_remote_accept() {
+        let (client_carrier, _server_carrier) = carrier_pair();
+        let client =
+            Arc::new(OwnedRoutedStreamClient::new(client_carrier).expect("owned mux client"));
+
+        let stream = tokio::time::timeout(
+            Duration::from_millis(50),
+            client.open(Duration::from_millis(10)),
+        )
+        .await
+        .expect("logical open must not wait for a remote acknowledgement")
+        .expect("logical stream");
+
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn carrier_server_handles_repeated_compound_streams() {
+        let (client_carrier, server_carrier) = carrier_pair();
+        let handled = Arc::new(AtomicUsize::new(0));
+        let server_handled = Arc::clone(&handled);
+        let server = tokio::spawn(async move {
+            serve_routed_stream_carrier(server_carrier, move |mut stream| {
+                let handled = Arc::clone(&server_handled);
+                async move {
+                    let mut request = Vec::new();
+                    stream
+                        .read_to_end(&mut request)
+                        .await
+                        .map_err(|error| mux_io_error("read test logical request", error))?;
+                    assert_eq!(request, b"ping");
+                    stream
+                        .write_all(b"pong")
+                        .await
+                        .map_err(|error| mux_io_error("write test logical response", error))?;
+                    stream
+                        .shutdown()
+                        .await
+                        .map_err(|error| mux_io_error("finish test logical response", error))?;
+                    handled.fetch_add(1, Ordering::Relaxed);
+                    Ok(false)
+                }
+            })
+            .await
+            .expect("serve routed carrier")
+        });
+        let client =
+            Arc::new(OwnedRoutedStreamClient::new(client_carrier).expect("owned mux client"));
+
+        for _ in 0..2 {
+            let mut stream = client
+                .open(Duration::from_secs(1))
+                .await
+                .expect("open logical stream");
+            stream.write_all(b"ping").await.expect("write request");
+            stream.shutdown().await.expect("finish request");
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .await
+                .expect("read response");
+            assert_eq!(response, b"pong");
+        }
+
+        drop(client);
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .expect("carrier server stopped")
+                .expect("join carrier server")
+        );
+        assert_eq!(handled.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn local_rpc_pool_reuses_carrier_but_not_call_context() {
+        let scope = Id::generate().to_string();
+        let establishments = Arc::new(AtomicUsize::new(0));
+        let (mut client_carrier, mut server_carrier) = tokio::io::duplex(256 * 1024);
+        let server = tokio::spawn(async move {
+            let carrier_context = crate::read_local_object_rpc_carrier_prelude(&mut server_carrier)
+                .await
+                .expect("read local carrier prelude");
+            let mut acceptor =
+                accept_local_object_rpc_stream_carrier(Box::new(server_carrier), &carrier_context)
+                    .expect("local carrier acceptor");
+            let first = acceptor
+                .accept()
+                .await
+                .expect("accept first")
+                .expect("first logical stream");
+            let first_context = RpcPeerContext::unauthenticated_local(
+                first.session_id.clone(),
+                first.channel_binding,
+            );
+            let second = acceptor
+                .accept()
+                .await
+                .expect("accept second")
+                .expect("second logical stream");
+            let second_context = RpcPeerContext::unauthenticated_local(
+                second.session_id.clone(),
+                second.channel_binding,
+            );
+            (first_context, second_context)
+        });
+
+        let count = Arc::clone(&establishments);
+        let mut first = open_pooled_local_object_rpc_stream(
+            scope.clone(),
+            Duration::from_secs(1),
+            async move {
+                count.fetch_add(1, Ordering::Relaxed);
+                let context =
+                    crate::write_local_object_rpc_carrier_prelude(&mut client_carrier).await?;
+                Ok((Box::new(client_carrier) as BoxedNetworkStream, context))
+            },
+        )
+        .await
+        .expect("first local logical stream");
+        let first_context =
+            RpcPeerContext::unauthenticated_local(first.session_id.clone(), first.channel_binding);
+
+        let count = Arc::clone(&establishments);
+        let mut second =
+            open_pooled_local_object_rpc_stream(scope, Duration::from_secs(1), async move {
+                count.fetch_add(1, Ordering::Relaxed);
+                Err(NetworkError::Io {
+                    operation: "unexpected local carrier establishment".to_string(),
+                    detail: "the existing local carrier should have been reused".to_string(),
+                })
+            })
+            .await
+            .expect("second local logical stream");
+        let second_context = RpcPeerContext::unauthenticated_local(
+            second.session_id.clone(),
+            second.channel_binding,
+        );
+        // Owned mux streams publish OPEN together with their first record.
+        // A byte-compatibility flush has no record-boundary meaning, so write
+        // one byte to exercise the adapter and make each stream observable.
+        first
+            .write_all(b"a")
+            .await
+            .expect("publish first local logical open");
+        second
+            .write_all(b"b")
+            .await
+            .expect("publish second local logical open");
+
+        let (server_first, server_second) = server.await.expect("server task");
+        assert_eq!(first_context, server_first);
+        assert_eq!(second_context, server_second);
+        assert_ne!(first_context.session_id, second_context.session_id);
+        assert_ne!(
+            first_context.channel_binding,
+            second_context.channel_binding
+        );
+        assert_eq!(establishments.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -1553,18 +1364,125 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stalled_logical_stream_does_not_block_an_unrelated_stream() {
+    async fn retiring_idle_pool_entry_gracefully_closes_the_carrier() {
+        let (client_carrier, server_carrier) = carrier_pair();
+        let local = client_carrier.local_node_id.clone();
+        let peer = client_carrier.peer_node_id.clone();
+        let scope = Id::generate().to_string();
+        let mut acceptor = accept_routed_stream_carrier(server_carrier);
+
+        let mut stream = open_pooled_routed_stream(
+            scope.clone(),
+            1,
+            RouteConstraints::default(),
+            local,
+            peer,
+            Duration::from_secs(1),
+            async move { Ok(client_carrier) },
+        )
+        .await
+        .expect("logical stream");
+        stream
+            .write_all(b"x")
+            .await
+            .expect("publish idle logical stream");
+        stream.shutdown().await.expect("close idle logical stream");
+        let accepted = acceptor
+            .accept()
+            .await
+            .expect("accept logical stream")
+            .expect("logical stream");
+        drop(stream);
+        drop(accepted);
+        assert_eq!(retire_pooled_routed_streams(&scope).await, 1);
+
+        let closed = tokio::time::timeout(Duration::from_secs(1), acceptor.accept())
+            .await
+            .expect("carrier close propagated")
+            .expect("clean carrier close");
+        assert!(closed.is_none());
+    }
+
+    #[tokio::test]
+    async fn logical_stream_transfers_bodies_larger_than_its_flow_control_window() {
+        const REQUEST_BYTES: usize = 512 * 1024 + 31;
+        const RESPONSE_BYTES: usize = 768 * 1024 + 47;
+
         let (client_carrier, server_carrier) = carrier_pair();
         let local = client_carrier.local_node_id.clone();
         let peer = client_carrier.peer_node_id.clone();
         let scope = Id::generate().to_string();
         let mut acceptor = accept_routed_stream_carrier(server_carrier);
         let server = tokio::spawn(async move {
+            let mut stream = acceptor
+                .accept()
+                .await
+                .expect("accept logical stream")
+                .expect("logical stream");
+            let mut request = Vec::new();
+            stream
+                .read_to_end(&mut request)
+                .await
+                .expect("read request body");
+            assert_eq!(request.len(), REQUEST_BYTES);
+            assert!(request.iter().all(|byte| *byte == 0x41));
+            stream
+                .write_all(&vec![0x52; RESPONSE_BYTES])
+                .await
+                .expect("write response body");
+            stream.shutdown().await.expect("finish response body");
+        });
+
+        let stream = open_pooled_routed_stream(
+            scope,
+            1,
+            RouteConstraints::default(),
+            local,
+            peer,
+            Duration::from_secs(1),
+            async move { Ok(client_carrier) },
+        )
+        .await
+        .expect("logical stream");
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let send = tokio::spawn(async move {
+            writer
+                .write_all(&vec![0x41; REQUEST_BYTES])
+                .await
+                .expect("write request body");
+            writer.shutdown().await.expect("finish request body");
+        });
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            reader
+                .read_to_end(&mut response)
+                .await
+                .expect("read response body");
+            send.await.expect("request writer");
+            server.await.expect("server task");
+        })
+        .await
+        .expect("large logical transfer completed without a flow-control deadlock");
+        eprintln!("chunk metrics: {:?}", crate::network_chunk_metrics());
+        assert_eq!(response.len(), RESPONSE_BYTES);
+        assert!(response.iter().all(|byte| *byte == 0x52));
+    }
+
+    #[tokio::test]
+    async fn stalled_logical_stream_does_not_block_an_unrelated_stream() {
+        let (client_carrier, server_carrier) = carrier_pair();
+        let local = client_carrier.local_node_id.clone();
+        let peer = client_carrier.peer_node_id.clone();
+        let scope = Id::generate().to_string();
+        let mut acceptor = accept_routed_stream_carrier(server_carrier);
+        let (stalled_accepted, wait_for_stalled_accept) = oneshot::channel();
+        let server = tokio::spawn(async move {
             let _stalled = acceptor
                 .accept()
                 .await
                 .expect("accept stalled stream")
                 .expect("stalled stream");
+            let _ = stalled_accepted.send(());
             let mut healthy = acceptor
                 .accept()
                 .await
@@ -1594,9 +1512,12 @@ mod tests {
         .await
         .expect("stalled logical stream");
         let stalled_writer = tokio::spawn(async move {
-            let bytes = vec![0x5a; ROUTED_STREAM_MUX_DATA_BYTES * 32];
+            let bytes = vec![0x5a; crate::owned_chunk::RPC_RECORD_MAX * 32];
             stalled.write_all(&bytes).await
         });
+        wait_for_stalled_accept
+            .await
+            .expect("stalled stream was published first");
 
         let mut healthy = open_pooled_routed_stream(
             scope.clone(),

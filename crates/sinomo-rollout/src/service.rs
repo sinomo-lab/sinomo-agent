@@ -4,7 +4,7 @@
 //! data directory and works with no daemon and no cluster. Binary/build activation
 //! routes still need daemon-local process ownership and remain daemon adapters.
 
-use sinomo_core::network::{ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_core::network::ObjectRpcRequest;
 use sinomo_core::service::{
     Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
     ServiceRegistryBuilder, ServiceRoute,
@@ -43,13 +43,11 @@ impl Service for RolloutService {
         Box::pin(async move {
             match request.route.as_str() {
                 ROLLOUT_DIAGNOSTICS_ROUTE => {
-                    let _: () = request.decode_body()?;
+                    let _: () = ctx.decode_request_body(&request).await?;
                     let rollout_paths = SelfRolloutPaths::new(&ctx.data_dir.root());
                     let report = rollout_diagnostics_report(&rollout_paths)
                         .map_err(|error| ServiceError::Service(error.to_string()))?;
-                    let response =
-                        ObjectRpcResponse::encode_body(ROLLOUT_DIAGNOSTICS_ROUTE, &report)?;
-                    ctx.respond(response)?;
+                    ctx.respond_value(ROLLOUT_DIAGNOSTICS_ROUTE, report)?;
                     Ok(ServiceDisposition::Continue)
                 }
                 other => Err(ServiceError::UnknownRoute(other.to_string())),

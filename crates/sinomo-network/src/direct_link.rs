@@ -8,6 +8,7 @@ use crate::error::NetworkError;
 use serde::{Deserialize, Serialize};
 use sinomo_base::{ClusterEndpointRecord, ClusterTransportKind, Id};
 use sinomo_node::NodeId;
+use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -22,9 +23,24 @@ const AUTHENTICATED_TRANSPORT_PRELUDE_HEADER_BYTES: usize = 46;
 ///
 /// Framing and application protocols live above this boundary. Implementors
 /// preserve byte order and half-close behavior without interpreting bytes.
-pub trait NetworkDuplexStream: AsyncRead + AsyncWrite + Unpin + Send {}
+pub trait NetworkDuplexStream: AsyncRead + AsyncWrite + Unpin + Send {
+    fn as_any(&self) -> &dyn Any;
 
-impl<T> NetworkDuplexStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send>;
+}
+
+impl<T> NetworkDuplexStream for T
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
+        self
+    }
+}
 
 pub type BoxedNetworkStream = Box<dyn NetworkDuplexStream>;
 

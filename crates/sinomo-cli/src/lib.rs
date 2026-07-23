@@ -150,6 +150,7 @@ use sinomo_runtime::daemon::{
     send_daemon_rollout_diagnostics_to_endpoint as daemon_send_daemon_rollout_diagnostics_to_endpoint,
     send_daemon_rollout_native_dylib_module as daemon_send_daemon_rollout_native_dylib_module,
     send_daemon_rollout_native_dylib_module_to_endpoint as daemon_send_daemon_rollout_native_dylib_module_to_endpoint,
+    send_daemon_rollout_native_dylib_module_to_target as daemon_send_daemon_rollout_native_dylib_module_to_target,
     send_daemon_rpc as daemon_send_daemon_rpc,
     send_daemon_rpc_call_async as daemon_send_daemon_rpc_call_async,
     send_daemon_rpc_to_endpoint as daemon_send_daemon_rpc_to_endpoint,

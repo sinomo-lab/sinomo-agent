@@ -6,11 +6,13 @@
 //! streamed body is a typed value or a semantic attachment. Routing and the
 //! stream protocol never inspect either service type.
 
+#[cfg(test)]
+use crate::object_rpc_stream::call_object_rpc_stream_with_consumption;
 use crate::object_rpc_stream::{
     ObjectRpcStreamBody, ObjectRpcStreamCall, ObjectRpcStreamIncomingBody,
     ObjectRpcStreamIncomingCall, ObjectRpcStreamReply, ObjectRpcStreamResponse, RpcDeliveryOutcome,
-    RpcPeerContext, RpcResponseConsumption, call_object_rpc_stream_with_consumption,
-    serve_object_rpc_stream,
+    RpcPeerContext, RpcResponseConsumption, call_object_rpc_chunk_stream_with_consumption,
+    serve_object_rpc_chunk_stream, serve_object_rpc_stream,
 };
 use crate::rpc_body::{
     ObjectRpcBodyRole, ObjectRpcCall, ObjectRpcIncomingBody, ObjectRpcIncomingRequest,
@@ -18,12 +20,13 @@ use crate::rpc_body::{
 };
 use crate::{
     NetworkDeliveryState, NetworkError, ObjectFrameIoOptions, ObjectRpcRequest, ObjectRpcResponse,
-    SinomoObjectCodec,
+    PeerStream, SinomoObjectCodec,
 };
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
-use tokio::io::{AsyncReadExt, AsyncWrite};
+#[cfg(test)]
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
 
 const SERVICE_RPC_HEAD_SCHEMA: &str = "sinomo.service-rpc.head.v1";
 
@@ -32,6 +35,12 @@ struct ServiceRequestHead {
     schema: String,
     request: ObjectRpcRequest,
     body_role: ObjectRpcBodyRole,
+    /// Digest over the encoded value and request metadata before the value is
+    /// moved into the body stream. This field sits inside the authenticated
+    /// object-RPC head, allowing daemon authorization to bind the signed
+    /// request without materializing the streamed value first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_digest_sha256: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -43,6 +52,62 @@ struct ServiceResponseHead {
 
 fn encode_service_head<T: Serialize>(head: &T) -> Result<Vec<u8>, NetworkError> {
     SinomoObjectCodec::network_frame().encode(head)
+}
+
+#[inline]
+fn service_timeline_started_ns(trace: Option<crate::NetworkTimelineTraceContext>) -> u64 {
+    trace
+        .map(|_| crate::network_timeline_monotonic_ns())
+        .unwrap_or(0)
+}
+
+#[inline]
+fn record_service_timeline_duration_ns(
+    trace: Option<crate::NetworkTimelineTraceContext>,
+    stage: u16,
+    flags: u16,
+    duration_ns: u64,
+    success: bool,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    crate::record_network_timeline_event_now(crate::NetworkTimelineEvent::new(
+        trace,
+        stage,
+        flags
+            | if success {
+                crate::network_timeline_flag::SUCCESS
+            } else {
+                0
+            },
+        0,
+        0,
+        0,
+        0,
+        0,
+        duration_ns,
+    ));
+}
+
+#[inline]
+fn record_service_timeline_since(
+    trace: Option<crate::NetworkTimelineTraceContext>,
+    stage: u16,
+    flags: u16,
+    started_ns: u64,
+    success: bool,
+) {
+    if trace.is_none() {
+        return;
+    }
+    record_service_timeline_duration_ns(
+        trace,
+        stage,
+        flags,
+        crate::network_timeline_monotonic_ns().saturating_sub(started_ns),
+        success,
+    );
 }
 
 fn decode_service_request_head(bytes: &[u8]) -> Result<ServiceRequestHead, NetworkError> {
@@ -86,48 +151,15 @@ fn validate_service_body_role(
 }
 
 fn bridge_stream_body(body: ObjectRpcStreamIncomingBody) -> ObjectRpcIncomingBody {
-    let total_bytes = body.total_bytes();
-    let (mut sender, incoming) = ObjectRpcIncomingBody::multiplexed_channel(total_bytes);
-    tokio::spawn(async move {
-        let mut body = body;
-        let mut received_bytes = 0_u64;
-        let mut buffer =
-            vec![0_u8; crate::object_rpc_stream::OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES];
-        let result = async {
-            loop {
-                let read = body
-                    .read(&mut buffer)
-                    .await
-                    .map_err(|source| NetworkError::Io {
-                        operation: "bridge stream-native service body".to_string(),
-                        detail: source.to_string(),
-                    })?;
-                if read == 0 {
-                    body.verifier().verify().await?;
-                    return sender.finish(received_bytes).await;
-                }
-                received_bytes = received_bytes.checked_add(read as u64).ok_or_else(|| {
-                    NetworkError::Serialization {
-                        detail: "stream-native service body length overflow".to_string(),
-                    }
-                })?;
-                if !sender.send(Bytes::copy_from_slice(&buffer[..read])).await? {
-                    // The public consumer has gone away. Keep draining the
-                    // incoming body so its authenticated finish and the peer's
-                    // response lifecycle can still complete.
-                }
-            }
-        }
-        .await;
-        if let Err(error) = result {
-            sender.fail(error.to_string());
-        }
-    });
-    incoming
+    // The protocol pump already owns the application body's bounded channel.
+    // Move it across this service adapter instead of spawning a second pump
+    // and copying every transport chunk through an intermediate buffer.
+    body.into_application_body()
 }
 
 async fn service_request_from_stream(
     incoming: ObjectRpcStreamIncomingCall,
+    preserve_streamed_value: bool,
 ) -> Result<ObjectRpcIncomingRequest, NetworkError> {
     let ObjectRpcStreamIncomingCall {
         request_id: _,
@@ -136,13 +168,34 @@ async fn service_request_from_stream(
         metadata,
         application_head,
         body,
+        request_ingress_duration_ns,
     } = incoming;
     if !metadata.is_empty() {
         return Err(NetworkError::Serialization {
             detail: "service RPC outer request metadata must be empty".to_string(),
         });
     }
+    let decode_started_ns = if crate::network_timeline_capture_is_active() {
+        crate::network_timeline_monotonic_ns()
+    } else {
+        0
+    };
     let mut head = decode_service_request_head(&application_head)?;
+    let timeline_trace = crate::network_timeline_trace_context_for_request(&head.request);
+    record_service_timeline_duration_ns(
+        timeline_trace,
+        crate::network_timeline_stage::RPC_REQUEST_INGRESS,
+        crate::network_timeline_flag::REQUEST,
+        request_ingress_duration_ns,
+        true,
+    );
+    record_service_timeline_since(
+        timeline_trace,
+        crate::network_timeline_stage::SERVICE_REQUEST_DECODE,
+        crate::network_timeline_flag::REQUEST,
+        decode_started_ns,
+        true,
+    );
     if head.request.route != method || head.request.operation_id() != operation_id.as_deref() {
         return Err(NetworkError::AuthDenied);
     }
@@ -155,8 +208,16 @@ async fn service_request_from_stream(
                     detail: "service RPC value is present in both head and stream".to_string(),
                 });
             }
-            head.request.body = body.materialize_to_vec().await?;
-            Ok(ObjectRpcIncomingRequest::value(head.request))
+            if preserve_streamed_value {
+                Ok(ObjectRpcIncomingRequest::streamed_value(
+                    head.request,
+                    bridge_stream_body(body),
+                    head.request_digest_sha256,
+                ))
+            } else {
+                head.request.body = body.materialize_to_vec().await?;
+                Ok(ObjectRpcIncomingRequest::value(head.request))
+            }
         }
         ObjectRpcBodyRole::Attachment => Ok(ObjectRpcIncomingRequest::new(
             head.request,
@@ -168,24 +229,37 @@ async fn service_request_from_stream(
 fn service_reply_to_stream(
     request_id: sinomo_base::Id,
     response: ObjectRpcOutgoingResponse,
+    timeline_trace: Option<crate::NetworkTimelineTraceContext>,
 ) -> Result<ObjectRpcStreamReply, NetworkError> {
+    let encode_started_ns = service_timeline_started_ns(timeline_trace);
     let (response, body_role, body) = response.into_stream_native_parts();
-    let application_head = encode_service_head(&ServiceResponseHead {
+    let application_head_result = encode_service_head(&ServiceResponseHead {
         schema: SERVICE_RPC_HEAD_SCHEMA.to_string(),
         response,
         body_role,
-    })?;
+    });
+    record_service_timeline_since(
+        timeline_trace,
+        crate::network_timeline_stage::SERVICE_RESPONSE_ENCODE,
+        crate::network_timeline_flag::RESPONSE,
+        encode_started_ns,
+        application_head_result.is_ok(),
+    );
+    let application_head = application_head_result?;
     Ok(ObjectRpcStreamReply {
         request_id,
         metadata: Default::default(),
         application_head,
         body: ObjectRpcStreamBody::source(body),
+        timeline_trace,
     })
 }
 
 async fn service_result_from_stream(
     expected_route: String,
     response: ObjectRpcStreamResponse,
+    preserve_streamed_value: bool,
+    timeline_trace: Option<crate::NetworkTimelineTraceContext>,
 ) -> Result<RpcResponseConsumption<ObjectRpcResult>, NetworkError> {
     let ObjectRpcStreamResponse {
         metadata,
@@ -197,7 +271,16 @@ async fn service_result_from_stream(
             detail: "service RPC outer response metadata must be empty".to_string(),
         });
     }
-    let mut head = decode_service_response_head(&application_head)?;
+    let decode_started_ns = service_timeline_started_ns(timeline_trace);
+    let head_result = decode_service_response_head(&application_head);
+    record_service_timeline_since(
+        timeline_trace,
+        crate::network_timeline_stage::SERVICE_RESPONSE_DECODE,
+        crate::network_timeline_flag::RESPONSE,
+        decode_started_ns,
+        head_result.is_ok(),
+    );
+    let mut head = head_result?;
     if head.response.route != expected_route {
         return Err(NetworkError::AuthDenied);
     }
@@ -213,10 +296,16 @@ async fn service_result_from_stream(
                         .to_string(),
                 });
             }
-            head.response.body = body.materialize_to_vec().await?;
-            Ok(RpcResponseConsumption::Complete(ObjectRpcResult::value(
-                head.response,
-            )))
+            if preserve_streamed_value {
+                Ok(RpcResponseConsumption::Streaming(
+                    ObjectRpcResult::streamed_value(head.response, bridge_stream_body(body)),
+                ))
+            } else {
+                head.response.body = body.materialize_to_vec().await?;
+                Ok(RpcResponseConsumption::Complete(ObjectRpcResult::value(
+                    head.response,
+                )))
+            }
         }
         ObjectRpcBodyRole::Attachment => Ok(RpcResponseConsumption::Streaming(
             ObjectRpcResult::new(head.response, bridge_stream_body(body)),
@@ -224,25 +313,38 @@ async fn service_result_from_stream(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn call_service_rpc_stream<S>(
     stream: S,
     context: &RpcPeerContext,
     call: ObjectRpcCall,
     request_auth: Vec<u8>,
+    request_digest_sha256: [u8; 32],
     options: ObjectFrameIoOptions,
 ) -> Result<ObjectRpcResult, NetworkError>
 where
     S: tokio::io::AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let timeline_trace = crate::network_timeline_trace_context_for_request(&call.request);
     let operation_id = call.request.operation_id().map(str::to_string);
     let route = call.request.route.clone();
     let (mut request, body_role, body) = call.into_stream_native_parts();
     request.auth = Some(request_auth);
-    let application_head = encode_service_head(&ServiceRequestHead {
+    let encode_started_ns = service_timeline_started_ns(timeline_trace);
+    let application_head_result = encode_service_head(&ServiceRequestHead {
         schema: SERVICE_RPC_HEAD_SCHEMA.to_string(),
         request,
         body_role,
-    })?;
+        request_digest_sha256: Some(request_digest_sha256),
+    });
+    record_service_timeline_since(
+        timeline_trace,
+        crate::network_timeline_stage::SERVICE_REQUEST_ENCODE,
+        crate::network_timeline_flag::REQUEST,
+        encode_started_ns,
+        application_head_result.is_ok(),
+    );
+    let application_head = application_head_result?;
     let stream_call = ObjectRpcStreamCall {
         request_id: sinomo_base::Id::generate(),
         method: route.clone(),
@@ -250,13 +352,14 @@ where
         metadata: Default::default(),
         application_head,
         body: ObjectRpcStreamBody::source(body),
+        timeline_trace,
     };
     match call_object_rpc_stream_with_consumption(
         stream,
         context,
         stream_call,
         options,
-        move |response| service_result_from_stream(route, response),
+        move |response| service_result_from_stream(route, response, false, timeline_trace),
     )
     .await
     {
@@ -289,6 +392,89 @@ where
     }
 }
 
+pub async fn call_service_rpc_peer_stream(
+    stream: PeerStream,
+    context: &RpcPeerContext,
+    call: ObjectRpcCall,
+    request_auth: Vec<u8>,
+    request_digest_sha256: [u8; 32],
+    options: ObjectFrameIoOptions,
+) -> Result<ObjectRpcResult, NetworkError> {
+    if !stream.has_owned_chunks() {
+        return Err(NetworkError::Io {
+            operation: "dispatch owned stream-native service RPC".to_string(),
+            detail: "peer stream does not expose the canonical owned-chunk transport; use the explicit byte compatibility entrypoint"
+                .to_string(),
+        });
+    }
+    let timeline_trace = crate::network_timeline_trace_context_for_request(&call.request);
+    let operation_id = call.request.operation_id().map(str::to_string);
+    let route = call.request.route.clone();
+    let (mut request, body_role, body) = call.into_stream_native_parts();
+    request.auth = Some(request_auth);
+    let encode_started_ns = service_timeline_started_ns(timeline_trace);
+    let application_head_result = encode_service_head(&ServiceRequestHead {
+        schema: SERVICE_RPC_HEAD_SCHEMA.to_string(),
+        request,
+        body_role,
+        request_digest_sha256: Some(request_digest_sha256),
+    });
+    record_service_timeline_since(
+        timeline_trace,
+        crate::network_timeline_stage::SERVICE_REQUEST_ENCODE,
+        crate::network_timeline_flag::REQUEST,
+        encode_started_ns,
+        application_head_result.is_ok(),
+    );
+    let application_head = application_head_result?;
+    let stream_call = ObjectRpcStreamCall {
+        request_id: sinomo_base::Id::generate(),
+        method: route.clone(),
+        operation_id: operation_id.clone(),
+        metadata: Default::default(),
+        application_head,
+        body: ObjectRpcStreamBody::source(body),
+        timeline_trace,
+    };
+    let chunks = stream.into_chunk_stream()?;
+    match call_object_rpc_chunk_stream_with_consumption(
+        chunks,
+        context,
+        stream_call,
+        options,
+        move |response| service_result_from_stream(route, response, true, timeline_trace),
+    )
+    .await
+    {
+        RpcDeliveryOutcome::Completed(result) => Ok(result),
+        RpcDeliveryOutcome::Rejected { detail } => {
+            if detail == NetworkError::AuthDenied.to_string() {
+                Err(NetworkError::AuthDenied)
+            } else {
+                Err(NetworkError::delivery_failed(
+                    "dispatch owned stream-native service RPC",
+                    NetworkDeliveryState::PossiblyApplied,
+                    detail,
+                ))
+            }
+        }
+        RpcDeliveryOutcome::NotSent { error } => Err(if error.delivery_state().is_some() {
+            error
+        } else {
+            NetworkError::delivery_failed(
+                "send owned stream-native service RPC",
+                NetworkDeliveryState::DefinitelyNotSent,
+                error.to_string(),
+            )
+        }),
+        RpcDeliveryOutcome::PossiblyApplied { error } => Err(NetworkError::outcome_unknown(
+            "owned stream-native service RPC",
+            operation_id.as_deref(),
+            error.to_string(),
+        )),
+    }
+}
+
 pub async fn serve_service_rpc_stream<S, F, Fut>(
     stream: S,
     context: &RpcPeerContext,
@@ -302,9 +488,56 @@ where
 {
     serve_object_rpc_stream(stream, context, options, move |incoming, peer| async move {
         let request_id = incoming.request_id.clone();
-        let request = service_request_from_stream(incoming).await?;
-        let response = handler(request, peer).await?;
-        service_reply_to_stream(request_id, response)
+        let request = service_request_from_stream(incoming, false).await?;
+        let timeline_trace = crate::network_timeline_trace_context_for_request(&request.request);
+        let handler_started_ns = service_timeline_started_ns(timeline_trace);
+        let response_result = handler(request, peer).await;
+        record_service_timeline_since(
+            timeline_trace,
+            crate::network_timeline_stage::SERVICE_HANDLER,
+            crate::network_timeline_flag::REQUEST | crate::network_timeline_flag::RESPONSE,
+            handler_started_ns,
+            response_result.is_ok(),
+        );
+        let response = response_result?;
+        service_reply_to_stream(request_id, response, timeline_trace)
+    })
+    .await
+}
+
+pub async fn serve_service_rpc_peer_stream<F, Fut>(
+    stream: PeerStream,
+    context: &RpcPeerContext,
+    options: ObjectFrameIoOptions,
+    handler: F,
+) -> Result<(), NetworkError>
+where
+    F: FnOnce(ObjectRpcIncomingRequest, RpcPeerContext) -> Fut,
+    Fut: Future<Output = Result<ObjectRpcOutgoingResponse, NetworkError>>,
+{
+    if !stream.has_owned_chunks() {
+        return Err(NetworkError::Io {
+            operation: "serve owned stream-native service RPC".to_string(),
+            detail: "peer stream does not expose the canonical owned-chunk transport; use the explicit byte compatibility entrypoint"
+                .to_string(),
+        });
+    }
+    let chunks = stream.into_chunk_stream()?;
+    serve_object_rpc_chunk_stream(chunks, context, options, move |incoming, peer| async move {
+        let request_id = incoming.request_id.clone();
+        let request = service_request_from_stream(incoming, true).await?;
+        let timeline_trace = crate::network_timeline_trace_context_for_request(&request.request);
+        let handler_started_ns = service_timeline_started_ns(timeline_trace);
+        let response_result = handler(request, peer).await;
+        record_service_timeline_since(
+            timeline_trace,
+            crate::network_timeline_stage::SERVICE_HANDLER,
+            crate::network_timeline_flag::REQUEST | crate::network_timeline_flag::RESPONSE,
+            handler_started_ns,
+            response_result.is_ok(),
+        );
+        let response = response_result?;
+        service_reply_to_stream(request_id, response, timeline_trace)
     })
     .await
 }
@@ -373,11 +606,14 @@ mod tests {
             "test.service-stream",
             vec![7; request_bytes],
         );
+        let call = ObjectRpcCall::value(request);
+        let request_digest_sha256 = crate::daemon_auth::daemon_rpc_call_sha256(&call)?;
         let result = call_service_rpc_stream(
             client,
             &client_context,
-            ObjectRpcCall::value(request),
+            call,
             b"test-auth".to_vec(),
+            request_digest_sha256,
             ObjectFrameIoOptions::default(),
         )
         .await?;
@@ -470,18 +706,21 @@ mod tests {
             )
             .await
         });
+        let call = ObjectRpcCall::new(
+            ObjectRpcRequest::from_encoded_body(
+                "/test/service-attachment",
+                "test.service-attachment",
+                b"typed-head".to_vec(),
+            ),
+            crate::ObjectRpcBodySource::bytes(vec![3; bytes]),
+        );
+        let request_digest_sha256 = crate::daemon_auth::daemon_rpc_call_sha256(&call)?;
         let result = call_service_rpc_stream(
             client,
             &client_context,
-            ObjectRpcCall::new(
-                ObjectRpcRequest::from_encoded_body(
-                    "/test/service-attachment",
-                    "test.service-attachment",
-                    b"typed-head".to_vec(),
-                ),
-                crate::ObjectRpcBodySource::bytes(vec![3; bytes]),
-            ),
+            call,
             b"origin-auth".to_vec(),
+            request_digest_sha256,
             ObjectFrameIoOptions::default(),
         )
         .await?;
@@ -515,7 +754,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_service_attachment_reports_a_terminal_digest_failure() {
+    async fn streaming_service_attachment_reports_a_known_digest_failure() {
         let bytes = crate::object_rpc_stream::OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES + 1;
         let (client, server) = tokio::io::duplex(2 * OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES);
         let client_context = local_context();
@@ -543,21 +782,26 @@ mod tests {
                         metadata: Default::default(),
                         application_head,
                         body,
+                        timeline_trace: None,
                     })
                 },
             )
             .await
         });
 
+        let call = ObjectRpcCall::value(ObjectRpcRequest::from_encoded_body(
+            "/test/service-corrupt-attachment",
+            "test.service-corrupt-attachment",
+            b"typed-request-head".to_vec(),
+        ));
+        let request_digest_sha256 =
+            crate::daemon_auth::daemon_rpc_call_sha256(&call).expect("request digest");
         let result = call_service_rpc_stream(
             client,
             &client_context,
-            ObjectRpcCall::value(ObjectRpcRequest::from_encoded_body(
-                "/test/service-corrupt-attachment",
-                "test.service-corrupt-attachment",
-                b"typed-request-head".to_vec(),
-            )),
+            call,
             b"origin-auth".to_vec(),
+            request_digest_sha256,
             ObjectFrameIoOptions::default(),
         )
         .await
@@ -568,7 +812,10 @@ mod tests {
             .await
             .expect_err("corrupt response attachment must fail while streaming");
         assert!(
-            error.to_string().contains("body reader ended")
+            error
+                .to_string()
+                .contains("network authorization was denied")
+                || error.to_string().contains("body reader ended")
                 || error
                     .to_string()
                     .contains("changed after its authenticated descriptor")
@@ -635,11 +882,13 @@ mod tests {
                 move |request, _| async move {
                     assert_eq!(request.body.total_bytes(), Some(request_bytes as u64));
                     let call = ObjectRpcCall::from_forwarded_body(request.request, request.body);
+                    let request_digest_sha256 = crate::daemon_auth::daemon_rpc_call_sha256(&call)?;
                     let result = call_service_rpc_stream(
                         proxy_outgoing,
                         &downstream_proxy_context,
                         call,
                         b"proxy-auth".to_vec(),
+                        request_digest_sha256,
                         ObjectFrameIoOptions::default(),
                     )
                     .await?;
@@ -650,18 +899,22 @@ mod tests {
             .await
         });
 
+        let call = ObjectRpcCall::new(
+            ObjectRpcRequest::from_encoded_body(
+                "/test/service-proxy-attachment",
+                "test.service-proxy-attachment",
+                b"proxied-request-head".to_vec(),
+            ),
+            crate::ObjectRpcBodySource::zeroes(request_bytes as u64),
+        );
+        let request_digest_sha256 =
+            crate::daemon_auth::daemon_rpc_call_sha256(&call).expect("request digest");
         let result = call_service_rpc_stream(
             client,
             &upstream_client_context,
-            ObjectRpcCall::new(
-                ObjectRpcRequest::from_encoded_body(
-                    "/test/service-proxy-attachment",
-                    "test.service-proxy-attachment",
-                    b"proxied-request-head".to_vec(),
-                ),
-                crate::ObjectRpcBodySource::zeroes(request_bytes as u64),
-            ),
+            call,
             b"origin-auth".to_vec(),
+            request_digest_sha256,
             ObjectFrameIoOptions::default(),
         )
         .await

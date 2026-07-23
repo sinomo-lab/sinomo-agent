@@ -151,6 +151,15 @@ pub fn decode_cluster_kv_authoritative_snapshot_rpc_body(
     body: &[u8],
 ) -> Result<KvAuthoritativeRead<KvSnapshot>, KvError> {
     let response: KvAuthoritativeRead<KvSnapshot> = decode_cluster_kv_rpc_body(body)?;
+    validate_cluster_kv_authoritative_snapshot_read(&response)?;
+    Ok(response)
+}
+
+/// Applies the authoritative snapshot invariants after either contiguous or
+/// stream-native SOBJ decoding.
+pub fn validate_cluster_kv_authoritative_snapshot_read(
+    response: &KvAuthoritativeRead<KvSnapshot>,
+) -> Result<(), KvError> {
     response.value.validate_resource_bounds()?;
     validate_cluster_kv_current_term_authority_proof(&response.authority)?;
     if response.authority.revision != response.value.revision {
@@ -161,7 +170,7 @@ pub fn decode_cluster_kv_authoritative_snapshot_rpc_body(
             ),
         });
     }
-    Ok(response)
+    Ok(())
 }
 
 pub fn cluster_kv_authoritative_range_prefix_rpc_payload(
@@ -264,7 +273,7 @@ pub fn decode_cluster_kv_authoritative_watch_start_rpc_body(
     Ok(response)
 }
 
-fn validate_cluster_kv_authoritative_watch_start_response(
+pub fn validate_cluster_kv_authoritative_watch_start_response(
     response: &KvAuthoritativeRead<ClusterKvWatchRegistration>,
 ) -> Result<(), KvError> {
     validate_cluster_kv_current_term_authority_proof(&response.authority)?;
@@ -330,7 +339,7 @@ pub fn decode_cluster_kv_request_outcome_rpc_body(
     Ok(read)
 }
 
-fn validate_cluster_kv_request_outcome_read(
+pub fn validate_cluster_kv_request_outcome_read(
     read: &ClusterKvRequestOutcomeRead,
 ) -> Result<(), KvError> {
     validate_cluster_kv_current_term_authority_proof(&read.authority)?;
@@ -691,6 +700,57 @@ pub trait ClusterKvLocalReadWatchHost {
     ) -> Result<ClusterKvWatchCancelResponse, Self::Error>;
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClusterKvLocalReadWatchRequest {
+    RangePrefix(String),
+    CreateWatch(ClusterKvWatchPrefixRequest),
+    DrainWatch(ClusterKvWatchDrainRequest),
+    CancelWatch(ClusterKvWatchCancelRequest),
+}
+
+pub fn handle_cluster_kv_local_read_watch_request<H>(
+    request: ClusterKvLocalReadWatchRequest,
+    host: &mut H,
+) -> Result<ClusterKvRpcPayload, H::Error>
+where
+    H: ClusterKvLocalReadWatchHost,
+{
+    match request {
+        ClusterKvLocalReadWatchRequest::RangePrefix(prefix) => {
+            let result = host.range_prefix(&prefix)?;
+            Ok(ClusterKvRpcPayload {
+                route: CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE,
+                category: CLUSTER_KV_RPC_CATEGORY,
+                body: encode_cluster_kv_rpc_body(&result).map_err(H::kv_error)?,
+            })
+        }
+        ClusterKvLocalReadWatchRequest::CreateWatch(request) => {
+            let result = host.create_watch(request)?;
+            Ok(ClusterKvRpcPayload {
+                route: CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE,
+                category: CLUSTER_KV_RPC_CATEGORY,
+                body: encode_cluster_kv_rpc_body(&result).map_err(H::kv_error)?,
+            })
+        }
+        ClusterKvLocalReadWatchRequest::DrainWatch(request) => {
+            let result = host.drain_watch(request)?;
+            Ok(ClusterKvRpcPayload {
+                route: CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE,
+                category: CLUSTER_KV_RPC_CATEGORY,
+                body: encode_cluster_kv_rpc_body(&result).map_err(H::kv_error)?,
+            })
+        }
+        ClusterKvLocalReadWatchRequest::CancelWatch(request) => {
+            let result = host.cancel_watch(request)?;
+            Ok(ClusterKvRpcPayload {
+                route: CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE,
+                category: CLUSTER_KV_RPC_CATEGORY,
+                body: encode_cluster_kv_rpc_body(&result).map_err(H::kv_error)?,
+            })
+        }
+    }
+}
+
 pub fn handle_cluster_kv_local_read_watch_rpc_payload<H>(
     route: &str,
     body: &[u8],
@@ -699,47 +759,20 @@ pub fn handle_cluster_kv_local_read_watch_rpc_payload<H>(
 where
     H: ClusterKvLocalReadWatchHost,
 {
-    let payload = match route {
-        CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE => {
-            let prefix: String = decode_cluster_kv_rpc_body(body).map_err(H::kv_error)?;
-            let result = host.range_prefix(&prefix)?;
-            ClusterKvRpcPayload {
-                route: CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE,
-                category: CLUSTER_KV_RPC_CATEGORY,
-                body: encode_cluster_kv_rpc_body(&result).map_err(H::kv_error)?,
-            }
-        }
-        CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE => {
-            let request: ClusterKvWatchPrefixRequest =
-                decode_cluster_kv_rpc_body(body).map_err(H::kv_error)?;
-            let result = host.create_watch(request)?;
-            ClusterKvRpcPayload {
-                route: CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE,
-                category: CLUSTER_KV_RPC_CATEGORY,
-                body: encode_cluster_kv_rpc_body(&result).map_err(H::kv_error)?,
-            }
-        }
-        CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE => {
-            let request: ClusterKvWatchDrainRequest =
-                decode_cluster_kv_rpc_body(body).map_err(H::kv_error)?;
-            let result = host.drain_watch(request)?;
-            ClusterKvRpcPayload {
-                route: CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE,
-                category: CLUSTER_KV_RPC_CATEGORY,
-                body: encode_cluster_kv_rpc_body(&result).map_err(H::kv_error)?,
-            }
-        }
-        CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE => {
-            let request: ClusterKvWatchCancelRequest =
-                decode_cluster_kv_rpc_body(body).map_err(H::kv_error)?;
-            let result = host.cancel_watch(request)?;
-            ClusterKvRpcPayload {
-                route: CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE,
-                category: CLUSTER_KV_RPC_CATEGORY,
-                body: encode_cluster_kv_rpc_body(&result).map_err(H::kv_error)?,
-            }
-        }
+    let request = match route {
+        CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE => ClusterKvLocalReadWatchRequest::RangePrefix(
+            decode_cluster_kv_rpc_body(body).map_err(H::kv_error)?,
+        ),
+        CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE => ClusterKvLocalReadWatchRequest::CreateWatch(
+            decode_cluster_kv_rpc_body(body).map_err(H::kv_error)?,
+        ),
+        CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE => ClusterKvLocalReadWatchRequest::DrainWatch(
+            decode_cluster_kv_rpc_body(body).map_err(H::kv_error)?,
+        ),
+        CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE => ClusterKvLocalReadWatchRequest::CancelWatch(
+            decode_cluster_kv_rpc_body(body).map_err(H::kv_error)?,
+        ),
         _ => return Ok(None),
     };
-    Ok(Some(payload))
+    handle_cluster_kv_local_read_watch_request(request, host).map(Some)
 }

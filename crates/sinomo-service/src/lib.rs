@@ -189,8 +189,45 @@ impl ServiceContext {
         std::mem::take(&mut self.request_body)
     }
 
-    fn request_body_is_empty(&self) -> bool {
-        self.request_body.is_empty()
+    /// Whether this call carries a semantic attachment in addition to its
+    /// ordinary typed request value.
+    pub fn has_request_attachment(&self) -> bool {
+        self.request_body.is_attachment()
+    }
+
+    /// Decodes the ordinary typed request value directly from transport-owned
+    /// chunks when it arrived through the stream-native value path.
+    ///
+    /// A semantic attachment is independent of the typed request head. In that
+    /// case this decodes `request.body` and leaves the attachment available to
+    /// [`Self::take_request_body`].
+    pub async fn decode_request_body<T>(
+        &mut self,
+        request: &ObjectRpcRequest,
+    ) -> Result<T, ServiceError>
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
+        if self.request_body.is_streamed_value() {
+            return Ok(std::mem::take(&mut self.request_body).decode_sobj().await?);
+        }
+        Ok(request.decode_body()?)
+    }
+
+    async fn materialize_request_value(
+        &mut self,
+        request: &mut ObjectRpcRequest,
+    ) -> Result<(), ServiceError> {
+        if self.request_body.is_streamed_value() {
+            request.body = std::mem::take(&mut self.request_body)
+                .collect_to_vec(usize::MAX)
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn request_attachment_is_empty(&self) -> bool {
+        !self.has_request_attachment()
     }
 
     fn set_response_body_mode(&mut self, mode: ServiceBodyMode) {
@@ -207,6 +244,50 @@ impl ServiceContext {
     /// Send a response without a body attachment.
     pub fn respond(&mut self, response: ObjectRpcResponse) -> Result<(), ServiceError> {
         self.respond_with_body(response, ObjectRpcBodySource::default())
+    }
+
+    /// Encodes an ordinary typed response directly into transport-shaped
+    /// segments that the owned path adopts without payload copies.
+    pub fn respond_borrowed_value<T: serde::Serialize + ?Sized>(
+        &mut self,
+        route: impl Into<String>,
+        value: &T,
+    ) -> Result<(), ServiceError> {
+        let sink = self.response_sink.take().ok_or_else(|| {
+            ServiceError::Service("service response was already sent".to_string())
+        })?;
+        sink.send(ObjectRpcOutgoingResponse::encode_borrowed_value(
+            route, value,
+        )?)
+    }
+
+    /// Sends an owned ordinary response value. Values larger than one network
+    /// record remain as their Rust representation until the transport grants
+    /// slab credit, then serialize directly into those owned slabs.
+    pub fn respond_value<T>(
+        &mut self,
+        route: impl Into<String>,
+        value: T,
+    ) -> Result<(), ServiceError>
+    where
+        T: serde::Serialize + Send + 'static,
+    {
+        let sink = self.response_sink.take().ok_or_else(|| {
+            ServiceError::Service("service response was already sent".to_string())
+        })?;
+        sink.send(ObjectRpcOutgoingResponse::encode_value(route, value)?)
+    }
+
+    #[doc(hidden)]
+    pub fn respond_owned_value<T>(
+        &mut self,
+        route: impl Into<String>,
+        value: T,
+    ) -> Result<(), ServiceError>
+    where
+        T: serde::Serialize + Send + 'static,
+    {
+        self.respond_value(route, value)
     }
 
     /// Send a response with an optional body source managed by `sinomo-network`.
@@ -273,6 +354,18 @@ pub enum ServiceBodyMode {
     Required,
 }
 
+/// How an ordinary typed request value crosses the final service boundary.
+///
+/// Stream-native incremental decoding is the default. A compatibility route
+/// must opt in explicitly when its handler still requires one contiguous
+/// encoded request buffer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ServiceRequestValueMode {
+    BufferedCompatibility,
+    #[default]
+    Incremental,
+}
+
 /// Current capacity of one method in the active service registry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceRouteReadiness {
@@ -309,6 +402,7 @@ pub struct ServiceRoute {
     pub timeout_ms: Option<u64>,
     pub request_body_mode: ServiceBodyMode,
     pub response_body_mode: ServiceBodyMode,
+    pub request_value_mode: ServiceRequestValueMode,
 }
 
 impl ServiceRoute {
@@ -327,6 +421,7 @@ impl ServiceRoute {
             timeout_ms: None,
             request_body_mode: ServiceBodyMode::None,
             response_body_mode: ServiceBodyMode::None,
+            request_value_mode: ServiceRequestValueMode::Incremental,
         }
     }
 
@@ -419,6 +514,18 @@ impl ServiceRoute {
         self.response_body_mode = mode;
         self
     }
+
+    pub fn with_incremental_request_value(mut self) -> Self {
+        self.request_value_mode = ServiceRequestValueMode::Incremental;
+        self
+    }
+
+    /// Explicit compatibility boundary for a handler that still decodes the
+    /// complete serialized request from [`ObjectRpcRequest::body`].
+    pub fn with_buffered_request_value(mut self) -> Self {
+        self.request_value_mode = ServiceRequestValueMode::BufferedCompatibility;
+        self
+    }
 }
 
 type ServiceHandler =
@@ -440,6 +547,7 @@ struct RouteOwner {
     timeout_ms: Option<u64>,
     request_body_mode: ServiceBodyMode,
     response_body_mode: ServiceBodyMode,
+    request_value_mode: ServiceRequestValueMode,
     semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
@@ -470,7 +578,7 @@ impl ServiceRegistry {
                     request.route.as_str(),
                     "request",
                     owner.request_body_mode,
-                    ctx.request_body_is_empty(),
+                    ctx.request_attachment_is_empty(),
                 ) {
                     return Box::pin(async move { Err(error) });
                 }
@@ -480,9 +588,14 @@ impl ServiceRegistry {
                 let semaphore = owner.semaphore.clone();
                 let timeout = owner.timeout_ms.map(Duration::from_millis);
                 let response_body_mode = owner.response_body_mode;
+                let request_value_mode = owner.request_value_mode;
                 Box::pin(async move {
                     let mut ctx = ctx;
+                    let mut request = request;
                     ctx.set_response_body_mode(response_body_mode);
+                    if request_value_mode == ServiceRequestValueMode::BufferedCompatibility {
+                        ctx.materialize_request_value(&mut request).await?;
+                    }
                     if let Some(semaphore) = semaphore {
                         let permit =
                             semaphore.try_acquire_owned().map_err(|error| match error {
@@ -558,6 +671,7 @@ impl ServiceRegistry {
                 timeout_ms: owner.timeout_ms,
                 request_body_mode: owner.request_body_mode,
                 response_body_mode: owner.response_body_mode,
+                request_value_mode: owner.request_value_mode,
             })
             .collect()
     }
@@ -578,6 +692,7 @@ impl ServiceRegistry {
             timeout_ms: owner.timeout_ms,
             request_body_mode: owner.request_body_mode,
             response_body_mode: owner.response_body_mode,
+            request_value_mode: owner.request_value_mode,
         })
     }
 
@@ -636,6 +751,7 @@ impl ServiceRegistry {
                                 timeout_ms: owner.timeout_ms,
                                 request_body_mode: owner.request_body_mode,
                                 response_body_mode: owner.response_body_mode,
+                                request_value_mode: owner.request_value_mode,
                             },
                         },
                     )
@@ -877,6 +993,7 @@ impl ServiceRegistryBuilder {
                             timeout_ms: metadata.timeout_ms,
                             request_body_mode: metadata.request_body_mode,
                             response_body_mode: metadata.response_body_mode,
+                            request_value_mode: metadata.request_value_mode,
                             semaphore: metadata
                                 .concurrency_limit
                                 .map(|limit| Arc::new(tokio::sync::Semaphore::new(limit))),

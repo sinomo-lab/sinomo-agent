@@ -20,7 +20,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::direct_read::handle_dfs_direct_read_rpc_request_with_initialized_content_store;
+use crate::direct_read::handle_dfs_direct_read_request_with_initialized_content_store;
 use crate::local_state::open_cluster_aware_dfs_metadata_backend_for_inspection;
 use crate::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_SERVICE_ROUTES, DFS_DIRECT_READ_ROUTE,
@@ -30,14 +30,16 @@ use crate::{
     DfsMetadataJournalBatchCommand, DfsMetadataReplicaShardContext, DfsMetadataShardConfig,
     DfsMetadataShardId, DfsMetadataShardMembershipHandoff, DfsMetadataSnapshotInstallCommand,
     DfsOperatorInspector, DfsOperatorStatus, DfsOutboundAttachment, DfsSmokeReport,
-    LocalContentStore, decode_dfs_message_rpc_request, default_dfs_metadata_root,
-    default_dfs_metadata_shards_root, dfs_module_surfaces, dfs_route_is_message_data_plane,
-    inspect_cluster_aware_dfs_status, metadata_shard_key, metadata_shard_membership_handoff_key,
-    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
-    resolve_dfs_conflicts, sifs_file_system_id, use_dfs_conflict_version,
+    LocalContentStore, default_dfs_metadata_root, default_dfs_metadata_shards_root,
+    dfs_module_surfaces, dfs_route_is_message_data_plane, inspect_cluster_aware_dfs_status,
+    metadata_shard_key, metadata_shard_membership_handoff_key, metadata_shards_prefix,
+    open_local_sharded_metadata_backend, open_root_local_metadata_backend, resolve_dfs_conflicts,
+    sifs_file_system_id, use_dfs_conflict_version,
 };
 use sinomo_core::local::SinomoDataDir;
-use sinomo_core::network::{ClusterPaths, ObjectRpcRequest, ObjectRpcResponse};
+#[cfg(test)]
+use sinomo_core::network::ObjectRpcResponse;
+use sinomo_core::network::{ClusterPaths, ObjectRpcRequest};
 use sinomo_core::node::NodeId;
 
 use sinomo_core::service::{
@@ -97,6 +99,12 @@ fn dfs_service_route(route: &'static str) -> ServiceRoute {
     }
     if dfs_route_returns_response_body(route.route.as_str()) {
         route = route.with_response_body_mode(ServiceBodyMode::Optional);
+    }
+    if matches!(
+        route.route.as_str(),
+        DFS_METADATA_JOURNAL_BATCH_ROUTE | DFS_METADATA_SNAPSHOT_INSTALL_ROUTE
+    ) {
+        route = route.with_incremental_request_value();
     }
     route
 }
@@ -251,10 +259,10 @@ impl Service for DfsService {
                 request.route.as_str(),
                 "control",
             );
-            let response = match request.route.as_str() {
+            match request.route.as_str() {
                 DFS_STATUS_ROUTE => {
                     let started_at = Instant::now();
-                    let _: () = request.decode_body()?;
+                    let _: () = ctx.decode_request_body(&request).await?;
                     let status_started_at = Instant::now();
                     let data_dir = Arc::clone(&ctx.data_dir);
                     let status = tokio::task::spawn_blocking(move || dfs_status(&data_dir))
@@ -263,17 +271,17 @@ impl Service for DfsService {
                             ServiceError::Service(format!("DFS status task failed: {source}"))
                         })??;
                     let status_ms = status_started_at.elapsed().as_millis();
-                    let response = ObjectRpcResponse::encode_body(DFS_STATUS_ROUTE, &status)?;
+                    ctx.respond_value(DFS_STATUS_ROUTE, status)?;
                     dfs_service_perf_trace(format_args!(
                         "service route={} status_ms={} total_ms={}",
                         DFS_STATUS_ROUTE,
                         status_ms,
                         started_at.elapsed().as_millis()
                     ));
-                    response
                 }
                 DFS_METADATA_JOURNAL_BATCH_ROUTE => {
-                    let command: DfsMetadataJournalBatchCommand = request.decode_body()?;
+                    let command: DfsMetadataJournalBatchCommand =
+                        ctx.decode_request_body(&request).await?;
                     let authenticated_source_node_id = authenticated_dfs_cluster_source_node_id(
                         &ctx,
                         DFS_METADATA_JOURNAL_BATCH_ROUTE,
@@ -301,10 +309,11 @@ impl Service for DfsService {
                         ServiceError::Service(format!("DFS metadata journal task failed: {source}"))
                     })?
                     .map_err(service_error)?;
-                    ObjectRpcResponse::encode_body(DFS_METADATA_JOURNAL_BATCH_ROUTE, &response)?
+                    ctx.respond_value(DFS_METADATA_JOURNAL_BATCH_ROUTE, response)?;
                 }
                 DFS_METADATA_SNAPSHOT_INSTALL_ROUTE => {
-                    let command: DfsMetadataSnapshotInstallCommand = request.decode_body()?;
+                    let command: DfsMetadataSnapshotInstallCommand =
+                        ctx.decode_request_body(&request).await?;
                     let authenticated_source_node_id = authenticated_dfs_cluster_source_node_id(
                         &ctx,
                         DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
@@ -334,10 +343,11 @@ impl Service for DfsService {
                         ))
                     })?
                     .map_err(service_error)?;
-                    ObjectRpcResponse::encode_body(DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, &response)?
+                    ctx.respond_value(DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, response)?;
                 }
                 DFS_INSPECTION_ROUTE => {
-                    let inspection: DaemonDfsInspectionRequest = request.decode_body()?;
+                    let inspection: DaemonDfsInspectionRequest =
+                        ctx.decode_request_body(&request).await?;
                     let data_dir = Arc::clone(&ctx.data_dir);
                     let response =
                         tokio::task::spawn_blocking(move || dfs_inspection(&data_dir, inspection))
@@ -347,11 +357,10 @@ impl Service for DfsService {
                                     "DFS inspection task failed: {source}"
                                 ))
                             })??;
-                    ObjectRpcResponse::encode_body(DFS_INSPECTION_ROUTE, &response)?
+                    ctx.respond_value(DFS_INSPECTION_ROUTE, response)?;
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
-            };
-            ctx.respond(response)?;
+            }
             operation_metrics.succeed();
             Ok(ServiceDisposition::Continue)
         })
@@ -378,22 +387,23 @@ impl Service for DfsDataPlaneService {
                 request.route.as_str(),
                 "data",
             );
-            let response = match request.route.as_str() {
+            match request.route.as_str() {
                 DFS_SMOKE_ROUTE => {
-                    let _: () = request.decode_body()?;
+                    let _: () = ctx.decode_request_body(&request).await?;
                     let report = service.host.run_smoke().await.map_err(service_error)?;
-                    ObjectRpcResponse::encode_body(DFS_SMOKE_ROUTE, &report)?
+                    ctx.respond_value(DFS_SMOKE_ROUTE, report)?;
                 }
                 route if dfs_route_is_message_data_plane(route) => {
                     let authenticated_source_node_id =
                         authenticated_dfs_cluster_source_node_id(&ctx, route)?;
                     let traceparent = request.traceparent().map(ToString::to_string);
-                    let request_attachment = ctx.take_request_body();
-                    let command = if request_attachment.is_empty() {
-                        decode_dfs_message_rpc_request(&request)?
+                    let command = if !ctx.has_request_attachment() {
+                        ctx.decode_request_body::<DfsMessageCommand>(&request)
+                            .await?
                     } else {
-                        let head =
-                            crate::body_rpc::decode_dfs_attachment_message_rpc_request(&request)?;
+                        let head: crate::body_rpc::DfsAttachmentMessageCommand =
+                            ctx.decode_request_body(&request).await?;
+                        let request_attachment = ctx.take_request_body();
                         let max_bytes =
                             usize::try_from(head.attachment.total_size_bytes).map_err(|_| {
                                 ServiceError::Service(format!(
@@ -424,22 +434,23 @@ impl Service for DfsDataPlaneService {
                         operation_metrics.succeed();
                         return Ok(ServiceDisposition::Continue);
                     }
-                    ObjectRpcResponse::encode_body(route, &message_response.response)?
+                    ctx.respond_value(route, message_response.response)?;
                 }
                 DFS_DIRECT_READ_ROUTE => {
                     let content = service.content_store_for(&ctx.data_dir)?;
-                    let response =
-                        handle_dfs_direct_read_rpc_request_with_initialized_content_store(
-                            &content, request,
-                        )
-                        .map_err(service_error)?;
+                    let request = ctx
+                        .decode_request_body::<crate::DfsDirectReadRequest>(&request)
+                        .await?;
+                    let response = handle_dfs_direct_read_request_with_initialized_content_store(
+                        &content, request,
+                    )
+                    .map_err(service_error)?;
                     ctx.respond_with_body(response.response, response.attachment)?;
                     operation_metrics.succeed();
                     return Ok(ServiceDisposition::Continue);
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
-            };
-            ctx.respond(response)?;
+            }
             operation_metrics.succeed();
             Ok(ServiceDisposition::Continue)
         })
@@ -904,12 +915,18 @@ mod tests {
             .expect("encode")
             .with_traceparent("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01");
         let disposition = registry.dispatch(ctx, request).await?;
-        let response = frames
+        let outgoing = frames
             .lock()
             .expect("frames")
             .pop()
-            .expect("a response frame")
-            .response;
+            .expect("a response frame");
+        let mut response = outgoing.response;
+        if response.body.is_empty() {
+            // Unit-test compatibility boundary: production transports consume
+            // the owned value source directly. These service tests materialize
+            // it only so their existing typed assertions can use ObjectRpcResponse.
+            response.body = outgoing.body.collect_to_vec(usize::MAX).await?;
+        }
         Ok((disposition, response))
     }
 

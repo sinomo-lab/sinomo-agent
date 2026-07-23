@@ -613,15 +613,15 @@ impl AgentToolGateway for AgentRemoteObjectRpcTool {
             },
             move || {
                 cancellation_for_cancel.store(true, Ordering::SeqCst);
-                let cancel = match ObjectRpcRequest::encode_body(
+                let mut cancel = match ObjectRpcCall::encode_value(
                     &cancel_route,
                     &cancel_category,
-                    &ObjectRpcCancelRequest::new(
+                    ObjectRpcCancelRequest::new(
                         operation_id.clone(),
                         "agent turn cancellation requested",
                     ),
                 ) {
-                    Ok(request) => request.with_cancels_operation_id(operation_id.clone()),
+                    Ok(call) => call,
                     Err(error) => {
                         cancellation_for_cancel.store(false, Ordering::SeqCst);
                         return AgentToolGatewayCancellation::rejected(format!(
@@ -629,10 +629,13 @@ impl AgentToolGateway for AgentRemoteObjectRpcTool {
                         ));
                     }
                 };
+                cancel.request = cancel
+                    .request
+                    .with_cancels_operation_id(operation_id.clone());
                 let result = run_agent_remote_session(cancel_transport.call_targeted(
                     cancel_target_node_id.clone(),
                     cancel_route_key.clone(),
-                    ObjectRpcCall::value(cancel),
+                    cancel,
                 ));
                 match result {
                     Ok(result) => match result.response.error_detail() {
@@ -716,15 +719,24 @@ fn execute_remote_tool(
             cancellation_requested,
         );
     }
-    let rpc = match ObjectRpcRequest::encode_body(route, category, &payload) {
-        Ok(request) => request.with_operation_id(operation_id),
+    let mut rpc = match ObjectRpcCall::encode_value(route, category, payload) {
+        Ok(call) => call,
         Err(error) => return remote_encode_error(tool, error),
     };
-    match run_agent_remote_session(transport.call_targeted(
-        target_node_id,
-        route_key,
-        ObjectRpcCall::value(rpc),
-    )) {
+    rpc.request = rpc.request.with_operation_id(operation_id);
+    match run_agent_remote_future(async {
+        let mut response = transport
+            .call_targeted(target_node_id, route_key, rpc)
+            .await?;
+        // The agent tool surface is synchronous and returns a fully owned JSON
+        // result. Gather only ordinary streamed values while the transport
+        // runtime is alive; semantic attachments remain an error below.
+        response
+            .materialize_value_body(usize::MAX)
+            .await
+            .map_err(|source| source.to_string())?;
+        Ok(response)
+    }) {
         Ok(response) => remote_rpc_tool_result(tool, response, cancellation_requested),
         Err(detail) => remote_transport_error(tool, detail, cancellation_requested),
     }
@@ -772,16 +784,17 @@ fn execute_remote_file_get(
             }
         };
     let request = RemoteManagementFileReadRequest::new(input.remote_path.clone());
-    let rpc =
-        match ObjectRpcRequest::encode_body(REMOTE_MANAGEMENT_FS_READ_ROUTE, category, &request) {
-            Ok(request) => request.with_operation_id(operation_id),
+    let mut rpc =
+        match ObjectRpcCall::encode_value(REMOTE_MANAGEMENT_FS_READ_ROUTE, category, request) {
+            Ok(call) => call,
             Err(error) => return remote_encode_error(tool, error),
         };
+    rpc.request = rpc.request.with_operation_id(operation_id);
     let temp_path = temp.path().to_path_buf();
     let remote_path = input.remote_path.clone();
     let transfer = match run_agent_remote_future(async {
         let result = transport
-            .call_targeted(target_node_id, route_key, ObjectRpcCall::value(rpc))
+            .call_targeted(target_node_id, route_key, rpc)
             .await?;
         let (response, mut body) = result.into_parts();
         validate_agent_response_route(&response, REMOTE_MANAGEMENT_FS_READ_ROUTE)?;
@@ -925,13 +938,10 @@ fn execute_remote_file_put(
         let result = transport
             .call_targeted(target_node_id, route_key, ObjectRpcCall::new(rpc, body))
             .await?;
-        let (response, body) = result.into_parts();
-        validate_agent_response_route(&response, REMOTE_MANAGEMENT_FS_WRITE_ROUTE)?;
-        if !body.is_empty() {
-            return Err("remote file put unexpectedly returned an attachment".to_string());
-        }
-        let response: RemoteManagementFileWriteResponse = response
+        validate_agent_response_route(&result.response, REMOTE_MANAGEMENT_FS_WRITE_ROUTE)?;
+        let response: RemoteManagementFileWriteResponse = result
             .decode_body()
+            .await
             .map_err(|error| format!("decode remote file put response: {error}"))?;
         let written = response.into_result().map_err(|error| error.to_string())?;
         validate_agent_transfer(&written, &remote_path)?;

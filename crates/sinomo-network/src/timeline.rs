@@ -36,6 +36,31 @@ pub mod network_timeline_stage {
     pub const RPC_EXCHANGE: u16 = 23;
     pub const FRAME_READ: u16 = 27;
     pub const FRAME_SOCKET_WRITE: u16 = 29;
+    pub const RPC_PREPARE: u16 = 30;
+    pub const RPC_REQUEST_STAGE: u16 = 31;
+    pub const RPC_RESPONSE_WAIT: u16 = 32;
+    pub const RPC_REQUEST_INGRESS: u16 = 33;
+    pub const SERVICE_REQUEST_ENCODE: u16 = 34;
+    pub const SERVICE_REQUEST_DECODE: u16 = 35;
+    pub const SERVICE_HANDLER: u16 = 36;
+    pub const SERVICE_RESPONSE_ENCODE: u16 = 37;
+    pub const RPC_RESPONSE_STAGE: u16 = 38;
+    pub const SERVICE_RESPONSE_DECODE: u16 = 39;
+    pub const DAEMON_AUTH: u16 = 40;
+    pub const AUTH_ENVELOPE_DECODE: u16 = 41;
+    pub const AUTH_BODY_BINDING: u16 = 42;
+    pub const AUTH_SIGNATURE_VERIFY: u16 = 43;
+    pub const AUTH_PEER_BINDING: u16 = 44;
+    pub const AUTH_NONCE: u16 = 45;
+    pub const AUTH_ROUTE_POLICY: u16 = 46;
+    pub const PING_REQUEST_DECODE: u16 = 47;
+    pub const PING_RESPONSE_BUILD: u16 = 48;
+    pub const PING_RESPONSE_ENCODE: u16 = 49;
+    pub const DAEMON_DISPATCH: u16 = 50;
+    pub const DAEMON_RESPONSE_FINALIZE: u16 = 51;
+    pub const AUTH_TIMESTAMP: u16 = 52;
+    pub const AUTH_SIGNING_PAYLOAD: u16 = 53;
+    pub const AUTH_ED25519: u16 = 54;
 }
 
 pub mod network_timeline_flag {
@@ -58,6 +83,31 @@ pub const fn network_timeline_stage_name(stage: u16) -> &'static str {
         network_timeline_stage::RPC_EXCHANGE => "rpc.exchange",
         network_timeline_stage::FRAME_READ => "frame.read",
         network_timeline_stage::FRAME_SOCKET_WRITE => "frame.socket-write",
+        network_timeline_stage::RPC_PREPARE => "rpc.prepare",
+        network_timeline_stage::RPC_REQUEST_STAGE => "rpc.request-stage",
+        network_timeline_stage::RPC_RESPONSE_WAIT => "rpc.response-wait",
+        network_timeline_stage::RPC_REQUEST_INGRESS => "rpc.request-ingress",
+        network_timeline_stage::SERVICE_REQUEST_ENCODE => "service.request-encode",
+        network_timeline_stage::SERVICE_REQUEST_DECODE => "service.request-decode",
+        network_timeline_stage::SERVICE_HANDLER => "service.handler",
+        network_timeline_stage::SERVICE_RESPONSE_ENCODE => "service.response-encode",
+        network_timeline_stage::RPC_RESPONSE_STAGE => "rpc.response-stage",
+        network_timeline_stage::SERVICE_RESPONSE_DECODE => "service.response-decode",
+        network_timeline_stage::DAEMON_AUTH => "daemon.auth",
+        network_timeline_stage::AUTH_ENVELOPE_DECODE => "auth.envelope-decode",
+        network_timeline_stage::AUTH_BODY_BINDING => "auth.body-binding",
+        network_timeline_stage::AUTH_SIGNATURE_VERIFY => "auth.signature-verify",
+        network_timeline_stage::AUTH_PEER_BINDING => "auth.peer-binding",
+        network_timeline_stage::AUTH_NONCE => "auth.nonce",
+        network_timeline_stage::AUTH_ROUTE_POLICY => "auth.route-policy",
+        network_timeline_stage::PING_REQUEST_DECODE => "ping.request-decode",
+        network_timeline_stage::PING_RESPONSE_BUILD => "ping.response-build",
+        network_timeline_stage::PING_RESPONSE_ENCODE => "ping.response-encode",
+        network_timeline_stage::DAEMON_DISPATCH => "daemon.dispatch",
+        network_timeline_stage::DAEMON_RESPONSE_FINALIZE => "daemon.response-finalize",
+        network_timeline_stage::AUTH_TIMESTAMP => "auth.timestamp",
+        network_timeline_stage::AUTH_SIGNING_PAYLOAD => "auth.signing-payload",
+        network_timeline_stage::AUTH_ED25519 => "auth.ed25519",
         _ => "unknown",
     }
 }

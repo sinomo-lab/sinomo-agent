@@ -9,36 +9,37 @@
 
 use crate::error::NetworkError;
 use crate::object::{ObjectFrameIoOptions, SinomoObjectCodec};
-use crate::rpc_body::ObjectRpcBodySource;
+use crate::owned_chunk::{
+    AuthenticatedChunkReader, AuthenticatedChunkStream, AuthenticatedChunkWriter, ChunkAllocator,
+    OwnedChunk, RPC_CONTROL_PAYLOAD_MAX, observe_chunk_identity,
+};
+use crate::rpc_body::{
+    ObjectRpcBodyChunk, ObjectRpcBodyReceiver, ObjectRpcBodyReceiverFuture, ObjectRpcBodySource,
+    ObjectRpcIncomingBody,
+};
 use bytes::Bytes;
-use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use sinomo_base::Id;
 use sinomo_node::NodeId;
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::io;
+use std::io::{self, IoSlice};
 use std::pin::Pin;
-use std::str::FromStr;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
-pub const OBJECT_RPC_STREAM_MAX_HEAD_BYTES: usize = 256 * 1024;
+pub const OBJECT_RPC_STREAM_MAX_HEAD_BYTES: usize = RPC_CONTROL_PAYLOAD_MAX;
 pub const OBJECT_RPC_STREAM_INLINE_BODY_BYTES: usize = 8 * 1024;
 pub const OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES: usize = 64 * 1024;
+#[cfg(test)]
 pub const OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES: usize = 256 * 1024;
 
 const OBJECT_RPC_STREAM_PROTOCOL: &str = "sinomo.object-rpc.stream.v2";
 const OBJECT_RPC_STREAM_WIRE_MAGIC: [u8; 4] = *b"SOR2";
-const LOCAL_OBJECT_RPC_STREAM_PRELUDE_MAGIC: [u8; 4] = *b"SOL1";
-const LOCAL_OBJECT_RPC_STREAM_MAX_SESSION_ID_BYTES: usize = 128;
 const OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES: usize = 9;
 const OBJECT_RPC_STREAM_MAX_TERMINAL_BYTES: usize = 16 * 1024;
-const OBJECT_RPC_STREAM_WRITE_BUFFER_BYTES: usize = OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES;
-const OBJECT_RPC_STREAM_BODY_CHANNEL_DEPTH: usize =
-    OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES / OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES;
 const OBJECT_RPC_STREAM_MAX_HEAD_CLOCK_SKEW_MILLIS: u64 = 5 * 60 * 1000;
 const OBJECT_RPC_STREAM_MIN_PROGRESS_INTERVAL: Duration = Duration::from_millis(10);
 const AUTHENTICATED_CONTROL_TAG_BYTES: usize = 32;
@@ -124,144 +125,6 @@ impl RpcPeerContext {
             RpcPeerIdentity::UnauthenticatedLocal => (None, None),
         }
     }
-}
-
-pub fn local_object_rpc_stream_prelude_prefix_matches(prefix: &[u8]) -> bool {
-    prefix.len() <= LOCAL_OBJECT_RPC_STREAM_PRELUDE_MAGIC.len()
-        && LOCAL_OBJECT_RPC_STREAM_PRELUDE_MAGIC.starts_with(prefix)
-}
-
-async fn write_local_object_rpc_prelude<S>(
-    stream: &mut S,
-    magic: [u8; 4],
-    operation: &str,
-) -> Result<RpcPeerContext, NetworkError>
-where
-    S: AsyncWrite + Unpin + ?Sized,
-{
-    let session_id = Id::generate();
-    let session_id_bytes = session_id.as_str().as_bytes();
-    let session_id_len =
-        u16::try_from(session_id_bytes.len()).map_err(|_| NetworkError::FrameTooLarge {
-            actual_bytes: session_id_bytes.len(),
-            max_bytes: LOCAL_OBJECT_RPC_STREAM_MAX_SESSION_ID_BYTES,
-        })?;
-    if session_id_bytes.len() > LOCAL_OBJECT_RPC_STREAM_MAX_SESSION_ID_BYTES {
-        return Err(NetworkError::FrameTooLarge {
-            actual_bytes: session_id_bytes.len(),
-            max_bytes: LOCAL_OBJECT_RPC_STREAM_MAX_SESSION_ID_BYTES,
-        });
-    }
-    let mut channel_binding = [0_u8; 32];
-    SystemRandom::new()
-        .fill(&mut channel_binding)
-        .map_err(|_| delivery_error(operation, "system random failed"))?;
-    stream
-        .write_all(&magic)
-        .await
-        .map_err(|error| delivery_error(operation, error.to_string()))?;
-    stream
-        .write_all(&channel_binding)
-        .await
-        .map_err(|error| delivery_error(operation, error.to_string()))?;
-    stream
-        .write_all(&session_id_len.to_be_bytes())
-        .await
-        .map_err(|error| delivery_error(operation, error.to_string()))?;
-    stream
-        .write_all(session_id_bytes)
-        .await
-        .map_err(|error| delivery_error(operation, error.to_string()))?;
-    stream
-        .flush()
-        .await
-        .map_err(|error| delivery_error(operation, error.to_string()))?;
-    Ok(RpcPeerContext::unauthenticated_local(
-        session_id,
-        channel_binding,
-    ))
-}
-
-async fn read_local_object_rpc_prelude<S>(
-    stream: &mut S,
-    expected_magic: [u8; 4],
-    operation: &str,
-) -> Result<RpcPeerContext, NetworkError>
-where
-    S: AsyncRead + Unpin + ?Sized,
-{
-    let mut magic = [0_u8; 4];
-    stream
-        .read_exact(&mut magic)
-        .await
-        .map_err(|error| delivery_error(operation, error.to_string()))?;
-    if magic != expected_magic {
-        return Err(NetworkError::AuthDenied);
-    }
-    let mut channel_binding = [0_u8; 32];
-    stream
-        .read_exact(&mut channel_binding)
-        .await
-        .map_err(|error| delivery_error(operation, error.to_string()))?;
-    if channel_binding == [0; 32] {
-        return Err(NetworkError::AuthDenied);
-    }
-    let session_id_len = stream
-        .read_u16()
-        .await
-        .map_err(|error| delivery_error(operation, error.to_string()))?
-        as usize;
-    if session_id_len == 0 || session_id_len > LOCAL_OBJECT_RPC_STREAM_MAX_SESSION_ID_BYTES {
-        return Err(NetworkError::FrameTooLarge {
-            actual_bytes: session_id_len,
-            max_bytes: LOCAL_OBJECT_RPC_STREAM_MAX_SESSION_ID_BYTES,
-        });
-    }
-    let mut session_id = vec![0_u8; session_id_len];
-    stream
-        .read_exact(&mut session_id)
-        .await
-        .map_err(|error| delivery_error(operation, error.to_string()))?;
-    let session_id = std::str::from_utf8(&session_id)
-        .ok()
-        .and_then(|value| Id::from_str(value).ok())
-        .ok_or(NetworkError::AuthDenied)?;
-    Ok(RpcPeerContext::unauthenticated_local(
-        session_id,
-        channel_binding,
-    ))
-}
-
-/// Starts the loopback-only stream prelude. The daemon listener must
-/// independently prove socket locality and authorize the signed service
-/// request; this prelude only supplies a unique transcript binding shared by
-/// the two protocol endpoints.
-pub async fn write_local_object_rpc_stream_prelude<S>(
-    stream: &mut S,
-) -> Result<RpcPeerContext, NetworkError>
-where
-    S: AsyncWrite + Unpin + ?Sized,
-{
-    write_local_object_rpc_prelude(
-        stream,
-        LOCAL_OBJECT_RPC_STREAM_PRELUDE_MAGIC,
-        "write local RPC stream prelude",
-    )
-    .await
-}
-
-pub async fn read_local_object_rpc_stream_prelude<S>(
-    stream: &mut S,
-) -> Result<RpcPeerContext, NetworkError>
-where
-    S: AsyncRead + Unpin + ?Sized,
-{
-    read_local_object_rpc_prelude(
-        stream,
-        LOCAL_OBJECT_RPC_STREAM_PRELUDE_MAGIC,
-        "read local RPC stream prelude",
-    )
-    .await
 }
 
 /// A request or response body supplied through the same API whether its final
@@ -371,6 +234,10 @@ pub struct ObjectRpcStreamCall {
     /// their typed request head while the body remains incrementally framed.
     pub application_head: Vec<u8>,
     pub body: ObjectRpcStreamBody,
+    /// Capture-local diagnostic context. This is never serialized on the
+    /// object-RPC wire and is `None` outside an explicitly sampled timeline.
+    #[doc(hidden)]
+    pub timeline_trace: Option<crate::NetworkTimelineTraceContext>,
 }
 
 impl ObjectRpcStreamCall {
@@ -383,6 +250,7 @@ impl ObjectRpcStreamCall {
             metadata: BTreeMap::new(),
             application_head: Vec::new(),
             body,
+            timeline_trace: None,
         }
     }
 
@@ -405,6 +273,10 @@ pub struct ObjectRpcStreamIncomingCall {
     pub metadata: BTreeMap<String, String>,
     pub application_head: Vec<u8>,
     pub body: ObjectRpcStreamIncomingBody,
+    /// Time from the server record reader starting until the authenticated
+    /// request head and body descriptor are ready for the service adapter.
+    #[doc(hidden)]
+    pub request_ingress_duration_ns: u64,
 }
 
 /// Server-produced response head and streaming body source.
@@ -414,6 +286,9 @@ pub struct ObjectRpcStreamReply {
     pub metadata: BTreeMap<String, String>,
     pub application_head: Vec<u8>,
     pub body: ObjectRpcStreamBody,
+    /// Capture-local diagnostic context. This is never serialized.
+    #[doc(hidden)]
+    pub timeline_trace: Option<crate::NetworkTimelineTraceContext>,
 }
 
 impl ObjectRpcStreamReply {
@@ -424,6 +299,7 @@ impl ObjectRpcStreamReply {
             metadata: BTreeMap::new(),
             application_head: Vec::new(),
             body,
+            timeline_trace: None,
         }
     }
 }
@@ -582,14 +458,14 @@ pub struct ObjectRpcBodyVerification {
 
 #[derive(Clone, Debug)]
 pub struct ObjectRpcStreamBodyVerifier {
-    receiver: watch::Receiver<Option<Result<ObjectRpcBodyVerification, NetworkError>>>,
+    receiver: watch::Receiver<Option<Result<IncomingTerminal, NetworkError>>>,
 }
 
 impl ObjectRpcStreamBodyVerifier {
     pub async fn verify(mut self) -> Result<ObjectRpcBodyVerification, NetworkError> {
         loop {
             if let Some(result) = self.receiver.borrow().clone() {
-                return result;
+                return incoming_body_verification(&result);
             }
             self.receiver.changed().await.map_err(|_| {
                 delivery_error(
@@ -606,21 +482,13 @@ impl ObjectRpcStreamBodyVerifier {
 /// while it still authenticates the finish record.
 #[derive(Debug)]
 pub struct ObjectRpcStreamIncomingBody {
-    receiver: mpsc::Receiver<Bytes>,
-    current: Option<Bytes>,
-    total_bytes: Option<u64>,
+    body: ObjectRpcIncomingBody,
     verifier: ObjectRpcStreamBodyVerifier,
 }
 
 impl ObjectRpcStreamIncomingBody {
-    pub const fn total_bytes(&self) -> Option<u64> {
-        self.total_bytes
-    }
-
-    /// A handler that will commit an irreversible effect must await this proof
-    /// after consuming any speculative body bytes.
-    pub fn verifier(&self) -> ObjectRpcStreamBodyVerifier {
-        self.verifier.clone()
+    pub fn total_bytes(&self) -> Option<u64> {
+        self.body.total_bytes()
     }
 
     /// Materializes the complete authenticated body without imposing a size
@@ -631,69 +499,15 @@ impl ObjectRpcStreamIncomingBody {
         self.collect_to_vec(usize::MAX).await
     }
 
-    pub async fn collect_to_vec(mut self, max_bytes: usize) -> Result<Vec<u8>, NetworkError> {
-        if let Some(total_bytes) = self.total_bytes {
-            let declared = usize::try_from(total_bytes).unwrap_or(usize::MAX);
-            if declared > max_bytes {
-                return Err(NetworkError::FrameTooLarge {
-                    actual_bytes: declared,
-                    max_bytes,
-                });
-            }
-        }
-        let mut output = Vec::new();
-        if let Some(total_bytes) = self.total_bytes {
-            let declared =
-                usize::try_from(total_bytes).map_err(|_| NetworkError::ResourceExhausted {
-                    operation: "materialize object RPC stream body".to_string(),
-                    requested_bytes: usize::MAX,
-                })?;
-            output
-                .try_reserve_exact(declared)
-                .map_err(|_| NetworkError::ResourceExhausted {
-                    operation: "materialize object RPC stream body".to_string(),
-                    requested_bytes: declared,
-                })?;
-        }
-        let mut chunk = Vec::new();
-        chunk
-            .try_reserve_exact(OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES)
-            .map_err(|_| NetworkError::ResourceExhausted {
-                operation: "allocate object RPC stream materialization buffer".to_string(),
-                requested_bytes: OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES,
-            })?;
-        chunk.resize(OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES, 0);
-        loop {
-            let read = self.read(&mut chunk).await.map_err(|error| {
-                delivery_error("read object RPC stream body", error.to_string())
-            })?;
-            if read == 0 {
-                break;
-            }
-            let next =
-                output
-                    .len()
-                    .checked_add(read)
-                    .ok_or_else(|| NetworkError::ResourceExhausted {
-                        operation: "materialize object RPC stream body".to_string(),
-                        requested_bytes: usize::MAX,
-                    })?;
-            if next > max_bytes {
-                return Err(NetworkError::FrameTooLarge {
-                    actual_bytes: next,
-                    max_bytes,
-                });
-            }
-            output
-                .try_reserve(read)
-                .map_err(|_| NetworkError::ResourceExhausted {
-                    operation: "materialize object RPC stream body".to_string(),
-                    requested_bytes: next,
-                })?;
-            output.extend_from_slice(&chunk[..read]);
-        }
-        self.verifier.verify().await?;
+    pub async fn collect_to_vec(self, max_bytes: usize) -> Result<Vec<u8>, NetworkError> {
+        let verifier = self.verifier;
+        let output = self.body.collect_to_vec(max_bytes).await?;
+        verifier.verify().await?;
         Ok(output)
+    }
+
+    pub(crate) fn into_application_body(self) -> ObjectRpcIncomingBody {
+        self.body
     }
 }
 
@@ -703,23 +517,7 @@ impl AsyncRead for ObjectRpcStreamIncomingBody {
         context: &mut Context<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        loop {
-            if let Some(mut current) = self.current.take() {
-                let copy_bytes = current.len().min(buffer.remaining());
-                buffer.put_slice(&current[..copy_bytes]);
-                if copy_bytes < current.len() {
-                    current = current.slice(copy_bytes..);
-                    self.current = Some(current);
-                }
-                return Poll::Ready(Ok(()));
-            }
-            match self.receiver.poll_recv(context) {
-                Poll::Ready(Some(bytes)) if bytes.is_empty() => continue,
-                Poll::Ready(Some(bytes)) => self.current = Some(bytes),
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
+        Pin::new(&mut self.body).poll_read(context, buffer)
     }
 }
 
@@ -766,7 +564,7 @@ impl IncomingDirection {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum IncomingTerminal {
     Completed(ObjectRpcBodyVerification),
     Rejected(String),
@@ -788,6 +586,78 @@ fn delivery_error(operation: &str, detail: impl Into<String>) -> NetworkError {
     NetworkError::Io {
         operation: operation.to_string(),
         detail: detail.into(),
+    }
+}
+
+#[inline]
+fn timeline_started_ns(trace: Option<crate::NetworkTimelineTraceContext>) -> u64 {
+    trace
+        .map(|_| crate::network_timeline_monotonic_ns())
+        .unwrap_or(0)
+}
+
+#[inline]
+fn record_rpc_timeline_duration(
+    trace: Option<crate::NetworkTimelineTraceContext>,
+    stage: u16,
+    flags: u16,
+    started_ns: u64,
+    success: bool,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    crate::record_network_timeline_event_now(crate::NetworkTimelineEvent::new(
+        trace,
+        stage,
+        flags
+            | if success {
+                crate::network_timeline_flag::SUCCESS
+            } else {
+                0
+            },
+        0,
+        0,
+        0,
+        0,
+        0,
+        crate::network_timeline_monotonic_ns().saturating_sub(started_ns),
+    ));
+}
+
+struct RpcTimelineStageGuard {
+    trace: Option<crate::NetworkTimelineTraceContext>,
+    stage: u16,
+    flags: u16,
+    started_ns: u64,
+    success: bool,
+}
+
+impl RpcTimelineStageGuard {
+    fn new(trace: Option<crate::NetworkTimelineTraceContext>, stage: u16, flags: u16) -> Self {
+        Self {
+            trace,
+            stage,
+            flags,
+            started_ns: timeline_started_ns(trace),
+            success: false,
+        }
+    }
+
+    fn mark_success(&mut self) {
+        self.success = true;
+    }
+}
+
+impl Drop for RpcTimelineStageGuard {
+    fn drop(&mut self) {
+        record_rpc_timeline_duration(
+            self.trace,
+            self.stage,
+            self.flags,
+            self.started_ns,
+            self.success,
+        );
     }
 }
 
@@ -866,14 +736,37 @@ fn decode_authenticated_control<T: serde::de::DeserializeOwned>(
     decode_control(unsigned_payload)
 }
 
-async fn write_all_counted<W: AsyncWrite + Unpin>(
+async fn write_wire_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
-    bytes: &[u8],
+    kind: u8,
+    payload: &[u8],
     operation: &str,
 ) -> Result<(), SendFailure> {
+    let length = u32::try_from(payload.len()).map_err(|_| SendFailure {
+        error: NetworkError::FrameTooLarge {
+            actual_bytes: payload.len(),
+            max_bytes: u32::MAX as usize,
+        },
+        wrote_any: false,
+    })?;
+    let mut prefix = [0_u8; OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES];
+    prefix[..4].copy_from_slice(&OBJECT_RPC_STREAM_WIRE_MAGIC);
+    prefix[4] = kind;
+    prefix[5..].copy_from_slice(&length.to_be_bytes());
+
+    // Keep the producer-owned body separate from its small wire prefix. The
+    // logical-stream writer accepts this as one vectored record and performs
+    // the single normalization copy required by the byte-stream adapter.
+    let total = prefix.len().saturating_add(payload.len());
     let mut written = 0_usize;
-    while written < bytes.len() {
-        match writer.write(&bytes[written..]).await {
+    while written < total {
+        let result = if written < prefix.len() {
+            let slices = [IoSlice::new(&prefix[written..]), IoSlice::new(payload)];
+            writer.write_vectored(&slices).await
+        } else {
+            writer.write(&payload[written - prefix.len()..]).await
+        };
+        match result {
             Ok(0) => {
                 return Err(SendFailure {
                     error: delivery_error(
@@ -893,28 +786,6 @@ async fn write_all_counted<W: AsyncWrite + Unpin>(
         }
     }
     Ok(())
-}
-
-async fn write_wire_frame<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    kind: u8,
-    payload: &[u8],
-    operation: &str,
-) -> Result<(), SendFailure> {
-    let length = u32::try_from(payload.len()).map_err(|_| SendFailure {
-        error: NetworkError::FrameTooLarge {
-            actual_bytes: payload.len(),
-            max_bytes: u32::MAX as usize,
-        },
-        wrote_any: false,
-    })?;
-    let mut encoded =
-        Vec::with_capacity(OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES.saturating_add(payload.len()));
-    encoded.extend_from_slice(&OBJECT_RPC_STREAM_WIRE_MAGIC);
-    encoded.push(kind);
-    encoded.extend_from_slice(&length.to_be_bytes());
-    encoded.extend_from_slice(payload);
-    write_all_counted(writer, &encoded, operation).await
 }
 
 async fn read_exact_idle<R: AsyncRead + Unpin>(
@@ -993,17 +864,346 @@ async fn read_wire_frame<R: AsyncRead + Unpin>(
     Ok((kind, payload))
 }
 
-async fn read_response_head_with_progress<R: AsyncRead + Unpin>(
+type RpcRecordFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, NetworkError>> + Send + 'a>>;
+type RpcSendFuture<'a> = Pin<Box<dyn Future<Output = Result<(), SendFailure>> + Send + 'a>>;
+
+struct RpcRecord {
+    kind: u8,
+    payload: ObjectRpcBodyChunk,
+}
+
+impl RpcRecord {
+    fn from_bytes(kind: u8, payload: Vec<u8>) -> Self {
+        Self {
+            kind,
+            payload: ObjectRpcBodyChunk::bytes(Bytes::from(payload)),
+        }
+    }
+}
+
+trait RpcRecordReader: Send + 'static {
+    fn read_record(&mut self, options: ObjectFrameIoOptions) -> RpcRecordFuture<'_, RpcRecord>;
+}
+
+trait RpcRecordWriter: Send + 'static {
+    fn chunk_allocator(&self) -> Option<&ChunkAllocator>;
+
+    fn write_record<'a>(
+        &'a mut self,
+        kind: u8,
+        payload: &'a [u8],
+        operation: &'a str,
+    ) -> RpcSendFuture<'a>;
+
+    fn write_owned_record<'a>(
+        &'a mut self,
+        kind: u8,
+        chunk: OwnedChunk,
+        operation: &'a str,
+    ) -> RpcSendFuture<'a>;
+
+    fn flush_record(&mut self) -> RpcSendFuture<'_>;
+
+    fn finish_records(&mut self) -> RpcSendFuture<'_>;
+}
+
+struct ByteRpcRecordReader {
+    reader: Box<dyn AsyncRead + Unpin + Send>,
+}
+
+impl RpcRecordReader for ByteRpcRecordReader {
+    fn read_record(&mut self, options: ObjectFrameIoOptions) -> RpcRecordFuture<'_, RpcRecord> {
+        Box::pin(async move {
+            let (kind, payload) = read_wire_frame(&mut self.reader, options).await?;
+            Ok(RpcRecord::from_bytes(kind, payload))
+        })
+    }
+}
+
+struct ByteRpcRecordWriter {
+    writer: Box<dyn AsyncWrite + Unpin + Send>,
+}
+
+impl RpcRecordWriter for ByteRpcRecordWriter {
+    fn chunk_allocator(&self) -> Option<&ChunkAllocator> {
+        None
+    }
+
+    fn write_record<'a>(
+        &'a mut self,
+        kind: u8,
+        payload: &'a [u8],
+        operation: &'a str,
+    ) -> RpcSendFuture<'a> {
+        Box::pin(write_wire_frame(&mut self.writer, kind, payload, operation))
+    }
+
+    fn write_owned_record<'a>(
+        &'a mut self,
+        kind: u8,
+        chunk: OwnedChunk,
+        operation: &'a str,
+    ) -> RpcSendFuture<'a> {
+        Box::pin(async move {
+            write_wire_frame(&mut self.writer, kind, chunk.as_slice(), operation).await
+        })
+    }
+
+    fn flush_record(&mut self) -> RpcSendFuture<'_> {
+        Box::pin(async move {
+            self.writer.flush().await.map_err(|error| SendFailure {
+                error: delivery_error("flush byte object RPC records", error.to_string()),
+                wrote_any: true,
+            })
+        })
+    }
+
+    fn finish_records(&mut self) -> RpcSendFuture<'_> {
+        Box::pin(async move {
+            self.writer.shutdown().await.map_err(|error| SendFailure {
+                error: delivery_error("finish byte object RPC records", error.to_string()),
+                wrote_any: true,
+            })
+        })
+    }
+}
+
+struct OwnedRpcRecordReader {
+    reader: Box<dyn AuthenticatedChunkReader>,
+}
+
+impl RpcRecordReader for OwnedRpcRecordReader {
+    fn read_record(&mut self, options: ObjectFrameIoOptions) -> RpcRecordFuture<'_, RpcRecord> {
+        Box::pin(async move {
+            let receive = self.reader.recv_chunk();
+            let lease = if let Some(timeout) = options.idle_timeout {
+                tokio::time::timeout(timeout, receive).await.map_err(|_| {
+                    delivery_error(
+                        "read owned object RPC record",
+                        format!("idle timeout after {timeout:?}"),
+                    )
+                })??
+            } else {
+                receive.await?
+            }
+            .ok_or_else(|| {
+                delivery_error(
+                    "read owned object RPC record",
+                    "peer finished before the next RPC record",
+                )
+            })?;
+            let record = lease.as_slice();
+            if record.len() < OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES
+                || record[..4] != OBJECT_RPC_STREAM_WIRE_MAGIC
+            {
+                return Err(serialization_error(
+                    "invalid owned object RPC stream record prefix",
+                ));
+            }
+            let kind = record[4];
+            let max_bytes = max_payload_for_kind(kind)?;
+            let length =
+                u32::from_be_bytes(record[5..9].try_into().expect("four-byte length")) as usize;
+            if length > max_bytes {
+                return Err(NetworkError::FrameTooLarge {
+                    actual_bytes: length,
+                    max_bytes,
+                });
+            }
+            if record.len() != OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES + length {
+                return Err(serialization_error(format!(
+                    "owned object RPC record declared {length} payload bytes but carried {}",
+                    record
+                        .len()
+                        .saturating_sub(OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES)
+                )));
+            }
+            let payload = lease.slice(OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES, record.len())?;
+            observe_chunk_identity(payload.slab_id(), "rpc-record-received");
+            Ok(RpcRecord {
+                kind,
+                payload: ObjectRpcBodyChunk::lease(payload),
+            })
+        })
+    }
+}
+
+struct OwnedRpcRecordWriter {
+    writer: Box<dyn AuthenticatedChunkWriter>,
+    allocator: ChunkAllocator,
+}
+
+impl OwnedRpcRecordWriter {
+    fn rpc_prefix(kind: u8, payload_bytes: usize) -> Result<[u8; 9], SendFailure> {
+        let max_bytes = max_payload_for_kind(kind).map_err(|error| SendFailure {
+            error,
+            wrote_any: false,
+        })?;
+        if payload_bytes > max_bytes {
+            return Err(SendFailure {
+                error: NetworkError::FrameTooLarge {
+                    actual_bytes: payload_bytes,
+                    max_bytes,
+                },
+                wrote_any: false,
+            });
+        }
+        let length = u32::try_from(payload_bytes).map_err(|_| SendFailure {
+            error: NetworkError::FrameTooLarge {
+                actual_bytes: payload_bytes,
+                max_bytes: u32::MAX as usize,
+            },
+            wrote_any: false,
+        })?;
+        let mut prefix = [0_u8; OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES];
+        prefix[..4].copy_from_slice(&OBJECT_RPC_STREAM_WIRE_MAGIC);
+        prefix[4] = kind;
+        prefix[5..].copy_from_slice(&length.to_be_bytes());
+        Ok(prefix)
+    }
+}
+
+impl RpcRecordWriter for OwnedRpcRecordWriter {
+    fn chunk_allocator(&self) -> Option<&ChunkAllocator> {
+        Some(&self.allocator)
+    }
+
+    fn write_record<'a>(
+        &'a mut self,
+        kind: u8,
+        payload: &'a [u8],
+        operation: &'a str,
+    ) -> RpcSendFuture<'a> {
+        Box::pin(async move {
+            let prefix = Self::rpc_prefix(kind, payload.len())?;
+            let mut chunk = self
+                .allocator
+                .allocate_control(payload.len())
+                .await
+                .map_err(|error| SendFailure {
+                    error,
+                    wrote_any: false,
+                })?;
+            chunk.writable_payload()[..payload.len()].copy_from_slice(payload);
+            chunk
+                .commit_payload(payload.len())
+                .and_then(|_| chunk.prepend(&prefix))
+                .map_err(|error| SendFailure {
+                    error,
+                    wrote_any: false,
+                })?;
+            self.writer
+                .send_chunk(chunk)
+                .await
+                .map_err(|error| SendFailure {
+                    error: delivery_error(operation, error.to_string()),
+                    wrote_any: true,
+                })
+        })
+    }
+
+    fn write_owned_record<'a>(
+        &'a mut self,
+        kind: u8,
+        mut chunk: OwnedChunk,
+        operation: &'a str,
+    ) -> RpcSendFuture<'a> {
+        Box::pin(async move {
+            observe_chunk_identity(chunk.slab_id(), "rpc-body-produced");
+            let prefix = Self::rpc_prefix(kind, chunk.len())?;
+            chunk.prepend(&prefix).map_err(|error| SendFailure {
+                error,
+                wrote_any: false,
+            })?;
+            observe_chunk_identity(chunk.slab_id(), "rpc-record-framed");
+            self.writer
+                .send_chunk(chunk)
+                .await
+                .map_err(|error| SendFailure {
+                    error: delivery_error(operation, error.to_string()),
+                    wrote_any: true,
+                })
+        })
+    }
+
+    fn flush_record(&mut self) -> RpcSendFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn finish_records(&mut self) -> RpcSendFuture<'_> {
+        Box::pin(async move {
+            self.writer.finish().await.map_err(|error| SendFailure {
+                error,
+                wrote_any: true,
+            })
+        })
+    }
+}
+
+fn byte_record_halves<S>(stream: S) -> (ByteRpcRecordReader, ByteRpcRecordWriter)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (reader, writer) = tokio::io::split(stream);
+    (
+        ByteRpcRecordReader {
+            reader: Box::new(reader),
+        },
+        ByteRpcRecordWriter {
+            writer: Box::new(writer),
+        },
+    )
+}
+
+fn owned_record_halves(
+    stream: AuthenticatedChunkStream,
+) -> (OwnedRpcRecordReader, OwnedRpcRecordWriter) {
+    let (reader, writer) = stream.into_halves();
+    let allocator = writer.allocator().clone();
+    (
+        OwnedRpcRecordReader { reader },
+        OwnedRpcRecordWriter { writer, allocator },
+    )
+}
+
+async fn read_response_head_with_progress<R: RpcRecordReader>(
     reader: &mut R,
     options: ObjectFrameIoOptions,
     context: &RpcPeerContext,
     request_id: &Id,
     request_head_digest: [u8; 32],
-) -> Result<((u8, Vec<u8>), u64), NetworkError> {
+    timeline_trace: Option<crate::NetworkTimelineTraceContext>,
+) -> Result<(RpcRecord, u64), NetworkError> {
+    let started_ns = timeline_started_ns(timeline_trace);
+    let result = read_response_head_with_progress_inner(
+        reader,
+        options,
+        context,
+        request_id,
+        request_head_digest,
+    )
+    .await;
+    record_rpc_timeline_duration(
+        timeline_trace,
+        crate::network_timeline_stage::RPC_RESPONSE_WAIT,
+        crate::network_timeline_flag::RESPONSE,
+        started_ns,
+        result.is_ok(),
+    );
+    result
+}
+
+async fn read_response_head_with_progress_inner<R: RpcRecordReader>(
+    reader: &mut R,
+    options: ObjectFrameIoOptions,
+    context: &RpcPeerContext,
+    request_id: &Id,
+    request_head_digest: [u8; 32],
+) -> Result<(RpcRecord, u64), NetworkError> {
     let mut last_progress_nonce = 0;
     loop {
-        let frame = read_wire_frame(reader, options).await?;
-        if frame.0 != FRAME_RESPONSE_PROGRESS {
+        let frame = reader.read_record(options).await?;
+        if frame.kind != FRAME_RESPONSE_PROGRESS {
             return Ok((frame, last_progress_nonce));
         }
         validate_stream_progress(
@@ -1012,7 +1212,7 @@ async fn read_response_head_with_progress<R: AsyncRead + Unpin>(
             request_id,
             request_head_digest,
             &mut last_progress_nonce,
-            &frame.1,
+            &frame.payload,
         )?;
     }
 }
@@ -1025,35 +1225,6 @@ async fn hash_source(source: ObjectRpcBodySource) -> Result<[u8; 32], NetworkErr
     }
     producer.finish().await?;
     Ok(*hasher.finalize().as_bytes())
-}
-
-async fn materialize_small_replayable_source(
-    source: ObjectRpcBodySource,
-    expected_length: usize,
-) -> Result<Vec<u8>, NetworkError> {
-    let mut producer = source.producer(OBJECT_RPC_STREAM_INLINE_BODY_BYTES)?;
-    let mut bytes = Vec::with_capacity(expected_length);
-    while let Some(chunk) = producer.next().await? {
-        let next_length = bytes
-            .len()
-            .checked_add(chunk.len())
-            .ok_or_else(|| serialization_error("object RPC inline body length overflow"))?;
-        if next_length > OBJECT_RPC_STREAM_INLINE_BODY_BYTES {
-            return Err(NetworkError::FrameTooLarge {
-                actual_bytes: next_length,
-                max_bytes: OBJECT_RPC_STREAM_INLINE_BODY_BYTES,
-            });
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    producer.finish().await?;
-    if bytes.len() != expected_length {
-        return Err(serialization_error(format!(
-            "object RPC replayable body declared {expected_length} bytes but produced {}",
-            bytes.len()
-        )));
-    }
-    Ok(bytes)
 }
 
 async fn prepare_outgoing_body(
@@ -1074,23 +1245,9 @@ async fn prepare_outgoing_body(
         }
         OutgoingBodyKind::Source(source) => {
             let total_bytes = source.total_bytes();
-            if body.supplied_digest.is_none()
-                && let Some(length) = total_bytes.and_then(|length| usize::try_from(length).ok())
-                && length <= OBJECT_RPC_STREAM_INLINE_BODY_BYTES
-                && let Some(replay) = source.try_clone_replayable()
-            {
-                let bytes = materialize_small_replayable_source(replay, length).await?;
-                let digest = *blake3::hash(&bytes).as_bytes();
-                return Ok(PreparedOutgoingBody {
-                    descriptor: BodyDescriptor::Inline {
-                        length: length as u64,
-                        digest,
-                    },
-                    inline_body: Some(InlineBody { bytes }),
-                    source: None,
-                });
-            }
             let digest = if let Some(digest) = body.supplied_digest {
+                Some(digest)
+            } else if let Some(digest) = source.known_digest() {
                 Some(digest)
             } else if let Some(replay) = source.try_clone_replayable() {
                 Some(hash_source(replay).await?)
@@ -1146,22 +1303,228 @@ fn descriptor_total_bytes(descriptor: &BodyDescriptor) -> Option<u64> {
     }
 }
 
-enum IncomingBodyCompletion {
-    Ready(Result<IncomingTerminal, NetworkError>),
-    Task(tokio::task::JoinHandle<Result<IncomingTerminal, NetworkError>>),
+#[derive(Clone)]
+struct IncomingBodyCompletion {
+    receiver: watch::Receiver<Option<Result<IncomingTerminal, NetworkError>>>,
 }
 
 impl IncomingBodyCompletion {
-    fn abort(&self) {
-        if let Self::Task(task) = self {
-            task.abort();
+    async fn join(mut self) -> Result<IncomingTerminal, NetworkError> {
+        loop {
+            if let Some(result) = self.receiver.borrow().clone() {
+                return result;
+            }
+            self.receiver.changed().await.map_err(|_| {
+                delivery_error(
+                    "complete object RPC stream body",
+                    "body receiver ended without a terminal result",
+                )
+            })?;
         }
     }
 
-    async fn join(self) -> Result<Result<IncomingTerminal, NetworkError>, tokio::task::JoinError> {
-        match self {
-            Self::Ready(result) => Ok(result),
-            Self::Task(task) => task.await,
+    #[cfg(test)]
+    fn is_ready(&self) -> bool {
+        self.receiver.borrow().is_some()
+    }
+}
+
+fn incoming_body_verification(
+    result: &Result<IncomingTerminal, NetworkError>,
+) -> Result<ObjectRpcBodyVerification, NetworkError> {
+    match result {
+        Ok(IncomingTerminal::Completed(verification)) => Ok(verification.clone()),
+        Ok(IncomingTerminal::Rejected(detail)) => Err(serialization_error(format!(
+            "object RPC body rejected: {detail}"
+        ))),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+struct PullIncomingBodyState<R> {
+    reader: R,
+    options: ObjectFrameIoOptions,
+    context: RpcPeerContext,
+    direction: IncomingDirection,
+    request_id: Id,
+    head_digest: [u8; 32],
+    progress_head_digest: [u8; 32],
+    last_progress_nonce: u64,
+    descriptor: BodyDescriptor,
+    hasher: blake3::Hasher,
+    observed_length: u64,
+    pending_chunk: Option<ObjectRpcBodyChunk>,
+    terminal_sender: watch::Sender<Option<Result<IncomingTerminal, NetworkError>>>,
+    terminal_published: bool,
+}
+
+impl<R: RpcRecordReader> PullIncomingBodyState<R> {
+    fn publish(&mut self, result: Result<IncomingTerminal, NetworkError>) {
+        if self.terminal_published {
+            return;
+        }
+        self.terminal_published = true;
+        self.terminal_sender.send_replace(Some(result));
+    }
+
+    async fn recv_chunk(&mut self) -> Result<Option<ObjectRpcBodyChunk>, NetworkError> {
+        if self.terminal_published {
+            return Ok(None);
+        }
+        let result = self.recv_chunk_inner().await;
+        if let Err(error) = &result
+            && !self.terminal_published
+        {
+            self.publish(Err(error.clone()));
+        }
+        result
+    }
+
+    async fn recv_chunk_inner(&mut self) -> Result<Option<ObjectRpcBodyChunk>, NetworkError> {
+        if let Some(chunk) = self.pending_chunk.take() {
+            return Ok(Some(chunk));
+        }
+        loop {
+            let RpcRecord { kind, payload } = self.reader.read_record(self.options).await?;
+            if kind == self.direction.progress_kind() {
+                validate_stream_progress(
+                    &self.context,
+                    self.direction,
+                    &self.request_id,
+                    self.progress_head_digest,
+                    &mut self.last_progress_nonce,
+                    &payload,
+                )?;
+                continue;
+            }
+            if kind == self.direction.data_kind() {
+                if matches!(self.descriptor, BodyDescriptor::Inline { .. }) {
+                    return Err(serialization_error(
+                        "inline object RPC body was followed by a data frame",
+                    ));
+                }
+                self.observed_length = self
+                    .observed_length
+                    .checked_add(u64::try_from(payload.len()).unwrap_or(u64::MAX))
+                    .ok_or_else(|| serialization_error("object RPC body length overflow"))?;
+                if let Some(declared) = descriptor_total_bytes(&self.descriptor)
+                    && self.observed_length > declared
+                {
+                    return Err(serialization_error(format!(
+                        "object RPC body exceeded declared length {declared}"
+                    )));
+                }
+                self.hasher.update(&payload);
+                if let BodyDescriptor::Known { length, digest } = self.descriptor
+                    && self.observed_length == length
+                {
+                    let observed_digest = *self.hasher.finalize().as_bytes();
+                    if observed_digest != digest {
+                        return Err(NetworkError::AuthDenied);
+                    }
+                    self.publish(Ok(IncomingTerminal::Completed(ObjectRpcBodyVerification {
+                        length: self.observed_length,
+                        digest: observed_digest,
+                    })));
+                }
+                if payload.is_empty() {
+                    continue;
+                }
+                return Ok(Some(payload));
+            }
+            if kind != self.direction.finish_kind() {
+                return Err(serialization_error(format!(
+                    "unexpected object RPC stream frame kind {kind} in {:?} body",
+                    self.direction
+                )));
+            }
+            let finish: BodyFinishUnsigned = decode_authenticated_control(
+                &self.context.channel_binding,
+                self.direction.finish_domain(),
+                &payload,
+            )?;
+            validate_incoming_finish(
+                &self.context,
+                &self.request_id,
+                self.head_digest,
+                self.observed_length,
+                &self.hasher.finalize(),
+                &self.descriptor,
+                &finish,
+            )?;
+            let verification = ObjectRpcBodyVerification {
+                length: self.observed_length,
+                digest: finish.content_digest,
+            };
+            match finish.status {
+                FinishStatus::Completed => {
+                    self.publish(Ok(IncomingTerminal::Completed(verification)));
+                    return Ok(None);
+                }
+                FinishStatus::Rejected { detail } => {
+                    self.publish(Ok(IncomingTerminal::Rejected(detail.clone())));
+                    return Err(serialization_error(format!(
+                        "object RPC body rejected: {detail}"
+                    )));
+                }
+            }
+        }
+    }
+
+    async fn drain(mut self) {
+        while matches!(self.recv_chunk().await, Ok(Some(_))) {}
+    }
+}
+
+struct PullIncomingBodyReceiver<R: RpcRecordReader> {
+    state: Option<PullIncomingBodyState<R>>,
+}
+
+impl<R: RpcRecordReader> std::fmt::Debug for PullIncomingBodyReceiver<R> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PullIncomingBodyReceiver")
+            .field(
+                "terminal",
+                &self
+                    .state
+                    .as_ref()
+                    .is_none_or(|state| state.terminal_published),
+            )
+            .finish()
+    }
+}
+
+impl<R: RpcRecordReader> ObjectRpcBodyReceiver for PullIncomingBodyReceiver<R> {
+    fn recv_chunk(&mut self) -> ObjectRpcBodyReceiverFuture<'_> {
+        Box::pin(async move {
+            let Some(state) = self.state.as_mut() else {
+                return Ok(None);
+            };
+            state
+                .recv_chunk()
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        })
+    }
+}
+
+impl<R: RpcRecordReader> Drop for PullIncomingBodyReceiver<R> {
+    fn drop(&mut self) {
+        let Some(mut state) = self.state.take() else {
+            return;
+        };
+        if state.terminal_published {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(state.drain());
+            }
+            Err(error) => state.publish(Err(delivery_error(
+                "drain abandoned object RPC body",
+                format!("Tokio runtime unavailable: {error}"),
+            ))),
         }
     }
 }
@@ -1171,186 +1534,106 @@ async fn make_incoming_body<R>(
     options: ObjectFrameIoOptions,
     context: RpcPeerContext,
     spec: IncomingBodySpec,
-    complete_inline_now: bool,
+    inline_completes_without_finish: bool,
 ) -> (
     ObjectRpcStreamIncomingBody,
     ObjectRpcStreamBodyVerifier,
     IncomingBodyCompletion,
 )
 where
-    R: AsyncRead + Unpin + Send + 'static,
+    R: RpcRecordReader,
 {
     let total_bytes = descriptor_total_bytes(&spec.descriptor);
-    let (sender, receiver) = mpsc::channel(OBJECT_RPC_STREAM_BODY_CHANNEL_DEPTH.max(1));
-    let (verification_sender, verification_receiver) = watch::channel(None);
+    let (terminal_sender, terminal_receiver) = watch::channel(None);
     let verifier = ObjectRpcStreamBodyVerifier {
-        receiver: verification_receiver,
+        receiver: terminal_receiver.clone(),
+    };
+    let completion = IncomingBodyCompletion {
+        receiver: terminal_receiver,
+    };
+    let descriptor_validation = validate_descriptor_inline(&spec.descriptor, &spec.inline_body);
+    let incoming_body = match (descriptor_validation, spec.descriptor, spec.inline_body) {
+        (Ok(()), BodyDescriptor::Inline { length, digest }, Some(InlineBody { bytes }))
+            if inline_completes_without_finish =>
+        {
+            terminal_sender.send_replace(Some(Ok(IncomingTerminal::Completed(
+                ObjectRpcBodyVerification { length, digest },
+            ))));
+            ObjectRpcIncomingBody::bytes(bytes)
+        }
+        (Ok(()), descriptor @ BodyDescriptor::Inline { .. }, Some(InlineBody { bytes })) => {
+            let observed_length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&bytes);
+            let pending_chunk =
+                (!bytes.is_empty()).then(|| ObjectRpcBodyChunk::bytes(Bytes::from(bytes)));
+            ObjectRpcIncomingBody::receiver(
+                total_bytes,
+                Box::new(PullIncomingBodyReceiver {
+                    state: Some(PullIncomingBodyState {
+                        reader,
+                        options,
+                        context,
+                        direction: spec.direction,
+                        request_id: spec.request_id,
+                        head_digest: spec.head_digest,
+                        progress_head_digest: spec.progress_head_digest,
+                        last_progress_nonce: spec.last_progress_nonce,
+                        descriptor,
+                        hasher,
+                        observed_length,
+                        pending_chunk,
+                        terminal_sender,
+                        terminal_published: false,
+                    }),
+                }),
+            )
+        }
+        (Ok(()), BodyDescriptor::Known { length: 0, digest }, None) => {
+            let observed_digest = *blake3::hash(&[]).as_bytes();
+            let result = if observed_digest == digest {
+                Ok(IncomingTerminal::Completed(ObjectRpcBodyVerification {
+                    length: 0,
+                    digest: observed_digest,
+                }))
+            } else {
+                Err(NetworkError::AuthDenied)
+            };
+            terminal_sender.send_replace(Some(result));
+            ObjectRpcIncomingBody::empty()
+        }
+        (Ok(()), descriptor, None) => ObjectRpcIncomingBody::receiver(
+            total_bytes,
+            Box::new(PullIncomingBodyReceiver {
+                state: Some(PullIncomingBodyState {
+                    reader,
+                    options,
+                    context,
+                    direction: spec.direction,
+                    request_id: spec.request_id,
+                    head_digest: spec.head_digest,
+                    progress_head_digest: spec.progress_head_digest,
+                    last_progress_nonce: spec.last_progress_nonce,
+                    descriptor,
+                    hasher: blake3::Hasher::new(),
+                    observed_length: 0,
+                    pending_chunk: None,
+                    terminal_sender,
+                    terminal_published: false,
+                }),
+            }),
+        ),
+        (Ok(()), _, Some(_)) => unreachable!("inline descriptor validation matched the body"),
+        (Err(error), _, _) => {
+            terminal_sender.send_replace(Some(Err(error)));
+            ObjectRpcIncomingBody::empty()
+        }
     };
     let body = ObjectRpcStreamIncomingBody {
-        receiver,
-        current: None,
-        total_bytes,
+        body: incoming_body,
         verifier: verifier.clone(),
     };
-    let task_verifier = verifier.clone();
-    let inline = complete_inline_now && matches!(spec.descriptor, BodyDescriptor::Inline { .. });
-    if inline {
-        let result: Result<IncomingTerminal, NetworkError> = (|| {
-            validate_descriptor_inline(&spec.descriptor, &spec.inline_body)?;
-            let BodyDescriptor::Inline { length, digest } = spec.descriptor else {
-                unreachable!("the inline fast path checked the descriptor")
-            };
-            let inline_body = spec
-                .inline_body
-                .expect("the validated inline descriptor has a body");
-            if !inline_body.bytes.is_empty() {
-                sender
-                    .try_send(Bytes::from(inline_body.bytes))
-                    .map_err(|error| {
-                        delivery_error("deliver inline object RPC body", error.to_string())
-                    })?;
-            }
-            Ok(IncomingTerminal::Completed(ObjectRpcBodyVerification {
-                length,
-                digest,
-            }))
-        })();
-        drop(sender);
-        let verification = match &result {
-            Ok(IncomingTerminal::Completed(verification)) => Ok(verification.clone()),
-            Ok(IncomingTerminal::Rejected(detail)) => Err(serialization_error(format!(
-                "object RPC body rejected: {detail}"
-            ))),
-            Err(error) => Err(error.clone()),
-        };
-        verification_sender.send_replace(Some(verification));
-        return (body, task_verifier, IncomingBodyCompletion::Ready(result));
-    }
-    let pending = async move {
-        let result = pump_incoming_body(
-            reader,
-            options,
-            &context,
-            spec.direction,
-            &spec.request_id,
-            spec.head_digest,
-            spec.progress_head_digest,
-            spec.last_progress_nonce,
-            spec.descriptor,
-            spec.inline_body,
-            sender,
-        )
-        .await;
-        let verification = match &result {
-            Ok(IncomingTerminal::Completed(verification)) => Ok(verification.clone()),
-            Ok(IncomingTerminal::Rejected(detail)) => Err(serialization_error(format!(
-                "object RPC body rejected: {detail}"
-            ))),
-            Err(error) => Err(error.clone()),
-        };
-        verification_sender.send_replace(Some(verification));
-        result
-    };
-    let completion = IncomingBodyCompletion::Task(tokio::spawn(pending));
-    (body, task_verifier, completion)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn pump_incoming_body<R: AsyncRead + Unpin>(
-    mut reader: R,
-    options: ObjectFrameIoOptions,
-    context: &RpcPeerContext,
-    direction: IncomingDirection,
-    request_id: &Id,
-    head_digest: [u8; 32],
-    progress_head_digest: [u8; 32],
-    mut last_progress_nonce: u64,
-    descriptor: BodyDescriptor,
-    inline_body: Option<InlineBody>,
-    sender: mpsc::Sender<Bytes>,
-) -> Result<IncomingTerminal, NetworkError> {
-    validate_descriptor_inline(&descriptor, &inline_body)?;
-    let mut sender = Some(sender);
-    let mut hasher = blake3::Hasher::new();
-    let mut observed_length = 0_u64;
-    if let Some(inline) = inline_body {
-        observed_length = u64::try_from(inline.bytes.len())
-            .map_err(|_| serialization_error("inline body length does not fit u64"))?;
-        hasher.update(&inline.bytes);
-        if !inline.bytes.is_empty()
-            && let Some(active_sender) = sender.as_ref()
-            && active_sender.send(Bytes::from(inline.bytes)).await.is_err()
-        {
-            sender = None;
-        }
-    }
-    loop {
-        let (kind, payload) = read_wire_frame(&mut reader, options).await?;
-        if kind == direction.progress_kind() {
-            validate_stream_progress(
-                context,
-                direction,
-                request_id,
-                progress_head_digest,
-                &mut last_progress_nonce,
-                &payload,
-            )?;
-            continue;
-        }
-        if kind == direction.data_kind() {
-            if matches!(descriptor, BodyDescriptor::Inline { .. }) {
-                return Err(serialization_error(
-                    "inline object RPC body was followed by a data frame",
-                ));
-            }
-            observed_length = observed_length
-                .checked_add(payload.len() as u64)
-                .ok_or_else(|| serialization_error("object RPC body length overflow"))?;
-            if let Some(declared) = descriptor_total_bytes(&descriptor)
-                && observed_length > declared
-            {
-                return Err(serialization_error(format!(
-                    "object RPC body exceeded declared length {declared}"
-                )));
-            }
-            hasher.update(&payload);
-            if !payload.is_empty()
-                && let Some(active_sender) = sender.as_ref()
-                && active_sender.send(Bytes::from(payload)).await.is_err()
-            {
-                sender = None;
-            }
-            continue;
-        }
-        if kind != direction.finish_kind() {
-            return Err(serialization_error(format!(
-                "unexpected object RPC stream frame kind {kind} in {direction:?} body"
-            )));
-        }
-        let finish: BodyFinishUnsigned = decode_authenticated_control(
-            &context.channel_binding,
-            direction.finish_domain(),
-            &payload,
-        )?;
-        validate_incoming_finish(
-            context,
-            request_id,
-            head_digest,
-            observed_length,
-            &hasher.finalize(),
-            &descriptor,
-            &finish,
-        )?;
-        drop(sender);
-        let verification = ObjectRpcBodyVerification {
-            length: observed_length,
-            digest: finish.content_digest,
-        };
-        return Ok(match finish.status {
-            FinishStatus::Completed => IncomingTerminal::Completed(verification),
-            FinishStatus::Rejected { detail } => IncomingTerminal::Rejected(detail),
-        });
-    }
+    (body, verifier, completion)
 }
 
 fn validate_incoming_finish(
@@ -1391,7 +1674,37 @@ fn validate_incoming_finish(
     Ok(())
 }
 
-async fn write_prepared_body_data<W: AsyncWrite + Unpin>(
+enum OutgoingRpcData {
+    Bytes(Bytes),
+    Owned(OwnedChunk),
+}
+
+impl OutgoingRpcData {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Owned(chunk) => chunk.as_slice(),
+        }
+    }
+}
+
+async fn next_outgoing_body_chunk(
+    producer: &mut crate::rpc_body::BodyProducer,
+    allocator: Option<&ChunkAllocator>,
+) -> Result<Option<OutgoingRpcData>, NetworkError> {
+    match allocator {
+        Some(allocator) => producer
+            .next_owned(allocator)
+            .await
+            .map(|chunk| chunk.map(OutgoingRpcData::Owned)),
+        None => producer
+            .next()
+            .await
+            .map(|chunk| chunk.map(OutgoingRpcData::Bytes)),
+    }
+}
+
+async fn write_prepared_body_data<W: RpcRecordWriter>(
     writer: &mut W,
     context: &RpcPeerContext,
     direction: IncomingDirection,
@@ -1416,6 +1729,9 @@ async fn write_prepared_body_data<W: AsyncWrite + Unpin>(
                 wrote_any: false,
             })?;
         loop {
+            let allocator = writer.chunk_allocator().cloned();
+            let mut next_chunk =
+                std::pin::pin!(next_outgoing_body_chunk(&mut producer, allocator.as_ref()));
             let next = await_with_stream_progress(
                 writer,
                 context,
@@ -1424,7 +1740,7 @@ async fn write_prepared_body_data<W: AsyncWrite + Unpin>(
                 progress_head_digest,
                 progress_interval,
                 progress_nonce,
-                producer.next(),
+                next_chunk.as_mut(),
             )
             .await?
             .map_err(|error| SendFailure {
@@ -1434,24 +1750,40 @@ async fn write_prepared_body_data<W: AsyncWrite + Unpin>(
             let Some(chunk) = next else {
                 break;
             };
-            if chunk.len() > OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES {
+            if chunk.as_slice().len() > OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES {
                 return Err(SendFailure {
                     error: NetworkError::FrameTooLarge {
-                        actual_bytes: chunk.len(),
+                        actual_bytes: chunk.as_slice().len(),
                         max_bytes: OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES,
                     },
                     wrote_any: length != 0,
                 });
             }
             length = length
-                .checked_add(chunk.len() as u64)
+                .checked_add(chunk.as_slice().len() as u64)
                 .ok_or_else(|| SendFailure {
                     error: serialization_error("object RPC body length overflow"),
                     wrote_any: true,
                 })?;
-            hasher.update(&chunk);
-            write_wire_frame(writer, data_kind, &chunk, "write object RPC body data").await?;
+            hasher.update(chunk.as_slice());
+            match chunk {
+                OutgoingRpcData::Bytes(bytes) => {
+                    writer
+                        .write_record(
+                            data_kind,
+                            &bytes,
+                            "write byte-compatible object RPC body data",
+                        )
+                        .await?;
+                }
+                OutgoingRpcData::Owned(chunk) => {
+                    writer
+                        .write_owned_record(data_kind, chunk, "write owned object RPC body data")
+                        .await?;
+                }
+            }
         }
+        let mut finish_producer = std::pin::pin!(producer.finish());
         await_with_stream_progress(
             writer,
             context,
@@ -1460,7 +1792,7 @@ async fn write_prepared_body_data<W: AsyncWrite + Unpin>(
             progress_head_digest,
             progress_interval,
             progress_nonce,
-            producer.finish(),
+            finish_producer.as_mut(),
         )
         .await?
         .map_err(|error| SendFailure {
@@ -1525,7 +1857,7 @@ fn make_finish(
     }
 }
 
-async fn write_finish<W: AsyncWrite + Unpin>(
+async fn write_finish<W: RpcRecordWriter>(
     writer: &mut W,
     context: &RpcPeerContext,
     kind: u8,
@@ -1542,7 +1874,9 @@ async fn write_finish<W: AsyncWrite + Unpin>(
         error,
         wrote_any: false,
     })?;
-    write_wire_frame(writer, kind, &payload, "write object RPC body finish").await
+    writer
+        .write_record(kind, &payload, "write object RPC body finish")
+        .await
 }
 
 fn request_head(
@@ -1750,7 +2084,7 @@ fn response_progress_interval(
     }
 }
 
-async fn write_stream_progress<W: AsyncWrite + Unpin>(
+async fn write_stream_progress<W: RpcRecordWriter>(
     writer: &mut W,
     context: &RpcPeerContext,
     direction: IncomingDirection,
@@ -1763,17 +2097,14 @@ async fn write_stream_progress<W: AsyncWrite + Unpin>(
             error,
             wrote_any: false,
         })?;
-    write_wire_frame(
-        writer,
-        direction.progress_kind(),
-        &payload,
-        "write object RPC stream progress",
-    )
-    .await?;
-    writer.flush().await.map_err(|error| SendFailure {
-        error: delivery_error("flush object RPC stream progress", error.to_string()),
-        wrote_any: true,
-    })
+    writer
+        .write_record(
+            direction.progress_kind(),
+            &payload,
+            "write object RPC stream progress",
+        )
+        .await?;
+    writer.flush_record().await
 }
 
 async fn await_with_stream_progress<W, F, T>(
@@ -1784,20 +2115,19 @@ async fn await_with_stream_progress<W, F, T>(
     head_digest: [u8; 32],
     progress_interval: Option<Duration>,
     next_nonce: &mut u64,
-    future: F,
+    mut future: Pin<&mut F>,
 ) -> Result<T, SendFailure>
 where
-    W: AsyncWrite + Unpin,
-    F: Future<Output = T>,
+    W: RpcRecordWriter,
+    F: Future<Output = T> + ?Sized,
 {
     let Some(interval) = progress_interval else {
         return Ok(future.await);
     };
-    tokio::pin!(future);
     loop {
         tokio::select! {
             biased;
-            result = &mut future => return Ok(result),
+            result = future.as_mut() => return Ok(result),
             () = tokio::time::sleep(interval) => {
                 write_stream_progress(
                     writer,
@@ -1814,7 +2144,7 @@ where
     }
 }
 
-async fn send_request<W: AsyncWrite + Unpin>(
+async fn send_request<W: RpcRecordWriter>(
     mut writer: W,
     context: RpcPeerContext,
     request_id: Id,
@@ -1822,8 +2152,10 @@ async fn send_request<W: AsyncWrite + Unpin>(
     head_payload: Vec<u8>,
     mut body: PreparedOutgoingBody,
     options: ObjectFrameIoOptions,
+    timeline_trace: Option<crate::NetworkTimelineTraceContext>,
 ) -> Result<(), SendFailure> {
-    if body.source.is_some() {
+    let started_ns = timeline_started_ns(timeline_trace);
+    let result = async {
         let result = write_request_frames(
             &mut writer,
             &context,
@@ -1835,44 +2167,25 @@ async fn send_request<W: AsyncWrite + Unpin>(
         )
         .await;
         if result.is_ok() {
-            writer.shutdown().await.map_err(|error| SendFailure {
-                error: delivery_error("finish object RPC request direction", error.to_string()),
-                wrote_any: true,
-            })?;
+            writer.flush_record().await?;
+            writer.finish_records().await?;
         } else {
-            let _ = writer.shutdown().await;
+            let _ = writer.finish_records().await;
         }
-        return result;
+        result
     }
-
-    let mut writer =
-        tokio::io::BufWriter::with_capacity(OBJECT_RPC_STREAM_WRITE_BUFFER_BYTES, writer);
-    let result = write_request_frames(
-        &mut writer,
-        &context,
-        request_id,
-        request_head_digest,
-        &head_payload,
-        &mut body,
-        options,
-    )
     .await;
-    if result.is_ok() {
-        writer.flush().await.map_err(|error| SendFailure {
-            error: delivery_error("flush object RPC request", error.to_string()),
-            wrote_any: true,
-        })?;
-        writer.shutdown().await.map_err(|error| SendFailure {
-            error: delivery_error("finish object RPC request direction", error.to_string()),
-            wrote_any: true,
-        })?;
-    } else {
-        let _ = writer.shutdown().await;
-    }
+    record_rpc_timeline_duration(
+        timeline_trace,
+        crate::network_timeline_stage::RPC_REQUEST_STAGE,
+        crate::network_timeline_flag::REQUEST,
+        started_ns,
+        result.is_ok(),
+    );
     result
 }
 
-async fn write_request_frames<W: AsyncWrite + Unpin>(
+async fn write_request_frames<W: RpcRecordWriter>(
     writer: &mut W,
     context: &RpcPeerContext,
     request_id: Id,
@@ -1881,13 +2194,13 @@ async fn write_request_frames<W: AsyncWrite + Unpin>(
     body: &mut PreparedOutgoingBody,
     options: ObjectFrameIoOptions,
 ) -> Result<(), SendFailure> {
-    write_wire_frame(
-        writer,
-        FRAME_REQUEST_HEAD,
-        head_payload,
-        "write object RPC request head",
-    )
-    .await?;
+    writer
+        .write_record(
+            FRAME_REQUEST_HEAD,
+            head_payload,
+            "write object RPC request head",
+        )
+        .await?;
     if matches!(body.descriptor, BodyDescriptor::Inline { .. }) {
         return Ok(());
     }
@@ -1908,6 +2221,14 @@ async fn write_request_frames<W: AsyncWrite + Unpin>(
         error: failure.error,
         wrote_any: true,
     })?;
+    // A Known descriptor is already authenticated in the request head and
+    // commits to both the exact length and digest. The final data record
+    // therefore closes the body at its declared byte boundary; the logical
+    // mux can combine that record with stream FINISH. Length-only and deferred
+    // producers still need the authenticated finish to publish their digest.
+    if matches!(body.descriptor, BodyDescriptor::Known { .. }) {
+        return Ok(());
+    }
     let finish = make_finish(
         context,
         request_id,
@@ -1938,15 +2259,17 @@ async fn write_request_frames<W: AsyncWrite + Unpin>(
 /// and any terminal authentication or transport failure is delivered by its
 /// read path. This function never reconnects, reroutes, or automatically
 /// resends a possibly applied call.
-pub(crate) async fn call_object_rpc_stream_with_consumption<S, F, Fut, T>(
-    stream: S,
+async fn call_object_rpc_records_with_consumption<R, W, F, Fut, T>(
+    mut reader: R,
+    writer: W,
     context: &RpcPeerContext,
     call: ObjectRpcStreamCall,
     options: ObjectFrameIoOptions,
     response_consumer: F,
 ) -> RpcDeliveryOutcome<T>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    R: RpcRecordReader,
+    W: RpcRecordWriter,
     F: FnOnce(ObjectRpcStreamResponse) -> Fut,
     Fut: Future<Output = Result<RpcResponseConsumption<T>, NetworkError>>,
 {
@@ -1960,7 +2283,9 @@ where
         metadata,
         application_head,
         body,
+        timeline_trace,
     } = call;
+    let prepare_started_ns = timeline_started_ns(timeline_trace);
     let body = match prepare_outgoing_body(body).await {
         Ok(body) => body,
         Err(error) => return RpcDeliveryOutcome::NotSent { error },
@@ -1979,7 +2304,13 @@ where
         Err(error) => return RpcDeliveryOutcome::NotSent { error },
     };
     let request_head_digest = *blake3::hash(&head_payload).as_bytes();
-    let (mut reader, writer) = tokio::io::split(stream);
+    record_rpc_timeline_duration(
+        timeline_trace,
+        crate::network_timeline_stage::RPC_PREPARE,
+        crate::network_timeline_flag::REQUEST,
+        prepare_started_ns,
+        true,
+    );
     let request_is_inline = body.source.is_none();
     let (response_frame, last_response_progress_nonce, request_send_completed, mut send_task) =
         if request_is_inline {
@@ -1991,6 +2322,7 @@ where
                 head_payload,
                 body,
                 options,
+                timeline_trace,
             )
             .await
             {
@@ -2013,6 +2345,7 @@ where
                 context,
                 &request_id,
                 request_head_digest,
+                timeline_trace,
             )
             .await
             {
@@ -2028,6 +2361,7 @@ where
                 head_payload,
                 body,
                 options,
+                timeline_trace,
             ));
             let (frame, last_nonce, completed) = tokio::select! {
                 send_result = &mut task => {
@@ -2038,6 +2372,7 @@ where
                             context,
                             &request_id,
                             request_head_digest,
+                            timeline_trace,
                         ).await {
                             Ok((frame, last_nonce)) => (frame, last_nonce, true),
                             Err(error) => return RpcDeliveryOutcome::PossiblyApplied { error },
@@ -2058,6 +2393,7 @@ where
                     context,
                     &request_id,
                     request_head_digest,
+                    timeline_trace,
                 ) => {
                     match response {
                         Ok((frame, last_nonce)) => (frame, last_nonce, false),
@@ -2075,7 +2411,7 @@ where
             };
             (frame, last_nonce, completed, Some(task))
         };
-    if response_frame.0 != FRAME_RESPONSE_HEAD {
+    if response_frame.kind != FRAME_RESPONSE_HEAD {
         if let Some(task) = &send_task {
             task.abort();
         }
@@ -2086,7 +2422,7 @@ where
     let response_head: ResponseHeadUnsigned = match decode_authenticated_control(
         &context.channel_binding,
         AUTH_RESPONSE_HEAD,
-        &response_frame.1,
+        &response_frame.payload,
     ) {
         Ok(head) => head,
         Err(error) => {
@@ -2104,7 +2440,7 @@ where
         }
         return RpcDeliveryOutcome::PossiblyApplied { error };
     }
-    let response_head_digest = *blake3::hash(&response_frame.1).as_bytes();
+    let response_head_digest = *blake3::hash(&response_frame.payload).as_bytes();
     let (metadata, application_head, descriptor, inline_body) = match response_head.disposition {
         ResponseDisposition::Accepted {
             metadata,
@@ -2119,7 +2455,7 @@ where
             return RpcDeliveryOutcome::Rejected { detail };
         }
     };
-    let (body, _verifier, receive_task) = make_incoming_body(
+    let (body, _verifier, receive_completion) = make_incoming_body(
         reader,
         options,
         context.clone(),
@@ -2132,7 +2468,7 @@ where
             descriptor,
             inline_body,
         },
-        request_send_completed,
+        request_is_inline,
     )
     .await;
     let consumer_result = match response_consumer(ObjectRpcStreamResponse {
@@ -2144,28 +2480,24 @@ where
     {
         Ok(RpcResponseConsumption::Complete(value)) => Ok(value),
         Ok(RpcResponseConsumption::Streaming(value)) => {
-            tokio::spawn(async move {
-                if request_send_completed {
-                    let _ = receive_task.join().await;
-                } else {
-                    let _ = tokio::join!(
-                        receive_task.join(),
-                        send_task.expect("an incomplete object RPC request has a writer task")
-                    );
-                }
-            });
+            // The returned application body now owns the authenticated record
+            // reader and drives it directly. Only an independently running
+            // request producer still needs to be detached here.
+            if !request_send_completed {
+                tokio::spawn(async move {
+                    let _ = send_task
+                        .expect("an incomplete object RPC request has a writer task")
+                        .await;
+                });
+            }
+            drop(receive_completion);
             return RpcDeliveryOutcome::Completed(value);
         }
         Err(error) => Err(error),
     };
-    let terminal = match receive_task.join().await {
-        Ok(Ok(terminal)) => terminal,
-        Ok(Err(error)) => return RpcDeliveryOutcome::PossiblyApplied { error },
-        Err(error) => {
-            return RpcDeliveryOutcome::PossiblyApplied {
-                error: delivery_error("join object RPC response reader", error.to_string()),
-            };
-        }
+    let terminal = match receive_completion.join().await {
+        Ok(terminal) => terminal,
+        Err(error) => return RpcDeliveryOutcome::PossiblyApplied { error },
     };
     if !request_send_completed {
         match send_task
@@ -2196,6 +2528,54 @@ where
 }
 
 #[cfg(test)]
+pub(crate) async fn call_object_rpc_stream_with_consumption<S, F, Fut, T>(
+    stream: S,
+    context: &RpcPeerContext,
+    call: ObjectRpcStreamCall,
+    options: ObjectFrameIoOptions,
+    response_consumer: F,
+) -> RpcDeliveryOutcome<T>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    F: FnOnce(ObjectRpcStreamResponse) -> Fut,
+    Fut: Future<Output = Result<RpcResponseConsumption<T>, NetworkError>>,
+{
+    let (reader, writer) = byte_record_halves(stream);
+    call_object_rpc_records_with_consumption(
+        reader,
+        writer,
+        context,
+        call,
+        options,
+        response_consumer,
+    )
+    .await
+}
+
+pub(crate) async fn call_object_rpc_chunk_stream_with_consumption<F, Fut, T>(
+    stream: AuthenticatedChunkStream,
+    context: &RpcPeerContext,
+    call: ObjectRpcStreamCall,
+    options: ObjectFrameIoOptions,
+    response_consumer: F,
+) -> RpcDeliveryOutcome<T>
+where
+    F: FnOnce(ObjectRpcStreamResponse) -> Fut,
+    Fut: Future<Output = Result<RpcResponseConsumption<T>, NetworkError>>,
+{
+    let (reader, writer) = owned_record_halves(stream);
+    call_object_rpc_records_with_consumption(
+        reader,
+        writer,
+        context,
+        call,
+        options,
+        response_consumer,
+    )
+    .await
+}
+
+#[cfg(test)]
 async fn call_object_rpc_stream<S, F, Fut, T>(
     stream: S,
     context: &RpcPeerContext,
@@ -2222,7 +2602,7 @@ where
     .await
 }
 
-async fn write_rejection<W: AsyncWrite + Unpin>(
+async fn write_rejection<W: RpcRecordWriter>(
     writer: &mut W,
     context: &RpcPeerContext,
     request_id: Id,
@@ -2235,18 +2615,14 @@ async fn write_rejection<W: AsyncWrite + Unpin>(
         request_head_digest,
         ResponseDisposition::Rejected { detail },
     )?;
-    write_wire_frame(
-        writer,
-        FRAME_RESPONSE_HEAD,
-        &payload,
-        "write object RPC rejection",
-    )
-    .await
-    .map_err(|failure| failure.error)?;
     writer
-        .shutdown()
+        .write_record(FRAME_RESPONSE_HEAD, &payload, "write object RPC rejection")
         .await
-        .map_err(|error| delivery_error("finish object RPC rejection", error.to_string()))
+        .map_err(|failure| failure.error)?;
+    writer
+        .finish_records()
+        .await
+        .map_err(|failure| failure.error)
 }
 
 /// Serves exactly one call from one authenticated duplex stream. The handler
@@ -2254,19 +2630,28 @@ async fn write_rejection<W: AsyncWrite + Unpin>(
 /// continues independently. Response data may therefore start before the full
 /// request is consumed, but a successful response finish is withheld until the
 /// request's content proof verifies.
-pub async fn serve_object_rpc_stream<S, F, Fut>(
-    stream: S,
+async fn serve_object_rpc_records<R, W, F, Fut>(
+    mut reader: R,
+    mut writer: W,
     context: &RpcPeerContext,
     options: ObjectFrameIoOptions,
     handler: F,
 ) -> Result<(), NetworkError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    R: RpcRecordReader,
+    W: RpcRecordWriter,
     F: FnOnce(ObjectRpcStreamIncomingCall, RpcPeerContext) -> Fut,
     Fut: Future<Output = Result<ObjectRpcStreamReply, NetworkError>>,
 {
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let (kind, head_payload) = read_wire_frame(&mut reader, options).await?;
+    let request_ingress_started_ns = if crate::network_timeline_capture_is_active() {
+        crate::network_timeline_monotonic_ns()
+    } else {
+        0
+    };
+    let RpcRecord {
+        kind,
+        payload: head_payload,
+    } = reader.read_record(options).await?;
     if kind != FRAME_REQUEST_HEAD {
         return Err(serialization_error("expected object RPC request head"));
     }
@@ -2278,7 +2663,7 @@ where
     let request_id = head.request_id.clone();
     let negotiated_response_progress_interval =
         response_progress_interval(options, head.response_progress_interval_millis);
-    let (body, request_verifier, request_task) = make_incoming_body(
+    let (body, request_verifier, request_completion) = make_incoming_body(
         reader,
         options,
         context.clone(),
@@ -2294,6 +2679,11 @@ where
         true,
     )
     .await;
+    let request_ingress_duration_ns = if request_ingress_started_ns == 0 {
+        0
+    } else {
+        crate::network_timeline_monotonic_ns().saturating_sub(request_ingress_started_ns)
+    };
     let incoming = ObjectRpcStreamIncomingCall {
         request_id: request_id.clone(),
         method: head.method,
@@ -2301,30 +2691,34 @@ where
         metadata: head.metadata,
         application_head: head.application_head,
         body,
+        request_ingress_duration_ns,
     };
     let mut response_progress_nonce = 1;
-    let handler_result = match await_with_stream_progress(
-        &mut writer,
-        context,
-        IncomingDirection::Response,
-        &request_id,
-        request_head_digest,
-        negotiated_response_progress_interval,
-        &mut response_progress_nonce,
-        handler(incoming, context.clone()),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(failure) => {
-            request_task.abort();
-            return Err(failure.error);
+    // Keep one handler future in the caller's state and lend a pinned view to
+    // the progress driver. Passing it by value makes an async state machine
+    // retain multiple copies of a potentially large service future, which can
+    // overflow an otherwise-idle Tokio worker stack in debug builds.
+    let handler_result = {
+        let mut handler_future = std::pin::pin!(handler(incoming, context.clone()));
+        match await_with_stream_progress(
+            &mut writer,
+            context,
+            IncomingDirection::Response,
+            &request_id,
+            request_head_digest,
+            negotiated_response_progress_interval,
+            &mut response_progress_nonce,
+            handler_future.as_mut(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(failure) => return Err(failure.error),
         }
     };
     let reply = match handler_result {
         Ok(reply) if reply.request_id == request_id => reply,
         Ok(_) => {
-            request_task.abort();
             return write_rejection(
                 &mut writer,
                 context,
@@ -2335,7 +2729,6 @@ where
             .await;
         }
         Err(error) => {
-            request_task.abort();
             return write_rejection(
                 &mut writer,
                 context,
@@ -2346,6 +2739,12 @@ where
             .await;
         }
     };
+    let mut response_stage = RpcTimelineStageGuard::new(
+        reply.timeline_trace,
+        crate::network_timeline_stage::RPC_RESPONSE_STAGE,
+        crate::network_timeline_flag::RESPONSE,
+    );
+    let mut prepare_response_body = std::pin::pin!(prepare_outgoing_body(reply.body));
     let prepared_response_body = match await_with_stream_progress(
         &mut writer,
         context,
@@ -2354,20 +2753,16 @@ where
         request_head_digest,
         negotiated_response_progress_interval,
         &mut response_progress_nonce,
-        prepare_outgoing_body(reply.body),
+        prepare_response_body.as_mut(),
     )
     .await
     {
         Ok(result) => result,
-        Err(failure) => {
-            request_task.abort();
-            return Err(failure.error);
-        }
+        Err(failure) => return Err(failure.error),
     };
     let mut response_body = match prepared_response_body {
         Ok(body) => body,
         Err(error) => {
-            request_task.abort();
             return write_rejection(
                 &mut writer,
                 context,
@@ -2378,13 +2773,38 @@ where
             .await;
         }
     };
+    let response_completes_at_known_boundary =
+        matches!(response_body.descriptor, BodyDescriptor::Known { .. });
+    if response_completes_at_known_boundary {
+        // A known response needs no terminal record, so establish the request
+        // body's verified outcome before publishing the accepted response
+        // head. Unknown/length-only responses keep the terminal status record
+        // and may still begin while a long request is being verified.
+        let mut verify_request = std::pin::pin!(request_verifier.clone().verify());
+        let request_result = await_with_stream_progress(
+            &mut writer,
+            context,
+            IncomingDirection::Response,
+            &request_id,
+            request_head_digest,
+            negotiated_response_progress_interval,
+            &mut response_progress_nonce,
+            verify_request.as_mut(),
+        )
+        .await
+        .map_err(|failure| failure.error)?;
+        if let Err(error) = request_result {
+            return write_rejection(
+                &mut writer,
+                context,
+                request_id,
+                request_head_digest,
+                format!("request body verification failed: {error}"),
+            )
+            .await;
+        }
+    }
     let buffer_entire_response = request_is_inline && response_body.source.is_none();
-    let write_buffer_bytes = if response_body.source.is_some() {
-        0
-    } else {
-        OBJECT_RPC_STREAM_WRITE_BUFFER_BYTES
-    };
-    let mut writer = tokio::io::BufWriter::with_capacity(write_buffer_bytes, writer);
     let (_, response_payload) = response_head(
         context,
         request_id.clone(),
@@ -2397,34 +2817,35 @@ where
         },
     )?;
     let response_head_digest = *blake3::hash(&response_payload).as_bytes();
-    write_wire_frame(
-        &mut writer,
-        FRAME_RESPONSE_HEAD,
-        &response_payload,
-        "write object RPC response head",
-    )
-    .await
-    .map_err(|failure| failure.error)?;
+    writer
+        .write_record(
+            FRAME_RESPONSE_HEAD,
+            &response_payload,
+            "write object RPC response head",
+        )
+        .await
+        .map_err(|failure| failure.error)?;
     if buffer_entire_response {
-        writer.shutdown().await.map_err(|error| {
-            delivery_error("finish inline object RPC response", error.to_string())
-        })?;
-        return match request_task.join().await {
-            Ok(Ok(IncomingTerminal::Completed(_))) => Ok(()),
-            Ok(Ok(IncomingTerminal::Rejected(detail))) => Err(serialization_error(format!(
+        writer
+            .finish_records()
+            .await
+            .map_err(|failure| failure.error)?;
+        let result = match request_completion.join().await {
+            Ok(IncomingTerminal::Completed(_)) => Ok(()),
+            Ok(IncomingTerminal::Rejected(detail)) => Err(serialization_error(format!(
                 "request body rejected: {detail}"
             ))),
-            Ok(Err(error)) => Err(error),
-            Err(error) => Err(delivery_error(
-                "join object RPC request reader",
-                error.to_string(),
-            )),
+            Err(error) => Err(error),
         };
+        if result.is_ok() {
+            response_stage.mark_success();
+        }
+        return result;
     }
     writer
-        .flush()
+        .flush_record()
         .await
-        .map_err(|error| delivery_error("flush object RPC response head", error.to_string()))?;
+        .map_err(|failure| failure.error)?;
     let response_verification = write_prepared_body_data(
         &mut writer,
         context,
@@ -2438,6 +2859,24 @@ where
     )
     .await
     .map_err(|failure| failure.error)?;
+    if response_completes_at_known_boundary {
+        writer
+            .finish_records()
+            .await
+            .map_err(|failure| failure.error)?;
+        let result = match request_completion.join().await {
+            Ok(IncomingTerminal::Completed(_)) => Ok(()),
+            Ok(IncomingTerminal::Rejected(detail)) => Err(serialization_error(format!(
+                "request body rejected: {detail}"
+            ))),
+            Err(error) => Err(error),
+        };
+        if result.is_ok() {
+            response_stage.mark_success();
+        }
+        return result;
+    }
+    let mut verify_request = std::pin::pin!(request_verifier.verify());
     let request_result = await_with_stream_progress(
         &mut writer,
         context,
@@ -2446,7 +2885,7 @@ where
         request_head_digest,
         negotiated_response_progress_interval,
         &mut response_progress_nonce,
-        request_verifier.verify(),
+        verify_request.as_mut(),
     )
     .await
     .map_err(|failure| failure.error)?;
@@ -2472,29 +2911,208 @@ where
     )
     .await
     .map_err(|failure| failure.error)?;
-    writer.shutdown().await.map_err(|error| {
-        delivery_error("finish object RPC response direction", error.to_string())
-    })?;
-    match request_task.join().await {
-        Ok(Ok(IncomingTerminal::Completed(_))) if request_result.is_ok() => Ok(()),
-        Ok(Ok(IncomingTerminal::Rejected(detail))) => Err(serialization_error(format!(
+    writer
+        .finish_records()
+        .await
+        .map_err(|failure| failure.error)?;
+    let result = match request_completion.join().await {
+        Ok(IncomingTerminal::Completed(_)) if request_result.is_ok() => Ok(()),
+        Ok(IncomingTerminal::Rejected(detail)) => Err(serialization_error(format!(
             "request body rejected: {detail}"
         ))),
-        Ok(Err(error)) => Err(error),
-        Err(error) => Err(delivery_error(
-            "join object RPC request reader",
-            error.to_string(),
-        )),
+        Err(error) => Err(error),
         _ => request_result.map(|_| ()),
+    };
+    if result.is_ok() {
+        response_stage.mark_success();
     }
+    result
+}
+
+pub async fn serve_object_rpc_stream<S, F, Fut>(
+    stream: S,
+    context: &RpcPeerContext,
+    options: ObjectFrameIoOptions,
+    handler: F,
+) -> Result<(), NetworkError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    F: FnOnce(ObjectRpcStreamIncomingCall, RpcPeerContext) -> Fut,
+    Fut: Future<Output = Result<ObjectRpcStreamReply, NetworkError>>,
+{
+    let (reader, writer) = byte_record_halves(stream);
+    serve_object_rpc_records(reader, writer, context, options, handler).await
+}
+
+pub(crate) async fn serve_object_rpc_chunk_stream<F, Fut>(
+    stream: AuthenticatedChunkStream,
+    context: &RpcPeerContext,
+    options: ObjectFrameIoOptions,
+    handler: F,
+) -> Result<(), NetworkError>
+where
+    F: FnOnce(ObjectRpcStreamIncomingCall, RpcPeerContext) -> Fut,
+    Fut: Future<Output = Result<ObjectRpcStreamReply, NetworkError>>,
+{
+    let (reader, writer) = owned_record_halves(stream);
+    serve_object_rpc_records(reader, writer, context, options, handler).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::owned_chunk::{
+        AuthenticatedChunkReader, AuthenticatedChunkWriter, ChunkClass, ChunkLease,
+        ChunkStreamFuture, RPC_RECORD_MAX, ResetReason,
+    };
+    use std::collections::VecDeque;
     use std::io::Cursor;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    struct TestChunkReader {
+        receiver: tokio::sync::mpsc::Receiver<Option<ChunkLease>>,
+        allocator: ChunkAllocator,
+    }
+
+    impl AuthenticatedChunkReader for TestChunkReader {
+        fn allocator(&self) -> &ChunkAllocator {
+            &self.allocator
+        }
+
+        fn max_payload_bytes(&self) -> usize {
+            RPC_RECORD_MAX
+        }
+
+        fn recv_chunk(&mut self) -> ChunkStreamFuture<'_, Option<ChunkLease>> {
+            Box::pin(async move {
+                self.receiver.recv().await.ok_or_else(|| NetworkError::Io {
+                    operation: "receive test owned object RPC record".to_string(),
+                    detail: "test channel closed without a finish record".to_string(),
+                })
+            })
+        }
+    }
+
+    struct TestChunkWriter {
+        sender: tokio::sync::mpsc::Sender<Option<ChunkLease>>,
+        allocator: ChunkAllocator,
+        data_slab_ids: Arc<StdMutex<Vec<u64>>>,
+        record_kinds: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl AuthenticatedChunkWriter for TestChunkWriter {
+        fn max_payload_bytes(&self) -> usize {
+            RPC_RECORD_MAX
+        }
+
+        fn allocator(&self) -> &ChunkAllocator {
+            &self.allocator
+        }
+
+        fn send_chunk(&mut self, chunk: OwnedChunk) -> ChunkStreamFuture<'_, ()> {
+            Box::pin(async move {
+                self.record_kinds
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(chunk.as_slice()[4]);
+                if chunk.class() == ChunkClass::Data {
+                    self.data_slab_ids
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .push(chunk.slab_id());
+                }
+                self.sender
+                    .send(Some(chunk.into_lease()))
+                    .await
+                    .map_err(|_| NetworkError::Io {
+                        operation: "send test owned object RPC record".to_string(),
+                        detail: "test receiver closed".to_string(),
+                    })
+            })
+        }
+
+        fn finish(&mut self) -> ChunkStreamFuture<'_, ()> {
+            Box::pin(async move {
+                self.sender.send(None).await.map_err(|_| NetworkError::Io {
+                    operation: "finish test owned object RPC records".to_string(),
+                    detail: "test receiver closed".to_string(),
+                })
+            })
+        }
+
+        fn reset(&mut self, _reason: ResetReason) -> ChunkStreamFuture<'_, ()> {
+            self.finish()
+        }
+    }
+
+    struct ReadyRecordReader {
+        records: VecDeque<RpcRecord>,
+    }
+
+    impl RpcRecordReader for ReadyRecordReader {
+        fn read_record(
+            &mut self,
+            _options: ObjectFrameIoOptions,
+        ) -> RpcRecordFuture<'_, RpcRecord> {
+            Box::pin(async move {
+                self.records.pop_front().ok_or_else(|| NetworkError::Io {
+                    operation: "read ready test object RPC record".to_string(),
+                    detail: "no buffered record remains".to_string(),
+                })
+            })
+        }
+    }
+
+    fn test_owned_chunk_pair() -> (
+        AuthenticatedChunkStream,
+        AuthenticatedChunkStream,
+        Arc<StdMutex<Vec<u64>>>,
+        Arc<StdMutex<Vec<u8>>>,
+        Arc<StdMutex<Vec<u8>>>,
+    ) {
+        let (client_sender, server_receiver) = tokio::sync::mpsc::channel(8);
+        let (server_sender, client_receiver) = tokio::sync::mpsc::channel(8);
+        let client_allocator = ChunkAllocator::default();
+        let server_allocator = ChunkAllocator::default();
+        let client_data_slab_ids = Arc::new(StdMutex::new(Vec::new()));
+        let server_data_slab_ids = Arc::new(StdMutex::new(Vec::new()));
+        let client_record_kinds = Arc::new(StdMutex::new(Vec::new()));
+        let server_record_kinds = Arc::new(StdMutex::new(Vec::new()));
+        let client = AuthenticatedChunkStream::new(
+            Box::new(TestChunkReader {
+                receiver: client_receiver,
+                allocator: client_allocator.clone(),
+            }),
+            Box::new(TestChunkWriter {
+                sender: client_sender,
+                allocator: client_allocator,
+                data_slab_ids: Arc::clone(&client_data_slab_ids),
+                record_kinds: Arc::clone(&client_record_kinds),
+            }),
+        )
+        .expect("client test chunk stream");
+        let server = AuthenticatedChunkStream::new(
+            Box::new(TestChunkReader {
+                receiver: server_receiver,
+                allocator: server_allocator.clone(),
+            }),
+            Box::new(TestChunkWriter {
+                sender: server_sender,
+                allocator: server_allocator,
+                data_slab_ids: server_data_slab_ids,
+                record_kinds: Arc::clone(&server_record_kinds),
+            }),
+        )
+        .expect("server test chunk stream");
+        (
+            client,
+            server,
+            client_data_slab_ids,
+            client_record_kinds,
+            server_record_kinds,
+        )
+    }
 
     fn node(name: &str) -> NodeId {
         NodeId::from_legacy_named(name).expect("node id")
@@ -2516,6 +3134,294 @@ mod tests {
             RpcPeerContext::authenticated(server, client, session_id, binding)
                 .expect("server context"),
         )
+    }
+
+    #[derive(Default)]
+    struct VectoredOnlyWriter {
+        bytes: Vec<u8>,
+        vectored_calls: usize,
+    }
+
+    impl AsyncWrite for VectoredOnlyWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            panic!("object frame unexpectedly used the scalar copy path")
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffers: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            self.vectored_calls += 1;
+            let written = buffers.iter().map(|buffer| buffer.len()).sum();
+            for buffer in buffers {
+                self.bytes.extend_from_slice(buffer);
+            }
+            Poll::Ready(Ok(written))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn object_frame_moves_prefix_and_payload_through_one_vectored_write() {
+        let payload = body_bytes(OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES, 0x51);
+        let mut writer = VectoredOnlyWriter::default();
+
+        write_wire_frame(
+            &mut writer,
+            FRAME_REQUEST_DATA,
+            &payload,
+            "test object frame vectored write",
+        )
+        .await
+        .expect("write frame");
+
+        assert_eq!(writer.vectored_calls, 1);
+        assert_eq!(
+            writer.bytes.len(),
+            payload.len() + OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES
+        );
+        assert_eq!(&writer.bytes[..4], &OBJECT_RPC_STREAM_WIRE_MAGIC);
+        assert_eq!(writer.bytes[4], FRAME_REQUEST_DATA);
+        assert_eq!(
+            &writer.bytes[OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES..],
+            payload
+        );
+    }
+
+    #[tokio::test]
+    async fn application_body_adapter_preserves_received_chunk_ownership() {
+        let expected = Bytes::from(vec![0x6d; OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES]);
+        let expected_pointer = expected.as_ptr();
+        let (mut sender, incoming) = ObjectRpcIncomingBody::multiplexed_chunk_ring_with_depth(
+            Some(expected.len() as u64),
+            1,
+        );
+        assert!(sender.send(expected).await.expect("send body chunk"));
+        sender
+            .finish(OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES as u64)
+            .await
+            .expect("finish body");
+        drop(sender);
+        let (_verification_sender, verification_receiver) = watch::channel(None);
+        let stream_body = ObjectRpcStreamIncomingBody {
+            body: incoming,
+            verifier: ObjectRpcStreamBodyVerifier {
+                receiver: verification_receiver,
+            },
+        };
+
+        let mut chunks = stream_body.into_application_body().into_chunk_stream();
+        let actual = chunks
+            .next_chunk(usize::MAX)
+            .await
+            .expect("read body chunk")
+            .expect("body chunk");
+
+        assert_eq!(actual.as_ptr(), expected_pointer);
+        assert_eq!(actual.len(), OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES);
+    }
+
+    #[tokio::test]
+    async fn known_body_is_pulled_by_the_application_without_a_receive_task() {
+        let expected = Bytes::from_static(b"already buffered typed body");
+        let digest = *blake3::hash(&expected).as_bytes();
+        let (_, server_context) = peer_contexts();
+        let request_id = Id::from_legacy_named("request_buffered_known_body").expect("request id");
+        let reader = ReadyRecordReader {
+            records: VecDeque::from([RpcRecord {
+                kind: FRAME_REQUEST_DATA,
+                payload: ObjectRpcBodyChunk::bytes(expected.clone()),
+            }]),
+        };
+
+        let (body, verifier, completion) = make_incoming_body(
+            reader,
+            ObjectFrameIoOptions::default(),
+            server_context,
+            IncomingBodySpec {
+                direction: IncomingDirection::Request,
+                request_id,
+                head_digest: [0x31; 32],
+                progress_head_digest: [0x31; 32],
+                last_progress_nonce: 0,
+                descriptor: BodyDescriptor::Known {
+                    length: expected.len() as u64,
+                    digest,
+                },
+                inline_body: None,
+            },
+            false,
+        )
+        .await;
+
+        assert!(
+            !completion.is_ready(),
+            "constructing the body must not run or spawn its record reader"
+        );
+        assert_eq!(
+            body.materialize_to_vec().await.expect("materialize body"),
+            expected
+        );
+        assert!(
+            completion.is_ready(),
+            "the application pull must publish terminal verification"
+        );
+        assert_eq!(
+            verifier.verify().await.expect("verify buffered body"),
+            ObjectRpcBodyVerification {
+                length: expected.len() as u64,
+                digest,
+            }
+        );
+        assert!(matches!(
+            completion.join().await.expect("complete pulled body"),
+            IncomingTerminal::Completed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn owned_object_rpc_preserves_body_slab_through_delivery() {
+        let (client, server, transmitted_data_slab_ids, _, _) = test_owned_chunk_pair();
+        let (client_context, server_context) = peer_contexts();
+        let payload = vec![0x7a; OBJECT_RPC_STREAM_INLINE_BODY_BYTES + 1024];
+        let expected = payload.clone();
+        let (delivered_id_sender, delivered_id_receiver) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            serve_object_rpc_chunk_stream(
+                server,
+                &server_context,
+                ObjectFrameIoOptions::default(),
+                move |incoming, _| async move {
+                    let request_id = incoming.request_id.clone();
+                    let mut body = incoming.body.into_application_body();
+                    let chunk = body
+                        .next_chunk()
+                        .await
+                        .expect("read owned request body")
+                        .expect("request body chunk");
+                    assert_eq!(&*chunk, &expected);
+                    delivered_id_sender
+                        .send(chunk.pooled_slab_id().expect("pooled request body"))
+                        .expect("record delivered slab id");
+                    assert!(
+                        body.next_chunk()
+                            .await
+                            .expect("finish owned request body")
+                            .is_none()
+                    );
+                    Ok(ObjectRpcStreamReply::new(
+                        request_id,
+                        ObjectRpcStreamBody::bytes(Vec::new()),
+                    ))
+                },
+            )
+            .await
+            .expect("serve owned object RPC");
+        });
+
+        let result = call_object_rpc_chunk_stream_with_consumption(
+            client,
+            &client_context,
+            ObjectRpcStreamCall::new("test.owned", ObjectRpcStreamBody::bytes(payload)),
+            ObjectFrameIoOptions::default(),
+            |response| async move {
+                assert!(response.body.materialize_to_vec().await?.is_empty());
+                Ok(RpcResponseConsumption::Complete(()))
+            },
+        )
+        .await;
+        assert!(matches!(result, RpcDeliveryOutcome::Completed(())));
+        server_task.await.expect("join owned object RPC server");
+        let delivered_id = delivered_id_receiver.await.expect("delivered slab id");
+        let transmitted = transmitted_data_slab_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(transmitted.as_slice(), &[delivered_id]);
+    }
+
+    #[tokio::test]
+    async fn small_known_owned_rpc_uses_head_and_data_without_redundant_finish() {
+        let (client, server, _, client_record_kinds, server_record_kinds) = test_owned_chunk_pair();
+        let (client_context, server_context) = peer_contexts();
+        let request = "small owned request".to_string();
+        let expected_request = request.clone();
+        let response = "small owned response".to_string();
+        let expected_response = response.clone();
+        let server_task = tokio::spawn(async move {
+            serve_object_rpc_chunk_stream(
+                server,
+                &server_context,
+                ObjectFrameIoOptions::default(),
+                move |incoming, _| {
+                    let response = response.clone();
+                    let expected_request = expected_request.clone();
+                    async move {
+                        let request_id = incoming.request_id.clone();
+                        let encoded = incoming.body.materialize_to_vec().await?;
+                        let actual: String = SinomoObjectCodec::network_frame().decode(&encoded)?;
+                        assert_eq!(actual, expected_request);
+                        Ok(ObjectRpcStreamReply::new(
+                            request_id,
+                            ObjectRpcStreamBody::source(ObjectRpcBodySource::sobj_value(response)?),
+                        ))
+                    }
+                },
+            )
+            .await
+            .expect("serve small owned object RPC");
+        });
+
+        let outcome = call_object_rpc_chunk_stream_with_consumption(
+            client,
+            &client_context,
+            ObjectRpcStreamCall::new(
+                "test.small-owned",
+                ObjectRpcStreamBody::source(
+                    ObjectRpcBodySource::sobj_value(request).expect("encode request"),
+                ),
+            ),
+            ObjectFrameIoOptions::default(),
+            |response| async move {
+                let encoded = response.body.materialize_to_vec().await?;
+                let actual: String = SinomoObjectCodec::network_frame().decode(&encoded)?;
+                assert_eq!(actual, expected_response);
+                Ok(RpcResponseConsumption::Complete(()))
+            },
+        )
+        .await;
+        assert!(matches!(outcome, RpcDeliveryOutcome::Completed(())));
+        server_task.await.expect("join small owned RPC server");
+
+        assert_eq!(
+            client_record_kinds
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            &[FRAME_REQUEST_HEAD, FRAME_REQUEST_DATA]
+        );
+        assert_eq!(
+            server_record_kinds
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            &[FRAME_RESPONSE_HEAD, FRAME_RESPONSE_DATA]
+        );
     }
 
     #[test]
@@ -2608,12 +3514,11 @@ mod tests {
 
     #[tokio::test]
     async fn unlimited_materialization_reports_unrepresentable_allocation() {
-        let (_sender, receiver) = mpsc::channel(1);
+        let (_sender, incoming) =
+            ObjectRpcIncomingBody::multiplexed_chunk_ring_with_depth(Some(u64::MAX), 1);
         let (_verification_sender, verification_receiver) = watch::channel(None);
         let body = ObjectRpcStreamIncomingBody {
-            receiver,
-            current: None,
-            total_bytes: Some(u64::MAX),
+            body: incoming,
             verifier: ObjectRpcStreamBodyVerifier {
                 receiver: verification_receiver,
             },

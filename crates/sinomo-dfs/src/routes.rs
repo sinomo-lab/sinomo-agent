@@ -7,7 +7,7 @@ use crate::{
     DfsMetadataSnapshotInstallResponse, DfsNamespaceCommand, DfsNamespaceOperation,
     DfsNetworkMessage, DfsOperatorStatus, DfsRoutedMessage, DfsSmokeReport,
 };
-use sinomo_core::network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_core::network::{NetworkError, ObjectRpcCall, ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_core::node::NodeId;
 
 pub const DFS_RPC_CATEGORY: &str = "dfs";
@@ -501,6 +501,16 @@ pub fn dfs_metadata_journal_batch_rpc_request(
     ObjectRpcRequest::encode_body(DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_RPC_CATEGORY, command)
 }
 
+pub fn dfs_metadata_journal_batch_rpc_call(
+    command: &DfsMetadataJournalBatchCommand,
+) -> Result<ObjectRpcCall, NetworkError> {
+    ObjectRpcCall::encode_borrowed_value(
+        DFS_METADATA_JOURNAL_BATCH_ROUTE,
+        DFS_RPC_CATEGORY,
+        command,
+    )
+}
+
 pub fn decode_dfs_metadata_journal_batch_rpc_response(
     response: &ObjectRpcResponse,
 ) -> Result<DfsMetadataJournalBatchResponse, NetworkError> {
@@ -511,6 +521,16 @@ pub fn dfs_metadata_snapshot_install_rpc_request(
     command: &DfsMetadataSnapshotInstallCommand,
 ) -> Result<ObjectRpcRequest, NetworkError> {
     ObjectRpcRequest::encode_body(
+        DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+        DFS_RPC_CATEGORY,
+        command,
+    )
+}
+
+pub fn dfs_metadata_snapshot_install_rpc_call(
+    command: &DfsMetadataSnapshotInstallCommand,
+) -> Result<ObjectRpcCall, NetworkError> {
+    ObjectRpcCall::encode_borrowed_value(
         DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
         DFS_RPC_CATEGORY,
         command,
@@ -532,8 +552,31 @@ pub fn dfs_routed_message_rpc_request(
 pub fn dfs_message_rpc_request(
     command: &DfsMessageCommand,
 ) -> Result<ObjectRpcRequest, NetworkError> {
-    let mut request =
+    let request =
         ObjectRpcRequest::encode_body(dfs_message_route(command), DFS_RPC_CATEGORY, command)?;
+    Ok(prepare_dfs_message_request(request, command))
+}
+
+/// Encodes a typed DFS message directly into transport-owned SOBJ chunks.
+///
+/// The request-only helper above remains the compatibility boundary for code
+/// that needs an independently serializable `ObjectRpcRequest`. Routed DFS
+/// transport should use this call form so the ordinary value is not first
+/// materialized in `ObjectRpcRequest::body`.
+pub fn dfs_message_rpc_call(command: &DfsMessageCommand) -> Result<ObjectRpcCall, NetworkError> {
+    let mut call = ObjectRpcCall::encode_borrowed_value(
+        dfs_message_route(command),
+        DFS_RPC_CATEGORY,
+        command,
+    )?;
+    call.request = prepare_dfs_message_request(call.request, command);
+    Ok(call)
+}
+
+fn prepare_dfs_message_request(
+    mut request: ObjectRpcRequest,
+    command: &DfsMessageCommand,
+) -> ObjectRpcRequest {
     if dfs_network_message_response_retry_safe(&command.routed_message.message) {
         // Ordinary distributed writes carry a stable request identity and their outcome
         // is durably reconciled at the metadata primary. Their completed
@@ -553,7 +596,7 @@ pub fn dfs_message_rpc_request(
     } else {
         request.ensure_trace_context();
     }
-    Ok(request)
+    request
 }
 
 pub fn decode_dfs_message_rpc_response(

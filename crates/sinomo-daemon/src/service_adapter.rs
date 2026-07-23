@@ -85,8 +85,9 @@ use crate::{
     DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE, DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
     DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE, DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
     DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE,
-    DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE, DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
-    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE,
+    DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE, DAEMON_NETWORK_CHUNK_METRICS_ROUTE,
+    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
+    DAEMON_STATUS_ROUTE,
 };
 use sinomo_config::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_SEARCH_ROUTE, CONFIG_SET_ROUTE, ConfigRegistry,
@@ -98,12 +99,15 @@ use sinomo_core::kv::{
     CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE, CLUSTER_KV_REQUEST_OUTCOME_ROUTE,
     CLUSTER_KV_RPC_ROUTE_POLICIES, CLUSTER_KV_RPC_ROUTES, CLUSTER_KV_TXN_ROUTE,
     CLUSTER_KV_WATCH_EVENTS_ROUTE, CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_RPC_ROUTE_POLICIES,
-    CLUSTER_RAFT_RPC_ROUTES, ClusterKvRpcRoutePolicy, ClusterKvWatchCancelRequest,
-    ClusterKvWatchCancelResponse, ClusterKvWatchDrainRequest, ClusterKvWatchDrainResponse,
-    ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration, KvAuthoritativeRead, KvEntry, KvError,
-    KvOp, KvTxn, KvTxnResponse,
+    CLUSTER_RAFT_RPC_ROUTES, CLUSTER_RAFT_VOTE_ROUTE, ClusterKvRpcRoutePolicy,
+    ClusterKvWatchCancelRequest, ClusterKvWatchCancelResponse, ClusterKvWatchDrainRequest,
+    ClusterKvWatchDrainResponse, ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration,
+    ClusterRaftAppendRequest, ClusterRaftVoteRequest, KvAuthoritativeRead, KvEntry, KvError, KvOp,
+    KvTxn, KvTxnResponse,
 };
 use sinomo_core::local::SinomoDataDir;
+#[cfg(test)]
+use sinomo_core::network::ObjectRpcResult;
 use sinomo_core::network::{
     CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE,
     CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY,
@@ -194,7 +198,12 @@ pub(crate) async fn forward_object_rpc_call_from_daemon_control(
     // finish proofs to the route signed on their next hop instead of carrying
     // the outer daemon-forward proof into the inner object-RPC call (or vice
     // versa).
-    let call = ObjectRpcCall::from_forwarded_body(payload.request, request_body);
+    let call = match payload.streamed_value_digest_sha256 {
+        Some(digest) => {
+            ObjectRpcCall::from_forwarded_streamed_value(payload.request, request_body, digest)?
+        }
+        None => ObjectRpcCall::from_forwarded_body(payload.request, request_body),
+    };
     let forward_started = std::time::Instant::now();
     match crate::client::send_object_rpc_call_to_target_async_with_daemon_paths_and_network_error(
         paths,
@@ -206,41 +215,27 @@ pub(crate) async fn forward_object_rpc_call_from_daemon_control(
     )
     .await
     {
-        Ok(result) if result.body.is_empty() => {
-            // A received Value has already been materialized into the nested
-            // response head. Keep it there: moving its forwarding marker into
-            // the outer daemon response would relabel that nested value as an
-            // attachment of the proxy envelope.
-            let (response, _) = result.into_parts();
-            Ok((
-                crate::DaemonObjectRpcForwardResponse::Success {
-                    response,
-                    forward_elapsed_micros: forward_started
-                        .elapsed()
-                        .as_micros()
-                        .min(u128::from(u64::MAX))
-                        as u64,
-                },
-                ObjectRpcBodySource::empty(),
-            ))
+        Ok(result) => {
+            let streamed_value_body = result.has_streamed_value();
+            match result.into_forwarded_response() {
+                Ok(ObjectRpcOutgoingResponse { response, body }) => Ok((
+                    crate::DaemonObjectRpcForwardResponse::Success {
+                        response,
+                        streamed_value_body,
+                        forward_elapsed_micros: forward_started
+                            .elapsed()
+                            .as_micros()
+                            .min(u128::from(u64::MAX))
+                            as u64,
+                    },
+                    body,
+                )),
+                Err(error) => Ok((
+                    daemon_object_rpc_forward_network_error(error),
+                    ObjectRpcBodySource::empty(),
+                )),
+            }
         }
-        Ok(result) => match result.into_forwarded_response() {
-            Ok(ObjectRpcOutgoingResponse { response, body }) => Ok((
-                crate::DaemonObjectRpcForwardResponse::Success {
-                    response,
-                    forward_elapsed_micros: forward_started
-                        .elapsed()
-                        .as_micros()
-                        .min(u128::from(u64::MAX))
-                        as u64,
-                },
-                body,
-            )),
-            Err(error) => Ok((
-                daemon_object_rpc_forward_network_error(error),
-                ObjectRpcBodySource::empty(),
-            )),
-        },
         Err(error) => Ok((
             daemon_object_rpc_forward_network_error(error),
             ObjectRpcBodySource::empty(),
@@ -429,36 +424,95 @@ fn cluster_kv_local_node_id(
         .map_err(ServiceError::from)
 }
 
-fn object_rpc_response_from_kv_payload(
-    payload: sinomo_core::kv::ClusterKvRpcPayload,
-) -> ObjectRpcResponse {
-    ObjectRpcResponse::from_encoded_body(payload.route, payload.body)
+enum ClusterKvServiceResponse {
+    LocalRange(sinomo_core::kv::KvLocalRead<Vec<KvEntry>>),
+    WatchRegistration(ClusterKvWatchRegistration),
+    WatchDrain(ClusterKvWatchDrainResponse),
+    WatchCancel(ClusterKvWatchCancelResponse),
+    WatchEvents(sinomo_core::kv::ClusterKvWatchEventsResponse),
+    LocalSnapshot(sinomo_core::kv::KvLocalRead<sinomo_core::kv::KvSnapshot>),
+    AuthoritativeSnapshot(KvAuthoritativeRead<sinomo_core::kv::KvSnapshot>),
+    AuthoritativeRange(KvAuthoritativeRead<Vec<KvEntry>>),
+    AuthoritativeWatch(KvAuthoritativeRead<ClusterKvWatchRegistration>),
+    RequestOutcome(sinomo_core::kv::ClusterKvRequestOutcomeRead),
+    Transaction(sinomo_core::kv::ClusterKvTxnCommitResult),
+}
+
+impl ClusterKvServiceResponse {
+    fn respond(self, ctx: &mut ServiceContext) -> Result<(), ServiceError> {
+        match self {
+            Self::LocalRange(response) => ctx.respond_value(
+                sinomo_core::kv::CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE,
+                response,
+            ),
+            Self::WatchRegistration(response) => ctx.respond_value(
+                sinomo_core::kv::CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE,
+                response,
+            ),
+            Self::WatchDrain(response) => ctx.respond_value(
+                sinomo_core::kv::CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE,
+                response,
+            ),
+            Self::WatchCancel(response) => ctx.respond_value(
+                sinomo_core::kv::CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE,
+                response,
+            ),
+            Self::WatchEvents(response) => {
+                ctx.respond_value(CLUSTER_KV_WATCH_EVENTS_ROUTE, response)
+            }
+            Self::LocalSnapshot(response) => {
+                ctx.respond_value(CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE, response)
+            }
+            Self::AuthoritativeSnapshot(response) => {
+                ctx.respond_value(CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE, response)
+            }
+            Self::AuthoritativeRange(response) => {
+                ctx.respond_value(CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE, response)
+            }
+            Self::AuthoritativeWatch(response) => {
+                ctx.respond_value(CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE, response)
+            }
+            Self::RequestOutcome(response) => {
+                ctx.respond_value(CLUSTER_KV_REQUEST_OUTCOME_ROUTE, response)
+            }
+            Self::Transaction(response) => ctx.respond_value(CLUSTER_KV_TXN_ROUTE, response),
+        }
+    }
 }
 
 fn handle_cluster_kv_local_read_watch_request(
     paths: &ClusterPaths,
-    request: &ObjectRpcRequest,
-) -> Result<ObjectRpcResponse, ServiceError> {
+    request: sinomo_core::kv::ClusterKvLocalReadWatchRequest,
+) -> Result<ClusterKvServiceResponse, ServiceError> {
     let mut host = DaemonClusterKvLocalReadWatchHost { paths };
-    let payload = sinomo_core::kv::handle_cluster_kv_local_read_watch_rpc_payload(
-        request.route.as_str(),
-        &request.body,
-        &mut host,
-    )?
-    .ok_or_else(|| ServiceError::UnknownRoute(request.route.clone()))?;
-    Ok(object_rpc_response_from_kv_payload(payload))
+    match request {
+        sinomo_core::kv::ClusterKvLocalReadWatchRequest::RangePrefix(prefix) => {
+            sinomo_core::kv::ClusterKvLocalReadWatchHost::range_prefix(&mut host, &prefix)
+                .map(ClusterKvServiceResponse::LocalRange)
+        }
+        sinomo_core::kv::ClusterKvLocalReadWatchRequest::CreateWatch(request) => {
+            sinomo_core::kv::ClusterKvLocalReadWatchHost::create_watch(&mut host, request)
+                .map(ClusterKvServiceResponse::WatchRegistration)
+        }
+        sinomo_core::kv::ClusterKvLocalReadWatchRequest::DrainWatch(request) => {
+            sinomo_core::kv::ClusterKvLocalReadWatchHost::drain_watch(&mut host, request)
+                .map(ClusterKvServiceResponse::WatchDrain)
+        }
+        sinomo_core::kv::ClusterKvLocalReadWatchRequest::CancelWatch(request) => {
+            sinomo_core::kv::ClusterKvLocalReadWatchHost::cancel_watch(&mut host, request)
+                .map(ClusterKvServiceResponse::WatchCancel)
+        }
+    }
 }
 
 fn handle_cluster_kv_watch_events_request(
     paths: &ClusterPaths,
-    request: &ObjectRpcRequest,
-) -> Result<ObjectRpcResponse, ServiceError> {
-    let payload = sinomo_core::kv::decode_cluster_kv_watch_events_rpc_request_body(&request.body)?;
+    request: sinomo_core::kv::ClusterKvWatchEventsRequest,
+) -> Result<ClusterKvServiceResponse, ServiceError> {
     let state = sinomo_core::cluster::read_cluster_state(paths)?;
     let response =
-        sinomo_core::kv::handle_cluster_kv_watch_events(&paths.kv_paths(), &state, payload)?;
-    let payload = sinomo_core::kv::cluster_kv_watch_events_response_rpc_payload(&response)?;
-    Ok(object_rpc_response_from_kv_payload(payload))
+        sinomo_core::kv::handle_cluster_kv_watch_events(&paths.kv_paths(), &state, request)?;
+    Ok(ClusterKvServiceResponse::WatchEvents(response))
 }
 
 async fn run_blocking_service_task<T>(
@@ -518,18 +572,12 @@ fn service_routes_from_cluster_control_policies(
         .collect()
 }
 
-fn object_rpc_response_from_cluster_control_payload(
-    payload: sinomo_core::cluster::ClusterControlRpcPayload,
-) -> ObjectRpcResponse {
-    ObjectRpcResponse::from_encoded_body(payload.route, payload.body)
-}
-
 fn network_module_admin_service_route(route: &'static str) -> ServiceRoute {
     let descriptor = network_module_surfaces()
         .object_rpc_route_descriptor(route)
         .expect("network module surfaces should be valid")
         .unwrap_or_else(|| panic!("unknown network service route {route}"));
-    ServiceRoute::from_route_metadata(
+    let service_route = ServiceRoute::from_route_metadata(
         descriptor.route,
         descriptor.category,
         descriptor.auth_scope,
@@ -543,7 +591,12 @@ fn network_module_admin_service_route(route: &'static str) -> ServiceRoute {
     ))
     .with_response_body_mode(native_module_body_mode_to_service(
         descriptor.response_body_mode,
-    ))
+    ));
+    if route == CLUSTER_NETWORK_PING_ROUTE {
+        service_route.with_incremental_request_value()
+    } else {
+        service_route
+    }
 }
 
 fn rollout_daemon_service_route(route: &'static str) -> ServiceRoute {
@@ -580,6 +633,7 @@ impl Service for DaemonControlService {
             DAEMON_SHUTDOWN_ROUTE,
             DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
             DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
+            DAEMON_NETWORK_CHUNK_METRICS_ROUTE,
             DAEMON_OBJECT_RPC_FORWARD_ROUTE,
             DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
         ]
@@ -592,6 +646,7 @@ impl Service for DaemonControlService {
                 || route.route == DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE
                 || route.route == DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE
                 || route.route == DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE
+                || route.route == DAEMON_NETWORK_CHUNK_METRICS_ROUTE
             {
                 route.auth_scope = Some("local-command".to_string());
             }
@@ -613,7 +668,8 @@ impl Service for DaemonControlService {
                 || request.route == DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE
             {
                 let forward_route = request.route.clone();
-                let payload: crate::DaemonObjectRpcForwardRequest = request.decode_body()?;
+                let payload: crate::DaemonObjectRpcForwardRequest =
+                    ctx.decode_request_body(&request).await?;
                 let runtime =
                     require_service_runtime(runtime.as_ref(), "daemon object RPC call forward")?
                         .clone();
@@ -631,19 +687,17 @@ impl Service for DaemonControlService {
                 )?;
                 return Ok(ServiceDisposition::Continue);
             }
-            let (response, disposition) = match request.route.as_str() {
+            let disposition = match request.route.as_str() {
                 DAEMON_STATUS_ROUTE => {
-                    let _: () = request.decode_body()?;
+                    let _: () = ctx.decode_request_body(&request).await?;
                     let status = daemon_status_response_async(&paths, runtime.as_ref())
                         .await
                         .map_err(daemon_error)?;
-                    (
-                        ObjectRpcResponse::encode_body(DAEMON_STATUS_ROUTE, &status)?,
-                        ServiceDisposition::Continue,
-                    )
+                    ctx.respond_value(DAEMON_STATUS_ROUTE, status)?;
+                    ServiceDisposition::Continue
                 }
                 DAEMON_SHUTDOWN_ROUTE => {
-                    let _: () = request.decode_body()?;
+                    let _: () = ctx.decode_request_body(&request).await?;
                     crate::append_operational_event_best_effort(
                         &paths,
                         crate::OperationalSeverity::Info,
@@ -655,16 +709,12 @@ impl Service for DaemonControlService {
                             "route": DAEMON_SHUTDOWN_ROUTE,
                         }),
                     );
-                    (
-                        ObjectRpcResponse::encode_body(
-                            DAEMON_SHUTDOWN_ROUTE,
-                            &"sinomo daemon stopping".to_string(),
-                        )?,
-                        ServiceDisposition::Stop,
-                    )
+                    ctx.respond_value(DAEMON_SHUTDOWN_ROUTE, "sinomo daemon stopping".to_string())?;
+                    ServiceDisposition::Stop
                 }
                 DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE => {
-                    let _: crate::DaemonClusterMaintenanceRefreshRequest = request.decode_body()?;
+                    let _: crate::DaemonClusterMaintenanceRefreshRequest =
+                        ctx.decode_request_body(&request).await?;
                     crate::control::request_daemon_cluster_maintenance(
                         crate::control::DaemonClusterMaintenanceReason::ManualBroad,
                     );
@@ -683,32 +733,38 @@ impl Service for DaemonControlService {
                         }
                     }
                     tracing::info!("sinomo daemon cluster maintenance refresh requested by RPC");
-                    (
-                        ObjectRpcResponse::encode_body(
-                            DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
-                            &crate::DaemonClusterMaintenanceRefreshResponse,
-                        )?,
-                        ServiceDisposition::Continue,
-                    )
+                    ctx.respond_value(
+                        DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
+                        crate::DaemonClusterMaintenanceRefreshResponse,
+                    )?;
+                    ServiceDisposition::Continue
                 }
                 DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE => {
-                    let _: crate::DaemonLocalConnectivityReloadRequest = request.decode_body()?;
+                    let _: crate::DaemonLocalConnectivityReloadRequest =
+                        ctx.decode_request_body(&request).await?;
                     let cluster_paths =
                         cluster_paths_from_daemon_paths(&paths).map_err(daemon_error)?;
                     sinomo_core::network::invalidate_local_cluster_connectivity_cache(
                         &cluster_paths,
                     )?;
-                    (
-                        ObjectRpcResponse::encode_body(
-                            DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
-                            &crate::DaemonLocalConnectivityReloadResponse,
-                        )?,
-                        ServiceDisposition::Continue,
-                    )
+                    ctx.respond_value(
+                        DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
+                        crate::DaemonLocalConnectivityReloadResponse,
+                    )?;
+                    ServiceDisposition::Continue
+                }
+                DAEMON_NETWORK_CHUNK_METRICS_ROUTE => {
+                    let _: () = ctx.decode_request_body(&request).await?;
+                    ctx.respond_value(
+                        DAEMON_NETWORK_CHUNK_METRICS_ROUTE,
+                        crate::DaemonNetworkChunkMetricsResponse {
+                            chunk_metrics: sinomo_core::network::network_chunk_metrics(),
+                        },
+                    )?;
+                    ServiceDisposition::Continue
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             };
-            ctx.respond(response)?;
             Ok(disposition)
         })
     }
@@ -881,44 +937,59 @@ impl Service for ClusterKvService {
             let cluster_paths = ClusterPaths::new(ctx.data_dir.as_ref());
             let route = request.route.clone();
             if CLUSTER_KV_LOCAL_READ_WATCH_ROUTES.contains(&route.as_str()) {
-                let request_for_task = request.clone();
+                let request = match route.as_str() {
+                    sinomo_core::kv::CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE => {
+                        sinomo_core::kv::ClusterKvLocalReadWatchRequest::RangePrefix(
+                            ctx.decode_request_body(&request).await?,
+                        )
+                    }
+                    sinomo_core::kv::CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE => {
+                        sinomo_core::kv::ClusterKvLocalReadWatchRequest::CreateWatch(
+                            ctx.decode_request_body(&request).await?,
+                        )
+                    }
+                    sinomo_core::kv::CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE => {
+                        sinomo_core::kv::ClusterKvLocalReadWatchRequest::DrainWatch(
+                            ctx.decode_request_body(&request).await?,
+                        )
+                    }
+                    sinomo_core::kv::CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE => {
+                        sinomo_core::kv::ClusterKvLocalReadWatchRequest::CancelWatch(
+                            ctx.decode_request_body(&request).await?,
+                        )
+                    }
+                    other => return Err(ServiceError::UnknownRoute(other.to_string())),
+                };
                 let cluster_paths_for_task = cluster_paths.clone();
                 let response = run_blocking_service_task(
                     route.clone(),
                     "cluster kv local read/watch",
                     move || {
-                        handle_cluster_kv_local_read_watch_request(
-                            &cluster_paths_for_task,
-                            &request_for_task,
-                        )
+                        handle_cluster_kv_local_read_watch_request(&cluster_paths_for_task, request)
                     },
                 )
                 .await?;
-                ctx.respond(response)?;
+                response.respond(&mut ctx)?;
                 return Ok(ServiceDisposition::Continue);
             }
             if route == CLUSTER_KV_WATCH_EVENTS_ROUTE {
-                let request_for_task = request.clone();
+                let request: sinomo_core::kv::ClusterKvWatchEventsRequest =
+                    ctx.decode_request_body(&request).await?;
                 let cluster_paths_for_task = cluster_paths.clone();
                 let response = run_blocking_service_task(
                     route.clone(),
                     "cluster kv watch-event fanout",
                     move || {
-                        handle_cluster_kv_watch_events_request(
-                            &cluster_paths_for_task,
-                            &request_for_task,
-                        )
+                        handle_cluster_kv_watch_events_request(&cluster_paths_for_task, request)
                     },
                 )
                 .await?;
-                ctx.respond(response)?;
+                response.respond(&mut ctx)?;
                 return Ok(ServiceDisposition::Continue);
             }
             let response = match route.as_str() {
                 CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE => {
-                    sinomo_core::kv::decode_cluster_kv_local_snapshot_rpc_request_body(
-                        &request.body,
-                    )?;
+                    let _: () = ctx.decode_request_body(&request).await?;
                     let cluster_paths_for_task = cluster_paths.clone();
                     run_blocking_service_task(
                         route.clone(),
@@ -931,40 +1002,33 @@ impl Service for ClusterKvService {
                                 &cluster_paths_for_task,
                                 &state,
                             )?;
-                            let payload =
-                                sinomo_core::kv::cluster_kv_local_snapshot_response_rpc_payload(
-                                    &snapshot,
-                                )?;
-                            Ok(object_rpc_response_from_kv_payload(payload))
+                            Ok(ClusterKvServiceResponse::LocalSnapshot(snapshot))
                         },
                     )
                     .await?
                 }
                 CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE => {
+                    let _: sinomo_core::kv::ClusterKvAuthoritativeSnapshotRequest =
+                        ctx.decode_request_body(&request).await?;
                     let runtime = require_service_runtime(
                         runtime.as_ref(),
                         "cluster kv authoritative snapshot",
                     )?;
+                    let barrier = sinomo_core::kv::cluster_kv_authoritative_snapshot_rpc_payload()?;
                     let snapshot =
                         handle_daemon_cluster_kv_authoritative_snapshot_request_async_on_runtime(
                             &paths,
-                            &request.body,
+                            &barrier.body,
                             ctx.signer.is_local(),
                             runtime,
                         )
                         .await
                         .map_err(daemon_error)?;
-                    let payload =
-                        sinomo_core::kv::cluster_kv_authoritative_snapshot_response_rpc_payload(
-                            &snapshot,
-                        )?;
-                    object_rpc_response_from_kv_payload(payload)
+                    ClusterKvServiceResponse::AuthoritativeSnapshot(snapshot)
                 }
                 CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE => {
-                    let range =
-                        sinomo_core::kv::decode_cluster_kv_authoritative_range_prefix_rpc_request_body(
-                            &request.body,
-                        )?;
+                    let range: sinomo_core::kv::ClusterKvAuthoritativeRangePrefixRequest =
+                        ctx.decode_request_body(&request).await?;
                     let runtime = require_service_runtime(
                         runtime.as_ref(),
                         "cluster kv authoritative range-prefix",
@@ -983,17 +1047,11 @@ impl Service for ClusterKvService {
                         &snapshot,
                         &range.prefix,
                     )?;
-                    let payload =
-                        sinomo_core::kv::cluster_kv_authoritative_range_prefix_response_rpc_payload(
-                            &range,
-                        )?;
-                    object_rpc_response_from_kv_payload(payload)
+                    ClusterKvServiceResponse::AuthoritativeRange(range)
                 }
                 CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE => {
-                    let watch =
-                        sinomo_core::kv::decode_cluster_kv_authoritative_watch_start_rpc_request_body(
-                            &request.body,
-                        )?;
+                    let watch: sinomo_core::kv::ClusterKvAuthoritativeWatchStartRequest =
+                        ctx.decode_request_body(&request).await?;
                     let runtime = require_service_runtime(
                         runtime.as_ref(),
                         "cluster kv authoritative watch start",
@@ -1037,13 +1095,16 @@ impl Service for ClusterKvService {
                         value: registration,
                         authority,
                     };
-                    let payload =
-                        sinomo_core::kv::cluster_kv_authoritative_watch_start_response_rpc_payload(
-                            &response,
-                        )?;
-                    object_rpc_response_from_kv_payload(payload)
+                    sinomo_core::kv::validate_cluster_kv_authoritative_watch_start_response(
+                        &response,
+                    )?;
+                    ClusterKvServiceResponse::AuthoritativeWatch(response)
                 }
                 CLUSTER_KV_REQUEST_OUTCOME_ROUTE => {
+                    let request: sinomo_core::kv::ClusterKvRequestOutcomeRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let request =
+                        sinomo_core::kv::cluster_kv_request_outcome_rpc_payload(&request)?;
                     let runtime =
                         require_service_runtime(runtime.as_ref(), "cluster kv request outcome")?;
                     let outcome =
@@ -1055,13 +1116,12 @@ impl Service for ClusterKvService {
                         )
                         .await
                         .map_err(daemon_error)?;
-                    let payload =
-                        sinomo_core::kv::cluster_kv_request_outcome_response_rpc_payload(&outcome)?;
-                    object_rpc_response_from_kv_payload(payload)
+                    sinomo_core::kv::validate_cluster_kv_request_outcome_read(&outcome)?;
+                    ClusterKvServiceResponse::RequestOutcome(outcome)
                 }
                 CLUSTER_KV_TXN_ROUTE => {
-                    let request =
-                        sinomo_core::kv::decode_cluster_kv_txn_rpc_request_body(&request.body)?;
+                    let request: sinomo_core::kv::KvTxnRequest =
+                        ctx.decode_request_body(&request).await?;
                     let txn_paths = paths.clone();
                     let runtime =
                         require_service_runtime(runtime.as_ref(), "cluster kv transaction")?;
@@ -1103,12 +1163,11 @@ impl Service for ClusterKvService {
                         }
                     }
                     .map_err(daemon_error)?;
-                    let payload = sinomo_core::kv::cluster_kv_txn_response_rpc_payload(&result)?;
-                    object_rpc_response_from_kv_payload(payload)
+                    ClusterKvServiceResponse::Transaction(result)
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             };
-            ctx.respond(response)?;
+            response.respond(&mut ctx)?;
             Ok(ServiceDisposition::Continue)
         })
     }
@@ -1155,12 +1214,71 @@ pub(crate) async fn handle_daemon_cluster_network_ping_request(
     data_dir: &SinomoDataDir,
     request: ObjectRpcIncomingRequest,
 ) -> Result<ObjectRpcOutgoingResponse, ServiceError> {
+    let timeline =
+        sinomo_core::network::network_timeline_trace_context_for_request(&request.request);
+    handle_daemon_cluster_network_ping_request_with_timeline(paths, data_dir, request, timeline)
+        .await
+}
+
+pub(crate) async fn handle_daemon_cluster_network_ping_request_with_timeline(
+    paths: &DaemonPaths,
+    data_dir: &SinomoDataDir,
+    request: ObjectRpcIncomingRequest,
+    timeline: Option<sinomo_core::network::NetworkTimelineTraceContext>,
+) -> Result<ObjectRpcOutgoingResponse, ServiceError> {
+    if request.has_streamed_value() {
+        let decode_started_ns = daemon_service_timeline_started_ns(timeline);
+        let ping_request: Result<sinomo_core::cluster::ClusterNetworkPingRequest, _> =
+            request.decode_body().await;
+        record_daemon_service_timeline_stage(
+            timeline,
+            sinomo_core::network::network_timeline_stage::PING_REQUEST_DECODE,
+            sinomo_core::network::network_timeline_flag::REQUEST,
+            decode_started_ns,
+            ping_request.is_ok(),
+        );
+        let ping_request = ping_request?;
+        let responder_node_id = cached_cluster_network_ping_node_id(paths, data_dir)?;
+        let build_started_ns = daemon_service_timeline_started_ns(timeline);
+        let response = sinomo_core::cluster::cluster_network_ping_response_for_node(
+            &responder_node_id,
+            ping_request,
+            time::OffsetDateTime::now_utc(),
+        );
+        record_daemon_service_timeline_stage(
+            timeline,
+            sinomo_core::network::network_timeline_stage::PING_RESPONSE_BUILD,
+            sinomo_core::network::network_timeline_flag::RESPONSE,
+            build_started_ns,
+            response.is_ok(),
+        );
+        let response = response?;
+        let encode_started_ns = daemon_service_timeline_started_ns(timeline);
+        let encoded = ObjectRpcOutgoingResponse::encode_value(CLUSTER_NETWORK_PING_ROUTE, response);
+        record_daemon_service_timeline_stage(
+            timeline,
+            sinomo_core::network::network_timeline_stage::PING_RESPONSE_ENCODE,
+            sinomo_core::network::network_timeline_flag::RESPONSE,
+            encode_started_ns,
+            encoded.is_ok(),
+        );
+        return encoded.map_err(ServiceError::from);
+    }
+
     let ObjectRpcIncomingRequest {
         request: request_head,
         body: request_body,
     } = request;
-    let ping_request =
-        sinomo_core::cluster::decode_cluster_network_ping_rpc_request(&request_head)?;
+    let decode_started_ns = daemon_service_timeline_started_ns(timeline);
+    let ping_request = sinomo_core::cluster::decode_cluster_network_ping_rpc_request(&request_head);
+    record_daemon_service_timeline_stage(
+        timeline,
+        sinomo_core::network::network_timeline_stage::PING_REQUEST_DECODE,
+        sinomo_core::network::network_timeline_flag::REQUEST,
+        decode_started_ns,
+        ping_request.is_ok(),
+    );
+    let ping_request = ping_request?;
 
     match ping_request.payload_mode {
         sinomo_core::cluster::ClusterNetworkPingPayloadMode::EmbeddedSobj => {
@@ -1172,12 +1290,31 @@ pub(crate) async fn handle_daemon_cluster_network_ping_request(
                 .into());
             }
             let responder_node_id = cached_cluster_network_ping_node_id(paths, data_dir)?;
-            let response = sinomo_core::cluster::handle_cluster_network_ping_rpc_request_for_node(
+            let build_started_ns = daemon_service_timeline_started_ns(timeline);
+            let response = sinomo_core::cluster::cluster_network_ping_response_for_node(
                 &responder_node_id,
-                request_head,
+                ping_request,
                 time::OffsetDateTime::now_utc(),
-            )?;
-            Ok(ObjectRpcOutgoingResponse::value(response))
+            );
+            record_daemon_service_timeline_stage(
+                timeline,
+                sinomo_core::network::network_timeline_stage::PING_RESPONSE_BUILD,
+                sinomo_core::network::network_timeline_flag::RESPONSE,
+                build_started_ns,
+                response.is_ok(),
+            );
+            let response = response?;
+            let encode_started_ns = daemon_service_timeline_started_ns(timeline);
+            let encoded =
+                ObjectRpcOutgoingResponse::encode_value(CLUSTER_NETWORK_PING_ROUTE, response);
+            record_daemon_service_timeline_stage(
+                timeline,
+                sinomo_core::network::network_timeline_stage::PING_RESPONSE_ENCODE,
+                sinomo_core::network::network_timeline_flag::RESPONSE,
+                encode_started_ns,
+                encoded.is_ok(),
+            );
+            encoded.map_err(ServiceError::from)
         }
         sinomo_core::cluster::ClusterNetworkPingPayloadMode::SemanticAttachment => {
             sinomo_core::cluster::validate_cluster_network_ping_attachment_request(&ping_request)?;
@@ -1227,6 +1364,46 @@ pub(crate) async fn handle_daemon_cluster_network_ping_request(
     }
 }
 
+#[inline]
+fn daemon_service_timeline_started_ns(
+    timeline: Option<sinomo_core::network::NetworkTimelineTraceContext>,
+) -> u64 {
+    timeline
+        .map(|_| sinomo_core::network::network_timeline_monotonic_ns())
+        .unwrap_or(0)
+}
+
+#[inline]
+fn record_daemon_service_timeline_stage(
+    timeline: Option<sinomo_core::network::NetworkTimelineTraceContext>,
+    stage: u16,
+    flags: u16,
+    started_ns: u64,
+    success: bool,
+) {
+    let Some(trace) = timeline else {
+        return;
+    };
+    sinomo_core::network::record_network_timeline_event_now(
+        sinomo_core::network::NetworkTimelineEvent::new(
+            trace,
+            stage,
+            flags
+                | if success {
+                    sinomo_core::network::network_timeline_flag::SUCCESS
+                } else {
+                    0
+                },
+            0,
+            0,
+            0,
+            0,
+            0,
+            sinomo_core::network::network_timeline_monotonic_ns().saturating_sub(started_ns),
+        ),
+    );
+}
+
 impl Service for ClusterHealthService {
     fn name(&self) -> &'static str {
         "cluster-network"
@@ -1265,32 +1442,30 @@ impl Service for ClusterHealthService {
                 return Ok(ServiceDisposition::Continue);
             }
             if request.route == CLUSTER_NETWORK_CONNECTIVITY_ROUTE {
-                let _: () = request.decode_body()?;
+                let _: () = ctx.decode_request_body(&request).await?;
                 let response = run_blocking_service_task(
                     CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
                     "cluster network connectivity",
-                    move || {
-                        let records = read_bounded_cluster_connectivity_snapshot(&cluster_paths)?;
-                        ObjectRpcResponse::encode_body(CLUSTER_NETWORK_CONNECTIVITY_ROUTE, &records)
-                            .map_err(ServiceError::from)
-                    },
+                    move || read_bounded_cluster_connectivity_snapshot(&cluster_paths),
                 )
                 .await?;
-                ctx.respond(response)?;
+                ctx.respond_value(CLUSTER_NETWORK_CONNECTIVITY_ROUTE, response)?;
                 return Ok(ServiceDisposition::Continue);
             }
+            let _: () = ctx.decode_request_body(&request).await?;
             let runtime = require_service_runtime(runtime.as_ref(), "cluster health")?;
             let probe = DaemonClusterStatusProbe::new(&cluster_paths, runtime);
-            let response = sinomo_core::cluster::handle_current_cluster_health_rpc_request_async(
-                runtime,
-                &cluster_paths,
-                &probe,
-                request,
-                time::OffsetDateTime::now_utc(),
-            )
-            .await
-            .map_err(ServiceError::from)?;
-            ctx.respond(response)?;
+            let response =
+                sinomo_core::cluster::current_cluster_health_rows_for_decoded_request_async(
+                    runtime,
+                    &cluster_paths,
+                    &probe,
+                    &request,
+                    time::OffsetDateTime::now_utc(),
+                )
+                .await
+                .map_err(ServiceError::from)?;
+            ctx.respond_value(request.route, response)?;
             Ok(ServiceDisposition::Continue)
         })
     }
@@ -1422,15 +1597,36 @@ impl Service for ClusterKvConsensusService {
             let cluster_paths = cluster_paths_from_daemon_paths(&paths).map_err(daemon_error)?;
             let authenticated_peer = cluster_authenticated_peer(&ctx.signer, &route)?;
             let runtime = require_service_runtime(runtime.as_ref(), "cluster kv consensus rpc")?;
-            let response = sinomo_core::cluster::handle_cluster_kv_consensus_rpc_request_async(
-                runtime,
-                &cluster_paths,
-                request,
-                &authenticated_peer,
-            )
-            .await
-            .map_err(ServiceError::from)?;
-            ctx.respond(response)?;
+            match route.as_str() {
+                CLUSTER_RAFT_APPEND_ROUTE => {
+                    let payload: ClusterRaftAppendRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let response = sinomo_core::cluster::handle_cluster_raft_append_request_async(
+                        runtime,
+                        &cluster_paths,
+                        payload,
+                        &authenticated_peer,
+                    )
+                    .await
+                    .map_err(ServiceError::from)?;
+                    ctx.respond_value(CLUSTER_RAFT_APPEND_ROUTE, response)?;
+                }
+                CLUSTER_RAFT_VOTE_ROUTE => {
+                    let payload: ClusterRaftVoteRequest = ctx.decode_request_body(&request).await?;
+                    let response = sinomo_core::cluster::handle_cluster_raft_vote_request_async(
+                        runtime,
+                        &cluster_paths,
+                        payload,
+                        &authenticated_peer,
+                    )
+                    .await
+                    .map_err(ServiceError::from)?;
+                    ctx.respond_value(CLUSTER_RAFT_VOTE_ROUTE, response)?;
+                }
+                other => {
+                    return Err(ServiceError::UnknownRoute(other.to_string()));
+                }
+            }
             Ok(ServiceDisposition::Continue)
         })
     }
@@ -1497,7 +1693,7 @@ impl Service for ClusterMembershipService {
         Box::pin(async move {
             if request.route == CLUSTER_JOIN_CHALLENGE_ROUTE {
                 let challenge: sinomo_core::cluster::ClusterInviteChallengeRequest =
-                    request.decode_body()?;
+                    ctx.decode_request_body(&request).await?;
                 crate::cluster_join_trace(format_args!(
                     "challenge invite={} received",
                     challenge.invite_id
@@ -1593,16 +1789,13 @@ impl Service for ClusterMembershipService {
                         "cluster join challenge timed out".to_string(),
                     ))
                 })?;
-                ctx.respond(ObjectRpcResponse::encode_body(
-                    CLUSTER_JOIN_CHALLENGE_ROUTE,
-                    &proof,
-                )?)?;
+                ctx.respond_value(CLUSTER_JOIN_CHALLENGE_ROUTE, proof)?;
                 return Ok(ServiceDisposition::Continue);
             }
             let cluster_paths = cluster_paths_from_daemon_paths(&paths).map_err(daemon_error)?;
             if request.route == CLUSTER_JOIN_REGISTER_ROUTE {
                 let payload: sinomo_core::cluster::ClusterJoinRegistrationRequest =
-                    request.decode_body().map_err(ServiceError::from)?;
+                    ctx.decode_request_body(&request).await?;
                 let register_started = std::time::Instant::now();
                 let invite_id = payload.invite.invite_id.clone();
                 crate::cluster_join_trace(format_args!(
@@ -1653,18 +1846,16 @@ impl Service for ClusterMembershipService {
                         crate::control::DaemonClusterMaintenanceReason::JoinAccepted,
                     );
                 }
-                ctx.respond(ObjectRpcResponse::encode_body(
-                    CLUSTER_JOIN_REGISTER_ROUTE,
-                    &response,
-                )?)?;
+                ctx.respond_value(CLUSTER_JOIN_REGISTER_ROUTE, response)?;
                 return Ok(ServiceDisposition::Continue);
             }
             let service_runtime =
                 require_service_runtime(runtime.as_ref(), "cluster membership publish")?;
             let mut publish_host = DaemonClusterMemberMutationHost::new_on_runtime(service_runtime);
-            let response = match request.route.as_str() {
+            match request.route.as_str() {
                 CLUSTER_INVITE_PUBLISH_ROUTE => {
-                    let payload = request.decode_body().map_err(ServiceError::from)?;
+                    let payload: sinomo_core::cluster::ClusterInvitePublishRequest =
+                        ctx.decode_request_body(&request).await?;
                     let (signer_node_id, signer_public_key) =
                         service_signer_cluster_identity(&ctx.signer, CLUSTER_INVITE_PUBLISH_ROUTE)?;
                     let response =
@@ -1679,11 +1870,11 @@ impl Service for ClusterMembershipService {
                         )
                         .await
                         .map_err(ServiceError::from)?;
-                    ObjectRpcResponse::encode_body(CLUSTER_INVITE_PUBLISH_ROUTE, &response)?
+                    ctx.respond_value(CLUSTER_INVITE_PUBLISH_ROUTE, response)?;
                 }
                 CLUSTER_MEMBER_PUBLISH_ROUTE => {
                     let payload: sinomo_core::cluster::ClusterMemberPublishRequest =
-                        request.decode_body().map_err(ServiceError::from)?;
+                        ctx.decode_request_body(&request).await?;
                     let member_count = payload.members.len();
                     let signer_origin = service_signer_origin_name(&ctx.signer);
                     let (signer_node_id, _) =
@@ -1706,11 +1897,10 @@ impl Service for ClusterMembershipService {
                         &response,
                         publish_started.elapsed(),
                     );
-                    ObjectRpcResponse::encode_body(CLUSTER_MEMBER_PUBLISH_ROUTE, &response)?
+                    ctx.respond_value(CLUSTER_MEMBER_PUBLISH_ROUTE, response)?;
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
-            };
-            ctx.respond(response)?;
+            }
             Ok(ServiceDisposition::Continue)
         })
     }
@@ -1875,17 +2065,89 @@ impl Service for ClusterControlService {
         let runtime = self.runtime.clone();
         Box::pin(async move {
             let route = request.route.clone();
+            let request = match route.as_str() {
+                sinomo_core::cluster::CLUSTER_CONTROL_INIT_ROUTE => {
+                    ClusterControlServiceRequest::Init(ctx.decode_request_body(&request).await?)
+                }
+                sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE => {
+                    ClusterControlServiceRequest::Join(ctx.decode_request_body(&request).await?)
+                }
+                sinomo_core::cluster::CLUSTER_CONTROL_INVITE_ROUTE => {
+                    ClusterControlServiceRequest::Invite(ctx.decode_request_body(&request).await?)
+                }
+                sinomo_core::cluster::CLUSTER_CONTROL_RENAME_ROUTE => {
+                    ClusterControlServiceRequest::Rename(ctx.decode_request_body(&request).await?)
+                }
+                sinomo_core::cluster::CLUSTER_CONTROL_ROLE_ROUTE => {
+                    ClusterControlServiceRequest::Role(ctx.decode_request_body(&request).await?)
+                }
+                sinomo_core::cluster::CLUSTER_CONTROL_REMOVE_ROUTE => {
+                    ClusterControlServiceRequest::Remove(ctx.decode_request_body(&request).await?)
+                }
+                sinomo_core::cluster::CLUSTER_CONTROL_LEAVE_ROUTE => {
+                    ClusterControlServiceRequest::Leave(ctx.decode_request_body(&request).await?)
+                }
+                other => return Err(ServiceError::UnknownRoute(other.to_string())),
+            };
             let runtime = require_service_runtime(runtime.as_ref(), "cluster control")?.clone();
             let remote_authority =
                 authorize_cluster_control_service_request(&paths, &runtime, &route, &ctx.signer)
                     .await?;
             let response = run_blocking_service_task(route.clone(), "cluster control", move || {
-                handle_daemon_cluster_control_request(&paths, &request, &runtime, remote_authority)
+                handle_daemon_cluster_control_request(&paths, request, &runtime, remote_authority)
             })
             .await?;
-            ctx.respond(response)?;
+            response.respond(&mut ctx)?;
             Ok(cluster_control_service_disposition(&route))
         })
+    }
+}
+
+enum ClusterControlServiceRequest {
+    Init(sinomo_core::cluster::ClusterControlInitRequest),
+    Join(sinomo_core::cluster::ClusterControlJoinRequest),
+    Invite(sinomo_core::cluster::ClusterControlInviteRequest),
+    Rename(sinomo_core::cluster::ClusterControlRenameRequest),
+    Role(sinomo_core::cluster::ClusterControlRoleRequest),
+    Remove(sinomo_core::cluster::ClusterControlRemoveRequest),
+    Leave(sinomo_core::cluster::ClusterControlLeaveRequest),
+}
+
+enum ClusterControlServiceResponse {
+    Init(sinomo_core::cluster::ClusterControlInitResponse),
+    Join(sinomo_core::cluster::ClusterControlJoinResponse),
+    Invite(sinomo_core::cluster::ClusterControlInviteResponse),
+    Rename(sinomo_core::cluster::ClusterControlRenameResponse),
+    Role(sinomo_core::cluster::ClusterControlRoleResponse),
+    Remove(sinomo_core::cluster::ClusterControlRemoveResponse),
+    Leave(sinomo_core::cluster::ClusterControlLeaveResponse),
+}
+
+impl ClusterControlServiceResponse {
+    fn respond(self, ctx: &mut ServiceContext) -> Result<(), ServiceError> {
+        match self {
+            Self::Init(response) => {
+                ctx.respond_value(sinomo_core::cluster::CLUSTER_CONTROL_INIT_ROUTE, response)
+            }
+            Self::Join(response) => {
+                ctx.respond_value(sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE, response)
+            }
+            Self::Invite(response) => {
+                ctx.respond_value(sinomo_core::cluster::CLUSTER_CONTROL_INVITE_ROUTE, response)
+            }
+            Self::Rename(response) => {
+                ctx.respond_value(sinomo_core::cluster::CLUSTER_CONTROL_RENAME_ROUTE, response)
+            }
+            Self::Role(response) => {
+                ctx.respond_value(sinomo_core::cluster::CLUSTER_CONTROL_ROLE_ROUTE, response)
+            }
+            Self::Remove(response) => {
+                ctx.respond_value(sinomo_core::cluster::CLUSTER_CONTROL_REMOVE_ROUTE, response)
+            }
+            Self::Leave(response) => {
+                ctx.respond_value(sinomo_core::cluster::CLUSTER_CONTROL_LEAVE_ROUTE, response)
+            }
+        }
     }
 }
 
@@ -1931,33 +2193,25 @@ pub(crate) fn mark_cluster_identity_restart_after_response(
     }
 }
 
-/// Dispatches one `/cluster/control/*` request to the daemon-side operation
-/// and encodes the typed response.
+/// Dispatches one `/cluster/control/*` request to the daemon-side operation.
 fn handle_daemon_cluster_control_request(
     paths: &DaemonPaths,
-    request: &ObjectRpcRequest,
+    request: ClusterControlServiceRequest,
     runtime: &tokio::runtime::Handle,
     mut remote_authority: Option<RemoteClusterControlAuthorityFence>,
-) -> Result<ObjectRpcResponse, ServiceError> {
-    let payload = match request.route.as_str() {
-        sinomo_core::cluster::CLUSTER_CONTROL_INIT_ROUTE => {
-            let payload =
-                sinomo_core::cluster::decode_cluster_control_init_rpc_request_body(&request.body)?;
+) -> Result<ClusterControlServiceResponse, ServiceError> {
+    match request {
+        ClusterControlServiceRequest::Init(payload) => {
             let response = handle_daemon_cluster_control_init_on_runtime(paths, payload, runtime)
                 .map_err(daemon_error)?;
-            sinomo_core::cluster::cluster_control_init_response_rpc_payload(&response)?
+            Ok(ClusterControlServiceResponse::Init(response))
         }
-        sinomo_core::cluster::CLUSTER_CONTROL_JOIN_ROUTE => {
-            let payload =
-                sinomo_core::cluster::decode_cluster_control_join_rpc_request_body(&request.body)?;
+        ClusterControlServiceRequest::Join(payload) => {
             let response = handle_daemon_cluster_control_join_on_runtime(paths, payload, runtime)
                 .map_err(daemon_error)?;
-            sinomo_core::cluster::cluster_control_join_response_rpc_payload(&response)?
+            Ok(ClusterControlServiceResponse::Join(response))
         }
-        sinomo_core::cluster::CLUSTER_CONTROL_INVITE_ROUTE => {
-            let payload = sinomo_core::cluster::decode_cluster_control_invite_rpc_request_body(
-                &request.body,
-            )?;
+        ClusterControlServiceRequest::Invite(payload) => {
             let response = handle_daemon_cluster_control_invite_with_authority_on_runtime(
                 paths,
                 payload,
@@ -1965,12 +2219,9 @@ fn handle_daemon_cluster_control_request(
                 remote_authority.take(),
             )
             .map_err(daemon_error)?;
-            sinomo_core::cluster::cluster_control_invite_response_rpc_payload(&response)?
+            Ok(ClusterControlServiceResponse::Invite(response))
         }
-        sinomo_core::cluster::CLUSTER_CONTROL_RENAME_ROUTE => {
-            let payload = sinomo_core::cluster::decode_cluster_control_rename_rpc_request_body(
-                &request.body,
-            )?;
+        ClusterControlServiceRequest::Rename(payload) => {
             let response = handle_daemon_cluster_control_rename_with_authority_on_runtime(
                 paths,
                 payload,
@@ -1978,11 +2229,9 @@ fn handle_daemon_cluster_control_request(
                 remote_authority.take(),
             )
             .map_err(daemon_error)?;
-            sinomo_core::cluster::cluster_control_rename_response_rpc_payload(&response)?
+            Ok(ClusterControlServiceResponse::Rename(response))
         }
-        sinomo_core::cluster::CLUSTER_CONTROL_ROLE_ROUTE => {
-            let payload =
-                sinomo_core::cluster::decode_cluster_control_role_rpc_request_body(&request.body)?;
+        ClusterControlServiceRequest::Role(payload) => {
             let response = handle_daemon_cluster_control_role_with_authority_on_runtime(
                 paths,
                 payload,
@@ -1990,12 +2239,9 @@ fn handle_daemon_cluster_control_request(
                 remote_authority.take(),
             )
             .map_err(daemon_error)?;
-            sinomo_core::cluster::cluster_control_role_response_rpc_payload(&response)?
+            Ok(ClusterControlServiceResponse::Role(response))
         }
-        sinomo_core::cluster::CLUSTER_CONTROL_REMOVE_ROUTE => {
-            let payload = sinomo_core::cluster::decode_cluster_control_remove_rpc_request_body(
-                &request.body,
-            )?;
+        ClusterControlServiceRequest::Remove(payload) => {
             let response = handle_daemon_cluster_control_remove_with_authority_on_runtime(
                 paths,
                 payload,
@@ -2003,18 +2249,14 @@ fn handle_daemon_cluster_control_request(
                 remote_authority.take(),
             )
             .map_err(daemon_error)?;
-            sinomo_core::cluster::cluster_control_remove_response_rpc_payload(&response)?
+            Ok(ClusterControlServiceResponse::Remove(response))
         }
-        sinomo_core::cluster::CLUSTER_CONTROL_LEAVE_ROUTE => {
-            let payload =
-                sinomo_core::cluster::decode_cluster_control_leave_rpc_request_body(&request.body)?;
+        ClusterControlServiceRequest::Leave(payload) => {
             let response = handle_daemon_cluster_control_leave_on_runtime(paths, payload, runtime)
                 .map_err(daemon_error)?;
-            sinomo_core::cluster::cluster_control_leave_response_rpc_payload(&response)?
+            Ok(ClusterControlServiceResponse::Leave(response))
         }
-        other => return Err(ServiceError::UnknownRoute(other.to_string())),
-    };
-    Ok(object_rpc_response_from_cluster_control_payload(payload))
+    }
 }
 
 pub(crate) const NETWORK_MODULES_LIST_ROUTE: &str = "/network/modules";
@@ -2040,6 +2282,27 @@ struct NetworkModuleSetEnabledRequest {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 struct NetworkModuleSetEnabledResponse {
     module: sinomo_core::network::NetworkModuleStatus,
+}
+
+enum NetworkModuleServiceRequest {
+    List,
+    SetEnabled(NetworkModuleSetEnabledRequest),
+}
+
+enum NetworkModuleServiceResponse {
+    List(NetworkModuleListResponse),
+    SetEnabled(NetworkModuleSetEnabledResponse),
+}
+
+impl NetworkModuleServiceResponse {
+    fn respond(self, ctx: &mut ServiceContext) -> Result<(), ServiceError> {
+        match self {
+            Self::List(response) => ctx.respond_value(NETWORK_MODULES_LIST_ROUTE, response),
+            Self::SetEnabled(response) => {
+                ctx.respond_value(NETWORK_MODULES_SET_ENABLED_ROUTE, response)
+            }
+        }
+    }
 }
 
 fn network_module_service_route(route: &'static str) -> ServiceRoute {
@@ -2082,13 +2345,23 @@ impl Service for NetworkModulesService {
         let paths = self.paths.clone();
         Box::pin(async move {
             let route = request.route.clone();
+            let request = match route.as_str() {
+                NETWORK_MODULES_LIST_ROUTE => {
+                    let _: () = ctx.decode_request_body(&request).await?;
+                    NetworkModuleServiceRequest::List
+                }
+                NETWORK_MODULES_SET_ENABLED_ROUTE => NetworkModuleServiceRequest::SetEnabled(
+                    ctx.decode_request_body(&request).await?,
+                ),
+                other => return Err(ServiceError::UnknownRoute(other.to_string())),
+            };
             // Module start/stop hooks block (dylib work on its own runtime);
             // keep them off the async workers like the other daemon services.
             let response = run_blocking_service_task(route.clone(), "network modules", move || {
                 handle_daemon_network_modules_request(&paths, &request)
             })
             .await?;
-            ctx.respond(response)?;
+            response.respond(&mut ctx)?;
             Ok(ServiceDisposition::Continue)
         })
     }
@@ -2098,24 +2371,19 @@ impl Service for NetworkModulesService {
 /// network modules.
 fn handle_daemon_network_modules_request(
     paths: &DaemonPaths,
-    request: &ObjectRpcRequest,
-) -> Result<ObjectRpcResponse, ServiceError> {
+    request: &NetworkModuleServiceRequest,
+) -> Result<NetworkModuleServiceResponse, ServiceError> {
     let modules = crate::registry::daemon_network_modules().ok_or_else(|| {
         ServiceError::Service("daemon network module registry is not initialized".to_string())
     })?;
-    match request.route.as_str() {
-        NETWORK_MODULES_LIST_ROUTE => {
-            let _: () = request.decode_body()?;
+    match request {
+        NetworkModuleServiceRequest::List => {
             let response = NetworkModuleListResponse {
                 modules: modules.registry.snapshot(),
             };
-            Ok(ObjectRpcResponse::encode_body(
-                NETWORK_MODULES_LIST_ROUTE,
-                &response,
-            )?)
+            Ok(NetworkModuleServiceResponse::List(response))
         }
-        NETWORK_MODULES_SET_ENABLED_ROUTE => {
-            let payload: NetworkModuleSetEnabledRequest = request.decode_body()?;
+        NetworkModuleServiceRequest::SetEnabled(payload) => {
             if payload.enabled {
                 // A module registered pre-cluster has no stored context; give
                 // it the current one so enabling actually starts the listener.
@@ -2166,12 +2434,8 @@ fn handle_daemon_network_modules_request(
                 })?;
             }
             let response = NetworkModuleSetEnabledResponse { module: status };
-            Ok(ObjectRpcResponse::encode_body(
-                NETWORK_MODULES_SET_ENABLED_ROUTE,
-                &response,
-            )?)
+            Ok(NetworkModuleServiceResponse::SetEnabled(response))
         }
-        other => Err(ServiceError::UnknownRoute(other.to_string())),
     }
 }
 
@@ -2209,7 +2473,7 @@ impl Service for RolloutControlService {
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         let paths = self.paths.clone();
         Box::pin(async move {
-            let _: () = request.decode_body()?;
+            let _: () = ctx.decode_request_body(&request).await?;
             let route = request.route;
             let response = match route.as_str() {
                 ROLLOUT_FINALIZE_SHADOW_ROUTE => {
@@ -2228,7 +2492,7 @@ impl Service for RolloutControlService {
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             };
-            ctx.respond(ObjectRpcResponse::encode_body(route, &response)?)?;
+            ctx.respond_value(route, response)?;
             Ok(ServiceDisposition::Continue)
         })
     }
@@ -2237,9 +2501,8 @@ impl Service for RolloutControlService {
 impl RolloutBinaryService {
     fn finish(
         paths: &DaemonPaths,
-        route: &'static str,
         result: Result<ClusterRolloutBinaryResponse, DaemonError>,
-    ) -> Result<(ObjectRpcResponse, ServiceDisposition), ServiceError> {
+    ) -> Result<(ClusterRolloutBinaryResponse, ServiceDisposition), ServiceError> {
         let response = result.unwrap_or_else(|error| ClusterRolloutBinaryResponse {
             status: "failed".to_string(),
             detail: error.to_string(),
@@ -2252,18 +2515,17 @@ impl RolloutBinaryService {
         } else {
             ServiceDisposition::Continue
         };
-        Ok((
-            ObjectRpcResponse::encode_body(route, &response)?,
-            disposition,
-        ))
+        Ok((response, disposition))
     }
 }
 
 async fn decode_rollout_build_session_request(
+    ctx: &mut ServiceContext,
     request: &ObjectRpcRequest,
-    body: &mut sinomo_core::network::ObjectRpcIncomingBody,
 ) -> Result<sinomo_rollout::ClusterRolloutBuildRequest, ServiceError> {
-    let mut payload: sinomo_rollout::ClusterRolloutBuildRequest = request.decode_body()?;
+    let mut payload: sinomo_rollout::ClusterRolloutBuildRequest =
+        ctx.decode_request_body(request).await?;
+    let mut body = ctx.take_request_body();
     if body.is_empty() {
         return Ok(payload);
     }
@@ -2323,14 +2585,14 @@ impl Service for RolloutBinaryService {
             let route = request.route.clone();
             let (response, disposition) = match route.as_str() {
                 ROLLOUT_BINARY_ROUTE => {
-                    let payload = request.decode_body()?;
+                    let payload = ctx.decode_request_body(&request).await?;
                     let mut body = ctx.take_request_body();
                     let result =
                         handle_daemon_rollout_binary_request(&paths, payload, &mut body).await;
-                    Self::finish(&paths, ROLLOUT_BINARY_ROUTE, result)?
+                    Self::finish(&paths, result)?
                 }
                 ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE => {
-                    let payload = request.decode_body()?;
+                    let payload = ctx.decode_request_body(&request).await?;
                     let rollout_paths = paths.clone();
                     run_blocking_service_task(
                         route.clone(),
@@ -2338,7 +2600,6 @@ impl Service for RolloutBinaryService {
                         move || {
                             Self::finish(
                                 &rollout_paths,
-                                ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
                                 handle_daemon_rollout_native_dylib_module_request(
                                     &rollout_paths,
                                     payload,
@@ -2349,13 +2610,11 @@ impl Service for RolloutBinaryService {
                     .await?
                 }
                 ROLLOUT_BUILD_ROUTE => {
-                    let mut body = ctx.take_request_body();
-                    let payload = decode_rollout_build_session_request(&request, &mut body).await?;
+                    let payload = decode_rollout_build_session_request(&mut ctx, &request).await?;
                     let rollout_paths = paths.clone();
                     run_blocking_service_task(route.clone(), "rollout build", move || {
                         Self::finish(
                             &rollout_paths,
-                            ROLLOUT_BUILD_ROUTE,
                             handle_daemon_rollout_build_request(&rollout_paths, payload),
                         )
                     })
@@ -2363,7 +2622,7 @@ impl Service for RolloutBinaryService {
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             };
-            ctx.respond(response)?;
+            ctx.respond_value(route, response)?;
             Ok(disposition)
         })
     }
@@ -2372,6 +2631,84 @@ impl Service for RolloutBinaryService {
 struct DaemonDfsBrowserService {
     runtime: Option<tokio::runtime::Handle>,
     event_hub: Arc<DaemonEventHub>,
+}
+
+enum DaemonDfsBrowserServiceResponse {
+    Status(crate::DaemonDfsBrowserStatusResponse),
+    List(crate::DaemonDfsBrowserListResponse),
+    Stat(crate::DaemonDfsBrowserStatResponse),
+    ReadFile(crate::DaemonDfsBrowserReadFileResponse),
+    ReadObjectVersion(crate::DaemonDfsBrowserReadObjectVersionResponse),
+    ReadFilePrefix(crate::DaemonDfsBrowserReadFilePrefixResponse),
+    ReadFiles(crate::DaemonDfsBrowserReadFilesResponse),
+    WriteFile(crate::DaemonDfsBrowserWriteFileResponse),
+    ReplaceFileIfVersion(crate::DaemonDfsBrowserReplaceFileIfVersionResponse),
+    CreateDirAll(crate::DaemonDfsBrowserCreateDirAllResponse),
+    Rename(crate::DaemonDfsBrowserRenameResponse),
+    Delete(crate::DaemonDfsBrowserDeleteResponse),
+    PinMetadata(crate::DaemonDfsBrowserPinMetadataResponse),
+    UnpinMetadata(crate::DaemonDfsBrowserUnpinMetadataResponse),
+    PinContent(crate::DaemonDfsBrowserPinContentResponse),
+    UnpinContent(crate::DaemonDfsBrowserUnpinContentResponse),
+    TransferMetadataPrimary(crate::DaemonDfsBrowserTransferMetadataPrimaryResponse),
+    PlacementPreview(crate::DaemonDfsBrowserPlacementPreviewResponse),
+    PlacementUpdate(crate::DaemonDfsBrowserPlacementUpdateResponse),
+    PlacementProgress(crate::DaemonDfsBrowserPlacementProgressResponse),
+    PlacementActivity(crate::DaemonDfsBrowserPlacementActivityResponse),
+}
+
+impl DaemonDfsBrowserServiceResponse {
+    fn respond(self, ctx: &mut ServiceContext) -> Result<(), ServiceError> {
+        match self {
+            Self::Status(value) => ctx.respond_value(DAEMON_DFS_BROWSER_STATUS_ROUTE, value),
+            Self::List(value) => ctx.respond_value(DAEMON_DFS_BROWSER_LIST_ROUTE, value),
+            Self::Stat(value) => ctx.respond_value(DAEMON_DFS_BROWSER_STAT_ROUTE, value),
+            Self::ReadFile(value) => ctx.respond_value(DAEMON_DFS_BROWSER_READ_FILE_ROUTE, value),
+            Self::ReadObjectVersion(value) => {
+                ctx.respond_value(DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE, value)
+            }
+            Self::ReadFilePrefix(value) => {
+                ctx.respond_value(DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE, value)
+            }
+            Self::ReadFiles(value) => ctx.respond_value(DAEMON_DFS_BROWSER_READ_FILES_ROUTE, value),
+            Self::WriteFile(value) => ctx.respond_value(DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, value),
+            Self::ReplaceFileIfVersion(value) => {
+                ctx.respond_value(DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE, value)
+            }
+            Self::CreateDirAll(value) => {
+                ctx.respond_value(DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE, value)
+            }
+            Self::Rename(value) => ctx.respond_value(DAEMON_DFS_BROWSER_RENAME_ROUTE, value),
+            Self::Delete(value) => ctx.respond_value(DAEMON_DFS_BROWSER_DELETE_ROUTE, value),
+            Self::PinMetadata(value) => {
+                ctx.respond_value(DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE, value)
+            }
+            Self::UnpinMetadata(value) => {
+                ctx.respond_value(DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE, value)
+            }
+            Self::PinContent(value) => {
+                ctx.respond_value(DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE, value)
+            }
+            Self::UnpinContent(value) => {
+                ctx.respond_value(DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE, value)
+            }
+            Self::TransferMetadataPrimary(value) => {
+                ctx.respond_value(DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE, value)
+            }
+            Self::PlacementPreview(value) => {
+                ctx.respond_value(DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE, value)
+            }
+            Self::PlacementUpdate(value) => {
+                ctx.respond_value(DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE, value)
+            }
+            Self::PlacementProgress(value) => {
+                ctx.respond_value(DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE, value)
+            }
+            Self::PlacementActivity(value) => {
+                ctx.respond_value(DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE, value)
+            }
+        }
+    }
 }
 
 struct DaemonDfsBrowserBackend {
@@ -3540,7 +3877,8 @@ impl Service for DaemonDfsBrowserService {
             let data_dir = Arc::clone(&ctx.data_dir);
             let response = match route.as_str() {
                 DAEMON_DFS_BROWSER_STATUS_ROUTE => {
-                    let payload: crate::DaemonDfsBrowserStatusRequest = request.decode_body()?;
+                    let payload: crate::DaemonDfsBrowserStatusRequest =
+                        ctx.decode_request_body(&request).await?;
                     let backend =
                         run_blocking_service_task(route.clone(), "DFS browser status", move || {
                             DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)
@@ -3554,35 +3892,32 @@ impl Service for DaemonDfsBrowserService {
                     } else {
                         (None, None)
                     };
-                    ObjectRpcResponse::encode_body(
-                        DAEMON_DFS_BROWSER_STATUS_ROUTE,
-                        &crate::DaemonDfsBrowserStatusResponse {
-                            node_id: backend.node_id()?,
-                            health,
-                            health_error,
-                        },
-                    )?
+                    DaemonDfsBrowserServiceResponse::Status(crate::DaemonDfsBrowserStatusResponse {
+                        node_id: backend.node_id()?,
+                        health,
+                        health_error,
+                    })
                 }
                 DAEMON_DFS_BROWSER_LIST_ROUTE => {
-                    let payload = request.decode_body()?;
+                    let payload = ctx.decode_request_body(&request).await?;
                     let result =
                         run_blocking_service_task(route.clone(), "DFS browser list", move || {
                             DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?.list(payload)
                         })
                         .await?;
-                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_LIST_ROUTE, &result)?
+                    DaemonDfsBrowserServiceResponse::List(result)
                 }
                 DAEMON_DFS_BROWSER_STAT_ROUTE => {
-                    let payload = request.decode_body()?;
+                    let payload = ctx.decode_request_body(&request).await?;
                     let result =
                         run_blocking_service_task(route.clone(), "DFS browser stat", move || {
                             DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?.stat(payload)
                         })
                         .await?;
-                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_STAT_ROUTE, &result)?
+                    DaemonDfsBrowserServiceResponse::Stat(result)
                 }
                 DAEMON_DFS_BROWSER_READ_FILE_ROUTE => {
-                    let payload = request.decode_body()?;
+                    let payload = ctx.decode_request_body(&request).await?;
                     let result = run_blocking_service_task(
                         route.clone(),
                         "DFS browser read file",
@@ -3592,10 +3927,10 @@ impl Service for DaemonDfsBrowserService {
                         },
                     )
                     .await?;
-                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_READ_FILE_ROUTE, &result)?
+                    DaemonDfsBrowserServiceResponse::ReadFile(result)
                 }
                 DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE => {
-                    let payload = request.decode_body()?;
+                    let payload = ctx.decode_request_body(&request).await?;
                     let result = run_blocking_service_task(
                         route.clone(),
                         "DFS browser read object version",
@@ -3605,13 +3940,10 @@ impl Service for DaemonDfsBrowserService {
                         },
                     )
                     .await?;
-                    ObjectRpcResponse::encode_body(
-                        DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
-                        &result,
-                    )?
+                    DaemonDfsBrowserServiceResponse::ReadObjectVersion(result)
                 }
                 DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE => {
-                    let payload = request.decode_body()?;
+                    let payload = ctx.decode_request_body(&request).await?;
                     let result = run_blocking_service_task(
                         route.clone(),
                         "DFS browser read file prefix",
@@ -3621,13 +3953,10 @@ impl Service for DaemonDfsBrowserService {
                         },
                     )
                     .await?;
-                    ObjectRpcResponse::encode_body(
-                        DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
-                        &result,
-                    )?
+                    DaemonDfsBrowserServiceResponse::ReadFilePrefix(result)
                 }
                 DAEMON_DFS_BROWSER_READ_FILES_ROUTE => {
-                    let payload = request.decode_body()?;
+                    let payload = ctx.decode_request_body(&request).await?;
                     let result = run_blocking_service_task(
                         route.clone(),
                         "DFS browser read files",
@@ -3637,10 +3966,11 @@ impl Service for DaemonDfsBrowserService {
                         },
                     )
                     .await?;
-                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_READ_FILES_ROUTE, &result)?
+                    DaemonDfsBrowserServiceResponse::ReadFiles(result)
                 }
                 DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE => {
-                    let payload: crate::DaemonDfsBrowserWriteFileRequest = request.decode_body()?;
+                    let payload: crate::DaemonDfsBrowserWriteFileRequest =
+                        ctx.decode_request_body(&request).await?;
                     let changed_path = payload.path.clone();
                     let backend_data_dir = Arc::clone(&data_dir);
                     let publish_data_dir = Arc::clone(&data_dir);
@@ -3671,11 +4001,11 @@ impl Service for DaemonDfsBrowserService {
                         "write-file",
                         vec![changed_path],
                     );
-                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, &result.0)?
+                    DaemonDfsBrowserServiceResponse::WriteFile(result.0)
                 }
                 DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE => {
                     let payload: crate::DaemonDfsBrowserReplaceFileIfVersionRequest =
-                        request.decode_body()?;
+                        ctx.decode_request_body(&request).await?;
                     let changed_path = payload.path.clone();
                     let backend_data_dir = Arc::clone(&data_dir);
                     let publish_data_dir = Arc::clone(&data_dir);
@@ -3708,14 +4038,11 @@ impl Service for DaemonDfsBrowserService {
                             vec![changed_path],
                         );
                     }
-                    ObjectRpcResponse::encode_body(
-                        DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE,
-                        &result.0,
-                    )?
+                    DaemonDfsBrowserServiceResponse::ReplaceFileIfVersion(result.0)
                 }
                 DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE => {
                     let payload: crate::DaemonDfsBrowserCreateDirAllRequest =
-                        request.decode_body()?;
+                        ctx.decode_request_body(&request).await?;
                     let changed_path = payload.path.clone();
                     let backend_data_dir = Arc::clone(&data_dir);
                     let publish_data_dir = Arc::clone(&data_dir);
@@ -3746,13 +4073,11 @@ impl Service for DaemonDfsBrowserService {
                         "create-dir-all",
                         vec![changed_path],
                     );
-                    ObjectRpcResponse::encode_body(
-                        DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
-                        &result.0,
-                    )?
+                    DaemonDfsBrowserServiceResponse::CreateDirAll(result.0)
                 }
                 DAEMON_DFS_BROWSER_RENAME_ROUTE => {
-                    let payload: crate::DaemonDfsBrowserRenameRequest = request.decode_body()?;
+                    let payload: crate::DaemonDfsBrowserRenameRequest =
+                        ctx.decode_request_body(&request).await?;
                     let changed_paths = vec![payload.from.clone(), payload.to.clone()];
                     let backend_data_dir = Arc::clone(&data_dir);
                     let publish_data_dir = Arc::clone(&data_dir);
@@ -3780,10 +4105,11 @@ impl Service for DaemonDfsBrowserService {
                         "rename",
                         changed_paths,
                     );
-                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_RENAME_ROUTE, &result.0)?
+                    DaemonDfsBrowserServiceResponse::Rename(result.0)
                 }
                 DAEMON_DFS_BROWSER_DELETE_ROUTE => {
-                    let payload: crate::DaemonDfsBrowserDeleteRequest = request.decode_body()?;
+                    let payload: crate::DaemonDfsBrowserDeleteRequest =
+                        ctx.decode_request_body(&request).await?;
                     let changed_path = payload.path.clone();
                     let backend_data_dir = Arc::clone(&data_dir);
                     let publish_data_dir = Arc::clone(&data_dir);
@@ -3811,11 +4137,11 @@ impl Service for DaemonDfsBrowserService {
                         "delete",
                         vec![changed_path],
                     );
-                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_DELETE_ROUTE, &result.0)?
+                    DaemonDfsBrowserServiceResponse::Delete(result.0)
                 }
                 DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE => {
                     let payload: crate::DaemonDfsBrowserPinMetadataRequest =
-                        request.decode_body()?;
+                        ctx.decode_request_body(&request).await?;
                     let changed_path = payload.path.clone();
                     let result = run_blocking_service_task(
                         route.clone(),
@@ -3833,14 +4159,11 @@ impl Service for DaemonDfsBrowserService {
                         "pin-metadata",
                         vec![changed_path],
                     );
-                    ObjectRpcResponse::encode_body(
-                        DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE,
-                        &result.0,
-                    )?
+                    DaemonDfsBrowserServiceResponse::PinMetadata(result.0)
                 }
                 DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE => {
                     let payload: crate::DaemonDfsBrowserUnpinMetadataRequest =
-                        request.decode_body()?;
+                        ctx.decode_request_body(&request).await?;
                     let changed_path = payload.path.clone();
                     let result = run_blocking_service_task(
                         route.clone(),
@@ -3860,14 +4183,11 @@ impl Service for DaemonDfsBrowserService {
                             vec![changed_path],
                         );
                     }
-                    ObjectRpcResponse::encode_body(
-                        DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE,
-                        &result.0,
-                    )?
+                    DaemonDfsBrowserServiceResponse::UnpinMetadata(result.0)
                 }
                 DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE => {
                     let payload: crate::DaemonDfsBrowserPinContentRequest =
-                        request.decode_body()?;
+                        ctx.decode_request_body(&request).await?;
                     let changed_path = payload.path.clone();
                     let result = run_blocking_service_task(
                         route.clone(),
@@ -3885,11 +4205,11 @@ impl Service for DaemonDfsBrowserService {
                         "pin-content",
                         vec![changed_path],
                     );
-                    ObjectRpcResponse::encode_body(DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE, &result.0)?
+                    DaemonDfsBrowserServiceResponse::PinContent(result.0)
                 }
                 DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE => {
                     let payload: crate::DaemonDfsBrowserUnpinContentRequest =
-                        request.decode_body()?;
+                        ctx.decode_request_body(&request).await?;
                     let changed_path = payload.path.clone();
                     let result = run_blocking_service_task(
                         route.clone(),
@@ -3909,14 +4229,11 @@ impl Service for DaemonDfsBrowserService {
                             vec![changed_path],
                         );
                     }
-                    ObjectRpcResponse::encode_body(
-                        DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
-                        &result.0,
-                    )?
+                    DaemonDfsBrowserServiceResponse::UnpinContent(result.0)
                 }
                 DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE => {
                     let payload: crate::DaemonDfsBrowserTransferMetadataPrimaryRequest =
-                        request.decode_body()?;
+                        ctx.decode_request_body(&request).await?;
                     let changed_path = payload.path.clone();
                     let result = run_blocking_service_task(
                         route.clone(),
@@ -3936,13 +4253,10 @@ impl Service for DaemonDfsBrowserService {
                             vec![changed_path],
                         );
                     }
-                    ObjectRpcResponse::encode_body(
-                        DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
-                        &result.0,
-                    )?
+                    DaemonDfsBrowserServiceResponse::TransferMetadataPrimary(result.0)
                 }
                 DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE => {
-                    let payload = request.decode_body()?;
+                    let payload = ctx.decode_request_body(&request).await?;
                     let result = run_blocking_service_task(
                         route.clone(),
                         "DFS browser placement preview",
@@ -3952,18 +4266,16 @@ impl Service for DaemonDfsBrowserService {
                         },
                     )
                     .await?;
-                    ObjectRpcResponse::encode_body(
-                        DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE,
-                        &result,
-                    )?
+                    DaemonDfsBrowserServiceResponse::PlacementPreview(result)
                 }
                 DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE => {
-                    let _: crate::DaemonDfsBrowserPlacementUpdateRequest = request.decode_body()?;
+                    let _: crate::DaemonDfsBrowserPlacementUpdateRequest =
+                        ctx.decode_request_body(&request).await?;
                     return Err(legacy_daemon_dfs_browser_placement_update_error());
                 }
                 DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE => {
                     let payload: crate::DaemonDfsBrowserPlacementUpdateV2Request =
-                        request.decode_body()?;
+                        ctx.decode_request_body(&request).await?;
                     let changed_path = payload.path.clone();
                     let result = run_blocking_service_task(
                         route.clone(),
@@ -3981,13 +4293,10 @@ impl Service for DaemonDfsBrowserService {
                         "update-policy",
                         vec![changed_path],
                     );
-                    ObjectRpcResponse::encode_body(
-                        DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE,
-                        &result.0,
-                    )?
+                    DaemonDfsBrowserServiceResponse::PlacementUpdate(result.0)
                 }
                 DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE => {
-                    let payload = request.decode_body()?;
+                    let payload = ctx.decode_request_body(&request).await?;
                     let result = run_blocking_service_task(
                         route.clone(),
                         "DFS browser placement progress",
@@ -3997,13 +4306,10 @@ impl Service for DaemonDfsBrowserService {
                         },
                     )
                     .await?;
-                    ObjectRpcResponse::encode_body(
-                        DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
-                        &result,
-                    )?
+                    DaemonDfsBrowserServiceResponse::PlacementProgress(result)
                 }
                 DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE => {
-                    let payload = request.decode_body()?;
+                    let payload = ctx.decode_request_body(&request).await?;
                     let result = run_blocking_service_task(
                         route.clone(),
                         "DFS browser placement activity",
@@ -4013,14 +4319,11 @@ impl Service for DaemonDfsBrowserService {
                         },
                     )
                     .await?;
-                    ObjectRpcResponse::encode_body(
-                        DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE,
-                        &result,
-                    )?
+                    DaemonDfsBrowserServiceResponse::PlacementActivity(result)
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             };
-            ctx.respond(response)?;
+            response.respond(&mut ctx)?;
             Ok(ServiceDisposition::Continue)
         })
     }
@@ -4069,7 +4372,8 @@ impl Service for DaemonDfsPlacementAuthorityAdminService {
         Box::pin(async move {
             let runtime =
                 require_service_runtime(runtime.as_ref(), "DFS placement authority admin")?.clone();
-            let payload: crate::DaemonDfsPlacementAuthorityAdminRequest = request.decode_body()?;
+            let payload: crate::DaemonDfsPlacementAuthorityAdminRequest =
+                ctx.decode_request_body(&request).await?;
             let response = match payload {
                 crate::DaemonDfsPlacementAuthorityAdminRequest::Inspect { file_system_id } => {
                     let permit = run_blocking_service_task(
@@ -4133,10 +4437,7 @@ impl Service for DaemonDfsPlacementAuthorityAdminService {
                     crate::DaemonDfsPlacementAuthorityAdminResponse::Recovery { outcome }
                 }
             };
-            ctx.respond(ObjectRpcResponse::encode_body(
-                DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE,
-                &response,
-            )?)?;
+            ctx.respond_value(DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE, response)?;
             Ok(ServiceDisposition::Continue)
         })
     }
@@ -5557,19 +5858,55 @@ pub(crate) fn authenticate_daemon_control_request_via_registry(
     request: &DaemonControlRequest,
     service_host: &DaemonServiceRegistryHost,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
+    authenticate_daemon_control_request_via_registry_inner(paths, request, None, service_host)
+}
+
+pub(crate) fn authenticate_daemon_control_request_via_registry_with_digest(
+    paths: &DaemonPaths,
+    request: &DaemonControlRequest,
+    request_digest_sha256: &[u8; 32],
+    service_host: &DaemonServiceRegistryHost,
+) -> Result<AuthenticatedDaemonCommand, DaemonError> {
+    authenticate_daemon_control_request_via_registry_inner(
+        paths,
+        request,
+        Some(request_digest_sha256),
+        service_host,
+    )
+}
+
+fn authenticate_daemon_control_request_via_registry_inner(
+    paths: &DaemonPaths,
+    request: &DaemonControlRequest,
+    request_digest_sha256: Option<&[u8; 32]>,
+    service_host: &DaemonServiceRegistryHost,
+) -> Result<AuthenticatedDaemonCommand, DaemonError> {
+    let authenticate = |authorize_route| match (request_digest_sha256, authorize_route) {
+        (Some(digest), true) => {
+            crate::auth::authenticate_daemon_control_request_with_digest(paths, request, digest)
+        }
+        (Some(digest), false) => {
+            crate::auth::authenticate_daemon_control_request_without_route_authorization_with_digest(
+                paths, request, digest,
+            )
+        }
+        (None, true) => crate::auth::authenticate_daemon_control_request(paths, request),
+        (None, false) => {
+            crate::auth::authenticate_daemon_control_request_without_route_authorization(
+                paths, request,
+            )
+        }
+    };
     let Some(descriptor) = service_host.object_rpc_route_descriptor(&request.route) else {
-        return crate::auth::authenticate_daemon_control_request(paths, request);
+        return authenticate(true);
     };
     if descriptor.auth_scope.is_none() {
-        let authenticated = crate::auth::authenticate_daemon_control_request(paths, request)?;
+        let authenticated = authenticate(true)?;
         return daemon_route_local_permissions_are_granted(paths, &descriptor)
             .then_some(authenticated)
             .ok_or(DaemonError::AuthDenied);
     }
-    let authenticated =
-        crate::auth::authenticate_daemon_control_request_without_route_authorization(
-            paths, request,
-        )?;
+    let authenticated = authenticate(false)?;
     if daemon_authenticated_command_authorizes_route_descriptor(paths, &authenticated, &descriptor)
     {
         Ok(authenticated)
@@ -5583,42 +5920,44 @@ pub(crate) fn authenticate_daemon_control_request_via_registry(
 pub(crate) fn authenticate_routed_daemon_control_request_via_registry(
     paths: &DaemonPaths,
     request: &DaemonControlRequest,
+    request_digest_sha256: Option<&[u8; 32]>,
     service_host: &DaemonServiceRegistryHost,
     peer_node_id: &str,
     peer_public_key: &str,
     peer_is_raft_voter: bool,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
+    let authenticate = |authorize_route| {
+        if let Some(digest) = request_digest_sha256 {
+            crate::auth::authenticate_verified_cluster_peer_request_with_digest(
+                paths,
+                request,
+                digest,
+                peer_node_id,
+                peer_public_key,
+                peer_is_raft_voter,
+                authorize_route,
+            )
+        } else {
+            crate::auth::authenticate_verified_cluster_peer_request(
+                paths,
+                request,
+                peer_node_id,
+                peer_public_key,
+                peer_is_raft_voter,
+                authorize_route,
+            )
+        }
+    };
     let Some(descriptor) = service_host.object_rpc_route_descriptor(&request.route) else {
-        return crate::auth::authenticate_verified_cluster_peer_request(
-            paths,
-            request,
-            peer_node_id,
-            peer_public_key,
-            peer_is_raft_voter,
-            true,
-        );
+        return authenticate(true);
     };
     if descriptor.auth_scope.is_none() {
-        let authenticated = crate::auth::authenticate_verified_cluster_peer_request(
-            paths,
-            request,
-            peer_node_id,
-            peer_public_key,
-            peer_is_raft_voter,
-            true,
-        )?;
+        let authenticated = authenticate(true)?;
         return daemon_route_local_permissions_are_granted(paths, &descriptor)
             .then_some(authenticated)
             .ok_or(DaemonError::AuthDenied);
     }
-    let authenticated = crate::auth::authenticate_verified_cluster_peer_request(
-        paths,
-        request,
-        peer_node_id,
-        peer_public_key,
-        peer_is_raft_voter,
-        false,
-    )?;
+    let authenticated = authenticate(false)?;
     if daemon_authenticated_command_authorizes_route_descriptor(paths, &authenticated, &descriptor)
     {
         Ok(authenticated)
@@ -6040,23 +6379,19 @@ impl Drop for NativeDylibOperationCancellationRegistration {
 
 fn dispatch_native_dylib_module_cancel_request(
     active_operations: &Arc<Mutex<BTreeMap<String, DaemonOperationCancellationToken>>>,
-    request: ObjectRpcRequest,
-) -> Result<ObjectRpcResponse, NetworkError> {
-    let payload: ObjectRpcCancelRequest = request.decode_body()?;
+    metadata_operation_id: Option<String>,
+    payload: ObjectRpcCancelRequest,
+) -> Result<ObjectRpcCancelResponse, NetworkError> {
     let operation_id = payload.operation_id;
-    let metadata_operation_id = request.cancels_operation_id().map(str::to_string);
     if metadata_operation_id
         .as_deref()
         .is_some_and(|metadata| metadata != operation_id)
     {
-        return ObjectRpcResponse::encode_body(
-            MODULE_NATIVE_DYLIB_CANCEL_ROUTE,
-            &ObjectRpcCancelResponse {
-                operation_id,
-                cancelled: false,
-                detail: "cancel metadata operation id does not match request body".to_string(),
-            },
-        );
+        return Ok(ObjectRpcCancelResponse {
+            operation_id,
+            cancelled: false,
+            detail: "cancel metadata operation id does not match request body".to_string(),
+        });
     }
     let token = active_operations
         .lock()
@@ -6075,14 +6410,11 @@ fn dispatch_native_dylib_module_cancel_request(
             "native dylib module operation is not active".to_string(),
         )
     };
-    ObjectRpcResponse::encode_body(
-        MODULE_NATIVE_DYLIB_CANCEL_ROUTE,
-        &ObjectRpcCancelResponse {
-            operation_id,
-            cancelled,
-            detail,
-        },
-    )
+    Ok(ObjectRpcCancelResponse {
+        operation_id,
+        cancelled,
+        detail,
+    })
 }
 
 fn inject_native_dylib_host_authority(
@@ -6653,6 +6985,10 @@ fn daemon_service_registry_with_module_snapshot(
             descriptor.concurrency_limit = Some(4);
             descriptor.timeout_ms = Some(310_000);
             descriptor = descriptor
+                // The native-module ABI deliberately accepts one contiguous
+                // opaque `payload_sobj`. Until that ABI becomes chunk-native,
+                // make its required compatibility materialization explicit.
+                .with_buffered_request_value()
                 .observable("daemon.native_dylib_module_route", "true")
                 .observable(
                     "module.registry.snapshot_version",
@@ -6701,9 +7037,14 @@ fn daemon_service_registry_with_module_snapshot(
         move |mut ctx, request| {
             let active_operations = Arc::clone(&active_operations);
             async move {
-                let response =
-                    dispatch_native_dylib_module_cancel_request(&active_operations, request)?;
-                ctx.respond(response)?;
+                let metadata_operation_id = request.cancels_operation_id().map(str::to_string);
+                let payload: ObjectRpcCancelRequest = ctx.decode_request_body(&request).await?;
+                let response = dispatch_native_dylib_module_cancel_request(
+                    &active_operations,
+                    metadata_operation_id,
+                    payload,
+                )?;
+                ctx.respond_value(MODULE_NATIVE_DYLIB_CANCEL_ROUTE, response)?;
                 Ok(ServiceDisposition::Continue)
             }
         },
@@ -6870,7 +7211,6 @@ pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
     request: ObjectRpcRequest,
     paths: Option<&DaemonPaths>,
 ) -> Result<(ObjectRpcResponse, bool), DaemonError> {
-    let route = request.route.clone();
     let (response, stop) = dispatch_rpc_via_registry_with_body_async(
         service_host,
         authenticated,
@@ -6878,15 +7218,10 @@ pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
         paths,
     )
     .await?;
-    if !response.body.is_empty() {
-        return Err(NetworkError::Serialization {
-            detail: format!(
-                "object rpc route {route} returned an attachment through the value-only daemon service"
-            ),
-        }
-        .into());
-    }
-    Ok((response.response, stop))
+    let response = response
+        .into_materialized_value_response(usize::MAX)
+        .await?;
+    Ok((response, stop))
 }
 
 pub(crate) async fn dispatch_rpc_via_registry_with_body_async(
@@ -7246,6 +7581,7 @@ mod tests {
                 &(),
             )
             .expect("request"),
+            streamed_value_digest_sha256: None,
             connect_timeout_millis: 5_000,
             idle_timeout_millis: Some(310_000),
             overall_timeout_millis: None,
@@ -7271,6 +7607,7 @@ mod tests {
                 &(),
             )
             .expect("request"),
+            streamed_value_digest_sha256: None,
             connect_timeout_millis: 7_000,
             idle_timeout_millis: None,
             overall_timeout_millis: None,
@@ -7290,7 +7627,6 @@ mod tests {
         host: &DaemonServiceRegistryHost,
         request: sinomo_core::network::ObjectRpcRequest,
     ) -> Result<sinomo_core::network::ObjectRpcResponse, sinomo_core::network::NetworkError> {
-        let route = request.route.clone();
         let response = dispatch_service_registry_request(
             host.service_registry.active_snapshot().registry_arc(),
             Arc::clone(&host.service_data_dir),
@@ -7299,14 +7635,7 @@ mod tests {
             ObjectRpcIncomingRequest::value(request),
         )
         .await?;
-        if !response.body.is_empty() {
-            return Err(sinomo_core::network::NetworkError::Serialization {
-                detail: format!(
-                    "object rpc route {route} returned an attachment to a value-only test caller"
-                ),
-            });
-        }
-        Ok(response.response)
+        response.into_materialized_value_response(usize::MAX).await
     }
 
     async fn call_authorized_value_service_host_async(
@@ -7666,14 +7995,23 @@ mod tests {
         )
         .expect("request head");
         let expected_bundle = vec![9_u8; 48 * 1024];
-        let mut body = sinomo_core::network::ObjectRpcIncomingBody::bytes(expected_bundle.clone());
+        let root = sinomo_testdir::TestDir::new("sinomo-rollout-build-session-body");
+        let mut context = ServiceContext::new(
+            Arc::new(SinomoDataDir::new(&root)),
+            None,
+            ServiceSigner::Local,
+            sinomo_core::network::ObjectRpcIncomingBody::bytes(expected_bundle.clone()),
+            Box::new(BufferSink {
+                response: Arc::new(Mutex::new(None)),
+            }),
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
 
         let decoded = runtime
-            .block_on(decode_rollout_build_session_request(&request, &mut body))
+            .block_on(decode_rollout_build_session_request(&mut context, &request))
             .expect("session request");
 
         assert_eq!(decoded.source_bundle, Some(expected_bundle));
@@ -8945,6 +9283,49 @@ mod tests {
     }
 
     #[test]
+    fn local_streamed_request_authentication_uses_preserved_signed_digest() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-local-streamed-auth");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let registry = ServiceRegistry::builder()
+            .register(DaemonControlService {
+                paths: paths.clone(),
+                runtime: None,
+            })
+            .build();
+        let host = test_service_host(&root, registry);
+        let mut request =
+            ObjectRpcRequest::encode_body(DAEMON_STATUS_ROUTE, DAEMON_RPC_CATEGORY, &())
+                .expect("status request");
+        let request_digest: [u8; 32] = sinomo_core::network::daemon_rpc_body_sha256(&request)
+            .try_into()
+            .expect("request digest");
+        request.auth = Some(
+            crate::auth::sign_daemon_rpc_request_from_data_dir(&data_dir, &request)
+                .expect("sign streamed status request"),
+        );
+        request.body.clear();
+
+        assert!(matches!(
+            authenticate_daemon_control_request_via_registry_with_digest(
+                &paths,
+                &request,
+                &[0x55; 32],
+                &host,
+            ),
+            Err(DaemonError::AuthDenied)
+        ));
+        let authenticated = authenticate_daemon_control_request_via_registry_with_digest(
+            &paths,
+            &request,
+            &request_digest,
+            &host,
+        )
+        .expect("authenticate preserved streamed request digest");
+        assert_eq!(authenticated.signer, DaemonSignerAuthority::Local);
+    }
+
+    #[test]
     fn daemon_maintenance_refresh_rpc_notifies_dfs_maintenance() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-maintenance-refresh-dfs");
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -9028,6 +9409,48 @@ mod tests {
         response
             .decode_body::<crate::DaemonLocalConnectivityReloadResponse>()
             .expect("decode connectivity reload response");
+    }
+
+    #[test]
+    fn daemon_network_chunk_metrics_rpc_samples_daemon_process() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-network-chunk-metrics");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let registry = ServiceRegistry::builder()
+            .register(DaemonControlService {
+                paths,
+                runtime: Some(runtime.handle().clone()),
+            })
+            .build();
+        let host = test_service_host(&root, registry);
+
+        let response = runtime
+            .block_on(call_value_service_host_async(&host, {
+                let mut request = ObjectRpcRequest::encode_body(
+                    DAEMON_NETWORK_CHUNK_METRICS_ROUTE,
+                    DAEMON_RPC_CATEGORY,
+                    &(),
+                )
+                .expect("request");
+                annotate_test_request(&mut request, DaemonSignerAuthority::Local);
+                request
+            }))
+            .expect("network chunk metrics response");
+
+        response.error_detail().expect("network chunk metrics ok");
+        let snapshot = response
+            .decode_body::<crate::DaemonNetworkChunkMetricsResponse>()
+            .expect("decode network chunk metrics response")
+            .chunk_metrics;
+        let after = sinomo_core::network::network_chunk_metrics();
+        assert!(snapshot.allocations <= after.allocations);
+        assert!(snapshot.payload_copy_bytes <= after.payload_copy_bytes);
+        assert!(snapshot.peak_active_bytes <= after.peak_active_bytes);
+        assert!(snapshot.peak_allocated_bytes <= after.peak_allocated_bytes);
     }
 
     #[test]
@@ -10708,6 +11131,23 @@ mod tests {
             object_rpc_forward.response_body_mode,
             ServiceBodyMode::Optional
         );
+        let network_chunk_metrics = route_metadata
+            .iter()
+            .find(|route| route.route == crate::DAEMON_NETWORK_CHUNK_METRICS_ROUTE)
+            .expect("daemon network chunk metrics route metadata");
+        assert_eq!(network_chunk_metrics.category, crate::DAEMON_RPC_CATEGORY);
+        assert_eq!(
+            network_chunk_metrics.auth_scope.as_deref(),
+            Some("local-command")
+        );
+        assert_eq!(
+            network_chunk_metrics.request_body_mode,
+            ServiceBodyMode::None
+        );
+        assert_eq!(
+            network_chunk_metrics.response_body_mode,
+            ServiceBodyMode::None
+        );
         let dfs_object_rpc_forward = route_metadata
             .iter()
             .find(|route| route.route == crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE)
@@ -10826,6 +11266,10 @@ mod tests {
         );
         assert_eq!(ping.request_body_mode, ServiceBodyMode::Optional);
         assert_eq!(ping.response_body_mode, ServiceBodyMode::Optional);
+        assert_eq!(
+            ping.request_value_mode,
+            sinomo_core::service::ServiceRequestValueMode::Incremental
+        );
         assert_eq!(
             ping_module_route.request_body_mode,
             sinomo_module_api::NativeModuleBodyMode::Optional
@@ -11153,23 +11597,31 @@ mod tests {
         // and stream-native service frames. Any unexpected transport path
         // fails at its first wire prefix instead of satisfying the test.
         // Case zero exercises bodies in both directions. Case one proves that
-        // a head-only DFS request still receives a streamed response. Case two
+        // a large typed DFS request keeps its value role and one-pass
+        // authentication proof through both proxy directions. Case two
         // carries the membership challenge route used when a bridge relays a
         // downstream join to a state authority.
+        let streamed_value_route = "/test/session-forward/streamed-value";
+        let streamed_request_value = vec![0x6b_u8; 768 * 1024 + 43];
+        let streamed_request_body =
+            ObjectRpcRequest::encode_body(streamed_value_route, "test", &streamed_request_value)
+                .expect("streamed request value")
+                .body;
         let inner_routes = [
             "/test/session-forward/0".to_string(),
-            "/dfs/test/session-forward/1".to_string(),
+            streamed_value_route.to_string(),
             sinomo_core::network::CLUSTER_JOIN_CHALLENGE_ROUTE.to_string(),
         ];
-        let request_bodies = [vec![0x31_u8; 2 * 1024 * 1024 + 113], Vec::new(), Vec::new()];
-        let response_bodies = [
-            vec![0x72_u8; 3 * 1024 * 1024 + 211],
-            vec![0x54_u8; 1024 * 1024 + 79],
+        let request_bodies = [
+            vec![0x31_u8; 2 * 1024 * 1024 + 113],
+            streamed_request_body,
             Vec::new(),
         ];
+        let response_bodies = [vec![0x72_u8; 3 * 1024 * 1024 + 211], Vec::new(), Vec::new()];
         let target_routes = inner_routes.clone();
         let target_expected_requests = request_bodies.clone();
         let target_responses = response_bodies.clone();
+        let target_streamed_request_value = streamed_request_value.clone();
         let target_directory = sinomo_core::network::DirectorySnapshot::try_from_records(
             sinomo_core::network::DirectoryVersion(1),
             target_state.members.clone(),
@@ -11322,27 +11774,67 @@ mod tests {
                 )
                 .expect("target service context");
                 let response_node = server_target_node.clone();
-                sinomo_core::network::serve_service_rpc_stream(
+                let expected_streamed_request_value = target_streamed_request_value.clone();
+                sinomo_core::network::serve_service_rpc_peer_stream(
                     routed,
                     &context,
                     sinomo_core::network::ObjectFrameIoOptions::default(),
                     move |mut incoming, _peer| async move {
                         assert_eq!(incoming.request.route, expected_route);
-                        assert!(
-                            incoming.body.total_bytes().is_none_or(|total| {
-                                total == expected_request.len() as u64
-                            }),
-                            "the proxy must preserve a known length or use the authenticated deferred-body contract"
+                        let request_route = incoming.request.route.clone();
+                        assert_eq!(
+                            incoming.has_streamed_value(),
+                            index != 0,
+                            "case {index} used the wrong service body semantics"
                         );
-                        let mut actual_request = Vec::new();
-                        incoming
-                            .body
-                            .read_to_end(&mut actual_request)
-                            .await
-                            .expect("target request body");
-                        assert_eq!(actual_request, expected_request);
+                        match index {
+                            0 => {
+                                assert!(
+                                    incoming.body.total_bytes().is_none_or(|total| {
+                                        total == expected_request.len() as u64
+                                    }),
+                                    "the proxy must preserve a known length or use the authenticated deferred-body contract"
+                                );
+                                let mut actual_request = Vec::new();
+                                incoming
+                                    .body
+                                    .read_to_end(&mut actual_request)
+                                    .await
+                                    .expect("target request body");
+                                assert_eq!(actual_request, expected_request);
+                            }
+                            1 => {
+                                assert_eq!(
+                                    incoming
+                                        .decode_body::<Vec<u8>>()
+                                        .await
+                                        .expect("decode forwarded streamed value"),
+                                    expected_streamed_request_value
+                                );
+                            }
+                            2 => {
+                                assert_eq!(
+                                    incoming
+                                        .decode_body::<String>()
+                                        .await
+                                        .expect("decode forwarded membership value"),
+                                    "request-2"
+                                );
+                            }
+                            _ => unreachable!("unexpected forwarding case"),
+                        }
+                        if index == 1 {
+                            let mut outgoing = ObjectRpcOutgoingResponse::encode_value(
+                                request_route,
+                                "response-1".to_string(),
+                            )?;
+                            outgoing
+                                .response
+                                .mark_responder_node_id(response_node.to_string());
+                            return Ok(outgoing);
+                        }
                         let mut response = ObjectRpcResponse::encode_body(
-                            incoming.request.route,
+                            request_route,
                             &format!("response-{index}"),
                         )
                         .expect("target response head");
@@ -11383,20 +11875,34 @@ mod tests {
             crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE,
         ];
         let outer_server = tokio::spawn(async move {
+            let mut stream = outer_listener
+                .accept()
+                .await
+                .expect("outer accept")
+                .into_inner();
+            let carrier_context =
+                sinomo_core::network::read_local_object_rpc_carrier_prelude(&mut stream)
+                    .await
+                    .expect("outer local carrier prelude");
+            let mut acceptor = sinomo_core::network::accept_local_object_rpc_stream_carrier(
+                Box::new(stream),
+                &carrier_context,
+            )
+            .expect("outer local carrier");
             for forward_route in forward_routes {
-                let mut stream = outer_listener
+                let logical = acceptor
                     .accept()
                     .await
-                    .expect("outer accept")
-                    .into_inner();
-                let context =
-                    sinomo_core::network::read_local_object_rpc_stream_prelude(&mut stream)
-                        .await
-                        .expect("outer local stream prelude");
+                    .expect("accept outer logical stream")
+                    .expect("outer logical stream");
+                let context = sinomo_core::network::RpcPeerContext::unauthenticated_local(
+                    logical.session_id.clone(),
+                    logical.channel_binding,
+                );
                 let handler_paths = outer_paths.clone();
                 let handler_runtime = outer_runtime.clone();
-                sinomo_core::network::serve_service_rpc_stream(
-                    stream,
+                sinomo_core::network::serve_service_rpc_peer_stream(
+                    logical,
                     &context,
                     sinomo_core::network::ObjectFrameIoOptions::default(),
                     move |incoming, _peer| async move {
@@ -11440,21 +11946,41 @@ mod tests {
             .enumerate()
         {
             let forward_route = forward_routes[index];
-            let inner_request = ObjectRpcRequest::encode_body(
-                inner_route,
-                if index == 2 {
-                    sinomo_core::network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
-                } else if index == 1 {
-                    sinomo_dfs::DFS_RPC_CATEGORY
-                } else {
-                    "test"
-                },
-                &format!("request-{index}"),
-            )
-            .expect("inner request head");
+            let category = if index == 2 {
+                sinomo_core::network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
+            } else if index == 1 {
+                sinomo_dfs::DFS_RPC_CATEGORY
+            } else {
+                "test"
+            };
+            let (inner_request, streamed_value_digest_sha256) = if index == 1 {
+                let contiguous = ObjectRpcRequest::from_encoded_body(
+                    inner_route.clone(),
+                    category,
+                    request_body.clone(),
+                );
+                let digest = sinomo_core::network::daemon_rpc_body_sha256(&contiguous)
+                    .try_into()
+                    .expect("daemon request digest");
+                (
+                    ObjectRpcRequest::from_encoded_body(inner_route, category, Vec::new()),
+                    Some(digest),
+                )
+            } else {
+                (
+                    ObjectRpcRequest::encode_body(
+                        inner_route,
+                        category,
+                        &format!("request-{index}"),
+                    )
+                    .expect("inner request head"),
+                    None,
+                )
+            };
             let payload = crate::DaemonObjectRpcForwardRequest {
                 target_node_id: target_node.clone(),
                 request: inner_request,
+                streamed_value_digest_sha256,
                 connect_timeout_millis: 5_000,
                 idle_timeout_millis: Some(310_000),
                 overall_timeout_millis: None,
@@ -11481,11 +12007,34 @@ mod tests {
                 .response
                 .decode_body()
                 .expect("forward response envelope");
-            let crate::DaemonObjectRpcForwardResponse::Success { response, .. } = envelope else {
+            let crate::DaemonObjectRpcForwardResponse::Success {
+                response,
+                streamed_value_body,
+                ..
+            } = envelope
+            else {
                 panic!(
                     "forward returned a network error: {envelope:?}; local={local_node} target={target_node}"
                 );
             };
+            assert_eq!(streamed_value_body, index == 1);
+            if streamed_value_body {
+                assert_eq!(
+                    response.responder_node_id(),
+                    Some(target_node.as_str()),
+                    "the streamed nested response must preserve the verified final target identity"
+                );
+                let nested = ObjectRpcResult::from_forwarded_body(response, result.body, true)
+                    .expect("restore streamed nested response");
+                assert_eq!(
+                    nested
+                        .decode_body::<String>()
+                        .await
+                        .expect("decode streamed nested value"),
+                    "response-1"
+                );
+                continue;
+            }
             assert!(
                 result
                     .body

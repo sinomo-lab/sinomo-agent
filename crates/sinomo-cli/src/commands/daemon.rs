@@ -762,20 +762,19 @@ impl CliClusterControlPlaneTransport {
         }
         let options = network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout);
         let mut client = network::ClusterObjectRpcClient::routed(&mut host, &self.cluster_paths);
-        let result = runtime.block_on(client.call_target(
-            state,
-            target_node_id,
-            network::ObjectRpcCall::value(request.clone()),
-            options,
-        ));
+        let result = runtime.block_on(async {
+            let result = client
+                .call_target(
+                    state,
+                    target_node_id,
+                    network::ObjectRpcCall::value(request.clone()),
+                    options,
+                )
+                .await?;
+            result.into_materialized_value_response(usize::MAX).await
+        });
         runtime.shutdown_timeout(Duration::from_millis(250));
-        let result = result?;
-        if !result.body.is_empty() {
-            return Err(network::NetworkError::Serialization {
-                detail: "CLI daemon node RPC returned an unexpected attachment".to_string(),
-            });
-        }
-        Ok(result.response)
+        result
     }
 }
 
@@ -849,20 +848,19 @@ impl cluster::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
         }
         let options = network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout);
         let mut client = network::ClusterObjectRpcClient::routed(&mut host, &self.cluster_paths);
-        let result = runtime.block_on(client.call_endpoint(
-            &state,
-            endpoint,
-            network::ObjectRpcCall::value(request.clone()),
-            options,
-        ));
+        let result = runtime.block_on(async {
+            let result = client
+                .call_endpoint(
+                    &state,
+                    endpoint,
+                    network::ObjectRpcCall::value(request.clone()),
+                    options,
+                )
+                .await?;
+            result.into_materialized_value_response(usize::MAX).await
+        });
         runtime.shutdown_timeout(Duration::from_millis(250));
-        let result = result?;
-        if !result.body.is_empty() {
-            return Err(network::NetworkError::Serialization {
-                detail: "CLI daemon endpoint RPC returned an unexpected attachment".to_string(),
-            });
-        }
-        Ok(result.response)
+        result
     }
 
     fn call_node_object_rpc(

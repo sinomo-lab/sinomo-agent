@@ -7,14 +7,14 @@
 #   docker compose -f docker/docker-compose.dev.yml up --build -d
 #   docker compose -f docker/docker-compose.dev.yml exec node1 sinomo cluster health
 #   cargo build -p sinomo                                    # iterate...
-#   docker compose -f docker/docker-compose.dev.yml restart  # ...nodes pick up the new binary
+#   docker compose -f docker/docker-compose.dev.yml up -d --no-deps --force-recreate node1 node2 node3 node4 node5 node6
 #   docker compose -f docker/docker-compose.dev.yml down -v  # tear down + wipe volumes
 #
 # `--build` only rebuilds the thin runtime image (docker/Dockerfile.dev); the
 # binary defaults to ../target/debug/sinomo on the host; set
 # SINOMO_DOCKER_BINARY to bind an explicitly optimized build for performance
-# gates. The entrypoint script is also bind-mounted, so script edits apply on
-# restart too.
+# gates. Recreate rather than restart after replacing either bind-mounted host
+# file: Docker retains the old mounted inode across a container restart.
 # In-container self-rollout builds are unavailable here (no toolchain); use the
 # root docker-compose.yml (full image) when testing rollout-from-source.
 #

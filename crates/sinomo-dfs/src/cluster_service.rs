@@ -5,7 +5,7 @@
 
 use sinomo_core::ClusterBootstrapState;
 use sinomo_core::local::SinomoDataDir;
-use sinomo_core::network::{ClusterPaths, ObjectRpcRequest};
+use sinomo_core::network::ClusterPaths;
 use sinomo_core::node::NodeId;
 use std::sync::Arc;
 
@@ -183,10 +183,4 @@ fn open_cluster_dfs_service_with_peer_transports_for_nodes_and_state(
             service.with_boxed_metadata_backend_for_commit_promotion_recovery(metadata)
         }
     }
-}
-
-pub(crate) fn object_rpc_request_from_kv_payload(
-    payload: sinomo_core::kv::ClusterKvRpcPayload,
-) -> ObjectRpcRequest {
-    ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
 }

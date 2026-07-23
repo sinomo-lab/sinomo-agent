@@ -439,14 +439,22 @@ impl CanonicalDfsMessagePeerTransport {
         call: ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
     ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
-        let ObjectRpcCall { request, body } = call;
+        let streamed_value = call.has_streamed_value_body();
+        let ObjectRpcCall { mut request, body } = call;
         if !dfs_route_is_message_data_plane(&request.route) {
             return Err(DfsPeerTransportError::new(format!(
                 "unexpected DFS message peer route {}",
                 request.route
             )));
         }
-        let command = if body.is_empty() {
+        let command = if streamed_value {
+            request.body = body
+                .collect_to_vec(usize::MAX)
+                .await
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            decode_dfs_message_rpc_request(&request)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
+        } else if body.is_empty() {
             decode_dfs_message_rpc_request(&request)
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
         } else {
@@ -2156,19 +2164,13 @@ struct RecordingPeerTransport {
     options: Mutex<Vec<(String, bool)>>,
 }
 
-impl DfsPeerTransport for RecordingPeerTransport {
-    fn call_object_rpc(
+impl RecordingPeerTransport {
+    fn call_materialized_value(
         &self,
         target_node_id: &NodeId,
-        call: ObjectRpcCall,
+        request: ObjectRpcRequest,
         options: DfsObjectRpcSendOptions,
     ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
-        if !call.body.is_empty() {
-            return Err(DfsPeerTransportError::new(
-                "recording peer does not accept an attachment",
-            ));
-        }
-        let request = &call.request;
         self.options
             .lock()
             .expect("options")
@@ -2262,6 +2264,18 @@ impl DfsPeerTransport for RecordingPeerTransport {
     }
 }
 
+impl DfsPeerTransport for RecordingPeerTransport {
+    fn call_object_rpc(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcCall,
+        options: DfsObjectRpcSendOptions,
+    ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+        let request = crate::node_transport::materialize_dfs_value_call_sync(call, usize::MAX)?;
+        self.call_materialized_value(target_node_id, request, options)
+    }
+}
+
 impl AsyncDfsPeerTransport for RecordingPeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
@@ -2269,7 +2283,11 @@ impl AsyncDfsPeerTransport for RecordingPeerTransport {
         call: ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
     ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>> {
-        Box::pin(async move { self.call_object_rpc(target_node_id, call, options) })
+        Box::pin(async move {
+            let request =
+                crate::node_transport::materialize_dfs_value_call(call, usize::MAX).await?;
+            self.call_materialized_value(target_node_id, request, options)
+        })
     }
 }
 
@@ -2286,12 +2304,7 @@ impl DfsPeerTransport for ConcurrentMetadataPeerTransport {
         call: ObjectRpcCall,
         _options: DfsObjectRpcSendOptions,
     ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
-        if !call.body.is_empty() {
-            return Err(DfsPeerTransportError::new(
-                "metadata peer does not accept an attachment",
-            ));
-        }
-        let request = &call.request;
+        let request = crate::node_transport::materialize_dfs_value_call_sync(call, usize::MAX)?;
         let active = self.active_calls.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_active_calls.fetch_max(active, Ordering::SeqCst);
         // Yield the worker long enough for the other scoped workers to enter.
@@ -13984,8 +13997,16 @@ impl StatelessPrimaryPeerTransport {
                 "unexpected stateless DFS target {target_node_id}"
             )));
         }
-        let ObjectRpcCall { request, body } = call;
-        let command = if body.is_empty() {
+        let streamed_value = call.has_streamed_value_body();
+        let ObjectRpcCall { mut request, body } = call;
+        let command = if streamed_value {
+            request.body = body
+                .collect_to_vec(usize::MAX)
+                .await
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            decode_dfs_message_rpc_request(&request)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
+        } else if body.is_empty() {
             decode_dfs_message_rpc_request(&request)
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
         } else {

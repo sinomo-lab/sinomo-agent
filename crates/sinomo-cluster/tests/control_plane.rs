@@ -133,7 +133,7 @@ use sinomo_network::{
 
 use sinomo_base::ClusterNodeRolloutStatus;
 use sinomo_kv::{
-    CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, CLUSTER_KV_TXN_ROUTE,
+    CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, CLUSTER_KV_TXN_ROUTE,
     CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_REVISION_LAG, CLUSTER_RAFT_APPEND_ROUTE,
     CLUSTER_RAFT_RPC_CATEGORY, CLUSTER_RAFT_VOTE_ROUTE, ClusterKvRaftAppendReplicationOutcome,
     ClusterKvRaftCommandStorage, ClusterKvRaftLeaderElectionOptions,
@@ -8332,7 +8332,10 @@ impl ClusterKvSnapshotRefreshHost for RecordingKvSnapshotRefreshHost {
         timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError> {
         self.fetches.push((target_node_id.clone(), timeout));
-        assert_eq!(request.route, CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE);
+        assert_eq!(
+            request.route,
+            sinomo_kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE
+        );
         let snapshot =
             self.snapshots
                 .get(target_node_id)
@@ -8341,15 +8344,13 @@ impl ClusterKvSnapshotRefreshHost for RecordingKvSnapshotRefreshHost {
                     operation: "test snapshot refresh".to_string(),
                     detail: format!("no snapshot for {target_node_id}"),
                 })?;
-        let payload =
-            sinomo_kv::cluster_kv_local_snapshot_response_rpc_payload(&sinomo_kv::KvLocalRead {
-                revision: snapshot.revision,
-                observed_term: 1,
-                applied_index: snapshot.revision.0,
-                known_leader: self.known_authority.clone(),
+        let payload = sinomo_kv::cluster_kv_authoritative_snapshot_response_rpc_payload(
+            &sinomo_kv::KvAuthoritativeRead {
+                authority: test_current_quorum_authority(&snapshot),
                 value: snapshot,
-            })
-            .map_err(kv_err)?;
+            },
+        )
+        .map_err(kv_err)?;
         Ok(object_rpc_response_from_kv_payload(payload))
     }
 }
@@ -13027,6 +13028,7 @@ impl ClusterSignedObjectRpcAsyncHost for RecordingJoinRegistrationHost {
     fn sign_object_rpc_request_async<'a>(
         &'a mut self,
         _request: &'a ObjectRpcRequest,
+        _request_digest_sha256: [u8; 32],
     ) -> ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
         Box::pin(async { panic!("voter-local join registration should not forward object RPCs") })
     }
@@ -30102,17 +30104,18 @@ impl ClusterKvSnapshotRefreshHost for NodeOnlySnapshotRefreshHost {
     ) -> Result<ObjectRpcResponse, NetworkError> {
         self.node_calls += 1;
         assert!(!target_node_id.as_str().is_empty());
-        assert_eq!(request.route, sinomo_kv::CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE);
+        assert_eq!(
+            request.route,
+            sinomo_kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE
+        );
         let snapshot = self.node_snapshot.as_ref().expect("node snapshot");
-        let payload =
-            sinomo_kv::cluster_kv_local_snapshot_response_rpc_payload(&sinomo_kv::KvLocalRead {
-                revision: snapshot.revision,
-                observed_term: 1,
-                applied_index: snapshot.revision.0,
-                known_leader: Some(target_node_id.clone()),
+        let payload = sinomo_kv::cluster_kv_authoritative_snapshot_response_rpc_payload(
+            &sinomo_kv::KvAuthoritativeRead {
+                authority: test_current_quorum_authority(snapshot),
                 value: snapshot.clone(),
-            })
-            .map_err(kv_err)?;
+            },
+        )
+        .map_err(kv_err)?;
         Ok(ObjectRpcResponse::from_encoded_body(
             payload.route,
             payload.body,

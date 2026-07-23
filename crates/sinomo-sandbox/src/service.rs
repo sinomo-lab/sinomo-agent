@@ -22,7 +22,7 @@ use crate::{
     SandboxBackend, SandboxBackendError, SandboxCancellationToken, SandboxId,
     SandboxRunCancelResponse,
 };
-use sinomo_core::network::{ObjectRpcCancelRequest, ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_core::network::{ObjectRpcCancelRequest, ObjectRpcRequest};
 
 use sinomo_core::service::{
     Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
@@ -153,137 +153,275 @@ pub fn register_services_with_factory(
     builder.register(SandboxService::new(factory))
 }
 
-fn dispatch_sandbox_backend_request(
-    backend: &mut dyn SandboxBackend,
-    request: ObjectRpcRequest,
-    active_run_cancellations: &Arc<Mutex<BTreeMap<String, SandboxCancellationToken>>>,
-    active_sandbox_operations: &Arc<Mutex<BTreeMap<SandboxId, SandboxOperationState>>>,
-) -> Result<ObjectRpcResponse, ServiceError> {
-    let response = match request.route.as_str() {
+enum SandboxBackendServiceRequest {
+    Create(crate::SandboxCreateInstanceRequest),
+    Status(crate::SandboxStatusRequest),
+    Update(crate::SandboxUpdateInstanceRequest),
+    Checkpoint(crate::SandboxCheckpointRequest),
+    Resume(crate::SandboxResumeRequest),
+    Reboot(crate::SandboxRebootRequest),
+    Destroy(crate::SandboxDestroyRequest),
+    List(crate::SandboxListRequest),
+    Read(crate::SandboxReadRequest),
+    Write(crate::SandboxWriteRequest),
+    HttpFetch(crate::SandboxHttpRequest),
+    HttpFetchToFile(crate::SandboxHttpFetchToFileRequest),
+    ImportBusyBox(crate::SandboxImportBusyBoxToolchainRequest),
+    ToolchainAddCommand(crate::SandboxAddToolchainCommandRequest),
+    ToolchainAddArtifact(crate::SandboxAddToolchainArtifactRequest),
+    ToolchainImportPackage(crate::SandboxImportToolchainPackageRequest),
+    ToolchainImportPackageFromPath(crate::SandboxImportToolchainPackageFromPathRequest),
+    RunToolchain {
+        operation_id: Option<String>,
+        payload: crate::SandboxRunToolchainRequest,
+    },
+    RunProcessPlan {
+        operation_id: Option<String>,
+        payload: crate::SandboxRunProcessPlanRequest,
+    },
+}
+
+enum SandboxBackendServiceResponse {
+    Create(crate::SandboxCreateInstanceResponse),
+    Status(crate::SandboxStatusResponse),
+    Update(crate::SandboxUpdateInstanceResponse),
+    Checkpoint(crate::SandboxCheckpointResponse),
+    Resume(crate::SandboxResumeResponse),
+    Reboot(crate::SandboxRebootResponse),
+    Destroy(crate::SandboxDestroyResponse),
+    List(crate::SandboxListResponse),
+    Read(crate::SandboxReadResponse),
+    Write(crate::SandboxWriteResponse),
+    HttpFetch(crate::SandboxHttpResponse),
+    HttpFetchToFile(crate::SandboxHttpFetchFileResult),
+    ImportBusyBox(crate::SandboxImportBusyBoxToolchainResponse),
+    ToolchainAddCommand(crate::SandboxAddToolchainCommandResponse),
+    ToolchainAddArtifact(crate::SandboxAddToolchainArtifactResponse),
+    ToolchainImportPackage(crate::SandboxImportToolchainPackageResponse),
+    ToolchainImportPackageFromPath(crate::SandboxImportToolchainPackageResponse),
+    RunToolchain(crate::SandboxLocalCommandOutcome),
+    RunProcessPlan(crate::SandboxProcessPlanOutcome),
+}
+
+impl SandboxBackendServiceResponse {
+    fn respond(self, ctx: &mut ServiceContext) -> Result<(), ServiceError> {
+        match self {
+            Self::Create(response) => ctx.respond_value(SANDBOX_CREATE_ROUTE, response),
+            Self::Status(response) => ctx.respond_value(SANDBOX_STATUS_ROUTE, response),
+            Self::Update(response) => ctx.respond_value(SANDBOX_UPDATE_ROUTE, response),
+            Self::Checkpoint(response) => ctx.respond_value(SANDBOX_CHECKPOINT_ROUTE, response),
+            Self::Resume(response) => ctx.respond_value(SANDBOX_RESUME_ROUTE, response),
+            Self::Reboot(response) => ctx.respond_value(SANDBOX_REBOOT_ROUTE, response),
+            Self::Destroy(response) => ctx.respond_value(SANDBOX_DESTROY_ROUTE, response),
+            Self::List(response) => ctx.respond_value(SANDBOX_LIST_ROUTE, response),
+            Self::Read(response) => ctx.respond_value(SANDBOX_READ_ROUTE, response),
+            Self::Write(response) => ctx.respond_value(SANDBOX_WRITE_ROUTE, response),
+            Self::HttpFetch(response) => ctx.respond_value(SANDBOX_HTTP_FETCH_ROUTE, response),
+            Self::HttpFetchToFile(response) => {
+                ctx.respond_value(SANDBOX_HTTP_FETCH_TO_FILE_ROUTE, response)
+            }
+            Self::ImportBusyBox(response) => {
+                ctx.respond_value(SANDBOX_IMPORT_BUSYBOX_ROUTE, response)
+            }
+            Self::ToolchainAddCommand(response) => {
+                ctx.respond_value(SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE, response)
+            }
+            Self::ToolchainAddArtifact(response) => {
+                ctx.respond_value(SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE, response)
+            }
+            Self::ToolchainImportPackage(response) => {
+                ctx.respond_value(SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE, response)
+            }
+            Self::ToolchainImportPackageFromPath(response) => {
+                ctx.respond_value(SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE, response)
+            }
+            Self::RunToolchain(response) => {
+                ctx.respond_value(SANDBOX_RUN_TOOLCHAIN_ROUTE, response)
+            }
+            Self::RunProcessPlan(response) => {
+                ctx.respond_value(SANDBOX_RUN_PROCESS_PLAN_ROUTE, response)
+            }
+        }
+    }
+}
+
+async fn decode_sandbox_backend_service_request(
+    ctx: &mut ServiceContext,
+    request: &ObjectRpcRequest,
+) -> Result<SandboxBackendServiceRequest, ServiceError> {
+    Ok(match request.route.as_str() {
         SANDBOX_CREATE_ROUTE => {
-            let payload: crate::SandboxCreateInstanceRequest = request.decode_body()?;
-            ObjectRpcResponse::encode_body(SANDBOX_CREATE_ROUTE, &backend.create(payload)?)?
+            SandboxBackendServiceRequest::Create(ctx.decode_request_body(request).await?)
         }
         SANDBOX_STATUS_ROUTE => {
-            let payload: crate::SandboxStatusRequest = request.decode_body()?;
-            ObjectRpcResponse::encode_body(SANDBOX_STATUS_ROUTE, &backend.status(payload)?)?
+            SandboxBackendServiceRequest::Status(ctx.decode_request_body(request).await?)
         }
         SANDBOX_UPDATE_ROUTE => {
-            let payload: crate::SandboxUpdateInstanceRequest = request.decode_body()?;
-            let _guard = begin_sandbox_operation(
-                active_sandbox_operations,
-                &payload.sandbox_id,
-                SandboxOperationKind::Mutation,
-            )?;
-            ObjectRpcResponse::encode_body(SANDBOX_UPDATE_ROUTE, &backend.update(payload)?)?
+            SandboxBackendServiceRequest::Update(ctx.decode_request_body(request).await?)
         }
         SANDBOX_CHECKPOINT_ROUTE => {
-            let payload: crate::SandboxCheckpointRequest = request.decode_body()?;
-            let _guard = begin_sandbox_operation(
-                active_sandbox_operations,
-                &payload.sandbox_id,
-                SandboxOperationKind::Mutation,
-            )?;
-            ObjectRpcResponse::encode_body(SANDBOX_CHECKPOINT_ROUTE, &backend.checkpoint(payload)?)?
+            SandboxBackendServiceRequest::Checkpoint(ctx.decode_request_body(request).await?)
         }
         SANDBOX_RESUME_ROUTE => {
-            let payload: crate::SandboxResumeRequest = request.decode_body()?;
-            let _guard = begin_sandbox_operation(
-                active_sandbox_operations,
-                &payload.sandbox_id,
-                SandboxOperationKind::Mutation,
-            )?;
-            ObjectRpcResponse::encode_body(SANDBOX_RESUME_ROUTE, &backend.resume(payload)?)?
+            SandboxBackendServiceRequest::Resume(ctx.decode_request_body(request).await?)
         }
         SANDBOX_REBOOT_ROUTE => {
-            let payload: crate::SandboxRebootRequest = request.decode_body()?;
-            let _guard = begin_sandbox_operation(
-                active_sandbox_operations,
-                &payload.sandbox_id,
-                SandboxOperationKind::Mutation,
-            )?;
-            ObjectRpcResponse::encode_body(SANDBOX_REBOOT_ROUTE, &backend.reboot(payload)?)?
+            SandboxBackendServiceRequest::Reboot(ctx.decode_request_body(request).await?)
         }
         SANDBOX_DESTROY_ROUTE => {
-            let payload: crate::SandboxDestroyRequest = request.decode_body()?;
-            let _guard = begin_sandbox_operation(
-                active_sandbox_operations,
-                &payload.sandbox_id,
-                SandboxOperationKind::Mutation,
-            )?;
-            ObjectRpcResponse::encode_body(SANDBOX_DESTROY_ROUTE, &backend.destroy(payload)?)?
+            SandboxBackendServiceRequest::Destroy(ctx.decode_request_body(request).await?)
         }
         SANDBOX_LIST_ROUTE => {
-            let payload: crate::SandboxListRequest = request.decode_body()?;
-            ObjectRpcResponse::encode_body(SANDBOX_LIST_ROUTE, &backend.list(payload)?)?
+            SandboxBackendServiceRequest::List(ctx.decode_request_body(request).await?)
         }
         SANDBOX_READ_ROUTE => {
-            let payload: crate::SandboxReadRequest = request.decode_body()?;
-            ObjectRpcResponse::encode_body(SANDBOX_READ_ROUTE, &backend.read(payload)?)?
+            SandboxBackendServiceRequest::Read(ctx.decode_request_body(request).await?)
         }
         SANDBOX_WRITE_ROUTE => {
-            let payload: crate::SandboxWriteRequest = request.decode_body()?;
-            let _guard = begin_sandbox_operation(
-                active_sandbox_operations,
-                &payload.sandbox_id,
-                SandboxOperationKind::Mutation,
-            )?;
-            ObjectRpcResponse::encode_body(SANDBOX_WRITE_ROUTE, &backend.write(payload)?)?
+            SandboxBackendServiceRequest::Write(ctx.decode_request_body(request).await?)
         }
         SANDBOX_HTTP_FETCH_ROUTE => {
-            let payload = request.decode_body()?;
-            ObjectRpcResponse::encode_body(SANDBOX_HTTP_FETCH_ROUTE, &backend.http_fetch(payload)?)?
+            SandboxBackendServiceRequest::HttpFetch(ctx.decode_request_body(request).await?)
         }
         SANDBOX_HTTP_FETCH_TO_FILE_ROUTE => {
-            let payload: crate::SandboxHttpFetchToFileRequest = request.decode_body()?;
+            SandboxBackendServiceRequest::HttpFetchToFile(ctx.decode_request_body(request).await?)
+        }
+        SANDBOX_IMPORT_BUSYBOX_ROUTE => {
+            SandboxBackendServiceRequest::ImportBusyBox(ctx.decode_request_body(request).await?)
+        }
+        SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE => SandboxBackendServiceRequest::ToolchainAddCommand(
+            ctx.decode_request_body(request).await?,
+        ),
+        SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE => SandboxBackendServiceRequest::ToolchainAddArtifact(
+            ctx.decode_request_body(request).await?,
+        ),
+        SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE => {
+            SandboxBackendServiceRequest::ToolchainImportPackage(
+                ctx.decode_request_body(request).await?,
+            )
+        }
+        SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE => {
+            SandboxBackendServiceRequest::ToolchainImportPackageFromPath(
+                ctx.decode_request_body(request).await?,
+            )
+        }
+        SANDBOX_RUN_TOOLCHAIN_ROUTE => SandboxBackendServiceRequest::RunToolchain {
+            operation_id: request.operation_id().map(str::to_string),
+            payload: ctx.decode_request_body(request).await?,
+        },
+        SANDBOX_RUN_PROCESS_PLAN_ROUTE => SandboxBackendServiceRequest::RunProcessPlan {
+            operation_id: request.operation_id().map(str::to_string),
+            payload: ctx.decode_request_body(request).await?,
+        },
+        other => return Err(ServiceError::UnknownRoute(other.to_string())),
+    })
+}
+
+fn dispatch_sandbox_backend_request(
+    backend: &mut dyn SandboxBackend,
+    request: SandboxBackendServiceRequest,
+    active_run_cancellations: &Arc<Mutex<BTreeMap<String, SandboxCancellationToken>>>,
+    active_sandbox_operations: &Arc<Mutex<BTreeMap<SandboxId, SandboxOperationState>>>,
+) -> Result<SandboxBackendServiceResponse, ServiceError> {
+    let response = match request {
+        SandboxBackendServiceRequest::Create(payload) => {
+            SandboxBackendServiceResponse::Create(backend.create(payload)?)
+        }
+        SandboxBackendServiceRequest::Status(payload) => {
+            SandboxBackendServiceResponse::Status(backend.status(payload)?)
+        }
+        SandboxBackendServiceRequest::Update(payload) => {
             let _guard = begin_sandbox_operation(
                 active_sandbox_operations,
                 &payload.sandbox_id,
                 SandboxOperationKind::Mutation,
             )?;
-            ObjectRpcResponse::encode_body(
-                SANDBOX_HTTP_FETCH_TO_FILE_ROUTE,
-                &backend.http_fetch_to_file(payload)?,
-            )?
+            SandboxBackendServiceResponse::Update(backend.update(payload)?)
         }
-        SANDBOX_IMPORT_BUSYBOX_ROUTE => {
-            let payload = request.decode_body()?;
-            ObjectRpcResponse::encode_body(
-                SANDBOX_IMPORT_BUSYBOX_ROUTE,
-                &backend.import_busybox(payload)?,
-            )?
+        SandboxBackendServiceRequest::Checkpoint(payload) => {
+            let _guard = begin_sandbox_operation(
+                active_sandbox_operations,
+                &payload.sandbox_id,
+                SandboxOperationKind::Mutation,
+            )?;
+            SandboxBackendServiceResponse::Checkpoint(backend.checkpoint(payload)?)
         }
-        SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE => {
-            let payload = request.decode_body()?;
-            ObjectRpcResponse::encode_body(
-                SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE,
-                &backend.toolchain_add_command(payload)?,
-            )?
+        SandboxBackendServiceRequest::Resume(payload) => {
+            let _guard = begin_sandbox_operation(
+                active_sandbox_operations,
+                &payload.sandbox_id,
+                SandboxOperationKind::Mutation,
+            )?;
+            SandboxBackendServiceResponse::Resume(backend.resume(payload)?)
         }
-        SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE => {
-            let payload = request.decode_body()?;
-            ObjectRpcResponse::encode_body(
-                SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE,
-                &backend.toolchain_add_artifact(payload)?,
-            )?
+        SandboxBackendServiceRequest::Reboot(payload) => {
+            let _guard = begin_sandbox_operation(
+                active_sandbox_operations,
+                &payload.sandbox_id,
+                SandboxOperationKind::Mutation,
+            )?;
+            SandboxBackendServiceResponse::Reboot(backend.reboot(payload)?)
         }
-        SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE => {
-            let payload = request.decode_body()?;
-            ObjectRpcResponse::encode_body(
-                SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE,
-                &backend.import_toolchain_package(payload)?,
-            )?
+        SandboxBackendServiceRequest::Destroy(payload) => {
+            let _guard = begin_sandbox_operation(
+                active_sandbox_operations,
+                &payload.sandbox_id,
+                SandboxOperationKind::Mutation,
+            )?;
+            SandboxBackendServiceResponse::Destroy(backend.destroy(payload)?)
         }
-        SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE => {
-            let payload = request.decode_body()?;
-            ObjectRpcResponse::encode_body(
-                SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE,
-                &backend.import_toolchain_package_from_path(payload)?,
-            )?
+        SandboxBackendServiceRequest::List(payload) => {
+            SandboxBackendServiceResponse::List(backend.list(payload)?)
         }
-        SANDBOX_RUN_TOOLCHAIN_ROUTE => {
-            let operation_id = request.operation_id().map(str::to_string);
-            let payload: crate::SandboxRunToolchainRequest = request.decode_body()?;
+        SandboxBackendServiceRequest::Read(payload) => {
+            SandboxBackendServiceResponse::Read(backend.read(payload)?)
+        }
+        SandboxBackendServiceRequest::Write(payload) => {
+            let _guard = begin_sandbox_operation(
+                active_sandbox_operations,
+                &payload.sandbox_id,
+                SandboxOperationKind::Mutation,
+            )?;
+            SandboxBackendServiceResponse::Write(backend.write(payload)?)
+        }
+        SandboxBackendServiceRequest::HttpFetch(payload) => {
+            SandboxBackendServiceResponse::HttpFetch(backend.http_fetch(payload)?)
+        }
+        SandboxBackendServiceRequest::HttpFetchToFile(payload) => {
+            let _guard = begin_sandbox_operation(
+                active_sandbox_operations,
+                &payload.sandbox_id,
+                SandboxOperationKind::Mutation,
+            )?;
+            SandboxBackendServiceResponse::HttpFetchToFile(backend.http_fetch_to_file(payload)?)
+        }
+        SandboxBackendServiceRequest::ImportBusyBox(payload) => {
+            SandboxBackendServiceResponse::ImportBusyBox(backend.import_busybox(payload)?)
+        }
+        SandboxBackendServiceRequest::ToolchainAddCommand(payload) => {
+            SandboxBackendServiceResponse::ToolchainAddCommand(
+                backend.toolchain_add_command(payload)?,
+            )
+        }
+        SandboxBackendServiceRequest::ToolchainAddArtifact(payload) => {
+            SandboxBackendServiceResponse::ToolchainAddArtifact(
+                backend.toolchain_add_artifact(payload)?,
+            )
+        }
+        SandboxBackendServiceRequest::ToolchainImportPackage(payload) => {
+            SandboxBackendServiceResponse::ToolchainImportPackage(
+                backend.import_toolchain_package(payload)?,
+            )
+        }
+        SandboxBackendServiceRequest::ToolchainImportPackageFromPath(payload) => {
+            SandboxBackendServiceResponse::ToolchainImportPackageFromPath(
+                backend.import_toolchain_package_from_path(payload)?,
+            )
+        }
+        SandboxBackendServiceRequest::RunToolchain {
+            operation_id,
+            payload,
+        } => {
             let _guard = begin_sandbox_operation(
                 active_sandbox_operations,
                 &payload.sandbox_id,
@@ -296,11 +434,12 @@ fn dispatch_sandbox_backend_request(
             let result =
                 backend.run_toolchain_with_cancellation(payload, cancellation_token.clone());
             unregister_sandbox_run_cancellation(active_run_cancellations, operation_id.as_deref());
-            ObjectRpcResponse::encode_body(SANDBOX_RUN_TOOLCHAIN_ROUTE, &result?)?
+            SandboxBackendServiceResponse::RunToolchain(result?)
         }
-        SANDBOX_RUN_PROCESS_PLAN_ROUTE => {
-            let operation_id = request.operation_id().map(str::to_string);
-            let payload: crate::SandboxRunProcessPlanRequest = request.decode_body()?;
+        SandboxBackendServiceRequest::RunProcessPlan {
+            operation_id,
+            payload,
+        } => {
             let _guard = begin_sandbox_operation(
                 active_sandbox_operations,
                 &payload.sandbox_id,
@@ -313,9 +452,8 @@ fn dispatch_sandbox_backend_request(
             let result =
                 backend.run_process_plan_with_cancellation(payload, cancellation_token.clone());
             unregister_sandbox_run_cancellation(active_run_cancellations, operation_id.as_deref());
-            ObjectRpcResponse::encode_body(SANDBOX_RUN_PROCESS_PLAN_ROUTE, &result?)?
+            SandboxBackendServiceResponse::RunProcessPlan(result?)
         }
-        other => return Err(ServiceError::UnknownRoute(other.to_string())),
     };
     Ok(response)
 }
@@ -354,24 +492,19 @@ fn unregister_sandbox_run_cancellation(
 
 fn dispatch_sandbox_run_cancel_request(
     active_run_cancellations: &Arc<Mutex<BTreeMap<String, SandboxCancellationToken>>>,
-    request: ObjectRpcRequest,
-) -> Result<ObjectRpcResponse, ServiceError> {
-    let payload: ObjectRpcCancelRequest = request.decode_body()?;
+    payload: ObjectRpcCancelRequest,
+    metadata_operation_id: Option<String>,
+) -> Result<SandboxRunCancelResponse, ServiceError> {
     let operation_id = payload.operation_id;
-    let metadata_operation_id = request.cancels_operation_id().map(str::to_string);
     if metadata_operation_id
         .as_deref()
         .is_some_and(|metadata| metadata != operation_id)
     {
-        return ObjectRpcResponse::encode_body(
-            SANDBOX_RUN_CANCEL_ROUTE,
-            &SandboxRunCancelResponse {
-                operation_id,
-                cancelled: false,
-                detail: "cancel metadata operation id does not match request body".to_string(),
-            },
-        )
-        .map_err(ServiceError::from);
+        return Ok(SandboxRunCancelResponse {
+            operation_id,
+            cancelled: false,
+            detail: "cancel metadata operation id does not match request body".to_string(),
+        });
     }
     let token = active_run_cancellations
         .lock()
@@ -392,15 +525,11 @@ fn dispatch_sandbox_run_cancel_request(
     } else {
         (false, "sandbox run operation is not active".to_string())
     };
-    ObjectRpcResponse::encode_body(
-        SANDBOX_RUN_CANCEL_ROUTE,
-        &SandboxRunCancelResponse {
-            operation_id,
-            cancelled,
-            detail,
-        },
-    )
-    .map_err(ServiceError::from)
+    Ok(SandboxRunCancelResponse {
+        operation_id,
+        cancelled,
+        detail,
+    })
 }
 
 impl Service for SandboxService {
@@ -447,11 +576,17 @@ impl Service for SandboxService {
         let active_sandbox_operations = Arc::clone(&self.active_sandbox_operations);
         Box::pin(async move {
             if request.route == SANDBOX_RUN_CANCEL_ROUTE {
-                let response =
-                    dispatch_sandbox_run_cancel_request(&active_run_cancellations, request)?;
-                ctx.respond(response)?;
+                let metadata_operation_id = request.cancels_operation_id().map(str::to_string);
+                let payload = ctx.decode_request_body(&request).await?;
+                let response = dispatch_sandbox_run_cancel_request(
+                    &active_run_cancellations,
+                    payload,
+                    metadata_operation_id,
+                )?;
+                ctx.respond_value(SANDBOX_RUN_CANCEL_ROUTE, response)?;
                 return Ok(ServiceDisposition::Continue);
             }
+            let request = decode_sandbox_backend_service_request(&mut ctx, &request).await?;
             let mut backend = factory.open(&ctx)?;
             let active_run_cancellations_for_task = Arc::clone(&active_run_cancellations);
             let active_sandbox_operations_for_task = Arc::clone(&active_sandbox_operations);
@@ -467,7 +602,7 @@ impl Service for SandboxService {
             .map_err(|source| {
                 ServiceError::Service(format!("sandbox backend task failed: {source}"))
             })??;
-            ctx.respond(response)?;
+            response.respond(&mut ctx)?;
             Ok(ServiceDisposition::Continue)
         })
     }

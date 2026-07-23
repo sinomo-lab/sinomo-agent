@@ -1,4 +1,7 @@
-use crate::{ClusterPaths, NetworkError, ObjectRpcRequest, SinomoObjectCodec};
+use crate::{
+    ClusterPaths, NetworkError, ObjectRpcCall, ObjectRpcRequest, SinomoObjectCodec,
+    rpc_body::AuthValuePayloadPart,
+};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::digest;
 #[cfg(test)]
@@ -139,12 +142,45 @@ pub fn daemon_rpc_body_sha256(request: &ObjectRpcRequest) -> Vec<u8> {
     let mut digest = digest::Context::new(&digest::SHA256);
     digest.update(DAEMON_RPC_REQUEST_DIGEST_DOMAIN);
     daemon_rpc_digest_update_bytes(&mut digest, &request.body);
-    daemon_rpc_digest_update_len(&mut digest, request.metadata.len());
-    for (key, value) in &request.metadata {
-        daemon_rpc_digest_update_bytes(&mut digest, key.as_bytes());
-        daemon_rpc_digest_update_bytes(&mut digest, value.as_bytes());
-    }
+    daemon_rpc_digest_update_metadata(&mut digest, request);
     digest.finish().as_ref().to_vec()
+}
+
+/// Computes the daemon authorization digest for a stream-native call without
+/// materializing a producer-owned typed value.
+///
+/// Trusted proxy envelopes use this proof to preserve authentication while
+/// transferring a one-pass value body into the daemon's outgoing call.
+pub fn daemon_rpc_call_sha256(call: &ObjectRpcCall) -> Result<[u8; 32], NetworkError> {
+    if let Some(digest) = call.body.forwarded_request_digest(&call.request.metadata)? {
+        return Ok(digest);
+    }
+
+    let mut digest = digest::Context::new(&digest::SHA256);
+    digest.update(DAEMON_RPC_REQUEST_DIGEST_DOMAIN);
+    let used_streamed_value = call.body.visit_auth_value_payload(&mut |part| match part {
+        AuthValuePayloadPart::Length(bytes) => daemon_rpc_digest_update_len(&mut digest, bytes),
+        AuthValuePayloadPart::Bytes(bytes) => digest.update(bytes),
+    })?;
+    if !used_streamed_value {
+        daemon_rpc_digest_update_bytes(&mut digest, &call.request.body);
+    }
+    daemon_rpc_digest_update_metadata(&mut digest, &call.request);
+    digest
+        .finish()
+        .as_ref()
+        .try_into()
+        .map_err(|_| NetworkError::Serialization {
+            detail: "daemon RPC request digest was not 32 bytes".to_string(),
+        })
+}
+
+fn daemon_rpc_digest_update_metadata(digest: &mut digest::Context, request: &ObjectRpcRequest) {
+    daemon_rpc_digest_update_len(digest, request.metadata.len());
+    for (key, value) in &request.metadata {
+        daemon_rpc_digest_update_bytes(digest, key.as_bytes());
+        daemon_rpc_digest_update_bytes(digest, value.as_bytes());
+    }
 }
 
 fn daemon_rpc_digest_update_bytes(digest: &mut digest::Context, bytes: &[u8]) {
@@ -604,6 +640,77 @@ mod tests {
             daemon_rpc_body_sha256(&request_a),
             daemon_rpc_body_sha256(&request_b)
         );
+    }
+
+    #[test]
+    fn producer_native_request_digest_matches_contiguous_request_digest() {
+        #[derive(Serialize)]
+        struct Fixture {
+            label: String,
+            payload: Vec<u8>,
+        }
+
+        let value = Fixture {
+            label: "producer-native".repeat(17),
+            payload: vec![0x5a; 3 * crate::owned_chunk::BODY_CHUNK_MAX + 37],
+        };
+        let mut contiguous = ObjectRpcRequest::encode_body(
+            "/test/producer-native-auth",
+            "test.producer-native-auth",
+            &value,
+        )
+        .expect("encode contiguous request");
+        contiguous
+            .metadata
+            .insert("traceparent".to_string(), "00-test".to_string());
+        let mut call = ObjectRpcCall::encode_owned_value(
+            "/test/producer-native-auth",
+            "test.producer-native-auth",
+            value,
+        )
+        .expect("encode producer-native request");
+        call.request.metadata = contiguous.metadata.clone();
+
+        assert!(call.request.body.is_empty());
+        assert_eq!(
+            daemon_rpc_call_sha256(&call)
+                .expect("producer-native digest")
+                .as_slice(),
+            daemon_rpc_body_sha256(&contiguous)
+        );
+    }
+
+    #[test]
+    fn forwarded_streamed_request_digest_is_reused_only_for_unchanged_metadata() {
+        let mut contiguous = ObjectRpcRequest::encode_body(
+            "/test/forwarded-auth",
+            "test.forwarded-auth",
+            &vec![0x31_u8; 2 * crate::owned_chunk::BODY_CHUNK_MAX + 11],
+        )
+        .expect("encode forwarded request");
+        contiguous
+            .metadata
+            .insert("operation-id".to_string(), "op-forwarded".to_string());
+        let digest: [u8; 32] = daemon_rpc_body_sha256(&contiguous)
+            .try_into()
+            .expect("request digest");
+        let encoded_value = std::mem::take(&mut contiguous.body);
+        let body = crate::ObjectRpcIncomingBody::bytes(encoded_value)
+            .with_role(crate::rpc_body::ObjectRpcBodyRole::Value)
+            .with_value_auth_digest_sha256(Some(digest));
+        let mut call = ObjectRpcCall::from_forwarded_body(contiguous, body);
+
+        assert_eq!(
+            daemon_rpc_call_sha256(&call).expect("forwarded digest"),
+            digest
+        );
+        call.request
+            .metadata
+            .insert("late-mutation".to_string(), "denied".to_string());
+        assert!(matches!(
+            daemon_rpc_call_sha256(&call),
+            Err(NetworkError::Serialization { .. })
+        ));
     }
 
     #[test]

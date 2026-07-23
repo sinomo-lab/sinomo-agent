@@ -112,7 +112,7 @@ pub use body_rpc::{
 };
 pub use cluster_service::cluster_dfs_peer_node_ids;
 pub(crate) use cluster_service::{
-    object_rpc_request_from_kv_payload, open_cluster_dfs_service_with_message_sender,
+    open_cluster_dfs_service_with_message_sender,
     open_cluster_dfs_service_with_message_sender_lazy,
     open_cluster_dfs_service_with_peer_transports_for_nodes,
     open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state,
@@ -168,7 +168,7 @@ pub(crate) use direct_read::{
 };
 pub use direct_read::{
     DfsDirectReadAttachmentResponse, DfsDirectReadClientData, DfsDirectReadClientResponse,
-    DfsDirectReadClientResult, dfs_direct_read_response_from_rpc_result,
+    DfsDirectReadClientResult, dfs_direct_read_response_from_rpc_result, dfs_direct_read_rpc_call,
     dfs_direct_read_rpc_request, handle_dfs_direct_read_rpc_request,
 };
 pub use discovery::{
@@ -472,9 +472,10 @@ pub use routes::{
     decode_dfs_status_rpc_response, dfs_inspection_rpc_request,
     dfs_message_allows_write_repair_progress, dfs_message_execution_scope,
     dfs_message_is_read_only_request, dfs_message_requires_fresh_metadata,
-    dfs_message_requires_full_metadata_hydrate, dfs_message_rpc_request,
-    dfs_metadata_journal_batch_execution_scope, dfs_metadata_journal_batch_rpc_request,
-    dfs_metadata_snapshot_install_execution_scope, dfs_metadata_snapshot_install_rpc_request,
+    dfs_message_requires_full_metadata_hydrate, dfs_message_rpc_call, dfs_message_rpc_request,
+    dfs_metadata_journal_batch_execution_scope, dfs_metadata_journal_batch_rpc_call,
+    dfs_metadata_journal_batch_rpc_request, dfs_metadata_snapshot_install_execution_scope,
+    dfs_metadata_snapshot_install_rpc_call, dfs_metadata_snapshot_install_rpc_request,
     dfs_route_is_message_data_plane, dfs_routed_message_rpc_request, dfs_smoke_rpc_request,
     dfs_status_rpc_request,
 };

@@ -1917,12 +1917,7 @@ async fn send_join_endpoint_rpc_async(
             options,
         )
         .await?;
-    if !result.body.is_empty() {
-        return Err(network::NetworkError::Serialization {
-            detail: "cluster join endpoint RPC returned an unexpected attachment".to_string(),
-        });
-    }
-    Ok(result.response)
+    result.into_materialized_value_response(usize::MAX).await
 }
 
 pub(crate) fn parse_cluster_join_invite_argument(raw: &str) -> Result<ClusterJoinInvite, CliError> {
@@ -2989,21 +2984,19 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
                 "cluster kv snapshot refresh signing",
             );
             let mut client = network::ClusterObjectRpcClient::routed(&mut host, &self.paths);
-            let result = runtime.block_on(client.call_target(
-                state,
-                target_node_id,
-                network::ObjectRpcCall::value(request.clone()),
-                network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
-            ));
+            let result = runtime.block_on(async {
+                let result = client
+                    .call_target(
+                        state,
+                        target_node_id,
+                        network::ObjectRpcCall::value(request.clone()),
+                        network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
+                    )
+                    .await?;
+                result.into_materialized_value_response(usize::MAX).await
+            });
             runtime.shutdown_timeout(Duration::from_millis(250));
-            let result = result?;
-            if !result.body.is_empty() {
-                return Err(network::NetworkError::Serialization {
-                    detail: "cluster KV snapshot refresh returned an unexpected attachment"
-                        .to_string(),
-                });
-            }
-            Ok(result.response)
+            result
         }
 
         fn cache_cluster_kv_snapshot_if_newer_than_raft(

@@ -13,14 +13,24 @@ use crate::direct_link::{
 };
 use crate::directory::{ClusterDirectory, DirectorySnapshot};
 use crate::error::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
+use crate::owned_chunk::{
+    AuthenticatedChunkReader, AuthenticatedChunkStream, AuthenticatedChunkWriter, BODY_CHUNK_MAX,
+    BoxedAuthenticatedChunkReader, BoxedAuthenticatedChunkWriter, ChunkAllocator, ChunkClass,
+    ChunkLease, ChunkStreamFuture, MUX_RECORD_HEADER_BYTES, OwnedChunk, PayloadCopyReason,
+    RPC_CONTROL_PAYLOAD_MAX, RPC_RECORD_HEADER_BYTES, ResetReason, SECURE_PLAINTEXT_MAX,
+    SECURE_RECORD_HEADER_BYTES, SECURE_RECORD_TAG_BYTES, observe_chunk_identity,
+};
+#[cfg(test)]
+use crate::owned_chunk::{ChunkPool, MUX_RECORD_MAX, SECURE_WIRE_MAX};
 use serde::{Deserialize, Serialize};
 use sinomo_base::{ClusterEndpointRecord, Id};
 use sinomo_node::NodeId;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
+use std::io::IoSlice;
 use std::pin::Pin;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::task::{Context, Poll};
@@ -243,9 +253,16 @@ const ROUTED_SESSION_WIRE_PREFIX: [u8; 4] = *b"SRT1";
 const ROUTED_SESSION_OPEN_FRAME: u8 = 1;
 const ROUTED_SESSION_ACCEPT_FRAME: u8 = 2;
 const MAX_ROUTED_SESSION_FRAME_BYTES: usize = 64 * 1024;
-const ROUTED_SESSION_DATA_FRAME_BYTES: usize = 64 * 1024;
-const ROUTED_SESSION_RELAY_BUFFER_BYTES: usize = 64 * 1024;
+// A secure record must fit one complete mux record. These limits are derived
+// outwards so a maximum-sized application chunk is not fragmented merely
+// because the inner protocols add their framing.
+#[cfg(test)]
+const ROUTED_STREAM_MUX_HEADER_BYTES: usize = MUX_RECORD_HEADER_BYTES;
+#[cfg(test)]
+const ROUTED_SESSION_DATA_FRAME_BYTES: usize = MUX_RECORD_MAX;
 const ROUTED_SESSION_DATA_WIRE_PREFIX: [u8; 4] = *b"SRE1";
+const ROUTED_SESSION_DATA_CONTROL_FLAG: u32 = 1 << 31;
+const ROUTED_SESSION_DATA_LENGTH_MASK: u32 = !ROUTED_SESSION_DATA_CONTROL_FLAG;
 const ROUTED_SESSION_BINDING_DOMAIN: &[u8] = b"sinomo.routed-session.binding.v1\0";
 const ROUTED_SESSION_KEY_DOMAIN: &[u8] = b"sinomo.routed-session.data-key.v1\0";
 const ROUTED_SESSION_AAD_DOMAIN: &[u8] = b"sinomo.routed-session.data-frame.v1\0";
@@ -509,492 +526,338 @@ fn routed_session_data_aad(
     *aad.finalize().as_bytes()
 }
 
-fn routed_session_data_io(operation: &str, detail: impl std::fmt::Display) -> std::io::Error {
-    std::io::Error::other(format!("{operation}: {detail}"))
+type RoutedSessionReadHalf = Box<dyn AsyncRead + Unpin + Send>;
+type RoutedSessionWriteHalf = Box<dyn AsyncWrite + Unpin + Send>;
+
+fn split_routed_session_io(
+    io: BoxedNetworkStream,
+) -> (RoutedSessionReadHalf, RoutedSessionWriteHalf) {
+    if io.as_any().is::<tokio::net::TcpStream>() {
+        let io = io
+            .into_any()
+            .downcast::<tokio::net::TcpStream>()
+            .expect("checked routed-session TCP stream");
+        let (reader, writer) = (*io).into_split();
+        return (Box::new(reader), Box::new(writer));
+    }
+    // A module transport that does not expose native owned halves retains the
+    // compatibility split. TCP, including the Docker/debug carrier, never
+    // enters this Arc<Mutex>-backed path.
+    let (reader, writer) = tokio::io::split(io);
+    (Box::new(reader), Box::new(writer))
 }
 
-struct EncryptedRoutedSessionStream {
-    io: Option<BoxedNetworkStream>,
-    sealing_key: ring::aead::LessSafeKey,
+struct EncryptedRoutedChunkReader {
+    reader: RoutedSessionReadHalf,
     opening_key: ring::aead::LessSafeKey,
     session_id: Id,
     channel_binding: [u8; 32],
-    outgoing_direction: u8,
     incoming_direction: u8,
-    outgoing_sequence: u64,
     incoming_sequence: u64,
-    outgoing_wire: Vec<u8>,
-    outgoing_offset: usize,
-    outgoing_final_queued: bool,
-    write_closed: bool,
-    incoming_header: [u8; 16],
-    incoming_header_filled: usize,
-    incoming_ciphertext: Vec<u8>,
-    incoming_ciphertext_filled: usize,
-    incoming_plaintext_bytes: Option<usize>,
-    incoming_plaintext: Vec<u8>,
-    incoming_plaintext_offset: usize,
+    allocator: ChunkAllocator,
     read_closed: bool,
 }
 
-impl EncryptedRoutedSessionStream {
-    fn new(
-        io: BoxedNetworkStream,
-        outgoing_key: [u8; 32],
-        incoming_key: [u8; 32],
-        session_id: Id,
-        channel_binding: [u8; 32],
-        outgoing_direction: u8,
-        incoming_direction: u8,
-    ) -> Self {
-        let sealing_key =
-            ring::aead::UnboundKey::new(&ring::aead::CHACHA20_POLY1305, &outgoing_key)
-                .expect("derived routed-session sealing key has the algorithm key length");
-        let opening_key =
-            ring::aead::UnboundKey::new(&ring::aead::CHACHA20_POLY1305, &incoming_key)
-                .expect("derived routed-session opening key has the algorithm key length");
-        Self {
-            io: Some(io),
-            sealing_key: ring::aead::LessSafeKey::new(sealing_key),
-            opening_key: ring::aead::LessSafeKey::new(opening_key),
-            session_id,
-            channel_binding,
-            outgoing_direction,
-            incoming_direction,
-            outgoing_sequence: 0,
-            incoming_sequence: 0,
-            outgoing_wire: Vec::with_capacity(
-                16_usize
-                    .saturating_add(ROUTED_SESSION_DATA_FRAME_BYTES)
-                    .saturating_add(ring::aead::CHACHA20_POLY1305.tag_len()),
-            ),
-            outgoing_offset: 0,
-            outgoing_final_queued: false,
-            write_closed: false,
-            incoming_header: [0; 16],
-            incoming_header_filled: 0,
-            incoming_ciphertext: Vec::new(),
-            incoming_ciphertext_filled: 0,
-            incoming_plaintext_bytes: None,
-            incoming_plaintext: Vec::new(),
-            incoming_plaintext_offset: 0,
-            read_closed: false,
+impl EncryptedRoutedChunkReader {
+    async fn recv_record(&mut self) -> Result<Option<ChunkLease>, NetworkError> {
+        if self.read_closed {
+            return Ok(None);
         }
-    }
-
-    fn queue_outgoing_frame(&mut self, plaintext: &[u8]) -> Result<(), std::io::Error> {
-        debug_assert_eq!(self.outgoing_offset, self.outgoing_wire.len());
-        let plaintext_bytes = u32::try_from(plaintext.len()).map_err(|_| {
-            routed_session_data_io("encrypt routed-session data", "oversized frame")
-        })?;
-        let aad = routed_session_data_aad(
-            &self.session_id,
-            &self.channel_binding,
-            self.outgoing_direction,
-            self.outgoing_sequence,
-            plaintext_bytes,
-        );
-        let mut ciphertext = Vec::with_capacity(
-            plaintext
-                .len()
-                .saturating_add(ring::aead::CHACHA20_POLY1305.tag_len()),
-        );
-        ciphertext.extend_from_slice(plaintext);
-        self.sealing_key
-            .seal_in_place_append_tag(
-                routed_session_data_nonce(self.outgoing_direction, self.outgoing_sequence),
-                ring::aead::Aad::from(aad),
-                &mut ciphertext,
-            )
-            .map_err(|_| routed_session_data_io("encrypt routed-session data", "AEAD failure"))?;
-        self.outgoing_wire.clear();
-        self.outgoing_wire
-            .extend_from_slice(&ROUTED_SESSION_DATA_WIRE_PREFIX);
-        self.outgoing_wire
-            .extend_from_slice(&self.outgoing_sequence.to_be_bytes());
-        self.outgoing_wire
-            .extend_from_slice(&plaintext_bytes.to_be_bytes());
-        self.outgoing_wire.extend_from_slice(&ciphertext);
-        self.outgoing_offset = 0;
-        if plaintext.is_empty() {
-            self.outgoing_final_queued = true;
-        } else {
-            self.outgoing_sequence = self.outgoing_sequence.checked_add(1).ok_or_else(|| {
-                routed_session_data_io("encrypt routed-session data", "sequence exhausted")
+        let mut header = [0_u8; SECURE_RECORD_HEADER_BYTES];
+        self.reader
+            .read_exact(&mut header)
+            .await
+            .map_err(|error| NetworkError::Io {
+                operation: "read owned routed-session secure header".to_string(),
+                detail: error.to_string(),
             })?;
+        if header[..4] != ROUTED_SESSION_DATA_WIRE_PREFIX {
+            return Err(NetworkError::Serialization {
+                detail: "invalid owned routed-session secure record prefix".to_string(),
+            });
         }
-        Ok(())
-    }
-
-    fn poll_drain_outgoing(
-        &mut self,
-        context: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        while self.outgoing_offset < self.outgoing_wire.len() {
-            let Self {
-                io,
-                outgoing_wire,
-                outgoing_offset,
-                ..
-            } = self;
-            let io = io.as_mut().expect("encrypted routed-session transport");
-            match Pin::new(&mut **io).poll_write(context, &outgoing_wire[*outgoing_offset..]) {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(routed_session_data_io(
-                        "write encrypted routed-session data",
-                        "write returned zero bytes",
-                    )));
-                }
-                Poll::Ready(Ok(written)) => *outgoing_offset += written,
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        self.outgoing_wire.clear();
-        self.outgoing_offset = 0;
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_fill_incoming_header(
-        &mut self,
-        context: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        while self.incoming_header_filled < self.incoming_header.len() {
-            let Self {
-                io,
-                incoming_header,
-                incoming_header_filled,
-                ..
-            } = self;
-            let io = io.as_mut().expect("encrypted routed-session transport");
-            let mut buffer = ReadBuf::new(&mut incoming_header[*incoming_header_filled..]);
-            match Pin::new(&mut **io).poll_read(context, &mut buffer) {
-                Poll::Ready(Ok(())) => {
-                    let read = buffer.filled().len();
-                    if read == 0 {
-                        return Poll::Ready(Err(routed_session_data_io(
-                            "decrypt routed-session data",
-                            "missing authenticated final frame",
-                        )));
-                    }
-                    *incoming_header_filled += read;
-                }
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        Poll::Ready(Ok(()))
-    }
-
-    fn prepare_incoming_ciphertext(&mut self) -> Result<(), std::io::Error> {
-        if self.incoming_plaintext_bytes.is_some() {
-            return Ok(());
-        }
-        if self.incoming_header[..4] != ROUTED_SESSION_DATA_WIRE_PREFIX {
-            return Err(routed_session_data_io(
-                "decrypt routed-session data",
-                "invalid frame prefix",
-            ));
-        }
-        let sequence = u64::from_be_bytes(
-            self.incoming_header[4..12]
-                .try_into()
-                .expect("routed data sequence header"),
-        );
+        let sequence =
+            u64::from_be_bytes(header[4..12].try_into().expect("secure record sequence"));
         if sequence != self.incoming_sequence {
-            return Err(routed_session_data_io(
-                "decrypt routed-session data",
-                "non-monotonic frame sequence",
-            ));
+            return Err(NetworkError::Serialization {
+                detail: format!(
+                    "non-monotonic owned routed-session sequence {sequence}; expected {}",
+                    self.incoming_sequence
+                ),
+            });
         }
-        let plaintext_bytes = u32::from_be_bytes(
-            self.incoming_header[12..]
-                .try_into()
-                .expect("routed data length header"),
-        );
-        let plaintext_bytes = usize::try_from(plaintext_bytes).expect("u32 fits usize");
-        if plaintext_bytes > ROUTED_SESSION_DATA_FRAME_BYTES {
-            return Err(routed_session_data_io(
-                "decrypt routed-session data",
-                "oversized encrypted frame",
-            ));
-        }
-        self.incoming_ciphertext.resize(
-            plaintext_bytes.saturating_add(ring::aead::CHACHA20_POLY1305.tag_len()),
-            0,
-        );
-        self.incoming_ciphertext_filled = 0;
-        self.incoming_plaintext_bytes = Some(plaintext_bytes);
-        Ok(())
-    }
-
-    fn poll_fill_incoming_ciphertext(
-        &mut self,
-        context: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        while self.incoming_ciphertext_filled < self.incoming_ciphertext.len() {
-            let Self {
-                io,
-                incoming_ciphertext,
-                incoming_ciphertext_filled,
-                ..
-            } = self;
-            let io = io.as_mut().expect("encrypted routed-session transport");
-            let mut buffer = ReadBuf::new(&mut incoming_ciphertext[*incoming_ciphertext_filled..]);
-            match Pin::new(&mut **io).poll_read(context, &mut buffer) {
-                Poll::Ready(Ok(())) => {
-                    let read = buffer.filled().len();
-                    if read == 0 {
-                        return Poll::Ready(Err(routed_session_data_io(
-                            "decrypt routed-session data",
-                            "truncated encrypted frame",
-                        )));
-                    }
-                    *incoming_ciphertext_filled += read;
-                }
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => return Poll::Pending,
+        let encoded_length =
+            u32::from_be_bytes(header[12..].try_into().expect("secure record length"));
+        let class = if encoded_length & ROUTED_SESSION_DATA_CONTROL_FLAG == 0 {
+            ChunkClass::Data
+        } else {
+            ChunkClass::Control
+        };
+        let plaintext_bytes = usize::try_from(encoded_length & ROUTED_SESSION_DATA_LENGTH_MASK)
+            .expect("u32 length fits usize");
+        let class_plaintext_max = match class {
+            ChunkClass::Data => SECURE_PLAINTEXT_MAX,
+            ChunkClass::Control => {
+                MUX_RECORD_HEADER_BYTES + RPC_RECORD_HEADER_BYTES + RPC_CONTROL_PAYLOAD_MAX
             }
+        };
+        if plaintext_bytes > class_plaintext_max {
+            return Err(NetworkError::FrameTooLarge {
+                actual_bytes: plaintext_bytes,
+                max_bytes: class_plaintext_max,
+            });
         }
-        Poll::Ready(Ok(()))
-    }
-
-    fn open_incoming_frame(&mut self) -> Result<(), std::io::Error> {
-        let plaintext_bytes = self
-            .incoming_plaintext_bytes
-            .take()
-            .expect("prepared routed-session ciphertext length");
-        let plaintext_bytes_u32 = u32::try_from(plaintext_bytes).expect("bounded plaintext length");
+        if plaintext_bytes == 0 && class != ChunkClass::Control {
+            return Err(NetworkError::Serialization {
+                detail: "owned routed-session final record used the data slab class".to_string(),
+            });
+        }
+        let mut chunk = match class {
+            ChunkClass::Data => self.allocator.allocate_data(0).await?,
+            ChunkClass::Control => self.allocator.allocate_control(0).await?,
+        };
+        let wire_bytes = SECURE_RECORD_HEADER_BYTES
+            .saturating_add(plaintext_bytes)
+            .saturating_add(SECURE_RECORD_TAG_BYTES);
+        chunk.set_range(0, wire_bytes)?;
+        chunk.as_mut_slice()[..SECURE_RECORD_HEADER_BYTES].copy_from_slice(&header);
+        self.reader
+            .read_exact(&mut chunk.as_mut_slice()[SECURE_RECORD_HEADER_BYTES..])
+            .await
+            .map_err(|error| NetworkError::Io {
+                operation: "read owned routed-session ciphertext".to_string(),
+                detail: error.to_string(),
+            })?;
         let aad = routed_session_data_aad(
             &self.session_id,
             &self.channel_binding,
             self.incoming_direction,
             self.incoming_sequence,
-            plaintext_bytes_u32,
+            encoded_length,
         );
         self.opening_key
             .open_in_place(
                 routed_session_data_nonce(self.incoming_direction, self.incoming_sequence),
                 ring::aead::Aad::from(aad),
-                &mut self.incoming_ciphertext,
+                &mut chunk.as_mut_slice()[SECURE_RECORD_HEADER_BYTES..],
             )
-            .map_err(|_| {
-                routed_session_data_io("decrypt routed-session data", "authentication failed")
-            })?;
-        self.incoming_header_filled = 0;
-        self.incoming_ciphertext_filled = 0;
+            .map_err(|_| NetworkError::AuthDenied)?;
+        chunk.strip_prefix(SECURE_RECORD_HEADER_BYTES)?;
+        chunk.strip_suffix(SECURE_RECORD_TAG_BYTES)?;
+        observe_chunk_identity(chunk.slab_id(), "secure-record-decrypted");
         if plaintext_bytes == 0 {
-            self.incoming_ciphertext.clear();
             self.read_closed = true;
-            return Ok(());
+            return Ok(None);
         }
-        self.incoming_sequence = self.incoming_sequence.checked_add(1).ok_or_else(|| {
-            routed_session_data_io("decrypt routed-session data", "sequence exhausted")
-        })?;
-        self.incoming_ciphertext.truncate(plaintext_bytes);
-        self.incoming_plaintext = std::mem::take(&mut self.incoming_ciphertext);
-        self.incoming_plaintext_offset = 0;
+        self.incoming_sequence =
+            self.incoming_sequence
+                .checked_add(1)
+                .ok_or_else(|| NetworkError::Serialization {
+                    detail: "owned routed-session receive sequence exhausted".to_string(),
+                })?;
+        Ok(Some(chunk.into_lease()))
+    }
+}
+
+impl AuthenticatedChunkReader for EncryptedRoutedChunkReader {
+    fn allocator(&self) -> &ChunkAllocator {
+        &self.allocator
+    }
+
+    fn max_payload_bytes(&self) -> usize {
+        SECURE_PLAINTEXT_MAX
+    }
+
+    fn recv_chunk(&mut self) -> ChunkStreamFuture<'_, Option<ChunkLease>> {
+        Box::pin(self.recv_record())
+    }
+}
+
+struct EncryptedRoutedChunkWriter {
+    writer: RoutedSessionWriteHalf,
+    sealing_key: ring::aead::LessSafeKey,
+    session_id: Id,
+    channel_binding: [u8; 32],
+    outgoing_direction: u8,
+    outgoing_sequence: u64,
+    allocator: ChunkAllocator,
+    write_closed: bool,
+}
+
+impl EncryptedRoutedChunkWriter {
+    async fn send_record(
+        &mut self,
+        mut chunk: OwnedChunk,
+        final_record: bool,
+    ) -> Result<(), NetworkError> {
+        if self.write_closed {
+            return Err(NetworkError::Io {
+                operation: "write owned routed-session record".to_string(),
+                detail: "write direction is closed".to_string(),
+            });
+        }
+        let plaintext_bytes = chunk.len();
+        if plaintext_bytes > SECURE_PLAINTEXT_MAX {
+            return Err(NetworkError::FrameTooLarge {
+                actual_bytes: plaintext_bytes,
+                max_bytes: SECURE_PLAINTEXT_MAX,
+            });
+        }
+        if final_record && plaintext_bytes != 0 {
+            return Err(NetworkError::Serialization {
+                detail: "owned routed-session final record carried plaintext".to_string(),
+            });
+        }
+        let plaintext_u32 =
+            u32::try_from(plaintext_bytes).map_err(|_| NetworkError::FrameTooLarge {
+                actual_bytes: plaintext_bytes,
+                max_bytes: SECURE_PLAINTEXT_MAX,
+            })?;
+        let class_flag = match chunk.class() {
+            ChunkClass::Data => 0,
+            ChunkClass::Control => ROUTED_SESSION_DATA_CONTROL_FLAG,
+        };
+        let encoded_length = plaintext_u32 | class_flag;
+        let aad = routed_session_data_aad(
+            &self.session_id,
+            &self.channel_binding,
+            self.outgoing_direction,
+            self.outgoing_sequence,
+            encoded_length,
+        );
+        observe_chunk_identity(chunk.slab_id(), "secure-record-plaintext");
+        let tag = self
+            .sealing_key
+            .seal_in_place_separate_tag(
+                routed_session_data_nonce(self.outgoing_direction, self.outgoing_sequence),
+                ring::aead::Aad::from(aad),
+                chunk.as_mut_slice(),
+            )
+            .map_err(|_| NetworkError::Io {
+                operation: "encrypt owned routed-session record".to_string(),
+                detail: "AEAD failure".to_string(),
+            })?;
+        chunk.append(tag.as_ref())?;
+        let mut header = [0_u8; SECURE_RECORD_HEADER_BYTES];
+        header[..4].copy_from_slice(&ROUTED_SESSION_DATA_WIRE_PREFIX);
+        header[4..12].copy_from_slice(&self.outgoing_sequence.to_be_bytes());
+        header[12..].copy_from_slice(&encoded_length.to_be_bytes());
+        chunk.prepend(&header)?;
+        observe_chunk_identity(chunk.slab_id(), "secure-record-socket-staging");
+        self.writer
+            .write_all(chunk.as_slice())
+            .await
+            .map_err(|error| NetworkError::Io {
+                operation: "write owned routed-session secure record".to_string(),
+                detail: error.to_string(),
+            })?;
+        if final_record {
+            self.write_closed = true;
+            self.writer
+                .shutdown()
+                .await
+                .map_err(|error| NetworkError::Io {
+                    operation: "half-close owned routed-session".to_string(),
+                    detail: error.to_string(),
+                })?;
+        } else {
+            self.outgoing_sequence = self.outgoing_sequence.checked_add(1).ok_or_else(|| {
+                NetworkError::Serialization {
+                    detail: "owned routed-session send sequence exhausted".to_string(),
+                }
+            })?;
+        }
         Ok(())
     }
 }
 
-impl AsyncRead for EncryptedRoutedSessionStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        if buffer.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-        loop {
-            if self.incoming_plaintext_offset < self.incoming_plaintext.len() {
-                let available = &self.incoming_plaintext[self.incoming_plaintext_offset..];
-                let copied = available.len().min(buffer.remaining());
-                buffer.put_slice(&available[..copied]);
-                self.incoming_plaintext_offset += copied;
-                if self.incoming_plaintext_offset == self.incoming_plaintext.len() {
-                    self.incoming_plaintext.clear();
-                    self.incoming_plaintext_offset = 0;
-                }
-                return Poll::Ready(Ok(()));
+impl AuthenticatedChunkWriter for EncryptedRoutedChunkWriter {
+    fn max_payload_bytes(&self) -> usize {
+        SECURE_PLAINTEXT_MAX
+    }
+
+    fn allocator(&self) -> &ChunkAllocator {
+        &self.allocator
+    }
+
+    fn send_chunk(&mut self, chunk: OwnedChunk) -> ChunkStreamFuture<'_, ()> {
+        Box::pin(self.send_record(chunk, false))
+    }
+
+    fn finish(&mut self) -> ChunkStreamFuture<'_, ()> {
+        Box::pin(async move {
+            if self.write_closed {
+                return Ok(());
             }
-            if self.read_closed {
-                return Poll::Ready(Ok(()));
-            }
-            match self.poll_fill_incoming_header(context) {
-                Poll::Ready(Ok(())) => {}
-                other => return other,
-            }
-            if let Err(error) = self.prepare_incoming_ciphertext() {
-                return Poll::Ready(Err(error));
-            }
-            match self.poll_fill_incoming_ciphertext(context) {
-                Poll::Ready(Ok(())) => {}
-                other => return other,
-            }
-            if let Err(error) = self.open_incoming_frame() {
-                return Poll::Ready(Err(error));
-            }
-        }
+            let final_record = self.allocator.allocate_control(0).await?;
+            self.send_record(final_record, true).await
+        })
+    }
+
+    fn reset(&mut self, reason: ResetReason) -> ChunkStreamFuture<'_, ()> {
+        Box::pin(async move {
+            self.write_closed = true;
+            self.writer
+                .shutdown()
+                .await
+                .map_err(|error| NetworkError::Io {
+                    operation: format!("reset owned routed-session: {}", reason.detail),
+                    detail: error.to_string(),
+                })
+        })
     }
 }
 
-impl AsyncWrite for EncryptedRoutedSessionStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        if self.write_closed || self.outgoing_final_queued {
-            return Poll::Ready(Err(routed_session_data_io(
-                "encrypt routed-session data",
-                "write direction is closed",
-            )));
-        }
-        match self.poll_drain_outgoing(context) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-            Poll::Pending => return Poll::Pending,
-        }
-        if buffer.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        let written = buffer.len().min(ROUTED_SESSION_DATA_FRAME_BYTES);
-        if let Err(error) = self.queue_outgoing_frame(&buffer[..written]) {
-            return Poll::Ready(Err(error));
-        }
-        match self.poll_drain_outgoing(context) {
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(written)),
-        }
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        match self.poll_drain_outgoing(context) {
-            Poll::Ready(Ok(())) => Pin::new(
-                &mut **self
-                    .io
-                    .as_mut()
-                    .expect("encrypted routed-session transport"),
-            )
-            .poll_flush(context),
-            other => other,
-        }
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        if self.write_closed {
-            return Poll::Ready(Ok(()));
-        }
-        match self.poll_drain_outgoing(context) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(error))
-                if self.outgoing_final_queued
-                    && matches!(
-                        error.kind(),
-                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                    ) =>
-            {
-                self.write_closed = true;
-                return Poll::Ready(Ok(()));
-            }
-            other => return other,
-        }
-        if !self.outgoing_final_queued {
-            if let Err(error) = self.queue_outgoing_frame(&[]) {
-                return Poll::Ready(Err(error));
-            }
-        }
-        match self.poll_drain_outgoing(context) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                ) =>
-            {
-                self.write_closed = true;
-                return Poll::Ready(Ok(()));
-            }
-            other => return other,
-        }
-        match Pin::new(
-            &mut **self
-                .io
-                .as_mut()
-                .expect("encrypted routed-session transport"),
-        )
-        .poll_shutdown(context)
-        {
-            Poll::Ready(Ok(())) => {
-                self.write_closed = true;
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                ) =>
-            {
-                self.write_closed = true;
-                Poll::Ready(Ok(()))
-            }
-            other => other,
-        }
-    }
-}
-
-impl Drop for EncryptedRoutedSessionStream {
-    fn drop(&mut self) {
-        if self.read_closed {
-            return;
-        }
-        let Some(mut io) = self.io.take() else {
-            return;
-        };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        // A caller may finish its write half after receiving its application
-        // response and then drop without reading the peer's authenticated
-        // final frame. Keep draining the already-authorized routed carrier so
-        // relays can observe an orderly EOF instead of an artificial reset.
-        runtime.spawn(async move {
-            let _ = io.shutdown().await;
-            let _ = tokio::io::copy(&mut io, &mut tokio::io::sink()).await;
-        });
-    }
-}
-
-fn encrypted_routed_session_stream(
+pub(crate) fn encrypted_routed_session_chunk_stream(
     io: BoxedNetworkStream,
     shared_secret: [u8; 32],
     session_id: Id,
     channel_binding: [u8; 32],
     source_side: bool,
-) -> BoxedNetworkStream {
+) -> Result<AuthenticatedChunkStream, NetworkError> {
+    debug_assert_eq!(
+        ring::aead::CHACHA20_POLY1305.tag_len(),
+        SECURE_RECORD_TAG_BYTES
+    );
     let outgoing_direction = if source_side { 0 } else { 1 };
     let incoming_direction = if source_side { 1 } else { 0 };
     let outgoing_key =
         routed_session_data_key(&shared_secret, &channel_binding, outgoing_direction);
     let incoming_key =
         routed_session_data_key(&shared_secret, &channel_binding, incoming_direction);
-    Box::new(EncryptedRoutedSessionStream::new(
-        io,
-        outgoing_key,
-        incoming_key,
+    let sealing_key = ring::aead::UnboundKey::new(&ring::aead::CHACHA20_POLY1305, &outgoing_key)
+        .map(ring::aead::LessSafeKey::new)
+        .map_err(|_| NetworkError::Serialization {
+            detail: "invalid owned routed-session sealing key".to_string(),
+        })?;
+    let opening_key = ring::aead::UnboundKey::new(&ring::aead::CHACHA20_POLY1305, &incoming_key)
+        .map(ring::aead::LessSafeKey::new)
+        .map_err(|_| NetworkError::Serialization {
+            detail: "invalid owned routed-session opening key".to_string(),
+        })?;
+    let allocator = ChunkAllocator::default();
+    let (reader, writer) = split_routed_session_io(io);
+    let reader: BoxedAuthenticatedChunkReader = Box::new(EncryptedRoutedChunkReader {
+        reader,
+        opening_key,
+        session_id: session_id.clone(),
+        channel_binding,
+        incoming_direction,
+        incoming_sequence: 0,
+        allocator: allocator.clone(),
+        read_closed: false,
+    });
+    let writer: BoxedAuthenticatedChunkWriter = Box::new(EncryptedRoutedChunkWriter {
+        writer,
+        sealing_key,
         session_id,
         channel_binding,
         outgoing_direction,
-        incoming_direction,
-    ))
+        outgoing_sequence: 0,
+        allocator,
+        write_closed: false,
+    });
+    AuthenticatedChunkStream::new(reader, writer)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1042,6 +905,7 @@ impl Default for ConnectOptions {
 /// Socket-like stream bound to one authenticated destination and route.
 pub struct PeerStream {
     io: BoxedNetworkStream,
+    chunk_io: Option<Arc<Mutex<Option<AuthenticatedChunkStream>>>>,
     pub local_node_id: NodeId,
     pub peer_node_id: NodeId,
     pub session_id: Id,
@@ -1074,6 +938,7 @@ impl PeerStream {
         }
         Ok(Self {
             io,
+            chunk_io: None,
             local_node_id,
             peer_node_id,
             session_id,
@@ -1082,8 +947,258 @@ impl PeerStream {
         })
     }
 
+    pub(crate) fn new_owned(
+        chunk_io: AuthenticatedChunkStream,
+        local_node_id: NodeId,
+        peer_node_id: NodeId,
+        session_id: Id,
+        channel_binding: [u8; 32],
+        route_trace: RouteTrace,
+    ) -> Result<Self, NetworkError> {
+        let chunk_io = Arc::new(Mutex::new(Some(chunk_io)));
+        let mut stream = Self::new(
+            Box::new(LazyChunkByteStream::new(Arc::clone(&chunk_io))),
+            local_node_id,
+            peer_node_id,
+            session_id,
+            channel_binding,
+            route_trace,
+        )?;
+        stream.chunk_io = Some(chunk_io);
+        Ok(stream)
+    }
+
+    pub(crate) const fn has_owned_chunks(&self) -> bool {
+        self.chunk_io.is_some()
+    }
+
+    pub(crate) fn into_chunk_stream(mut self) -> Result<AuthenticatedChunkStream, NetworkError> {
+        let holder = self.chunk_io.take().ok_or_else(|| NetworkError::Io {
+            operation: "open authenticated owned-chunk stream".to_string(),
+            detail: "peer stream is a byte-compatibility transport".to_string(),
+        })?;
+        holder
+            .lock()
+            .map_err(|_| NetworkError::Io {
+                operation: "open authenticated owned-chunk stream".to_string(),
+                detail: "owned-chunk stream lock poisoned".to_string(),
+            })?
+            .take()
+            .ok_or_else(|| NetworkError::Io {
+                operation: "open authenticated owned-chunk stream".to_string(),
+                detail: "owned-chunk stream already entered byte compatibility mode".to_string(),
+            })
+    }
+
     pub fn into_inner(self) -> BoxedNetworkStream {
         self.io
+    }
+}
+
+struct LazyChunkByteStream {
+    holder: Arc<Mutex<Option<AuthenticatedChunkStream>>>,
+    io: Option<ChunkByteCompatibilityStream>,
+}
+
+impl LazyChunkByteStream {
+    fn new(holder: Arc<Mutex<Option<AuthenticatedChunkStream>>>) -> Self {
+        Self { holder, io: None }
+    }
+
+    fn ensure_io(&mut self) -> Result<&mut ChunkByteCompatibilityStream, std::io::Error> {
+        if self.io.is_none() {
+            let chunk_stream = self
+                .holder
+                .lock()
+                .map_err(|_| std::io::Error::other("owned-chunk stream lock poisoned"))?
+                .take()
+                .ok_or_else(|| {
+                    std::io::Error::other(
+                        "owned-chunk stream was already consumed by its canonical API",
+                    )
+                })?;
+            self.io = Some(spawn_chunk_byte_compatibility_adapter(chunk_stream));
+        }
+        self.io
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("missing owned-chunk byte adapter"))
+    }
+}
+
+struct ChunkByteCompatibilityStream {
+    io: tokio::io::DuplexStream,
+    write_drained: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    shutdown_started: bool,
+}
+
+fn spawn_chunk_byte_compatibility_adapter(
+    chunk_stream: AuthenticatedChunkStream,
+) -> ChunkByteCompatibilityStream {
+    let (application, bridge) = tokio::io::duplex(4 * BODY_CHUNK_MAX);
+    let (mut bridge_reader, mut bridge_writer) = tokio::io::split(bridge);
+    let (mut chunk_reader, mut chunk_writer) = chunk_stream.into_halves();
+    let write_allocator = chunk_writer.allocator().clone();
+    let (write_drained, write_drained_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = async {
+            loop {
+                let mut chunk = write_allocator
+                    .allocate_data(BODY_CHUNK_MAX)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let read = bridge_reader
+                    .read(chunk.writable_payload())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if read == 0 {
+                    return chunk_writer
+                        .finish()
+                        .await
+                        .map_err(|error| error.to_string());
+                }
+                chunk
+                    .commit_payload(read)
+                    .map_err(|error| error.to_string())?;
+                write_allocator
+                    .record_payload_copy(read, PayloadCopyReason::ByteStreamWriteAdapter);
+                chunk_writer
+                    .send_chunk(chunk)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        .await;
+        if let Err(error) = &result {
+            tracing::debug!(%error, "owned-chunk byte write adapter stopped");
+            let _ = chunk_writer
+                .reset(ResetReason {
+                    detail: error.clone(),
+                })
+                .await;
+        }
+        let _ = write_drained.send(result);
+    });
+    let read_allocator = chunk_reader.allocator().clone();
+    tokio::spawn(async move {
+        loop {
+            match chunk_reader.recv_chunk().await {
+                Ok(Some(chunk)) => {
+                    read_allocator
+                        .record_payload_copy(chunk.len(), PayloadCopyReason::ByteStreamReadAdapter);
+                    if bridge_writer.write_all(chunk.as_slice()).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    let _ = bridge_writer.shutdown().await;
+                    return;
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "owned-chunk byte read adapter stopped");
+                    let _ = bridge_writer.shutdown().await;
+                    return;
+                }
+            }
+        }
+    });
+    ChunkByteCompatibilityStream {
+        io: application,
+        write_drained: write_drained_rx,
+        shutdown_started: false,
+    }
+}
+
+impl AsyncRead for ChunkByteCompatibilityStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.io).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for ChunkByteCompatibilityStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        Pin::new(&mut self.io).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.io).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        if !self.shutdown_started {
+            match Pin::new(&mut self.io).poll_shutdown(context) {
+                Poll::Ready(Ok(())) => self.shutdown_started = true,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        match Pin::new(&mut self.write_drained).poll(context) {
+            Poll::Ready(Ok(Ok(()))) => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(Err(detail))) => Poll::Ready(Err(std::io::Error::other(detail))),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(std::io::Error::other(
+                "owned-chunk byte write adapter stopped before draining",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncRead for LazyChunkByteStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        match self.ensure_io() {
+            Ok(io) => Pin::new(io).poll_read(context, buffer),
+            Err(error) => Poll::Ready(Err(error)),
+        }
+    }
+}
+
+impl AsyncWrite for LazyChunkByteStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        match self.ensure_io() {
+            Ok(io) => Pin::new(io).poll_write(context, buffer),
+            Err(error) => Poll::Ready(Err(error)),
+        }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        match self.ensure_io() {
+            Ok(io) => Pin::new(io).poll_flush(context),
+            Err(error) => Poll::Ready(Err(error)),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        match self.ensure_io() {
+            Ok(io) => Pin::new(io).poll_shutdown(context),
+            Err(error) => Poll::Ready(Err(error)),
+        }
     }
 }
 
@@ -1104,6 +1219,18 @@ impl AsyncWrite for PeerStream {
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
         Pin::new(&mut *self.io).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        Pin::new(&mut *self.io).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
     }
 
     fn poll_flush(
@@ -1316,14 +1443,14 @@ async fn initiate_routed_session(
         &descriptor_transcript,
         &acceptance_transcript,
     );
-    let io = encrypted_routed_session_stream(
+    let io = encrypted_routed_session_chunk_stream(
         stream.io,
         shared_secret,
         open.descriptor.session_id.clone(),
         channel_binding,
         true,
-    );
-    PeerStream::new(
+    )?;
+    PeerStream::new_owned(
         io,
         open.descriptor.source_node_id,
         open.descriptor.destination_node_id,
@@ -1374,18 +1501,18 @@ async fn accept_routed_session_destination(
         &descriptor_transcript,
         &acceptance_transcript,
     );
-    let io = encrypted_routed_session_stream(
+    let io = encrypted_routed_session_chunk_stream(
         stream.io,
         shared_secret,
         descriptor.session_id.clone(),
         channel_binding,
         false,
-    );
+    )?;
     let mut nodes = descriptor.path.clone();
     nodes.reverse();
     let mut endpoint_ids = descriptor.endpoint_ids.clone();
     endpoint_ids.reverse();
-    PeerStream::new(
+    PeerStream::new_owned(
         io,
         descriptor.destination_node_id.clone(),
         descriptor.source_node_id.clone(),
@@ -1565,6 +1692,7 @@ enum RoutedRelayAdjacentEdge {
     Outgoing,
 }
 
+#[derive(Debug)]
 struct RoutedRelayCopyError {
     edge: RoutedRelayAdjacentEdge,
     operation: &'static str,
@@ -1576,16 +1704,24 @@ async fn copy_routed_relay_direction<R, W>(
     reader_edge: RoutedRelayAdjacentEdge,
     mut writer: W,
     writer_edge: RoutedRelayAdjacentEdge,
+    allocator: ChunkAllocator,
 ) -> Result<u64, RoutedRelayCopyError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut copied = 0_u64;
-    let mut buffer = vec![0_u8; ROUTED_SESSION_RELAY_BUFFER_BYTES];
     loop {
+        let mut chunk = allocator
+            .allocate_data(BODY_CHUNK_MAX)
+            .await
+            .map_err(|error| RoutedRelayCopyError {
+                edge: reader_edge,
+                operation: "allocate opaque routed-session relay slab",
+                source: std::io::Error::other(error.to_string()),
+            })?;
         let read = reader
-            .read(&mut buffer)
+            .read(chunk.writable_payload())
             .await
             .map_err(|source| RoutedRelayCopyError {
                 edge: reader_edge,
@@ -1603,8 +1739,15 @@ where
                 })?;
             return Ok(copied);
         }
+        chunk
+            .commit_payload(read)
+            .map_err(|error| RoutedRelayCopyError {
+                edge: reader_edge,
+                operation: "commit opaque routed-session relay slab",
+                source: std::io::Error::other(error.to_string()),
+            })?;
         writer
-            .write_all(&buffer[..read])
+            .write_all(chunk.as_slice())
             .await
             .map_err(|source| RoutedRelayCopyError {
                 edge: writer_edge,
@@ -1612,6 +1755,266 @@ where
                 source,
             })?;
         copied = copied.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn splice_routed_tcp_direction(
+    reader: std::net::TcpStream,
+    reader_edge: RoutedRelayAdjacentEdge,
+    writer: std::net::TcpStream,
+    writer_edge: RoutedRelayAdjacentEdge,
+) -> Result<u64, RoutedRelayCopyError> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    fn io_error(edge: RoutedRelayAdjacentEdge, operation: &'static str) -> RoutedRelayCopyError {
+        RoutedRelayCopyError {
+            edge,
+            operation,
+            source: std::io::Error::last_os_error(),
+        }
+    }
+
+    let mut pipe_fds = [-1; 2];
+    // SAFETY: `pipe_fds` points to two valid integers and successful return
+    // initializes both descriptors. Each is immediately adopted by OwnedFd.
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io_error(
+            reader_edge,
+            "create Linux routed-session splice pipe",
+        ));
+    }
+    // SAFETY: successful pipe2 returned two fresh owned descriptors.
+    let pipe_read = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+    // SAFETY: successful pipe2 returned two fresh owned descriptors.
+    let pipe_write = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+    let mut copied = 0_u64;
+    loop {
+        let moved_to_pipe = loop {
+            // SAFETY: all descriptors are live for the duration of the call;
+            // null offsets select and advance their current stream positions.
+            let moved = unsafe {
+                libc::splice(
+                    reader.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    pipe_write.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    BODY_CHUNK_MAX,
+                    libc::SPLICE_F_MOVE,
+                )
+            };
+            if moved >= 0 {
+                break moved as usize;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            let _ = reader.shutdown(std::net::Shutdown::Both);
+            let _ = writer.shutdown(std::net::Shutdown::Both);
+            return Err(RoutedRelayCopyError {
+                edge: reader_edge,
+                operation: "splice opaque routed-session bytes into kernel pipe",
+                source: error,
+            });
+        };
+        if moved_to_pipe == 0 {
+            if let Err(source) = writer.shutdown(std::net::Shutdown::Write)
+                && source.kind() != std::io::ErrorKind::NotConnected
+            {
+                return Err(RoutedRelayCopyError {
+                    edge: writer_edge,
+                    operation: "half-close spliced routed-session relay edge",
+                    source,
+                });
+            }
+            return Ok(copied);
+        }
+        let mut remaining = moved_to_pipe;
+        while remaining != 0 {
+            let moved_to_socket = loop {
+                // SAFETY: all descriptors are live, the pipe contains at least
+                // `remaining` bytes, and null offsets advance stream positions.
+                let moved = unsafe {
+                    libc::splice(
+                        pipe_read.as_raw_fd(),
+                        std::ptr::null_mut(),
+                        writer.as_raw_fd(),
+                        std::ptr::null_mut(),
+                        remaining,
+                        libc::SPLICE_F_MOVE,
+                    )
+                };
+                if moved > 0 {
+                    break moved as usize;
+                }
+                let error = if moved == 0 {
+                    std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "splice wrote zero routed-session bytes",
+                    )
+                } else {
+                    std::io::Error::last_os_error()
+                };
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.kind() == std::io::ErrorKind::BrokenPipe {
+                    // The peer can finish the routed carrier and close its
+                    // receive half while the opposite splice task still has a
+                    // final opaque record staged in this direction's kernel
+                    // pipe. Nothing can consume those bytes once the socket
+                    // reports EPIPE, so retire only this direction. Shutting
+                    // down both cloned sockets here would also abort the
+                    // independent reverse direction during normal teardown.
+                    let _ = reader.shutdown(std::net::Shutdown::Read);
+                    return Ok(copied);
+                }
+                let _ = reader.shutdown(std::net::Shutdown::Both);
+                let _ = writer.shutdown(std::net::Shutdown::Both);
+                return Err(RoutedRelayCopyError {
+                    edge: writer_edge,
+                    operation: "splice opaque routed-session bytes from kernel pipe",
+                    source: error,
+                });
+            };
+            remaining -= moved_to_socket;
+        }
+        copied = copied.saturating_add(moved_to_pipe as u64);
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn splice_routed_tcp_pair(
+    incoming: tokio::net::TcpStream,
+    outgoing: tokio::net::TcpStream,
+) -> Result<(u64, u64), RoutedRelayCopyError> {
+    let incoming = incoming.into_std().map_err(|source| RoutedRelayCopyError {
+        edge: RoutedRelayAdjacentEdge::Incoming,
+        operation: "take incoming TCP relay stream",
+        source,
+    })?;
+    let outgoing = outgoing.into_std().map_err(|source| RoutedRelayCopyError {
+        edge: RoutedRelayAdjacentEdge::Outgoing,
+        operation: "take outgoing TCP relay stream",
+        source,
+    })?;
+    incoming
+        .set_nonblocking(false)
+        .map_err(|source| RoutedRelayCopyError {
+            edge: RoutedRelayAdjacentEdge::Incoming,
+            operation: "configure incoming TCP relay stream for splice",
+            source,
+        })?;
+    outgoing
+        .set_nonblocking(false)
+        .map_err(|source| RoutedRelayCopyError {
+            edge: RoutedRelayAdjacentEdge::Outgoing,
+            operation: "configure outgoing TCP relay stream for splice",
+            source,
+        })?;
+    let toward_destination_reader =
+        incoming
+            .try_clone()
+            .map_err(|source| RoutedRelayCopyError {
+                edge: RoutedRelayAdjacentEdge::Incoming,
+                operation: "clone incoming TCP relay stream",
+                source,
+            })?;
+    let toward_destination_writer =
+        outgoing
+            .try_clone()
+            .map_err(|source| RoutedRelayCopyError {
+                edge: RoutedRelayAdjacentEdge::Outgoing,
+                operation: "clone outgoing TCP relay stream",
+                source,
+            })?;
+    let toward_destination = tokio::task::spawn_blocking(move || {
+        splice_routed_tcp_direction(
+            toward_destination_reader,
+            RoutedRelayAdjacentEdge::Incoming,
+            toward_destination_writer,
+            RoutedRelayAdjacentEdge::Outgoing,
+        )
+    });
+    let toward_source = tokio::task::spawn_blocking(move || {
+        splice_routed_tcp_direction(
+            outgoing,
+            RoutedRelayAdjacentEdge::Outgoing,
+            incoming,
+            RoutedRelayAdjacentEdge::Incoming,
+        )
+    });
+    let (toward_destination, toward_source) = tokio::join!(toward_destination, toward_source);
+    let toward_destination = toward_destination.map_err(|source| RoutedRelayCopyError {
+        edge: RoutedRelayAdjacentEdge::Incoming,
+        operation: "join destination-bound TCP splice relay",
+        source: std::io::Error::other(source.to_string()),
+    })??;
+    let toward_source = toward_source.map_err(|source| RoutedRelayCopyError {
+        edge: RoutedRelayAdjacentEdge::Outgoing,
+        operation: "join source-bound TCP splice relay",
+        source: std::io::Error::other(source.to_string()),
+    })??;
+    Ok((toward_destination, toward_source))
+}
+
+async fn forward_routed_relay_pair(
+    incoming: BoxedNetworkStream,
+    outgoing: BoxedNetworkStream,
+) -> Result<(u64, u64), RoutedRelayCopyError> {
+    forward_routed_relay_pair_with_allocator(incoming, outgoing, ChunkAllocator::default()).await
+}
+
+async fn forward_routed_relay_pair_with_allocator(
+    incoming: BoxedNetworkStream,
+    outgoing: BoxedNetworkStream,
+    relay_allocator: ChunkAllocator,
+) -> Result<(u64, u64), RoutedRelayCopyError> {
+    #[cfg(target_os = "linux")]
+    if incoming.as_any().is::<tokio::net::TcpStream>()
+        && outgoing.as_any().is::<tokio::net::TcpStream>()
+    {
+        let incoming = incoming
+            .into_any()
+            .downcast::<tokio::net::TcpStream>()
+            .expect("checked incoming TCP relay stream");
+        let outgoing = outgoing
+            .into_any()
+            .downcast::<tokio::net::TcpStream>()
+            .expect("checked outgoing TCP relay stream");
+        metrics::counter!("sinomo.network.relay.mode", "mode" => "linux-splice").increment(1);
+        return splice_routed_tcp_pair(*incoming, *outgoing).await;
+    }
+
+    metrics::counter!("sinomo.network.relay.mode", "mode" => "pooled-slab").increment(1);
+    let (incoming_read, incoming_write) = tokio::io::split(incoming);
+    let (outgoing_read, outgoing_write) = tokio::io::split(outgoing);
+    let toward_destination = copy_routed_relay_direction(
+        incoming_read,
+        RoutedRelayAdjacentEdge::Incoming,
+        outgoing_write,
+        RoutedRelayAdjacentEdge::Outgoing,
+        relay_allocator.clone(),
+    );
+    let toward_source = copy_routed_relay_direction(
+        outgoing_read,
+        RoutedRelayAdjacentEdge::Outgoing,
+        incoming_write,
+        RoutedRelayAdjacentEdge::Incoming,
+        relay_allocator,
+    );
+    tokio::pin!(toward_destination);
+    tokio::pin!(toward_source);
+    tokio::select! {
+        result = &mut toward_destination => match result {
+            Ok(bytes) => Ok((bytes, toward_source.await?)),
+            Err(error) => Err(error),
+        },
+        result = &mut toward_source => match result {
+            Ok(bytes) => Ok((toward_destination.await?, bytes)),
+            Err(error) => Err(error),
+        },
     }
 }
 
@@ -1776,62 +2179,18 @@ pub async fn accept_or_relay_routed_session(
         &acceptance_frame,
     )
     .await?;
-    let (incoming_read, incoming_write) = tokio::io::split(stream.io);
-    let (outgoing_read, outgoing_write) = tokio::io::split(outgoing.io);
-    let toward_destination = copy_routed_relay_direction(
-        incoming_read,
-        RoutedRelayAdjacentEdge::Incoming,
-        outgoing_write,
-        RoutedRelayAdjacentEdge::Outgoing,
-    );
-    let toward_source = copy_routed_relay_direction(
-        outgoing_read,
-        RoutedRelayAdjacentEdge::Outgoing,
-        incoming_write,
-        RoutedRelayAdjacentEdge::Incoming,
-    );
-    tokio::pin!(toward_destination);
-    tokio::pin!(toward_source);
-    let (bytes_toward_destination, bytes_toward_source) = tokio::select! {
-        result = &mut toward_destination => match result {
-            Ok(bytes) => (
-                bytes,
-                toward_source.await.map_err(|error| routed_relay_copy_error(
+    let (bytes_toward_destination, bytes_toward_source) =
+        forward_routed_relay_pair(stream.io, outgoing.io)
+            .await
+            .map_err(|error| {
+                routed_relay_copy_error(
                     error,
                     failure_sink,
                     &relay_node_id,
                     &next_node_id,
                     &endpoint_id,
-                ))?,
-            ),
-            Err(error) => return Err(routed_relay_copy_error(
-                error,
-                failure_sink,
-                &relay_node_id,
-                &next_node_id,
-                &endpoint_id,
-            )),
-        },
-        result = &mut toward_source => match result {
-            Ok(bytes) => (
-                toward_destination.await.map_err(|error| routed_relay_copy_error(
-                    error,
-                    failure_sink,
-                    &relay_node_id,
-                    &next_node_id,
-                    &endpoint_id,
-                ))?,
-                bytes,
-            ),
-            Err(error) => return Err(routed_relay_copy_error(
-                error,
-                failure_sink,
-                &relay_node_id,
-                &next_node_id,
-                &endpoint_id,
-            )),
-        },
-    };
+                )
+            })?;
     Ok(RoutedSessionDisposition::Relayed(RoutedRelayReport {
         session_id: descriptor.session_id.clone(),
         source_node_id: descriptor.source_node_id.clone(),
@@ -2309,8 +2668,206 @@ mod tests {
 
     const TEST_ROUTED_PAYLOAD: &[u8; 32] = b"opaque-multi-hop-payload-1234567";
 
+    #[tokio::test]
+    async fn encrypted_record_keeps_one_complete_maximum_mux_frame() {
+        let (client, mut wire) = tokio::io::duplex(2 * ROUTED_SESSION_DATA_FRAME_BYTES);
+        let session_id = Id::from_legacy_named("session_vectored_record").expect("session id");
+        let binding = [0x29; 32];
+        let shared_secret = [0x31; 32];
+        let encrypted = encrypted_routed_session_chunk_stream(
+            Box::new(client),
+            shared_secret,
+            session_id.clone(),
+            binding,
+            true,
+        )
+        .expect("owned encrypted stream");
+        let (_reader, mut writer) = encrypted.into_halves();
+        let mux_header = [0x53; ROUTED_STREAM_MUX_HEADER_BYTES];
+        let rpc_header = [0x52; RPC_RECORD_HEADER_BYTES];
+        let mux_payload = vec![0x71; BODY_CHUNK_MAX];
+        let mut record = writer
+            .allocator()
+            .allocate_data(BODY_CHUNK_MAX)
+            .await
+            .expect("allocate maximum body chunk");
+        record.writable_payload()[..mux_payload.len()].copy_from_slice(&mux_payload);
+        record
+            .commit_payload(mux_payload.len())
+            .expect("commit maximum body");
+        record.prepend(&rpc_header).expect("prepend RPC header");
+        record.prepend(&mux_header).expect("prepend mux header");
+        assert_eq!(record.len(), ROUTED_SESSION_DATA_FRAME_BYTES);
+        writer.send_chunk(record).await.expect("send secure record");
+
+        let mut header = [0_u8; 16];
+        wire.read_exact(&mut header)
+            .await
+            .expect("read secure header");
+        assert_eq!(&header[..4], &ROUTED_SESSION_DATA_WIRE_PREFIX);
+        assert_eq!(
+            u32::from_be_bytes(header[12..].try_into().expect("length")) as usize,
+            ROUTED_SESSION_DATA_FRAME_BYTES
+        );
+        let mut ciphertext =
+            vec![0_u8; ROUTED_SESSION_DATA_FRAME_BYTES + ring::aead::CHACHA20_POLY1305.tag_len()];
+        wire.read_exact(&mut ciphertext)
+            .await
+            .expect("read secure payload");
+        let aad = routed_session_data_aad(
+            &session_id,
+            &binding,
+            0,
+            0,
+            ROUTED_SESSION_DATA_FRAME_BYTES as u32,
+        );
+        let outgoing_key = routed_session_data_key(&shared_secret, &binding, 0);
+        let key = ring::aead::UnboundKey::new(&ring::aead::CHACHA20_POLY1305, &outgoing_key)
+            .expect("test key");
+        let plaintext = ring::aead::LessSafeKey::new(key)
+            .open_in_place(
+                routed_session_data_nonce(0, 0),
+                ring::aead::Aad::from(aad),
+                &mut ciphertext,
+            )
+            .expect("decrypt record");
+        assert_eq!(&plaintext[..mux_header.len()], &mux_header);
+        assert_eq!(
+            &plaintext[mux_header.len()..mux_header.len() + rpc_header.len()],
+            &rpc_header
+        );
+        assert_eq!(
+            &plaintext[mux_header.len() + rpc_header.len()..],
+            &mux_payload
+        );
+    }
+
     fn node(name: &str) -> NodeId {
         NodeId::from_legacy_named(name).expect("node id")
+    }
+
+    #[tokio::test]
+    async fn portable_relay_forwards_both_directions_with_bounded_owned_buffers() {
+        let (mut source, incoming_relay) = tokio::io::duplex(4096);
+        let (outgoing_relay, mut destination) = tokio::io::duplex(4096);
+        let pool = ChunkPool::new(SECURE_WIRE_MAX * 2, SECURE_WIRE_MAX, 2, 0);
+        let allocator = ChunkAllocator::new(pool, SECURE_WIRE_MAX * 2, SECURE_WIRE_MAX);
+        let metrics = allocator.clone();
+        let relay = tokio::spawn(forward_routed_relay_pair_with_allocator(
+            Box::new(incoming_relay),
+            Box::new(outgoing_relay),
+            allocator,
+        ));
+        let request = vec![0x31; BODY_CHUNK_MAX * 3 + 79];
+        let mut received_request = Vec::new();
+        let (sent, received) = tokio::join!(
+            async {
+                source.write_all(&request).await?;
+                source.shutdown().await
+            },
+            destination.read_to_end(&mut received_request)
+        );
+        sent.expect("write relay request");
+        received.expect("read relayed request");
+        assert_eq!(received_request, request);
+
+        let response = vec![0x73; BODY_CHUNK_MAX * 2 + 113];
+        let mut received_response = Vec::new();
+        let (sent, received) = tokio::join!(
+            async {
+                destination.write_all(&response).await?;
+                destination.shutdown().await
+            },
+            source.read_to_end(&mut received_response)
+        );
+        sent.expect("write relay response");
+        received.expect("read relayed response");
+        assert_eq!(received_response, response);
+        assert_eq!(
+            relay
+                .await
+                .expect("join portable relay")
+                .expect("relay pair"),
+            (request.len() as u64, response.len() as u64)
+        );
+        let metrics = metrics.metrics();
+        assert_eq!(
+            metrics.payload_copy_bytes, 0,
+            "the portable relay must transfer the same pooled slab without a userspace payload copy"
+        );
+        assert_eq!(metrics.active_bytes, 0);
+        assert!(
+            metrics.peak_active_bytes <= SECURE_WIRE_MAX * 2,
+            "the portable relay may retain at most one slab per active direction"
+        );
+        assert!(
+            metrics.allocations <= 2,
+            "the portable relay must reuse its per-direction slabs across the complete transfer"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_tcp_relay_uses_splice_for_full_duplex_transfer() {
+        let incoming_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind incoming relay listener");
+        let outgoing_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind outgoing relay listener");
+        let source = tokio::net::TcpStream::connect(
+            incoming_listener.local_addr().expect("incoming address"),
+        );
+        let destination = tokio::net::TcpStream::connect(
+            outgoing_listener.local_addr().expect("outgoing address"),
+        );
+        let (source, incoming, destination, outgoing) = tokio::join!(
+            source,
+            incoming_listener.accept(),
+            destination,
+            outgoing_listener.accept()
+        );
+        let mut source = source.expect("connect source");
+        let mut destination = destination.expect("connect destination");
+        let (incoming_relay, _) = incoming.expect("accept incoming relay");
+        let (outgoing_relay, _) = outgoing.expect("accept outgoing relay");
+        let relay = tokio::spawn(forward_routed_relay_pair(
+            Box::new(incoming_relay),
+            Box::new(outgoing_relay),
+        ));
+
+        let request = vec![0x41; BODY_CHUNK_MAX * 2 + 37];
+        let mut received_request = Vec::new();
+        let (sent, received) = tokio::join!(
+            async {
+                source.write_all(&request).await?;
+                source.shutdown().await
+            },
+            destination.read_to_end(&mut received_request)
+        );
+        sent.expect("write splice request");
+        received.expect("read spliced request");
+        assert_eq!(received_request, request);
+
+        let response = vec![0x82; BODY_CHUNK_MAX + 101];
+        let mut received_response = Vec::new();
+        let (sent, received) = tokio::join!(
+            async {
+                destination.write_all(&response).await?;
+                destination.shutdown().await
+            },
+            source.read_to_end(&mut received_response)
+        );
+        sent.expect("write splice response");
+        received.expect("read spliced response");
+        assert_eq!(received_response, response);
+        assert_eq!(
+            relay
+                .await
+                .expect("join splice relay")
+                .expect("splice pair"),
+            (request.len() as u64, response.len() as u64)
+        );
     }
 
     fn edge(

@@ -927,64 +927,56 @@ impl Service for ObserveService {
         request: sinomo_core::network::ObjectRpcRequest,
     ) -> ServiceFuture<'_> {
         Box::pin(async move {
-            let response = match request.route.as_str() {
+            match request.route.as_str() {
                 OBSERVE_EVENTS_ROUTE => {
-                    let request: ObserveEventsRequest = request.decode_body()?;
+                    let request: ObserveEventsRequest = ctx.decode_request_body(&request).await?;
                     let records = read_operational_events(ctx.data_dir.root(), &request.into())
                         .map_err(service_error)?;
-                    sinomo_core::network::ObjectRpcResponse::encode_body(
-                        OBSERVE_EVENTS_ROUTE,
-                        &ObserveEventsResponse { records },
-                    )?
+                    ctx.respond_value(OBSERVE_EVENTS_ROUTE, ObserveEventsResponse { records })?;
                 }
                 OBSERVE_LOGS_ROUTE => {
-                    let request: ObserveLogsRequest = request.decode_body()?;
+                    let request: ObserveLogsRequest = ctx.decode_request_body(&request).await?;
                     let records = read_operational_logs(ctx.data_dir.root(), &request.into())
                         .map_err(service_error)?;
-                    sinomo_core::network::ObjectRpcResponse::encode_body(
-                        OBSERVE_LOGS_ROUTE,
-                        &ObserveLogsResponse { records },
-                    )?
+                    ctx.respond_value(OBSERVE_LOGS_ROUTE, ObserveLogsResponse { records })?;
                 }
                 OBSERVE_METRICS_ROUTE => {
-                    let request: ObserveMetricsRequest = request.decode_body()?;
-                    sinomo_core::network::ObjectRpcResponse::encode_body(
+                    let request: ObserveMetricsRequest = ctx.decode_request_body(&request).await?;
+                    ctx.respond_value(
                         OBSERVE_METRICS_ROUTE,
-                        &read_observe_metrics_for_data_dir(ctx.data_dir.as_ref(), &request),
-                    )?
+                        read_observe_metrics_for_data_dir(ctx.data_dir.as_ref(), &request),
+                    )?;
                 }
                 OBSERVE_TRACES_ROUTE => {
-                    let request: ObserveTracesRequest = request.decode_body()?;
-                    sinomo_core::network::ObjectRpcResponse::encode_body(
-                        OBSERVE_TRACES_ROUTE,
-                        &read_observe_traces(&request),
-                    )?
+                    let request: ObserveTracesRequest = ctx.decode_request_body(&request).await?;
+                    ctx.respond_value(OBSERVE_TRACES_ROUTE, read_observe_traces(&request))?;
                 }
                 OBSERVE_CONTROL_ROUTE => {
-                    let request: ObserveControlRequest = request.decode_body()?;
-                    sinomo_core::network::ObjectRpcResponse::encode_body(
+                    let request: ObserveControlRequest = ctx.decode_request_body(&request).await?;
+                    ctx.respond_value(
                         OBSERVE_CONTROL_ROUTE,
-                        &update_observe_control(request).map_err(service_error)?,
-                    )?
+                        update_observe_control(request).map_err(service_error)?,
+                    )?;
                 }
                 OBSERVE_CPU_PROFILE_ROUTE => {
-                    let request: ObserveCpuProfileRequest = request.decode_body()?;
-                    sinomo_core::network::ObjectRpcResponse::encode_body(
+                    let request: ObserveCpuProfileRequest =
+                        ctx.decode_request_body(&request).await?;
+                    ctx.respond_value(
                         OBSERVE_CPU_PROFILE_ROUTE,
-                        &handle_observe_cpu_profile(ctx.data_dir.root(), request)
+                        handle_observe_cpu_profile(ctx.data_dir.root(), request)
                             .map_err(service_error)?,
-                    )?
+                    )?;
                 }
                 OBSERVE_NETWORK_TIMELINE_ROUTE => {
-                    let request: ObserveNetworkTimelineRequest = request.decode_body()?;
-                    sinomo_core::network::ObjectRpcResponse::encode_body(
+                    let request: ObserveNetworkTimelineRequest =
+                        ctx.decode_request_body(&request).await?;
+                    ctx.respond_value(
                         OBSERVE_NETWORK_TIMELINE_ROUTE,
-                        &handle_observe_network_timeline(request).map_err(service_error)?,
-                    )?
+                        handle_observe_network_timeline(request).map_err(service_error)?,
+                    )?;
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
-            };
-            ctx.respond(response)?;
+            }
             Ok(ServiceDisposition::Continue)
         })
     }

@@ -46,6 +46,7 @@ pub(crate) fn encode_dfs_attachment_message_rpc_request(
     Ok(head)
 }
 
+#[cfg(test)]
 pub(crate) fn decode_dfs_attachment_message_rpc_request(
     request: &ObjectRpcRequest,
 ) -> Result<DfsAttachmentMessageCommand, NetworkError> {

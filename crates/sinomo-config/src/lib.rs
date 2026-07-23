@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sinomo_core::kv::{KvEntry, KvOp, KvRequestId, KvTxn, KvTxnRequest};
 use sinomo_core::local::SinomoDataDir;
-use sinomo_core::network::{ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_core::network::ObjectRpcRequest;
 use sinomo_core::service::{
     ClusterAccess, Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
     ServiceRegistryBuilder, ServiceRoute,
@@ -915,10 +915,13 @@ impl Service for ConfigService {
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         let store = Arc::clone(&self.store);
         Box::pin(async move {
-            let cluster = ctx.cluster.as_deref();
-            let response = match request.route.as_str() {
+            // Incremental request decoding mutably consumes the streamed
+            // request value. Keep an owned handle instead of borrowing it
+            // through `ctx` across that decode.
+            let cluster = ctx.cluster.clone();
+            match request.route.as_str() {
                 CONFIG_CATALOG_ROUTE => {
-                    let request: ConfigCatalogRequest = request.decode_body()?;
+                    let request: ConfigCatalogRequest = ctx.decode_request_body(&request).await?;
                     let definitions = store
                         .registry()
                         .definitions()
@@ -930,46 +933,36 @@ impl Service for ConfigService {
                         })
                         .cloned()
                         .collect();
-                    ObjectRpcResponse::encode_body(
-                        CONFIG_CATALOG_ROUTE,
-                        &ConfigCatalogResponse { definitions },
-                    )?
+                    ctx.respond_value(CONFIG_CATALOG_ROUTE, ConfigCatalogResponse { definitions })?;
                 }
                 CONFIG_SEARCH_ROUTE => {
-                    let request: ConfigSearchRequest = request.decode_body()?;
+                    let request: ConfigSearchRequest = ctx.decode_request_body(&request).await?;
                     let definitions = store.registry().search(&request.query);
-                    ObjectRpcResponse::encode_body(
-                        CONFIG_SEARCH_ROUTE,
-                        &ConfigSearchResponse { definitions },
-                    )?
+                    ctx.respond_value(CONFIG_SEARCH_ROUTE, ConfigSearchResponse { definitions })?;
                 }
                 CONFIG_GET_ROUTE => {
-                    let request: ConfigGetRequest = request.decode_body()?;
+                    let request: ConfigGetRequest = ctx.decode_request_body(&request).await?;
                     let resolution = store
-                        .get_async(&ctx.data_dir, cluster, &request.key)
+                        .get_async(&ctx.data_dir, cluster.as_deref(), &request.key)
                         .await?;
-                    ObjectRpcResponse::encode_body(
-                        CONFIG_GET_ROUTE,
-                        &ConfigGetResponse { resolution },
-                    )?
+                    ctx.respond_value(CONFIG_GET_ROUTE, ConfigGetResponse { resolution })?;
                 }
                 CONFIG_SET_ROUTE => {
-                    let request: ConfigSetRequest = request.decode_body()?;
+                    let request: ConfigSetRequest = ctx.decode_request_body(&request).await?;
                     let result = store
                         .set_async_with_request_id(
                             &ctx.data_dir,
-                            cluster,
+                            cluster.as_deref(),
                             &request.key,
                             request.value,
                             request.target,
                             request.request_id,
                         )
                         .await?;
-                    ObjectRpcResponse::encode_body(CONFIG_SET_ROUTE, &ConfigSetResponse { result })?
+                    ctx.respond_value(CONFIG_SET_ROUTE, ConfigSetResponse { result })?;
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
-            };
-            ctx.respond(response)?;
+            }
             Ok(ServiceDisposition::Continue)
         })
     }

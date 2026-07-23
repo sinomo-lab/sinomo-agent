@@ -1408,21 +1408,19 @@ fn run_remote_get(
         })?;
     let request = RemoteManagementFileReadRequest::new(options.remote_path.clone());
     request.validate().map_err(command_error)?;
-    let head = ObjectRpcRequest::encode_body(
+    let call = ObjectRpcCall::encode_value(
         REMOTE_MANAGEMENT_FS_READ_ROUTE,
         REMOTE_MANAGEMENT_RPC_CATEGORY,
-        &request,
+        request,
     )
     .map_err(command_error)?;
     let target = options.common.target.clone();
     let remote_path = options.remote_path.clone();
     let transfer_path = temp_path.path().to_path_buf();
     let (expected_len, expected_hash, actual_hash) = run_remote_session(async {
-        let result = rpc(target, ObjectRpcCall::value(head))
-            .await
-            .map_err(|error| {
-                format!("remote RPC {REMOTE_MANAGEMENT_FS_READ_ROUTE} failed: {error}")
-            })?;
+        let result = rpc(target, call).await.map_err(|error| {
+            format!("remote RPC {REMOTE_MANAGEMENT_FS_READ_ROUTE} failed: {error}")
+        })?;
         let (response, mut body) = result.into_parts();
         validate_response_route(&response, REMOTE_MANAGEMENT_FS_READ_ROUTE)?;
         let response: RemoteManagementFileReadResponse =
@@ -1547,13 +1545,9 @@ fn run_remote_put(
             .map_err(|error| {
                 format!("remote RPC {REMOTE_MANAGEMENT_FS_WRITE_ROUTE} failed: {error}")
             })?;
-        let (response, response_body) = result.into_parts();
-        validate_response_route(&response, REMOTE_MANAGEMENT_FS_WRITE_ROUTE)?;
-        if !response_body.is_empty() {
-            return Err("remote file write unexpectedly returned an attachment".to_string());
-        }
+        validate_response_route(&result.response, REMOTE_MANAGEMENT_FS_WRITE_ROUTE)?;
         let response: RemoteManagementFileWriteResponse =
-            response.decode_body().map_err(|error| {
+            result.decode_body().await.map_err(|error| {
                 format!("failed to decode {REMOTE_MANAGEMENT_FS_WRITE_ROUTE} response: {error}")
             })?;
         let written = response.into_result().map_err(|error| error.to_string())?;
@@ -1746,25 +1740,20 @@ fn remote_rpc<Req, Resp>(
 ) -> Result<Resp, CliCommandError>
 where
     Req: Serialize + ?Sized,
-    Resp: DeserializeOwned + Send,
+    Resp: DeserializeOwned + Send + 'static,
 {
-    let head = ObjectRpcRequest::encode_body(route, category, request).map_err(|error| {
+    let call = ObjectRpcCall::encode_borrowed_value(route, category, request).map_err(|error| {
         CliCommandError::new(format!("failed to encode {route} request: {error}"))
     })?;
     let target = target.map(str::to_string);
     run_remote_session(async {
-        let result = rpc(target, ObjectRpcCall::value(head))
+        let result = rpc(target, call)
             .await
             .map_err(|error| format!("remote RPC {route} failed: {error}"))?;
-        let (response, body) = result.into_parts();
-        validate_response_route(&response, route)?;
-        if !body.is_empty() {
-            return Err(format!(
-                "remote RPC {route} unexpectedly returned an attachment"
-            ));
-        }
-        response
+        validate_response_route(&result.response, route)?;
+        result
             .decode_body()
+            .await
             .map_err(|error| format!("failed to decode {route} response: {error}"))
     })
 }
@@ -1960,7 +1949,9 @@ fn command_error(error: impl fmt::Display) -> CliCommandError {
 mod tests {
     use super::*;
     use sinomo_config::{ConfigKey, ConfigValueSource};
-    use sinomo_core::network::{ObjectRpcIncomingBody, ObjectRpcResponse};
+    use sinomo_core::network::{
+        ObjectRpcBodySource, ObjectRpcIncomingBody, ObjectRpcResponse, SinomoObjectCodec,
+    };
     use std::sync::Mutex;
 
     fn strings(values: &[&str]) -> Vec<String> {
@@ -1999,6 +1990,24 @@ mod tests {
         }
     }
 
+    async fn decode_test_call_value<T>(body: ObjectRpcBodySource) -> Result<T, String>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let total_bytes = body
+            .total_bytes()
+            .ok_or_else(|| "test value body did not declare a length".to_string())?;
+        let max_bytes = usize::try_from(total_bytes)
+            .map_err(|_| "test value body does not fit this host".to_string())?;
+        let encoded = body
+            .collect_to_vec(max_bytes)
+            .await
+            .map_err(|error| error.to_string())?;
+        SinomoObjectCodec::network_frame()
+            .decode(&encoded)
+            .map_err(|error| error.to_string())
+    }
+
     #[test]
     fn remote_handler_forwards_target_and_bounds_one_shot_shell() {
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -2006,21 +2015,25 @@ mod tests {
         let handler = remote_cli_command_handler(move |target, call| {
             let seen = Arc::clone(&seen_for_rpc);
             async move {
-                let request = call.request;
+                let ObjectRpcCall { request, body } = call;
                 seen.lock().expect("seen").push((
                     target,
                     request.route.clone(),
                     request.category.clone(),
                 ));
                 let response = match request.route.as_str() {
-                    REMOTE_MANAGEMENT_SYSTEM_INFO_ROUTE => ObjectRpcResponse::encode_body(
-                        REMOTE_MANAGEMENT_SYSTEM_INFO_ROUTE,
-                        &RemoteManagementSystemInfoResponse::success(system_info()),
-                    )
-                    .map_err(|error| error.to_string())?,
+                    REMOTE_MANAGEMENT_SYSTEM_INFO_ROUTE => {
+                        let _: RemoteManagementSystemInfoRequest =
+                            decode_test_call_value(body).await?;
+                        ObjectRpcResponse::encode_body(
+                            REMOTE_MANAGEMENT_SYSTEM_INFO_ROUTE,
+                            &RemoteManagementSystemInfoResponse::success(system_info()),
+                        )
+                        .map_err(|error| error.to_string())?
+                    }
                     REMOTE_MANAGEMENT_SHELL_RUN_ROUTE => {
                         let request: RemoteManagementShellRunRequest =
-                            request.decode_body().map_err(|error| error.to_string())?;
+                            decode_test_call_value(body).await?;
                         assert_eq!(request.command, "echo ok");
                         assert_eq!(request.timeout_ms, Some(MAX_COMMAND_TIMEOUT_MS));
                         assert_eq!(request.max_output_bytes, Some(MAX_SHELL_CAPTURE_BYTES));
@@ -2095,10 +2108,8 @@ mod tests {
         let handler = remote_cli_command_handler(|target, call| async move {
             assert_eq!(target.as_deref(), Some("node-observe"));
             assert_eq!(call.request.route, REMOTE_MANAGEMENT_SYSTEM_OBSERVE_ROUTE);
-            let request: RemoteManagementSystemObserveRequest = call
-                .request
-                .decode_body()
-                .map_err(|error| error.to_string())?;
+            let request: RemoteManagementSystemObserveRequest =
+                decode_test_call_value(call.body).await?;
             assert!(request.include_devices);
             assert!(request.include_resource_exposures);
             let response = ObjectRpcResponse::encode_body(
@@ -2152,18 +2163,18 @@ mod tests {
         let handler = remote_cli_command_handler(move |target, call| {
             let seen = Arc::clone(&seen_for_rpc);
             async move {
-                let request = call.request;
+                let ObjectRpcCall { request, body } = call;
                 assert_eq!(request.route, CONFIG_SET_ROUTE);
                 assert_eq!(request.category, CONFIG_RPC_CATEGORY);
-                let body: ConfigSetRequest =
-                    request.decode_body().map_err(|error| error.to_string())?;
-                *seen.lock().expect("seen") = Some((target, body.clone()));
+                let request_body: ConfigSetRequest = decode_test_call_value(body).await?;
+                *seen.lock().expect("seen") = Some((target, request_body.clone()));
                 let response = ObjectRpcResponse::encode_body(
                     CONFIG_SET_ROUTE,
                     &ConfigSetResponse {
                         result: ConfigWriteResult {
-                            key: ConfigKey::new(body.key).map_err(|error| error.to_string())?,
-                            value: body.value,
+                            key: ConfigKey::new(request_body.key)
+                                .map_err(|error| error.to_string())?,
+                            value: request_body.value,
                             source: ConfigValueSource::Local,
                         },
                     },
@@ -2211,18 +2222,17 @@ mod tests {
         move |_target, call| {
             let state = Arc::clone(&state);
             Box::pin(async move {
-                let request = call.request;
+                let ObjectRpcCall { request, body } = call;
                 match request.route.as_str() {
                     REMOTE_MANAGEMENT_FS_WRITE_ROUTE => {
                         let write: RemoteManagementFileWriteRequest =
                             request.decode_body().map_err(|error| error.to_string())?;
-                        let declared_length = call.body.total_bytes().ok_or_else(|| {
+                        let declared_length = body.total_bytes().ok_or_else(|| {
                             "test upload body did not declare a length".to_string()
                         })?;
                         let collect_bytes = usize::try_from(declared_length)
                             .map_err(|_| "test upload body does not fit this host".to_string())?;
-                        let uploaded = call
-                            .body
+                        let uploaded = body
                             .collect_to_vec(collect_bytes)
                             .await
                             .map_err(|error| error.to_string())?;
@@ -2251,8 +2261,7 @@ mod tests {
                     }
                     REMOTE_MANAGEMENT_FS_READ_ROUTE => {
                         let read: RemoteManagementFileReadRequest =
-                            request.decode_body().map_err(|error| error.to_string())?;
-                        assert!(call.body.is_empty());
+                            decode_test_call_value(body).await?;
                         let mut state = state.lock().expect("transfer state");
                         state.read_calls += 1;
                         let bytes = state.remote.clone();

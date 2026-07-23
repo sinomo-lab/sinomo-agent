@@ -34,6 +34,8 @@ pub mod network_module_abi;
 mod object;
 mod object_file_store;
 mod object_rpc_stream;
+mod owned_chunk;
+mod owned_mux;
 mod path_metrics;
 mod paths;
 mod peer;
@@ -52,6 +54,8 @@ mod timeline;
 // assemble protocol frames themselves.
 #[cfg(test)]
 mod layer_boundary_tests;
+#[cfg(test)]
+mod owned_path_tests;
 mod policy;
 
 pub use builtin_link::{
@@ -121,7 +125,7 @@ pub use connectivity_store::{
 pub use daemon_auth::{
     DAEMON_AUTH_PROTOCOL, SignedDaemonCommand, cached_daemon_signing_public_key,
     daemon_auth_decode_public_key, daemon_auth_encode_public_key, daemon_auth_signing_payload,
-    daemon_rpc_body_sha256, invalidate_cached_daemon_signing_identity,
+    daemon_rpc_body_sha256, daemon_rpc_call_sha256, invalidate_cached_daemon_signing_identity,
     sign_daemon_rpc_request_digest_for_local_node, sign_daemon_rpc_request_digest_from_data_dir,
     sign_daemon_rpc_request_for_local_node, sign_daemon_rpc_request_from_data_dir,
     try_sign_daemon_rpc_request_digest_from_cached_data_dir,
@@ -239,9 +243,13 @@ pub use route_graph_read_model::{
 };
 pub use routed_identity::DaemonRoutedSessionIdentity;
 pub use routed_stream_pool::{
-    RoutedStreamAcceptor, RoutedStreamIncoming, accept_pooled_routed_stream_carrier,
-    accept_routed_stream_carrier, open_pooled_routed_stream, pooled_routed_relationship_is_active,
-    register_routed_stream_incoming, retire_pooled_routed_streams,
+    RoutedStreamAcceptor, RoutedStreamIncoming, accept_local_object_rpc_stream_carrier,
+    accept_pooled_routed_stream_carrier, accept_routed_stream_carrier,
+    local_object_rpc_carrier_prelude_prefix_matches, open_pooled_local_object_rpc_stream,
+    open_pooled_routed_stream, pooled_routed_relationship_is_active,
+    read_local_object_rpc_carrier_prelude, register_routed_stream_incoming,
+    retire_pooled_routed_streams, serve_local_object_rpc_stream_carrier,
+    serve_routed_stream_carrier, write_local_object_rpc_carrier_prelude,
 };
 pub use routing::{
     CandidatePath, ConnectOptions, DirectRoutedConnector, MAX_ROUTE_CANDIDATES,
@@ -264,10 +272,8 @@ pub use object::{
 };
 pub use object::{decode_single_object_frame_from_slice, encode_object_frame_to_vec};
 pub use object::{read_object_frame_async, read_object_frame_async_with_max_bytes};
-pub use object_rpc_stream::{
-    RpcPeerContext, RpcPeerIdentity, local_object_rpc_stream_prelude_prefix_matches,
-    read_local_object_rpc_stream_prelude,
-};
+pub use object_rpc_stream::{RpcPeerContext, RpcPeerIdentity};
+pub use owned_chunk::{NetworkChunkMetrics, network_chunk_metrics};
 pub use paths::ClusterPaths;
 pub use peer::{
     AsyncInProcessNetwork, AsyncInProcessTransport, AsyncNetworkSendOptions, InProcessNetwork,
@@ -289,11 +295,11 @@ pub use rpc::{
     ObjectRpcRequest, ObjectRpcResponse,
 };
 pub use rpc_body::{
-    ObjectRpcBodySource, ObjectRpcCall, ObjectRpcIncomingBody, ObjectRpcIncomingRequest,
-    ObjectRpcOutgoingResponse, ObjectRpcResult,
+    ObjectRpcBodyChunk, ObjectRpcBodySource, ObjectRpcCall, ObjectRpcIncomingBody,
+    ObjectRpcIncomingRequest, ObjectRpcOutgoingResponse, ObjectRpcResult,
 };
 pub use rpc_future::ClusterMembershipRpcFuture;
-pub use service_rpc_stream::serve_service_rpc_stream;
+pub use service_rpc_stream::{serve_service_rpc_peer_stream, serve_service_rpc_stream};
 #[cfg(any(test, feature = "test-support"))]
 pub use sinomo_node::upsert_member_record;
 pub use timeline::{

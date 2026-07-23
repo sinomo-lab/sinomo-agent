@@ -184,7 +184,28 @@ pub fn authenticate_daemon_control_request(
     paths: &DaemonPaths,
     request: &sinomo_core::network::DaemonControlRequest,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
-    authenticate_daemon_control_request_inner(paths, request, true, true)
+    authenticate_daemon_control_request_inner(paths, request, None, true, true)
+}
+
+/// Authenticates a stream-native local request using the request digest
+/// preserved in its authenticated service head.
+///
+/// The typed value has moved out of `request.body` by this point, so
+/// recomputing the binding from the now-empty head would reject every valid
+/// streamed request. The signed envelope still commits to this digest, and
+/// object RPC independently authenticates the streamed bytes.
+pub(crate) fn authenticate_daemon_control_request_with_digest(
+    paths: &DaemonPaths,
+    request: &sinomo_core::network::DaemonControlRequest,
+    request_digest_sha256: &[u8; 32],
+) -> Result<AuthenticatedDaemonCommand, DaemonError> {
+    authenticate_daemon_control_request_inner(
+        paths,
+        request,
+        Some(request_digest_sha256),
+        true,
+        true,
+    )
 }
 
 /// Authenticates the signed request and its signer without applying the static
@@ -197,14 +218,28 @@ pub(crate) fn authenticate_daemon_control_request_without_route_authorization(
     paths: &DaemonPaths,
     request: &sinomo_core::network::DaemonControlRequest,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
-    authenticate_daemon_control_request_inner(paths, request, true, false)
+    authenticate_daemon_control_request_inner(paths, request, None, true, false)
+}
+
+pub(crate) fn authenticate_daemon_control_request_without_route_authorization_with_digest(
+    paths: &DaemonPaths,
+    request: &sinomo_core::network::DaemonControlRequest,
+    request_digest_sha256: &[u8; 32],
+) -> Result<AuthenticatedDaemonCommand, DaemonError> {
+    authenticate_daemon_control_request_inner(
+        paths,
+        request,
+        Some(request_digest_sha256),
+        true,
+        false,
+    )
 }
 
 pub(crate) fn authenticate_daemon_control_request_without_nonce(
     paths: &DaemonPaths,
     request: &sinomo_core::network::DaemonControlRequest,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
-    authenticate_daemon_control_request_inner(paths, request, false, true)
+    authenticate_daemon_control_request_inner(paths, request, None, false, true)
 }
 
 /// Verifies an origin-signed request whose exact cluster identity was already
@@ -221,17 +256,116 @@ pub(crate) fn authenticate_verified_cluster_peer_request(
     is_raft_voter: bool,
     authorize_route: bool,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
+    authenticate_verified_cluster_peer_request_inner(
+        paths,
+        request,
+        None,
+        expected_node_id,
+        expected_public_key,
+        is_raft_voter,
+        authorize_route,
+    )
+}
+
+/// Authenticates a stream-native request using the complete request digest
+/// preserved in its end-to-end authenticated service head.
+pub(crate) fn authenticate_verified_cluster_peer_request_with_digest(
+    paths: &DaemonPaths,
+    request: &sinomo_core::network::DaemonControlRequest,
+    request_digest_sha256: &[u8; 32],
+    expected_node_id: &str,
+    expected_public_key: &str,
+    is_raft_voter: bool,
+    authorize_route: bool,
+) -> Result<AuthenticatedDaemonCommand, DaemonError> {
+    authenticate_verified_cluster_peer_request_inner(
+        paths,
+        request,
+        Some(request_digest_sha256),
+        expected_node_id,
+        expected_public_key,
+        is_raft_voter,
+        authorize_route,
+    )
+}
+
+fn authenticate_verified_cluster_peer_request_inner(
+    paths: &DaemonPaths,
+    request: &sinomo_core::network::DaemonControlRequest,
+    request_digest_sha256: Option<&[u8; 32]>,
+    expected_node_id: &str,
+    expected_public_key: &str,
+    is_raft_voter: bool,
+    authorize_route: bool,
+) -> Result<AuthenticatedDaemonCommand, DaemonError> {
+    let timeline = sinomo_core::network::network_timeline_trace_context_for_request(request);
     let auth = request.auth.as_deref().ok_or(DaemonError::AuthDenied)?;
-    let envelope: SignedDaemonCommand =
-        sinomo_core::network::SinomoObjectCodec::default().decode(auth)?;
-    verify_daemon_rpc_body_binding(&envelope, request)?;
-    verify_signed_daemon_command_signature(&envelope, request)?;
+    let decode_started_ns = auth_timeline_started_ns(timeline);
+    let envelope_result = sinomo_core::network::SinomoObjectCodec::default()
+        .decode(auth)
+        .map_err(DaemonError::from);
+    record_auth_timeline_stage(
+        timeline,
+        sinomo_core::network::network_timeline_stage::AUTH_ENVELOPE_DECODE,
+        decode_started_ns,
+        envelope_result.is_ok(),
+    );
+    let envelope: SignedDaemonCommand = envelope_result?;
+
+    let binding_started_ns = auth_timeline_started_ns(timeline);
+    let binding_result = if let Some(actual) = request_digest_sha256 {
+        envelope
+            .rpc_body_sha256
+            .as_deref()
+            .filter(|expected| *expected == actual)
+            .map(|_| ())
+            .ok_or(DaemonError::AuthDenied)
+    } else {
+        verify_daemon_rpc_body_binding(&envelope, request)
+    };
+    record_auth_timeline_stage(
+        timeline,
+        sinomo_core::network::network_timeline_stage::AUTH_BODY_BINDING,
+        binding_started_ns,
+        binding_result.is_ok(),
+    );
+    binding_result?;
+
+    let signature_started_ns = auth_timeline_started_ns(timeline);
+    let signature_result = verify_signed_daemon_command_signature(&envelope, request);
+    record_auth_timeline_stage(
+        timeline,
+        sinomo_core::network::network_timeline_stage::AUTH_SIGNATURE_VERIFY,
+        signature_started_ns,
+        signature_result.is_ok(),
+    );
+    signature_result?;
+
+    let peer_binding_started_ns = auth_timeline_started_ns(timeline);
     let signer_public_key =
         sinomo_core::network::daemon_auth_encode_public_key(&envelope.public_key);
-    if envelope.node_id != expected_node_id || signer_public_key != expected_public_key {
-        return Err(DaemonError::AuthDenied);
-    }
-    remember_daemon_auth_nonce(paths, &envelope)?;
+    let peer_binding_result = (envelope.node_id == expected_node_id
+        && signer_public_key == expected_public_key)
+        .then_some(())
+        .ok_or(DaemonError::AuthDenied);
+    record_auth_timeline_stage(
+        timeline,
+        sinomo_core::network::network_timeline_stage::AUTH_PEER_BINDING,
+        peer_binding_started_ns,
+        peer_binding_result.is_ok(),
+    );
+    peer_binding_result?;
+
+    let nonce_started_ns = auth_timeline_started_ns(timeline);
+    let nonce_result = remember_daemon_auth_nonce(paths, &envelope);
+    record_auth_timeline_stage(
+        timeline,
+        sinomo_core::network::network_timeline_stage::AUTH_NONCE,
+        nonce_started_ns,
+        nonce_result.is_ok(),
+    );
+    nonce_result?;
+
     let authenticated = AuthenticatedDaemonCommand {
         route: request.route.clone(),
         signer: if is_raft_voter {
@@ -242,22 +376,82 @@ pub(crate) fn authenticate_verified_cluster_peer_request(
         signer_node_id: envelope.node_id,
         signer_public_key,
     };
-    if authorize_route {
-        authorize_authenticated_daemon_command_at_node(paths, &authenticated)?;
-    }
+    let route_started_ns = auth_timeline_started_ns(timeline);
+    let route_result = if authorize_route {
+        authorize_authenticated_daemon_command_at_node(paths, &authenticated)
+    } else {
+        Ok(())
+    };
+    record_auth_timeline_stage(
+        timeline,
+        sinomo_core::network::network_timeline_stage::AUTH_ROUTE_POLICY,
+        route_started_ns,
+        route_result.is_ok(),
+    );
+    route_result?;
     Ok(authenticated)
+}
+
+#[inline]
+fn auth_timeline_started_ns(
+    timeline: Option<sinomo_core::network::NetworkTimelineTraceContext>,
+) -> u64 {
+    timeline
+        .map(|_| sinomo_core::network::network_timeline_monotonic_ns())
+        .unwrap_or(0)
+}
+
+#[inline]
+fn record_auth_timeline_stage(
+    timeline: Option<sinomo_core::network::NetworkTimelineTraceContext>,
+    stage: u16,
+    started_ns: u64,
+    success: bool,
+) {
+    let Some(trace) = timeline else {
+        return;
+    };
+    sinomo_core::network::record_network_timeline_event_now(
+        sinomo_core::network::NetworkTimelineEvent::new(
+            trace,
+            stage,
+            sinomo_core::network::network_timeline_flag::REQUEST
+                | if success {
+                    sinomo_core::network::network_timeline_flag::SUCCESS
+                } else {
+                    0
+                },
+            0,
+            0,
+            0,
+            0,
+            0,
+            sinomo_core::network::network_timeline_monotonic_ns().saturating_sub(started_ns),
+        ),
+    );
 }
 
 fn authenticate_daemon_control_request_inner(
     paths: &DaemonPaths,
     request: &sinomo_core::network::DaemonControlRequest,
+    request_digest_sha256: Option<&[u8; 32]>,
     remember_nonce: bool,
     authorize_route: bool,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
     let auth = request.auth.as_deref().ok_or(DaemonError::AuthDenied)?;
     let envelope: SignedDaemonCommand =
         sinomo_core::network::SinomoObjectCodec::default().decode(auth)?;
-    verify_daemon_rpc_body_binding(&envelope, request)?;
+    if let Some(actual) = request_digest_sha256 {
+        let expected = envelope
+            .rpc_body_sha256
+            .as_deref()
+            .ok_or(DaemonError::AuthDenied)?;
+        if expected != actual {
+            return Err(DaemonError::AuthDenied);
+        }
+    } else {
+        verify_daemon_rpc_body_binding(&envelope, request)?;
+    }
     let signer = verify_signed_daemon_command(paths, &envelope, request)?;
     if remember_nonce {
         remember_daemon_auth_nonce(paths, &envelope)?;
@@ -380,6 +574,7 @@ pub fn authorize_authenticated_daemon_command(
             if route == crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE
                 || route == crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE
                 || route == crate::DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE
+                || route == crate::DAEMON_NETWORK_CHUNK_METRICS_ROUTE
                 || route == crate::DAEMON_EVENT_SUBSCRIBE_ROUTE =>
         {
             authenticated.signer.can_run_local_command()
@@ -620,19 +815,33 @@ fn verify_signed_daemon_command_signature(
     envelope: &SignedDaemonCommand,
     request: &sinomo_core::network::ObjectRpcRequest,
 ) -> Result<(), DaemonError> {
+    let timeline = sinomo_core::network::network_timeline_trace_context_for_request(request);
     if envelope.protocol != DAEMON_AUTH_PROTOCOL {
         return Err(DaemonError::AuthDenied);
     }
-    let signed_at = OffsetDateTime::parse(&envelope.timestamp, &Rfc3339)
-        .map_err(|_| DaemonError::AuthDenied)?;
-    let now = OffsetDateTime::now_utc();
-    let skew = (now - signed_at).whole_seconds().abs();
-    if skew > DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS {
-        return Err(DaemonError::AuthExpired);
-    }
-    if envelope.nonce.trim().is_empty() || request.route.trim().is_empty() {
-        return Err(DaemonError::AuthDenied);
-    }
+    let timestamp_started_ns = auth_timeline_started_ns(timeline);
+    let timestamp_result = (|| {
+        let signed_at = OffsetDateTime::parse(&envelope.timestamp, &Rfc3339)
+            .map_err(|_| DaemonError::AuthDenied)?;
+        let now = OffsetDateTime::now_utc();
+        let skew = (now - signed_at).whole_seconds().abs();
+        if skew > DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS {
+            return Err(DaemonError::AuthExpired);
+        }
+        if envelope.nonce.trim().is_empty() || request.route.trim().is_empty() {
+            return Err(DaemonError::AuthDenied);
+        }
+        Ok(())
+    })();
+    record_auth_timeline_stage(
+        timeline,
+        sinomo_core::network::network_timeline_stage::AUTH_TIMESTAMP,
+        timestamp_started_ns,
+        timestamp_result.is_ok(),
+    );
+    timestamp_result?;
+
+    let payload_started_ns = auth_timeline_started_ns(timeline);
     let signing_payload = sinomo_core::network::daemon_auth_signing_payload(
         &envelope.node_id,
         &envelope.public_key,
@@ -642,10 +851,24 @@ fn verify_signed_daemon_command_signature(
         &request.category,
         envelope.rpc_body_sha256.as_deref(),
     );
-    UnparsedPublicKey::new(&ED25519, &envelope.public_key)
+    record_auth_timeline_stage(
+        timeline,
+        sinomo_core::network::network_timeline_stage::AUTH_SIGNING_PAYLOAD,
+        payload_started_ns,
+        true,
+    );
+
+    let verify_started_ns = auth_timeline_started_ns(timeline);
+    let verify_result = UnparsedPublicKey::new(&ED25519, &envelope.public_key)
         .verify(&signing_payload, &envelope.signature)
-        .map_err(|_| DaemonError::AuthDenied)?;
-    Ok(())
+        .map_err(|_| DaemonError::AuthDenied);
+    record_auth_timeline_stage(
+        timeline,
+        sinomo_core::network::network_timeline_stage::AUTH_ED25519,
+        verify_started_ns,
+        verify_result.is_ok(),
+    );
+    verify_result
 }
 
 fn authorize_daemon_signer(
@@ -1417,6 +1640,55 @@ mod tests {
             ),
             Err(DaemonError::AuthDenied)
         ));
+
+        let mut streamed_request = sinomo_core::network::ObjectRpcRequest::encode_body(
+            sinomo_dfs::DFS_STATUS_ROUTE,
+            sinomo_dfs::DFS_RPC_CATEGORY,
+            &"stream-native-value",
+        )
+        .expect("streamed routed request");
+        let streamed_digest: [u8; 32] = daemon_rpc_body_sha256(&streamed_request)
+            .try_into()
+            .expect("request digest");
+        streamed_request.auth = Some(
+            sign_daemon_rpc_request_from_data_dir(&data_dir, &streamed_request)
+                .expect("sign streamed routed request"),
+        );
+        let streamed_envelope: SignedDaemonCommand =
+            sinomo_core::network::SinomoObjectCodec::default()
+                .decode(
+                    streamed_request
+                        .auth
+                        .as_deref()
+                        .expect("streamed request auth"),
+                )
+                .expect("decode streamed routed auth");
+        let streamed_public_key =
+            sinomo_core::network::daemon_auth_encode_public_key(&streamed_envelope.public_key);
+        streamed_request.body.clear();
+        assert!(matches!(
+            authenticate_verified_cluster_peer_request_with_digest(
+                &paths,
+                &streamed_request,
+                &[0x55; 32],
+                &streamed_envelope.node_id,
+                &streamed_public_key,
+                false,
+                true,
+            ),
+            Err(DaemonError::AuthDenied)
+        ));
+        let authenticated = authenticate_verified_cluster_peer_request_with_digest(
+            &paths,
+            &streamed_request,
+            &streamed_digest,
+            &streamed_envelope.node_id,
+            &streamed_public_key,
+            false,
+            true,
+        )
+        .expect("authenticated streamed request digest");
+        assert_eq!(authenticated.signer, DaemonSignerAuthority::Member);
     }
 
     #[test]
@@ -2440,6 +2712,7 @@ mod tests {
             crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE,
             crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
             crate::DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
+            crate::DAEMON_NETWORK_CHUNK_METRICS_ROUTE,
         ] {
             authorize_authenticated_daemon_command(&authenticated_command(
                 route.to_string(),

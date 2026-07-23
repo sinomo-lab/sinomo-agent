@@ -7,8 +7,8 @@
 
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
-    NetworkError, ObjectRpcBodySource, ObjectRpcIncomingBody, ObjectRpcRequest, ObjectRpcResponse,
-    ObjectRpcResult,
+    NetworkError, ObjectRpcBodySource, ObjectRpcCall, ObjectRpcIncomingBody, ObjectRpcRequest,
+    ObjectRpcResponse, ObjectRpcResult,
 };
 
 use crate::DfsError;
@@ -108,6 +108,15 @@ pub fn dfs_direct_read_rpc_request(
     Ok(rpc_request.with_response_retry_safe())
 }
 
+pub fn dfs_direct_read_rpc_call(
+    request: &DfsDirectReadRequest,
+) -> Result<ObjectRpcCall, NetworkError> {
+    let mut call =
+        ObjectRpcCall::encode_borrowed_value(DFS_DIRECT_READ_ROUTE, DFS_RPC_CATEGORY, request)?;
+    call.request = call.request.with_response_retry_safe();
+    Ok(call)
+}
+
 pub(crate) fn dfs_direct_read_request_from_read_request(
     request: &DfsReadRequest,
 ) -> Option<DfsDirectReadRequest> {
@@ -134,11 +143,10 @@ pub fn handle_dfs_direct_read_rpc_request(
     serve_dfs_direct_read_request(&content, request)
 }
 
-pub(crate) fn handle_dfs_direct_read_rpc_request_with_initialized_content_store(
+pub(crate) fn handle_dfs_direct_read_request_with_initialized_content_store(
     content: &LocalContentStore,
-    request: ObjectRpcRequest,
+    request: DfsDirectReadRequest,
 ) -> Result<DfsDirectReadAttachmentResponse, DfsError> {
-    let request = decode_dfs_direct_read_rpc_request(request)?;
     serve_dfs_direct_read_request(content, request)
 }
 

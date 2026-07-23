@@ -101,10 +101,12 @@ pub use health::{
     cluster_health_rpc_request_without_peer_views,
     cluster_health_rpc_request_without_recursive_peer_views, cluster_local_health_rpc_request,
     cluster_network_ping_attachment_rpc_request,
-    cluster_network_ping_attachment_rpc_response_for_node, cluster_network_ping_rpc_request,
+    cluster_network_ping_attachment_rpc_response_for_node, cluster_network_ping_response_for_node,
+    cluster_network_ping_rpc_call_with_response_payload, cluster_network_ping_rpc_request,
     cluster_network_ping_rpc_request_with_response_payload, cluster_state_authority_health,
-    decode_cluster_health_rpc_response, decode_cluster_network_ping_rpc_request,
-    decode_cluster_network_ping_rpc_response, handle_cluster_network_ping_rpc_request_for_node,
+    current_cluster_health_rows_for_decoded_request_async, decode_cluster_health_rpc_response,
+    decode_cluster_network_ping_rpc_request, decode_cluster_network_ping_rpc_response,
+    handle_cluster_network_ping_rpc_request_for_node,
     handle_current_cluster_health_rpc_request_async, unknown_cluster_node_status,
     validate_cluster_network_ping_attachment_request,
 };
@@ -219,7 +221,10 @@ pub use raft_quorum::{
     ClusterKvQuorumAsyncHost, ClusterRaftQuorumBatch, ClusterRaftQuorumBatchOutcomes,
     ClusterRaftQuorumCommitHost,
 };
-pub use raft_rpc::handle_cluster_kv_consensus_rpc_request_async;
+pub use raft_rpc::{
+    handle_cluster_kv_consensus_rpc_request_async, handle_cluster_raft_append_request_async,
+    handle_cluster_raft_vote_request_async,
+};
 pub use state_authority_reachability::{
     ClusterStateAuthorityQuorumStatus, ClusterStateAuthorityReachabilityAsyncHost,
     ClusterStateAuthorityReachabilityHost, ClusterStateAuthorityReachabilityOptions,

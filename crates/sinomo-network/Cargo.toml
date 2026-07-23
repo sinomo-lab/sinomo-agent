@@ -22,6 +22,7 @@ base64.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 fs2.workspace = true
+futures-util.workspace = true
 ring = "0.17.14"
 serde.workspace = true
 serde_bytes.workspace = true
@@ -42,6 +43,9 @@ sinomo-local = { path = "../sinomo-local" }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 sinomo-storage = { path = "../sinomo-storage" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 sinomo-kv = { path = "../sinomo-kv", features = ["test-support"] }

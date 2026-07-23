@@ -39,6 +39,7 @@ pub const DAEMON_SHUTDOWN_ROUTE: &str = "/daemon/shutdown";
 pub const DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE: &str = "/daemon/cluster/maintenance-refresh";
 pub const DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE: &str =
     "/daemon/cluster/local-connectivity-reload";
+pub const DAEMON_NETWORK_CHUNK_METRICS_ROUTE: &str = "/daemon/network/chunk-metrics";
 pub const DAEMON_OBJECT_RPC_FORWARD_ROUTE: &str = "/daemon/object-rpc/forward";
 pub const DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE: &str = "/daemon/dfs/object-rpc/forward";
 pub const DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE: &str = "/daemon/dfs/placement-authority";
@@ -156,6 +157,11 @@ pub enum DaemonEventStreamItem {
 pub struct DaemonObjectRpcForwardRequest {
     pub target_node_id: sinomo_core::node::NodeId,
     pub request: sinomo_core::network::ObjectRpcRequest,
+    /// Authentication proof for an ordinary typed value carried in the outer
+    /// proxy body. `None` means that body, when present, is a semantic
+    /// attachment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streamed_value_digest_sha256: Option<[u8; 32]>,
     pub connect_timeout_millis: u64,
     /// Overrides the routed session's no-progress timeout. Missing values from
     /// older callers retain the daemon's default network timeout.
@@ -180,6 +186,10 @@ pub enum DaemonObjectRpcForwardDeliveryState {
 pub enum DaemonObjectRpcForwardResponse {
     Success {
         response: sinomo_core::network::ObjectRpcResponse,
+        /// The outer proxy body is the nested response's ordinary typed value,
+        /// not a semantic attachment of the forwarding envelope.
+        #[serde(default)]
+        streamed_value_body: bool,
         /// Time spent inside the daemon on the routed object-RPC call. This
         /// excludes the caller-to-daemon loopback proxy RPC.
         #[serde(default)]
@@ -190,6 +200,16 @@ pub enum DaemonObjectRpcForwardResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         delivery_state: Option<DaemonObjectRpcForwardDeliveryState>,
     },
+}
+
+/// Process-local ownership-native network allocator snapshot.
+///
+/// The cluster benchmark samples this on the source daemon before and after
+/// its measured calls so copy and allocation results cover the routed carrier,
+/// rather than only the CLI-to-daemon adapter process.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonNetworkChunkMetricsResponse {
+    pub chunk_metrics: sinomo_core::network::NetworkChunkMetrics,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]

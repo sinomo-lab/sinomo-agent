@@ -1850,8 +1850,10 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost
     fn sign_object_rpc_request_async<'a>(
         &'a mut self,
         request: &'a sinomo_core::network::ObjectRpcRequest,
+        request_digest_sha256: [u8; 32],
     ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
-        self.object_rpc_host.sign_object_rpc_request_async(request)
+        self.object_rpc_host
+            .sign_object_rpc_request_async(request, request_digest_sha256)
     }
 
     fn observe_signed_endpoint_rpc_async<'a>(
@@ -1985,7 +1987,6 @@ pub(crate) async fn forward_cluster_invite_challenge_to_cluster_state_authority_
                 detail: format!("cluster state read task failed: {source}"),
             })
         })??;
-    let rpc_request = sinomo_core::cluster::cluster_join_challenge_rpc_request(challenge)?;
     let mut host = DaemonClusterJoinRegistrationHost::new_on_runtime(paths, runtime);
     let authority_targets =
         sinomo_core::network::ClusterEndpointSelector::select_unique_node_targets_async(
@@ -2016,7 +2017,11 @@ pub(crate) async fn forward_cluster_invite_challenge_to_cluster_state_authority_
             .call_target(
                 &state,
                 &target.node_id,
-                sinomo_core::network::ObjectRpcCall::value(rpc_request.clone()),
+                sinomo_core::network::ObjectRpcCall::encode_borrowed_value(
+                    sinomo_core::network::CLUSTER_JOIN_CHALLENGE_ROUTE,
+                    sinomo_core::network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+                    challenge,
+                )?,
                 sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(
                     sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
                 ),
@@ -2039,7 +2044,7 @@ pub(crate) async fn forward_cluster_invite_challenge_to_cluster_state_authority_
                     target.transport,
                     started.elapsed()
                 );
-                return result.response.decode_body().map_err(DaemonError::from);
+                return result.decode_body().await.map_err(DaemonError::from);
             }
             Err(error) => {
                 crate::cluster_join_trace(format_args!(
@@ -2066,7 +2071,11 @@ pub(crate) async fn forward_cluster_invite_challenge_to_cluster_state_authority_
                 .call_endpoint(
                     &state,
                     endpoint,
-                    sinomo_core::network::ObjectRpcCall::value(rpc_request.clone()),
+                    sinomo_core::network::ObjectRpcCall::encode_borrowed_value(
+                        sinomo_core::network::CLUSTER_JOIN_CHALLENGE_ROUTE,
+                        sinomo_core::network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+                        challenge,
+                    )?,
                     sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(
                         sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
                     ),
@@ -2087,7 +2096,7 @@ pub(crate) async fn forward_cluster_invite_challenge_to_cluster_state_authority_
                         endpoint.transport,
                         started.elapsed()
                     );
-                    return result.response.decode_body().map_err(DaemonError::from);
+                    return result.decode_body().await.map_err(DaemonError::from);
                 }
                 Err(error) => {
                     crate::cluster_join_trace(format_args!(
@@ -2138,16 +2147,18 @@ fn call_node_object_rpc_on_runtime(
     })?;
     let mut host = DaemonSignedObjectRpcAsyncHost::new(runtime, true).with_cluster_paths(&paths);
     let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &paths);
-    block_on_cluster_network_future_on_owner_runtime(
-        runtime,
-        client.call_target(
-            state,
-            target_node_id,
-            sinomo_core::network::ObjectRpcCall::value(rpc_request.clone()),
-            options,
-        ),
-    )
-    .map(|result| result.response)
+    block_on_cluster_network_future_on_owner_runtime(runtime, async {
+        client
+            .call_target(
+                state,
+                target_node_id,
+                sinomo_core::network::ObjectRpcCall::value(rpc_request.clone()),
+                options,
+            )
+            .await?
+            .into_materialized_value_response(usize::MAX)
+            .await
+    })
     .map_err(DaemonError::from)
 }
 
@@ -5326,20 +5337,6 @@ fn complete_accepted_join_connectivity_handoff_on_runtime(
     accepted_endpoint: &ClusterEndpointRecord,
     runtime: &tokio::runtime::Handle,
 ) -> usize {
-    let request = match ObjectRpcRequest::encode_body(
-        sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
-        sinomo_core::network::CLUSTER_NETWORK_RPC_CATEGORY,
-        &(),
-    ) {
-        Ok(request) => request,
-        Err(error) => {
-            tracing::debug!(
-                %error,
-                "sinomo daemon could not encode accepted introducer connectivity handoff request"
-            );
-            return 0;
-        }
-    };
     let fetch_paths = paths.clone();
     let fetch_state = state.clone();
     let fetch_endpoint = accepted_endpoint.clone();
@@ -5349,7 +5346,6 @@ fn complete_accepted_join_connectivity_handoff_on_runtime(
             fetch_paths,
             fetch_state,
             fetch_endpoint,
-            request,
             fetch_runtime,
             DAEMON_JOIN_CONNECTIVITY_HANDOFF_TIMEOUT,
             PeerConnectivityFetchScope::FullSnapshot,
@@ -5372,17 +5368,6 @@ async fn import_peer_connectivity_records_from_reachable_endpoints_async(
     records: &[ClusterConnectivityRecord],
     runtime: tokio::runtime::Handle,
 ) -> usize {
-    let request = match ObjectRpcRequest::encode_body(
-        sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
-        sinomo_core::network::CLUSTER_NETWORK_RPC_CATEGORY,
-        &(),
-    ) {
-        Ok(request) => request,
-        Err(error) => {
-            tracing::warn!("sinomo daemon peer connectivity request encode failed: {error}");
-            return 0;
-        }
-    };
     let timeouts = cluster_control_plane_timeouts();
     let import_records = peer_connectivity_import_records_for_reachable_peers(
         state,
@@ -5415,7 +5400,6 @@ async fn import_peer_connectivity_records_from_reachable_endpoints_async(
         };
         let state = state.clone();
         let paths = paths.clone();
-        let request = request.clone();
         let runtime = runtime.clone();
         let timeout = connectivity_import_timeout_for_endpoint(&endpoint, timeouts);
         handles.push(tokio::spawn(async move {
@@ -5424,7 +5408,6 @@ async fn import_peer_connectivity_records_from_reachable_endpoints_async(
                 paths,
                 state,
                 endpoint,
-                request,
                 runtime,
                 timeout,
                 PeerConnectivityFetchScope::EndpointSource,
@@ -5589,7 +5572,6 @@ async fn fetch_peer_connectivity_records_from_endpoint_async(
     paths: ClusterPaths,
     state: ClusterBootstrapState,
     endpoint: ClusterEndpointRecord,
-    request: ObjectRpcRequest,
     runtime: tokio::runtime::Handle,
     timeout: Duration,
     scope: PeerConnectivityFetchScope,
@@ -5607,7 +5589,12 @@ async fn fetch_peer_connectivity_records_from_endpoint_async(
             .call_endpoint(
                 &state,
                 &endpoint,
-                sinomo_core::network::ObjectRpcCall::value(request),
+                sinomo_core::network::ObjectRpcCall::encode_value(
+                    sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
+                    sinomo_core::network::CLUSTER_NETWORK_RPC_CATEGORY,
+                    (),
+                )
+                .map_err(|error| error.to_string())?,
                 sinomo_core::network::ClusterObjectRpcOptions::default()
                     .with_overall_timeout(timeout),
             )
@@ -5616,10 +5603,7 @@ async fn fetch_peer_connectivity_records_from_endpoint_async(
             Ok(response) => response,
             Err(error) => return Err(error.to_string()),
         };
-        if let Err(error) = response.response.error_detail() {
-            return Err(format!("returned error: {error}"));
-        }
-        let peer_records = match response.response.decode_body() {
+        let peer_records = match response.decode_body().await {
             Ok(records) => {
                 filter_peer_connectivity_response_records(&state, &endpoint, records, scope)?
             }
@@ -5828,11 +5812,6 @@ async fn fetch_daemon_status_from_endpoint_direct_async(
     endpoint: &ClusterEndpointRecord,
     timeout: Duration,
 ) -> Result<crate::DaemonStatus, DaemonError> {
-    let request = sinomo_core::network::ObjectRpcRequest::encode_body(
-        crate::DAEMON_STATUS_ROUTE,
-        crate::DAEMON_RPC_CATEGORY,
-        &(),
-    )?;
     let runtime = tokio::runtime::Handle::current();
     let mut host = DaemonSignedObjectRpcAsyncHost::direct_only(&runtime);
     let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
@@ -5840,14 +5819,18 @@ async fn fetch_daemon_status_from_endpoint_direct_async(
         .call_endpoint(
             state,
             endpoint,
-            sinomo_core::network::ObjectRpcCall::value(request),
+            sinomo_core::network::ObjectRpcCall::encode_value(
+                crate::DAEMON_STATUS_ROUTE,
+                crate::DAEMON_RPC_CATEGORY,
+                (),
+            )?,
             // Status probing owns this semantic operation deadline; transport
             // phase timeouts remain separate inside sinomo-network.
             sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
         )
         .await
         .map_err(DaemonError::from)?;
-    response.response.decode_body().map_err(DaemonError::from)
+    response.decode_body().await.map_err(DaemonError::from)
 }
 
 /// Records which of the two heartbeat records `refresh_daemon_node_status_in_kv`
@@ -6693,7 +6676,16 @@ async fn call_member_object_rpc_target_async(
         )
         .await
     {
-        Ok(result) => Ok(Some(result.response)),
+        Ok(result) => match result.into_materialized_value_response(usize::MAX).await {
+            Ok(response) => Ok(Some(response)),
+            Err(error) => {
+                tracing::debug!(
+                    "sinomo daemon {operation} of {} returned a non-value response: {error}",
+                    member.node_id
+                );
+                Ok(None)
+            }
+        },
         Err(error) => {
             tracing::debug!(
                 "sinomo daemon {operation} of {} failed: {error}",
@@ -8178,12 +8170,14 @@ fn daemon_control_transport_env_cluster_paths() -> Option<ClusterPaths> {
     None
 }
 
+#[cfg(test)]
 fn cluster_kv_object_rpc_request(
     payload: sinomo_core::kv::ClusterKvRpcPayload,
 ) -> ObjectRpcRequest {
     ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
 }
 
+#[cfg(test)]
 fn cluster_raft_append_object_rpc_request(
     payload: sinomo_core::kv::ClusterKvRpcPayload,
 ) -> ObjectRpcRequest {
@@ -8191,6 +8185,7 @@ fn cluster_raft_append_object_rpc_request(
     cluster_kv_object_rpc_request(payload).with_response_retry_safe()
 }
 
+#[cfg(test)]
 fn cluster_raft_vote_object_rpc_request(
     payload: sinomo_core::kv::ClusterKvRpcPayload,
 ) -> ObjectRpcRequest {
@@ -8200,30 +8195,6 @@ fn cluster_raft_vote_object_rpc_request(
     cluster_kv_object_rpc_request(payload).with_response_retry_safe()
 }
 
-fn decode_routed_cluster_raft_append_response(
-    response: &ObjectRpcResponse,
-) -> Result<ClusterRaftAppendResponse, sinomo_core::network::NetworkError> {
-    response.error_detail()?;
-    sinomo_core::kv::decode_cluster_raft_append_rpc_response_body(&response.body).map_err(|error| {
-        sinomo_core::network::NetworkError::Io {
-            operation: "decode routed cluster raft append".to_string(),
-            detail: error.to_string(),
-        }
-    })
-}
-
-fn decode_routed_cluster_raft_vote_response(
-    response: &ObjectRpcResponse,
-) -> Result<ClusterRaftVoteResponse, sinomo_core::network::NetworkError> {
-    response.error_detail()?;
-    sinomo_core::kv::decode_cluster_raft_vote_rpc_response_body(&response.body).map_err(|error| {
-        sinomo_core::network::NetworkError::Io {
-            operation: "decode routed cluster raft vote".to_string(),
-            detail: error.to_string(),
-        }
-    })
-}
-
 async fn send_cluster_raft_append_routed_async(
     paths: &ClusterPaths,
     target_node_id: &NodeId,
@@ -8231,25 +8202,23 @@ async fn send_cluster_raft_append_routed_async(
     timeout: Duration,
     runtime: &tokio::runtime::Handle,
 ) -> Result<ClusterRaftAppendResponse, sinomo_core::network::NetworkError> {
-    let rpc_request = cluster_raft_append_object_rpc_request(
-        sinomo_core::kv::cluster_raft_append_rpc_payload(request).map_err(|error| {
-            sinomo_core::network::NetworkError::Io {
-                operation: "encode routed cluster raft append".to_string(),
-                detail: error.to_string(),
-            }
-        })?,
-    );
+    let mut call = sinomo_core::network::ObjectRpcCall::encode_borrowed_value(
+        sinomo_core::kv::CLUSTER_RAFT_APPEND_ROUTE,
+        sinomo_core::kv::CLUSTER_RAFT_RPC_CATEGORY,
+        request,
+    )?;
+    call.request = call.request.with_response_retry_safe();
     let mut host = DaemonSignedObjectRpcAsyncHost::new(runtime, true).with_cluster_paths(paths);
     let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, paths);
     let response = client
         .call_target(
             &request.state,
             target_node_id,
-            sinomo_core::network::ObjectRpcCall::value(rpc_request),
+            call,
             sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
         )
         .await?;
-    decode_routed_cluster_raft_append_response(&response.response)
+    response.decode_body().await
 }
 
 fn send_cluster_raft_append_routed_on_runtime(
@@ -8272,25 +8241,23 @@ async fn send_cluster_raft_vote_routed_async(
     timeout: Duration,
     runtime: &tokio::runtime::Handle,
 ) -> Result<ClusterRaftVoteResponse, sinomo_core::network::NetworkError> {
-    let rpc_request = cluster_raft_vote_object_rpc_request(
-        sinomo_core::kv::cluster_raft_vote_rpc_payload(request).map_err(|error| {
-            sinomo_core::network::NetworkError::Io {
-                operation: "encode routed cluster raft vote".to_string(),
-                detail: error.to_string(),
-            }
-        })?,
-    );
+    let mut call = sinomo_core::network::ObjectRpcCall::encode_borrowed_value(
+        sinomo_core::kv::CLUSTER_RAFT_VOTE_ROUTE,
+        sinomo_core::kv::CLUSTER_RAFT_RPC_CATEGORY,
+        request,
+    )?;
+    call.request = call.request.with_response_retry_safe();
     let mut host = DaemonSignedObjectRpcAsyncHost::new(runtime, true).with_cluster_paths(paths);
     let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, paths);
     let response = client
         .call_target(
             &request.state,
             target_node_id,
-            sinomo_core::network::ObjectRpcCall::value(rpc_request),
+            call,
             sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
         )
         .await?;
-    decode_routed_cluster_raft_vote_response(&response.response)
+    response.decode_body().await
 }
 
 fn send_cluster_raft_vote_routed_on_runtime(
@@ -8710,30 +8677,24 @@ impl sinomo_core::cluster::ClusterStateAuthorityReachabilityAsyncHost
             let Some(paths) = paths else {
                 return Ok(false);
             };
-            let request = ObjectRpcRequest::encode_body(
-                crate::DAEMON_STATUS_ROUTE,
-                crate::DAEMON_RPC_CATEGORY,
-                &(),
-            )
-            .map_err(|source| sinomo_core::network::NetworkError::Io {
-                operation: "encode routed daemon status probe".to_string(),
-                detail: source.to_string(),
-            })?;
             let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(self, &paths);
-            Ok(client
+            let result = client
                 .call_target(
                     state,
                     target_node_id,
-                    sinomo_core::network::ObjectRpcCall::value(request),
+                    sinomo_core::network::ObjectRpcCall::encode_value(
+                        crate::DAEMON_STATUS_ROUTE,
+                        crate::DAEMON_RPC_CATEGORY,
+                        (),
+                    )?,
                     sinomo_core::network::ClusterObjectRpcOptions::default()
                         .with_overall_timeout(timeout),
                 )
-                .await
-                .and_then(|result| {
-                    result.response.error_detail()?;
-                    Ok(result)
-                })
-                .is_ok())
+                .await;
+            Ok(match result {
+                Ok(result) => result.decode_body::<crate::DaemonStatus>().await.is_ok(),
+                Err(_) => false,
+            })
         })
     }
 }
@@ -8772,18 +8733,18 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonClusterCont
     fn sign_object_rpc_request_async<'a>(
         &'a mut self,
         request: &'a ObjectRpcRequest,
+        request_digest_sha256: [u8; 32],
     ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
         let runtime = self.rpc_mode.runtime().clone();
         let route = request.route.clone();
         let category = request.category.clone();
-        let body_sha256 = crate::daemon_rpc_body_sha256(request);
         Box::pin(async move {
             runtime
                 .spawn_blocking(move || {
                     crate::sign_daemon_rpc_request_digest_for_local_node(
                         &route,
                         &category,
-                        body_sha256,
+                        request_digest_sha256.to_vec(),
                     )
                 })
                 .await
@@ -9082,32 +9043,21 @@ impl sinomo_core::cluster::ClusterKvCommittedFanoutAsyncHost
                         .to_string(),
                 });
             };
-            let payload = sinomo_core::kv::cluster_kv_watch_events_rpc_payload(request).map_err(
-                |source| sinomo_core::network::NetworkError::Io {
-                    operation: "encode routed cluster kv watch-event fanout".to_string(),
-                    detail: source.to_string(),
-                },
-            )?;
-            let rpc_request =
-                ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
             let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(self, &paths);
             let response = client
                 .call_target(
                     state,
                     target_node_id,
-                    sinomo_core::network::ObjectRpcCall::value(rpc_request),
+                    sinomo_core::network::ObjectRpcCall::encode_borrowed_value(
+                        sinomo_core::kv::CLUSTER_KV_WATCH_EVENTS_ROUTE,
+                        sinomo_core::kv::CLUSTER_KV_RPC_CATEGORY,
+                        request,
+                    )?,
                     sinomo_core::network::ClusterObjectRpcOptions::default()
                         .with_overall_timeout(timeout),
                 )
                 .await?;
-            response.response.error_detail()?;
-            sinomo_core::kv::decode_cluster_kv_watch_events_rpc_response_body(
-                &response.response.body,
-            )
-            .map_err(|source| sinomo_core::network::NetworkError::Io {
-                operation: "decode routed cluster kv watch-event fanout".to_string(),
-                detail: source.to_string(),
-            })
+            response.decode_body().await
         })
     }
 }

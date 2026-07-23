@@ -179,7 +179,10 @@ pub fn stream_native_service_route_constraints() -> crate::RouteConstraints {
 /// capture. Ordinary traffic still pays only the timeline's relaxed atomic
 /// active check.
 fn prepare_call_for_active_network_timeline(call: &mut ObjectRpcCall) {
-    if !crate::network_timeline_capture_is_active() || call.request.auth.is_some() {
+    if !crate::network_timeline_capture_is_active()
+        || call.request.auth.is_some()
+        || !call.body.allows_request_metadata_mutation()
+    {
         return;
     }
     call.request.ensure_trace_context();
@@ -610,6 +613,7 @@ pub trait ClusterSignedObjectRpcAsyncHost: Send {
     fn sign_object_rpc_request_async<'a>(
         &'a mut self,
         request: &'a ObjectRpcRequest,
+        request_digest_sha256: [u8; 32],
     ) -> ClusterSignedObjectRpcFuture<'a, Vec<u8>>;
 
     fn observe_signed_endpoint_rpc_async<'a>(
@@ -764,8 +768,10 @@ where
         prepare_call_for_active_network_timeline(&mut call);
         let data_dir = cluster_paths_data_dir(self.route_context.map(|context| context.paths))?;
         let policy = options.call_policy();
+        let request_digest_sha256 = crate::daemon_auth::daemon_rpc_call_sha256(&call)?;
         let request_auth = cluster_object_rpc_sign_with_deadline(
-            self.host.sign_object_rpc_request_async(&call.request),
+            self.host
+                .sign_object_rpc_request_async(&call.request, request_digest_sha256),
             deadline,
         )
         .await?;
@@ -844,11 +850,12 @@ where
                     stream.session_id.clone(),
                     stream.channel_binding,
                 )?;
-                crate::service_rpc_stream::call_service_rpc_stream(
+                crate::service_rpc_stream::call_service_rpc_peer_stream(
                     stream,
                     &context,
                     call,
                     request_auth,
+                    request_digest_sha256,
                     crate::ObjectFrameIoOptions::idle_timeout(policy.health.no_progress_timeout),
                 )
                 .await
@@ -933,8 +940,10 @@ where
         );
         prepare_call_for_active_network_timeline(&mut call);
         let policy = options.call_policy();
+        let request_digest_sha256 = crate::daemon_auth::daemon_rpc_call_sha256(&call)?;
         let request_auth = cluster_object_rpc_sign_with_deadline(
-            self.host.sign_object_rpc_request_async(&call.request),
+            self.host
+                .sign_object_rpc_request_async(&call.request, request_digest_sha256),
             deadline,
         )
         .await?;
@@ -969,11 +978,12 @@ where
             stream.session_id.clone(),
             stream.channel_binding,
         );
-        let result = crate::service_rpc_stream::call_service_rpc_stream(
+        let result = crate::service_rpc_stream::call_service_rpc_peer_stream(
             stream,
             &context,
             call,
             request_auth,
+            request_digest_sha256,
             crate::ObjectFrameIoOptions::idle_timeout(policy.health.no_progress_timeout),
         )
         .await?;
@@ -1054,8 +1064,10 @@ where
         let sign_started_ns = trace
             .map(|_| crate::network_timeline_monotonic_ns())
             .unwrap_or(0);
+        let request_digest_sha256 = crate::daemon_auth::daemon_rpc_call_sha256(&call)?;
         let request_auth_result = cluster_object_rpc_sign_with_deadline(
-            self.host.sign_object_rpc_request_async(&call.request),
+            self.host
+                .sign_object_rpc_request_async(&call.request, request_digest_sha256),
             deadline,
         )
         .await;
@@ -1206,11 +1218,12 @@ where
         let exchange_started_ns = trace
             .map(|_| crate::network_timeline_monotonic_ns())
             .unwrap_or(0);
-        let result = crate::service_rpc_stream::call_service_rpc_stream(
+        let result = crate::service_rpc_stream::call_service_rpc_peer_stream(
             stream,
             &context,
             call,
             request_auth,
+            request_digest_sha256,
             crate::ObjectFrameIoOptions::idle_timeout(policy.health.no_progress_timeout),
         )
         .await;
@@ -1321,5 +1334,63 @@ fn cluster_target_rpc_timeout_error(
         phase: NetworkTimeoutPhase::Overall,
         timeout: timeout.unwrap_or_default(),
         delivery_state,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_timeline_does_not_mutate_forwarded_streamed_value_metadata() {
+        let _capture_guard = crate::timeline::network_timeline_test_capture_guard();
+        if crate::network_timeline_capture_is_active() {
+            let _ = crate::stop_network_timeline_capture();
+        }
+        crate::start_network_timeline_capture(8).expect("start timeline capture");
+
+        let mut request = ObjectRpcRequest::encode_body(
+            "/test/timeline-forwarded",
+            "test.timeline-forwarded",
+            &vec![0x5a_u8; crate::owned_chunk::BODY_CHUNK_MAX + 17],
+        )
+        .expect("encode forwarded request");
+        let digest: [u8; 32] = crate::daemon_rpc_body_sha256(&request)
+            .try_into()
+            .expect("request digest");
+        let encoded = std::mem::take(&mut request.body);
+        let body = crate::ObjectRpcIncomingBody::bytes(encoded);
+        let mut call = ObjectRpcCall::from_forwarded_streamed_value(request, body, digest)
+            .expect("forward streamed value");
+        let metadata = call.request.metadata.clone();
+
+        prepare_call_for_active_network_timeline(&mut call);
+
+        assert_eq!(call.request.metadata, metadata);
+        assert_eq!(
+            crate::daemon_rpc_call_sha256(&call).expect("reuse forwarded proof"),
+            digest
+        );
+        crate::stop_network_timeline_capture().expect("stop timeline capture");
+    }
+
+    #[test]
+    fn active_timeline_still_samples_mutable_calls() {
+        let _capture_guard = crate::timeline::network_timeline_test_capture_guard();
+        if crate::network_timeline_capture_is_active() {
+            let _ = crate::stop_network_timeline_capture();
+        }
+        crate::start_network_timeline_capture(8).expect("start timeline capture");
+        let mut call = ObjectRpcCall::value(ObjectRpcRequest::from_encoded_body(
+            "/test/timeline-mutable",
+            "test.timeline-mutable",
+            Vec::new(),
+        ));
+
+        prepare_call_for_active_network_timeline(&mut call);
+
+        assert!(call.request.traceparent().is_some());
+        assert!(call.request.observe_sampled());
+        crate::stop_network_timeline_capture().expect("stop timeline capture");
     }
 }

@@ -58,6 +58,44 @@ pub async fn handle_cluster_kv_consensus_rpc_request_async(
         })?
 }
 
+pub async fn handle_cluster_raft_append_request_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    request: ClusterRaftAppendRequest,
+    authenticated_peer: &ClusterAuthenticatedPeer,
+) -> Result<ClusterRaftAppendResponse, NetworkError> {
+    let paths = paths.clone();
+    let authenticated_peer = authenticated_peer.clone();
+    runtime
+        .spawn_blocking(move || {
+            handle_locked_cluster_raft_append_request(&paths, request, &authenticated_peer)
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "cluster raft append rpc".to_string(),
+            detail: format!("cluster raft append task failed: {source}"),
+        })?
+}
+
+pub async fn handle_cluster_raft_vote_request_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    request: ClusterRaftVoteRequest,
+    authenticated_peer: &ClusterAuthenticatedPeer,
+) -> Result<ClusterRaftVoteResponse, NetworkError> {
+    let paths = paths.clone();
+    let authenticated_peer = authenticated_peer.clone();
+    runtime
+        .spawn_blocking(move || {
+            handle_locked_cluster_raft_vote_request(&paths, request, &authenticated_peer)
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "cluster raft vote rpc".to_string(),
+            detail: format!("cluster raft vote task failed: {source}"),
+        })?
+}
+
 pub fn handle_cluster_raft_append_request(
     paths: &ClusterPaths,
     request: ClusterRaftAppendRequest,

@@ -5423,29 +5423,21 @@ fn check_agent_runtime_control_service_routes() -> AgentReadinessCheck {
 
 #[derive(Clone, Default)]
 struct ReadinessResponseSink {
-    frames: Arc<Mutex<Vec<ObjectRpcResponse>>>,
+    frames: Arc<Mutex<Vec<ObjectRpcOutgoingResponse>>>,
 }
 
 impl ReadinessResponseSink {
-    fn frames(&self) -> Vec<ObjectRpcResponse> {
-        self.frames
-            .lock()
-            .expect("readiness response frames")
-            .clone()
+    fn take_frames(&self) -> Vec<ObjectRpcOutgoingResponse> {
+        std::mem::take(&mut *self.frames.lock().expect("readiness response frames"))
     }
 }
 
 impl ResponseSink for ReadinessResponseSink {
     fn send(self: Box<Self>, response: ObjectRpcOutgoingResponse) -> Result<(), ServiceError> {
-        if !response.body.is_empty() {
-            return Err(ServiceError::Service(
-                "agent readiness sink received an unexpected response body".to_string(),
-            ));
-        }
         self.frames
             .lock()
             .expect("readiness response frames")
-            .push(response.response);
+            .push(response);
         Ok(())
     }
 }
@@ -5472,14 +5464,21 @@ where
         .map_err(|error| error.to_string())?;
     block_on_readiness_future(registry.dispatch(ctx, request))
         .map_err(|error| error.to_string())?;
-    let frames = sink.frames();
+    let mut frames = sink.take_frames();
     if frames.len() != 1 {
         return Err(format!(
             "expected one object-RPC response frame for {route}, got {}",
             frames.len()
         ));
     }
-    frames[0].decode_body().map_err(|error| error.to_string())
+    let response = block_on_readiness_future(
+        frames
+            .pop()
+            .expect("checked one readiness response")
+            .into_materialized_value_response(usize::MAX),
+    )
+    .map_err(|error| error.to_string())?;
+    response.decode_body().map_err(|error| error.to_string())
 }
 
 fn block_on_readiness_future<F: Future>(future: F) -> F::Output {

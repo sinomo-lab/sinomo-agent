@@ -20,9 +20,8 @@ use crate::member_mutation::{
 };
 use crate::member_store::{apply_cluster_raft_role, cluster_member_update_ops_from_store};
 use crate::membership_forward::{
-    ClusterMembershipRpcForwardHost,
-    forward_cluster_membership_rpc_to_state_authority_async_with_host,
-    forward_cluster_membership_rpc_to_state_authority_with_host,
+    ClusterMembershipRpcForwardHost, forward_cluster_membership_rpc_to_state_authority_with_host,
+    forward_cluster_membership_value_to_state_authority_async_with_host,
 };
 use crate::membership_rpc::{ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse};
 use crate::prelude::*;
@@ -1645,18 +1644,20 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
         apply_local_daemon_membership_observation(&mut state, observation);
     }
     if !cluster_kv_local_is_state_authority(&state) {
-        let rpc_request = cluster_join_registration_rpc_request(&request)?;
+        let rpc_head = cluster_join_registration_rpc_head();
         let forward_started = Instant::now();
         join_registration_trace(format_args!(
             "registration forward invite={} started with {} member(s)",
             request.invite.invite_id,
             request.members.len()
         ));
-        let response = forward_cluster_membership_rpc_to_state_authority_async_with_host(
+        let response: ClusterJoinRegistrationResponse =
+            forward_cluster_membership_value_to_state_authority_async_with_host(
             runtime,
             paths,
             &state,
-            &rpc_request,
+            &rpc_head,
+            &request,
             "join introducer is not a state authority and could not forward the join to any state authority",
             host,
         )
@@ -1666,12 +1667,10 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
             request.invite.invite_id,
             forward_started.elapsed()
         ));
-        let decode_started = Instant::now();
-        let response: ClusterJoinRegistrationResponse = response.decode_body()?;
         join_registration_trace(format_args!(
-            "registration forward invite={} decode completed in {:?}",
+            "registration forward invite={} stream decode completed in {:?}",
             request.invite.invite_id,
-            decode_started.elapsed()
+            forward_started.elapsed()
         ));
         if response.accepted {
             let record_started = Instant::now();
@@ -2223,6 +2222,15 @@ fn cluster_join_registration_rpc_request(
         request,
     )?
     .with_response_retry_safe())
+}
+
+fn cluster_join_registration_rpc_head() -> ObjectRpcRequest {
+    ObjectRpcRequest::from_encoded_body(
+        CLUSTER_JOIN_REGISTER_ROUTE,
+        CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+        Vec::new(),
+    )
+    .with_response_retry_safe()
 }
 
 pub fn record_forwarded_join_registration_acceptance_with_host(

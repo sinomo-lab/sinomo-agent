@@ -141,7 +141,7 @@ impl Service for DaemonEventService {
                     "daemon event subscriptions require the daemon-owned Tokio runtime".to_string(),
                 )
             })?;
-            let filters: DaemonEventSubscribeRequest = request.decode_body()?;
+            let filters: DaemonEventSubscribeRequest = ctx.decode_request_body(&request).await?;
             validate_filters(&filters)?;
 
             let subscription_id = Id::generate().to_string();

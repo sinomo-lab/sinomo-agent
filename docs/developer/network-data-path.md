@@ -5,7 +5,7 @@ contracts are in the [network architecture](../network-architecture.md); the
 public binary object encoding is specified by the
 [Sinomo Object format](../sinomo-object-format.md).
 
-All layers remain inside `crates/sinomo-network`. There is one production path:
+All routed cluster calls use one production path:
 
 ```text
 sinomo-service registry
@@ -21,6 +21,9 @@ direct_link.rs and transport modules
 
 No payload-size branch selects another carrier. Relayed and direct calls use the
 same object-RPC protocol, and relays forward opaque routed-stream bytes.
+The daemon still accepts the legacy one-call local `SXP1` byte stream as an
+explicit compatibility boundary. Persistent local `SLC1` carriers and every
+routed call use the owned-record path.
 
 ## Call and Body Contracts
 
@@ -33,15 +36,30 @@ same object-RPC protocol, and relays forward opaque routed-stream bytes.
 - `ObjectRpcBodySource` and `ObjectRpcIncomingBody` provide bounded streaming
   producers and consumers.
 
-An ordinary value remains a single SOBJ value regardless of encoded size. If
-it exceeds the inline allowance, the codec moves its bytes through the body
-stream and restores them before typed dispatch. A semantic attachment stays an
-attachment. Callers do not observe transport frames or choose a carrier.
+An ordinary value remains a single SOBJ value regardless of encoded size. The
+owned service adapter moves its encoded bytes through the body stream instead
+of embedding a potentially large value in the control head. Routes use the
+incremental mode by default and decode SOBJ directly from ownership-bearing
+chunks through `ServiceContext::decode_request_body`. A route must opt into
+`ServiceRoute::with_buffered_request_value` when a legacy handler still needs
+one contiguous encoded request buffer.
+Semantic attachments remain attachments. Callers do not observe transport
+frames or choose a carrier.
 
 `service_rpc_stream.rs` encodes the typed service head into the application-head
 slot of the object-RPC protocol. It does not implement routing or keep a service
 catalog. The single method registry, route policy, concurrency admission,
 readiness, and final handler dispatch live in `sinomo-service`.
+
+Received body chunks move from the authenticated object-RPC pump directly into
+the application body. The service adapter does not spawn a second body pump or
+copy chunks through an `AsyncRead` scratch buffer. Incremental SOBJ decoding
+retains one bounded chunk at a time, and internal proxy forwarding can transfer
+an exclusively owned received slab into the next call.
+`ObjectRpcBodySource::from_incoming_body` is the public ownership-transfer
+adapter; it consumes the incoming body and moves its leases into the outgoing
+producer. `AsyncRead` and contiguous value materialization remain explicit
+compatibility adapters.
 
 ## Routed Streams
 
@@ -52,9 +70,10 @@ binds source, destination, session identity, and channel binding before
 application bytes are accepted.
 
 Intermediate nodes run `accept_or_relay_routed_session`. They authenticate the
-adjacent links, validate the routed envelope, and copy opaque bytes between the
-two bounded streams. They do not decode SOBJ heads, inspect service methods, or
-select an RPC implementation.
+adjacent links and validate the routed envelope. Linux TCP-to-TCP relays use
+`splice` in both directions; portable relays move each opaque ciphertext block
+through one pooled slab. Relay memory is constant per direction. Relays do not
+decode SOBJ heads, inspect service methods, or select an RPC implementation.
 
 `route.rs` composes routing with object RPC through `ClusterObjectRpcClient`.
 It selects endpoints only while opening the routed stream. Once application
@@ -66,14 +85,89 @@ bytes have entered a stream, routing does not replay them on another path.
 stream carries exactly one request and one response. The current resource
 bounds are:
 
-- 256 KiB maximum request or response head;
+- 16 KiB maximum request or response control head;
 - 8 KiB inline-body allowance;
 - 64 KiB maximum data frame; and
 - 256 KiB receive window.
 
 These are resident-resource bounds, not total payload limits. Receive credit
-and bounded channels apply backpressure across direct and relayed calls. The
+and bounded ownership rings apply backpressure across direct and relayed calls. The
 network layer does not spool application bodies to temporary files.
+
+Record capacities are derived from the inside out. A 64 KiB body frame plus
+its nine-byte object prefix fits one mux record; that record plus its 17-byte
+mux prefix fits one encrypted routed-session record. Adding an outer header
+does not split an otherwise maximum-sized inner record.
+
+The canonical path shares one pooled allocation:
+
+```text
+[secure headroom][mux headroom][RPC headroom][payload][AEAD tailroom]
+```
+
+The producer fills the payload region. Object RPC and the mux move the
+allocation's start backward to prepend their headers. The routed-session writer
+hashes the plaintext, encrypts it in place, prepends the secure header, appends
+the detached tag, and retains that slab across partial socket writes. Receive
+performs the inverse operations in the same slab and exposes only initialized
+payload ranges.
+
+Small typed request and response values are encoded into one
+transport-shaped SOBJ allocation and adopted without normalization. Large
+owned values retain the semantic Rust value plus a compact encoding plan, then
+fill one credit-bounded transport slab at a time. Shared fan-out values retain
+one `Arc` per call instead of cloning the semantic payload. Asynchronous
+readers fill an allocated slab directly. Synchronous readers use one bounded
+blocking prefetch worker per body source; the worker fills connection-owned
+slabs and hands them to the persistent transmitter without a per-chunk
+request/oneshot bridge. Generated repeated-byte bodies also fill complete
+owned slabs directly; only callers that choose the byte compatibility view
+receive immutable `Bytes` slices.
+
+For a body whose authenticated head already commits to both its exact length
+and digest, the receiver verifies completion at that byte boundary. A small
+typed call is therefore a request head plus one owned data record, and likewise
+for its response; it does not add a redundant object-level finish record.
+Known-length and unknown-length producers still send an authenticated finish
+record because that record publishes the body digest. Inline byte bodies remain
+the explicit byte-compatibility form.
+
+Data and control slabs use separate pools, per-connection and process byte
+limits, and bounded retained free lists. The owned mux has one persistent RX
+task and one TX task, stream slots backed by chunk rings, and deficit
+round-robin transmission across active streams. Receive credit is attached to
+the delivered chunk lease and returns only when the downstream consumer drops
+or transfers the chunk. Aggregated window returns, RESET, ready stream FINISH,
+and front-of-stream object-RPC control records are prioritized over body data
+without reordering records inside a stream.
+
+A caller that supplies shared immutable bytes may pay one normalization copy.
+A caller that chooses `AsyncRead`, `AsyncWrite`, or contiguous service-value
+materialization pays the corresponding compatibility copy explicitly. The
+process-wide `network_chunk_metrics` snapshot and cluster network benchmarks
+report pooled-slab allocations, reuse, instrumented payload-copy bytes, and
+peak pooled memory. Payload-copy totals are broken down into shared-source
+normalization, byte-stream writes, byte-stream reads, and contiguous
+materialization so a payload-sized regression cannot be mistaken for a small
+control-value compatibility boundary. The benchmark also reports pooled
+allocations per logical GiB, the test process's lifetime peak RSS (`ru_maxrss`
+where supported), and logical throughput grouped by the direct or relayed
+route selected from the stabilized connectivity graph. Its copy and allocation
+totals combine benchmark-client counters with snapshots taken inside the source
+daemon, so the reported zero-copy result covers the routed carrier rather than
+only the loopback client adapter. The per-process and per-reason values remain
+available separately. Pool allocation counters deliberately describe the
+network allocator rather than every process heap allocation; the source
+snapshots also include the bounded diagnostic exchanges themselves, and peak
+RSS is a process high-water mark rather than a benchmark-window delta.
+
+Public helpers that accept an already encoded `ObjectRpcRequest` remain
+explicit compatibility entrypoints. They cannot recover the original typed
+value and may therefore pay one normalization copy. Production callers that
+still own a typed value use `ObjectRpcCall::encode_value`,
+`encode_borrowed_value`, or `encode_shared_value`; response consumers use
+`ObjectRpcResult::decode_body` so large values are decoded from chunks instead
+of first being gathered into a second full-size vector.
 
 Authenticated progress frames distinguish transport health from application
 silence. Dropping an incoming body cancels or drains the same call; it does not

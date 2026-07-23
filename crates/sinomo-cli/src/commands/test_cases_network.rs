@@ -19,6 +19,8 @@ use sinomo_runtime::test::{
     SinomoTestRequirement, SinomoTestResult,
 };
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -82,6 +84,77 @@ impl NetworkPingPayloadMode {
             Self::SemanticAttachment => "semantic-attachment",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum NetworkPingRouteClass {
+    Direct,
+    Relayed,
+    Unresolved,
+}
+
+impl NetworkPingRouteClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Relayed => "relayed",
+            Self::Unresolved => "unresolved",
+        }
+    }
+}
+
+fn network_ping_route_topology(
+    route_path: Option<&[NodeId]>,
+) -> (NetworkPingRouteClass, Option<usize>) {
+    let Some(route_path) = route_path else {
+        return (NetworkPingRouteClass::Unresolved, None);
+    };
+    let relay_hops = route_path.len().saturating_sub(2);
+    (
+        if relay_hops == 0 {
+            NetworkPingRouteClass::Direct
+        } else {
+            NetworkPingRouteClass::Relayed
+        },
+        Some(relay_hops),
+    )
+}
+
+#[cfg(unix)]
+fn process_peak_resident_bytes() -> Option<u64> {
+    let mut usage = MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: `usage` points to writable storage for one `rusage`; a zero
+    // return initializes it according to `getrusage(2)`.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: the successful call above initialized the complete structure.
+    let resident = u64::try_from(unsafe { usage.assume_init() }.ru_maxrss).ok()?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // Linux and Android expose ru_maxrss in KiB.
+        resident.checked_mul(1024)
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        // Darwin exposes ru_maxrss in bytes.
+        Some(resident)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    {
+        let _ = resident;
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn process_peak_resident_bytes() -> Option<u64> {
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -704,6 +777,21 @@ fn run_network_ping_with_defaults(
     };
     let targets = filter_network_test_targets(ctx, &cluster_state, discovered_targets)?;
     let target_count = targets.len();
+    let route_graph =
+        network::ClusterConnectivityGraph::read_for_local(&cluster_paths, cluster_state.as_ref());
+    let expected_route_by_target = targets
+        .iter()
+        .map(|target| {
+            let route =
+                network::cluster_route_next_hop(&route_graph, &cluster_state.local_node_id, target);
+            let (route_class, relay_hops) =
+                network_ping_route_topology(route.as_ref().map(|route| route.path.as_slice()));
+            (
+                target.clone(),
+                (route_class, relay_hops, route.map(|route| route.path)),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     ctx.record(
         "target_selection",
         if include_unobserved_targets {
@@ -716,6 +804,31 @@ fn run_network_ping_with_defaults(
     ctx.record(
         "targets",
         targets.iter().map(ToString::to_string).collect::<Vec<_>>(),
+    );
+    ctx.record(
+        "expected_route_by_target",
+        expected_route_by_target
+            .iter()
+            .map(|(target, (route_class, relay_hops, path))| {
+                (
+                    target.to_string(),
+                    format!(
+                        "class={} relay_hops={} path={}",
+                        route_class.as_str(),
+                        relay_hops
+                            .map(|hops| hops.to_string())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        path.as_ref()
+                            .map(|nodes| nodes
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(" -> "))
+                            .unwrap_or_else(|| "unresolved".to_string())
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>(),
     );
     if !super::test::cluster_test_has_expected_target_count(target_count, expected_targets) {
         return Ok(SinomoTestOutcome::failed(format!(
@@ -800,10 +913,13 @@ fn run_network_ping_with_defaults(
             let mut jobs = Vec::with_capacity(total_jobs);
             for attempt in 0..requests_per_target {
                 for target_node_id in &targets {
+                    let (route_class, relay_hops, _) = expected_route_by_target
+                        .get(target_node_id)
+                        .expect("every selected target has a route classification");
                     let nonce = format!("ping-{phase}-{nonce_prefix}-{target_node_id}-{attempt}");
-                    let mut request = match defaults.payload_mode {
+                    let mut call = match defaults.payload_mode {
                         NetworkPingPayloadMode::EmbeddedSobj => {
-                            cluster::cluster_network_ping_rpc_request_with_response_payload(
+                            cluster::cluster_network_ping_rpc_call_with_response_payload(
                                 &nonce,
                                 payload_bytes,
                                 response_payload_bytes,
@@ -815,6 +931,12 @@ fn run_network_ping_with_defaults(
                                 attachment_request_bytes,
                                 attachment_response_bytes,
                             )
+                            .map(|request| {
+                                network::ObjectRpcCall::new(
+                                    request,
+                                    network::ObjectRpcBodySource::zeroes(attachment_request_bytes),
+                                )
+                            })
                         }
                     }
                     .map_err(|source| {
@@ -826,19 +948,22 @@ fn run_network_ping_with_defaults(
                     if phase == "measure"
                         && should_sample_network_timeline(jobs.len(), total_jobs, timeline_samples)
                     {
-                        request = request
+                        call.request = call
+                            .request
                             .with_trace_context_if_missing()
                             .with_observe_sampled(true);
                     }
                     jobs.push(NetworkPingJob {
                         payload_mode: defaults.payload_mode,
                         target_node_id: target_node_id.clone(),
+                        route_class: *route_class,
+                        relay_hops: *relay_hops,
                         timeout: Duration::from_millis(timeout_ms),
                         control_timeout,
                         request_payload_bytes: payload_bytes,
                         response_payload_bytes,
                         nonce,
-                        request,
+                        call,
                         daemon_address: daemon_address.clone(),
                     });
                 }
@@ -849,14 +974,14 @@ fn run_network_ping_with_defaults(
     let jobs = build_jobs("measure", requests_per_target)?;
     let timeline_sample_count = jobs
         .iter()
-        .filter(|job| job.request.observe_sampled())
+        .filter(|job| job.call.request.observe_sampled())
         .count();
-    let timeline_first_sample = jobs.iter().find(|job| job.request.observe_sampled());
+    let timeline_first_sample = jobs.iter().find(|job| job.call.request.observe_sampled());
     let prepare_elapsed = prepare_started.elapsed();
     let total_requests = jobs.len();
     let maximum_request_sobj_head_bytes = jobs
         .iter()
-        .map(|job| job.request.body.len())
+        .map(|job| job.call.request.body.len())
         .max()
         .unwrap_or(0);
     ctx.record("payload_mode", defaults.payload_mode.as_str());
@@ -882,7 +1007,7 @@ fn run_network_ping_with_defaults(
     if let Some(job) = timeline_first_sample {
         ctx.record(
             "timeline_first_traceparent",
-            job.request.traceparent().unwrap_or_default(),
+            job.call.request.traceparent().unwrap_or_default(),
         );
         ctx.record("timeline_first_target", job.target_node_id.to_string());
     }
@@ -934,6 +1059,14 @@ fn run_network_ping_with_defaults(
         )));
     }
 
+    let source_daemon_chunk_metrics_before = runtime
+        .block_on(daemon_client.network_chunk_metrics_async())
+        .map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot sample source-daemon network chunk metrics before benchmark: {source}"
+            ))
+        })?
+        .chunk_metrics;
     let client_timeline_capacity = benchmark_client_timeline_capacity(timeline_sample_count);
     if timeline_sample_count > 0 {
         network::start_network_timeline_capture(client_timeline_capacity).map_err(|error| {
@@ -942,9 +1075,14 @@ fn run_network_ping_with_defaults(
             ))
         })?;
     }
+    // Snapshot after warmup so allocation/copy counters describe only the
+    // measured calls. This makes ownership regressions visible alongside
+    // latency and throughput without changing either hard gate.
+    let chunk_metrics_before = network::network_chunk_metrics();
     let started = Instant::now();
     let measured_result = runtime.block_on(run_network_ping_jobs_async(jobs, concurrency_limit));
     let elapsed = started.elapsed();
+    let chunk_metrics_after = network::network_chunk_metrics();
     let client_timeline = if timeline_sample_count > 0 {
         Some(network::stop_network_timeline_capture().map_err(|error| {
             SinomoTestError::failed(format!(
@@ -954,6 +1092,14 @@ fn run_network_ping_with_defaults(
     } else {
         None
     };
+    let source_daemon_chunk_metrics_after = runtime
+        .block_on(daemon_client.network_chunk_metrics_async())
+        .map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot sample source-daemon network chunk metrics after benchmark: {source}"
+            ))
+        })?
+        .chunk_metrics;
     let mut results = measured_result?;
     let total_elapsed = benchmark_started.elapsed();
     if let Some(snapshot) = client_timeline {
@@ -975,6 +1121,8 @@ fn run_network_ping_with_defaults(
     let mut failures = Vec::new();
     let mut successes_by_target = BTreeMap::<String, usize>::new();
     let mut failures_by_target = BTreeMap::<String, usize>::new();
+    let mut successes_by_route_class = BTreeMap::<String, usize>::new();
+    let mut successes_by_relay_hops = BTreeMap::<String, usize>::new();
     let mut latencies_by_target = BTreeMap::<String, Vec<u64>>::new();
     let mut latencies_by_target_us = BTreeMap::<String, Vec<u64>>::new();
     for result in &results {
@@ -993,6 +1141,17 @@ fn run_network_ping_with_defaults(
                     .push(result.latency_us);
                 *successes_by_target
                     .entry(result.target_node_id.to_string())
+                    .or_default() += 1;
+                *successes_by_route_class
+                    .entry(result.route_class.as_str().to_string())
+                    .or_default() += 1;
+                *successes_by_relay_hops
+                    .entry(
+                        result
+                            .relay_hops
+                            .map(|hops| hops.to_string())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    )
                     .or_default() += 1;
             }
             NetworkPingOutcome::Failure(detail) => {
@@ -1028,6 +1187,92 @@ fn run_network_ping_with_defaults(
     let request_bytes_per_second = rate_per_second(total_success_request_bytes as f64, elapsed);
     let response_bytes_per_second = rate_per_second(total_success_response_bytes as f64, elapsed);
     let payload_bytes_per_second = rate_per_second(total_success_payload_bytes as f64, elapsed);
+    let successful_payload_bytes_by_route_class = successes_by_route_class
+        .iter()
+        .map(|(route_class, successes)| {
+            (
+                route_class.clone(),
+                payload_bytes_per_success.saturating_mul(*successes) as u64,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let payload_bytes_per_second_by_route_class = successful_payload_bytes_by_route_class
+        .iter()
+        .map(|(route_class, bytes)| (route_class.clone(), rate_per_second(*bytes as f64, elapsed)))
+        .collect::<BTreeMap<_, _>>();
+    let client_chunk_allocations = chunk_metrics_after
+        .allocations
+        .saturating_sub(chunk_metrics_before.allocations);
+    let client_chunk_reuses = chunk_metrics_after
+        .reuses
+        .saturating_sub(chunk_metrics_before.reuses);
+    let client_chunk_deallocations = chunk_metrics_after
+        .deallocations
+        .saturating_sub(chunk_metrics_before.deallocations);
+    let client_payload_copy_bytes = chunk_metrics_after
+        .payload_copy_bytes
+        .saturating_sub(chunk_metrics_before.payload_copy_bytes);
+    let client_shared_source_normalization_copy_bytes = chunk_metrics_after
+        .shared_source_normalization_copy_bytes
+        .saturating_sub(chunk_metrics_before.shared_source_normalization_copy_bytes);
+    let client_byte_stream_write_adapter_copy_bytes = chunk_metrics_after
+        .byte_stream_write_adapter_copy_bytes
+        .saturating_sub(chunk_metrics_before.byte_stream_write_adapter_copy_bytes);
+    let client_byte_stream_read_adapter_copy_bytes = chunk_metrics_after
+        .byte_stream_read_adapter_copy_bytes
+        .saturating_sub(chunk_metrics_before.byte_stream_read_adapter_copy_bytes);
+    let client_contiguous_body_materialization_copy_bytes = chunk_metrics_after
+        .contiguous_body_materialization_copy_bytes
+        .saturating_sub(chunk_metrics_before.contiguous_body_materialization_copy_bytes);
+    let source_daemon_chunk_allocations = source_daemon_chunk_metrics_after
+        .allocations
+        .saturating_sub(source_daemon_chunk_metrics_before.allocations);
+    let source_daemon_chunk_reuses = source_daemon_chunk_metrics_after
+        .reuses
+        .saturating_sub(source_daemon_chunk_metrics_before.reuses);
+    let source_daemon_chunk_deallocations = source_daemon_chunk_metrics_after
+        .deallocations
+        .saturating_sub(source_daemon_chunk_metrics_before.deallocations);
+    let source_daemon_payload_copy_bytes = source_daemon_chunk_metrics_after
+        .payload_copy_bytes
+        .saturating_sub(source_daemon_chunk_metrics_before.payload_copy_bytes);
+    let source_daemon_shared_source_normalization_copy_bytes = source_daemon_chunk_metrics_after
+        .shared_source_normalization_copy_bytes
+        .saturating_sub(source_daemon_chunk_metrics_before.shared_source_normalization_copy_bytes);
+    let source_daemon_byte_stream_write_adapter_copy_bytes = source_daemon_chunk_metrics_after
+        .byte_stream_write_adapter_copy_bytes
+        .saturating_sub(source_daemon_chunk_metrics_before.byte_stream_write_adapter_copy_bytes);
+    let source_daemon_byte_stream_read_adapter_copy_bytes = source_daemon_chunk_metrics_after
+        .byte_stream_read_adapter_copy_bytes
+        .saturating_sub(source_daemon_chunk_metrics_before.byte_stream_read_adapter_copy_bytes);
+    let source_daemon_contiguous_body_materialization_copy_bytes =
+        source_daemon_chunk_metrics_after
+            .contiguous_body_materialization_copy_bytes
+            .saturating_sub(
+                source_daemon_chunk_metrics_before.contiguous_body_materialization_copy_bytes,
+            );
+    let chunk_allocations =
+        client_chunk_allocations.saturating_add(source_daemon_chunk_allocations);
+    let chunk_reuses = client_chunk_reuses.saturating_add(source_daemon_chunk_reuses);
+    let chunk_deallocations =
+        client_chunk_deallocations.saturating_add(source_daemon_chunk_deallocations);
+    let payload_copy_bytes =
+        client_payload_copy_bytes.saturating_add(source_daemon_payload_copy_bytes);
+    let shared_source_normalization_copy_bytes = client_shared_source_normalization_copy_bytes
+        .saturating_add(source_daemon_shared_source_normalization_copy_bytes);
+    let byte_stream_write_adapter_copy_bytes = client_byte_stream_write_adapter_copy_bytes
+        .saturating_add(source_daemon_byte_stream_write_adapter_copy_bytes);
+    let byte_stream_read_adapter_copy_bytes = client_byte_stream_read_adapter_copy_bytes
+        .saturating_add(source_daemon_byte_stream_read_adapter_copy_bytes);
+    let contiguous_body_materialization_copy_bytes =
+        client_contiguous_body_materialization_copy_bytes
+            .saturating_add(source_daemon_contiguous_body_materialization_copy_bytes);
+    let chunk_allocations_per_gib = if total_success_payload_bytes == 0 {
+        0.0
+    } else {
+        chunk_allocations as f64 * (1024_f64 * 1024_f64 * 1024_f64)
+            / total_success_payload_bytes as f64
+    };
     let latency_by_target_ms = latencies_by_target
         .into_iter()
         .map(|(target, mut target_latencies)| {
@@ -1072,6 +1317,114 @@ fn run_network_ping_with_defaults(
     ctx.record("requests_per_second", requests_per_second);
     ctx.record("success_payload_bytes", total_success_payload_bytes as u64);
     ctx.record("payload_bytes_per_second", payload_bytes_per_second);
+    ctx.record("chunk_allocations", chunk_allocations);
+    ctx.record("chunk_reuses", chunk_reuses);
+    ctx.record("chunk_deallocations", chunk_deallocations);
+    ctx.record("payload_copy_bytes", payload_copy_bytes);
+    ctx.record(
+        "shared_source_normalization_copy_bytes",
+        shared_source_normalization_copy_bytes,
+    );
+    ctx.record(
+        "byte_stream_write_adapter_copy_bytes",
+        byte_stream_write_adapter_copy_bytes,
+    );
+    ctx.record(
+        "byte_stream_read_adapter_copy_bytes",
+        byte_stream_read_adapter_copy_bytes,
+    );
+    ctx.record(
+        "contiguous_body_materialization_copy_bytes",
+        contiguous_body_materialization_copy_bytes,
+    );
+    ctx.record("client_chunk_allocations", client_chunk_allocations);
+    ctx.record("client_chunk_reuses", client_chunk_reuses);
+    ctx.record("client_chunk_deallocations", client_chunk_deallocations);
+    ctx.record("client_payload_copy_bytes", client_payload_copy_bytes);
+    ctx.record(
+        "client_shared_source_normalization_copy_bytes",
+        client_shared_source_normalization_copy_bytes,
+    );
+    ctx.record(
+        "client_byte_stream_write_adapter_copy_bytes",
+        client_byte_stream_write_adapter_copy_bytes,
+    );
+    ctx.record(
+        "client_byte_stream_read_adapter_copy_bytes",
+        client_byte_stream_read_adapter_copy_bytes,
+    );
+    ctx.record(
+        "client_contiguous_body_materialization_copy_bytes",
+        client_contiguous_body_materialization_copy_bytes,
+    );
+    ctx.record(
+        "source_daemon_chunk_allocations",
+        source_daemon_chunk_allocations,
+    );
+    ctx.record("source_daemon_chunk_reuses", source_daemon_chunk_reuses);
+    ctx.record(
+        "source_daemon_chunk_deallocations",
+        source_daemon_chunk_deallocations,
+    );
+    ctx.record(
+        "source_daemon_payload_copy_bytes",
+        source_daemon_payload_copy_bytes,
+    );
+    ctx.record(
+        "source_daemon_shared_source_normalization_copy_bytes",
+        source_daemon_shared_source_normalization_copy_bytes,
+    );
+    ctx.record(
+        "source_daemon_byte_stream_write_adapter_copy_bytes",
+        source_daemon_byte_stream_write_adapter_copy_bytes,
+    );
+    ctx.record(
+        "source_daemon_byte_stream_read_adapter_copy_bytes",
+        source_daemon_byte_stream_read_adapter_copy_bytes,
+    );
+    ctx.record(
+        "source_daemon_contiguous_body_materialization_copy_bytes",
+        source_daemon_contiguous_body_materialization_copy_bytes,
+    );
+    ctx.record("chunk_allocations_per_gib", chunk_allocations_per_gib);
+    ctx.record(
+        "pooled_chunk_allocations_per_gib",
+        chunk_allocations_per_gib,
+    );
+    ctx.record(
+        "chunk_peak_active_bytes",
+        chunk_metrics_after
+            .peak_active_bytes
+            .max(source_daemon_chunk_metrics_after.peak_active_bytes) as u64,
+    );
+    ctx.record(
+        "chunk_peak_allocated_bytes",
+        chunk_metrics_after
+            .peak_allocated_bytes
+            .max(source_daemon_chunk_metrics_after.peak_allocated_bytes) as u64,
+    );
+    ctx.record(
+        "chunk_retained_bytes",
+        chunk_metrics_after
+            .retained_bytes
+            .saturating_add(source_daemon_chunk_metrics_after.retained_bytes) as u64,
+    );
+    ctx.record(
+        "client_chunk_peak_active_bytes",
+        chunk_metrics_after.peak_active_bytes as u64,
+    );
+    ctx.record(
+        "client_chunk_peak_allocated_bytes",
+        chunk_metrics_after.peak_allocated_bytes as u64,
+    );
+    ctx.record(
+        "source_daemon_chunk_peak_active_bytes",
+        source_daemon_chunk_metrics_after.peak_active_bytes as u64,
+    );
+    ctx.record(
+        "source_daemon_chunk_peak_allocated_bytes",
+        source_daemon_chunk_metrics_after.peak_allocated_bytes as u64,
+    );
     ctx.record(
         "logical_transfer_bytes_per_success",
         payload_bytes_per_success as u64,
@@ -1125,6 +1478,19 @@ fn run_network_ping_with_defaults(
     ctx.record("proxy_round_trip_latency_p50_us", proxy_round_trip_p50_us);
     ctx.record("proxy_round_trip_latency_p95_us", proxy_round_trip_p95_us);
     ctx.record("successes_by_target", successes_by_target);
+    ctx.record("successes_by_route_class", successes_by_route_class);
+    ctx.record("successes_by_relay_hops", successes_by_relay_hops);
+    ctx.record(
+        "successful_payload_bytes_by_route_class",
+        successful_payload_bytes_by_route_class,
+    );
+    ctx.record(
+        "payload_bytes_per_second_by_route_class",
+        payload_bytes_per_second_by_route_class,
+    );
+    if let Some(process_peak_resident_bytes) = process_peak_resident_bytes() {
+        ctx.record("process_peak_resident_bytes", process_peak_resident_bytes);
+    }
     ctx.record("failures_by_target", failures_by_target);
     ctx.record("latency_by_target_ms", latency_by_target_ms);
     ctx.record("latency_by_target_us", latency_by_target_us);
@@ -1191,7 +1557,7 @@ fn run_network_ping_with_defaults(
         ),
     };
     Ok(SinomoTestOutcome::passed(format!(
-        "network ping completed {success_count}/{total_requests} {} RPCs in {}ms ({requests_per_second:.2} req/s, {throughput_summary}, p50={p50_ms}ms/{p50_us}us p95={p95_ms}ms/{p95_us}us)",
+        "network ping completed {success_count}/{total_requests} {} RPCs in {}ms ({requests_per_second:.2} req/s, {throughput_summary}, payload-copy-bytes={payload_copy_bytes}, chunk-allocations/GiB={chunk_allocations_per_gib:.2}, p50={p50_ms}ms/{p50_us}us p95={p95_ms}ms/{p95_us}us)",
         defaults.payload_mode.as_str(),
         elapsed.as_millis()
     )))
@@ -2277,22 +2643,26 @@ fn normalized_tcp_endpoint_address(address: &str) -> &str {
     value
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct NetworkPingJob {
     payload_mode: NetworkPingPayloadMode,
     target_node_id: NodeId,
+    route_class: NetworkPingRouteClass,
+    relay_hops: Option<usize>,
     nonce: String,
     timeout: Duration,
     control_timeout: Duration,
     request_payload_bytes: usize,
     response_payload_bytes: usize,
-    request: network::ObjectRpcRequest,
+    call: network::ObjectRpcCall,
     daemon_address: String,
 }
 
 #[derive(Debug)]
 struct NetworkPingResult {
     target_node_id: NodeId,
+    route_class: NetworkPingRouteClass,
+    relay_hops: Option<usize>,
     latency_ms: u64,
     latency_us: u64,
     proxy_round_trip_latency_us: u64,
@@ -2307,8 +2677,12 @@ enum NetworkPingOutcome {
 
 async fn run_network_ping_job(job: NetworkPingJob) -> NetworkPingResult {
     let started = Instant::now();
+    let timeout = job.timeout;
+    let target_node_id = job.target_node_id.clone();
+    let route_class = job.route_class;
+    let relay_hops = job.relay_hops;
     let outcome =
-        run_network_ping_outcome_with_deadline(job.timeout, run_network_ping_job_inner(&job)).await;
+        run_network_ping_outcome_with_deadline(timeout, run_network_ping_job_inner(job)).await;
     let wall_elapsed = started.elapsed();
     // The direct and one-relay hardgates constrain the daemon's routed RPC,
     // not the additional test-client-to-daemon proxy RPC. The full outer call
@@ -2321,7 +2695,9 @@ async fn run_network_ping_job(job: NetworkPingJob) -> NetworkPingResult {
         _ => wall_elapsed,
     };
     NetworkPingResult {
-        target_node_id: job.target_node_id,
+        target_node_id,
+        route_class,
+        relay_hops,
         latency_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
         latency_us: elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
         proxy_round_trip_latency_us: wall_elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
@@ -2342,19 +2718,38 @@ async fn run_network_ping_outcome_with_deadline(
     }
 }
 
-async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome {
-    let client =
-        DaemonApiClient::at_address(job.daemon_address.clone()).with_timeout(job.control_timeout);
-    let (response, response_body, forward_elapsed) = match job.payload_mode {
+async fn run_network_ping_job_inner(job: NetworkPingJob) -> NetworkPingOutcome {
+    let NetworkPingJob {
+        payload_mode,
+        target_node_id,
+        route_class: _,
+        relay_hops: _,
+        nonce,
+        timeout,
+        control_timeout,
+        request_payload_bytes,
+        response_payload_bytes,
+        call,
+        daemon_address,
+    } = job;
+    let client = DaemonApiClient::at_address(daemon_address).with_timeout(control_timeout);
+    let (response, response_body, forward_elapsed) = match payload_mode {
         NetworkPingPayloadMode::EmbeddedSobj => {
-            let (response, forward_elapsed) = match client
-                .object_rpc_to_target_with_forward_elapsed_async(
-                    &job.target_node_id,
-                    &job.request,
-                    job.timeout,
-                    Some(job.timeout),
+            let (result, forward_elapsed) = match client
+                .object_rpc_call_to_target_with_forward_elapsed_async(
+                    &target_node_id,
+                    call,
+                    timeout,
+                    Some(timeout),
                     true,
                 )
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
+            };
+            let response = match result
+                .decode_body::<cluster::ClusterNetworkPingResponse>()
                 .await
             {
                 Ok(response) => response,
@@ -2363,24 +2758,12 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
             (response, None, Some(forward_elapsed))
         }
         NetworkPingPayloadMode::SemanticAttachment => {
-            let request_attachment_bytes = match u64::try_from(job.request_payload_bytes) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    return NetworkPingOutcome::Failure(
-                        "request attachment size does not fit u64".to_string(),
-                    );
-                }
-            };
-            let call = network::ObjectRpcCall::new(
-                job.request.clone(),
-                network::ObjectRpcBodySource::zeroes(request_attachment_bytes),
-            );
-            let result = match client
-                .object_rpc_call_to_target_with_deadline_async(
-                    &job.target_node_id,
+            let (result, forward_elapsed) = match client
+                .object_rpc_call_to_target_with_forward_elapsed_async(
+                    &target_node_id,
                     call,
-                    job.timeout,
-                    Some(job.timeout),
+                    timeout,
+                    Some(timeout),
                     true,
                 )
                 .await
@@ -2388,29 +2771,30 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
                 Ok(result) => result,
                 Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
             };
-            (result.response, Some(result.body), None)
+            if let Err(error) = result.response.error_detail() {
+                return NetworkPingOutcome::Failure(error.to_string());
+            }
+            let response = match cluster::decode_cluster_network_ping_rpc_response(&result.response)
+            {
+                Ok(response) => response,
+                Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
+            };
+            (response, Some(result.body), Some(forward_elapsed))
         }
     };
-    if let Err(error) = response.error_detail() {
-        return NetworkPingOutcome::Failure(error.to_string());
-    }
-    let response = match cluster::decode_cluster_network_ping_rpc_response(&response) {
-        Ok(response) => response,
-        Err(error) => return NetworkPingOutcome::Failure(error.to_string()),
-    };
-    if response.nonce != job.nonce {
+    if response.nonce != nonce {
         return NetworkPingOutcome::Failure(format!(
             "nonce mismatch: got {}, expected {}",
-            response.nonce, job.nonce
+            response.nonce, nonce
         ));
     }
-    if response.responder_node_id != job.target_node_id {
+    if response.responder_node_id != target_node_id {
         return NetworkPingOutcome::Failure(format!(
             "responder mismatch: got {}, expected {}",
-            response.responder_node_id, job.target_node_id
+            response.responder_node_id, target_node_id
         ));
     }
-    match job.payload_mode {
+    match payload_mode {
         NetworkPingPayloadMode::EmbeddedSobj => {
             if response.payload_mode != cluster::ClusterNetworkPingPayloadMode::EmbeddedSobj {
                 return NetworkPingOutcome::Failure(format!(
@@ -2418,17 +2802,17 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
                     response.payload_mode
                 ));
             }
-            if response.payload_bytes != job.request_payload_bytes {
+            if response.payload_bytes != request_payload_bytes {
                 return NetworkPingOutcome::Failure(format!(
                     "payload length mismatch: got {}, expected {}",
-                    response.payload_bytes, job.request_payload_bytes
+                    response.payload_bytes, request_payload_bytes
                 ));
             }
-            if response.response_payload.len() != job.response_payload_bytes {
+            if response.response_payload.len() != response_payload_bytes {
                 return NetworkPingOutcome::Failure(format!(
                     "response payload length mismatch: got {}, expected {}",
                     response.response_payload.len(),
-                    job.response_payload_bytes
+                    response_payload_bytes
                 ));
             }
         }
@@ -2444,7 +2828,7 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
                     "semantic attachment response mixed bytes into the SOBJ head".to_string(),
                 );
             }
-            let expected_request_bytes = match u64::try_from(job.request_payload_bytes) {
+            let expected_request_bytes = match u64::try_from(request_payload_bytes) {
                 Ok(bytes) => bytes,
                 Err(_) => {
                     return NetworkPingOutcome::Failure(
@@ -2455,10 +2839,10 @@ async fn run_network_ping_job_inner(job: &NetworkPingJob) -> NetworkPingOutcome 
             if response.request_attachment_bytes != expected_request_bytes {
                 return NetworkPingOutcome::Failure(format!(
                     "request attachment length mismatch: got {}, expected {}",
-                    response.request_attachment_bytes, job.request_payload_bytes
+                    response.request_attachment_bytes, request_payload_bytes
                 ));
             }
-            let expected_response_bytes = match u64::try_from(job.response_payload_bytes) {
+            let expected_response_bytes = match u64::try_from(response_payload_bytes) {
                 Ok(bytes) => bytes,
                 Err(_) => {
                     return NetworkPingOutcome::Failure(
@@ -2710,6 +3094,34 @@ mod tests {
         assert_eq!(defaults.warmup_requests_per_target, Some(20));
         assert_eq!(defaults.concurrency, 8);
         assert_eq!(defaults.min_requests_per_second, 50.0);
+    }
+
+    #[test]
+    fn route_topology_separates_direct_and_relayed_throughput_samples() {
+        let local = NodeId::from_legacy_named("node_network_topology_local").expect("local");
+        let relay = NodeId::from_legacy_named("node_network_topology_relay").expect("relay");
+        let target = NodeId::from_legacy_named("node_network_topology_target").expect("target");
+        let direct = vec![local.clone(), target.clone()];
+        let relayed = vec![local, relay, target];
+
+        assert_eq!(
+            network_ping_route_topology(Some(&direct)),
+            (NetworkPingRouteClass::Direct, Some(0))
+        );
+        assert_eq!(
+            network_ping_route_topology(Some(&relayed)),
+            (NetworkPingRouteClass::Relayed, Some(1))
+        );
+        assert_eq!(
+            network_ping_route_topology(None),
+            (NetworkPingRouteClass::Unresolved, None)
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn process_peak_resident_memory_is_available_for_cluster_benchmarks() {
+        assert!(process_peak_resident_bytes().is_some_and(|bytes| bytes > 0));
     }
 
     #[test]

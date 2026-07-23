@@ -7,7 +7,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::events::SessionId;
-use sinomo_runtime::network::{ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_runtime::network::ObjectRpcRequest;
 use sinomo_runtime::service::{
     Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
     ServiceRegistryBuilder, ServiceRoute,
@@ -517,25 +517,27 @@ impl Service for AgentRuntimeService {
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         Box::pin(async move {
             let store = FileAgentSessionStore::for_data_dir(ctx.data_dir.as_ref());
-            let response = match request.route.as_str() {
+            match request.route.as_str() {
                 AGENT_SESSION_INSPECT_ROUTE => {
-                    let request: AgentSessionInspectRequest = request.decode_body()?;
+                    let request: AgentSessionInspectRequest =
+                        ctx.decode_request_body(&request).await?;
                     let response = inspect_session(&store, request)?;
-                    ObjectRpcResponse::encode_body(AGENT_SESSION_INSPECT_ROUTE, &response)?
+                    ctx.respond_value(AGENT_SESSION_INSPECT_ROUTE, response)?;
                 }
                 AGENT_SESSION_PROGRESS_ROUTE => {
-                    let request: AgentSessionProgressRequest = request.decode_body()?;
+                    let request: AgentSessionProgressRequest =
+                        ctx.decode_request_body(&request).await?;
                     let response = session_progress(&store, request)?;
-                    ObjectRpcResponse::encode_body(AGENT_SESSION_PROGRESS_ROUTE, &response)?
+                    ctx.respond_value(AGENT_SESSION_PROGRESS_ROUTE, response)?;
                 }
                 AGENT_SESSION_TERMINAL_RESULTS_ROUTE => {
-                    let request: AgentSessionTerminalResultsRequest = request.decode_body()?;
+                    let request: AgentSessionTerminalResultsRequest =
+                        ctx.decode_request_body(&request).await?;
                     let response = terminal_results(&store, request)?;
-                    ObjectRpcResponse::encode_body(AGENT_SESSION_TERMINAL_RESULTS_ROUTE, &response)?
+                    ctx.respond_value(AGENT_SESSION_TERMINAL_RESULTS_ROUTE, response)?;
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
-            };
-            ctx.respond(response)?;
+            }
             Ok(ServiceDisposition::Continue)
         })
     }
@@ -571,47 +573,52 @@ impl Service for AgentRuntimeControlService {
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         let host = std::sync::Arc::clone(&self.host);
         Box::pin(async move {
-            let response = match request.route.as_str() {
+            match request.route.as_str() {
                 AGENT_SESSION_STEER_ROUTE => {
-                    let request: AgentSessionSteerRequest = request.decode_body()?;
+                    let request: AgentSessionSteerRequest =
+                        ctx.decode_request_body(&request).await?;
                     let session_id = request.session_id.clone();
                     let result = host.steer(request).map_err(agent_control_error)?;
-                    ObjectRpcResponse::encode_body(
+                    ctx.respond_value(
                         AGENT_SESSION_STEER_ROUTE,
-                        &AgentSessionControlResponse { session_id, result },
-                    )?
+                        AgentSessionControlResponse { session_id, result },
+                    )?;
                 }
                 AGENT_SESSION_FOLLOW_UP_ROUTE => {
-                    let request: AgentSessionFollowUpRequest = request.decode_body()?;
+                    let request: AgentSessionFollowUpRequest =
+                        ctx.decode_request_body(&request).await?;
                     let session_id = request.session_id.clone();
                     let result = host.follow_up(request).map_err(agent_control_error)?;
-                    ObjectRpcResponse::encode_body(
+                    ctx.respond_value(
                         AGENT_SESSION_FOLLOW_UP_ROUTE,
-                        &AgentSessionControlResponse { session_id, result },
-                    )?
+                        AgentSessionControlResponse { session_id, result },
+                    )?;
                 }
                 AGENT_SESSION_REMOVE_QUEUED_INPUT_ROUTE => {
-                    let request: AgentSessionRemoveQueuedInputRequest = request.decode_body()?;
+                    let request: AgentSessionRemoveQueuedInputRequest =
+                        ctx.decode_request_body(&request).await?;
                     let session_id = request.session_id.clone();
                     let result = host
                         .remove_queued_input(request)
                         .map_err(agent_control_error)?;
-                    ObjectRpcResponse::encode_body(
+                    ctx.respond_value(
                         AGENT_SESSION_REMOVE_QUEUED_INPUT_ROUTE,
-                        &AgentSessionControlResponse { session_id, result },
-                    )?
+                        AgentSessionControlResponse { session_id, result },
+                    )?;
                 }
                 AGENT_SESSION_INTERRUPT_ROUTE => {
-                    let request: AgentSessionInterruptRequest = request.decode_body()?;
+                    let request: AgentSessionInterruptRequest =
+                        ctx.decode_request_body(&request).await?;
                     let session_id = request.session_id.clone();
                     let result = host.interrupt(request).map_err(agent_control_error)?;
-                    ObjectRpcResponse::encode_body(
+                    ctx.respond_value(
                         AGENT_SESSION_INTERRUPT_ROUTE,
-                        &AgentSessionControlResponse { session_id, result },
-                    )?
+                        AgentSessionControlResponse { session_id, result },
+                    )?;
                 }
                 AGENT_SESSION_RESUME_ROUTE => {
-                    let request: AgentSessionResumeRequest = request.decode_body()?;
+                    let request: AgentSessionResumeRequest =
+                        ctx.decode_request_body(&request).await?;
                     let response = match host.resume(request.clone()) {
                         Ok(response) => response,
                         Err(error) => {
@@ -619,11 +626,10 @@ impl Service for AgentRuntimeControlService {
                             resume_session_from_store(&store, request, error.to_string())?
                         }
                     };
-                    ObjectRpcResponse::encode_body(AGENT_SESSION_RESUME_ROUTE, &response)?
+                    ctx.respond_value(AGENT_SESSION_RESUME_ROUTE, response)?;
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
-            };
-            ctx.respond(response)?;
+            }
             Ok(ServiceDisposition::Continue)
         })
     }
@@ -841,7 +847,9 @@ mod tests {
     };
     use sinomo_lm::{LanguageModelError, LanguageModelRequest, LanguageModelResponse};
     use sinomo_runtime::local::SinomoDataDir;
-    use sinomo_runtime::network::{ObjectRpcIncomingBody, ObjectRpcOutgoingResponse};
+    use sinomo_runtime::network::{
+        ObjectRpcIncomingBody, ObjectRpcOutgoingResponse, ObjectRpcResponse,
+    };
     use sinomo_runtime::service::{ResponseSink, ServiceRegistry, ServiceSigner};
     use std::future::Future;
     use std::pin::Pin;

@@ -110,32 +110,24 @@ impl Service for DaemonBuildService {
         Box::pin(async move {
             match request.route.as_str() {
                 BUILD_CAPABILITIES_ROUTE => {
-                    let payload: BuildCapabilitiesRequest = request.decode_body()?;
+                    let payload: BuildCapabilitiesRequest =
+                        ctx.decode_request_body(&request).await?;
                     let response = host.capabilities(payload)?;
-                    ctx.respond(ObjectRpcResponse::encode_body(
-                        BUILD_CAPABILITIES_ROUTE,
-                        &response,
-                    )?)?;
+                    ctx.respond_value(BUILD_CAPABILITIES_ROUTE, response)?;
                 }
                 BUILD_SUBMIT_ROUTE => {
-                    let payload: BuildSubmitRequest = request.decode_body()?;
+                    let payload: BuildSubmitRequest = ctx.decode_request_body(&request).await?;
                     let mut body = ctx.take_request_body();
                     let response = host.submit(payload, &mut body).await?;
-                    ctx.respond(ObjectRpcResponse::encode_body(
-                        BUILD_SUBMIT_ROUTE,
-                        &response,
-                    )?)?;
+                    ctx.respond_value(BUILD_SUBMIT_ROUTE, response)?;
                 }
                 BUILD_STATUS_ROUTE => {
-                    let payload: BuildStatusRequest = request.decode_body()?;
+                    let payload: BuildStatusRequest = ctx.decode_request_body(&request).await?;
                     let response = host.status(&payload)?;
-                    ctx.respond(ObjectRpcResponse::encode_body(
-                        BUILD_STATUS_ROUTE,
-                        &response,
-                    )?)?;
+                    ctx.respond_value(BUILD_STATUS_ROUTE, response)?;
                 }
                 BUILD_ARTIFACT_ROUTE => {
-                    let payload: BuildArtifactRequest = request.decode_body()?;
+                    let payload: BuildArtifactRequest = ctx.decode_request_body(&request).await?;
                     let (response, body) = host.artifact(&payload)?;
                     ctx.respond_with_body(
                         ObjectRpcResponse::encode_body(BUILD_ARTIFACT_ROUTE, &response)?,

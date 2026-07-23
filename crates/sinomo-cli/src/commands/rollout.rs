@@ -718,12 +718,12 @@ pub(crate) fn rollout_module_native_dylib(
                 options.rollout.shadow_port,
                 requested_at.clone(),
             )?;
-            Ok((group.group, request))
+            Ok((group.group, Arc::new(request)))
         })
         .collect::<Result<Vec<_>, CliError>>()?;
     for (group, request) in prepared {
         for target in &group.rollout_targets {
-            match send_daemon_rollout_native_dylib_module(target, &request) {
+            match send_daemon_rollout_native_dylib_module(target, Arc::clone(&request)) {
                 Ok(response) => {
                     println!("{}: {}", target.label(), response.status);
                     if response.status != "accepted" {
@@ -1511,7 +1511,7 @@ fn cluster_build_contacts(
 
 fn send_daemon_build_capabilities_for_target(
     target: &RolloutTarget,
-    request: &BuildCapabilitiesRequest,
+    request: BuildCapabilitiesRequest,
 ) -> Result<BuildCapabilitiesResponse, CliError> {
     if let Some(node_id) = target.rollout_node_id() {
         sinomo_runtime::daemon::send_daemon_build_capabilities_to_target(node_id, request)
@@ -1548,7 +1548,7 @@ fn send_daemon_build_submit_for_target(
 
 fn send_daemon_build_status_for_target(
     target: &RolloutTarget,
-    request: &BuildStatusRequest,
+    request: BuildStatusRequest,
 ) -> Result<BuildStatusResponse, CliError> {
     if let Some(node_id) = target.rollout_node_id() {
         sinomo_runtime::daemon::send_daemon_build_status_to_target(node_id, request)
@@ -1792,7 +1792,7 @@ fn discover_cluster_builder_plans(
             build_key: None,
             artifact_kinds: artifact_kinds.clone(),
         };
-        let initial = match send_daemon_build_capabilities_for_target(contact, &initial_request) {
+        let initial = match send_daemon_build_capabilities_for_target(contact, initial_request) {
             Ok(response) => response,
             Err(error) => {
                 unavailable.push(format!("{}: {error}", contact.label()));
@@ -1824,7 +1824,7 @@ fn discover_cluster_builder_plans(
             build_key: Some(plan.key.clone()),
             artifact_kinds: exact_kinds,
         };
-        let exact = match send_daemon_build_capabilities_for_target(contact, &exact_request) {
+        let exact = match send_daemon_build_capabilities_for_target(contact, exact_request) {
             Ok(response) => response,
             Err(error) => {
                 unavailable.push(format!("{}: {error}", contact.label()));
@@ -1913,12 +1913,15 @@ fn submit_cluster_build_and_wait(
         Err(error) => return Err(error),
     };
     println!("  job: {} ({:?})", submit.job_id, submit.state);
-    let status_request = BuildStatusRequest {
-        job_id: submit.job_id,
-    };
+    let status_job_id = submit.job_id;
     let mut last_state = None;
     loop {
-        let response = send_daemon_build_status_for_target(&builder.contact, &status_request)?;
+        let response = send_daemon_build_status_for_target(
+            &builder.contact,
+            BuildStatusRequest {
+                job_id: status_job_id.clone(),
+            },
+        )?;
         let status = response.status;
         if status.key != builder.plan.key {
             return Err(CliError::Parse {
@@ -3723,16 +3726,15 @@ fn send_daemon_rollout_binary_direct(
 
 pub(crate) fn send_daemon_rollout_native_dylib_module(
     target: &RolloutTarget,
-    request: &ClusterRolloutNativeDylibModuleRequest,
+    request: Arc<ClusterRolloutNativeDylibModuleRequest>,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
-    if target.rollout_node_id().is_some() {
-        send_rollout_object_rpc_value(
-            target,
-            sinomo_runtime::rollout::ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
-            sinomo_runtime::rollout::ROLLOUT_RPC_CATEGORY,
+    if let Some(node_id) = target.rollout_node_id() {
+        daemon_send_daemon_rollout_native_dylib_module_to_target(
+            node_id,
             request,
             DAEMON_ROLLOUT_TIMEOUT,
         )
+        .map_err(Into::into)
     } else if let Some(endpoint) = &target.endpoint {
         daemon_send_daemon_rollout_native_dylib_module_to_endpoint(
             endpoint,
