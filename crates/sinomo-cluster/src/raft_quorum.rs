@@ -1753,6 +1753,7 @@ struct NetworkClusterKvRaftQuorumCommitAsyncHost<'a, H> {
     trace: ClusterKvQuorumCommitTrace,
     initial_term: u64,
     initial_revision: u64,
+    required_replication_node_id: Option<NodeId>,
     host: &'a mut H,
 }
 
@@ -2082,6 +2083,79 @@ where
         })
     }
 
+    fn confirm_required_replication_target_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+        timeout: Duration,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, (), NetworkError> {
+        let Some(target) = self.required_replication_node_id.clone() else {
+            return Box::pin(async { Ok(()) });
+        };
+        if target == state.local_node_id || !state.node_is_raft_voter(&target) {
+            return Box::pin(async { Ok(()) });
+        }
+        let paths = self.paths;
+        let runtime = self.runtime;
+        let storage = Arc::clone(&self.storage);
+        let append_options = self.append_options;
+        let trace = self.trace.clone();
+        let host = &mut *self.host;
+        Box::pin(async move {
+            let started = Instant::now();
+            let mut node_host = AsyncNodeRaftAppendReplicationHost {
+                runtime,
+                paths,
+                storage,
+                options: ClusterRaftAppendReplicationOptions {
+                    timeout,
+                    ..append_options
+                },
+                host,
+            };
+            let result = sinomo_kv::replicate_cluster_kv_raft_to_target_async_with_host(
+                state,
+                &target,
+                &[],
+                node_host.options.kv_options(),
+                &mut node_host,
+            )
+            .await;
+            match &result {
+                Ok(outcome) if outcome.response.accepted => trace.record(
+                    "required_replication_commit_confirm",
+                    started.elapsed(),
+                    state.term,
+                    outcome.response.append.match_index,
+                    state.kv_revision,
+                    "accepted",
+                    format_args!("confirmed committed index to forwarding voter {target}"),
+                ),
+                Ok(outcome) => trace.record(
+                    "required_replication_commit_confirm",
+                    started.elapsed(),
+                    state.term,
+                    outcome.response.append.match_index,
+                    state.kv_revision,
+                    "rejected",
+                    format_args!(
+                        "forwarding voter {target} rejected committed-index confirmation: {}",
+                        outcome.response.detail
+                    ),
+                ),
+                Err(error) => trace.record(
+                    "required_replication_commit_confirm",
+                    started.elapsed(),
+                    state.term,
+                    0,
+                    state.kv_revision,
+                    "error",
+                    format_args!("could not confirm committed index to {target}: {error}"),
+                ),
+            }
+            result.map(|_| ())
+        })
+    }
+
     fn remote_voter_targets_async<'a>(
         &'a mut self,
         state: &'a ClusterBootstrapState,
@@ -2165,11 +2239,14 @@ where
         let paths = self.paths;
         let storage = Arc::clone(&self.storage);
         let append_options = self.append_options;
+        let required_replication_node_id = self.required_replication_node_id.clone();
         let trace = self.trace.clone();
         let host = &mut *self.host;
         Box::pin(async move {
             let started = Instant::now();
             let target_count = targets.len();
+            let mut required_replication_node_id = required_replication_node_id
+                .filter(|required| targets.iter().any(|target| target == required));
             if required_remote_acks == 0 || targets.is_empty() {
                 trace.record(
                     "replication",
@@ -2243,6 +2320,12 @@ where
 
                 let mut sends = Vec::new();
                 for target in &mut pending {
+                    if required_replication_node_id
+                        .as_ref()
+                        .is_some_and(|required| required != &target.target)
+                    {
+                        continue;
+                    }
                     if target.attempts >= append_options.max_attempts {
                         continue;
                     }
@@ -2288,6 +2371,7 @@ where
                 if outcomes.is_empty() {
                     break;
                 }
+                let mut required_replication_failed = false;
                 for (target_node_id, request, result) in outcomes {
                     let Some(position) = pending
                         .iter()
@@ -2300,6 +2384,9 @@ where
                         Ok(response) if response.accepted => {
                             record_cluster_kv_replication_catch_up("accepted", target.attempts);
                             accepted = accepted.saturating_add(1);
+                            if required_replication_node_id.as_ref() == Some(&target.target) {
+                                required_replication_node_id = None;
+                            }
                             completed.push(sinomo_kv::ClusterKvRaftTargetReplicationAttempt {
                                 target: target.target,
                                 latency_ms: Some(
@@ -2314,6 +2401,9 @@ where
                             });
                         }
                         Ok(response) if response.append.term > request.append.term => {
+                            if required_replication_node_id.as_ref() == Some(&target.target) {
+                                required_replication_failed = true;
+                            }
                             record_cluster_kv_replication_catch_up("higher_term", target.attempts);
                             completed.push(sinomo_kv::ClusterKvRaftTargetReplicationAttempt {
                                 target: target.target,
@@ -2340,6 +2430,9 @@ where
                             pending.push(target);
                         }
                         Ok(response) => {
+                            if required_replication_node_id.as_ref() == Some(&target.target) {
+                                required_replication_failed = true;
+                            }
                             record_cluster_kv_replication_catch_up("rejected", target.attempts);
                             completed.push(sinomo_kv::ClusterKvRaftTargetReplicationAttempt {
                                 target: target.target,
@@ -2355,6 +2448,9 @@ where
                             });
                         }
                         Err(error) => {
+                            if required_replication_node_id.as_ref() == Some(&target.target) {
+                                required_replication_failed = true;
+                            }
                             record_cluster_kv_replication_catch_up("failed", target.attempts);
                             completed.push(sinomo_kv::ClusterKvRaftTargetReplicationAttempt {
                                 target: target.target,
@@ -2370,6 +2466,9 @@ where
                             });
                         }
                     }
+                }
+                if required_replication_failed {
+                    break;
                 }
             }
 
@@ -2546,6 +2645,7 @@ pub async fn commit_cluster_raft_command_with_quorum_async_with_host<H>(
     request: KvCommandRequest,
     options: ClusterKvRaftQuorumCommitOptions,
     append_options: ClusterRaftAppendReplicationOptions,
+    required_replication_node_id: Option<NodeId>,
     host: &mut H,
 ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError>
 where
@@ -2585,6 +2685,7 @@ where
         trace: trace.clone(),
         initial_term,
         initial_revision,
+        required_replication_node_id,
         host,
     };
     let commit_started = Instant::now();

@@ -1614,9 +1614,11 @@ pub fn cluster_doctor_findings(
             {
                 continue;
             }
-            if cluster_route_next_hop(&connectivity_graph, &source.node_id, &target.node_id)
-                .is_none()
-            {
+            if !sinomo_network::cluster_nodes_share_healthy_component(
+                &connectivity_graph,
+                &source.node_id,
+                &target.node_id,
+            ) {
                 findings.push(ClusterDoctorFinding::warning(
                     "authority-route-missing",
                     format!(

@@ -424,9 +424,15 @@ mod tests {
         > {
             Box::pin(async move {
                 let request_id = request.request_id.clone();
+                let command_digest = request
+                    .clone()
+                    .into_command_request()
+                    .digest()
+                    .expect("transaction digest");
                 self.commits.lock().expect("commit lock").push(request);
                 Ok(ClusterKvTxnCommitResult {
                     request_id,
+                    command_digest,
                     snapshot: KvSnapshot {
                         revision: KvRevision(1),
                         compacted_revision: KvRevision::ZERO,

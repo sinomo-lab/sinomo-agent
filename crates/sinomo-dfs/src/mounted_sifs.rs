@@ -6,7 +6,7 @@
 use sinomo_core::ClusterBootstrapState;
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
-use sinomo_core::kv::{KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
+use sinomo_core::kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_core::local::SinomoDataDir;
 #[cfg(test)]
 use sinomo_core::network::ObjectRpcResponse;
@@ -357,7 +357,11 @@ mod tests {
                     .expect("transaction request");
             let payload = sinomo_core::kv::cluster_kv_txn_response_rpc_payload(
                 &sinomo_core::kv::ClusterKvTxnCommitResult {
-                    request_id: submitted.request_id,
+                    request_id: submitted.request_id.clone(),
+                    command_digest: submitted
+                        .into_command_request()
+                        .digest()
+                        .expect("transaction digest"),
                     snapshot: sinomo_core::kv::KvSnapshot {
                         revision: KvRevision(7),
                         compacted_revision: KvRevision::ZERO,
@@ -826,33 +830,6 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
             .ok_or_else(|| KvError::AuthorityUnavailable {
                 detail: "cluster KV transaction response omitted its committed result".to_string(),
             })
-    }
-
-    fn linearizable_compare_value(
-        &mut self,
-        key: String,
-        expected_value: Vec<u8>,
-        barrier_key: String,
-    ) -> Result<bool, KvError> {
-        // A fresh write keeps this on the quorum-backed transaction path. A
-        // compare-only transaction could otherwise be satisfied by the
-        // cluster KV semantic no-effect shortcut.
-        let barrier_value =
-            sinomo_core::kv::encode_kv_value(&sinomo_core::Id::generate().to_string())?;
-        Ok(self
-            .txn(KvTxn {
-                compares: vec![KvCompare::ValueEquals {
-                    key,
-                    value: expected_value,
-                }],
-                success: vec![KvOp::Put {
-                    key: barrier_key,
-                    value: barrier_value,
-                    lease_id: None,
-                }],
-                failure: Vec::new(),
-            })?
-            .succeeded)
     }
 }
 

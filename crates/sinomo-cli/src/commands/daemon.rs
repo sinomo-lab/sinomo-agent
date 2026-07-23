@@ -11,13 +11,19 @@ use sinomo_runtime::cluster::ClusterKvPathsExt;
 pub(crate) enum DaemonCliCommand {
     Run(DaemonRunOptions),
     Start(DaemonRunOptions),
-    Status(DaemonRunOptions),
+    Status(DaemonStatusOptions),
     Stop(DaemonRunOptions),
     ShadowRun(DaemonRunOptions),
     ShadowStart(DaemonRunOptions),
-    ShadowStatus(DaemonRunOptions),
+    ShadowStatus(DaemonStatusOptions),
     ShadowStop(DaemonRunOptions),
     CompleteShadowRollout,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DaemonStatusOptions {
+    pub(crate) endpoint: DaemonRunOptions,
+    pub(crate) explicit_address: bool,
 }
 
 pub(crate) fn print_daemon_platform(status: &DaemonStatus) {
@@ -85,6 +91,17 @@ fn daemon_options_from_matches(
     Ok(options)
 }
 
+fn daemon_status_options_from_matches(
+    matches: &CliCommandMatches,
+    options: DaemonRunOptions,
+) -> Result<DaemonStatusOptions, CliParseError> {
+    let explicit_address = matches.value("--host").is_some() || matches.value("--port").is_some();
+    Ok(DaemonStatusOptions {
+        endpoint: daemon_options_from_matches(matches, options)?,
+        explicit_address,
+    })
+}
+
 fn parse_daemon_matches(matches: &CliCommandMatches) -> Result<DaemonCliCommand, CliParseError> {
     let path = matches
         .path()
@@ -93,14 +110,17 @@ fn parse_daemon_matches(matches: &CliCommandMatches) -> Result<DaemonCliCommand,
         .collect::<Vec<_>>();
     let main = || daemon_options_from_matches(matches, DaemonRunOptions::default());
     let shadow = || daemon_options_from_matches(matches, DaemonRunOptions::shadow_default());
+    let main_status = || daemon_status_options_from_matches(matches, DaemonRunOptions::default());
+    let shadow_status =
+        || daemon_status_options_from_matches(matches, DaemonRunOptions::shadow_default());
     match path.as_slice() {
         ["daemon", "run"] => main().map(DaemonCliCommand::Run),
         ["daemon", "start"] => main().map(DaemonCliCommand::Start),
-        ["daemon", "status"] => main().map(DaemonCliCommand::Status),
+        ["daemon", "status"] => main_status().map(DaemonCliCommand::Status),
         ["daemon", "stop"] => main().map(DaemonCliCommand::Stop),
         ["daemon", "shadow", "run"] => shadow().map(DaemonCliCommand::ShadowRun),
         ["daemon", "shadow", "start"] => shadow().map(DaemonCliCommand::ShadowStart),
-        ["daemon", "shadow", "status"] => shadow().map(DaemonCliCommand::ShadowStatus),
+        ["daemon", "shadow", "status"] => shadow_status().map(DaemonCliCommand::ShadowStatus),
         ["daemon", "shadow", "stop"] => shadow().map(DaemonCliCommand::ShadowStop),
         ["daemon", "__complete-shadow-rollout"] => Ok(DaemonCliCommand::CompleteShadowRollout),
         _ => Err(CliParseError::Parse {
@@ -382,11 +402,11 @@ pub(crate) fn start_daemon_with_paths_with_env(
     Ok(())
 }
 
-pub(crate) fn print_daemon_status(options: DaemonRunOptions) -> Result<(), CliError> {
+pub(crate) fn print_daemon_status(options: DaemonStatusOptions) -> Result<(), CliError> {
     print_daemon_status_with_paths(options, daemon_paths_from_defaults()?, "daemon")
 }
 
-pub(crate) fn print_shadow_daemon_status(options: DaemonRunOptions) -> Result<(), CliError> {
+pub(crate) fn print_shadow_daemon_status(options: DaemonStatusOptions) -> Result<(), CliError> {
     print_daemon_status_with_paths(
         options,
         shadow_daemon_paths_from_defaults()?,
@@ -395,41 +415,21 @@ pub(crate) fn print_shadow_daemon_status(options: DaemonRunOptions) -> Result<()
 }
 
 pub(crate) fn print_daemon_status_with_paths(
-    options: DaemonRunOptions,
+    options: DaemonStatusOptions,
     paths: DaemonPaths,
     label: &str,
 ) -> Result<(), CliError> {
+    if options.explicit_address {
+        let address = daemon_connect_address(&options.endpoint.host, options.endpoint.port);
+        let status = daemon_fetch_daemon_status_from_address(&address, DAEMON_PROBE_TIMEOUT)?;
+        print_running_daemon_status(&status, label);
+        println!("  target: {address}");
+        return Ok(());
+    }
+
     match probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT) {
         DaemonProbeStatus::Running(status) => {
-            println!("sinomo {label} is running");
-            println!("  pid: {}", status.pid);
-            println!("  version: {}", status.version);
-            if let Some(commit) = &status.commit {
-                println!("  commit: {commit}");
-            }
-            println!("  bind: {}", daemon_bind_address(&status));
-            println!("  control address: {}", status.address);
-            print_daemon_platform(&status);
-            if let Some(executable) = &status.executable {
-                println!("  executable: {}", executable.display());
-            }
-            if let Some(rollout) = &status.rollout {
-                println!("  rollout: {}", format_rollout_status(rollout));
-            }
-            if let Some(cluster) = &status.cluster {
-                println!("  cluster: {}", cluster.cluster_id);
-                println!("  node: {}", cluster.node_id);
-                println!("  cluster process: {}", cluster.process);
-                println!(
-                    "  member: {} {}",
-                    format_member_role(&cluster.member_role),
-                    format_member_state(&cluster.member_state)
-                );
-            }
-            if let Some(stats) = &status.idle_stats {
-                print_daemon_idle_stats(stats);
-            }
-            println!("  lock: {}", status.lock_file.display());
+            print_running_daemon_status(&status, label);
             println!("  status: {}", paths.status.display());
             Ok(())
         }
@@ -461,10 +461,13 @@ pub(crate) fn print_daemon_status_with_paths(
                     );
                 }
             } else {
-                println!("  default bind: {}:{}", options.host, options.port);
+                println!(
+                    "  default bind: {}:{}",
+                    options.endpoint.host, options.endpoint.port
+                );
                 println!(
                     "  default control address: {}",
-                    daemon_connect_address(&options.host, options.port)
+                    daemon_connect_address(&options.endpoint.host, options.endpoint.port)
                 );
             }
             println!("  lock: {}", paths.lock.display());
@@ -472,14 +475,49 @@ pub(crate) fn print_daemon_status_with_paths(
         }
         DaemonProbeStatus::NotRunning => {
             println!("sinomo {label} is not running");
-            println!("  default bind: {}:{}", options.host, options.port);
+            println!(
+                "  default bind: {}:{}",
+                options.endpoint.host, options.endpoint.port
+            );
             println!(
                 "  default control address: {}",
-                daemon_connect_address(&options.host, options.port)
+                daemon_connect_address(&options.endpoint.host, options.endpoint.port)
             );
             Ok(())
         }
     }
+}
+
+fn print_running_daemon_status(status: &DaemonStatus, label: &str) {
+    println!("sinomo {label} is running");
+    println!("  pid: {}", status.pid);
+    println!("  version: {}", status.version);
+    if let Some(commit) = &status.commit {
+        println!("  commit: {commit}");
+    }
+    println!("  bind: {}", daemon_bind_address(status));
+    println!("  control address: {}", status.address);
+    print_daemon_platform(status);
+    if let Some(executable) = &status.executable {
+        println!("  executable: {}", executable.display());
+    }
+    if let Some(rollout) = &status.rollout {
+        println!("  rollout: {}", format_rollout_status(rollout));
+    }
+    if let Some(cluster) = &status.cluster {
+        println!("  cluster: {}", cluster.cluster_id);
+        println!("  node: {}", cluster.node_id);
+        println!("  cluster process: {}", cluster.process);
+        println!(
+            "  member: {} {}",
+            format_member_role(&cluster.member_role),
+            format_member_state(&cluster.member_state)
+        );
+    }
+    if let Some(stats) = &status.idle_stats {
+        print_daemon_idle_stats(stats);
+    }
+    println!("  lock: {}", status.lock_file.display());
 }
 
 fn format_bytes(bytes: u64) -> String {

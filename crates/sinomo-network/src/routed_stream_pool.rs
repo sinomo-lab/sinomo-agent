@@ -213,7 +213,7 @@ fn logical_stream_metadata(
 fn logical_stream_pair(
     stream_id: u64,
     commands: mpsc::Sender<MuxFrame>,
-    carrier_owner: Option<Arc<ServerCarrierOwner>>,
+    carrier_owner: Option<Arc<RoutedStreamClient>>,
 ) -> (
     BoxedNetworkStream,
     mpsc::Sender<LogicalInbound>,
@@ -228,58 +228,61 @@ fn logical_stream_pair(
     let outbound_window_weak = Arc::downgrade(&outbound_window);
     let outgoing_commands = commands.clone();
     let outgoing = tokio::spawn(async move {
-        let _carrier_owner = carrier_owner;
-        let mut buffer = Vec::new();
-        if buffer
-            .try_reserve_exact(ROUTED_STREAM_MUX_DATA_BYTES)
-            .is_err()
-        {
-            let _ = outgoing_commands
-                .send(MuxFrame::control(FRAME_RESET, stream_id))
-                .await;
-            return;
-        }
-        buffer.resize(ROUTED_STREAM_MUX_DATA_BYTES, 0);
-        loop {
-            let read = match bridge_read.read(&mut buffer).await {
-                Ok(read) => read,
-                Err(_) => {
-                    let _ = outgoing_commands
-                        .send(MuxFrame::control(FRAME_RESET, stream_id))
-                        .await;
-                    return;
-                }
-            };
-            if read == 0 {
-                let _ = outgoing_commands
-                    .send(MuxFrame::control(FRAME_FINISH, stream_id))
-                    .await;
-                return;
-            }
-            let Ok(permit) = Arc::clone(&outbound_window).acquire_owned().await else {
-                return;
-            };
-            permit.forget();
-            let mut payload = Vec::new();
-            if payload.try_reserve_exact(read).is_err() {
+        async {
+            let mut buffer = Vec::new();
+            if buffer
+                .try_reserve_exact(ROUTED_STREAM_MUX_DATA_BYTES)
+                .is_err()
+            {
                 let _ = outgoing_commands
                     .send(MuxFrame::control(FRAME_RESET, stream_id))
                     .await;
                 return;
             }
-            payload.extend_from_slice(&buffer[..read]);
-            if outgoing_commands
-                .send(MuxFrame {
-                    kind: FRAME_DATA,
-                    stream_id,
-                    payload: Bytes::from(payload),
-                })
-                .await
-                .is_err()
-            {
-                return;
+            buffer.resize(ROUTED_STREAM_MUX_DATA_BYTES, 0);
+            loop {
+                let read = match bridge_read.read(&mut buffer).await {
+                    Ok(read) => read,
+                    Err(_) => {
+                        let _ = outgoing_commands
+                            .send(MuxFrame::control(FRAME_RESET, stream_id))
+                            .await;
+                        return;
+                    }
+                };
+                if read == 0 {
+                    let _ = outgoing_commands
+                        .send(MuxFrame::control(FRAME_FINISH, stream_id))
+                        .await;
+                    return;
+                }
+                let Ok(permit) = Arc::clone(&outbound_window).acquire_owned().await else {
+                    return;
+                };
+                permit.forget();
+                let mut payload = Vec::new();
+                if payload.try_reserve_exact(read).is_err() {
+                    let _ = outgoing_commands
+                        .send(MuxFrame::control(FRAME_RESET, stream_id))
+                        .await;
+                    return;
+                }
+                payload.extend_from_slice(&buffer[..read]);
+                if outgoing_commands
+                    .send(MuxFrame {
+                        kind: FRAME_DATA,
+                        stream_id,
+                        payload: Bytes::from(payload),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
             }
         }
+        .await;
+        drop(carrier_owner);
     });
     let incoming_commands = commands;
     let incoming = tokio::spawn(async move {
@@ -394,8 +397,25 @@ struct RoutedStreamClient {
     state: Arc<Mutex<ClientMuxState>>,
     closed: Arc<AtomicBool>,
     next_stream_id: AtomicU64,
-    reader_task: JoinHandle<()>,
-    writer_task: JoinHandle<()>,
+    reader_task: Mutex<Option<JoinHandle<()>>>,
+    writer_task: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Clone)]
+enum IncomingLogicalStreamSink {
+    Fixed(mpsc::Sender<Result<PeerStream, NetworkError>>),
+    Registered(NodeId),
+}
+
+impl IncomingLogicalStreamSink {
+    fn sender(&self) -> Option<mpsc::Sender<Result<PeerStream, NetworkError>>> {
+        match self {
+            Self::Fixed(sender) => Some(sender.clone()),
+            Self::Registered(local_node_id) => {
+                registered_routed_stream_incoming_sender(local_node_id)
+            }
+        }
+    }
 }
 
 struct PooledLogicalStream {
@@ -438,7 +458,12 @@ impl AsyncWrite for PooledLogicalStream {
 }
 
 impl RoutedStreamClient {
-    fn new(carrier: PeerStream) -> Self {
+    fn new(
+        carrier: PeerStream,
+        next_stream_id: u64,
+        incoming_sink: IncomingLogicalStreamSink,
+    ) -> Arc<Self> {
+        debug_assert!(matches!(next_stream_id, 1 | 2));
         let local_node_id = carrier.local_node_id.clone();
         let peer_node_id = carrier.peer_node_id.clone();
         let carrier_session_id = carrier.session_id.clone();
@@ -448,6 +473,19 @@ impl RoutedStreamClient {
         let (commands, command_receiver) = mpsc::channel(ROUTED_STREAM_MUX_COMMANDS);
         let state = Arc::new(Mutex::new(ClientMuxState::default()));
         let closed = Arc::new(AtomicBool::new(false));
+        let client = Arc::new(Self {
+            local_node_id: local_node_id.clone(),
+            peer_node_id: peer_node_id.clone(),
+            carrier_session_id: carrier_session_id.clone(),
+            carrier_binding,
+            route_trace: route_trace.clone(),
+            commands: commands.clone(),
+            state: Arc::clone(&state),
+            closed: Arc::clone(&closed),
+            next_stream_id: AtomicU64::new(next_stream_id),
+            reader_task: Mutex::new(None),
+            writer_task: Mutex::new(None),
+        });
         let writer_state = Arc::clone(&state);
         let writer_closed = Arc::clone(&closed);
         let writer_task = tokio::spawn(async move {
@@ -455,9 +493,15 @@ impl RoutedStreamClient {
                 fail_client_mux(&writer_state, &writer_closed, error.to_string());
             }
         });
+        *client
+            .writer_task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(writer_task);
         let reader_state = Arc::clone(&state);
         let reader_closed = Arc::clone(&closed);
         let reader_commands = commands.clone();
+        let reader_client = Arc::downgrade(&client);
+        let local_stream_parity = next_stream_id % 2;
         let reader_task = tokio::spawn(async move {
             let mut reader = reader;
             loop {
@@ -555,30 +599,103 @@ impl RoutedStreamClient {
                         }
                     }
                     FRAME_OPEN => {
-                        fail_client_mux(
-                            &reader_state,
-                            &reader_closed,
-                            "routed stream mux server attempted to open a client stream",
+                        let collides = {
+                            let state = reader_state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
+                            frame.stream_id % 2 == local_stream_parity
+                                || state.streams.contains_key(&frame.stream_id)
+                                || state
+                                    .outbound_windows
+                                    .get(&frame.stream_id)
+                                    .is_some_and(|window| window.strong_count() != 0)
+                        };
+                        if collides {
+                            fail_client_mux(
+                                &reader_state,
+                                &reader_closed,
+                                "routed stream mux received an invalid peer stream id",
+                            );
+                            return;
+                        }
+                        let Some(incoming) = incoming_sink.sender() else {
+                            let _ = reader_commands
+                                .send(MuxFrame::control(FRAME_RESET, frame.stream_id))
+                                .await;
+                            continue;
+                        };
+                        let permit = match incoming.reserve().await {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                let _ = reader_commands
+                                    .send(MuxFrame::control(FRAME_RESET, frame.stream_id))
+                                    .await;
+                                continue;
+                            }
+                        };
+                        let Some(carrier_owner) = reader_client.upgrade() else {
+                            return;
+                        };
+                        let (io, inbound, outbound_window, _outgoing_task, _incoming_task) =
+                            logical_stream_pair(
+                                frame.stream_id,
+                                reader_commands.clone(),
+                                Some(carrier_owner),
+                            );
+                        let (session_id, channel_binding) = logical_stream_metadata(
+                            &carrier_session_id,
+                            &carrier_binding,
+                            frame.stream_id,
                         );
-                        return;
+                        let stream = match PeerStream::new(
+                            io,
+                            local_node_id.clone(),
+                            peer_node_id.clone(),
+                            session_id,
+                            channel_binding,
+                            route_trace.clone(),
+                        ) {
+                            Ok(stream) => stream,
+                            Err(error) => {
+                                permit.send(Err(error));
+                                fail_client_mux(
+                                    &reader_state,
+                                    &reader_closed,
+                                    "failed to materialize a peer-opened routed logical stream",
+                                );
+                                return;
+                            }
+                        };
+                        {
+                            let mut state = reader_state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
+                            state
+                                .outbound_windows
+                                .retain(|_, window| window.strong_count() != 0);
+                            state.streams.insert(frame.stream_id, inbound);
+                            state
+                                .outbound_windows
+                                .insert(frame.stream_id, outbound_window);
+                        }
+                        if reader_commands
+                            .send(MuxFrame::control(FRAME_ACCEPT, frame.stream_id))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        permit.send(Ok(stream));
                     }
                     _ => unreachable!("validated mux frame kind"),
                 }
             }
         });
-        Self {
-            local_node_id,
-            peer_node_id,
-            carrier_session_id,
-            carrier_binding,
-            route_trace,
-            commands,
-            state,
-            closed,
-            next_stream_id: AtomicU64::new(1),
-            reader_task,
-            writer_task,
-        }
+        *client
+            .reader_task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(reader_task);
+        client
     }
 
     fn is_closed(&self) -> bool {
@@ -696,9 +813,121 @@ impl RoutedStreamClient {
 
 impl Drop for RoutedStreamClient {
     fn drop(&mut self) {
-        self.reader_task.abort();
-        self.writer_task.abort();
+        if let Some(task) = self
+            .reader_task
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            task.abort();
+        }
+        let writer_task = self
+            .writer_task
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        // Once every logical-stream bridge has released its carrier owner, the
+        // writer still owns a bounded queue of already accepted DATA/FINISH
+        // frames. Detach it so those frames drain before the write half closes.
+        drop(writer_task);
     }
+}
+
+struct RoutedStreamIncomingRegistration {
+    token: Id,
+    sender: mpsc::Sender<Result<PeerStream, NetworkError>>,
+}
+
+static ROUTED_STREAM_INCOMING: OnceLock<Mutex<BTreeMap<NodeId, RoutedStreamIncomingRegistration>>> =
+    OnceLock::new();
+
+fn routed_stream_incoming_registry()
+-> &'static Mutex<BTreeMap<NodeId, RoutedStreamIncomingRegistration>> {
+    ROUTED_STREAM_INCOMING.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn registered_routed_stream_incoming_sender(
+    local_node_id: &NodeId,
+) -> Option<mpsc::Sender<Result<PeerStream, NetworkError>>> {
+    routed_stream_incoming_registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(local_node_id)
+        .filter(|registration| !registration.sender.is_closed())
+        .map(|registration| registration.sender.clone())
+}
+
+/// Process-local delivery boundary for logical streams opened by a routed peer.
+///
+/// A daemon registers its local node once, then handles these streams through
+/// the same authenticated service-RPC path as streams accepted on a newly
+/// established carrier. Keeping dispatch outside the routing crate preserves
+/// the separation between node routing and object RPC.
+pub struct RoutedStreamIncoming {
+    local_node_id: NodeId,
+    token: Id,
+    incoming: mpsc::Receiver<Result<PeerStream, NetworkError>>,
+}
+
+impl RoutedStreamIncoming {
+    pub async fn accept(&mut self) -> Result<Option<PeerStream>, NetworkError> {
+        match self.incoming.recv().await {
+            Some(Ok(stream)) => Ok(Some(stream)),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        }
+    }
+}
+
+impl Drop for RoutedStreamIncoming {
+    fn drop(&mut self) {
+        let mut registry = routed_stream_incoming_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if registry
+            .get(&self.local_node_id)
+            .is_some_and(|registration| registration.token == self.token)
+        {
+            registry.remove(&self.local_node_id);
+        }
+    }
+}
+
+/// Registers the current process to receive peer-opened logical streams for
+/// `local_node_id`. Only one live service dispatcher may own a node identity in
+/// a process.
+pub fn register_routed_stream_incoming(
+    local_node_id: NodeId,
+) -> Result<RoutedStreamIncoming, NetworkError> {
+    let token = Id::generate();
+    let (sender, incoming) = mpsc::channel(ROUTED_STREAM_MUX_ACCEPTED_STREAMS);
+    let mut registry = routed_stream_incoming_registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if registry
+        .get(&local_node_id)
+        .is_some_and(|registration| !registration.sender.is_closed())
+    {
+        return Err(NetworkError::Io {
+            operation: "register routed logical stream service dispatcher".to_string(),
+            detail: format!(
+                "node {} already has a live routed stream dispatcher",
+                local_node_id
+            ),
+        });
+    }
+    registry.insert(
+        local_node_id.clone(),
+        RoutedStreamIncomingRegistration {
+            token: token.clone(),
+            sender,
+        },
+    );
+    Ok(RoutedStreamIncoming {
+        local_node_id,
+        token,
+        incoming,
+    })
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -711,6 +940,37 @@ struct PoolKey {
     require_confidentiality: bool,
     require_relay_forwarding: bool,
     max_hops: usize,
+}
+
+impl PoolKey {
+    fn new(
+        scope: String,
+        directory_generation: u64,
+        constraints: RouteConstraints,
+        local_node_id: NodeId,
+        peer_node_id: NodeId,
+    ) -> Self {
+        Self {
+            scope,
+            directory_generation,
+            local_node_id,
+            peer_node_id,
+            require_full_duplex: constraints.require_full_duplex,
+            require_confidentiality: constraints.require_confidentiality,
+            require_relay_forwarding: constraints.require_relay_forwarding,
+            max_hops: constraints.max_hops,
+        }
+    }
+
+    fn same_relationship(&self, other: &Self) -> bool {
+        self.scope == other.scope
+            && self.local_node_id == other.local_node_id
+            && self.peer_node_id == other.peer_node_id
+            && self.require_full_duplex == other.require_full_duplex
+            && self.require_confidentiality == other.require_confidentiality
+            && self.require_relay_forwarding == other.require_relay_forwarding
+            && self.max_hops == other.max_hops
+    }
 }
 
 static ROUTED_STREAM_POOL: OnceLock<
@@ -729,7 +989,56 @@ fn routed_stream_connect_locks()
     ROUTED_STREAM_CONNECT_LOCKS.get_or_init(|| tokio::sync::Mutex::new(BTreeMap::new()))
 }
 
-/// Opens a logical stream from the current generation's routing-owned carrier.
+/// Reports whether this process currently owns a live routing carrier for the
+/// exact node relationship in `scope`.
+///
+/// Both initiated and accepted full-duplex carriers are published in the same
+/// pool, so this is routing-owned end-to-end reachability evidence rather than
+/// an inference from directed endpoint observations. `None` means the pool was
+/// concurrently locked; callers must treat that as unknown, never as proof of
+/// unavailability.
+pub fn pooled_routed_relationship_is_active(
+    scope: &str,
+    local_node_id: &NodeId,
+    peer_node_id: &NodeId,
+) -> Option<bool> {
+    let Some(pool) = ROUTED_STREAM_POOL.get() else {
+        return Some(false);
+    };
+    let Ok(pool) = pool.try_lock() else {
+        return None;
+    };
+    Some(pool.iter().any(|(key, client)| {
+        key.scope == scope
+            && &key.local_node_id == local_node_id
+            && &key.peer_node_id == peer_node_id
+            && !client.is_closed()
+    }))
+}
+
+fn reusable_pooled_client(
+    pool: &mut BTreeMap<PoolKey, Arc<RoutedStreamClient>>,
+    key: &PoolKey,
+) -> Option<Arc<RoutedStreamClient>> {
+    pool.retain(|_, client| !client.is_closed());
+    let client = pool.get(key).cloned().or_else(|| {
+        pool.iter()
+            .filter(|(candidate, _)| candidate.same_relationship(key))
+            .max_by_key(|(candidate, _)| candidate.directory_generation)
+            .map(|(_, client)| Arc::clone(client))
+    })?;
+
+    // The caller constructed `key` from its current, already-authorized
+    // directory snapshot. A live end-to-end authenticated carrier for the
+    // exact same identities and constraints remains valid when the two local
+    // snapshot readers temporarily observe different generations. Publish it
+    // under the caller's generation and retire the other lookup aliases.
+    pool.insert(key.clone(), Arc::clone(&client));
+    pool.retain(|candidate, _| !candidate.same_relationship(key) || candidate == key);
+    Some(client)
+}
+
+/// Opens a logical stream from a routing-owned authenticated carrier.
 ///
 /// `establish` is polled only when no healthy carrier exists. A failed carrier
 /// is retired before this function returns an error, but application bytes are
@@ -746,25 +1055,16 @@ pub async fn open_pooled_routed_stream<F>(
 where
     F: Future<Output = Result<PeerStream, NetworkError>>,
 {
-    let key = PoolKey {
+    let key = PoolKey::new(
         scope,
         directory_generation,
+        constraints,
         local_node_id,
         peer_node_id,
-        require_full_duplex: constraints.require_full_duplex,
-        require_confidentiality: constraints.require_confidentiality,
-        require_relay_forwarding: constraints.require_relay_forwarding,
-        max_hops: constraints.max_hops,
-    };
+    );
     let existing = {
         let mut pool = routed_stream_pool().lock().await;
-        pool.retain(|pool_key, client| {
-            !client.is_closed()
-                && (pool_key.scope != key.scope
-                    || pool_key.local_node_id != key.local_node_id
-                    || pool_key.directory_generation >= key.directory_generation)
-        });
-        pool.get(&key).cloned()
+        reusable_pooled_client(&mut pool, &key)
     };
     if let Some(client) = existing {
         match client.open(timeout).await {
@@ -783,11 +1083,7 @@ where
 
     let connect_lock = {
         let mut locks = routed_stream_connect_locks().lock().await;
-        locks.retain(|lock_key, _| {
-            lock_key.scope != key.scope
-                || lock_key.local_node_id != key.local_node_id
-                || lock_key.directory_generation >= key.directory_generation
-        });
+        locks.retain(|lock_key, _| !lock_key.same_relationship(&key) || lock_key == &key);
         Arc::clone(
             locks
                 .entry(key.clone())
@@ -796,8 +1092,8 @@ where
     };
     let connect_guard = connect_lock.lock().await;
     let existing = {
-        let pool = routed_stream_pool().lock().await;
-        pool.get(&key).filter(|client| !client.is_closed()).cloned()
+        let mut pool = routed_stream_pool().lock().await;
+        reusable_pooled_client(&mut pool, &key)
     };
     let client = match existing {
         Some(client) => client,
@@ -808,7 +1104,11 @@ where
             {
                 return Err(NetworkError::AuthDenied);
             }
-            let client = Arc::new(RoutedStreamClient::new(carrier));
+            let client = RoutedStreamClient::new(
+                carrier,
+                1,
+                IncomingLogicalStreamSink::Registered(key.local_node_id.clone()),
+            );
             routed_stream_pool()
                 .lock()
                 .await
@@ -852,35 +1152,7 @@ pub async fn retire_pooled_routed_streams(scope: &str) -> usize {
 /// Server side of one accepted routing-owned carrier.
 pub struct RoutedStreamAcceptor {
     incoming: mpsc::Receiver<Result<PeerStream, NetworkError>>,
-    _carrier_owner: Arc<ServerCarrierOwner>,
-}
-
-#[derive(Default)]
-struct ServerCarrierOwner {
-    reader_task: Mutex<Option<JoinHandle<()>>>,
-    writer_task: Mutex<Option<JoinHandle<()>>>,
-}
-
-impl Drop for ServerCarrierOwner {
-    fn drop(&mut self) {
-        if let Some(task) = self
-            .reader_task
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
-            task.abort();
-        }
-        let writer_task = self
-            .writer_task
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        // Detach rather than abort: once the reader and logical bridges drop
-        // their senders, the writer drains every queued DATA/FINISH frame and
-        // then shuts down the carrier cleanly.
-        drop(writer_task);
-    }
+    _carrier_owner: Arc<RoutedStreamClient>,
 }
 
 impl RoutedStreamAcceptor {
@@ -893,154 +1165,64 @@ impl RoutedStreamAcceptor {
     }
 }
 
-/// Converts one accepted authenticated routed stream into a logical-stream
-/// acceptor. The first frame must be the routing mux protocol; no legacy
-/// application-stream fallback is retained.
-pub fn accept_routed_stream_carrier(carrier: PeerStream) -> RoutedStreamAcceptor {
-    let local_node_id = carrier.local_node_id.clone();
-    let peer_node_id = carrier.peer_node_id.clone();
-    let carrier_session_id = carrier.session_id.clone();
-    let carrier_binding = carrier.channel_binding;
-    let route_trace = carrier.route_trace.clone();
-    let (reader, writer) = tokio::io::split(carrier);
-    let (commands, command_receiver) = mpsc::channel(ROUTED_STREAM_MUX_COMMANDS);
+fn routed_stream_acceptor_and_client(
+    carrier: PeerStream,
+) -> (RoutedStreamAcceptor, Arc<RoutedStreamClient>) {
     let (accepted, incoming) = mpsc::channel(ROUTED_STREAM_MUX_ACCEPTED_STREAMS);
-    let carrier_owner = Arc::new(ServerCarrierOwner::default());
-    let writer_task = tokio::spawn(async move {
-        if let Err(error) = run_mux_writer(writer, command_receiver).await {
-            tracing::debug!(%error, "routed stream mux writer stopped");
-        }
+    let carrier_owner =
+        RoutedStreamClient::new(carrier, 2, IncomingLogicalStreamSink::Fixed(accepted));
+    (
+        RoutedStreamAcceptor {
+            incoming,
+            _carrier_owner: Arc::clone(&carrier_owner),
+        },
+        carrier_owner,
+    )
+}
+
+/// Converts one accepted authenticated routed stream into a logical-stream
+/// acceptor and makes the same carrier available for reverse-direction opens.
+/// The first frame must be the routing mux protocol; no legacy application-
+/// stream fallback is retained.
+pub async fn accept_pooled_routed_stream_carrier(
+    scope: String,
+    directory_generation: u64,
+    constraints: RouteConstraints,
+    carrier: PeerStream,
+) -> Result<RoutedStreamAcceptor, NetworkError> {
+    let key = PoolKey::new(
+        scope,
+        directory_generation,
+        constraints,
+        carrier.local_node_id.clone(),
+        carrier.peer_node_id.clone(),
+    );
+    let (acceptor, client) = routed_stream_acceptor_and_client(carrier);
+    let connect_lock = {
+        let mut locks = routed_stream_connect_locks().lock().await;
+        locks.retain(|lock_key, _| !lock_key.same_relationship(&key) || lock_key == &key);
+        Arc::clone(
+            locks
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    };
+    let _connect_guard = connect_lock.lock().await;
+    let mut pool = routed_stream_pool().lock().await;
+    pool.retain(|pool_key, pooled| {
+        !pooled.is_closed() && (!pool_key.same_relationship(&key) || pool_key == &key)
     });
-    *carrier_owner
-        .writer_task
-        .lock()
-        .unwrap_or_else(|error| error.into_inner()) = Some(writer_task);
-    let reader_commands = commands.clone();
-    let reader_carrier_owner = Arc::downgrade(&carrier_owner);
-    let reader_task = tokio::spawn(async move {
-        let mut reader = reader;
-        let mut streams = BTreeMap::<u64, mpsc::Sender<LogicalInbound>>::new();
-        let mut outbound_windows = BTreeMap::<u64, Weak<Semaphore>>::new();
-        loop {
-            let frame = match read_mux_frame(&mut reader).await {
-                Ok(Some(frame)) => frame,
-                Ok(None) => return,
-                Err(error) => {
-                    let _ = accepted.send(Err(error)).await;
-                    return;
-                }
-            };
-            match frame.kind {
-                FRAME_OPEN => {
-                    if frame.stream_id % 2 == 0
-                        || streams.contains_key(&frame.stream_id)
-                        || outbound_windows
-                            .get(&frame.stream_id)
-                            .is_some_and(|window| window.strong_count() != 0)
-                    {
-                        let _ = accepted.send(Err(NetworkError::AuthDenied)).await;
-                        return;
-                    }
-                    let Some(logical_carrier_owner) = reader_carrier_owner.upgrade() else {
-                        return;
-                    };
-                    let (io, inbound, outbound_window, _outgoing_task, _incoming_task) =
-                        logical_stream_pair(
-                            frame.stream_id,
-                            reader_commands.clone(),
-                            Some(logical_carrier_owner),
-                        );
-                    let (session_id, channel_binding) = logical_stream_metadata(
-                        &carrier_session_id,
-                        &carrier_binding,
-                        frame.stream_id,
-                    );
-                    let stream = match PeerStream::new(
-                        io,
-                        local_node_id.clone(),
-                        peer_node_id.clone(),
-                        session_id,
-                        channel_binding,
-                        route_trace.clone(),
-                    ) {
-                        Ok(stream) => stream,
-                        Err(error) => {
-                            let _ = accepted.send(Err(error)).await;
-                            return;
-                        }
-                    };
-                    outbound_windows.retain(|_, window| window.strong_count() != 0);
-                    streams.insert(frame.stream_id, inbound);
-                    outbound_windows.insert(frame.stream_id, outbound_window);
-                    if accepted.send(Ok(stream)).await.is_err() {
-                        return;
-                    }
-                    if reader_commands
-                        .send(MuxFrame::control(FRAME_ACCEPT, frame.stream_id))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                FRAME_DATA => {
-                    let sender = streams.get(&frame.stream_id).cloned();
-                    if let Some(sender) = sender {
-                        if sender
-                            .send(LogicalInbound::Data(frame.payload))
-                            .await
-                            .is_err()
-                        {
-                            streams.remove(&frame.stream_id);
-                            let _ = reader_commands
-                                .send(MuxFrame::control(FRAME_RESET, frame.stream_id))
-                                .await;
-                        }
-                    } else {
-                        let _ = reader_commands
-                            .send(MuxFrame::control(FRAME_RESET, frame.stream_id))
-                            .await;
-                    }
-                }
-                FRAME_FINISH => {
-                    let sender = streams.remove(&frame.stream_id);
-                    drop(sender);
-                }
-                FRAME_RESET => {
-                    let sender = streams.remove(&frame.stream_id);
-                    let window = outbound_windows.remove(&frame.stream_id);
-                    if let Some(sender) = sender {
-                        let _ = sender.send(LogicalInbound::Reset).await;
-                    }
-                    if let Some(window) = window.and_then(|window| window.upgrade()) {
-                        window.close();
-                    }
-                }
-                FRAME_WINDOW => {
-                    let window = outbound_windows.get(&frame.stream_id).cloned();
-                    if let Some(window) = window
-                        && let Err(error) = return_outbound_window(&window)
-                    {
-                        let _ = accepted.send(Err(error)).await;
-                        return;
-                    }
-                }
-                FRAME_ACCEPT => {
-                    let _ = accepted.send(Err(NetworkError::AuthDenied)).await;
-                    return;
-                }
-                _ => unreachable!("validated mux frame kind"),
-            }
-        }
-    });
-    *carrier_owner
-        .reader_task
-        .lock()
-        .unwrap_or_else(|error| error.into_inner()) = Some(reader_task);
-    RoutedStreamAcceptor {
-        incoming,
-        _carrier_owner: carrier_owner,
+    if !pool.get(&key).is_some_and(|pooled| !pooled.is_closed()) {
+        pool.insert(key, client);
     }
+    Ok(acceptor)
+}
+
+/// Converts one accepted authenticated routed stream into a logical-stream
+/// acceptor without publishing it into a routing pool. Tests and standalone
+/// adapters use this boundary when they do not own a directory generation.
+pub fn accept_routed_stream_carrier(carrier: PeerStream) -> RoutedStreamAcceptor {
+    routed_stream_acceptor_and_client(carrier).0
 }
 
 #[cfg(test)]
@@ -1152,6 +1334,176 @@ mod tests {
         assert_eq!(first.session_id, server_first);
         assert_eq!(second.session_id, server_second);
         assert_eq!(establishments.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn accepted_carrier_supports_reverse_direction_streams() {
+        let (client_carrier, server_carrier) = carrier_pair();
+        let client_node = client_carrier.local_node_id.clone();
+        let server_node = client_carrier.peer_node_id.clone();
+        let scope = Id::generate().to_string();
+        let constraints = RouteConstraints::default();
+        let mut client_incoming =
+            register_routed_stream_incoming(client_node.clone()).expect("incoming dispatcher");
+        let reverse_establishments = Arc::new(AtomicUsize::new(0));
+        let server_scope = scope.clone();
+        let server_local = server_node.clone();
+        let server_peer = client_node.clone();
+        let reverse_count = Arc::clone(&reverse_establishments);
+        let server = tokio::spawn(async move {
+            let mut acceptor = accept_pooled_routed_stream_carrier(
+                server_scope.clone(),
+                1,
+                constraints,
+                server_carrier,
+            )
+            .await
+            .expect("accept pooled carrier");
+            assert_eq!(
+                pooled_routed_relationship_is_active(&server_scope, &server_local, &server_peer,),
+                Some(true),
+                "an accepted carrier must publish reverse-direction reachability",
+            );
+            let mut initial = acceptor
+                .accept()
+                .await
+                .expect("accept initial stream")
+                .expect("initial stream");
+            let mut request = [0_u8; 4];
+            initial
+                .read_exact(&mut request)
+                .await
+                .expect("read initial request");
+            assert_eq!(&request, b"ping");
+            initial
+                .write_all(b"pong")
+                .await
+                .expect("write initial response");
+
+            let first_reverse_count = Arc::clone(&reverse_count);
+            let mut reverse = open_pooled_routed_stream(
+                server_scope.clone(),
+                2,
+                constraints,
+                server_local.clone(),
+                server_peer.clone(),
+                Duration::from_secs(1),
+                async move {
+                    first_reverse_count.fetch_add(1, Ordering::Relaxed);
+                    Err(NetworkError::Io {
+                        operation: "unexpected reverse carrier establishment".to_string(),
+                        detail: "the accepted carrier must be reusable in reverse".to_string(),
+                    })
+                },
+            )
+            .await
+            .expect("reverse logical stream");
+            reverse
+                .write_all(b"back")
+                .await
+                .expect("write reverse request");
+            let mut response = [0_u8; 4];
+            reverse
+                .read_exact(&mut response)
+                .await
+                .expect("read reverse response");
+            assert_eq!(&response, b"okay");
+
+            let mut reverse = open_pooled_routed_stream(
+                server_scope,
+                0,
+                constraints,
+                server_local,
+                server_peer,
+                Duration::from_secs(1),
+                async move {
+                    reverse_count.fetch_add(1, Ordering::Relaxed);
+                    Err(NetworkError::Io {
+                        operation: "unexpected reverse carrier establishment".to_string(),
+                        detail: "the accepted carrier must survive generation skew".to_string(),
+                    })
+                },
+            )
+            .await
+            .expect("reverse logical stream from older snapshot");
+            reverse
+                .write_all(b"past")
+                .await
+                .expect("write older-snapshot reverse request");
+            let mut response = [0_u8; 4];
+            reverse
+                .read_exact(&mut response)
+                .await
+                .expect("read older-snapshot reverse response");
+            assert_eq!(&response, b"safe");
+        });
+
+        let mut initial = open_pooled_routed_stream(
+            scope.clone(),
+            1,
+            constraints,
+            client_node.clone(),
+            server_node.clone(),
+            Duration::from_secs(1),
+            async move { Ok(client_carrier) },
+        )
+        .await
+        .expect("initial logical stream");
+        assert_eq!(
+            pooled_routed_relationship_is_active(&scope, &client_node, &server_node),
+            Some(true),
+            "an initiated carrier must publish forward-direction reachability",
+        );
+        initial
+            .write_all(b"ping")
+            .await
+            .expect("write initial request");
+        let mut response = [0_u8; 4];
+        initial
+            .read_exact(&mut response)
+            .await
+            .expect("read initial response");
+        assert_eq!(&response, b"pong");
+
+        let mut reverse = client_incoming
+            .accept()
+            .await
+            .expect("accept reverse stream")
+            .expect("reverse stream");
+        let mut request = [0_u8; 4];
+        reverse
+            .read_exact(&mut request)
+            .await
+            .expect("read reverse request");
+        assert_eq!(&request, b"back");
+        reverse
+            .write_all(b"okay")
+            .await
+            .expect("write reverse response");
+        let mut reverse = client_incoming
+            .accept()
+            .await
+            .expect("accept older-snapshot reverse stream")
+            .expect("older-snapshot reverse stream");
+        let mut request = [0_u8; 4];
+        reverse
+            .read_exact(&mut request)
+            .await
+            .expect("read older-snapshot reverse request");
+        assert_eq!(&request, b"past");
+        reverse
+            .write_all(b"safe")
+            .await
+            .expect("write older-snapshot reverse response");
+        server.await.expect("server task");
+
+        assert_eq!(reverse_establishments.load(Ordering::Relaxed), 0);
+        assert_eq!(retire_pooled_routed_streams(&scope).await, 2);
+        assert_eq!(
+            pooled_routed_relationship_is_active(&scope, &client_node, &server_node),
+            Some(false),
+            "retiring a scope must withdraw its routed reachability evidence",
+        );
     }
 
     #[tokio::test]

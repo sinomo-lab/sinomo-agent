@@ -7,6 +7,7 @@ use serde::Serialize;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
     ClusterConnectivityGraph, ClusterPaths, cluster_healthy_route_next_hop,
+    pooled_routed_relationship_is_active,
 };
 use sinomo_core::node::NodeId;
 use sinomo_core::{ClusterBootstrapState, ClusterMemberRecord, ClusterMemberRole, DfsObjectPolicy};
@@ -15,6 +16,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 use crate::control_plane::topology_preserving_metadata_shard_replicas;
@@ -37,11 +39,10 @@ use crate::{
         default_sifs_migration_has_backend_continuation,
         materialize_default_sifs_metadata_on_bound_primary_shards,
     },
-    metadata_service_key, metadata_shard_head_watermark_key, metadata_shard_key,
-    metadata_shard_membership_handoff_key, metadata_shard_membership_handoff_proof_key,
-    open_cluster_aware_dfs_metadata_backend, open_local_metadata_shard_backend,
-    open_local_sharded_metadata_backend, run_cluster_dfs_smoke_with_message_sender,
-    sifs_node_files_path,
+    metadata_service_key, metadata_shard_key, metadata_shard_membership_handoff_key,
+    metadata_shard_membership_handoff_proof_key, open_cluster_aware_dfs_metadata_backend,
+    open_local_metadata_shard_backend, open_local_sharded_metadata_backend,
+    run_cluster_dfs_smoke_with_message_sender, sifs_node_files_path,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,10 +81,6 @@ struct DfsDefaultMaterializationSignature {
     bootstrap_owner_node_ids: Vec<NodeId>,
     fallback_owner_node_id: NodeId,
     handoff_evidence: DfsDefaultMaterializationHandoffEvidence,
-    // Replica certification for cross-primary legacy migration consumes the
-    // exact committed head generation. Omitting it would let a pass that ran
-    // between batch apply and watermark commit cache a stale negative result.
-    head_watermarks: BTreeMap<DfsMetadataShardId, DfsMetadataShardHeadWatermark>,
 }
 
 impl PartialEq for DfsDefaultMaterializationSignature {
@@ -93,7 +90,6 @@ impl PartialEq for DfsDefaultMaterializationSignature {
             && self.bootstrap_owner_node_ids == other.bootstrap_owner_node_ids
             && self.fallback_owner_node_id == other.fallback_owner_node_id
             && self.handoff_evidence == other.handoff_evidence
-            && self.head_watermarks == other.head_watermarks
     }
 }
 
@@ -116,6 +112,12 @@ static DFS_DEFAULT_MATERIALIZATION_SIGNATURES: OnceLock<
 > = OnceLock::new();
 static DFS_DEFAULT_MATERIALIZATION_IMMEDIATE_RETRIES: OnceLock<Mutex<BTreeSet<PathBuf>>> =
     OnceLock::new();
+
+const METADATA_PRIMARY_ROUTING_UNAVAILABLE_GRACE: Duration = Duration::from_secs(180);
+type MetadataPrimaryRoutingSuspicionKey = (PathBuf, NodeId, NodeId);
+static METADATA_PRIMARY_ROUTING_SUSPICIONS: OnceLock<
+    Mutex<BTreeMap<MetadataPrimaryRoutingSuspicionKey, Instant>>,
+> = OnceLock::new();
 
 fn default_materialization_is_current(
     data_root: &Path,
@@ -218,20 +220,17 @@ pub fn invalidate_default_cluster_dfs_materialization_for_replica_progress(
     if !cached.awaiting_replica_progress || cached.invalidated_for_replica_progress {
         return false;
     }
-    // Preserve the subscription bit while forcing the signature miss. A head
-    // watermark can commit between the local batch wake and the next pass; if
-    // invalidation removed this entry, that ordering would lose the watermark
-    // edge and park migration indefinitely.
+    // Preserve the subscription bit while forcing the signature miss. A local
+    // replica can advance between the batch wake and the next pass; removing
+    // this entry would lose that edge and park migration indefinitely.
     cached.invalidated_for_replica_progress = true;
     true
 }
 
 /// Whether the settled/default materializer currently consumes exact replica
-/// head generations. Daemon projection observers use this to subscribe to
-/// watermark commits only while an actual cross-shard migration is blocked.
-pub fn default_cluster_dfs_materialization_awaits_replica_progress(
-    data_dir: &SinomoDataDir,
-) -> bool {
+/// generations.
+#[cfg(test)]
+fn default_cluster_dfs_materialization_awaits_replica_progress(data_dir: &SinomoDataDir) -> bool {
     DFS_DEFAULT_MATERIALIZATION_SIGNATURES
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
@@ -259,7 +258,6 @@ pub fn test_establish_default_cluster_dfs_replica_progress_subscription(data_dir
             bootstrap_owner_node_ids: vec![local_node_id.clone()],
             fallback_owner_node_id: local_node_id,
             handoff_evidence: Vec::new(),
-            head_watermarks: BTreeMap::new(),
         },
         true,
     );
@@ -291,12 +289,13 @@ fn default_materialization_run_count(data_root: &Path) -> usize {
 }
 
 pub trait DfsDefaultClusterBootstrapHost {
-    fn connectivity_graph(
+    fn metadata_shard_node_routing_unavailable(
         &self,
         state: &ClusterBootstrapState,
-    ) -> Option<ClusterConnectivityGraph> {
-        let _ = state;
-        None
+        node_id: &NodeId,
+    ) -> bool {
+        let _ = (state, node_id);
+        false
     }
 
     fn metadata_service_node_ids(
@@ -363,12 +362,13 @@ pub type DfsDefaultClusterBootstrapFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, DfsError>> + Send + 'a>>;
 
 pub trait DfsDefaultClusterAsyncBootstrapHost: Send {
-    fn connectivity_graph(
+    fn metadata_shard_node_routing_unavailable(
         &self,
         state: &ClusterBootstrapState,
-    ) -> Option<ClusterConnectivityGraph> {
-        let _ = state;
-        None
+        node_id: &NodeId,
+    ) -> bool {
+        let _ = (state, node_id);
+        false
     }
 
     fn metadata_service_node_ids(
@@ -622,11 +622,17 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
 }
 
 impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHost {
-    fn connectivity_graph(
+    fn metadata_shard_node_routing_unavailable(
         &self,
         state: &ClusterBootstrapState,
-    ) -> Option<ClusterConnectivityGraph> {
-        ClusterConnectivityGraph::try_read_for_local(&self.cluster_paths, state).ok()
+        node_id: &NodeId,
+    ) -> bool {
+        metadata_shard_node_routing_unavailable(
+            &self.cluster_paths,
+            state,
+            &self.local_node_id,
+            node_id,
+        )
     }
 
     fn current_metadata_shard(
@@ -665,19 +671,21 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
         current: &DfsMetadataShardConfig,
         target_primary_node_id: &NodeId,
     ) -> Result<bool, DfsError> {
-        let watermark = DfsControlPlaneStore::new(self.control_plane.as_mut())
-            .get_metadata_shard_head_watermark(&current.file_system_id, &current.shard_id)?;
         if metadata_shard_primary_transfer_ready_from_local_backend(
             &self.data_dir,
             &self.local_node_id,
             current,
             target_primary_node_id,
-            watermark.as_ref(),
         )? {
             return Ok(true);
         }
-        if !metadata_shard_primary_route_unhealthy(
+        let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(&self.cluster_paths)
+        else {
+            return Ok(false);
+        };
+        if !metadata_shard_node_routing_unavailable(
             &self.cluster_paths,
+            &state,
             &self.local_node_id,
             &current.primary_node_id,
         ) {
@@ -747,7 +755,6 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
         fallback_owner_node_id: NodeId,
     ) -> Result<(), DfsError> {
         let mut active_primary_shard_ids = BTreeSet::new();
-        let mut head_watermarks = BTreeMap::new();
         let mut completion_evidence = Vec::with_capacity(shards.len());
         let mut active_primary_shards = Vec::new();
         for active in &shards {
@@ -758,11 +765,6 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
                 &active.file_system_id,
                 &active.shard_id,
             )?;
-            if let Some(watermark) =
-                store.get_metadata_shard_head_watermark(&active.file_system_id, &active.shard_id)?
-            {
-                head_watermarks.insert(DfsMetadataShardId::new(active.shard_id.clone()), watermark);
-            }
             if active.primary_node_id == self.local_node_id && pending.is_none() {
                 active_primary_shards.push(active.clone());
                 active_primary_shard_ids.insert(DfsMetadataShardId::new(active.shard_id.clone()));
@@ -775,7 +777,6 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
             &file_system.file_system_id,
             &self.local_node_id,
             &shards,
-            &head_watermarks,
             &active_primary_shard_ids,
         );
         let mut bound_primary_backend = if active_primary_shards.is_empty() || has_continuation {
@@ -806,7 +807,6 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
             bound_primary_backend,
             file_system,
             &shards,
-            &head_watermarks,
             &active_primary_shard_ids,
             &self.local_node_id,
             bootstrap_owner_node_ids,
@@ -818,11 +818,17 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
 }
 
 impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncBootstrapHost {
-    fn connectivity_graph(
+    fn metadata_shard_node_routing_unavailable(
         &self,
         state: &ClusterBootstrapState,
-    ) -> Option<ClusterConnectivityGraph> {
-        ClusterConnectivityGraph::try_read_for_local(&self.cluster_paths, state).ok()
+        node_id: &NodeId,
+    ) -> bool {
+        metadata_shard_node_routing_unavailable(
+            &self.cluster_paths,
+            state,
+            &self.local_node_id,
+            node_id,
+        )
     }
 
     fn current_metadata_shard_async<'a>(
@@ -868,33 +874,30 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
         target_primary_node_id: NodeId,
     ) -> DfsDefaultClusterBootstrapFuture<'a, bool> {
         Box::pin(async move {
-            let watermark = DfsControlPlaneAsyncStore::new(self.control_plane.as_mut())
-                .get_metadata_shard_head_watermark(&current.file_system_id, &current.shard_id)
-                .await?;
             if metadata_shard_primary_transfer_ready_from_local_backend(
                 &self.data_dir,
                 &self.local_node_id,
                 &current,
                 &target_primary_node_id,
-                watermark.as_ref(),
             )? {
                 return Ok(true);
             }
-            if !metadata_shard_primary_route_unhealthy(
+            let Ok(state) =
+                sinomo_core::cluster::read_cluster_state_without_kv(&self.cluster_paths)
+            else {
+                return Ok(false);
+            };
+            if !metadata_shard_node_routing_unavailable(
                 &self.cluster_paths,
+                &state,
                 &self.local_node_id,
                 &current.primary_node_id,
             ) {
                 return Ok(false);
             }
-            let watermark_key =
-                metadata_shard_head_watermark_key(&current.file_system_id, &current.shard_id);
-            let watermark = self
-                .control_plane
-                .get_async(&watermark_key)
-                .await?
-                .map(|entry| entry.decode::<DfsMetadataShardHeadWatermark>())
-                .transpose()?;
+            let watermark = DfsControlPlaneAsyncStore::new(self.control_plane.as_mut())
+                .get_metadata_shard_head_watermark(&current.file_system_id, &current.shard_id)
+                .await?;
             metadata_shard_local_replica_failover_ready_from_local_backend(
                 &self.data_dir,
                 &self.local_node_id,
@@ -972,7 +975,6 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
     ) -> DfsDefaultClusterBootstrapFuture<'a, ()> {
         Box::pin(async move {
             let mut completion_evidence = Vec::with_capacity(shards.len());
-            let mut head_watermarks = BTreeMap::new();
             for active in &shards {
                 let pending = self
                     .control_plane
@@ -992,19 +994,6 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
                     .await?
                     .map(|entry| entry.decode::<DfsMetadataShardMembershipHandoffProof>())
                     .transpose()?;
-                if let Some(watermark) = self
-                    .control_plane
-                    .get_async(&metadata_shard_head_watermark_key(
-                        &active.file_system_id,
-                        &active.shard_id,
-                    ))
-                    .await?
-                    .map(|entry| entry.decode::<DfsMetadataShardHeadWatermark>())
-                    .transpose()?
-                {
-                    head_watermarks
-                        .insert(DfsMetadataShardId::new(active.shard_id.clone()), watermark);
-                }
                 completion_evidence.push((pending, proof));
             }
             bootstrap_owner_node_ids.sort();
@@ -1015,7 +1004,6 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
                 bootstrap_owner_node_ids: bootstrap_owner_node_ids.clone(),
                 fallback_owner_node_id: fallback_owner_node_id.clone(),
                 handoff_evidence: completion_evidence.clone(),
-                head_watermarks: head_watermarks.clone(),
             };
             let data_root = self.data_dir.root();
             if default_materialization_is_current(&data_root, &signature) {
@@ -1043,7 +1031,6 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
                 &file_system.file_system_id,
                 &self.local_node_id,
                 &shards,
-                &head_watermarks,
                 &active_primary_shard_ids,
             );
             let mut bound_primary_backend = if active_primary_shards.is_empty() || has_continuation
@@ -1075,7 +1062,6 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
                 bound_primary_backend,
                 &file_system,
                 &shards,
-                &head_watermarks,
                 &active_primary_shard_ids,
                 &self.local_node_id,
                 bootstrap_owner_node_ids,
@@ -1101,7 +1087,6 @@ pub fn metadata_shard_primary_transfer_ready_from_local_backend(
     local_node_id: &NodeId,
     current: &DfsMetadataShardConfig,
     target_primary_node_id: &NodeId,
-    watermark: Option<&DfsMetadataShardHeadWatermark>,
 ) -> Result<bool, DfsError> {
     if current.primary_node_id == *target_primary_node_id {
         return Ok(true);
@@ -1116,16 +1101,6 @@ pub fn metadata_shard_primary_transfer_ready_from_local_backend(
     {
         return Ok(false);
     }
-    let Some(watermark) = watermark else {
-        return Ok(false);
-    };
-    if !metadata_shard_head_watermark_certifies_failover_candidate(
-        current,
-        target_primary_node_id,
-        watermark,
-    ) {
-        return Ok(false);
-    }
     let shard_id = DfsMetadataShardId::new(current.shard_id.clone());
     if !local_dfs_metadata_shard_path(data_dir, &shard_id).exists() {
         return Ok(false);
@@ -1137,40 +1112,12 @@ pub fn metadata_shard_primary_transfer_ready_from_local_backend(
         .find(|status| status.shard_id == shard_id)
         .map(|status| status.journal_last_sequence)
         .unwrap_or(0);
-    if watermark.journal_sequence == 0 || journal_last_sequence < watermark.journal_sequence {
-        return Ok(false);
-    }
-    if journal_last_sequence == watermark.journal_sequence {
-        let fingerprint = crate::service_sync::metadata_shard_state_fingerprint_at(
-            &backend,
-            &shard_id,
-            journal_last_sequence,
-        )?;
-        return Ok(fingerprint == watermark.state_fingerprint);
-    }
-
-    // A membership-expansion handoff publishes an exact watermark for the
-    // expanded ring. Ordinary writes can advance the primary immediately
-    // afterward, while healthy journal replication advances only the durable
-    // sender cursor and intentionally avoids another KV watermark write. Use
-    // that cursor solely as admission to begin the next fenced handoff. It is
-    // not activation evidence: the handoff still freezes the current primary
-    // head and requires a fresh exact-prefix acknowledgement from every member
-    // before its control-plane CAS can promote the target.
+    // Every visible DFS publication requires this target to acknowledge the
+    // exact prepared prefix. The durable sender cursor is therefore the
+    // DFS-native proof that it covers the current head; KV supplies only the
+    // configured membership being changed.
     let target_cursor = backend.metadata_replication_cursor(target_primary_node_id, &shard_id)?;
-    let cursor_covers_current_head = target_cursor >= journal_last_sequence;
-    if cursor_covers_current_head {
-        tracing::trace!(
-            target: "sinomo.dfs.perf",
-            shard = %current.shard_id,
-            target_primary = %target_primary_node_id,
-            certified_sequence = watermark.journal_sequence,
-            journal_last_sequence,
-            target_cursor,
-            "metadata-primary-handoff cursor preflight admitted stale certified head"
-        );
-    }
-    Ok(cursor_covers_current_head)
+    Ok(target_cursor >= journal_last_sequence)
 }
 
 fn validate_bootstrap_metadata_shard_transition(
@@ -1267,15 +1214,10 @@ fn metadata_shard_local_replica_failover_ready_from_local_backend(
     {
         return Ok(false);
     }
-    let Some(ack_floor) = backend.metadata_prefix_ack_floor(&shard_id)? else {
+    let Some(ack_floor) = backend.metadata_authority_ack_floor(&shard_id)? else {
         return Ok(false);
     };
     if ack_floor.journal_sequence < watermark.journal_sequence {
-        return Ok(false);
-    }
-    if ack_floor.journal_sequence == watermark.journal_sequence
-        && ack_floor.state_fingerprint != watermark.state_fingerprint
-    {
         return Ok(false);
     }
     if status.journal_last_sequence == watermark.journal_sequence {
@@ -1318,21 +1260,92 @@ fn metadata_shard_head_watermark_certifies_failover_candidate(
         && acknowledged_node_ids.len() >= configured_node_ids.len() / 2 + 1
 }
 
-fn metadata_shard_primary_route_unhealthy(
+fn metadata_shard_node_routing_unavailable(
     cluster_paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
     local_node_id: &NodeId,
-    primary_node_id: &NodeId,
+    target_node_id: &NodeId,
 ) -> bool {
-    if primary_node_id == local_node_id {
+    if target_node_id == local_node_id {
         return false;
     }
-    let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths) else {
+    let Ok(graph) = ClusterConnectivityGraph::try_read_for_local(cluster_paths, state) else {
         return false;
     };
-    let Ok(graph) = ClusterConnectivityGraph::try_read_for_local(cluster_paths, &state) else {
+    if cluster_healthy_route_next_hop(&graph, local_node_id, target_node_id).is_some() {
+        clear_metadata_primary_routing_suspicion(cluster_paths, local_node_id, target_node_id);
+        return false;
+    }
+    match pooled_routed_relationship_is_active(
+        &state.cluster_id.to_string(),
+        local_node_id,
+        target_node_id,
+    ) {
+        Some(true) => {
+            clear_metadata_primary_routing_suspicion(cluster_paths, local_node_id, target_node_id);
+            false
+        }
+        None => false,
+        Some(false) => metadata_primary_routing_suspicion_elapsed(
+            cluster_paths,
+            local_node_id,
+            target_node_id,
+            Instant::now(),
+            METADATA_PRIMARY_ROUTING_UNAVAILABLE_GRACE,
+        ),
+    }
+}
+
+fn metadata_primary_routing_suspicion_key(
+    cluster_paths: &ClusterPaths,
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+) -> MetadataPrimaryRoutingSuspicionKey {
+    (
+        cluster_paths.root.clone(),
+        local_node_id.clone(),
+        target_node_id.clone(),
+    )
+}
+
+fn clear_metadata_primary_routing_suspicion(
+    cluster_paths: &ClusterPaths,
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+) {
+    if let Ok(mut suspicions) = METADATA_PRIMARY_ROUTING_SUSPICIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        suspicions.remove(&metadata_primary_routing_suspicion_key(
+            cluster_paths,
+            local_node_id,
+            target_node_id,
+        ));
+    }
+}
+
+fn metadata_primary_routing_suspicion_elapsed(
+    cluster_paths: &ClusterPaths,
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+    now: Instant,
+    grace: Duration,
+) -> bool {
+    let Ok(mut suspicions) = METADATA_PRIMARY_ROUTING_SUSPICIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    else {
         return false;
     };
-    cluster_healthy_route_next_hop(&graph, local_node_id, primary_node_id).is_none()
+    let first_observed = suspicions
+        .entry(metadata_primary_routing_suspicion_key(
+            cluster_paths,
+            local_node_id,
+            target_node_id,
+        ))
+        .or_insert(now);
+    now.saturating_duration_since(*first_observed) >= grace
 }
 
 fn stable_default_file_system_config(
@@ -1772,9 +1785,16 @@ pub fn default_cluster_metadata_shard_with_host(
             default_metadata_shard_replica_node_ids(&service_node_ids, &bootstrap_primary_node_id);
         return Ok(desired);
     };
-    let connectivity_graph = host.connectivity_graph(state);
+    let current_primary_unavailable =
+        host.metadata_shard_node_routing_unavailable(state, &current.primary_node_id);
+    let default_target_unavailable = if default_target_primary_node_id == current.primary_node_id {
+        current_primary_unavailable
+    } else {
+        host.metadata_shard_node_routing_unavailable(state, &default_target_primary_node_id)
+    };
     desired.primary_node_id = default_metadata_shard_target_primary_node_id(
-        connectivity_graph.as_ref(),
+        current_primary_unavailable,
+        default_target_unavailable,
         &state.local_node_id,
         &service_node_ids,
         default_target_primary_node_id,
@@ -1849,9 +1869,16 @@ pub async fn default_cluster_metadata_shard_with_async_host(
             default_metadata_shard_replica_node_ids(&service_node_ids, &bootstrap_primary_node_id);
         return Ok(desired);
     };
-    let connectivity_graph = host.connectivity_graph(state);
+    let current_primary_unavailable =
+        host.metadata_shard_node_routing_unavailable(state, &current.primary_node_id);
+    let default_target_unavailable = if default_target_primary_node_id == current.primary_node_id {
+        current_primary_unavailable
+    } else {
+        host.metadata_shard_node_routing_unavailable(state, &default_target_primary_node_id)
+    };
     desired.primary_node_id = default_metadata_shard_target_primary_node_id(
-        connectivity_graph.as_ref(),
+        current_primary_unavailable,
+        default_target_unavailable,
         &state.local_node_id,
         &service_node_ids,
         default_target_primary_node_id,
@@ -1891,61 +1918,33 @@ pub async fn default_cluster_metadata_shard_with_async_host(
 }
 
 fn default_metadata_shard_target_primary_node_id(
-    connectivity_graph: Option<&ClusterConnectivityGraph>,
+    current_primary_unavailable: bool,
+    default_target_unavailable: bool,
     local_node_id: &NodeId,
     service_node_ids: &[NodeId],
     default_target_primary_node_id: NodeId,
     current: &DfsMetadataShardConfig,
 ) -> NodeId {
     if current.primary_node_id == *local_node_id {
+        if default_target_primary_node_id != *local_node_id && default_target_unavailable {
+            return local_node_id.clone();
+        }
         return default_target_primary_node_id;
     }
-    if !service_node_ids
+    let local_is_eligible_replica = service_node_ids
         .iter()
         .any(|node_id| node_id == local_node_id)
-    {
-        return default_target_primary_node_id;
+        && current
+            .replica_node_ids
+            .iter()
+            .any(|node_id| node_id == local_node_id);
+    if current_primary_unavailable && local_is_eligible_replica {
+        return local_node_id.clone();
     }
-    if !current
-        .replica_node_ids
-        .iter()
-        .any(|node_id| node_id == local_node_id)
-    {
-        return default_target_primary_node_id;
+    if default_target_unavailable {
+        return current.primary_node_id.clone();
     }
-    let Some(graph) = connectivity_graph else {
-        return default_target_primary_node_id;
-    };
-    if cluster_healthy_route_next_hop(graph, local_node_id, &current.primary_node_id).is_some() {
-        return default_target_primary_node_id;
-    }
-    local_node_id.clone()
-}
-
-/// Whether the default placement policy is waiting for exact head evidence
-/// before it can move this shard's primary.
-///
-/// This is the same target calculation used by default-cluster
-/// reconciliation. Exposing the predicate lets a committed-state reactor
-/// subscribe to high-frequency head-watermark changes only while a topology
-/// or failover transition can actually consume them.
-pub fn default_metadata_shard_transition_awaits_head_watermark(
-    connectivity_graph: Option<&ClusterConnectivityGraph>,
-    local_node_id: &NodeId,
-    service_node_ids: &[NodeId],
-    current: &DfsMetadataShardConfig,
-    primary_offset: usize,
-) -> bool {
-    let fallback_node_id = service_node_ids.first().unwrap_or(local_node_id);
-    let default_target_primary_node_id =
-        default_metadata_shard_primary_node_id(service_node_ids, fallback_node_id, primary_offset);
-    default_metadata_shard_target_primary_node_id(
-        connectivity_graph,
-        local_node_id,
-        service_node_ids,
-        default_target_primary_node_id,
-        current,
-    ) != current.primary_node_id
+    default_target_primary_node_id
 }
 
 pub fn default_metadata_shard_primary_node_id(
@@ -2178,12 +2177,7 @@ mod tests {
     use super::*;
     use crate::{
         DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
-        DfsMetadataPrefixAckFloor, LocalSobjMetadataBackend,
-    };
-    use sinomo_core::ClusterTransportKind;
-    use sinomo_core::network::{
-        ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState,
-        ClusterEndpointId,
+        DfsMetadataAuthorityAckFloor, LocalSobjMetadataBackend,
     };
     use sinomo_core::node::ClusterId;
 
@@ -2231,17 +2225,18 @@ mod tests {
     #[derive(Debug)]
     struct TestDefaultClusterBootstrapHost {
         current_shard: Option<DfsMetadataShardConfig>,
-        connectivity_graph: Option<ClusterConnectivityGraph>,
+        unavailable_node_ids: BTreeSet<NodeId>,
         primary_transfer_ready: bool,
         primary_transfer_targets: Vec<NodeId>,
     }
 
     impl DfsDefaultClusterBootstrapHost for TestDefaultClusterBootstrapHost {
-        fn connectivity_graph(
+        fn metadata_shard_node_routing_unavailable(
             &self,
             _state: &ClusterBootstrapState,
-        ) -> Option<ClusterConnectivityGraph> {
-            self.connectivity_graph.clone()
+            node_id: &NodeId,
+        ) -> bool {
+            self.unavailable_node_ids.contains(node_id)
         }
 
         fn current_metadata_shard(
@@ -2343,23 +2338,6 @@ mod tests {
             host.put_metadata_shard(&same_epoch_overwrite),
             Err(DfsError::Distributed { message }) if message.contains("stale metadata-shard bootstrap transition")
         ));
-        assert!(
-            DfsControlPlaneStore::new(host.control_plane.as_mut())
-                .publish_metadata_shard_head_watermark(
-                    &initial,
-                    &DfsMetadataShardHeadWatermark {
-                        file_system_id: file_system_id.clone(),
-                        shard_id: "root".to_string(),
-                        primary_node_id: owner.clone(),
-                        epoch: initial.epoch,
-                        journal_sequence: 1,
-                        state_fingerprint: "blake3:bootstrap-sync".to_string(),
-                        acknowledged_node_ids: vec![owner.clone(), replacement.clone()],
-                    },
-                )
-                .expect("publish certified transfer head")
-        );
-
         let next_epoch = DfsMetadataShardConfig {
             replica_node_ids: vec![owner],
             epoch: 2,
@@ -2496,23 +2474,6 @@ mod tests {
             Err(DfsError::Distributed { message })
                 if message.contains("stale metadata-shard bootstrap transition")
         ));
-        assert!(
-            DfsControlPlaneAsyncStore::new(host.control_plane.as_mut())
-                .publish_metadata_shard_head_watermark(
-                    &initial,
-                    &DfsMetadataShardHeadWatermark {
-                        file_system_id: file_system_id.clone(),
-                        shard_id: "root".to_string(),
-                        primary_node_id: owner.clone(),
-                        epoch: initial.epoch,
-                        journal_sequence: 1,
-                        state_fingerprint: "blake3:bootstrap-async".to_string(),
-                        acknowledged_node_ids: vec![owner.clone(), replacement.clone()],
-                    },
-                )
-                .await
-                .expect("publish async certified transfer head")
-        );
         let next_epoch = DfsMetadataShardConfig {
             primary_node_id: replacement,
             replica_node_ids: vec![owner],
@@ -2555,7 +2516,6 @@ mod tests {
             bootstrap_owner_node_ids: vec![local.clone()],
             fallback_owner_node_id: local.clone(),
             handoff_evidence: Vec::new(),
-            head_watermarks: BTreeMap::new(),
         };
         record_default_materialization(data_dir.root(), signature, false);
 
@@ -2569,7 +2529,6 @@ mod tests {
                 bootstrap_owner_node_ids: vec![local.clone()],
                 fallback_owner_node_id: local,
                 handoff_evidence: Vec::new(),
-                head_watermarks: BTreeMap::new(),
             }
         ));
     }
@@ -2586,7 +2545,6 @@ mod tests {
             bootstrap_owner_node_ids: vec![local.clone()],
             fallback_owner_node_id: local,
             handoff_evidence: Vec::new(),
-            head_watermarks: BTreeMap::new(),
         };
         record_default_materialization(data_dir.root(), signature.clone(), true);
         assert!(
@@ -2680,36 +2638,6 @@ mod tests {
             default_materialization_run_count(&data_dir.root()),
             1,
             "an unchanged publication must not reopen every shard and rescan the object catalog"
-        );
-
-        let root_shard = first
-            .metadata_shards
-            .iter()
-            .find(|shard| shard.shard_id == "root")
-            .expect("root shard")
-            .clone();
-        DfsControlPlaneAsyncStore::new(host.control_plane.as_mut())
-            .publish_metadata_shard_head_watermark(
-                &root_shard,
-                &DfsMetadataShardHeadWatermark {
-                    file_system_id: root_shard.file_system_id.clone(),
-                    shard_id: root_shard.shard_id.clone(),
-                    primary_node_id: root_shard.primary_node_id.clone(),
-                    epoch: root_shard.epoch,
-                    journal_sequence: 1,
-                    state_fingerprint: "blake3:materialization-signature-head".to_string(),
-                    acknowledged_node_ids: vec![state.local_node_id.clone()],
-                },
-            )
-            .await
-            .expect("publish consulted head generation");
-        ensure_default_distributed_dfs_with_async_host(&state, &mut host, options)
-            .await
-            .expect("head-aware default DFS publication");
-        assert_eq!(
-            default_materialization_run_count(&data_dir.root()),
-            2,
-            "a consulted head generation must invalidate the materialization cache"
         );
     }
 
@@ -2927,7 +2855,6 @@ mod tests {
             default_dfs_metadata_shards_root(&data_dir),
             &file_system,
             &shards,
-            &BTreeMap::new(),
             &active_primary_shard_ids,
             &local,
             vec![local.clone()],
@@ -2981,7 +2908,6 @@ mod tests {
             default_dfs_metadata_shards_root(&data_dir),
             &file_system,
             &[services],
-            &BTreeMap::new(),
             &BTreeSet::new(),
             &local,
             vec![local.clone()],
@@ -3014,6 +2940,7 @@ mod tests {
             users_primary,
         );
         shards[0].replica_node_ids.push(services_primary.clone());
+        shards[1].replica_node_ids.push(root_primary.clone());
         let mut legacy_object = crate::distributed_sifs_bootstrap_objects(root_primary.clone())
             .into_iter()
             .next()
@@ -3041,62 +2968,16 @@ mod tests {
             .expect("root replica legacy object");
         let target_root_sequence = certified_root.journal_last_sequence();
         certified_root
-            .put_metadata_prefix_ack_floor(&DfsMetadataPrefixAckFloor {
+            .put_metadata_authority_ack_floor(&DfsMetadataAuthorityAckFloor {
                 shard_id: DfsMetadataShardId::new("root"),
                 journal_sequence: target_root_sequence,
-                state_fingerprint: "blake3:split-root-certified".to_string(),
             })
             .expect("certify root replica");
         drop(certified_root);
-        let target_watermarks = BTreeMap::from([(
-            DfsMetadataShardId::new("root"),
-            DfsMetadataShardHeadWatermark {
-                file_system_id: file_system.file_system_id.clone(),
-                shard_id: "root".to_string(),
-                primary_node_id: root_primary.clone(),
-                epoch: 1,
-                journal_sequence: target_root_sequence,
-                state_fingerprint: "blake3:split-root-certified".to_string(),
-                acknowledged_node_ids: vec![root_primary.clone(), services_primary.clone()],
-            },
-        )]);
-        let mut stale_target_watermarks = target_watermarks.clone();
-        let stale_root_watermark = stale_target_watermarks
-            .get_mut(&DfsMetadataShardId::new("root"))
-            .expect("stale root watermark");
-        stale_root_watermark.journal_sequence = target_root_sequence.saturating_sub(1);
-        stale_root_watermark.state_fingerprint = "blake3:stale-root-watermark".to_string();
-        let stale_report = materialize_default_sifs_metadata_on_active_primary_shards(
-            default_dfs_metadata_shards_root(&target_data_dir),
-            &file_system,
-            &shards,
-            &stale_target_watermarks,
-            &BTreeSet::from([DfsMetadataShardId::new("services")]),
-            &services_primary,
-            vec![root_primary.clone()],
-            root_primary.clone(),
-            OffsetDateTime::now_utc(),
-        )
-        .expect("defer stale certified root replica");
-        assert_eq!(stale_report.migration.migrated_objects, 0);
-        assert!(stale_report.awaiting_replica_progress);
-        assert!(
-            open_local_metadata_shard_backend(
-                &target_data_dir,
-                DfsMetadataShardId::new("services"),
-            )
-            .expect("services authority before current watermark")
-            .get_object(&legacy_object.object_id)
-            .expect("legacy object before current watermark")
-            .is_none(),
-            "a stale locally certified prefix must not seed the current target authority"
-        );
-
         let target_report = materialize_default_sifs_metadata_on_active_primary_shards(
             default_dfs_metadata_shards_root(&target_data_dir),
             &file_system,
             &shards,
-            &target_watermarks,
             &BTreeSet::from([DfsMetadataShardId::new("services")]),
             &services_primary,
             vec![root_primary.clone()],
@@ -3159,31 +3040,16 @@ mod tests {
             .expect("services replica adopted object");
         let services_replica_sequence = certified_services.journal_last_sequence();
         certified_services
-            .put_metadata_prefix_ack_floor(&DfsMetadataPrefixAckFloor {
+            .put_metadata_authority_ack_floor(&DfsMetadataAuthorityAckFloor {
                 shard_id: DfsMetadataShardId::new("services"),
                 journal_sequence: services_replica_sequence,
-                state_fingerprint: "blake3:split-services-certified".to_string(),
             })
             .expect("certify services replica");
         drop(certified_services);
-        let source_watermarks = BTreeMap::from([(
-            DfsMetadataShardId::new("services"),
-            DfsMetadataShardHeadWatermark {
-                file_system_id: file_system.file_system_id.clone(),
-                shard_id: "services".to_string(),
-                primary_node_id: services_primary.clone(),
-                epoch: 1,
-                journal_sequence: services_replica_sequence,
-                state_fingerprint: "blake3:split-services-certified".to_string(),
-                acknowledged_node_ids: vec![services_primary.clone(), root_primary.clone()],
-            },
-        )]);
-
         let source_report = materialize_default_sifs_metadata_on_active_primary_shards(
             default_dfs_metadata_shards_root(&source_data_dir),
             &file_system,
             &shards,
-            &source_watermarks,
             &BTreeSet::from([DfsMetadataShardId::new("root")]),
             &root_primary,
             vec![root_primary.clone()],
@@ -3265,31 +3131,16 @@ mod tests {
             .expect("same-id wrong target object");
         let target_sequence = target.journal_last_sequence();
         target
-            .put_metadata_prefix_ack_floor(&DfsMetadataPrefixAckFloor {
+            .put_metadata_authority_ack_floor(&DfsMetadataAuthorityAckFloor {
                 shard_id: DfsMetadataShardId::new("services"),
                 journal_sequence: target_sequence,
-                state_fingerprint: "blake3:wrong-target-certified".to_string(),
             })
             .expect("certify wrong target replica");
         drop(target);
-        let watermarks = BTreeMap::from([(
-            DfsMetadataShardId::new("services"),
-            DfsMetadataShardHeadWatermark {
-                file_system_id: file_system.file_system_id.clone(),
-                shard_id: "services".to_string(),
-                primary_node_id: shards[1].primary_node_id.clone(),
-                epoch: 1,
-                journal_sequence: target_sequence,
-                state_fingerprint: "blake3:wrong-target-certified".to_string(),
-                acknowledged_node_ids: vec![root_primary.clone()],
-            },
-        )]);
-
         let report = materialize_default_sifs_metadata_on_active_primary_shards(
             default_dfs_metadata_shards_root(&data_dir),
             &file_system,
             &shards,
-            &watermarks,
             &BTreeSet::from([DfsMetadataShardId::new("root")]),
             &root_primary,
             vec![root_primary.clone()],
@@ -3364,7 +3215,6 @@ mod tests {
             default_dfs_metadata_shards_root(&data_dir),
             &file_system,
             &shards,
-            &BTreeMap::new(),
             &BTreeSet::from([
                 DfsMetadataShardId::new("root"),
                 DfsMetadataShardId::new("services"),
@@ -3468,7 +3318,6 @@ mod tests {
             default_dfs_metadata_shards_root(&data_dir),
             &file_system,
             &shards,
-            &BTreeMap::new(),
             &BTreeSet::from([
                 DfsMetadataShardId::new("root"),
                 DfsMetadataShardId::new("services"),
@@ -3501,7 +3350,6 @@ mod tests {
             default_dfs_metadata_shards_root(&data_dir),
             &file_system,
             &shards,
-            &BTreeMap::new(),
             &BTreeSet::from([
                 DfsMetadataShardId::new("root"),
                 DfsMetadataShardId::new("services"),
@@ -3590,38 +3438,17 @@ mod tests {
             "ordinary object paging must continue to hide compacted tombstones"
         );
         let target_sequence = target.journal_last_sequence();
-        let target_fingerprint = crate::service_sync::metadata_shard_state_fingerprint_at(
-            &target,
-            &services_shard_id,
-            target_sequence,
-        )
-        .expect("certified target fingerprint");
         target
-            .put_metadata_prefix_ack_floor(&DfsMetadataPrefixAckFloor {
+            .put_metadata_authority_ack_floor(&DfsMetadataAuthorityAckFloor {
                 shard_id: services_shard_id.clone(),
                 journal_sequence: target_sequence,
-                state_fingerprint: target_fingerprint.clone(),
             })
             .expect("certify compacted target");
         drop(target);
-        let head_watermarks = BTreeMap::from([(
-            services_shard_id.clone(),
-            DfsMetadataShardHeadWatermark {
-                file_system_id: file_system.file_system_id.clone(),
-                shard_id: "services".to_string(),
-                primary_node_id: remote,
-                epoch: shards[1].epoch,
-                journal_sequence: target_sequence,
-                state_fingerprint: target_fingerprint,
-                acknowledged_node_ids: vec![local.clone()],
-            },
-        )]);
-
         let report = materialize_default_sifs_metadata_on_active_primary_shards(
             default_dfs_metadata_shards_root(&data_dir),
             &file_system,
             &shards,
-            &head_watermarks,
             &BTreeSet::from([
                 DfsMetadataShardId::new("root"),
                 DfsMetadataShardId::new("users"),
@@ -3649,7 +3476,6 @@ mod tests {
             default_dfs_metadata_shards_root(&data_dir),
             &file_system,
             &shards,
-            &head_watermarks,
             &BTreeSet::from([
                 DfsMetadataShardId::new("root"),
                 DfsMetadataShardId::new("users"),
@@ -3703,7 +3529,6 @@ mod tests {
             default_dfs_metadata_shards_root(&data_dir),
             &file_system,
             &shards,
-            &BTreeMap::new(),
             &BTreeSet::from([
                 DfsMetadataShardId::new("root"),
                 DfsMetadataShardId::new("services"),
@@ -3746,7 +3571,6 @@ mod tests {
             default_dfs_metadata_shards_root(&data_dir),
             &file_system,
             &shards,
-            &BTreeMap::new(),
             &BTreeSet::from([DfsMetadataShardId::new("root")]),
             &local,
             vec![local.clone()],
@@ -3801,7 +3625,6 @@ mod tests {
             default_dfs_metadata_shards_root(&data_dir),
             &file_system,
             &shards,
-            &BTreeMap::new(),
             &BTreeSet::from([DfsMetadataShardId::new("root")]),
             &local,
             vec![local.clone()],
@@ -3848,7 +3671,6 @@ mod tests {
             default_dfs_metadata_shards_root(&data_dir),
             &file_system,
             &shards,
-            &BTreeMap::new(),
             &BTreeSet::from([
                 DfsMetadataShardId::new("root"),
                 services_shard_id,
@@ -3947,19 +3769,9 @@ mod tests {
             },
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        let graph = ClusterConnectivityGraph::from_records(
-            state.local_node_id.clone(),
-            vec![test_connectivity_record(
-                &state,
-                &state.local_node_id,
-                &bootstrap_primary,
-                "reachable-peer",
-                ClusterConnectivityState::Healthy,
-            )],
-        );
         let mut host = TestDefaultClusterBootstrapHost {
             current_shard: Some(current.clone()),
-            connectivity_graph: Some(graph),
+            unavailable_node_ids: BTreeSet::from([unreachable_primary.clone()]),
             primary_transfer_ready: true,
             primary_transfer_targets: Vec::new(),
         };
@@ -4018,68 +3830,10 @@ mod tests {
             },
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        let healthy_graph = ClusterConnectivityGraph::from_records(
-            state.local_node_id.clone(),
-            vec![test_connectivity_record(
-                &state,
-                &state.local_node_id,
-                &current_primary,
-                "current-primary",
-                ClusterConnectivityState::Healthy,
-            )],
-        );
-        let current_unreachable_graph = ClusterConnectivityGraph::from_records(
-            state.local_node_id.clone(),
-            vec![test_connectivity_record(
-                &state,
-                &state.local_node_id,
-                &default_primary,
-                "default-primary",
-                ClusterConnectivityState::Healthy,
-            )],
-        );
-        let default_primary_offset = service_nodes
-            .iter()
-            .position(|node_id| node_id == &default_primary)
-            .expect("default primary is eligible");
-
-        assert!(
-            default_metadata_shard_transition_awaits_head_watermark(
-                Some(&healthy_graph),
-                &state.local_node_id,
-                &service_nodes,
-                &current,
-                default_primary_offset,
-            ),
-            "normal topology convergence needs head evidence before moving to the default primary"
-        );
-        assert!(
-            !default_metadata_shard_transition_awaits_head_watermark(
-                None,
-                &state.local_node_id,
-                &service_nodes,
-                &DfsMetadataShardConfig {
-                    primary_node_id: default_primary.clone(),
-                    ..current.clone()
-                },
-                default_primary_offset,
-            ),
-            "a stable default primary must not subscribe to POSIX head updates"
-        );
-        assert!(
-            default_metadata_shard_transition_awaits_head_watermark(
-                Some(&current_unreachable_graph),
-                &state.local_node_id,
-                &service_nodes,
-                &current,
-                default_primary_offset,
-            ),
-            "failover must subscribe to the head evidence needed for promotion"
-        );
-
         assert_eq!(
             default_metadata_shard_target_primary_node_id(
-                Some(&healthy_graph),
+                false,
+                false,
                 &state.local_node_id,
                 &service_nodes,
                 default_primary.clone(),
@@ -4090,7 +3844,8 @@ mod tests {
         );
         assert_eq!(
             default_metadata_shard_target_primary_node_id(
-                None,
+                false,
+                false,
                 &state.local_node_id,
                 &service_nodes,
                 default_primary.clone(),
@@ -4101,7 +3856,8 @@ mod tests {
         );
         assert_eq!(
             default_metadata_shard_target_primary_node_id(
-                Some(&current_unreachable_graph),
+                true,
+                false,
                 &state.local_node_id,
                 &service_nodes,
                 default_primary.clone(),
@@ -4115,15 +3871,76 @@ mod tests {
         );
         assert_eq!(
             default_metadata_shard_target_primary_node_id(
-                Some(&current_unreachable_graph),
+                true,
+                false,
                 &state.local_node_id,
                 &service_nodes,
-                default_primary,
+                default_primary.clone(),
                 &current,
             ),
             state.local_node_id,
             "unreachable current primary lets the local replica become target primary"
         );
+
+        let local_primary = DfsMetadataShardConfig {
+            primary_node_id: state.local_node_id.clone(),
+            replica_node_ids: vec![current_primary],
+            ..current
+        };
+        assert_eq!(
+            default_metadata_shard_target_primary_node_id(
+                false,
+                true,
+                &state.local_node_id,
+                &service_nodes,
+                default_primary,
+                &local_primary,
+            ),
+            state.local_node_id,
+            "a failover primary must remain authoritative while the default target is unavailable"
+        );
+    }
+
+    #[test]
+    fn metadata_primary_routing_unavailability_requires_sustained_evidence() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-routing-unavailability-grace");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let local = NodeId::from_legacy_named("node_dfs_routing_grace_local").expect("local");
+        let target = NodeId::from_legacy_named("node_dfs_routing_grace_target").expect("target");
+        let started = Instant::now();
+        let grace = Duration::from_secs(30);
+
+        assert!(!metadata_primary_routing_suspicion_elapsed(
+            &cluster_paths,
+            &local,
+            &target,
+            started,
+            grace,
+        ));
+        assert!(!metadata_primary_routing_suspicion_elapsed(
+            &cluster_paths,
+            &local,
+            &target,
+            started + grace - Duration::from_millis(1),
+            grace,
+        ));
+        assert!(metadata_primary_routing_suspicion_elapsed(
+            &cluster_paths,
+            &local,
+            &target,
+            started + grace,
+            grace,
+        ));
+
+        clear_metadata_primary_routing_suspicion(&cluster_paths, &local, &target);
+        assert!(!metadata_primary_routing_suspicion_elapsed(
+            &cluster_paths,
+            &local,
+            &target,
+            started + grace + Duration::from_secs(1),
+            grace,
+        ));
     }
 
     #[test]
@@ -4146,31 +3963,11 @@ mod tests {
             assignment: DfsMetadataShardAssignment::Root,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        let preliminary_watermark = DfsMetadataShardHeadWatermark {
-            file_system_id: current.file_system_id.clone(),
-            shard_id: current.shard_id.clone(),
-            primary_node_id: remote_primary.clone(),
-            epoch: current.epoch,
-            journal_sequence: 1,
-            state_fingerprint: "blake3:preliminary".to_string(),
-            acknowledged_node_ids: vec![remote_primary.clone(), local.clone()],
-        };
-
-        assert!(
-            !metadata_shard_local_replica_failover_ready_from_local_backend(
-                &data_dir,
-                &local,
-                &current,
-                &local,
-                Some(&preliminary_watermark),
-            )
-            .expect("empty local shard is not promotable")
-        );
         assert!(
             !metadata_shard_local_replica_failover_ready_from_local_backend(
                 &data_dir, &local, &current, &local, None,
             )
-            .expect("missing quorum head is not promotable")
+            .expect("empty local shard is not promotable")
         );
         assert!(
             !metadata_shard_local_replica_failover_ready_from_local_backend(
@@ -4181,7 +3978,7 @@ mod tests {
                     ..current.clone()
                 },
                 &local,
-                Some(&preliminary_watermark),
+                None,
             )
             .expect("non replica cannot self-promote")
         );
@@ -4191,7 +3988,7 @@ mod tests {
                 &local,
                 &current,
                 &remote_primary,
-                Some(&preliminary_watermark),
+                None,
             )
             .expect("local replica only proves local promotion")
         );
@@ -4204,11 +4001,7 @@ mod tests {
 
         assert!(
             !metadata_shard_local_replica_failover_ready_from_local_backend(
-                &data_dir,
-                &local,
-                &current,
-                &local,
-                Some(&preliminary_watermark),
+                &data_dir, &local, &current, &local, None,
             )
             .expect("locally originated shard state is not certified replica progress")
         );
@@ -4238,54 +4031,28 @@ mod tests {
         replica_backend
             .apply_journal_batch(&batch)
             .expect("apply certified primary batch");
-        let certified_fingerprint = crate::service_sync::metadata_shard_state_fingerprint_at(
+        replica_backend
+            .put_metadata_authority_ack_floor(&DfsMetadataAuthorityAckFloor {
+                shard_id: shard_id.clone(),
+                journal_sequence: batch.next_after_sequence,
+            })
+            .expect("persist certified replica authority floor");
+        let state_fingerprint = crate::service_sync::metadata_shard_state_fingerprint_at(
             &replica_backend,
             &shard_id,
             batch.next_after_sequence,
         )
-        .expect("certified replica fingerprint");
-        replica_backend
-            .put_metadata_prefix_ack_floor(&DfsMetadataPrefixAckFloor {
-                shard_id: shard_id.clone(),
-                journal_sequence: batch.next_after_sequence,
-                state_fingerprint: certified_fingerprint.clone(),
-            })
-            .expect("persist certified replica checkpoint floor");
+        .expect("replica state fingerprint");
         drop(replica_backend);
-
-        let certified_watermark = DfsMetadataShardHeadWatermark {
+        let watermark = DfsMetadataShardHeadWatermark {
+            file_system_id: current.file_system_id.clone(),
+            shard_id: current.shard_id.clone(),
+            primary_node_id: remote_primary,
+            epoch: current.epoch,
             journal_sequence: batch.next_after_sequence,
-            state_fingerprint: certified_fingerprint,
-            ..preliminary_watermark.clone()
+            state_fingerprint,
+            acknowledged_node_ids: vec![current.primary_node_id.clone(), local.clone()],
         };
-        let stale_epoch_watermark = DfsMetadataShardHeadWatermark {
-            epoch: current.epoch.saturating_sub(1),
-            ..certified_watermark.clone()
-        };
-        assert!(
-            !metadata_shard_local_replica_failover_ready_from_local_backend(
-                &replica_data_dir,
-                &local,
-                &current,
-                &local,
-                Some(&stale_epoch_watermark),
-            )
-            .expect("stale-epoch watermark is not promotable")
-        );
-        let missing_local_ack = DfsMetadataShardHeadWatermark {
-            acknowledged_node_ids: vec![remote_primary],
-            ..certified_watermark.clone()
-        };
-        assert!(
-            !metadata_shard_local_replica_failover_ready_from_local_backend(
-                &replica_data_dir,
-                &local,
-                &current,
-                &local,
-                Some(&missing_local_ack),
-            )
-            .expect("candidate absent from quorum acknowledgements is not promotable")
-        );
 
         assert!(
             metadata_shard_local_replica_failover_ready_from_local_backend(
@@ -4293,9 +4060,9 @@ mod tests {
                 &local,
                 &current,
                 &local,
-                Some(&certified_watermark),
+                Some(&watermark),
             )
-            .expect("quorum-certified primary head makes caught-up replica promotable")
+            .expect("DFS-certified primary head makes caught-up replica promotable")
         );
     }
 
@@ -4326,35 +4093,5 @@ mod tests {
             ));
         }
         state
-    }
-
-    fn test_connectivity_record(
-        state: &ClusterBootstrapState,
-        source: &NodeId,
-        target: &NodeId,
-        endpoint_name: &str,
-        connectivity_state: ClusterConnectivityState,
-    ) -> ClusterConnectivityRecord {
-        let now = OffsetDateTime::now_utc();
-        let healthy = connectivity_state == ClusterConnectivityState::Healthy;
-        ClusterConnectivityRecord {
-            cluster_id: state.cluster_id.clone(),
-            source_node_id: source.clone(),
-            target_node_id: target.clone(),
-            endpoint_id: ClusterEndpointId::derived(
-                "sinomo.test.dfs.metadata-primary",
-                format!("{}\0{}\0{endpoint_name}", source.as_str(), target.as_str()),
-            ),
-            transport: ClusterTransportKind::LanTcp,
-            address: format!("{endpoint_name}.example.test:21353"),
-            state: connectivity_state,
-            latency_ms: healthy.then_some(2),
-            consecutive_failures: if healthy { 0 } else { 1 },
-            last_success_at: healthy.then(|| now.to_string()),
-            last_failure_at: (!healthy).then(|| now.to_string()),
-            failure_reason: None,
-            observed_at: now,
-            expires_at: now + time::Duration::seconds(900),
-        }
     }
 }

@@ -850,6 +850,7 @@ pub struct ClusterKvRaftQuorumCommitResult {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ClusterKvTxnCommitResult {
     pub request_id: KvRequestId,
+    pub command_digest: KvCommandDigest,
     pub snapshot: KvSnapshot,
     pub txn_response: Option<KvTxnResponse>,
     pub authority: KvAuthorityProof,
@@ -1275,6 +1276,18 @@ pub trait ClusterKvRaftQuorumCommitAsyncHost: Send {
         &'a mut self,
         index: u64,
     ) -> ClusterKvRaftQuorumFuture<'a, ClusterKvRaftCommitResult, Self::Error>;
+
+    /// Confirms the leader's advanced commit index to a request-specific
+    /// replication target. The default is a no-op; network hosts use this for
+    /// forwarded writes whose compact response must be materializable from the
+    /// forwarding voter's local Raft snapshot.
+    fn confirm_required_replication_target_async<'a>(
+        &'a mut self,
+        _state: &'a ClusterBootstrapState,
+        _timeout: Duration,
+    ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
+        Box::pin(async { Ok(()) })
+    }
 
     fn remote_voter_targets_async<'a>(
         &'a mut self,
@@ -1856,6 +1869,22 @@ where
         host.commit_cluster_raft_index_with_events_async(entry.index)
             .await?
     };
+    {
+        let _phase = KvCommandPhaseMetricGuard::start("required_replication_commit_confirm");
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if !remaining.is_zero() {
+            // The commit is already durable at this point. Confirmation is a
+            // response-materialization optimization: failure leaves the
+            // caller's authoritative-snapshot fallback responsible for
+            // convergence and must not turn a committed request into an
+            // ordinary retryable error.
+            let _ = host
+                .confirm_required_replication_target_async(state, remaining)
+                .await;
+        }
+    }
     command_metrics.finish("committed");
     for target in targets {
         if fanout_node_ids
@@ -2024,7 +2053,6 @@ fn validate_cluster_kv_txn_commit_response(
                     "exact committed-request authority was not marked as a replay",
                 ));
             }
-            let digest = request.clone().into_command_request().digest()?;
             let record = response
                 .snapshot
                 .committed_requests
@@ -2036,7 +2064,7 @@ fn validate_cluster_kv_txn_commit_response(
                         request.request_id
                     ))
                 })?;
-            if record.command_digest != digest
+            if record.command_digest != response.command_digest
                 || record.term != response.authority.term
                 || record.log_index != response.authority.commit_index
                 || record.revision != response.authority.revision
@@ -2254,6 +2282,11 @@ where
             Ok(commit) => {
                 return Ok(ClusterKvTxnCommitResult {
                     request_id: request.request_id.clone(),
+                    command_digest: request
+                        .clone()
+                        .into_command_request()
+                        .digest()
+                        .map_err(H::kv_error)?,
                     snapshot: commit.snapshot,
                     txn_response: commit.txn_response,
                     authority: commit.authority,
@@ -2428,6 +2461,11 @@ where
             Ok(commit) => {
                 return Ok(ClusterKvTxnCommitResult {
                     request_id: request.request_id.clone(),
+                    command_digest: request
+                        .clone()
+                        .into_command_request()
+                        .digest()
+                        .map_err(H::kv_error)?,
                     snapshot: commit.snapshot,
                     txn_response: commit.txn_response,
                     authority: commit.authority,
@@ -4214,34 +4252,17 @@ impl DurableRaftKvNode {
         let mut snapshot_restored = false;
         if let Some(snapshot) = snapshot {
             let applied_index = self.applied_index();
-            let current_term = self.hard_state().current_term;
             let snapshot_matches_append = append.prev_log_index >= snapshot.last_included_index
                 && (append.prev_log_index != snapshot.last_included_index
                     || append.prev_log_term == snapshot.last_included_term);
             let snapshot_is_newer = snapshot.last_included_index > applied_index;
-            // Cluster RPC admission authenticates `append.leader_id` before this
-            // method is reached. A same-index install is nevertheless much more
-            // destructive than normal forward catch-up, so only allow it from the
-            // leader this follower has already recorded for the exact current term.
-            // This repairs a compacted committed-log fork even when the divergent
-            // local command happened to produce a higher KV revision.
-            let snapshot_repairs_same_index_divergence = snapshot.last_included_index > 0
-                && snapshot.last_included_index == applied_index
-                && snapshot.last_included_index == self.hard_state().commit_index
-                && self
-                    .term_at(snapshot.last_included_index)
-                    .is_some_and(|local_term| snapshot.last_included_term > local_term)
-                && snapshot.last_included_term <= append.term
-                && append.prev_log_index == snapshot.last_included_index
-                && append.prev_log_term == snapshot.last_included_term
-                && append.leader_commit == snapshot.last_included_index
-                && append.term == current_term
-                && self.hard_state().leader_id.as_ref() == Some(&append.leader_id);
-            let append_term_is_current = append.term >= current_term;
-            if append_term_is_current
-                && snapshot_matches_append
-                && (snapshot_is_newer || snapshot_repairs_same_index_divergence)
-            {
+            let append_term_is_current = append.term >= self.hard_state().current_term;
+            // Raft snapshots advance the committed prefix; they never arbitrate
+            // between two states at the same committed index. A same-index
+            // mismatch is a safety violation or durable corruption and must be
+            // rejected by AppendEntries without overwriting local committed
+            // state.
+            if append_term_is_current && snapshot_matches_append && snapshot_is_newer {
                 self.restore_snapshot(snapshot)?;
                 snapshot_restored = true;
             }

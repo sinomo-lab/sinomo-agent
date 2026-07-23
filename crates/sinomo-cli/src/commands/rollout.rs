@@ -2538,7 +2538,7 @@ fn rollout_cluster_legacy(options: RolloutOptions) -> Result<(), CliError> {
         options.shadow_port,
         requested_at.clone(),
     );
-    let mut binary_request: Option<PreparedClusterBinaryRollout> = None;
+    let mut binary_requests = BTreeMap::<(String, String), PreparedClusterBinaryRollout>::new();
     let mut source_bundle: Option<(Vec<u8>, String)> = None;
     let mut desired_source_head = None;
     if options.targets.is_empty() && options.remote_build && options.remote_repo.is_none() {
@@ -2639,14 +2639,29 @@ fn rollout_cluster_legacy(options: RolloutOptions) -> Result<(), CliError> {
             continue;
         }
 
-        if let Err(error) =
-            ensure_rollout_target_platform_from_status(target.label(), &target_status)
+        let explicit_binary = options.binary.is_some();
+        if !explicit_binary
+            && let Err(error) =
+                ensure_rollout_target_platform_from_status(target.label(), &target_status)
         {
             println!("{}: skipped: {error}", target.label());
             outcomes.record_failure(target.label(), "skipped", error.to_string());
             continue;
         }
-        if binary_request.is_none() {
+        let Some(target_os) = target_status.target_os.clone() else {
+            let detail = "target daemon did not report its operating system".to_string();
+            println!("{}: skipped: {detail}", target.label());
+            outcomes.record_failure(target.label(), "skipped", detail);
+            continue;
+        };
+        let Some(target_arch) = target_status.target_arch.clone() else {
+            let detail = "target daemon did not report its architecture".to_string();
+            println!("{}: skipped: {detail}", target.label());
+            outcomes.record_failure(target.label(), "skipped", detail);
+            continue;
+        };
+        let platform = (target_os.clone(), target_arch.clone());
+        if !binary_requests.contains_key(&platform) {
             let artifacts = rollout_prepare_dev_artifacts(&options)?;
             println!(
                 "cluster rollout binary: {}",
@@ -2655,18 +2670,23 @@ fn rollout_cluster_legacy(options: RolloutOptions) -> Result<(), CliError> {
             for module in &artifacts.native_dylib_modules {
                 println!("cluster rollout module: {}", module.built_library.display());
             }
-            binary_request = Some(prepare_cluster_binary_rollout(
+            let prepared = prepare_cluster_binary_rollout_for_target(
                 source.clone(),
                 &artifacts.built_binary,
                 &artifacts.native_dylib_modules,
                 options.skip_native_modules,
+                target_os,
+                target_arch,
                 options.host.clone(),
                 options.port,
                 options.shadow_port,
                 requested_at.clone(),
-            )?);
+            )?;
+            binary_requests.insert(platform.clone(), prepared);
         }
-        let request = binary_request.as_ref().expect("binary rollout request");
+        let request = binary_requests
+            .get(&platform)
+            .expect("binary rollout request");
         match send_prepared_daemon_rollout_binary(&target, request) {
             Ok(response) => {
                 println!("{}: {}", target.label(), response.status);
@@ -2822,11 +2842,13 @@ mod cluster_binary_rollout_tests {
             source: "test".to_string(),
         }];
 
-        let prepared = prepare_cluster_binary_rollout(
+        let prepared = prepare_cluster_binary_rollout_for_target(
             "test-source".to_string(),
             &binary,
             &modules,
             true,
+            "windows".to_string(),
+            "x86_64".to_string(),
             "127.0.0.1".to_string(),
             21_353,
             21_354,
@@ -2835,6 +2857,8 @@ mod cluster_binary_rollout_tests {
         .expect("prepare binary-only rollout without reading module artifact");
 
         assert!(prepared.manifest.native_dylib_modules.is_empty());
+        assert_eq!(prepared.manifest.target_os, "windows");
+        assert_eq!(prepared.manifest.target_arch, "x86_64");
         assert_eq!(prepared.manifest.total_bytes(), Some(11));
         assert_eq!(prepared.artifacts.len(), 1);
         assert_eq!(prepared.artifacts[0].artifact_id, "binary");
@@ -3586,30 +3610,6 @@ pub(crate) fn ensure_rollout_target_platform_from_status(
         status.target_arch.as_deref(),
     )
     .map_err(Into::into)
-}
-
-pub(crate) fn prepare_cluster_binary_rollout(
-    source: String,
-    binary: &Path,
-    native_dylib_modules: &[LocalRolloutNativeDylibModuleArtifact],
-    skip_native_modules: bool,
-    host: String,
-    port: u16,
-    shadow_port: u16,
-    requested_at: String,
-) -> Result<PreparedClusterBinaryRollout, CliError> {
-    prepare_cluster_binary_rollout_for_target(
-        source,
-        binary,
-        native_dylib_modules,
-        skip_native_modules,
-        std::env::consts::OS.to_string(),
-        std::env::consts::ARCH.to_string(),
-        host,
-        port,
-        shadow_port,
-        requested_at,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]

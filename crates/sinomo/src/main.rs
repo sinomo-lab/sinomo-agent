@@ -1,17 +1,44 @@
 use std::env;
 
 fn main() {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    configure_long_lived_daemon_allocator(&args);
     install_build_info();
     let runtime_config = sinomo_cli::default_cli_runtime_config()
         .with_native_rust_module_binding(sinomo_evolution::EVOLUTION_NATIVE_RUST_MODULE_BINDING)
         .with_test_cases(sinomo_evolution::register_evolution_test_cases);
     sinomo_cli::install_cli_runtime_config(runtime_config)
         .expect("default CLI module bindings should be installed once");
-    if let Err(error) = sinomo_cli::run(env::args().skip(1).collect()) {
+    if let Err(error) = sinomo_cli::run(args) {
         eprintln!("sinomo: {error}");
         std::process::exit(1);
     }
 }
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn configure_long_lived_daemon_allocator(args: &[String]) {
+    if !matches!(args, [daemon, run, ..] if daemon == "daemon" && run == "run")
+        && !matches!(args, [daemon, shadow, run, ..]
+            if daemon == "daemon" && shadow == "shadow" && run == "run")
+    {
+        return;
+    }
+
+    unsafe extern "C" {
+        fn mallopt(parameter: std::ffi::c_int, value: std::ffi::c_int) -> std::ffi::c_int;
+    }
+
+    // glibc otherwise creates an arena per busy worker. DFS and KV hydration
+    // can leave tens of MiB fragmented in each arena after the live objects are
+    // released, making an idle daemon retain the peak RSS of parallel work.
+    // Two arenas preserve concurrent allocation while bounding that retention.
+    const M_ARENA_MAX: std::ffi::c_int = -8;
+    const DAEMON_ARENA_MAX: std::ffi::c_int = 2;
+    let _ = unsafe { mallopt(M_ARENA_MAX, DAEMON_ARENA_MAX) };
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn configure_long_lived_daemon_allocator(_args: &[String]) {}
 
 fn install_build_info() {
     let build_info = sinomo_runtime::api::DaemonBuildInfo::new(

@@ -151,10 +151,13 @@ const CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT: Duration =
     CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT;
 const CLUSTER_NETWORK_PENDING_SERVICE_PUBLISH_TIMEOUT: Duration =
     CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT;
-// Preserve enough phase budget for one complete default transport attempt by
-// status/member/snapshot/service work after an early connectivity probe.
-const CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE: Duration =
-    sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+// A stale node-status publication can itself depend on the route that this
+// maintenance generation must repair. Bound that publication early enough to
+// leave one complete direct probe plus local projection overhead; otherwise a
+// restarted public node can remain unreachable forever while every tick spends
+// its whole budget trying to publish through the missing route.
+const CLUSTER_NETWORK_PENDING_CONNECTIVITY_RECOVERY_RESERVE: Duration =
+    Duration::from_millis(2_500);
 
 #[cfg(test)]
 fn cluster_network_info_key(node_id: &NodeId) -> String {
@@ -1466,7 +1469,7 @@ pub(crate) async fn handle_daemon_cluster_kv_request_async_on_runtime_with_timeo
     timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
 ) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
     handle_daemon_cluster_kv_request_async_with_forwarding_and_timeouts(
-        paths, request, true, runtime, timeouts,
+        paths, request, true, None, runtime, timeouts,
     )
     .await
 }
@@ -1476,7 +1479,8 @@ pub(crate) async fn handle_daemon_cluster_kv_request_async_on_runtime(
     request: sinomo_core::kv::KvTxnRequest,
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
-    handle_daemon_cluster_kv_request_async_with_forwarding(paths, request, true, runtime).await
+    handle_daemon_cluster_kv_request_async_with_forwarding(paths, request, true, None, runtime)
+        .await
 }
 
 pub(crate) async fn handle_daemon_cluster_kv_authoritative_snapshot_request_async_on_runtime(
@@ -1554,21 +1558,31 @@ pub(crate) async fn handle_daemon_cluster_kv_request_outcome_request_async_on_ru
 pub(crate) async fn handle_forwarded_daemon_cluster_kv_txn_request_async_on_runtime(
     paths: &DaemonPaths,
     request: sinomo_core::kv::KvTxnRequest,
+    forwarding_node_id: NodeId,
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
-    handle_daemon_cluster_kv_request_async_with_forwarding(paths, request, false, runtime).await
+    handle_daemon_cluster_kv_request_async_with_forwarding(
+        paths,
+        request,
+        false,
+        Some(forwarding_node_id),
+        runtime,
+    )
+    .await
 }
 
 async fn handle_daemon_cluster_kv_request_async_with_forwarding(
     paths: &DaemonPaths,
     request: sinomo_core::kv::KvTxnRequest,
     allow_forwarding: bool,
+    required_replication_node_id: Option<NodeId>,
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
     handle_daemon_cluster_kv_request_async_with_forwarding_and_timeouts(
         paths,
         request,
         allow_forwarding,
+        required_replication_node_id,
         runtime,
         cluster_control_plane_timeouts(),
     )
@@ -1579,6 +1593,7 @@ async fn handle_daemon_cluster_kv_request_async_with_forwarding_and_timeouts(
     paths: &DaemonPaths,
     request: sinomo_core::kv::KvTxnRequest,
     allow_forwarding: bool,
+    required_replication_node_id: Option<NodeId>,
     runtime: &tokio::runtime::Handle,
     timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
 ) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
@@ -1593,6 +1608,7 @@ async fn handle_daemon_cluster_kv_request_async_with_forwarding_and_timeouts(
             &cluster_paths,
             request,
             allow_forwarding,
+            required_replication_node_id,
             &task_runtime,
             timeouts,
         )
@@ -1631,6 +1647,7 @@ pub(crate) async fn handle_cluster_kv_txn_request_with_cluster_paths_async_on_ru
         cluster_paths,
         sinomo_core::kv::KvTxnRequest::generated(txn),
         allow_forwarding,
+        None,
         runtime,
         cluster_control_plane_timeouts(),
     )
@@ -1642,6 +1659,7 @@ async fn handle_cluster_kv_request_with_cluster_paths_async_on_runtime_with_time
     cluster_paths: &ClusterPaths,
     request: sinomo_core::kv::KvTxnRequest,
     allow_forwarding: bool,
+    required_replication_node_id: Option<NodeId>,
     runtime: &tokio::runtime::Handle,
     timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
 ) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
@@ -1649,6 +1667,7 @@ async fn handle_cluster_kv_request_with_cluster_paths_async_on_runtime_with_time
         DaemonClusterRpcMode::from_handle(runtime),
         timeouts,
     );
+    host.required_replication_node_id = required_replication_node_id;
     sinomo_core::cluster::handle_cluster_kv_txn_request_async_with_host(
         runtime,
         cluster_paths,
@@ -3951,24 +3970,20 @@ impl ClusterNetworkMaintenance {
         // fresh local observation that can repair their routes.
         let connectivity_probe_scheduled = connectivity_probe.is_some();
         let connectivity_publish_scheduled = connectivity_publish.is_some();
-        let connectivity_probe_deadline = if connectivity_probe_scheduled
-            && (!member_publishes.is_empty()
-                || !node_status_refreshes.is_empty()
-                || !low_priority_node_status_refreshes.is_empty()
-                || service_instance_publish.is_some())
-        {
+        let node_status_deadline = if connectivity_probe_scheduled {
             cluster_network_deadline_with_tail_reserve(
                 deadline,
-                CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE,
+                CLUSTER_NETWORK_PENDING_CONNECTIVITY_RECOVERY_RESERVE,
             )
         } else {
             deadline
         };
+        let connectivity_probe_deadline = deadline;
         for refresh in node_status_refreshes {
             publish_succeeded &= cluster_network_pending_step_with_deadline(
                 "node status refresh",
                 CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT,
-                deadline,
+                node_status_deadline,
                 self.run_pending_node_status_refresh_async(refresh, runtime.clone()),
             )
             .await
@@ -8399,6 +8414,7 @@ pub(crate) struct DaemonClusterControlPlaneTransport {
     timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
     active_cluster_paths: Option<ClusterPaths>,
     join_rpc_context: Option<DaemonClusterJoinRpcContext>,
+    required_replication_node_id: Option<NodeId>,
 }
 
 #[derive(Clone, Debug)]
@@ -8424,6 +8440,7 @@ impl DaemonClusterControlPlaneTransport {
             timeouts,
             active_cluster_paths: None,
             join_rpc_context: None,
+            required_replication_node_id: None,
         }
     }
 
@@ -8740,6 +8757,10 @@ impl sinomo_core::cluster::ClusterStateAuthorityReachabilityAsyncHost
 }
 
 impl sinomo_core::cluster::ClusterKvTxnQuorumAsyncHost for DaemonClusterControlPlaneTransport {
+    fn required_kv_replication_node_id(&self) -> Option<NodeId> {
+        self.required_replication_node_id.clone()
+    }
+
     fn request_kv_state_authority_vote_async<'a>(
         &'a mut self,
         _state: &'a ClusterBootstrapState,
@@ -14616,7 +14637,7 @@ mod tests {
             pending,
             runtime.handle().clone(),
             Instant::now()
-                + CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE
+                + CLUSTER_NETWORK_PENDING_CONNECTIVITY_RECOVERY_RESERVE
                 + Duration::from_millis(250),
         ));
         let probe_was_stalled = accepted_rx.recv_timeout(Duration::from_secs(1)).is_ok();
@@ -14628,7 +14649,7 @@ mod tests {
             "probe must connect and stall in the test peer"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < Duration::from_secs(4),
             "the probe must yield at its bounded deadline after the presence publish"
         );
         let statuses = sinomo_core::cluster::read_cluster_node_statuses_from_kv(&cluster_paths)
@@ -15096,27 +15117,26 @@ mod tests {
     }
 
     #[test]
-    fn cluster_network_deadline_with_tail_reserve_preserves_followup_budget() {
-        assert_eq!(
-            CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE,
-            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-            "follow-up work must retain one complete default transport attempt"
+    fn cluster_network_deadline_with_tail_reserve_preserves_connectivity_recovery_budget() {
+        assert!(
+            CLUSTER_NETWORK_PENDING_CONNECTIVITY_RECOVERY_RESERVE > CLUSTER_HEALTH_PROBE_TIMEOUT,
+            "connectivity recovery must retain a complete endpoint probe plus projection overhead"
         );
         let deadline = Instant::now() + Duration::from_secs(10);
         let reserved = cluster_network_deadline_with_tail_reserve(
             Some(deadline),
-            CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE,
+            CLUSTER_NETWORK_PENDING_CONNECTIVITY_RECOVERY_RESERVE,
         )
         .expect("reserved deadline");
         let tail = deadline.duration_since(reserved);
         assert!(
-            tail >= CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE,
-            "connectivity work must leave one full default attempt for status/service publish"
+            tail >= CLUSTER_NETWORK_PENDING_CONNECTIVITY_RECOVERY_RESERVE,
+            "status publication must leave the connectivity recovery reserve intact"
         );
 
         let already_expired = cluster_network_deadline_with_tail_reserve(
             Some(Instant::now() + Duration::from_millis(500)),
-            CLUSTER_NETWORK_PENDING_FOLLOWUP_TAIL_RESERVE,
+            CLUSTER_NETWORK_PENDING_CONNECTIVITY_RECOVERY_RESERVE,
         )
         .expect("expired reserved deadline");
         assert!(

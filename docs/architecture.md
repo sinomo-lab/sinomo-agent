@@ -186,11 +186,16 @@ Every clustered main daemon runs the default SIFS bootstrap, placement
 reconciliation, metadata replication, and repair lifecycle. These are mandatory
 runtime responsibilities, not deployment or environment-controlled features.
 
-The cluster KV stores compact filesystem configuration and shard placement. DFS
-metadata shards own paths, versions, intents, receipts, and namespace
-transactions. Content stores own immutable bytes and manifests. Normal
-quorum-backed writes serialize through the relevant owner or metadata primary;
-they do not create conflicting visible histories.
+The cluster KV stores compact filesystem configuration and shard placement.
+DFS metadata shards own paths, versions, intents, receipts, namespace
+transactions, journals, and repair state. Content stores own immutable bytes
+and manifests. DFS writes serialize through the relevant owner or metadata
+primary and produce one authoritative visible history. A healthy publication
+is acknowledged by the complete configured metadata shard without touching
+Raft. If only a DFS recovery quorum is reachable, cluster KV may commit one
+bounded, operation-specific permit and head watermark for the exact assignment
+and epoch. This deliberately reuses the cluster's existing Raft consensus to
+fence failover; it does not put DFS metadata or content in KV.
 
 See [DFS architecture](dfs-architecture.md) and the [SIFS layout](sifs.md).
 
@@ -385,9 +390,9 @@ Changes to the runtime must preserve these properties:
 3. Discovery and reachability never imply trust.
 4. Remote requests are re-authorized at the node that owns the affected
    capability, device, secret, or data.
-5. The cluster KV contains compact control state, not large content or
-   high-cardinality DFS metadata.
-6. Normal quorum-backed DFS operation has one authoritative visible history.
+5. The cluster KV contains compact configuration and consensus fences, not
+   content, DFS journals, or high-cardinality filesystem metadata.
+6. Normal DFS operation has one authoritative visible history.
 7. Memory retrieval is scoped, attributable, and bounded by context assembly.
 8. Candidate code cannot approve, authorize, or make itself unrecoverable.
 9. Producing a binary or module artifact never grants authority to activate,

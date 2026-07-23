@@ -1999,6 +1999,11 @@ mod tests {
             request: KvTxnRequest,
         ) -> Result<ClusterKvTxnCommitResult, NetworkError> {
             let request_id = request.request_id.clone();
+            let command_digest = request
+                .clone()
+                .into_command_request()
+                .digest()
+                .map_err(kv_err)?;
             let txn_response = if self.force_compare_failure {
                 sinomo_kv::KvTxnResponse {
                     succeeded: false,
@@ -2012,6 +2017,7 @@ mod tests {
             let snapshot = self.store.try_snapshot().map_err(kv_err)?;
             Ok(ClusterKvTxnCommitResult {
                 request_id,
+                command_digest,
                 snapshot,
                 txn_response: Some(txn_response),
                 authority: self.authority(),

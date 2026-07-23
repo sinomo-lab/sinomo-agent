@@ -68,6 +68,7 @@ pub struct DfsMetadataReplicaIngestPermit {
     shard_id: DfsMetadataShardId,
     source_node_id: NodeId,
     source_epoch: u64,
+    pending_primary_handoff_id: Option<String>,
 }
 
 impl DfsMetadataReplicaIngestPermit {
@@ -84,6 +85,27 @@ impl DfsMetadataReplicaIngestPermit {
             shard_id,
             source_node_id,
             source_epoch,
+            pending_primary_handoff_id: None,
+        }
+    }
+
+    /// Mint an exact, proof-bound repair permit for the promoted replica of a
+    /// still-pending primary handoff. The caller must validate the committed
+    /// retiring assignment, durable fence, successor identity, and snapshot
+    /// checkpoint before constructing this capability.
+    pub(crate) fn new_validated_pending_primary_handoff(
+        file_system_id: DfsFileSystemId,
+        shard_id: DfsMetadataShardId,
+        source_node_id: NodeId,
+        source_epoch: u64,
+        handoff_id: String,
+    ) -> Self {
+        Self {
+            file_system_id,
+            shard_id,
+            source_node_id,
+            source_epoch,
+            pending_primary_handoff_id: Some(handoff_id),
         }
     }
 
@@ -101,6 +123,19 @@ impl DfsMetadataReplicaIngestPermit {
 
     pub(crate) fn source_epoch(&self) -> u64 {
         self.source_epoch
+    }
+
+    pub(crate) fn pending_primary_handoff_id(&self) -> Option<&str> {
+        self.pending_primary_handoff_id.as_deref()
+    }
+
+    pub(crate) fn admits_write_freeze(&self, freeze: &DfsMetadataShardWriteFreeze) -> bool {
+        freeze
+            .activated_epoch
+            .is_some_and(|activated_epoch| self.source_epoch >= activated_epoch)
+            || (freeze.activated_epoch.is_none()
+                && self.pending_primary_handoff_id() == Some(freeze.handoff_id.as_str())
+                && self.source_epoch == freeze.retiring_epoch)
     }
 }
 

@@ -4,8 +4,8 @@ use crate::{
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsFileSystemId, DfsMessageCommand,
     DfsMessageResponse, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
     DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataSnapshotInstallCommand,
-    DfsMetadataSnapshotInstallResponse, DfsNetworkMessage, DfsOperatorStatus, DfsRoutedMessage,
-    DfsSmokeReport,
+    DfsMetadataSnapshotInstallResponse, DfsNamespaceCommand, DfsNamespaceOperation,
+    DfsNetworkMessage, DfsOperatorStatus, DfsRoutedMessage, DfsSmokeReport,
 };
 use sinomo_core::network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_core::node::NodeId;
@@ -313,6 +313,15 @@ fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessag
         DfsNetworkMessage::ReadRequest(_) | DfsNetworkMessage::BulkReadRequest(_) => {
             DfsMessageExecutionScope::ReadOnly
         }
+        DfsNetworkMessage::NamespaceRequest(command)
+            if matches!(
+                command.operation,
+                DfsNamespaceOperation::LookupPath { .. }
+                    | DfsNamespaceOperation::LookupPaths { .. }
+            ) =>
+        {
+            DfsMessageExecutionScope::ReadOnly
+        }
         DfsNetworkMessage::NamespaceRequest(command) => {
             if command.authority_shards.len() == 1 {
                 let stamped = &command.authority_shards[0];
@@ -388,7 +397,13 @@ pub fn dfs_message_execution_scope(command: &DfsMessageCommand) -> DfsMessageExe
 fn dfs_network_message_is_read_only_request(message: &DfsNetworkMessage) -> bool {
     matches!(
         message,
-        DfsNetworkMessage::ReadRequest(_) | DfsNetworkMessage::BulkReadRequest(_)
+        DfsNetworkMessage::ReadRequest(_)
+            | DfsNetworkMessage::BulkReadRequest(_)
+            | DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                operation: DfsNamespaceOperation::LookupPath { .. }
+                    | DfsNamespaceOperation::LookupPaths { .. },
+                ..
+            })
     )
 }
 
@@ -407,10 +422,20 @@ fn dfs_network_message_response_retry_safe(message: &DfsNetworkMessage) -> bool 
 }
 
 fn dfs_network_message_requires_full_metadata_hydrate(message: &DfsNetworkMessage) -> bool {
-    matches!(
-        message,
-        DfsNetworkMessage::ReadRequest(_) | DfsNetworkMessage::BulkReadRequest(_)
-    )
+    match message {
+        // Ordinary networked reads carry the exact version and content hash
+        // selected by the requester. The serving node can validate and stream
+        // that immutable blob directly; rebuilding the complete metadata view
+        // would add no authority or freshness evidence and can exceed the RPC
+        // budget on slower filesystems. Only the metadata-dependent form needs
+        // the legacy object lookup path.
+        DfsNetworkMessage::ReadRequest(request) => {
+            request.version.is_none() || request.content_hash.is_none()
+        }
+        // Every bulk item has a mandatory version, hash, and size.
+        DfsNetworkMessage::BulkReadRequest(_) => false,
+        _ => false,
+    }
 }
 
 pub fn dfs_message_requires_full_metadata_hydrate(command: &DfsMessageCommand) -> bool {
@@ -662,7 +687,7 @@ mod tests {
             }));
         assert_eq!(
             dfs_message_execution_scope(&empty_lookup),
-            DfsMessageExecutionScope::GlobalExclusive
+            DfsMessageExecutionScope::ReadOnly
         );
     }
 
@@ -737,6 +762,7 @@ mod tests {
             source_node_id: node_id("scope-primary"),
             file_system_id: Some(file_system_id.clone()),
             authority_epoch: Some(7),
+            primary_handoff_id: None,
             shard_id: DfsMetadataShardId::new("scope-snapshot-shard"),
             next_after_sequence: 0,
             snapshot: DfsMetadataTableSnapshot {

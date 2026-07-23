@@ -1267,8 +1267,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // Creating the in-memory intent is not the visible linearization
         // point. The commit path certifies this hinted epoch through a fresh
         // operation-bound full-shard acknowledgement immediately before
-        // atomic publication, using cluster quorum only as the partition
-        // fallback. A second barrier here only adds a WAN round trip (most
+        // atomic publication; cluster KV is used only to validate the configured
+        // shard assignment. A second barrier here only adds a WAN round trip (most
         // visibly for first publication of a newly created file).
         let owner_epoch = self.local_metadata_owner_epoch_hint_for_object(&object)?;
 

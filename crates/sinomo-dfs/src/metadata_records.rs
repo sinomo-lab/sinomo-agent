@@ -65,8 +65,7 @@ pub struct DfsMetadataReplayCursorStatus {
 
 /// Replica-local durable floor established before acknowledging an exact
 /// metadata checkpoint probe. Snapshot repair may not move the shard below
-/// this sequence or install different state at the same sequence, even if the
-/// cluster watermark publication for that probe is still in flight.
+/// this sequence or install different state at the same sequence.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataPrefixAckFloor {
     pub shard_id: DfsMetadataShardId,

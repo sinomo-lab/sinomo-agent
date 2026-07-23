@@ -63,14 +63,39 @@ pub fn decode_cluster_kv_txn_rpc_request_body(body: &[u8]) -> Result<KvTxnReques
 pub fn cluster_kv_txn_response_rpc_payload(
     response: &ClusterKvTxnCommitResult,
 ) -> Result<ClusterKvRpcPayload, KvError> {
+    let response = ClusterKvTxnRpcResponse {
+        request_id: response.request_id.clone(),
+        command_digest: response.command_digest,
+        txn_response: response.txn_response.clone(),
+        authority: response.authority.clone(),
+        replayed_committed_request: response.replayed_committed_request,
+    };
     Ok(ClusterKvRpcPayload {
         route: CLUSTER_KV_TXN_ROUTE,
         category: CLUSTER_KV_RPC_CATEGORY,
-        body: encode_cluster_kv_rpc_body(response)?,
+        body: encode_cluster_kv_rpc_body(&response)?,
     })
 }
 
-pub fn decode_cluster_kv_txn_rpc_body(body: &[u8]) -> Result<ClusterKvTxnCommitResult, KvError> {
+/// Compact transaction result transported over object RPC.
+///
+/// The committed KV snapshot is deliberately not part of the wire response.
+/// Voters already receive the committed entry through Raft replication, while
+/// a non-voter can fetch an authoritative snapshot only when it actually needs
+/// to materialize the internal commit result. Keeping the snapshot out of the
+/// common response makes transaction cost independent of total keyspace size.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvTxnRpcResponse {
+    pub request_id: KvRequestId,
+    /// Digest of the command that actually entered the replicated log. This
+    /// can include authority-fence compares added by the authenticated leader.
+    pub command_digest: KvCommandDigest,
+    pub txn_response: Option<KvTxnResponse>,
+    pub authority: KvAuthorityProof,
+    pub replayed_committed_request: bool,
+}
+
+pub fn decode_cluster_kv_txn_rpc_body(body: &[u8]) -> Result<ClusterKvTxnRpcResponse, KvError> {
     decode_cluster_kv_rpc_body(body)
 }
 

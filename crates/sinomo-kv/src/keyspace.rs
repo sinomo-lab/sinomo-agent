@@ -29,7 +29,10 @@ impl ClusterKvKeyspaceClass {
 /// Classifies a cluster KV key. Unknown and newly introduced prefixes fail
 /// closed as critical until they are deliberately classified.
 pub fn cluster_kv_keyspace_class(key: &str) -> ClusterKvKeyspaceClass {
-    if key.starts_with("/cluster/endpoints/") || key.starts_with("/cluster/policy/capabilities/") {
+    if key.starts_with("/cluster/endpoints/")
+        || key.starts_with("/cluster/policy/capabilities/")
+        || is_dfs_metadata_authority_barrier_key(key)
+    {
         return ClusterKvKeyspaceClass::Operational;
     }
     if key.starts_with("/cluster/node-status/")
@@ -42,6 +45,23 @@ pub fn cluster_kv_keyspace_class(key: &str) -> ClusterKvKeyspaceClass {
         return ClusterKvKeyspaceClass::Telemetry;
     }
     ClusterKvKeyspaceClass::Critical
+}
+
+/// DFS authority barriers contain fresh write-only nonces whose committed
+/// values are never consumed. Their Raft commits still prove quorum authority,
+/// while the derived materialized projection may safely coalesce nonce churn.
+/// Keep the match exact so every other DFS control-plane record fails closed.
+fn is_dfs_metadata_authority_barrier_key(key: &str) -> bool {
+    let Some(suffix) = key.strip_prefix("/dfs/filesystems/") else {
+        return false;
+    };
+    let Some((file_system_id, suffix)) = suffix.split_once('/') else {
+        return false;
+    };
+    let Some(shard_id) = suffix.strip_prefix("metadata-authority-barriers/") else {
+        return false;
+    };
+    !file_system_id.is_empty() && !shard_id.is_empty() && !shard_id.contains('/')
 }
 
 pub fn cluster_kv_default_read_authority_for_key(key: &str) -> KvReadAuthority {

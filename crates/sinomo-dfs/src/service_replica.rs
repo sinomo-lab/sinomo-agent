@@ -23,8 +23,8 @@ static DFS_METADATA_SHARD_PUBLICATION_LOCKS: OnceLock<(Mutex<BTreeSet<String>>, 
 /// check and retiring-primary fence capture for one shard.
 ///
 /// All service lanes in a daemon share this guard. A retiring primary cannot
-/// acknowledge its post-fence head while a full-shard-authorized publication
-/// is between its last exact assignment check and the backend commit, and a
+/// acknowledge its post-fence head while an authorized publication is between
+/// its last exact assignment check and the backend commit, and a
 /// publication that arrives afterward re-checks the durable pending handoff
 /// and fails before touching visible state.
 #[derive(Debug)]
@@ -88,8 +88,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map_or(0, |shard| shard.epoch))
     }
 
-    /// Return the exact shard assignment certified by the authority barrier,
-    /// not merely the epoch from an earlier object-to-shard selection.
+    /// Return the exact shard assignment after refreshing cluster
+    /// configuration, not merely the epoch from an earlier object-to-shard
+    /// selection.
     pub(crate) fn certified_local_metadata_owner_shard_for_object(
         &mut self,
         object: &DfsObjectMetadata,
@@ -120,7 +121,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .control_plane
             .as_mut()
             .map(|kv| {
-                DfsControlPlaneStore::new(kv.as_mut()).certify_metadata_shard_authority(&shard)
+                DfsControlPlaneStore::new(kv.as_mut()).metadata_shard_authority_is_current(&shard)
             })
             .transpose()?
             .unwrap_or(false);
@@ -141,9 +142,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// Capture the locally committed shard epoch for a new intent without a
     /// Raft write barrier. This is only an intent hint: every visible commit
-    /// must still call `ensure_intent_epoch_current*`, which obtains a fresh
-    /// operation-bound full-shard acknowledgement or the quorum fallback at
-    /// the metadata publication boundary.
+    /// must still call `ensure_intent_epoch_current*`, which obtains fresh
+    /// operation-bound full-shard or cluster-quorum authorization at the
+    /// metadata publication boundary.
     pub(crate) fn local_metadata_owner_epoch_hint_for_object(
         &mut self,
         object: &DfsObjectMetadata,
@@ -235,9 +236,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// Authorize one exact canonical mutation against one metadata shard.
     ///
-    /// The healthy path is a fresh, operation-bound acknowledgement from
-    /// every configured replica. Any incomplete or mixed-version response
-    /// falls back to the existing linearizable exact-assignment certificate.
+    /// The healthy path requires a fresh, operation-bound acknowledgement from
+    /// every configured shard member and does not touch Raft. When a member is
+    /// unavailable, the exact prepared operation may instead be fenced through
+    /// cluster KV's existing consensus log. KV carries only the permit and
+    /// assignment/epoch comparison; DFS remains the owner of the prepare,
+    /// journal, metadata, and repair state.
     /// The local committed assignment is compared again after the data-plane
     /// round so an observed reconfiguration cannot slip between evidence
     /// collection and the caller's immediately following metadata CAS.
@@ -259,6 +263,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             || prepared_batch.next_after_sequence
                 != metadata_authority_operation_prepare_sequence(operation)
         {
+            dfs_perf_trace(format_args!(
+                "metadata_authority action=reject reason=malformed shard={} epoch={} local_primary={} operation_well_formed={} batch_shard={} batch_entries={} batch_next={} operation_prepare={}",
+                shard.shard_id,
+                shard.epoch,
+                shard.primary_node_id == self.node_id,
+                metadata_authority_operation_is_well_formed_for_shard(operation, shard),
+                prepared_batch.shard_id.0,
+                prepared_batch.entries.len(),
+                prepared_batch.next_after_sequence,
+                metadata_authority_operation_prepare_sequence(operation),
+            ));
             return Err(DfsError::StaleOwnerEpoch {
                 file_system_id: shard.file_system_id.clone(),
                 local_node_id: self.node_id.clone(),
@@ -266,24 +281,41 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 epoch: shard.epoch,
             });
         }
-        if self.all_metadata_shard_replicas_accept_fresh_authority(
+        let acknowledged_node_ids = self.fresh_metadata_shard_authority_acknowledgements(
             shard,
             operation,
             prepared_batch,
             DFS_METADATA_AUTHORITY_PROBE_TIMEOUT,
-        )? && self.metadata_shard_assignment_still_exact(shard)?
+        )?;
+        let required_node_ids = std::iter::once(shard.primary_node_id.clone())
+            .chain(shard.replica_node_ids.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        dfs_perf_trace(format_args!(
+            "metadata_authority action=probe shard={} epoch={} prepare={} acknowledgements={} required={}",
+            shard.shard_id,
+            shard.epoch,
+            prepared_batch.next_after_sequence,
+            acknowledged_node_ids.len(),
+            required_node_ids.len(),
+        ));
+        if acknowledged_node_ids == required_node_ids
+            && self.metadata_shard_assignment_still_exact(shard)?
         {
-            let mut acknowledged_node_ids = vec![self.node_id.clone()];
-            acknowledged_node_ids.extend(shard.replica_node_ids.iter().cloned());
-            acknowledged_node_ids.sort();
-            acknowledged_node_ids.dedup();
             return Ok(DfsCanonicalAuthorization::FullShard {
                 operation_digest: metadata_authority_operation_digest(operation).to_string(),
                 expected_shard: shard.clone(),
-                acknowledged_node_ids,
+                acknowledged_node_ids: acknowledged_node_ids.into_iter().collect(),
                 prepare_sequence: prepared_batch.next_after_sequence,
             });
         }
+        dfs_perf_trace(format_args!(
+            "metadata_authority action=cluster_quorum_fallback shard={} epoch={} prepare={} acknowledgements={} required={}",
+            shard.shard_id,
+            shard.epoch,
+            metadata_authority_operation_prepare_sequence(operation),
+            acknowledged_node_ids.len(),
+            required_node_ids.len(),
+        ));
         let operation_digest = metadata_authority_operation_digest(operation);
         let Some(permit_id) = self.certify_exact_metadata_shard_operation(
             shard,
@@ -341,13 +373,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 acknowledged_node_ids,
                 prepare_sequence,
             } => {
-                let mut required = vec![expected_shard.primary_node_id.clone()];
-                required.extend(expected_shard.replica_node_ids.iter().cloned());
-                required.sort();
-                required.dedup();
-                let mut acknowledged = acknowledged_node_ids.clone();
-                acknowledged.sort();
-                acknowledged.dedup();
+                let required = std::iter::once(expected_shard.primary_node_id.clone())
+                    .chain(expected_shard.replica_node_ids.iter().cloned())
+                    .collect::<BTreeSet<_>>();
+                let acknowledged = acknowledged_node_ids
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
                 (
                     expected_shard,
                     authorized_digest == operation_digest
@@ -374,6 +406,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             || !metadata_authority_operation_is_well_formed_for_shard(operation, expected_shard)
             || !self.metadata_shard_assignment_still_exact(expected_shard)?
         {
+            dfs_perf_trace(format_args!(
+                "metadata_authority action=reject reason=publication_revalidation shard={} epoch={} typed_valid={} local_primary={}",
+                expected_shard.shard_id,
+                expected_shard.epoch,
+                valid,
+                expected_shard.primary_node_id == self.node_id,
+            ));
             return Err(DfsError::StaleOwnerEpoch {
                 file_system_id: expected_shard.file_system_id.clone(),
                 local_node_id: self.node_id.clone(),
@@ -404,13 +443,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(Option::flatten)
     }
 
-    fn all_metadata_shard_replicas_accept_fresh_authority(
+    fn fresh_metadata_shard_authority_acknowledgements(
         &mut self,
         shard: &DfsMetadataShardConfig,
         operation: &DfsMetadataAuthorityOperation,
         prepared_batch: &DfsMetadataJournalBatch,
         timeout: Duration,
-    ) -> Result<bool, DfsError> {
+    ) -> Result<BTreeSet<NodeId>, DfsError> {
         let targets = shard
             .replica_node_ids
             .iter()
@@ -418,7 +457,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .cloned()
             .collect::<BTreeSet<_>>();
         if targets.is_empty() {
-            return Ok(true);
+            return Ok(BTreeSet::from([self.node_id.clone()]));
         }
 
         let started_at = Instant::now();
@@ -432,7 +471,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let previous_deadline = self
             .transport
             .set_operation_deadline(Some(effective_deadline));
-        let result = self.try_all_metadata_shard_replicas_accept_fresh_authority(
+        let result = self.try_all_metadata_shard_members_accept_fresh_authority(
             shard,
             operation,
             prepared_batch,
@@ -442,12 +481,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         );
         self.transport.set_operation_deadline(previous_deadline);
         match result {
-            Err(DfsError::Network { .. }) => Ok(false),
+            Err(DfsError::Network { .. }) => Ok(BTreeSet::from([self.node_id.clone()])),
             other => other,
         }
     }
 
-    fn try_all_metadata_shard_replicas_accept_fresh_authority(
+    fn try_all_metadata_shard_members_accept_fresh_authority(
         &mut self,
         shard: &DfsMetadataShardConfig,
         operation: &DfsMetadataAuthorityOperation,
@@ -455,9 +494,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         targets: BTreeSet<NodeId>,
         started_at: Instant,
         timeout: Duration,
-    ) -> Result<bool, DfsError> {
+    ) -> Result<BTreeSet<NodeId>, DfsError> {
         let mut request_ids = Vec::with_capacity(targets.len());
         let mut request_targets = Vec::with_capacity(targets.len());
+        let mut acknowledged_node_ids = BTreeSet::from([self.node_id.clone()]);
+        let required_acknowledgements = targets.len() + 1;
         let prepared_prefix = self
             .metadata_backend
             .as_deref()
@@ -469,24 +510,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             prefix.is_well_formed() && prefix.journal_sequence == prepared_batch.next_after_sequence
         }) else {
             // The fast path is optional. A missing or moving exact prefix
-            // cannot authorize an operation-only acknowledgement; the caller
-            // obtains the normal cluster-quorum permit instead.
-            return Ok(false);
+            // cannot authorize publication.
+            return Ok(acknowledged_node_ids);
         };
         let result = (|| {
             let mut authority_requests = Vec::with_capacity(targets.len());
             for target_node_id in targets {
                 if started_at.elapsed() >= timeout {
-                    return Ok(false);
+                    break;
                 }
                 let Some(target_batch) =
                     self.metadata_authority_batch_for_target(&target_node_id, prepared_batch)?
                 else {
-                    // A replica that is farther behind than one bounded
-                    // catch-up batch cannot count as a healthy full-shard
-                    // acknowledgement. Background replication can close the
-                    // gap; this operation uses the quorum fallback meanwhile.
-                    return Ok(false);
+                    // A member farther behind than one bounded catch-up batch
+                    // cannot count toward this operation's full-shard proof.
+                    // Background replication can close the gap independently.
+                    continue;
                 };
                 let request_id = self.next_request_id();
                 let probe_id = sinomo_core::Id::generate().to_string();
@@ -506,7 +545,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     // Include every entry the target has not yet acknowledged,
                     // through the exact prepare. The receiver refuses gaps;
                     // older peers can still apply the prefix but cannot echo
-                    // the nonce and therefore force the quorum fallback.
+                    // the nonce and therefore cannot authorize publication.
                     batch: target_batch,
                 };
                 authority_requests.push((target_node_id, command));
@@ -516,15 +555,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .send_metadata_journal_batches_direct(&authority_requests)
             {
                 Ok(Some(responses)) => {
-                    if responses.len() != authority_requests.len() {
-                        return Ok(false);
-                    }
                     for (target_node_id, command) in &authority_requests {
                         let Some((_, response)) = responses
                             .iter()
                             .find(|(response_node_id, _)| response_node_id == target_node_id)
                         else {
-                            return Ok(false);
+                            continue;
                         };
                         let expected_confirmation_id = command
                             .authority_probe
@@ -534,18 +570,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             || response.verified_authority_probe_id.as_deref()
                                 != expected_confirmation_id.as_deref()
                         {
-                            return Ok(false);
+                            continue;
                         }
                         self.record_metadata_authority_replication_cursor(
                             target_node_id,
                             &command.batch.shard_id,
                             response.next_after_sequence,
                         );
+                        acknowledged_node_ids.insert(target_node_id.clone());
                     }
-                    return Ok(true);
+                    return Ok(acknowledged_node_ids);
                 }
                 Ok(None) => {}
-                Err(_) => return Ok(false),
+                Err(_) => return Ok(acknowledged_node_ids),
             }
             for (target_node_id, command) in authority_requests {
                 let request_id = command.request_id.clone();
@@ -564,39 +601,54 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         expected_shard: shard.clone(),
                     },
                 );
-                request_ids.push(request_id.clone());
-                request_targets.push((request_id.clone(), target_node_id.clone()));
-                let sent = self.send_dfs_message_if_routable(
+                let sent = match self.send_dfs_message_if_routable(
                     &target_node_id,
                     DfsNetworkMessage::MetadataJournalBatch(command),
-                )?;
+                ) {
+                    Ok(sent) => sent,
+                    Err(DfsError::Network { .. }) => false,
+                    Err(error) => return Err(error),
+                };
                 if !sent {
-                    return Ok(false);
+                    self.pending_metadata_authority_probes.remove(&request_id);
+                    continue;
                 }
+                request_ids.push(request_id.clone());
+                request_targets.push((request_id, target_node_id));
             }
             loop {
                 self.process_incoming()?;
-                let mut all_accepted = true;
-                for request_id in &request_ids {
+                let mut unresolved = false;
+                for (request_id, target_node_id) in &request_targets {
                     match self.metadata_authority_probe_results.get(request_id) {
-                        Some(true) => {}
-                        Some(false) => return Ok(false),
-                        None => all_accepted = false,
+                        Some(true) => {
+                            acknowledged_node_ids.insert(target_node_id.clone());
+                        }
+                        Some(false) => {}
+                        None => unresolved = true,
                     }
                 }
-                if all_accepted {
-                    for (_, target_node_id) in &request_targets {
+                if acknowledged_node_ids.len() == required_acknowledgements {
+                    let acknowledged_replicas = acknowledged_node_ids
+                        .iter()
+                        .filter(|id| *id != &self.node_id)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for target_node_id in &acknowledged_replicas {
                         self.record_metadata_authority_replication_cursor(
                             target_node_id,
                             &prepared_batch.shard_id,
                             prepared_batch.next_after_sequence,
                         );
                     }
-                    return Ok(true);
+                    return Ok(acknowledged_node_ids);
+                }
+                if !unresolved {
+                    return Ok(acknowledged_node_ids);
                 }
                 let elapsed = started_at.elapsed();
                 if elapsed >= timeout {
-                    return Ok(false);
+                    return Ok(acknowledged_node_ids);
                 }
                 let wait =
                     DFS_METADATA_AUTHORITY_PROBE_IDLE_WAIT.min(timeout.saturating_sub(elapsed));
@@ -880,14 +932,44 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             Err(error) => return Err(error),
         };
-        let metadata_shard = self.select_metadata_shard_for_object(&object)?;
-        let requester_has_supplied_metadata_authority = self
+        let mut metadata_shard = self.select_metadata_shard_for_object(&object)?;
+        let mut requester_has_supplied_metadata_authority = self
             .command_authority_shard_proves_metadata_primary(
                 requester_node_id,
                 &object,
                 metadata_shard.as_ref(),
                 authority_shard,
             )?;
+        if requester_has_supplied_metadata_authority
+            && authority_shard.is_some_and(|authority| metadata_shard.as_ref() != Some(authority))
+        {
+            // A long-lived content-replica lane may still hold the retiring
+            // shard assignment after a certified primary handoff. The signed
+            // command stamp is enough to trigger a fresh observation, but it
+            // is not itself a control-plane replacement: require the refreshed
+            // view to converge to that exact assignment before later replica
+            // cache decisions can mistake this node for the old primary.
+            self.refresh_control_plane_latest()?;
+            metadata_shard = self.select_metadata_shard_for_object(&object)?;
+            requester_has_supplied_metadata_authority = self
+                .command_authority_shard_proves_metadata_primary(
+                    requester_node_id,
+                    &object,
+                    metadata_shard.as_ref(),
+                    authority_shard,
+                )?;
+            if authority_shard.is_some_and(|authority| metadata_shard.as_ref() != Some(authority)) {
+                return Err(DfsError::UnauthorizedReplicaCommand {
+                    source_node_id: requester_node_id.clone(),
+                    reason: format!(
+                        "local metadata authority view for {} did not converge to authenticated shard {} epoch {}",
+                        object.file_system_id,
+                        authority_shard.expect("authority checked above").shard_id,
+                        authority_shard.expect("authority checked above").epoch,
+                    ),
+                });
+            }
+        }
         let requester_is_metadata_primary = metadata_shard
             .as_ref()
             .is_some_and(|shard| &shard.primary_node_id == requester_node_id)
@@ -1484,6 +1566,7 @@ mod authority_probe_tests {
     struct AuthorityProbeTransport {
         local_node_id: NodeId,
         behavior: ProbeBehavior,
+        unroutable_node_ids: BTreeSet<NodeId>,
         incoming: VecDeque<DfsRoutedMessage>,
         sent: Arc<Mutex<Vec<DfsRoutedMessage>>>,
     }
@@ -1493,6 +1576,7 @@ mod authority_probe_tests {
             Self {
                 local_node_id,
                 behavior,
+                unroutable_node_ids: BTreeSet::new(),
                 incoming: VecDeque::new(),
                 sent: Arc::new(Mutex::new(Vec::new())),
             }
@@ -1522,7 +1606,9 @@ mod authority_probe_tests {
             let Some(probe) = command.authority_probe else {
                 return Ok(());
             };
-            if self.behavior == ProbeBehavior::Unroutable {
+            if self.behavior == ProbeBehavior::Unroutable
+                || self.unroutable_node_ids.contains(target_node_id)
+            {
                 return Err(NetworkError::UnknownNode {
                     node_id: target_node_id.clone(),
                 });
@@ -1943,7 +2029,7 @@ mod authority_probe_tests {
     }
 
     #[test]
-    fn all_fresh_replica_authority_acks_bypass_kv_barrier() {
+    fn fresh_full_shard_authority_uses_no_kv_operation_barrier() {
         let replicas = vec![
             node("node_authority_probe_replica_a"),
             node("node_authority_probe_replica_b"),
@@ -1955,9 +2041,41 @@ mod authority_probe_tests {
 
         service
             .authorize_prepared_intent_for_object(&intent, &object, &operation, &prepared_batch)
-            .expect("fresh all-replica authority");
+            .expect("fresh full-shard authority");
 
         assert_eq!(txn_calls.load(Ordering::SeqCst), 0);
+        assert!(service.pending_metadata_authority_probes.is_empty());
+        assert!(service.metadata_authority_probe_results.is_empty());
+    }
+
+    #[test]
+    fn partial_shard_authority_uses_operation_bound_kv_fallback() {
+        let replica_a = node("node_authority_probe_quorum_replica_a");
+        let replica_b = node("node_authority_probe_quorum_replica_b");
+        let offline = node("node_authority_probe_quorum_offline");
+        let (mut service, object, intent, shard, txn_calls, _) = authority_fixture(
+            ProbeBehavior::Accept,
+            vec![replica_a.clone(), replica_b.clone(), offline.clone()],
+        );
+        service
+            .transport
+            .unroutable_node_ids
+            .insert(offline.clone());
+        let (operation, prepared_batch) =
+            prepared_authority_fixture(&mut service, &object, &intent, &shard);
+
+        let authorization = service
+            .authorize_prepared_intent_for_object(&intent, &object, &operation, &prepared_batch)
+            .expect("the DFS recovery quorum may use the operation-bound Raft fence")
+            .expect("clustered authorization");
+        assert!(
+            matches!(
+                authorization,
+                DfsCanonicalAuthorization::ClusterQuorum { .. }
+            ),
+            "the unavailable member must force the explicit degraded-path authorization"
+        );
+        assert_eq!(txn_calls.load(Ordering::SeqCst), 1);
         assert!(service.pending_metadata_authority_probes.is_empty());
         assert!(service.metadata_authority_probe_results.is_empty());
     }
@@ -1986,7 +2104,7 @@ mod authority_probe_tests {
     }
 
     #[test]
-    fn rejected_or_unroutable_authority_probe_falls_back_to_kv_barrier() {
+    fn rejected_or_unroutable_authority_probe_uses_kv_fallback() {
         for behavior in [ProbeBehavior::Reject, ProbeBehavior::Unroutable] {
             let replicas = vec![node("node_authority_probe_fallback_replica")];
             let (mut service, object, intent, shard, txn_calls, _) =
@@ -1994,9 +2112,17 @@ mod authority_probe_tests {
             let (operation, prepared_batch) =
                 prepared_authority_fixture(&mut service, &object, &intent, &shard);
 
-            service
+            let authorization = service
                 .authorize_prepared_intent_for_object(&intent, &object, &operation, &prepared_batch)
-                .expect("quorum fallback");
+                .expect("operation-bound cluster quorum fallback")
+                .expect("clustered authorization");
+            assert!(
+                matches!(
+                    authorization,
+                    DfsCanonicalAuthorization::ClusterQuorum { .. }
+                ),
+                "a rejected or unroutable replica must not be counted as DFS evidence"
+            );
 
             assert_eq!(txn_calls.load(Ordering::SeqCst), 1);
             assert!(service.pending_metadata_authority_probes.is_empty());
@@ -2005,7 +2131,7 @@ mod authority_probe_tests {
     }
 
     #[test]
-    fn explicit_lock_authority_path_still_uses_fresh_kv_barrier() {
+    fn explicit_lock_authority_path_reads_configuration_without_kv_write() {
         let replicas = vec![node("node_authority_probe_lock_replica")];
         let (mut service, object, _, _, txn_calls, _) =
             authority_fixture(ProbeBehavior::Accept, replicas);
@@ -2016,7 +2142,7 @@ mod authority_probe_tests {
                 .expect("lock authority epoch"),
             7
         );
-        assert_eq!(txn_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(txn_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

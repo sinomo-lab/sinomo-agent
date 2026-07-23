@@ -659,7 +659,7 @@ fn content_hash_range_fallback_validates_returned_window_not_full_blob_size() {
 }
 
 #[test]
-fn dfs_message_read_requests_require_fresh_metadata() {
+fn content_addressed_read_requests_do_not_require_full_metadata_hydration() {
     let source = NodeId::from_legacy_named("node_protocol_fresh_source").expect("source");
     let target = NodeId::from_legacy_named("node_protocol_fresh_target").expect("target");
     let object_id = DfsObjectId::from_legacy_named("obj_protocol_fresh").expect("object");
@@ -694,8 +694,8 @@ fn dfs_message_read_requests_require_fresh_metadata() {
         }),
     );
 
-    assert!(dfs_message_requires_full_metadata_hydrate(&read));
-    assert!(dfs_message_requires_full_metadata_hydrate(&bulk));
+    assert!(!dfs_message_requires_full_metadata_hydrate(&read));
+    assert!(!dfs_message_requires_full_metadata_hydrate(&bulk));
 }
 
 #[test]
@@ -1012,10 +1012,27 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
     assert!(dfs_message_is_read_only_request(&read));
     assert!(dfs_message_requires_full_metadata_hydrate(&read));
 
-    let lookup = test_dfs_message_command_from_message(
+    let hinted_read = test_dfs_message_command_from_message(
         &local,
         &remote,
         2,
+        DfsNetworkMessage::ReadRequest(DfsReadRequest {
+            request_id: "hinted-read-request".to_string(),
+            object_id: DfsObjectId::from_legacy_named("hinted_read_object").expect("object id"),
+            version: Some(DfsVersion::from_legacy_named("hinted_read_version").expect("version")),
+            content_hash: Some("blake3:hinted-read".to_string()),
+            content_size_bytes: Some(12),
+            range_offset: None,
+            range_max_bytes: None,
+        }),
+    );
+    assert!(dfs_message_is_read_only_request(&hinted_read));
+    assert!(!dfs_message_requires_full_metadata_hydrate(&hinted_read));
+
+    let lookup = test_dfs_message_command_from_message(
+        &local,
+        &remote,
+        3,
         DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
             request_id: "lookup-request".to_string(),
             file_system_id: file_system_id.clone(),
@@ -1028,7 +1045,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
             },
         }),
     );
-    assert!(!dfs_message_is_read_only_request(&lookup));
+    assert!(dfs_message_is_read_only_request(&lookup));
     assert!(
         !dfs_message_requires_full_metadata_hydrate(&lookup),
         "lookup requests use targeted backend path reads instead of full daemon hydration"
@@ -1069,7 +1086,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
             },
         }),
     );
-    assert!(!dfs_message_is_read_only_request(&lookup_paths));
+    assert!(dfs_message_is_read_only_request(&lookup_paths));
     assert!(
         !dfs_message_requires_full_metadata_hydrate(&lookup_paths),
         "batched lookup requests use targeted backend path reads instead of full daemon hydration"
@@ -2381,6 +2398,7 @@ fn dfs_peer_transport_adapters_delegate_all_routes() {
             source_node_id: local,
             file_system_id: None,
             authority_epoch: None,
+            primary_handoff_id: None,
             shard_id,
             next_after_sequence: 0,
             snapshot,
@@ -2772,6 +2790,7 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         source_node_id: local.clone(),
         file_system_id: None,
         authority_epoch: None,
+        primary_handoff_id: None,
         shard_id: shard_id.clone(),
         next_after_sequence: 9,
         snapshot,
@@ -8118,7 +8137,7 @@ fn metadata_replication_cursor_migrates_legacy_json_to_backend() {
 }
 
 #[test]
-fn metadata_shard_primary_transfer_ready_requires_exact_certified_head() {
+fn metadata_shard_primary_transfer_ready_requires_durable_replica_cursor() {
     let root = temp_root("metadata-primary-transfer-ready");
     let data_dir = SinomoDataDir::new(root.join("data"));
     data_dir.ensure_root_layout().expect("root layout");
@@ -8150,7 +8169,6 @@ fn metadata_shard_primary_transfer_ready_requires_exact_certified_head() {
                 ..current.clone()
             },
             &replica,
-            None,
         )
         .expect("already primary")
     );
@@ -8163,7 +8181,6 @@ fn metadata_shard_primary_transfer_ready_requires_exact_certified_head() {
                 ..current.clone()
             },
             &replica,
-            None,
         )
         .expect("remote primary")
     );
@@ -8173,7 +8190,6 @@ fn metadata_shard_primary_transfer_ready_requires_exact_certified_head() {
             &local,
             &current,
             &non_replica,
-            None,
         )
         .expect("non replica")
     );
@@ -8195,45 +8211,14 @@ fn metadata_shard_primary_transfer_ready_requires_exact_certified_head() {
         .expect("shard status")
         .journal_last_sequence;
     assert!(journal_last_sequence > 0);
-    let state_fingerprint = crate::service_sync::metadata_shard_state_fingerprint_at(
-        &backend,
-        &shard_id,
-        journal_last_sequence,
-    )
-    .expect("metadata transfer fingerprint");
-
     drop(backend);
 
     assert!(
         !metadata_shard_primary_transfer_ready_from_local_backend(
-            &data_dir, &local, &current, &replica, None,
+            &data_dir, &local, &current, &replica,
         )
-        .expect("missing certified head")
+        .expect("missing durable replica cursor")
     );
-    let stale_watermark = DfsMetadataShardHeadWatermark {
-        file_system_id: current.file_system_id.clone(),
-        shard_id: current.shard_id.clone(),
-        primary_node_id: local.clone(),
-        epoch: current.epoch,
-        journal_sequence: journal_last_sequence.saturating_sub(1),
-        state_fingerprint: "blake3:stale".to_string(),
-        acknowledged_node_ids: vec![local.clone(), replica.clone()],
-    };
-    assert!(
-        !metadata_shard_primary_transfer_ready_from_local_backend(
-            &data_dir,
-            &local,
-            &current,
-            &replica,
-            Some(&stale_watermark),
-        )
-        .expect("stale certified head")
-    );
-    let equal_height_wrong_fingerprint = DfsMetadataShardHeadWatermark {
-        journal_sequence: journal_last_sequence,
-        state_fingerprint: "blake3:equal-height-wrong-fingerprint".to_string(),
-        ..stale_watermark.clone()
-    };
     let mut backend =
         open_local_metadata_shard_backend(&data_dir, shard_id.clone()).expect("metadata backend");
     backend
@@ -8241,40 +8226,10 @@ fn metadata_shard_primary_transfer_ready_requires_exact_certified_head() {
         .expect("candidate durable sender cursor");
     drop(backend);
     assert!(
-        !metadata_shard_primary_transfer_ready_from_local_backend(
-            &data_dir,
-            &local,
-            &current,
-            &replica,
-            Some(&equal_height_wrong_fingerprint),
-        )
-        .expect("equal-height wrong fingerprint must fail closed")
-    );
-    assert!(
         metadata_shard_primary_transfer_ready_from_local_backend(
-            &data_dir,
-            &local,
-            &current,
-            &replica,
-            Some(&stale_watermark),
+            &data_dir, &local, &current, &replica,
         )
-        .expect("stale certified head with caught-up durable cursor")
-    );
-    let certified_watermark = DfsMetadataShardHeadWatermark {
-        journal_sequence: journal_last_sequence,
-        state_fingerprint,
-        ..stale_watermark
-    };
-
-    assert!(
-        metadata_shard_primary_transfer_ready_from_local_backend(
-            &data_dir,
-            &local,
-            &current,
-            &replica,
-            Some(&certified_watermark),
-        )
-        .expect("exact certified head")
+        .expect("caught-up durable replica cursor")
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -10271,6 +10226,147 @@ fn networked_metadata_journal_batch_requires_exact_authority_identity() {
 }
 
 #[test]
+fn networked_metadata_journal_batch_refreshes_stale_receiver_authority() {
+    let root = temp_root("networked-metadata-journal-refreshes-authority");
+    let primary = NodeId::from_legacy_named("node_meta_refresh_primary").expect("primary node id");
+    let replica = NodeId::from_legacy_named("node_meta_refresh_replica").expect("replica node id");
+    let file_system = file_system(primary.clone());
+    let shard = |epoch| DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![replica.clone()],
+        epoch,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let current = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    current.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .put_metadata_shard(&shard(12))
+            .expect("current shard config")
+    });
+    let mut stale = InProcessKvStore::new();
+    DfsControlPlaneStore::new(&mut stale)
+        .put_metadata_shard(&shard(11))
+        .expect("stale shard config");
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let control_plane =
+        RefreshingDfsControlPlaneKvClient::new(stale, current, Arc::clone(&refreshes));
+    let backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+            .expect("metadata backend");
+    let mut service = NetworkedDfsService::new(
+        DroppingSendTransport {
+            local_node_id: replica,
+        },
+        LocalContentStore::new(root.join("content")).expect("content store"),
+    )
+    .with_control_plane(control_plane)
+    .with_metadata_backend(backend)
+    .expect("receiver service");
+
+    let event = service
+        .handle_metadata_journal_batch(
+            primary.clone(),
+            DfsMetadataJournalBatchCommand {
+                request_id: "request-refresh-journal-authority".to_string(),
+                source_node_id: Some(primary),
+                file_system_id: Some(file_system.file_system_id),
+                authority_epoch: Some(12),
+                verify_prefix_only: false,
+                prefix_probe: None,
+                authority_probe: None,
+                batch: DfsMetadataJournalBatch {
+                    shard_id: DfsMetadataShardId::new("root"),
+                    entries: Vec::new(),
+                    next_after_sequence: 0,
+                },
+            },
+        )
+        .expect("current journal authority is accepted after refresh");
+
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::MetadataJournalBatchApplied { .. }
+    ));
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn replica_command_refreshes_stale_receiver_authority_before_cache_decisions() {
+    let root = temp_root("replica-command-refreshes-stale-authority");
+    let primary =
+        NodeId::from_legacy_named("node_replica_refresh_primary").expect("primary node id");
+    let replica =
+        NodeId::from_legacy_named("node_replica_refresh_replica").expect("replica node id");
+    let mut object = file_metadata(primary.clone());
+    object.object_id = DfsObjectId::from_legacy_named("object_replica_refresh").expect("object id");
+    object.path = "/services/replica-refresh.bin".to_string();
+    let shard = |primary_node_id: NodeId, epoch| DfsMetadataShardConfig {
+        file_system_id: object.file_system_id.clone(),
+        shard_id: "services".to_string(),
+        primary_node_id,
+        replica_node_ids: vec![replica.clone(), primary.clone()],
+        epoch,
+        assignment: DfsMetadataShardAssignment::PathPrefix {
+            prefix: "/services".to_string(),
+        },
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let stale_shard = shard(replica.clone(), 16);
+    let current_shard = shard(primary.clone(), 17);
+    let current = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    current.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .put_metadata_shard(&current_shard)
+            .expect("current shard config")
+    });
+    let mut stale = InProcessKvStore::new();
+    DfsControlPlaneStore::new(&mut stale)
+        .put_metadata_shard(&stale_shard)
+        .expect("stale shard config");
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let control_plane =
+        RefreshingDfsControlPlaneKvClient::new(stale, current, Arc::clone(&refreshes));
+    let backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("services"), root.join("metadata"))
+            .expect("metadata backend");
+    let mut service = NetworkedDfsService::new(
+        DroppingSendTransport {
+            local_node_id: replica,
+        },
+        LocalContentStore::new(root.join("content")).expect("content store"),
+    )
+    .with_control_plane(control_plane)
+    .with_metadata_backend(backend)
+    .expect("receiver service");
+
+    service
+        .ensure_replica_command_authorized_with_metadata(
+            &primary,
+            "intent_replica_refresh",
+            &object.object_id,
+            Some(&object),
+            Some(&current_shard),
+        )
+        .expect("authenticated current primary is accepted after refresh");
+
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        service
+            .command_authority_shard_for_object(Some(&object))
+            .expect("refreshed authority lookup"),
+        None,
+        "the content replica must not retain the retiring-primary authority view"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn networked_metadata_replica_ingest_without_control_plane_fails_closed_without_mutation() {
     let root = temp_root("networked-metadata-ingest-no-control-plane");
     let primary =
@@ -10344,6 +10440,7 @@ fn networked_metadata_replica_ingest_without_control_plane_fails_closed_without_
                 source_node_id: primary,
                 file_system_id: Some(file_system.file_system_id),
                 authority_epoch: Some(41),
+                primary_handoff_id: None,
                 shard_id,
                 next_after_sequence: source_sequence,
                 snapshot: source_snapshot,
@@ -10646,6 +10743,7 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
             source_node_id: primary,
             file_system_id: Some(context.shard.file_system_id.clone()),
             authority_epoch: Some(context.shard.epoch),
+            primary_handoff_id: None,
             shard_id: DfsMetadataShardId::new("root"),
             next_after_sequence: rollback_sequence,
             snapshot: rollback_snapshot,
@@ -11102,6 +11200,7 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
                 source_node_id: primary.clone(),
                 file_system_id: Some(file_system.file_system_id.clone()),
                 authority_epoch: Some(shard.epoch),
+                primary_handoff_id: None,
                 shard_id: shard_id.clone(),
                 next_after_sequence: journal_sequence,
                 snapshot: divergent.export_table_snapshot(),
@@ -11209,7 +11308,7 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
 }
 
 #[test]
-fn promoted_replica_refreshes_split_handle_durable_view_before_handoff_ack() {
+fn promoted_replica_auto_rebinds_cached_lane_before_stamped_routed_write() {
     let root = temp_root("service-primary-handoff-marker");
     let retiring_primary =
         NodeId::from_legacy_named("node_primary_handoff_retiring").expect("retiring primary");
@@ -11238,9 +11337,9 @@ fn promoted_replica_refreshes_split_handle_durable_view_before_handoff_ack() {
     source
         .put_file_system(&file_system)
         .expect("source filesystem");
-    source
-        .put_object(&file_metadata(retiring_primary.clone()))
-        .expect("source object");
+    let mut source_object = file_metadata(retiring_primary.clone());
+    source_object.policy = DfsObjectPolicy::ReplicatedEventual;
+    source.put_object(&source_object).expect("source object");
     let batch = source
         .journal_batch_since_limited(
             0,
@@ -11395,21 +11494,42 @@ fn promoted_replica_refreshes_split_handle_durable_view_before_handoff_ack() {
                 .expect("complete primary handoff")
         );
     });
-    assert_eq!(
-        service
-            .rebind_completed_local_metadata_shard_membership_handoffs(&file_system.file_system_id,)
-            .expect("rebind promoted generation"),
-        1
-    );
-    service
-        .metadata_backend
-        .as_deref_mut()
-        .expect("promoted backend")
-        .put_object(&directory_object(
-            "/promoted-authority-write",
-            promoted.clone(),
-        ))
-        .expect("new primary writes only after exact rebind");
+    let target_version = namespace::next_version(&source_object.version);
+    let event = service
+        .handle_distributed_write_request(
+            retiring_primary.clone(),
+            DfsDistributedWriteCommand {
+                request_id: "promoted-authority-first-routed-write".to_string(),
+                request: DfsWriteRequest {
+                    file_system_id: file_system.file_system_id.clone(),
+                    object_id: source_object.object_id.clone(),
+                    target_version: target_version.clone(),
+                    requesting_node_id: retiring_primary,
+                },
+                expected_base_version: Some(source_object.version.clone()),
+                metadata_journal_after_sequence: None,
+                bytes: b"first write through the cached promoted lane".to_vec(),
+                content_hash: None,
+                content_size_bytes: None,
+                desired_replica_nodes: vec![promoted.clone()],
+                policy: DfsReplicationPolicy::new(1, 1).expect("local write policy"),
+                object_metadata: Some(source_object.clone()),
+                authority_shard: Some(desired.clone()),
+                touch_parent_on_create: false,
+                foreground_replica_repair: false,
+                exclusive_create: false,
+            },
+        )
+        .expect("stamped routed write auto-rebinds promoted generation");
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::RemoteWriteServed {
+            result: DfsDistributedWriteResult::Outcome {
+                outcome: NetworkedDfsWriteOutcome::Committed { version, .. },
+            },
+            ..
+        } if version == target_version
+    ));
     assert_eq!(
         service
             .metadata_backend
@@ -11460,7 +11580,7 @@ fn pending_membership_handoff_authorizes_exact_suffix_and_prefix_for_new_replica
             handoff_id: "membership-handoff-receiver".to_string(),
             retiring_shard,
             desired_shard,
-            required_prepared_sequence: 4,
+            required_prepared_sequence: 0,
             required_head_watermark: None,
             retiring_primary_fence: None,
         }),
@@ -11663,6 +11783,7 @@ fn metadata_snapshot_install_processor_replaces_backend_snapshot() {
             source_node_id: primary,
             file_system_id: Some(context.shard.file_system_id.clone()),
             authority_epoch: Some(context.shard.epoch),
+            primary_handoff_id: None,
             shard_id: shard_id.clone(),
             next_after_sequence,
             snapshot,
@@ -24277,14 +24398,17 @@ fn repair_command_accepts_current_replica_after_metadata_primary_moves() {
         .handle_repair_replica(source.clone(), command.clone())
         .expect("repair command");
 
-    assert!(matches!(
-        event,
-        NetworkedDfsServiceEvent::ReplicaRepaired {
-            object_id: repaired_object_id,
-            replica_node_id,
-            ..
-        } if repaired_object_id == object_id && replica_node_id == target
-    ));
+    assert!(
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::ReplicaRepaired {
+                object_id: ref repaired_object_id,
+                ref replica_node_id,
+                ..
+            } if repaired_object_id == &object_id && replica_node_id == &target
+        ),
+        "unexpected repair event: {event:?}"
+    );
     let replayed = dfs
         .handle_repair_replica(source, command)
         .expect("replayed repair command");
@@ -24429,8 +24553,9 @@ fn repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale() {
     let version_2 =
         DfsVersion::from_legacy_named("version_repair_stale_receiver_2").expect("target version");
     let file_system = file_system(current_primary.clone());
-    let stale_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    stale_kv.with_client(|kv| {
+    let mut stale_kv = InProcessKvStore::new();
+    {
+        let kv = &mut stale_kv;
         let mut control = DfsControlPlaneStore::new(kv);
         control
             .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
@@ -24446,7 +24571,7 @@ fn repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale() {
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("stale metadata shard");
-    });
+    }
     let authority_shard = DfsMetadataShardConfig {
         file_system_id: file_system.file_system_id.clone(),
         shard_id: "services".to_string(),
@@ -24458,12 +24583,25 @@ fn repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale() {
         },
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
+    let current_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    current_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("current filesystem config");
+        control
+            .put_metadata_shard(&authority_shard)
+            .expect("current metadata shard");
+    });
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let refreshing_kv =
+        RefreshingDfsControlPlaneKvClient::new(stale_kv, current_kv, Arc::clone(&refreshes));
     let network = InProcessNetwork::new();
     let _primary_mailbox = network.add_node(current_primary.clone());
     let content = LocalContentStore::new(root.join("content")).expect("content");
     let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
     let mut dfs = NetworkedDfsService::new(network.add_node(target.clone()), content)
-        .with_control_plane(stale_kv)
+        .with_control_plane(refreshing_kv)
         .with_metadata_backend(metadata)
         .expect("metadata backend");
     let mut object = file_metadata(current_primary.clone());
@@ -24494,19 +24632,23 @@ fn repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale() {
         )
         .expect("repair command");
 
-    assert!(matches!(
-        event,
-        NetworkedDfsServiceEvent::ReplicaRepaired {
-            object_id: repaired_object_id,
-            replica_node_id,
-            ..
-        } if repaired_object_id == object_id && replica_node_id == target
-    ));
+    assert!(
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::ReplicaRepaired {
+                object_id: ref repaired_object_id,
+                ref replica_node_id,
+                ..
+            } if repaired_object_id == &object_id && replica_node_id == &target
+        ),
+        "unexpected repair event: {event:?}"
+    );
     let manifest = dfs
         .content()
         .read_manifest(object_id.as_str(), version_2.as_str())
         .expect("repaired manifest");
     assert_eq!(manifest.content_hash, content_hash);
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
     assert!(
         dfs.metadata_backend()
             .expect("backend")
@@ -30718,12 +30860,22 @@ fn sifs_posix_cluster(name: &str) -> SifsPosixCluster {
         observer_node.clone(),
     );
 
-    // The shard primary is the namespace authority and bootstraps SIFS
-    // locally; replicas join as followers of the primary's metadata journal
-    // stream and learn the bootstrap namespace through replication.
-    primary
-        .bootstrap_distributed_sifs()
-        .expect("primary SIFS bootstrap");
+    // The shard primary is the namespace authority. Clustered bootstrap is a
+    // normal DFS metadata publication, so the configured replicas must process
+    // and acknowledge its exact prepared prefix before it becomes visible.
+    let (writer, observer) = std::thread::scope(|scope| {
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer_stop = Arc::clone(&stop);
+        let observer_stop = Arc::clone(&stop);
+        let writer = scope.spawn(move || pump_sifs_service_until_stop(writer, writer_stop));
+        let observer = scope.spawn(move || pump_sifs_service_until_stop(observer, observer_stop));
+        let bootstrap = primary.bootstrap_distributed_sifs();
+        stop.store(true, Ordering::SeqCst);
+        let writer = writer.join().expect("writer bootstrap pump");
+        let observer = observer.join().expect("observer bootstrap pump");
+        bootstrap.expect("primary SIFS bootstrap");
+        (writer, observer)
+    });
 
     let mut cluster = SifsPosixCluster {
         root,
@@ -30736,8 +30888,11 @@ fn sifs_posix_cluster(name: &str) -> SifsPosixCluster {
         rejections: Vec::new(),
     };
     sifs_cluster_publish_metadata_until(&mut cluster, "initial follower catch-up", |cluster| {
-        cluster.writer.posix_stat(SIFS_USERS_PATH).is_ok()
-            && cluster.observer.posix_stat(SIFS_USERS_PATH).is_ok()
+        [SIFS_USERS_PATH, SIFS_SERVICES_PATH]
+            .into_iter()
+            .all(|path| {
+                cluster.writer.posix_stat(path).is_ok() && cluster.observer.posix_stat(path).is_ok()
+            })
     });
     // Follower-side bootstrap after catch-up must be a no-op: every namespace
     // anchor already exists from journal replay, so it must not append local
@@ -35593,9 +35748,20 @@ fn sifs_two_primary_cluster(name: &str) -> SifsTwoPrimaryCluster {
     let services_primary = node(&services_primary_node, "services-primary");
     let replica = node(&replica_node, "replica");
 
-    users_primary
-        .bootstrap_distributed_sifs()
-        .expect("genesis SIFS bootstrap");
+    let (services_primary, replica) = std::thread::scope(|scope| {
+        let stop = Arc::new(AtomicBool::new(false));
+        let services_stop = Arc::clone(&stop);
+        let replica_stop = Arc::clone(&stop);
+        let services_primary =
+            scope.spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+        let replica = scope.spawn(move || pump_sifs_service_until_stop(replica, replica_stop));
+        let bootstrap = users_primary.bootstrap_distributed_sifs();
+        stop.store(true, Ordering::SeqCst);
+        let services_primary = services_primary.join().expect("services bootstrap pump");
+        let replica = replica.join().expect("replica bootstrap pump");
+        bootstrap.expect("genesis SIFS bootstrap");
+        (services_primary, replica)
+    });
 
     let mut cluster = SifsTwoPrimaryCluster {
         root,

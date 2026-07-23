@@ -130,6 +130,7 @@ pub struct ClusterConnectivityGraph {
     reachable_records_by_pair: ClusterConnectivityPairIndex<(u8, u64, ClusterEndpointId)>,
     reachable_targets_by_source: ClusterConnectivityTargetIndex,
     healthy_targets_by_source: ClusterConnectivityTargetIndex,
+    healthy_relationship_neighbors: ClusterConnectivityTargetIndex,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -630,9 +631,10 @@ fn select_rotating_cluster_connectivity_probe_entries(
         return (Vec::new(), cursor.min(entries.len()));
     }
 
-    // Always keep the top-ranked entry so the nearest-expiring or brand-new
-    // endpoint is not pushed out by fairness rotation. Rotate the remaining
-    // bounded slots so endpoints behind stale/failing peers still get probed.
+    // Always keep the top-ranked entry so an identity-mismatch recovery, then
+    // the nearest-expiring or brand-new endpoint, is not pushed out by fairness
+    // rotation. Rotate the remaining bounded slots so endpoints behind
+    // stale/failing peers still get probed.
     let first = entries.remove(0);
     let rotating_len = entries.len();
     let start = cursor % rotating_len;
@@ -656,6 +658,7 @@ fn cluster_connectivity_probe_entry_cmp(
     right: &ClusterConnectivityProbeBatchEntry,
 ) -> std::cmp::Ordering {
     (
+        cluster_connectivity_probe_identity_recovery_rank(left.previous.as_ref()),
         cluster_connectivity_probe_expiry_rank(left.previous.as_ref()),
         cluster_connectivity_probe_state_rank(left.previous.as_ref()),
         &left.endpoint.node_id,
@@ -663,12 +666,23 @@ fn cluster_connectivity_probe_entry_cmp(
         left.endpoint.address.as_str(),
     )
         .cmp(&(
+            cluster_connectivity_probe_identity_recovery_rank(right.previous.as_ref()),
             cluster_connectivity_probe_expiry_rank(right.previous.as_ref()),
             cluster_connectivity_probe_state_rank(right.previous.as_ref()),
             &right.endpoint.node_id,
             right.endpoint.priority,
             right.endpoint.address.as_str(),
         ))
+}
+
+fn cluster_connectivity_probe_identity_recovery_rank(
+    record: Option<&ClusterConnectivityRecord>,
+) -> u8 {
+    if record.is_some_and(cluster_connectivity_failure_reason_is_identity_mismatch) {
+        0
+    } else {
+        1
+    }
 }
 
 fn cluster_connectivity_probe_expiry_rank(
@@ -1162,6 +1176,7 @@ impl ClusterConnectivityGraph {
             reachable_records_by_pair: ClusterConnectivityPairIndex::default(),
             reachable_targets_by_source: ClusterConnectivityTargetIndex::default(),
             healthy_targets_by_source: ClusterConnectivityTargetIndex::default(),
+            healthy_relationship_neighbors: ClusterConnectivityTargetIndex::default(),
         }
     }
 
@@ -1172,6 +1187,7 @@ impl ClusterConnectivityGraph {
         self.reachable_records_by_pair.clear();
         self.reachable_targets_by_source.clear();
         self.healthy_targets_by_source.clear();
+        self.healthy_relationship_neighbors.clear();
     }
 
     fn try_replace_records(
@@ -1188,6 +1204,7 @@ impl ClusterConnectivityGraph {
         let mut reachable_records_by_pair = ClusterConnectivityPairIndex::default();
         let mut reachable_targets_by_source = ClusterConnectivityTargetIndex::default();
         let mut healthy_targets_by_source = ClusterConnectivityTargetIndex::default();
+        let mut healthy_relationship_neighbors = ClusterConnectivityTargetIndex::default();
 
         for record in record_index.iter() {
             for address_key in try_cluster_endpoint_address_lookup_keys(&record.address)? {
@@ -1240,6 +1257,20 @@ impl ClusterConnectivityGraph {
                     ),
                     "index healthy connectivity records",
                 )?;
+                // A healthy routed carrier is authenticated and full duplex.
+                // Endpoint observations remain source-owned and directed, but
+                // component membership is therefore symmetric once either
+                // side has established the relationship.
+                healthy_relationship_neighbors.try_insert(
+                    &record.source_node_id,
+                    &record.target_node_id,
+                    "index healthy connectivity relationship",
+                )?;
+                healthy_relationship_neighbors.try_insert(
+                    &record.target_node_id,
+                    &record.source_node_id,
+                    "index reverse healthy connectivity relationship",
+                )?;
             }
         }
 
@@ -1249,6 +1280,7 @@ impl ClusterConnectivityGraph {
         self.reachable_records_by_pair = reachable_records_by_pair;
         self.reachable_targets_by_source = reachable_targets_by_source;
         self.healthy_targets_by_source = healthy_targets_by_source;
+        self.healthy_relationship_neighbors = healthy_relationship_neighbors;
         Ok(())
     }
 
@@ -1340,6 +1372,16 @@ impl ClusterConnectivityGraph {
     ) -> impl Iterator<Item = &'a NodeId> + 'a {
         self.healthy_targets_by_source
             .get(source)
+            .into_iter()
+            .flat_map(|targets| targets.iter())
+    }
+
+    pub(crate) fn healthy_relationship_neighbor_refs<'a>(
+        &'a self,
+        node_id: &NodeId,
+    ) -> impl Iterator<Item = &'a NodeId> + 'a {
+        self.healthy_relationship_neighbors
+            .get(node_id)
             .into_iter()
             .flat_map(|targets| targets.iter())
     }
@@ -1607,6 +1649,103 @@ mod tests {
             &ClusterNodeRole::Workstation,
             false,
             true,
+        ));
+    }
+
+    #[test]
+    fn identity_mismatch_recovery_precedes_older_unreachable_endpoint() {
+        let now = OffsetDateTime::now_utc();
+        let mut identity_mismatch = probe_record(ClusterConnectivityState::Unreachable, now);
+        identity_mismatch.failure_reason = Some(ClusterConnectivityFailureReason::IdentityMismatch);
+        identity_mismatch.expires_at = now + time::Duration::hours(2);
+        let mut older_unreachable = probe_record(
+            ClusterConnectivityState::Unreachable,
+            now - time::Duration::minutes(10),
+        );
+        older_unreachable.expires_at = now + time::Duration::minutes(1);
+
+        let entry = |suffix: &str, previous: ClusterConnectivityRecord| {
+            ClusterConnectivityProbeBatchEntry {
+                key: suffix.to_string(),
+                endpoint: ClusterEndpointRecord {
+                    endpoint_id: ClusterEndpointId::from_legacy_named(format!(
+                        "endpoint_connectivity_identity_recovery_{suffix}"
+                    ))
+                    .expect("endpoint id"),
+                    node_id: previous.target_node_id.clone(),
+                    transport: previous.transport.clone(),
+                    address: previous.address.clone(),
+                    source: ClusterEndpointSource::Observed,
+                    privacy: ClusterEndpointPrivacy::Lan,
+                    priority: 0,
+                    last_observed_latency_ms: None,
+                },
+                previous: Some(previous),
+            }
+        };
+        let identity_entry = entry("identity", identity_mismatch);
+        let older_entry = entry("older", older_unreachable);
+
+        assert_eq!(
+            cluster_connectivity_probe_entry_cmp(&identity_entry, &older_entry),
+            std::cmp::Ordering::Less,
+            "a rollout-time identity mismatch must get the non-rotating recovery slot"
+        );
+    }
+
+    #[test]
+    fn healthy_carrier_components_are_symmetric_and_transitive() {
+        let now = OffsetDateTime::now_utc();
+        let a = NodeId::from_legacy_named("node_healthy_component_a").expect("node a");
+        let b = NodeId::from_legacy_named("node_healthy_component_b").expect("node b");
+        let c = NodeId::from_legacy_named("node_healthy_component_c").expect("node c");
+        let record =
+            |source: &NodeId, target: &NodeId, suffix: &str, state| ClusterConnectivityRecord {
+                cluster_id: ClusterId::from_legacy_named("cluster_healthy_component")
+                    .expect("cluster id"),
+                source_node_id: source.clone(),
+                target_node_id: target.clone(),
+                endpoint_id: ClusterEndpointId::from_legacy_named(format!(
+                    "endpoint_healthy_component_{suffix}"
+                ))
+                .expect("endpoint id"),
+                transport: ClusterTransportKind::LanTcp,
+                address: format!("192.0.2.{}:21353", suffix.len()),
+                state,
+                latency_ms: Some(1),
+                consecutive_failures: 0,
+                last_success_at: Some(now.to_string()),
+                last_failure_at: None,
+                failure_reason: None,
+                observed_at: now,
+                expires_at: now + time::Duration::minutes(10),
+            };
+        // The two source-owned observations point into B. Their established
+        // carriers nevertheless place all three nodes in one full-duplex
+        // component. A degraded relationship must not extend that component.
+        let graph = ClusterConnectivityGraph::from_records(
+            a.clone(),
+            [
+                record(&a, &b, "a_b", ClusterConnectivityState::Healthy),
+                record(&c, &b, "c_b", ClusterConnectivityState::Healthy),
+            ],
+        );
+        assert!(crate::route::cluster_nodes_share_healthy_component(
+            &graph, &a, &c,
+        ));
+        assert!(crate::route::cluster_nodes_share_healthy_component(
+            &graph, &c, &a,
+        ));
+
+        let degraded = ClusterConnectivityGraph::from_records(
+            a.clone(),
+            [
+                record(&a, &b, "a_b", ClusterConnectivityState::Healthy),
+                record(&c, &b, "c_b", ClusterConnectivityState::Degraded),
+            ],
+        );
+        assert!(!crate::route::cluster_nodes_share_healthy_component(
+            &degraded, &a, &c,
         ));
     }
 

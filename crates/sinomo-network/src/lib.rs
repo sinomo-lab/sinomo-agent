@@ -231,16 +231,17 @@ pub use path_metrics::{
     NetworkPathEstimate, NetworkPathEstimator, NetworkPathKey, shared_network_path_estimator,
 };
 pub use policy::{NetworkCallPolicy, NetworkHealthPolicy};
-pub use route::cluster_healthy_route_next_hop;
 pub use route::cluster_route_next_hop;
+pub use route::{cluster_healthy_route_next_hop, cluster_nodes_share_healthy_component};
 pub use route_graph_read_model::invalidate_cluster_route_graph_cache;
 pub use route_graph_read_model::{
     read_cluster_connectivity_graph, read_cluster_connectivity_graph_with_query,
 };
 pub use routed_identity::DaemonRoutedSessionIdentity;
 pub use routed_stream_pool::{
-    RoutedStreamAcceptor, accept_routed_stream_carrier, open_pooled_routed_stream,
-    retire_pooled_routed_streams,
+    RoutedStreamAcceptor, RoutedStreamIncoming, accept_pooled_routed_stream_carrier,
+    accept_routed_stream_carrier, open_pooled_routed_stream, pooled_routed_relationship_is_active,
+    register_routed_stream_incoming, retire_pooled_routed_streams,
 };
 pub use routing::{
     CandidatePath, ConnectOptions, DirectRoutedConnector, MAX_ROUTE_CANDIDATES,
@@ -276,6 +277,7 @@ pub use roaming::open_daemon_rpc_stream_to_cluster_endpoint_async;
 pub use route::{
     ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterSignedObjectRpcAsyncHost,
     ClusterSignedObjectRpcFuture, ClusterSignedObjectRpcObservation,
+    stream_native_service_route_constraints,
 };
 pub use rpc::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_INVITE_PUBLISH_ROUTE,

@@ -5,7 +5,7 @@ use crate::kv_local_store::{
     read_cluster_kv_snapshot, write_imported_cluster_kv_snapshot_if_changed,
 };
 use sinomo_base::ClusterBootstrapState;
-use sinomo_kv::{InProcessKvStore, KvLocalRead, KvSnapshot};
+use sinomo_kv::{InProcessKvStore, KvAuthoritativeRead, KvSnapshot};
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 use sinomo_network::{
@@ -78,7 +78,7 @@ struct LocalClusterKvSnapshotRefreshHost<F> {
 
 impl<F> ClusterKvSnapshotRefreshHost for LocalClusterKvSnapshotRefreshHost<F>
 where
-    F: FnMut(&NodeId, Duration) -> Result<KvSnapshot, NetworkError>,
+    F: FnMut(&NodeId, Duration) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError>,
 {
     fn known_kv_state_authority_id(
         &mut self,
@@ -104,21 +104,17 @@ where
         request: &ObjectRpcRequest,
         timeout: Duration,
     ) -> Result<ObjectRpcResponse, NetworkError> {
-        if request.route != sinomo_kv::CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE {
+        if request.route != sinomo_kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE {
             return Err(NetworkError::Io {
                 operation: "cluster KV snapshot refresh".to_string(),
-                detail: format!("unsupported local snapshot RPC route {}", request.route),
+                detail: format!(
+                    "unsupported authoritative snapshot RPC route {}",
+                    request.route
+                ),
             });
         }
-        let snapshot = (self.fetch_cluster_kv_snapshot)(target_node_id, timeout)?;
-        let local_read = KvLocalRead {
-            revision: snapshot.revision,
-            observed_term: 0,
-            applied_index: 0,
-            known_leader: Some(target_node_id.clone()),
-            value: snapshot,
-        };
-        let payload = sinomo_kv::cluster_kv_local_snapshot_response_rpc_payload(&local_read)
+        let read = (self.fetch_cluster_kv_snapshot)(target_node_id, timeout)?;
+        let payload = sinomo_kv::cluster_kv_authoritative_snapshot_response_rpc_payload(&read)
             .map_err(kv_err)?;
         Ok(ObjectRpcResponse::from_encoded_body(
             payload.route,
@@ -127,6 +123,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct ClusterKvSnapshotRefreshOutcome {
     pub store: InProcessKvStore,
     pub fetched_remote: bool,
@@ -149,10 +146,7 @@ pub fn refresh_current_cluster_kv_store_with_outcome(
     options: ClusterKvSnapshotRefreshOptions,
     host: &mut impl ClusterKvSnapshotRefreshHost,
 ) -> Result<ClusterKvSnapshotRefreshOutcome, NetworkError> {
-    let mut snapshots = Vec::new();
-    if let Ok(snapshot) = read_cluster_kv_snapshot(paths) {
-        snapshots.push(snapshot);
-    }
+    let local_snapshot = read_cluster_kv_snapshot(paths).ok();
     let mut targets = ClusterEndpointSelector::new(paths, state).select_internal_unique_node_ids(
         ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
     );
@@ -165,8 +159,8 @@ pub fn refresh_current_cluster_kv_store_with_outcome(
         targets.insert(0, leader);
     }
 
-    let deadline = Instant::now() + options.refresh_budget(!snapshots.is_empty());
-    let mut fetched_remote = false;
+    let deadline = Instant::now() + options.refresh_budget(local_snapshot.is_some());
+    let mut authoritative_snapshot = None;
     for (index, target_node_id) in targets.iter().enumerate() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -186,23 +180,43 @@ pub fn refresh_current_cluster_kv_store_with_outcome(
             options.routed_node_attempt_timeout(fair_share),
             host,
         ) {
-            snapshots.push(snapshot);
-            fetched_remote = true;
+            authoritative_snapshot = Some(snapshot);
             break;
         }
     }
-    let snapshot = snapshots
-        .into_iter()
-        .max_by_key(|snapshot| snapshot.revision)
-        .ok_or_else(|| NetworkError::ClusterReadOnly {
-            detail: "no local or reachable cluster KV snapshot is available".to_string(),
-        })?;
-    write_imported_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
-    let materialized_cache_changed = host.cache_cluster_kv_snapshot_if_newer_than_raft(
-        paths,
-        &state.local_node_id,
-        snapshot.clone(),
-    )?;
+    let fetched_remote = authoritative_snapshot.is_some();
+    if let (Some(authoritative), Some(local)) =
+        (authoritative_snapshot.as_ref(), local_snapshot.as_ref())
+        && local.revision > authoritative.revision
+    {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "local KV projection revision {:?} is ahead of fresh authoritative revision {:?}; refusing snapshot arbitration and requiring Raft/state reconciliation",
+                local.revision, authoritative.revision
+            ),
+        });
+    }
+    // A fresh quorum-backed read is authoritative even when a local materialized
+    // projection reports a different revision. Never arbitrate consensus state
+    // by comparing plain snapshot revisions.
+    let snapshot =
+        authoritative_snapshot
+            .or(local_snapshot)
+            .ok_or_else(|| NetworkError::ClusterReadOnly {
+                detail:
+                    "no local KV projection or reachable authoritative KV snapshot is available"
+                        .to_string(),
+            })?;
+    let materialized_cache_changed = if fetched_remote {
+        write_imported_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
+        host.cache_cluster_kv_snapshot_if_newer_than_raft(
+            paths,
+            &state.local_node_id,
+            snapshot.clone(),
+        )?
+    } else {
+        false
+    };
     let store = InProcessKvStore::restore(snapshot).map_err(kv_err)?;
     Ok(ClusterKvSnapshotRefreshOutcome {
         store,
@@ -217,12 +231,12 @@ fn fetch_cluster_kv_snapshot_from_state_authority_node(
     timeout: Duration,
     host: &mut impl ClusterKvSnapshotRefreshHost,
 ) -> Result<KvSnapshot, NetworkError> {
-    let payload = sinomo_kv::cluster_kv_local_snapshot_rpc_payload().map_err(kv_err)?;
+    let payload = sinomo_kv::cluster_kv_authoritative_snapshot_rpc_payload().map_err(kv_err)?;
     let request =
         ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
     let response = host.call_node_object_rpc(state, authority_node_id, &request, timeout)?;
     response.error_detail()?;
-    sinomo_kv::decode_cluster_kv_local_snapshot_rpc_body(&response.body)
+    sinomo_kv::decode_cluster_kv_authoritative_snapshot_rpc_body(&response.body)
         .map(|read| read.value)
         .map_err(kv_err)
 }
@@ -234,7 +248,7 @@ pub fn refresh_current_cluster_kv_store_with_local_storage_and_transport<F>(
     fetch_cluster_kv_snapshot: F,
 ) -> Result<InProcessKvStore, NetworkError>
 where
-    F: FnMut(&NodeId, Duration) -> Result<KvSnapshot, NetworkError>,
+    F: FnMut(&NodeId, Duration) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError>,
 {
     let mut host = LocalClusterKvSnapshotRefreshHost {
         fetch_cluster_kv_snapshot,
@@ -285,7 +299,10 @@ mod tests {
             request: &ObjectRpcRequest,
             timeout: Duration,
         ) -> Result<ObjectRpcResponse, NetworkError> {
-            assert_eq!(request.route, sinomo_kv::CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE);
+            assert_eq!(
+                request.route,
+                sinomo_kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE
+            );
             self.calls.push((target_node_id.clone(), timeout));
             if self.stalled_target.as_ref() == Some(target_node_id) {
                 std::thread::sleep(timeout);
@@ -296,13 +313,18 @@ mod tests {
                     detail: format!("node {target_node_id} is unavailable"),
                 });
             };
-            let payload = sinomo_kv::cluster_kv_local_snapshot_response_rpc_payload(
-                &sinomo_kv::KvLocalRead {
+            let payload = sinomo_kv::cluster_kv_authoritative_snapshot_response_rpc_payload(
+                &sinomo_kv::KvAuthoritativeRead {
                     value: snapshot.clone(),
-                    revision: snapshot.revision,
-                    observed_term: 1,
-                    applied_index: snapshot.revision.0,
-                    known_leader: Some(self.known_authority.clone()),
+                    authority: sinomo_kv::KvAuthorityProof {
+                        term: 1,
+                        commit_index: snapshot.revision.0.max(1),
+                        revision: snapshot.revision,
+                        basis: sinomo_kv::KvAuthorityBasis::CurrentTermQuorum {
+                            voter_acks: 2,
+                            required_quorum: 2,
+                        },
+                    },
                 },
             )
             .expect("snapshot response payload");
@@ -442,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_refresh_stops_after_preferred_success_and_keeps_newer_local_snapshot() {
+    fn snapshot_refresh_rejects_local_projection_ahead_of_current_raft_authority() {
         let (_root, paths, state, targets) = snapshot_refresh_test_state();
         let preferred = targets[2].clone();
         crate::kv_local_store::write_cluster_kv_snapshot(&paths, &snapshot(9))
@@ -455,24 +477,20 @@ mod tests {
             cached_snapshot: None,
         };
 
-        let outcome = refresh_current_cluster_kv_store_with_outcome(
+        let error = refresh_current_cluster_kv_store_with_outcome(
             &paths,
             &state,
             snapshot_refresh_options(Duration::from_secs(1)),
             &mut host,
         )
-        .expect("preferred snapshot refresh");
+        .expect_err("a plain local snapshot cannot outrank fresh Raft authority");
 
-        assert!(outcome.fetched_remote);
         assert_eq!(host.calls.len(), 1);
         assert_eq!(host.calls[0].0, preferred);
-        assert_eq!(outcome.store.revision(), KvRevision(9));
-        assert_eq!(
-            host.cached_snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.revision),
-            Some(KvRevision(9)),
-            "the local snapshot must still participate in newest-snapshot selection"
+        assert!(
+            error.to_string().contains("refusing snapshot arbitration"),
+            "error should require Raft/state reconciliation: {error}"
         );
+        assert!(host.cached_snapshot.is_none());
     }
 }

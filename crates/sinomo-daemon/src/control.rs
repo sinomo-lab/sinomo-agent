@@ -2723,6 +2723,15 @@ pub(crate) async fn run_daemon_control_accept_loop(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), DaemonError> {
+    let cluster_paths = cluster_paths_from_daemon_paths(&paths)?;
+    let mut routed_stream_incoming =
+        match sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths) {
+            Ok(state) => Some(sinomo_core::network::register_routed_stream_incoming(
+                state.local_node_id,
+            )?),
+            Err(sinomo_core::network::NetworkError::ClusterOrphan) => None,
+            Err(error) => return Err(error.into()),
+        };
     loop {
         if *shutdown_rx.borrow() {
             break;
@@ -2735,6 +2744,44 @@ pub(crate) async fn run_daemon_control_accept_loop(
                     Ok(()) if *shutdown_rx.borrow() => break,
                     Ok(()) => continue,
                     Err(_) => break,
+                }
+            }
+            routed = async {
+                match routed_stream_incoming.as_mut() {
+                    Some(incoming) => incoming.accept().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match routed {
+                    Ok(Some(stream)) => {
+                        let client_paths = paths.clone();
+                        let client_label = label.clone();
+                        let client_service_host = service_host.clone();
+                        let client_service_runtime = service_runtime.clone();
+                        let client_shutdown_tx = shutdown_tx.clone();
+                        tokio::spawn(async move {
+                            match handle_daemon_peer_opened_routed_stream_async(
+                                stream,
+                                client_paths,
+                                client_service_host,
+                                client_service_runtime,
+                            )
+                            .await
+                            {
+                                Ok(true) => {
+                                    let _ = client_shutdown_tx.send(true);
+                                }
+                                Ok(false) => {}
+                                Err(error) => tracing::warn!(
+                                    "sinomo {client_label} peer-opened routed stream error: {error}"
+                                ),
+                            }
+                        });
+                    }
+                    Ok(None) => routed_stream_incoming = None,
+                    Err(error) => tracing::warn!(
+                        "sinomo {label} routed stream dispatcher error: {error}"
+                    ),
                 }
             }
             accepted = listener.accept() => {
@@ -2769,6 +2816,29 @@ pub(crate) async fn run_daemon_control_accept_loop(
         }
     }
     Ok(())
+}
+
+async fn handle_daemon_peer_opened_routed_stream_async(
+    stream: sinomo_core::network::PeerStream,
+    paths: DaemonPaths,
+    service_host: crate::service_adapter::DaemonServiceRegistryHost,
+    service_runtime: tokio::runtime::Handle,
+) -> Result<bool, DaemonError> {
+    let cluster_paths = cluster_paths_from_daemon_paths(&paths)?;
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+    let directory = sinomo_core::network::cluster_directory_with_bootstrap_state(
+        sinomo_core::network::cluster_directory_for(&cluster_paths),
+        &state,
+    )
+    .snapshot()?;
+    handle_daemon_stream_native_service_rpc_async(
+        stream,
+        directory,
+        paths,
+        service_host,
+        service_runtime,
+    )
+    .await
 }
 
 pub(crate) async fn handle_daemon_connection_async(
@@ -3084,6 +3154,7 @@ async fn handle_daemon_authenticated_transport_stream_async(
         state: &state,
         directory: &directory,
     };
+    let routed_pool_scope = state.cluster_id.to_string();
     match sinomo_core::network::accept_or_relay_routed_session(
         direct_stream,
         &directory,
@@ -3108,6 +3179,7 @@ async fn handle_daemon_authenticated_transport_stream_async(
                 paths,
                 service_host,
                 service_runtime,
+                routed_pool_scope,
             )
             .await
         }
@@ -3134,8 +3206,15 @@ async fn handle_daemon_routed_stream_carrier_async(
     paths: DaemonPaths,
     service_host: crate::service_adapter::DaemonServiceRegistryHost,
     service_runtime: tokio::runtime::Handle,
+    routed_pool_scope: String,
 ) -> Result<bool, DaemonError> {
-    let mut acceptor = sinomo_core::network::accept_routed_stream_carrier(carrier);
+    let mut acceptor = sinomo_core::network::accept_pooled_routed_stream_carrier(
+        routed_pool_scope,
+        directory.version().0,
+        sinomo_core::network::stream_native_service_route_constraints(),
+        carrier,
+    )
+    .await?;
     let mut handlers = tokio::task::JoinSet::new();
     let mut carrier_open = true;
     while carrier_open || !handlers.is_empty() {

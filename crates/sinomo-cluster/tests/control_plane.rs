@@ -241,6 +241,7 @@ fn test_cluster_kv_txn_commit_result_for_request(
 ) -> ClusterKvTxnCommitResult {
     ClusterKvTxnCommitResult {
         request_id,
+        command_digest: sinomo_kv::KvCommandDigest([0; 32]),
         authority: test_current_quorum_authority(&snapshot),
         snapshot,
         txn_response,
@@ -8270,6 +8271,28 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
                     sinomo_kv::cluster_kv_txn_response_rpc_payload(&result).map_err(kv_err)?;
                 Ok(object_rpc_response_from_kv_payload(payload))
             }
+            sinomo_kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE => {
+                let voter_count = state
+                    .members
+                    .iter()
+                    .filter(|member| sinomo_kv::cluster_kv_member_has_raft_vote(member))
+                    .count();
+                let required_quorum = sinomo_kv::cluster_kv_raft_quorum_size(voter_count);
+                let mut authority = test_current_quorum_authority(&self.snapshot);
+                authority.term = authority.term.max(state.term);
+                authority.basis = sinomo_kv::KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks: required_quorum,
+                    required_quorum,
+                };
+                let response = sinomo_kv::KvAuthoritativeRead {
+                    authority,
+                    value: self.snapshot.clone(),
+                };
+                let payload =
+                    sinomo_kv::cluster_kv_authoritative_snapshot_response_rpc_payload(&response)
+                        .map_err(kv_err)?;
+                Ok(object_rpc_response_from_kv_payload(payload))
+            }
             route => ObjectRpcResponse::encode_error(route, "unexpected route"),
         }
     }
@@ -9459,7 +9482,18 @@ fn cluster_kv_snapshot_refresh_local_driver_owns_local_raft_storage() {
         kv_snapshot_refresh_test_options(),
         |target_node_id, timeout| {
             fetches.push((target_node_id.clone(), timeout));
-            Ok(remote_snapshot.clone())
+            Ok(sinomo_kv::KvAuthoritativeRead {
+                value: remote_snapshot.clone(),
+                authority: sinomo_kv::KvAuthorityProof {
+                    term: 1,
+                    commit_index: 1,
+                    revision: remote_snapshot.revision,
+                    basis: sinomo_kv::KvAuthorityBasis::CurrentTermQuorum {
+                        voter_acks: 1,
+                        required_quorum: 1,
+                    },
+                },
+            })
         },
     )
     .expect("refresh snapshot through local driver");
@@ -11115,7 +11149,13 @@ fn cluster_kv_txn_forward_driver_uses_routed_node_rpc_for_known_state_authority(
     assert_eq!(result.txn_response, Some(txn_response));
     assert_eq!(
         host.rpcs,
-        vec![(peer_node_id, CLUSTER_KV_TXN_ROUTE.to_string())]
+        vec![
+            (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
+            (
+                peer_node_id,
+                sinomo_kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE.to_string(),
+            ),
+        ]
     );
 }
 
@@ -11172,7 +11212,13 @@ fn cluster_kv_txn_forward_driver_deduplicates_state_authority_endpoints() {
     assert_eq!(result.txn_response, Some(txn_response));
     assert_eq!(
         host.rpcs,
-        vec![(peer_node_id, CLUSTER_KV_TXN_ROUTE.to_string())]
+        vec![
+            (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
+            (
+                peer_node_id,
+                sinomo_kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE.to_string(),
+            ),
+        ]
     );
 }
 
@@ -11294,7 +11340,13 @@ fn cluster_kv_txn_forward_driver_uses_routed_node_rpc_without_known_state_author
     assert_eq!(result.txn_response, Some(txn_response));
     assert_eq!(
         host.rpcs,
-        vec![(peer_node_id, CLUSTER_KV_TXN_ROUTE.to_string())]
+        vec![
+            (peer_node_id.clone(), CLUSTER_KV_TXN_ROUTE.to_string()),
+            (
+                peer_node_id,
+                sinomo_kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE.to_string(),
+            ),
+        ]
     );
 }
 
@@ -20225,6 +20277,7 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
                     public_foreground_attempt_timeout: Duration::from_secs(1),
                     iroh_foreground_attempt_timeout: Duration::from_secs(1),
                 },
+                None,
                 &mut host,
             ),
         )
@@ -20260,14 +20313,34 @@ fn async_cluster_raft_quorum_commit_races_voters_and_returns_at_quorum() {
             &'a mut self,
             _paths: &'a ClusterPaths,
             _state: &'a ClusterBootstrapState,
-            _target_node_id: &'a NodeId,
-            _request: &'a ClusterRaftAppendRequest,
+            target_node_id: &'a NodeId,
+            request: &'a ClusterRaftAppendRequest,
             _timeout: Duration,
         ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse> {
-            Box::pin(async {
-                Err(NetworkError::Io {
-                    operation: "sequential quorum append".to_string(),
-                    detail: "concurrent batch path was not used".to_string(),
+            let delay = self
+                .delays
+                .get(target_node_id)
+                .copied()
+                .unwrap_or(Duration::from_secs(2));
+            let started = Arc::clone(&self.started);
+            let request = request.clone();
+            Box::pin(async move {
+                started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::time::sleep(delay).await;
+                Ok(ClusterRaftAppendResponse {
+                    accepted: true,
+                    detail: "accepted commit confirmation".to_string(),
+                    state: request.state.clone(),
+                    append: RaftAppendEntriesResponse {
+                        term: request.append.term,
+                        success: true,
+                        match_index: request
+                            .append
+                            .entries
+                            .last()
+                            .map(|entry| entry.index)
+                            .unwrap_or(request.append.prev_log_index),
+                    },
                 })
             })
         }
@@ -20449,6 +20522,7 @@ fn async_cluster_raft_quorum_commit_races_voters_and_returns_at_quorum() {
                     public_foreground_attempt_timeout: Duration::from_secs(1),
                     iroh_foreground_attempt_timeout: Duration::from_secs(1),
                 },
+                None,
                 &mut host,
             ),
         )
@@ -20480,13 +20554,76 @@ fn async_cluster_raft_quorum_commit_races_voters_and_returns_at_quorum() {
         .iter()
         .cloned()
         .zip([
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+            Duration::from_millis(80),
+            Duration::from_millis(15),
+        ])
+        .collect();
+    host.connectivity_records.clear();
+    started.store(0, std::sync::atomic::Ordering::Relaxed);
+    let required_replication_node = remotes[2].clone();
+    let began = std::time::Instant::now();
+    runtime
+        .block_on(
+            sinomo_cluster::commit_cluster_raft_command_with_quorum_async_with_host(
+                runtime.handle(),
+                &paths,
+                &mut state,
+                KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                    key: "/test/required-forwarding-voter".to_string(),
+                    value: b"ok".to_vec(),
+                    lease_id: None,
+                })),
+                ClusterKvRaftQuorumCommitOptions {
+                    timeout: Duration::from_secs(3),
+                },
+                ClusterRaftAppendReplicationOptions {
+                    timeout: Duration::from_secs(3),
+                    max_attempts: 3,
+                    tcp_command_timeout: Duration::from_secs(1),
+                    iroh_command_timeout: Duration::from_secs(1),
+                    tcp_foreground_attempt_timeout: Duration::from_secs(1),
+                    public_foreground_attempt_timeout: Duration::from_secs(1),
+                    iroh_foreground_attempt_timeout: Duration::from_secs(1),
+                },
+                Some(required_replication_node.clone()),
+                &mut host,
+            ),
+        )
+        .expect("required forwarding voter quorum commit");
+    assert!(
+        began.elapsed() >= Duration::from_millis(70),
+        "quorum returned before the required forwarding voter acknowledged: {:?}",
+        began.elapsed()
+    );
+    assert!(
+        host.connectivity_records
+            .iter()
+            .any(|(node_id, state)| node_id == &required_replication_node
+                && state == &ClusterConnectivityState::Healthy),
+        "required forwarding voter was not part of the accepted quorum: {:?}",
+        host.connectivity_records
+    );
+    assert_eq!(
+        started.load(std::sync::atomic::Ordering::Relaxed),
+        remotes.len() + 1,
+        "required forwarding voter should receive a post-commit confirmation append"
+    );
+
+    locked_set_cluster_raft_leader(&paths, &local, 3).expect("restore leader");
+    state.term = 3;
+    host.delays = remotes
+        .iter()
+        .cloned()
+        .zip([
             Duration::from_millis(10),
             Duration::from_millis(20),
             Duration::from_millis(30),
             Duration::from_secs(2),
         ])
         .collect();
-    host.higher_term_rejection = Some((remotes[0].clone(), 3));
+    host.higher_term_rejection = Some((remotes[0].clone(), 4));
     started.store(0, std::sync::atomic::Ordering::Relaxed);
     let error = runtime
         .block_on(
@@ -20511,6 +20648,7 @@ fn async_cluster_raft_quorum_commit_races_voters_and_returns_at_quorum() {
                     public_foreground_attempt_timeout: Duration::from_secs(1),
                     iroh_foreground_attempt_timeout: Duration::from_secs(1),
                 },
+                None,
                 &mut host,
             ),
         )
@@ -20528,7 +20666,7 @@ fn async_cluster_raft_quorum_commit_races_voters_and_returns_at_quorum() {
             .is_none()
     );
     let node = open_cluster_raft_kv_node(&paths, &local).expect("raft after higher term");
-    assert_eq!(node.hard_state().current_term, 3);
+    assert_eq!(node.hard_state().current_term, 4);
     assert_eq!(node.hard_state().leader_id, None);
 }
 
@@ -21713,7 +21851,7 @@ fn cluster_doctor_warns_unreachable_endpoint_without_healthy_route() {
 }
 
 #[test]
-fn cluster_doctor_warns_missing_authority_route_when_connectivity_is_asymmetric() {
+fn cluster_doctor_accepts_healthy_full_duplex_carrier_from_either_probe_direction() {
     let now = OffsetDateTime::now_utc();
     let cluster_id =
         ClusterId::from_legacy_named("cluster_network_doctor_asymmetric_route").expect("cluster");
@@ -21747,12 +21885,10 @@ fn cluster_doctor_warns_missing_authority_route_when_connectivity_is_asymmetric(
     let findings = cluster_doctor_findings(&state, &records, &[]);
 
     assert!(
-        findings.iter().any(|finding| {
-            finding.code == "authority-route-missing"
-                && finding.detail.contains(second.as_str())
-                && finding.detail.contains(first.as_str())
-        }),
-        "missing reverse authority routes should be reported: {findings:?}"
+        !findings
+            .iter()
+            .any(|finding| finding.code == "authority-route-missing"),
+        "one established full-duplex carrier places both authorities in the same healthy component: {findings:?}"
     );
 }
 

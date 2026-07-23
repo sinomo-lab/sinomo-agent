@@ -77,7 +77,7 @@ fn record_network_rpc_metrics(
     }
 }
 
-fn stream_native_service_route_constraints() -> crate::RouteConstraints {
+pub fn stream_native_service_route_constraints() -> crate::RouteConstraints {
     crate::RouteConstraints {
         // The routed-session layer encrypts and authenticates the complete
         // endpoint stream. Requiring the adjacent link to be confidential
@@ -206,6 +206,53 @@ pub fn cluster_healthy_route_next_hop(
     cluster_route_next_hop_excluding(graph, local, target, &[], ClusterRouteAdjacency::Healthy)
         .ok()
         .flatten()
+}
+
+/// Whether two nodes belong to the same component of established healthy,
+/// full-duplex carrier relationships.
+///
+/// Connectivity observations remain directed because each node owns its probe
+/// evidence. A healthy carrier itself is symmetric, so component consumers
+/// such as convergence scheduling and diagnostics must walk either direction
+/// without inventing a reverse dialable endpoint.
+pub fn cluster_nodes_share_healthy_component(
+    graph: &ClusterConnectivityGraph,
+    left: &NodeId,
+    right: &NodeId,
+) -> bool {
+    cluster_nodes_share_healthy_component_fallible(graph, left, right).unwrap_or(false)
+}
+
+fn cluster_nodes_share_healthy_component_fallible(
+    graph: &ClusterConnectivityGraph,
+    left: &NodeId,
+    right: &NodeId,
+) -> Result<bool, NetworkError> {
+    if left == right {
+        return Ok(true);
+    }
+    let mut seen = RouteNodeSet::default();
+    seen.try_insert_clone(left, "healthy component seen nodes")?;
+    let mut queue = VecDeque::new();
+    queue
+        .try_reserve(1)
+        .map_err(|_| crate::object::network_allocation_error("healthy component queue", 1))?;
+    queue.push_back(try_clone_route_node_id(left, "healthy component queue")?);
+    while let Some(current) = queue.pop_front() {
+        for next in graph.healthy_relationship_neighbor_refs(&current) {
+            if next == right {
+                return Ok(true);
+            }
+            if !seen.try_insert_clone(next, "healthy component seen nodes")? {
+                continue;
+            }
+            queue.try_reserve(1).map_err(|_| {
+                crate::object::network_allocation_error("healthy component queue", 1)
+            })?;
+            queue.push_back(try_clone_route_node_id(next, "healthy component queue")?);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn cluster_route_next_hop_fallible(

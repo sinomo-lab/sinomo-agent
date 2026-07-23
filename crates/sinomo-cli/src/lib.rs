@@ -5669,15 +5669,6 @@ const SINOMO_JOIN_URI_PREFIX: &str = cluster::SINOMO_JOIN_URI_PREFIX;
 const CLUSTER_INVITE_DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;
 const INSTALL_DEFAULT_HOST: &str = "0.0.0.0";
 
-fn daemon_fetch_cluster_kv_local_snapshot(
-    address: &str,
-    timeout: Duration,
-) -> Result<KvLocalRead<KvSnapshot>, sinomo_runtime::daemon::DaemonError> {
-    let request = cluster_kv_local_snapshot_rpc_request()?;
-    let response = daemon_send_daemon_rpc(address, &request, timeout)?;
-    decode_cluster_kv_local_snapshot_rpc_response(&response).map_err(Into::into)
-}
-
 fn daemon_fetch_cluster_kv_local_snapshot_from_endpoint(
     endpoint: &ClusterEndpointRecord,
     timeout: Duration,

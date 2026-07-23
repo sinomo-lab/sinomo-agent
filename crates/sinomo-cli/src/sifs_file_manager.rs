@@ -411,7 +411,17 @@ impl SifsFileManagerBackend {
         &self,
         operation_deadline: Option<Instant>,
     ) -> Result<(), String> {
-        self.prepare_metadata_after_mutation(operation_deadline)?;
+        if let Err(error) = self.prepare_metadata_after_mutation(operation_deadline) {
+            // The namespace/content mutation has already crossed its durable
+            // commit edge. Detached sends and metadata publication are
+            // replay-safe maintenance owned by the daemon; reporting their
+            // deadline as a mutation failure would invite an unsafe retry of
+            // an operation which already took effect.
+            eprintln!(
+                "warning: follow-up DFS maintenance was deferred after a committed mutation; durable daemon maintenance will retry: {error}"
+            );
+            return Ok(());
+        }
         handoff_or_publish_sifs_metadata(
             operation_deadline,
             |timeout| request_sifs_daemon_maintenance_refresh(&self.data_dir, timeout),
@@ -4463,6 +4473,19 @@ mod tests {
 
         assert_eq!(refresh_requests.get(), 0);
         assert_eq!(foreground_publishes.get(), 0);
+    }
+
+    #[test]
+    fn expired_detached_send_budget_does_not_misreport_committed_mutation() {
+        let root = temp_sifs_data_dir("committed-mutation-detached-send-deadline");
+        let data_dir = SinomoDataDir::new(&root);
+        let backend = SifsFileManagerBackend::open(&data_dir).expect("SIFS backend");
+
+        backend
+            .publish_metadata_after_mutation_with_deadline(Some(
+                Instant::now() - Duration::from_millis(1),
+            ))
+            .expect("expired follow-up budget must not fail a committed mutation");
     }
 
     fn healthy_connectivity_record(

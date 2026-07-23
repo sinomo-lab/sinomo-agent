@@ -272,6 +272,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &right.request_id,
             ))
         });
+        if !requests.is_empty() {
+            let request_keys = requests
+                .iter()
+                .map(|request| {
+                    (
+                        request.requester_node_id.clone(),
+                        request.request_id.clone(),
+                    )
+                })
+                .collect::<BTreeSet<_>>();
+            let recovered =
+                self.recover_durable_namespace_prepares_for_requests(&request_keys, max_requests)?;
+            report.scanned = report.scanned.saturating_add(recovered);
+            report.resolved = report.resolved.saturating_add(recovered);
+            if recovered > 0 {
+                requests = self
+                    .metadata_backend
+                    .as_ref()
+                    .expect("metadata backend checked above")
+                    .list_namespace_requests()?
+                    .into_iter()
+                    .filter(|request| request.status == DfsNamespaceRequestStatus::Pending)
+                    .collect();
+                requests.sort_by(|left, right| {
+                    (left.updated_at, &left.requester_node_id, &left.request_id).cmp(&(
+                        right.updated_at,
+                        &right.requester_node_id,
+                        &right.request_id,
+                    ))
+                });
+            }
+        }
         let mut locally_authoritative = Vec::new();
         for request in requests {
             let authority_is_local = self
@@ -288,7 +320,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         report.remaining = locally_authoritative.len();
 
-        for mut request in locally_authoritative.into_iter().take(max_requests) {
+        for mut request in locally_authoritative
+            .into_iter()
+            .take(max_requests.saturating_sub(report.scanned))
+        {
             report.scanned = report.scanned.saturating_add(1);
 
             let command = DfsNamespaceCommand {
@@ -695,6 +730,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut trace_affected_shards = 0;
         let mut trace_execute_ms = 0;
         let mut affected_shard_ids: Vec<DfsMetadataShardId> = Vec::new();
+        for expected in &command.authority_shards {
+            self.rebind_completed_local_metadata_shard_membership_handoff_if_frozen(expected)?;
+        }
         // The authority the requester should retry against when this node is
         // not the shard primary (the requester routed on a stale shard view).
         let mut authority_redirect: Option<NodeId> = None;

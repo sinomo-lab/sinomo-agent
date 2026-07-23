@@ -885,7 +885,7 @@ fn refresh_daemon_auth_membership_snapshot(data_dir: &Path) -> Result<(), Daemon
                     }
                 }
                 authoritative_snapshot = Some(authoritative.value.clone());
-                Ok(authoritative.value)
+                Ok(authoritative)
             },
         )?;
 
