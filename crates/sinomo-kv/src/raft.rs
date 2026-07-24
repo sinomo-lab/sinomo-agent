@@ -1,7 +1,7 @@
 use crate::internal::*;
 
 static CLUSTER_KV_RAFT_OPERATION_LOCKS: LazyLock<
-    Mutex<HashMap<PathBuf, &'static ClusterKvRaftOperationLock>>,
+    Mutex<HashMap<PathBuf, std::sync::Weak<ClusterKvRaftOperationLock>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 #[cfg(test)]
 pub(crate) static CLUSTER_KV_RAFT_SNAPSHOT_BYTES_LIMIT_FOR_TEST: AtomicU64 =
@@ -42,18 +42,37 @@ struct ClusterKvRaftOperationLock {
 /// command can retain it while its durable node remains open across blocking
 /// storage phases and network awaits.
 pub struct ClusterKvRaftOperationGuard {
-    lock: &'static ClusterKvRaftOperationLock,
+    root: PathBuf,
+    lock: Arc<ClusterKvRaftOperationLock>,
+}
+
+fn remove_cluster_kv_raft_operation_lock_if_unused(
+    root: &Path,
+    lock: &Arc<ClusterKvRaftOperationLock>,
+) {
+    let mut locks = CLUSTER_KV_RAFT_OPERATION_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let is_registered_lock = locks
+        .get(root)
+        .is_some_and(|registered| registered.as_ptr() == Arc::as_ptr(lock));
+    if is_registered_lock && Arc::strong_count(lock) == 1 {
+        locks.remove(root);
+    }
 }
 
 impl Drop for ClusterKvRaftOperationGuard {
     fn drop(&mut self) {
-        let mut held = self
-            .lock
-            .held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *held = false;
-        self.lock.ready.notify_one();
+        {
+            let mut held = self
+                .lock
+                .held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *held = false;
+            self.lock.ready.notify_one();
+        }
+        remove_cluster_kv_raft_operation_lock_if_unused(&self.root, &self.lock);
     }
 }
 
@@ -68,28 +87,122 @@ pub fn lock_cluster_kv_raft_operation_for_root(
                 path: "cluster kv raft operation locks".to_string(),
                 detail: format!("cluster kv raft operation lock table poisoned: {error}"),
             })?;
-        *guard.entry(root.clone()).or_insert_with(|| {
-            let lock: &'static ClusterKvRaftOperationLock =
-                Box::leak(Box::new(ClusterKvRaftOperationLock {
+        match guard.get(&root).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(ClusterKvRaftOperationLock {
                     held: Mutex::new(false),
                     ready: Condvar::new(),
-                }));
-            lock
-        })
+                });
+                guard.insert(root.clone(), Arc::downgrade(&lock));
+                lock
+            }
+        }
     };
-    let mut held = lock.held.lock().map_err(|error| KvError::Io {
-        path: root.display().to_string(),
-        detail: format!("cluster kv raft operation lock poisoned: {error}"),
-    })?;
+    let mut held = match lock.held.lock() {
+        Ok(held) => held,
+        Err(error) => {
+            let detail = format!("cluster kv raft operation lock poisoned: {error}");
+            drop(error);
+            remove_cluster_kv_raft_operation_lock_if_unused(&root, &lock);
+            return Err(KvError::Io {
+                path: root.display().to_string(),
+                detail,
+            });
+        }
+    };
     while *held {
-        held = lock.ready.wait(held).map_err(|error| KvError::Io {
-            path: root.display().to_string(),
-            detail: format!("cluster kv raft operation lock poisoned while waiting: {error}"),
-        })?;
+        held = match lock.ready.wait(held) {
+            Ok(held) => held,
+            Err(error) => {
+                let detail =
+                    format!("cluster kv raft operation lock poisoned while waiting: {error}");
+                drop(error);
+                remove_cluster_kv_raft_operation_lock_if_unused(&root, &lock);
+                return Err(KvError::Io {
+                    path: root.display().to_string(),
+                    detail,
+                });
+            }
+        };
     }
     *held = true;
     drop(held);
-    Ok(ClusterKvRaftOperationGuard { lock })
+    Ok(ClusterKvRaftOperationGuard { root, lock })
+}
+
+#[cfg(test)]
+fn cluster_kv_raft_operation_lock_is_registered_for_test(root: &Path) -> bool {
+    CLUSTER_KV_RAFT_OPERATION_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(root)
+}
+
+#[cfg(test)]
+mod operation_lock_tests {
+    use super::*;
+
+    #[test]
+    fn operation_lock_registry_releases_churned_roots() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ClusterKvRaftOperationGuard>();
+
+        let base = std::env::temp_dir().join(format!(
+            "sinomo-kv-operation-lock-churn-{}",
+            std::process::id()
+        ));
+        for index in 0..512 {
+            let root = base.join(index.to_string());
+            let guard =
+                lock_cluster_kv_raft_operation_for_root(&root).expect("operation lock acquired");
+            assert!(cluster_kv_raft_operation_lock_is_registered_for_test(
+                &root
+            ));
+            drop(guard);
+            assert!(
+                !cluster_kv_raft_operation_lock_is_registered_for_test(&root),
+                "dropped operation lock root {index} remained registered"
+            );
+        }
+    }
+
+    #[test]
+    fn operation_lock_registry_preserves_waiter_handoff() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-operation-lock-waiter-{}",
+            std::process::id()
+        ));
+        let first =
+            lock_cluster_kv_raft_operation_for_root(&root).expect("first operation lock acquired");
+        let waiter_root = root.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(0);
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).expect("waiter start reported");
+            let guard = lock_cluster_kv_raft_operation_for_root(&waiter_root)
+                .expect("waiting operation lock acquired");
+            acquired_tx.send(()).expect("waiter acquisition reported");
+            drop(guard);
+        });
+
+        started_rx.recv().expect("waiter started");
+        assert!(
+            matches!(
+                acquired_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "waiter acquired while the first operation still held the lock"
+        );
+        drop(first);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("waiter acquired after handoff");
+        waiter.join().expect("waiter completed");
+        assert!(!cluster_kv_raft_operation_lock_is_registered_for_test(
+            &root
+        ));
+    }
 }
 
 pub fn lock_cluster_kv_raft_operation_for_paths(
