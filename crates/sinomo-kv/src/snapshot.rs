@@ -43,12 +43,16 @@ pub fn read_cluster_kv_local_snapshot(
         // Read value and metadata from the same opened Raft view. Reopening via
         // the materialized-cache helper here can observe a different applied
         // index (or fall back while this node lock is held).
-        let snapshot = node.store().try_snapshot()?;
+        let revision = node.store().revision();
+        let observed_term = node.hard_state().current_term;
+        let applied_index = node.applied_index();
+        let known_leader = node.hard_state().leader_id.clone();
+        let snapshot = node.try_into_snapshot()?;
         Ok(KvLocalRead {
-            revision: snapshot.revision,
-            observed_term: node.hard_state().current_term,
-            applied_index: node.applied_index(),
-            known_leader: node.hard_state().leader_id.clone(),
+            revision,
+            observed_term,
+            applied_index,
+            known_leader,
             value: snapshot,
         })
     })();
@@ -66,15 +70,29 @@ pub fn read_cluster_kv_local_entry(
     node_id: &NodeId,
     key: &str,
 ) -> Result<KvLocalRead<Option<KvEntry>>, KvError> {
-    let local = read_cluster_kv_local_snapshot(paths, node_id)?;
-    let value = local.value.get(key).cloned();
-    Ok(KvLocalRead {
-        value,
-        revision: local.revision,
-        observed_term: local.observed_term,
-        applied_index: local.applied_index,
-        known_leader: local.known_leader,
-    })
+    let started = Instant::now();
+    let result = (|| {
+        let node = paths.raft_store().open_node(node_id)?;
+        let value = node
+            .store()
+            .get(key)
+            .map(|entry| try_clone_kv_entry(entry, "read local KV entry"))
+            .transpose()?;
+        Ok(KvLocalRead {
+            value,
+            revision: node.store().revision(),
+            observed_term: node.hard_state().current_term,
+            applied_index: node.applied_index(),
+            known_leader: node.hard_state().leader_id.clone(),
+        })
+    })();
+    record_kv_read(
+        "local",
+        "durable_raft_entry",
+        if result.is_ok() { "ok" } else { "error" },
+        started,
+    );
+    result
 }
 
 pub fn read_cluster_kv_local_prefix(
@@ -82,15 +100,25 @@ pub fn read_cluster_kv_local_prefix(
     node_id: &NodeId,
     prefix: &str,
 ) -> Result<KvLocalRead<Vec<KvEntry>>, KvError> {
-    let local = read_cluster_kv_local_snapshot(paths, node_id)?;
-    let value = local.value.try_range_prefix(prefix)?;
-    Ok(KvLocalRead {
-        value,
-        revision: local.revision,
-        observed_term: local.observed_term,
-        applied_index: local.applied_index,
-        known_leader: local.known_leader,
-    })
+    let started = Instant::now();
+    let result = (|| {
+        let node = paths.raft_store().open_node(node_id)?;
+        let value = node.store().range_prefix(prefix)?;
+        Ok(KvLocalRead {
+            value,
+            revision: node.store().revision(),
+            observed_term: node.hard_state().current_term,
+            applied_index: node.applied_index(),
+            known_leader: node.hard_state().leader_id.clone(),
+        })
+    })();
+    record_kv_read(
+        "local",
+        "durable_raft_prefix",
+        if result.is_ok() { "ok" } else { "error" },
+        started,
+    );
+    result
 }
 
 pub fn write_cluster_kv_snapshot(
@@ -697,7 +725,8 @@ impl KvMaterializedCache {
                         return Err(error);
                     }
                 };
-            let snapshot = match node.store().try_snapshot() {
+            let raft_paths = node.paths.clone();
+            let snapshot = match node.try_into_snapshot() {
                 Ok(snapshot) => snapshot.canonicalized(),
                 Err(error) => {
                     record_kv_read("local", "durable_raft_open", "error", started);
@@ -711,8 +740,8 @@ impl KvMaterializedCache {
                 return Err(error);
             }
             let snapshot = Arc::new(snapshot);
-            if let Some(identity) = raft_view_identity(&node.paths) {
-                cache_store_raft_view(&node.paths, identity, snapshot.clone());
+            if let Some(identity) = raft_view_identity(&raft_paths) {
+                cache_store_raft_view(&raft_paths, identity, snapshot.clone());
             }
             record_kv_read("local", "durable_raft_open", "ok", started);
             return Ok(snapshot);

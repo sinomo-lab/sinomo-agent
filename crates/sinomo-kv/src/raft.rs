@@ -164,6 +164,12 @@ pub enum ClusterKvRaftUncommittedAppend {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterKvRaftCommitResult {
+    /// Owned materialization for local-cache publication and callers that need
+    /// a complete post-commit view. Durable commit paths build this by
+    /// consuming the reconstructed node so entry/event/request payloads are
+    /// transferred rather than deep-cloned. Cloning this result is still
+    /// `O(total retained state)`; use the transaction response or indexed read
+    /// APIs when a complete snapshot is unnecessary.
     pub snapshot: KvSnapshot,
     pub txn_response: Option<KvTxnResponse>,
     pub events: Vec<KvEvent>,
@@ -2857,9 +2863,21 @@ impl ClusterKvRaftStore {
         append: RaftAppendEntriesRequest,
     ) -> Result<RaftAppendEntriesApplyOutcome, KvError> {
         let mut node = self.open_node(node_id)?;
-        let outcome = node.apply_append_entries_with_optional_snapshot(snapshot, append)?;
+        let (response, snapshot_restored, before_revision) =
+            node.apply_append_entries_with_optional_snapshot_state(snapshot, append)?;
         self.compact_node_if_needed(&mut node)?;
-        Ok(outcome)
+        let snapshot = node.try_into_snapshot()?;
+        let committed_events = if snapshot_restored || snapshot.revision == before_revision {
+            Vec::new()
+        } else {
+            Self::events_after_revision(&snapshot, before_revision)?
+        };
+        Ok(RaftAppendEntriesApplyOutcome {
+            response,
+            snapshot,
+            snapshot_restored,
+            committed_events,
+        })
     }
 
     pub fn apply_append_entries_with_optional_snapshot_and_publish<F>(
@@ -3074,11 +3092,13 @@ impl ClusterKvRaftStore {
                     request_id: request.request_id,
                 });
             }
+            let txn_response = record.txn_response.clone();
+            let committed_request = record.clone();
             return Ok(ClusterKvRaftCommitResult {
-                snapshot: node.store().try_snapshot()?,
-                txn_response: record.txn_response.clone(),
+                snapshot: node.try_into_snapshot()?,
+                txn_response,
                 events: Vec::new(),
-                committed_request: record.clone(),
+                committed_request,
             });
         }
         if let Err(error) = node.store().preflight_apply_command(&request.command) {
@@ -3119,7 +3139,7 @@ impl ClusterKvRaftStore {
             .cloned()
             .ok_or(KvError::MissingCommittedEntry { index: entry.index })?;
         self.compact_node_if_needed(&mut node)?;
-        let snapshot = node.store().try_snapshot()?;
+        let snapshot = node.try_into_snapshot()?;
         let events = Self::events_after_revision(&snapshot, before_revision)?;
         Ok(ClusterKvRaftCommitResult {
             snapshot,
@@ -3299,7 +3319,8 @@ impl ClusterKvRaftStore {
                 request_id: request.request_id.clone(),
             });
         }
-        Ok(Some((node.store().try_snapshot()?, record.clone())))
+        let record = record.clone();
+        Ok(Some((node.try_into_snapshot()?, record)))
     }
 
     pub fn locked_replay_request_if_committed(
@@ -3434,8 +3455,6 @@ impl ClusterKvRaftStore {
         node.commit_to(commit_index)?;
         let txn_response = node.txn_response_at(commit_index).cloned();
         self.compact_node_if_needed(&mut node)?;
-        let snapshot = node.store().try_snapshot()?;
-        let events = Self::events_after_revision(&snapshot, before_revision)?;
         let committed_request = node
             .log_entry_at(commit_index)
             .and_then(|entry| node.store().committed_request(&entry.request_id))
@@ -3443,6 +3462,8 @@ impl ClusterKvRaftStore {
             .ok_or(KvError::MissingCommittedEntry {
                 index: commit_index,
             })?;
+        let snapshot = node.try_into_snapshot()?;
+        let events = Self::events_after_revision(&snapshot, before_revision)?;
         Ok(ClusterKvRaftCommitResult {
             snapshot,
             txn_response,
@@ -3572,15 +3593,21 @@ where
         discard_uncommitted_tail: bool,
     ) -> Result<&mut DurableRaftKvNode, KvError> {
         if self.node.is_none() {
-            let operation_guard = self.store.lock_operation()?;
+            let operation_guard = self
+                .operation_guard
+                .is_none()
+                .then(|| self.store.lock_operation())
+                .transpose()?;
             let node = if discard_uncommitted_tail {
                 self.store
                     .open_node_discarding_uncommitted_tail(&self.node_id)?
             } else {
                 self.store.open_node(&self.node_id)?
             };
+            if let Some(operation_guard) = operation_guard {
+                self.operation_guard = Some(operation_guard);
+            }
             self.node = Some(node);
-            self.operation_guard = Some(operation_guard);
         }
         self.node.as_mut().ok_or_else(|| KvError::Io {
             path: self
@@ -3663,7 +3690,17 @@ where
                 request_id: request.request_id.clone(),
             });
         }
-        Ok(Some((node.store().try_snapshot()?, record.clone())))
+        let record = record.clone();
+        let node = self.node.take().ok_or_else(|| KvError::Io {
+            path: self
+                .store
+                .wal_paths(&self.node_id)
+                .root
+                .display()
+                .to_string(),
+            detail: "cluster KV Raft command session lost its replay node".to_string(),
+        })?;
+        Ok(Some((node.try_into_snapshot()?, record)))
     }
 
     pub fn append_uncommitted(&mut self, request: KvCommandRequest) -> Result<KvLogEntry, KvError> {
@@ -3817,25 +3854,35 @@ where
     ) -> Result<ClusterKvRaftCommitResult, KvError> {
         self.last_snapshot_publish_wrote = None;
         let store = self.store.clone();
-        let result = {
+        let (txn_response, committed_request, before_revision) = {
             let node = self.node_mut()?;
             let before_revision = node.store().revision();
             node.commit_to(index)?;
             let txn_response = node.txn_response_at(index).cloned();
             store.compact_node_if_needed(node)?;
-            let snapshot = node.store().try_snapshot()?;
-            let events = ClusterKvRaftStore::events_after_revision(&snapshot, before_revision)?;
             let committed_request = node
                 .log_entry_at(index)
                 .and_then(|entry| node.store().committed_request(&entry.request_id))
                 .cloned()
                 .ok_or(KvError::MissingCommittedEntry { index })?;
-            ClusterKvRaftCommitResult {
-                snapshot,
-                txn_response,
-                events,
-                committed_request,
-            }
+            (txn_response, committed_request, before_revision)
+        };
+        let node = self.node.take().ok_or_else(|| KvError::Io {
+            path: self
+                .store
+                .wal_paths(&self.node_id)
+                .root
+                .display()
+                .to_string(),
+            detail: "cluster KV Raft command session lost its committed node".to_string(),
+        })?;
+        let snapshot = node.try_into_snapshot()?;
+        let events = ClusterKvRaftStore::events_after_revision(&snapshot, before_revision)?;
+        let result = ClusterKvRaftCommitResult {
+            snapshot,
+            txn_response,
+            events,
+            committed_request,
         };
         let wrote =
             store.publish_commit_result(&result, &mut self.key_can_defer_materialized_snapshot)?;
@@ -4101,6 +4148,10 @@ impl DurableRaftKvNode {
         &self.node.store
     }
 
+    pub(crate) fn try_into_snapshot(self) -> Result<KvSnapshot, KvError> {
+        self.node.store.try_into_snapshot()
+    }
+
     pub fn log(&self) -> &[KvLogEntry] {
         &self.node.log
     }
@@ -4234,6 +4285,27 @@ impl DurableRaftKvNode {
         snapshot: Option<RaftSnapshot>,
         append: RaftAppendEntriesRequest,
     ) -> Result<RaftAppendEntriesApplyOutcome, KvError> {
+        let (response, snapshot_restored, before_revision) =
+            self.apply_append_entries_with_optional_snapshot_state(snapshot, append)?;
+        let snapshot = self.store().try_snapshot()?;
+        let committed_events = if snapshot_restored || snapshot.revision == before_revision {
+            Vec::new()
+        } else {
+            ClusterKvRaftStore::events_after_revision(&snapshot, before_revision)?
+        };
+        Ok(RaftAppendEntriesApplyOutcome {
+            response,
+            snapshot,
+            snapshot_restored,
+            committed_events,
+        })
+    }
+
+    fn apply_append_entries_with_optional_snapshot_state(
+        &mut self,
+        snapshot: Option<RaftSnapshot>,
+        append: RaftAppendEntriesRequest,
+    ) -> Result<(RaftAppendEntriesResponse, bool, KvRevision), KvError> {
         let before_revision = self.store().revision();
         let mut snapshot_restored = false;
         if let Some(snapshot) = snapshot {
@@ -4254,27 +4326,7 @@ impl DurableRaftKvNode {
             }
         }
         let response = self.append_entries(append)?;
-        let snapshot = self.store().try_snapshot()?;
-        let committed_events = if snapshot_restored || snapshot.revision == before_revision {
-            Vec::new()
-        } else {
-            let mut events = Vec::new();
-            for event in snapshot
-                .events
-                .iter()
-                .filter(|event| event.revision > before_revision)
-            {
-                try_reserve_kv_items(&mut events, 1, "collect append committed events")?;
-                events.push(event.clone());
-            }
-            events
-        };
-        Ok(RaftAppendEntriesApplyOutcome {
-            response,
-            snapshot,
-            snapshot_restored,
-            committed_events,
-        })
+        Ok((response, snapshot_restored, before_revision))
     }
 
     pub fn request_vote(

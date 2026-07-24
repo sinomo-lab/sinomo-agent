@@ -580,19 +580,13 @@ pub fn read_cluster_kv_local_snapshot(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<sinomo_kv::KvLocalRead<KvSnapshot>, NetworkError> {
-    let node = open_cluster_raft_kv_node(paths, &state.local_node_id)?;
-    let snapshot = node.store().try_snapshot().map_err(kv_err)?;
-    Ok(sinomo_kv::KvLocalRead {
-        revision: snapshot.revision,
-        observed_term: node.hard_state().current_term,
-        applied_index: node.applied_index(),
-        known_leader: node
-            .hard_state()
-            .leader_id
-            .clone()
-            .filter(|leader_id| state.node_is_raft_voter(leader_id)),
-        value: snapshot,
-    })
+    let mut local =
+        sinomo_kv::read_cluster_kv_local_snapshot(&paths.kv_paths(), &state.local_node_id)
+            .map_err(kv_err)?;
+    local.known_leader = local
+        .known_leader
+        .filter(|leader_id| state.node_is_raft_voter(leader_id));
+    Ok(local)
 }
 
 #[cfg(any(test, feature = "test-support"))]

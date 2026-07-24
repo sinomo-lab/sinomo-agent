@@ -65,6 +65,7 @@ impl SimulatedLeaseSet {
 #[derive(Debug, Default)]
 struct SimulatedKeyStateIndex {
     entries: BTreeMap<String, SimulatedKeyState>,
+    keys_by_lease: BTreeMap<LeaseId, BTreeSet<String>>,
 }
 
 impl SimulatedKeyStateIndex {
@@ -78,8 +79,19 @@ impl SimulatedKeyStateIndex {
         state: SimulatedKeyState,
         operation: &str,
     ) -> Result<(), KvError> {
-        self.entries
-            .insert(try_clone_kv_string(key, operation)?, state);
+        let key = try_clone_kv_string(key, operation)?;
+        if let Some(previous) = self.entries.insert(key.clone(), state)
+            && let Some(lease_id) = previous.lease_id
+            && let Some(keys) = self.keys_by_lease.get_mut(&lease_id)
+        {
+            keys.remove(&key);
+            if keys.is_empty() {
+                self.keys_by_lease.remove(&lease_id);
+            }
+        }
+        if state.present && let Some(lease_id) = state.lease_id {
+            self.keys_by_lease.entry(lease_id).or_default().insert(key);
+        }
         Ok(())
     }
 
@@ -89,14 +101,132 @@ impl SimulatedKeyStateIndex {
             .map(|(key, state)| (key.as_str(), state))
     }
 
-    fn iter_mut(&mut self) -> impl Iterator<Item = (&str, &mut SimulatedKeyState)> {
-        self.entries
-            .iter_mut()
-            .map(|(key, state)| (key.as_str(), state))
+    fn remove_prefix(&mut self, prefix: &str) -> Result<(), KvError> {
+        let start = try_clone_kv_string(prefix, "scan simulated touched-key prefix")?;
+        let mut keys = Vec::new();
+        for (key, _) in self
+            .entries
+            .range(start..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+        {
+            try_reserve_kv_items(&mut keys, 1, "collect simulated touched-key prefix")?;
+            keys.push(try_clone_kv_string(
+                key,
+                "collect simulated touched-key prefix",
+            )?);
+        }
+        for key in keys {
+            self.remove(&key);
+        }
+        Ok(())
     }
 
-    fn values_mut(&mut self) -> impl Iterator<Item = &mut SimulatedKeyState> {
-        self.entries.values_mut()
+    fn expire_lease(&mut self, lease_id: LeaseId) {
+        let Some(keys) = self.keys_by_lease.remove(&lease_id) else {
+            return;
+        };
+        for key in keys {
+            if let Some(state) = self.entries.get_mut(&key) {
+                *state = SimulatedKeyState::ABSENT;
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        let Some(previous) = self.entries.remove(key) else {
+            return;
+        };
+        let Some(lease_id) = previous.lease_id else {
+            return;
+        };
+        let Some(keys) = self.keys_by_lease.get_mut(&lease_id) else {
+            return;
+        };
+        keys.remove(key);
+        if keys.is_empty() {
+            self.keys_by_lease.remove(&lease_id);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SimulatedDeletedPrefixIndex {
+    prefixes: BTreeSet<String>,
+}
+
+impl SimulatedDeletedPrefixIndex {
+    fn contains_prefix_of(&self, key: &str) -> bool {
+        self.prefixes
+            .range::<str, _>((
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Included(key),
+            ))
+            .next_back()
+            .is_some_and(|prefix| key.starts_with(prefix))
+    }
+
+    fn try_insert(&mut self, prefix: &str) -> Result<(), KvError> {
+        if self.contains_prefix_of(prefix) {
+            return Ok(());
+        }
+        let start = try_clone_kv_string(prefix, "scan simulated deleted prefixes")?;
+        let mut descendants = Vec::new();
+        for descendant in self
+            .prefixes
+            .range(start..)
+            .take_while(|candidate| candidate.starts_with(prefix))
+        {
+            try_reserve_kv_items(
+                &mut descendants,
+                1,
+                "collect redundant simulated deleted prefixes",
+            )?;
+            descendants.push(try_clone_kv_string(
+                descendant,
+                "collect redundant simulated deleted prefixes",
+            )?);
+        }
+        for descendant in descendants {
+            self.prefixes.remove(&descendant);
+        }
+        self.prefixes.insert(try_clone_kv_string(
+            prefix,
+            "track simulated deleted prefix",
+        )?);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct SimulatedDeleteSummary {
+    total: usize,
+    keys_by_lease: BTreeMap<LeaseId, usize>,
+}
+
+impl SimulatedDeleteSummary {
+    fn record(&mut self, state: SimulatedKeyState) {
+        self.total = self.total.saturating_add(1);
+        if let Some(lease_id) = state.lease_id {
+            *self.keys_by_lease.entry(lease_id).or_default() += 1;
+        }
+    }
+}
+
+fn update_simulated_lease_key_counts(
+    counts: &mut BTreeMap<LeaseId, usize>,
+    old_lease_id: Option<LeaseId>,
+    new_lease_id: Option<LeaseId>,
+) {
+    if old_lease_id == new_lease_id {
+        return;
+    }
+    if let Some(lease_id) = old_lease_id {
+        let count = counts.entry(lease_id).or_default();
+        *count = count.saturating_sub(1);
+    }
+    if let Some(lease_id) = new_lease_id {
+        let count = counts.entry(lease_id).or_default();
+        *count = count.saturating_add(1);
     }
 }
 
@@ -142,6 +272,10 @@ impl KvEntryIndex {
             .range(prefix.to_owned()..)
             .next()
             .and_then(|(_, entry)| entry.key.starts_with(prefix).then_some(entry))
+    }
+
+    fn into_values(self) -> impl Iterator<Item = KvEntry> {
+        self.entries.into_values()
     }
 }
 
@@ -425,6 +559,10 @@ pub struct InProcessKvStore {
     pub(crate) watch_prefixes: KvWatchPrefixIndex,
     pub(crate) next_watch_id: u64,
     pub(crate) committed_requests: BTreeMap<KvRequestId, KvCommittedRequestEntry>,
+    // Ordered separately from the request-id lookup so steady-state eviction
+    // removes the oldest committed record in O(log n), not by scanning the
+    // entire retained ledger on every insert.
+    pub(crate) committed_request_order: BTreeSet<(u64, KvRequestId)>,
     // Exact sum of `KvCommittedRequestEntry::encoded_bytes` for the map above.
     pub(crate) committed_request_encoded_bytes: usize,
     pub(crate) expired_request_ids: BTreeSet<KvRequestId>,
@@ -479,22 +617,22 @@ impl InProcessKvStore {
                 operation: "measure committed KV request records".to_string(),
                 requested_bytes: usize::MAX,
             })?;
+        let request_id = record.request_id.clone();
+        let log_index = record.log_index;
         self.committed_requests.insert(
-            record.request_id.clone(),
+            request_id.clone(),
             KvCommittedRequestEntry {
                 record,
                 encoded_bytes,
             },
         );
+        self.committed_request_order
+            .insert((log_index, request_id));
         self.committed_request_encoded_bytes = committed_request_encoded_bytes;
         while self.committed_requests.len() > MAX_COMMITTED_KV_REQUESTS
             || self.committed_request_encoded_bytes > MAX_COMMITTED_KV_REQUEST_BYTES
         {
-            let Some(expired_id) = self
-                .committed_requests
-                .values()
-                .min_by_key(|entry| entry.record.log_index)
-                .map(|entry| entry.record.request_id.clone())
+            let Some((_, expired_id)) = self.committed_request_order.pop_first()
             else {
                 break;
             };
@@ -875,7 +1013,21 @@ impl InProcessKvStore {
         self.try_snapshot()
     }
 
+    /// Materializes the complete wire/persistence snapshot.
+    ///
+    /// This is deliberately an explicit `O(total retained state)` boundary:
+    /// every entry, event, lease, and committed-request record becomes owned by
+    /// the returned snapshot. Point and prefix reads must use the indexed store
+    /// APIs instead. If cluster KV grows beyond its control-plane role, replace
+    /// this owned representation with a persistent/COW snapshot view before
+    /// putting this method on a per-operation path.
     pub fn try_snapshot(&self) -> Result<KvSnapshot, KvError> {
+        metrics::histogram!("sinomo.kv.snapshot.materialize.entries")
+            .record(self.entries.len() as f64);
+        metrics::histogram!("sinomo.kv.snapshot.materialize.events")
+            .record(self.events.len() as f64);
+        metrics::histogram!("sinomo.kv.snapshot.materialize.committed_requests")
+            .record(self.committed_requests.len() as f64);
         let mut entries = Vec::new();
         try_reserve_kv_items(
             &mut entries,
@@ -904,6 +1056,72 @@ impl InProcessKvStore {
                 .map(|entry| entry.record.clone())
                 .collect(),
             expired_requests: self.expired_request_order.iter().cloned().collect(),
+        })
+    }
+
+    /// Consumes a store and transfers its owned state into a snapshot.
+    ///
+    /// Durable command sessions reconstruct a store, apply one operation, and
+    /// then discard it. Moving at that boundary avoids cloning every key/value
+    /// and committed-request payload while preserving the existing owned
+    /// `KvSnapshot` wire and persistence format.
+    pub(crate) fn try_into_snapshot(self) -> Result<KvSnapshot, KvError> {
+        let leases = self.try_current_leases_for_snapshot()?;
+        let Self {
+            revision,
+            compacted_revision,
+            entries,
+            events: shared_events,
+            committed_requests,
+            expired_request_order,
+            ..
+        } = self;
+
+        let mut snapshot_entries = Vec::new();
+        try_reserve_kv_items(
+            &mut snapshot_entries,
+            entries.len(),
+            "move kv snapshot entries",
+        )?;
+        snapshot_entries.extend(entries.into_values());
+        let mut events = Vec::new();
+        try_reserve_kv_items(
+            &mut events,
+            shared_events.len(),
+            "move kv snapshot events",
+        )?;
+        for event in shared_events {
+            events.push(match Arc::try_unwrap(event) {
+                Ok(event) => event,
+                Err(event) => try_clone_kv_event(&event, "move shared kv snapshot event")?,
+            });
+        }
+        let mut snapshot_committed_requests = Vec::new();
+        try_reserve_kv_items(
+            &mut snapshot_committed_requests,
+            committed_requests.len(),
+            "move kv snapshot committed requests",
+        )?;
+        snapshot_committed_requests.extend(
+            committed_requests
+                .into_values()
+                .map(|entry| entry.record),
+        );
+        let mut expired_requests = Vec::new();
+        try_reserve_kv_items(
+            &mut expired_requests,
+            expired_request_order.len(),
+            "move kv snapshot expired requests",
+        )?;
+        expired_requests.extend(expired_request_order);
+        Ok(KvSnapshot {
+            revision,
+            compacted_revision,
+            entries: snapshot_entries,
+            leases,
+            events,
+            committed_requests: snapshot_committed_requests,
+            expired_requests,
         })
     }
 
@@ -940,6 +1158,7 @@ impl InProcessKvStore {
         }
         let mut committed_requests: BTreeMap<KvRequestId, KvCommittedRequestEntry> =
             BTreeMap::new();
+        let mut committed_request_order = BTreeSet::new();
         let mut committed_request_encoded_bytes = 0_usize;
         for (record, encoded_bytes) in snapshot_committed_requests
             .into_iter()
@@ -961,6 +1180,7 @@ impl InProcessKvStore {
                     operation: "restore committed KV request byte accounting".to_string(),
                     requested_bytes: usize::MAX,
                 })?;
+            committed_request_order.insert((record.log_index, record.request_id.clone()));
             committed_requests.insert(
                 record.request_id.clone(),
                 KvCommittedRequestEntry {
@@ -990,6 +1210,7 @@ impl InProcessKvStore {
             watch_prefixes: KvWatchPrefixIndex::default(),
             next_watch_id: 1,
             committed_requests,
+            committed_request_order,
             committed_request_encoded_bytes,
             expired_request_ids,
             expired_request_order,
@@ -1106,8 +1327,14 @@ impl InProcessKvStore {
     fn validate_ops(&self, ops: &[KvOp]) -> Result<(), KvError> {
         let mut active_leases = SimulatedLeaseSet::from_leases(&self.leases)?;
         let mut touched_keys = SimulatedKeyStateIndex::default();
-        let mut deleted_prefixes = Vec::<String>::new();
-        let mut revoked_leases = Vec::<LeaseId>::new();
+        let mut deleted_prefixes = SimulatedDeletedPrefixIndex::default();
+        let mut revoked_leases = BTreeSet::<LeaseId>::new();
+        let mut lease_key_counts = self
+            .lease_keys
+            .keys_by_lease
+            .iter()
+            .map(|(lease_id, keys)| (*lease_id, keys.len()))
+            .collect::<BTreeMap<_, _>>();
         let mut mutation_events = 0_usize;
         for op in ops {
             validate_kv_op_payload(op)?;
@@ -1129,12 +1356,8 @@ impl InProcessKvStore {
                         &revoked_leases,
                     );
                     if old_state.lease_id != Some(*lease_id) {
-                        let lease_keys = self.simulated_lease_key_count(
-                            *lease_id,
-                            &touched_keys,
-                            &deleted_prefixes,
-                            &revoked_leases,
-                        );
+                        let lease_keys =
+                            lease_key_counts.get(lease_id).copied().unwrap_or_default();
                         if lease_keys >= MAX_KEYS_PER_LEASE {
                             return Err(KvError::LeaseKeyLimit {
                                 lease_id: *lease_id,
@@ -1146,6 +1369,11 @@ impl InProcessKvStore {
                     if !simulated_put_is_no_effect(&old_state, value, Some(*lease_id)) {
                         record_kv_mutation_events(&mut mutation_events, 1)?;
                     }
+                    update_simulated_lease_key_counts(
+                        &mut lease_key_counts,
+                        old_state.lease_id,
+                        Some(*lease_id),
+                    );
                     touched_keys.try_insert(
                         key,
                         SimulatedKeyState::present_with_value(Some(*lease_id), value),
@@ -1166,6 +1394,11 @@ impl InProcessKvStore {
                     if !simulated_put_is_no_effect(&old_state, value, None) {
                         record_kv_mutation_events(&mut mutation_events, 1)?;
                     }
+                    update_simulated_lease_key_counts(
+                        &mut lease_key_counts,
+                        old_state.lease_id,
+                        None,
+                    );
                     touched_keys.try_insert(
                         key,
                         SimulatedKeyState::present_with_value(None, value),
@@ -1173,12 +1406,20 @@ impl InProcessKvStore {
                     )?;
                 }
                 KvOp::Delete { key } => {
-                    if self
-                        .simulated_key_state(key, &touched_keys, &deleted_prefixes, &revoked_leases)
-                        .present
-                    {
+                    let old_state = self.simulated_key_state(
+                        key,
+                        &touched_keys,
+                        &deleted_prefixes,
+                        &revoked_leases,
+                    );
+                    if old_state.present {
                         record_kv_mutation_events(&mut mutation_events, 1)?;
                     }
+                    update_simulated_lease_key_counts(
+                        &mut lease_key_counts,
+                        old_state.lease_id,
+                        None,
+                    );
                     touched_keys.try_insert(
                         key,
                         SimulatedKeyState::ABSENT,
@@ -1186,28 +1427,20 @@ impl InProcessKvStore {
                     )?;
                 }
                 KvOp::DeletePrefix { prefix } => {
-                    let deleted_count = self.simulated_delete_prefix_count(
+                    let deleted = self.simulated_delete_prefix(
                         prefix,
                         &touched_keys,
                         &deleted_prefixes,
                         &revoked_leases,
                         MAX_DELETE_PREFIX_KEYS,
                     )?;
-                    record_kv_mutation_events(&mut mutation_events, deleted_count)?;
-                    for (key, state) in touched_keys.iter_mut() {
-                        if key.starts_with(prefix) {
-                            *state = SimulatedKeyState::ABSENT;
-                        }
+                    record_kv_mutation_events(&mut mutation_events, deleted.total)?;
+                    for (lease_id, deleted_keys) in deleted.keys_by_lease {
+                        let count = lease_key_counts.entry(lease_id).or_default();
+                        *count = count.saturating_sub(deleted_keys);
                     }
-                    try_reserve_kv_items(
-                        &mut deleted_prefixes,
-                        1,
-                        "track simulated deleted prefix",
-                    )?;
-                    deleted_prefixes.push(try_clone_kv_string(
-                        prefix,
-                        "track simulated deleted prefix",
-                    )?);
+                    touched_keys.remove_prefix(prefix)?;
+                    deleted_prefixes.try_insert(prefix)?;
                 }
                 KvOp::LeaseGrant {
                     lease_id,
@@ -1234,21 +1467,13 @@ impl InProcessKvStore {
                     }
                 }
                 KvOp::LeaseRevoke { lease_id } => {
-                    let deleted_count = self.simulated_lease_revoke_count(
-                        *lease_id,
-                        &touched_keys,
-                        &deleted_prefixes,
-                        &revoked_leases,
-                    );
+                    let deleted_count =
+                        lease_key_counts.get(lease_id).copied().unwrap_or_default();
                     record_kv_mutation_events(&mut mutation_events, deleted_count)?;
                     active_leases.remove(lease_id);
-                    for state in touched_keys.values_mut() {
-                        if state.present && state.lease_id == Some(*lease_id) {
-                            *state = SimulatedKeyState::ABSENT;
-                        }
-                    }
-                    try_reserve_kv_items(&mut revoked_leases, 1, "track simulated revoked lease")?;
-                    revoked_leases.push(*lease_id);
+                    lease_key_counts.insert(*lease_id, 0);
+                    touched_keys.expire_lease(*lease_id);
+                    revoked_leases.insert(*lease_id);
                 }
             }
         }
@@ -1381,84 +1606,52 @@ impl InProcessKvStore {
         Ok(keys)
     }
 
-    fn simulated_delete_prefix_count(
+    fn simulated_delete_prefix(
         &self,
         prefix: &str,
         touched_keys: &SimulatedKeyStateIndex,
-        deleted_prefixes: &[String],
-        revoked_leases: &[LeaseId],
+        deleted_prefixes: &SimulatedDeletedPrefixIndex,
+        revoked_leases: &BTreeSet<LeaseId>,
         max_keys: usize,
-    ) -> Result<usize, KvError> {
-        let mut count = 0_usize;
-        for entry in self.entries.prefix_entries(prefix) {
-            if self
-                .simulated_key_state(&entry.key, touched_keys, deleted_prefixes, revoked_leases)
-                .present
-            {
-                count = count.saturating_add(1);
-                if count > max_keys {
+    ) -> Result<SimulatedDeleteSummary, KvError> {
+        let mut deleted = SimulatedDeleteSummary::default();
+        let base_prefix_already_deleted = deleted_prefixes.contains_prefix_of(prefix);
+        if !base_prefix_already_deleted {
+            for entry in self.entries.prefix_entries(prefix) {
+                let state = self.simulated_key_state(
+                    &entry.key,
+                    touched_keys,
+                    deleted_prefixes,
+                    revoked_leases,
+                );
+                if state.present {
+                    deleted.record(state);
+                }
+                if deleted.total > max_keys {
                     return Err(KvError::DeletePrefixLimit {
                         prefix: prefix.to_string(),
-                        observed_keys: count,
+                        observed_keys: deleted.total,
                         max_keys,
                     });
-                }
-            }
-        }
-        for (key, state) in touched_keys.iter() {
-            if state.present && key.starts_with(prefix) && !self.entries.contains_key(key) {
-                count = count.saturating_add(1);
-                if count > max_keys {
-                    return Err(KvError::DeletePrefixLimit {
-                        prefix: prefix.to_string(),
-                        observed_keys: count,
-                        max_keys,
-                    });
-                }
-            }
-        }
-        Ok(count)
-    }
-
-    fn simulated_lease_revoke_count(
-        &self,
-        lease_id: LeaseId,
-        touched_keys: &SimulatedKeyStateIndex,
-        deleted_prefixes: &[String],
-        revoked_leases: &[LeaseId],
-    ) -> usize {
-        self.simulated_lease_key_count(lease_id, touched_keys, deleted_prefixes, revoked_leases)
-    }
-
-    fn simulated_lease_key_count(
-        &self,
-        lease_id: LeaseId,
-        touched_keys: &SimulatedKeyStateIndex,
-        deleted_prefixes: &[String],
-        revoked_leases: &[LeaseId],
-    ) -> usize {
-        let mut count = 0_usize;
-        if let Some(keys) = self.lease_keys.get(&lease_id) {
-            for key in keys {
-                let state =
-                    self.simulated_key_state(key, touched_keys, deleted_prefixes, revoked_leases);
-                if state.present && state.lease_id == Some(lease_id) {
-                    count = count.saturating_add(1);
                 }
             }
         }
         for (key, state) in touched_keys.iter() {
             if state.present
-                && state.lease_id == Some(lease_id)
-                && !self
-                    .lease_keys
-                    .get(&lease_id)
-                    .is_some_and(|keys| keys.iter().any(|existing| existing == key))
+                && key.starts_with(prefix)
+                && (base_prefix_already_deleted || !self.entries.contains_key(key))
             {
-                count = count.saturating_add(1);
+                deleted.record(*state);
+                if deleted.total > max_keys {
+                    return Err(KvError::DeletePrefixLimit {
+                        prefix: prefix.to_string(),
+                        observed_keys: deleted.total,
+                        max_keys,
+                    });
+                }
             }
         }
-        count
+        Ok(deleted)
     }
 
     fn validate_lease_key_capacity(&self, lease_id: LeaseId) -> Result<(), KvError> {
@@ -1653,16 +1846,13 @@ impl InProcessKvStore {
         &self,
         key: &str,
         touched_keys: &SimulatedKeyStateIndex,
-        deleted_prefixes: &[String],
-        revoked_leases: &[LeaseId],
+        deleted_prefixes: &SimulatedDeletedPrefixIndex,
+        revoked_leases: &BTreeSet<LeaseId>,
     ) -> SimulatedKeyState {
         if let Some(state) = touched_keys.get(key) {
             return state;
         }
-        if deleted_prefixes
-            .iter()
-            .any(|prefix| key.starts_with(prefix))
-        {
+        if deleted_prefixes.contains_prefix_of(key) {
             return SimulatedKeyState::ABSENT;
         }
         let Some(entry) = self.entries.get(key) else {
