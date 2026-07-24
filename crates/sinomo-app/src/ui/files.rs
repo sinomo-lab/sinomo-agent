@@ -17,6 +17,7 @@
 //! requested through the worker/daemon boundary instead of doing heavy listing
 //! work on the UI path.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
@@ -968,6 +969,7 @@ type FilesOperationResult = Result<FilesOperationOutcome, FilesOperationFailure>
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompactFilesOverlay {
     Commands,
+    SelectionActions,
     Inspector,
 }
 
@@ -1175,7 +1177,9 @@ struct FilesInspectorStructure {
     error: Option<String>,
     path: String,
     entries: Vec<SifsEntry>,
+    entry_metadata: BTreeMap<String, SifsEntryMetadata>,
     selected: Option<usize>,
+    marked_entries: BTreeSet<usize>,
     selected_details: Option<SifsObjectDetails>,
     selected_local_details: Option<LocalObjectDetails>,
     list_slow_after_secs: Option<u64>,
@@ -1310,7 +1314,9 @@ impl FilesStructureKey {
                     error: None,
                     path: "/".to_string(),
                     entries: Vec::new(),
+                    entry_metadata: BTreeMap::new(),
                     selected: None,
+                    marked_entries: BTreeSet::new(),
                     selected_details: None,
                     selected_local_details: None,
                     list_slow_after_secs: None,
@@ -1378,7 +1384,9 @@ impl FilesStructureKey {
             error: state.error.clone(),
             path: state.path.clone(),
             entries: state.entries.clone(),
+            entry_metadata: state.entry_metadata.clone(),
             selected: state.selected,
+            marked_entries: state.marked_entries.clone(),
             selected_details: state.selected_details.clone(),
             selected_local_details: state.selected_local_details.clone(),
             list_slow_after_secs: state.list_slow_after_secs,
@@ -9621,10 +9629,156 @@ fn unselected_inspector_rows(files: &FilesState) -> Vec<(&'static str, String)> 
             rows.push(("DFS detail", health));
         }
     }
-    if unselected_inspector_actions(files).len() <= 1 {
-        rows.push(("Next step", unselected_inspector_management(files)));
-    }
+    rows.push(("About", unselected_inspector_management(files)));
     rows
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MarkedSelectionSummary {
+    count: usize,
+    file_count: usize,
+    folder_count: usize,
+    link_count: usize,
+    known_size_bytes: u64,
+    unknown_size_count: usize,
+    paths: Vec<String>,
+    placement_known_count: usize,
+    placement_attention_count: usize,
+    placement_syncing_count: usize,
+    local_available_count: usize,
+}
+
+fn marked_selection_summary(files: &FilesState) -> Option<MarkedSelectionSummary> {
+    if files.marked_entries.is_empty() {
+        return None;
+    }
+    let mut summary = MarkedSelectionSummary {
+        count: 0,
+        file_count: 0,
+        folder_count: 0,
+        link_count: 0,
+        known_size_bytes: 0,
+        unknown_size_count: 0,
+        paths: Vec::with_capacity(files.marked_count().min(12)),
+        placement_known_count: 0,
+        placement_attention_count: 0,
+        placement_syncing_count: 0,
+        local_available_count: 0,
+    };
+    for entry in files
+        .marked_entries
+        .iter()
+        .filter_map(|index| files.entries.get(*index))
+    {
+        summary.count += 1;
+        if entry.is_link {
+            summary.link_count += 1;
+        } else if entry.is_dir {
+            summary.folder_count += 1;
+        } else {
+            summary.file_count += 1;
+        }
+        if !entry.is_dir {
+            if let Some(size) = entry.size {
+                summary.known_size_bytes = summary.known_size_bytes.saturating_add(size);
+            } else {
+                summary.unknown_size_count += 1;
+            }
+        }
+        if summary.paths.len() < 12 {
+            summary.paths.push(entry.path.clone());
+        }
+        if files.source == FilesSourceKind::Sifs
+            && let Some(metadata) = files.entry_metadata.get(&entry.path)
+        {
+            summary.placement_known_count += 1;
+            let badge = sifs_entry_placement_badge(metadata);
+            match badge.label.as_str() {
+                "conflict" | "repair" | "placing" => summary.placement_attention_count += 1,
+                "syncing" => summary.placement_syncing_count += 1,
+                _ => {}
+            }
+            if metadata
+                .current_locations
+                .iter()
+                .any(|node_id| node_id == &files.node_id)
+            {
+                summary.local_available_count += 1;
+            }
+        }
+    }
+    (summary.count > 0).then_some(summary)
+}
+
+fn marked_selection_composition(summary: &MarkedSelectionSummary) -> String {
+    let mut parts = Vec::with_capacity(3);
+    if summary.file_count > 0 {
+        parts.push(plural(summary.file_count, "file"));
+    }
+    if summary.folder_count > 0 {
+        parts.push(plural(summary.folder_count, "folder"));
+    }
+    if summary.link_count > 0 {
+        parts.push(plural(summary.link_count, "link"));
+    }
+    if parts.is_empty() {
+        plural(summary.count, "item")
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn marked_selection_size(summary: &MarkedSelectionSummary) -> String {
+    if summary.file_count == 0 && summary.link_count == 0 {
+        return "Not calculated for folders".to_string();
+    }
+    let known = human_size(Some(summary.known_size_bytes));
+    if summary.unknown_size_count == 0 {
+        known
+    } else {
+        format!(
+            "{known} known · {} without size metadata",
+            summary.unknown_size_count
+        )
+    }
+}
+
+fn marked_selection_placement(summary: &MarkedSelectionSummary) -> String {
+    if summary.placement_known_count == 0 {
+        return "Placement details not loaded".to_string();
+    }
+    let ready = summary
+        .placement_known_count
+        .saturating_sub(summary.placement_attention_count)
+        .saturating_sub(summary.placement_syncing_count);
+    let mut parts = Vec::with_capacity(3);
+    if ready > 0 {
+        parts.push(format!("{ready} available"));
+    }
+    if summary.placement_syncing_count > 0 {
+        parts.push(format!("{} syncing", summary.placement_syncing_count));
+    }
+    if summary.placement_attention_count > 0 {
+        parts.push(format!(
+            "{} {}",
+            summary.placement_attention_count,
+            if summary.placement_attention_count == 1 {
+                "needs attention"
+            } else {
+                "need attention"
+            }
+        ));
+    }
+    parts.join(" · ")
+}
+
+fn marked_selection_paths(summary: &MarkedSelectionSummary) -> String {
+    let mut paths = summary.paths.join("\n");
+    let remaining = summary.count.saturating_sub(summary.paths.len());
+    if remaining > 0 {
+        paths.push_str(&format!("\n… and {remaining} more"));
+    }
+    paths
 }
 
 #[cfg(test)]
@@ -10007,133 +10161,6 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             })
     };
 
-    let copy = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::Restore, "Copy to")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || {
-                    let files = s.files();
-                    files.can_modify_current_location()
-                        && (files.marked_count() > 0 || files.selected_entry().is_some())
-                }
-            })
-            .on_press_with_ctx(move |ctx| {
-                let kind = if s.files().marked_count() > 0 {
-                    FileActionPromptKind::CopySelected
-                } else {
-                    FileActionPromptKind::Copy
-                };
-                s.files_mut().open_action_prompt(kind);
-                request_files_overlay_rebuild(ctx);
-            })
-    };
-
-    let move_to = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::ChevronRight, "Move to")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || {
-                    let files = s.files();
-                    files.can_modify_current_location()
-                        && (files.marked_count() > 0 || files.selected_entry().is_some())
-                }
-            })
-            .on_press_with_ctx(move |ctx| {
-                let kind = if s.files().marked_count() > 0 {
-                    FileActionPromptKind::MoveSelected
-                } else {
-                    FileActionPromptKind::Move
-                };
-                s.files_mut().open_action_prompt(kind);
-                request_files_overlay_rebuild(ctx);
-            })
-    };
-
-    let refresh_placement = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::Storage, "Refresh placement")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || {
-                    let files = s.files();
-                    files.source == FilesSourceKind::Sifs
-                        && files.can_modify_current_location()
-                        && files.selected_entry().is_some()
-                }
-            })
-            .on_press_with_ctx(move |ctx| {
-                let waker = { s.borrow().waker.clone() };
-                s.files_mut().start_placement_refresh(waker);
-                request_files_overlay_rebuild(ctx);
-            })
-    };
-
-    let repair_replicas = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::Redo, "Repair replicas")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || {
-                    let files = s.files();
-                    files.source == FilesSourceKind::Sifs
-                        && files.can_modify_current_location()
-                        && files.selected_entry().is_some()
-                }
-            })
-            .on_press_with_ctx(move |ctx| {
-                let waker = { s.borrow().waker.clone() };
-                s.files_mut().start_replica_repair(waker);
-                request_files_overlay_rebuild(ctx);
-            })
-    };
-
-    let rename = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::MoreHorizontal, "Rename")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || {
-                    let files = s.files();
-                    files.can_modify_current_location() && files.selected_entry().is_some()
-                }
-            })
-            .on_press_with_ctx(move |ctx| {
-                s.files_mut()
-                    .open_action_prompt(FileActionPromptKind::Rename);
-                request_files_overlay_rebuild(ctx);
-            })
-    };
-
-    let delete = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::Trash, "Delete selected item")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || {
-                    let files = s.files();
-                    files.can_modify_current_location()
-                        && (files.marked_count() > 0 || files.selected_entry().is_some())
-                }
-            })
-            .on_press_with_ctx(move |ctx| {
-                let kind = if s.files().marked_count() > 0 {
-                    FileActionPromptKind::DeleteSelected
-                } else {
-                    FileActionPromptKind::Delete
-                };
-                s.files_mut().open_action_prompt(kind);
-                request_files_overlay_rebuild(ctx);
-            })
-    };
-
     let toolbar_row = Flex::horizontal()
         .main_gap(HEADER_COMMAND_GAP)
         .align_items(Alignment::Center)
@@ -10188,30 +10215,6 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         )
         .with_item(
             toolbar_tooltip("New folder", new_folder, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("Copy to", copy, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("Move to", move_to, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("Refresh placement", refresh_placement, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("Repair replicas", repair_replicas, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("Rename", rename, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("Delete selected item", delete, reader),
             FlexItem::new().no_shrink(),
         );
 
@@ -10500,7 +10503,7 @@ fn compact_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> 
     };
     let commands = {
         let s = shared.clone();
-        IconButton::new(IconGlyph::MoreHorizontal, "More file commands")
+        IconButton::new(IconGlyph::Folder, "More file commands")
             .size(30.0)
             .theme_when(clone_reader(reader))
             .selected_when({
@@ -10510,6 +10513,29 @@ fn compact_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> 
             .on_press_with_ctx(move |ctx| {
                 s.files_mut()
                     .open_compact_overlay(CompactFilesOverlay::Commands);
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+    let selection_actions = {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        IconButton::new(IconGlyph::MoreHorizontal, "Selected item actions")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when(move || {
+                let files = enabled.files();
+                files.marked_count() > 0 || files.selected_entry().is_some()
+            })
+            .selected_when({
+                let action = action.clone();
+                move || {
+                    action.files().compact_overlay == Some(CompactFilesOverlay::SelectionActions)
+                }
+            })
+            .on_press_with_ctx(move |ctx| {
+                action
+                    .files_mut()
+                    .open_compact_overlay(CompactFilesOverlay::SelectionActions);
                 request_files_overlay_rebuild(ctx);
             })
     };
@@ -10530,7 +10556,7 @@ fn compact_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> 
     };
     let inspector = {
         let s = shared.clone();
-        IconButton::new(IconGlyph::FileText, "Open file inspector")
+        IconButton::new(IconGlyph::FileText, "Open selection info")
             .size(30.0)
             .theme_when(clone_reader(reader))
             .selected_when({
@@ -10552,6 +10578,7 @@ fn compact_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> 
         .with_item(location, FlexItem::fill().min_width(72.0))
         .with_item(placement_activity, FlexItem::new().no_shrink())
         .with_item(commands, FlexItem::new().no_shrink())
+        .with_item(selection_actions, FlexItem::new().no_shrink())
         .with_item(inspector, FlexItem::new().no_shrink())
 }
 
@@ -10720,38 +10747,56 @@ fn files_list_body_rebuild(
 
 /// Transparent event target around the virtual table. The table owns primary-click selection;
 /// this wrapper handles the secondary-click counterpart before the parent [`ContextMenu`] opens.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileContextMenuTarget {
+    Selection,
+    CurrentLocation,
+}
+
 struct FileListContextTarget {
     shared: Shared,
     table_state: VirtualTableState,
+    context_target: Rc<Cell<FileContextMenuTarget>>,
     child: WidgetPod,
 }
 
 impl FileListContextTarget {
-    fn new<W>(shared: Shared, table_state: VirtualTableState, child: W) -> Self
+    fn new<W>(
+        shared: Shared,
+        table_state: VirtualTableState,
+        context_target: Rc<Cell<FileContextMenuTarget>>,
+        child: W,
+    ) -> Self
     where
         W: Widget + 'static,
     {
         Self {
             shared,
             table_state,
+            context_target,
             child: WidgetPod::new(child),
         }
     }
 
-    fn row_at_position(&self, bounds: Rect, position: Point) -> Option<usize> {
+    fn body_rect(&self, bounds: Rect) -> Rect {
         let theme = self.shared.theme();
         let padding = theme.metrics.data_viewport_padding;
         let header_height = theme.metrics.table_header_height;
         let header_gap = theme.metrics.select_menu_gap;
-        let body = Rect::new(
+        Rect::new(
             bounds.x() + padding.left,
             bounds.y() + padding.top + header_height + header_gap,
             (bounds.width() - padding.left - padding.right).max(0.0),
             (bounds.height() - padding.top - padding.bottom - header_height - header_gap).max(0.0),
-        );
+        )
+    }
+
+    fn row_at_position(&self, bounds: Rect, position: Point) -> Option<usize> {
+        let body = self.body_rect(bounds);
         if !body.contains(position) {
             return None;
         }
+        let theme = self.shared.theme();
         let row_height = theme.metrics.table_row_height.max(1.0);
         let scroll_y = self.table_state.scroll_state().current_offset().y;
         let index = ((position.y - body.y() + scroll_y) / row_height).floor() as usize;
@@ -10767,11 +10812,15 @@ impl Widget for FileListContextTarget {
             && pointer.button == Some(PointerButton::Secondary)
         {
             if let Some(index) = self.row_at_position(ctx.bounds(), pointer.position) {
+                self.context_target.set(FileContextMenuTarget::Selection);
                 self.shared.files_mut().select_context_entry(index);
                 ctx.request_paint();
                 ctx.request_semantics();
+            } else if self.body_rect(ctx.bounds()).contains(pointer.position) {
+                self.context_target
+                    .set(FileContextMenuTarget::CurrentLocation);
             } else {
-                // Do not let the parent menu open over the table header or unused body space.
+                // Do not let the parent menu open over the table header or outside the listing.
                 ctx.set_handled();
             }
         }
@@ -10802,103 +10851,48 @@ impl Widget for FileListContextTarget {
     }
 }
 
-fn files_context_menu_item(label: impl Into<String>, enabled: bool) -> MenuItem {
-    let item = MenuItem::new(label);
-    if enabled { item } else { item.disabled() }
-}
-
 fn files_context_menu_items(files: &FilesState) -> Vec<MenuItem> {
-    let Some(entry) = files.selected_entry() else {
-        return Vec::new();
-    };
-    let batch = files.marked_count() > 0;
-    let can_modify = files.can_modify_current_location();
-    let mut items = vec![MenuItem::new("Open")];
-    if !entry.is_dir {
-        items.push(MenuItem::new("Attach to current chat"));
-    }
-    items.push(
-        files_context_menu_item(
-            if batch { "Copy selected to" } else { "Copy to" },
-            can_modify,
-        )
-        .separator_before(),
-    );
-    items.push(files_context_menu_item(
-        if batch { "Move selected to" } else { "Move to" },
-        can_modify,
-    ));
-    items.push(files_context_menu_item(
-        match (files.source, batch) {
-            (FilesSourceKind::Local, false) => "Copy to SIFS",
-            (FilesSourceKind::Local, true) => "Copy selected to SIFS",
-            (FilesSourceKind::Sifs, false) => "Download",
-            (FilesSourceKind::Sifs, true) => "Download selected",
-        },
-        can_modify,
-    ));
-    items.push(files_context_menu_item("Rename", can_modify));
-    items.push(
-        files_context_menu_item(if batch { "Delete selected" } else { "Delete" }, can_modify)
-            .destructive()
-            .separator_before(),
-    );
-    items
+    file_context_menu_entries(files, FileContextMenuTarget::Selection)
+        .into_iter()
+        .map(|entry| entry.item)
+        .collect()
 }
 
-fn activate_files_context_menu_item(shared: &Shared, label: &str, ctx: &mut EventCtx) {
-    match label {
-        "Open" => {
-            if let Some(index) = shared.files().selected {
-                shared.files_mut().activate_row(index);
+fn file_context_menu<W>(
+    name: &'static str,
+    shared: &Shared,
+    reader: &ThemeReader,
+    context_target: Rc<Cell<FileContextMenuTarget>>,
+    activation_button: PointerButton,
+    anchor_to_pointer: bool,
+    trigger: W,
+) -> ContextMenu
+where
+    W: Widget + 'static,
+{
+    let items_shared = shared.clone();
+    let items_target = Rc::clone(&context_target);
+    let action_shared = shared.clone();
+    let action_target = Rc::clone(&context_target);
+    ContextMenu::new(name, trigger)
+        .theme_when(clone_reader(reader))
+        .items_when(move || {
+            file_context_menu_entries(&items_shared.files(), items_target.get())
+                .into_iter()
+                .map(|entry| entry.item)
+                .collect()
+        })
+        .on_activate_with_ctx(move |ctx, index, item| {
+            let action = file_context_menu_entries(&action_shared.files(), action_target.get())
+                .get(index)
+                .filter(|entry| entry.item.label() == item.label())
+                .map(|entry| entry.action);
+            if let Some(action) = action {
+                activate_file_context_action(&action_shared, action, ctx);
             }
-        }
-        "Attach to current chat" => {
-            let waker = { shared.borrow().waker.clone() };
-            shared.files_mut().start_attach_selected(waker);
-        }
-        "Copy to" | "Copy selected to" => {
-            let kind = if shared.files().marked_count() > 0 {
-                FileActionPromptKind::CopySelected
-            } else {
-                FileActionPromptKind::Copy
-            };
-            shared.files_mut().open_action_prompt(kind);
-        }
-        "Move to" | "Move selected to" => {
-            let kind = if shared.files().marked_count() > 0 {
-                FileActionPromptKind::MoveSelected
-            } else {
-                FileActionPromptKind::Move
-            };
-            shared.files_mut().open_action_prompt(kind);
-        }
-        "Copy to SIFS" | "Download" => {
-            let kind = match shared.files().source {
-                FilesSourceKind::Local => FileActionPromptKind::CopyToSifs,
-                FilesSourceKind::Sifs => FileActionPromptKind::CopyToLocal,
-            };
-            shared.files_mut().open_action_prompt(kind);
-        }
-        "Copy selected to SIFS" | "Download selected" => {
-            shared
-                .files_mut()
-                .open_action_prompt(FileActionPromptKind::TransferSelected);
-        }
-        "Rename" => shared
-            .files_mut()
-            .open_action_prompt(FileActionPromptKind::Rename),
-        "Delete" | "Delete selected" => {
-            let kind = if shared.files().marked_count() > 0 {
-                FileActionPromptKind::DeleteSelected
-            } else {
-                FileActionPromptKind::Delete
-            };
-            shared.files_mut().open_action_prompt(kind);
-        }
-        _ => return,
-    }
-    request_files_overlay_rebuild(ctx);
+        })
+        .activation_button(activation_button)
+        .anchor_to_pointer(anchor_to_pointer)
 }
 
 fn files_table_with_context_menu<W>(
@@ -10910,15 +10904,22 @@ fn files_table_with_context_menu<W>(
 where
     W: Widget + 'static,
 {
-    let target = FileListContextTarget::new(shared.clone(), table_state.clone(), table);
-    let items_shared = shared.clone();
-    let action_shared = shared.clone();
-    ContextMenu::new("files-list-context-menu", target)
-        .theme_when(clone_reader(reader))
-        .items_when(move || files_context_menu_items(&items_shared.files()))
-        .on_activate_with_ctx(move |ctx, _index, item| {
-            activate_files_context_menu_item(&action_shared, item.label(), ctx);
-        })
+    let context_target = Rc::new(Cell::new(FileContextMenuTarget::Selection));
+    let trigger = FileListContextTarget::new(
+        shared.clone(),
+        table_state.clone(),
+        Rc::clone(&context_target),
+        table,
+    );
+    file_context_menu(
+        "files-list-context-menu",
+        shared,
+        reader,
+        context_target,
+        PointerButton::Secondary,
+        true,
+        trigger,
+    )
 }
 
 fn files_list_body_table(
@@ -12634,85 +12635,24 @@ fn task_progress_tone(task: &FilesTask) -> SemanticTone {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RootInspectorAction {
-    RefreshFolder,
-    RepairReplicas,
-    OpenCluster,
-    ConnectionSettings,
-}
-
-impl RootInspectorAction {
-    fn label(self) -> &'static str {
-        match self {
-            Self::RefreshFolder => "Refresh folder",
-            Self::RepairReplicas => "Repair replicas",
-            Self::OpenCluster => "Open Cluster",
-            Self::ConnectionSettings => "Connection settings",
-        }
-    }
-
-    fn glyph(self) -> IconGlyph {
-        match self {
-            Self::RefreshFolder => IconGlyph::Redo,
-            Self::RepairReplicas => IconGlyph::Redo,
-            Self::OpenCluster => IconGlyph::Storage,
-            Self::ConnectionSettings => IconGlyph::Alert,
-        }
-    }
-
-    fn description(self) -> &'static str {
-        match self {
-            Self::RefreshFolder => "Reload the current file listing and SIFS health summary",
-            Self::RepairReplicas => "Request SIFS replica repair for the current location",
-            Self::OpenCluster => "Open Cluster health and routing diagnostics",
-            Self::ConnectionSettings => "Open Connection settings for daemon and SIFS recovery",
-        }
-    }
-}
-
-fn unselected_inspector_actions(files: &FilesState) -> Vec<RootInspectorAction> {
-    if files.loading || files.error.is_some() || files.selected_entry().is_some() {
-        return Vec::new();
-    }
-
-    let mut actions = vec![RootInspectorAction::RefreshFolder];
-    if files.source == FilesSourceKind::Sifs {
-        if files
-            .sifs_health
-            .as_ref()
-            .is_some_and(|health| health.pending_repair_count > 0)
-        {
-            actions.push(RootInspectorAction::RepairReplicas);
-        }
-        if files.sifs_health.as_ref().is_some_and(|health| {
-            sifs_health_has_attention(health) || sifs_health_has_activity(health)
-        }) {
-            actions.push(RootInspectorAction::OpenCluster);
-        }
-        if files.sifs_health_error.is_some() {
-            actions.push(RootInspectorAction::ConnectionSettings);
-        }
-    }
-    actions
-}
-
 fn open_cluster_tab(shared: &Shared) {
     shared.set_active_tab(Tab::Cluster);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InspectorAction {
-    OpenFolder,
-    ViewFile,
+enum FileContextAction {
+    Open,
     AttachToChat,
     Copy,
+    CopySelected,
     CopyIdentifiers,
-    CopyToSifs,
-    CopyToLocal,
+    Transfer,
+    TransferSelected,
     Move,
+    MoveSelected,
     Rename,
     Delete,
+    DeleteSelected,
     EditPlacement,
     RefreshPlacement,
     RepairReplicas,
@@ -12722,21 +12662,36 @@ enum InspectorAction {
     PinContent,
     UnpinContent,
     ConnectionSettings,
+    NewFile,
+    NewFolder,
+    ImportFiles,
+    ImportFolder,
+    RefreshFolder,
+    RepairCurrentLocation,
+    OpenCluster,
 }
 
-impl InspectorAction {
-    fn label(self) -> &'static str {
+impl FileContextAction {
+    fn label(self, source: FilesSourceKind) -> String {
         match self {
-            Self::OpenFolder => "Open folder",
-            Self::ViewFile => "View or edit",
+            Self::Open => "Open",
             Self::AttachToChat => "Attach to current chat",
-            Self::Copy => "Copy",
-            Self::CopyIdentifiers => "Copy IDs",
-            Self::CopyToSifs => "Copy to SIFS",
-            Self::CopyToLocal => "Download",
-            Self::Move => "Move",
+            Self::Copy => "Copy to",
+            Self::CopySelected => "Copy selected to",
+            Self::CopyIdentifiers => "Copy DFS identifiers",
+            Self::Transfer => match source {
+                FilesSourceKind::Local => "Copy to SIFS",
+                FilesSourceKind::Sifs => "Download",
+            },
+            Self::TransferSelected => match source {
+                FilesSourceKind::Local => "Copy selected to SIFS",
+                FilesSourceKind::Sifs => "Download selected",
+            },
+            Self::Move => "Move to",
+            Self::MoveSelected => "Move selected to",
             Self::Rename => "Rename",
             Self::Delete => "Delete",
+            Self::DeleteSelected => "Delete selected",
             Self::EditPlacement => "Edit placement",
             Self::RefreshPlacement => "Refresh placement",
             Self::RepairReplicas => "Repair replicas",
@@ -12746,45 +12701,32 @@ impl InspectorAction {
             Self::PinContent => "Pin content",
             Self::UnpinContent => "Unpin content",
             Self::ConnectionSettings => "Connection settings",
+            Self::NewFile => "New file",
+            Self::NewFolder => "New folder",
+            Self::ImportFiles => "Import files",
+            Self::ImportFolder => "Import folder",
+            Self::RefreshFolder => "Refresh current folder",
+            Self::RepairCurrentLocation => "Repair current folder replicas",
+            Self::OpenCluster => "Open Cluster",
         }
+        .to_string()
     }
 
-    fn glyph(self) -> IconGlyph {
+    fn group(self) -> u8 {
         match self {
-            Self::OpenFolder => IconGlyph::Folder,
-            Self::ViewFile => IconGlyph::FileText,
-            Self::AttachToChat => IconGlyph::Attach,
-            Self::Copy | Self::CopyIdentifiers => IconGlyph::Restore,
-            Self::CopyToSifs => IconGlyph::Storage,
-            Self::CopyToLocal => IconGlyph::Download,
-            Self::Move => IconGlyph::ChevronRight,
-            Self::Rename => IconGlyph::MoreHorizontal,
-            Self::Delete => IconGlyph::Trash,
-            Self::EditPlacement => IconGlyph::Storage,
-            Self::RefreshPlacement => IconGlyph::Storage,
-            Self::RepairReplicas => IconGlyph::Redo,
-            Self::MakeMetadataPrimary => IconGlyph::ChevronUp,
-            Self::PinMetadata => IconGlyph::Lock,
-            Self::UnpinMetadata => IconGlyph::Unlock,
-            Self::PinContent => IconGlyph::Lock,
-            Self::UnpinContent => IconGlyph::Unlock,
-            Self::ConnectionSettings => IconGlyph::Alert,
-        }
-    }
-
-    fn prompt_kind(self) -> Option<FileActionPromptKind> {
-        match self {
-            Self::Copy => Some(FileActionPromptKind::Copy),
-            Self::CopyToSifs => Some(FileActionPromptKind::CopyToSifs),
-            Self::CopyToLocal => Some(FileActionPromptKind::CopyToLocal),
-            Self::Move => Some(FileActionPromptKind::Move),
-            Self::Rename => Some(FileActionPromptKind::Rename),
-            Self::Delete => Some(FileActionPromptKind::Delete),
-            Self::EditPlacement => Some(FileActionPromptKind::Placement),
-            Self::OpenFolder
-            | Self::ViewFile
-            | Self::AttachToChat
-            | Self::CopyIdentifiers
+            Self::Open | Self::AttachToChat => 0,
+            Self::Copy
+            | Self::CopySelected
+            | Self::Transfer
+            | Self::TransferSelected
+            | Self::Move
+            | Self::MoveSelected
+            | Self::Rename
+            | Self::NewFile
+            | Self::NewFolder
+            | Self::ImportFiles
+            | Self::ImportFolder => 1,
+            Self::EditPlacement
             | Self::RefreshPlacement
             | Self::RepairReplicas
             | Self::MakeMetadataPrimary
@@ -12792,89 +12734,178 @@ impl InspectorAction {
             | Self::UnpinMetadata
             | Self::PinContent
             | Self::UnpinContent
-            | Self::ConnectionSettings => None,
+            | Self::CopyIdentifiers
+            | Self::RefreshFolder
+            | Self::RepairCurrentLocation
+            | Self::OpenCluster
+            | Self::ConnectionSettings => 2,
+            Self::Delete | Self::DeleteSelected => 3,
         }
     }
 
-    fn semantic_name(self, entry: &SifsEntry) -> String {
+    fn enabled(self, files: &FilesState) -> bool {
+        let can_modify = files.can_modify_current_location();
         match self {
-            Self::OpenFolder => "Open folder".to_string(),
-            Self::ViewFile => format!("View or edit {}", entry.name),
-            Self::AttachToChat => format!("Attach {} to current chat", entry.name),
-            Self::RefreshPlacement => format!("Refresh placement {}", entry.name),
-            Self::EditPlacement => format!("Edit placement {}", entry.name),
-            Self::RepairReplicas => format!("Repair replicas {}", entry.name),
-            Self::MakeMetadataPrimary => format!("Make metadata primary {}", entry.name),
-            Self::PinMetadata => format!("Pin metadata {}", entry.name),
-            Self::UnpinMetadata => format!("Unpin metadata {}", entry.name),
-            Self::PinContent => format!("Pin content {}", entry.name),
-            Self::UnpinContent => format!("Unpin content {}", entry.name),
-            Self::ConnectionSettings => "Connection settings".to_string(),
-            Self::CopyIdentifiers => format!("Copy full identifiers for {}", entry.name),
-            Self::CopyToSifs => format!("Copy to SIFS {}", entry.name),
-            Self::CopyToLocal => format!("Download {}", entry.name),
-            Self::Copy | Self::Move | Self::Rename | Self::Delete => {
-                format!("{} {}", self.label(), entry.name)
-            }
+            Self::Copy
+            | Self::CopySelected
+            | Self::Transfer
+            | Self::TransferSelected
+            | Self::Move
+            | Self::MoveSelected
+            | Self::Rename
+            | Self::Delete
+            | Self::DeleteSelected
+            | Self::NewFile
+            | Self::NewFolder => can_modify,
+            Self::ImportFiles | Self::ImportFolder => can_modify && !files.picker_lane.is_pending(),
+            Self::RefreshFolder => !files.loading,
+            Self::AttachToChat => !files.attachment_loading,
+            Self::Open
+            | Self::CopyIdentifiers
+            | Self::EditPlacement
+            | Self::RefreshPlacement
+            | Self::RepairReplicas
+            | Self::MakeMetadataPrimary
+            | Self::PinMetadata
+            | Self::UnpinMetadata
+            | Self::PinContent
+            | Self::UnpinContent
+            | Self::ConnectionSettings
+            | Self::RepairCurrentLocation
+            | Self::OpenCluster => true,
         }
+    }
+
+    fn destructive(self) -> bool {
+        matches!(self, Self::Delete | Self::DeleteSelected)
     }
 }
 
-fn inspector_actions(files: &FilesState, entry: &SifsEntry) -> Vec<InspectorAction> {
-    let mut actions = Vec::with_capacity(8);
-    if entry.is_dir {
-        actions.push(InspectorAction::OpenFolder);
-    } else {
-        actions.push(InspectorAction::ViewFile);
-        actions.push(InspectorAction::AttachToChat);
+struct FileContextMenuEntry {
+    action: FileContextAction,
+    item: MenuItem,
+}
+
+fn selection_context_actions(files: &FilesState) -> Vec<FileContextAction> {
+    if files.marked_count() > 0 {
+        return vec![
+            FileContextAction::CopySelected,
+            FileContextAction::MoveSelected,
+            FileContextAction::TransferSelected,
+            FileContextAction::DeleteSelected,
+        ];
     }
-    actions.push(InspectorAction::Copy);
-    match files.source {
-        FilesSourceKind::Local => actions.push(InspectorAction::CopyToSifs),
-        FilesSourceKind::Sifs => actions.push(InspectorAction::CopyToLocal),
+
+    let Some(entry) = files.selected_entry() else {
+        return Vec::new();
+    };
+    let mut actions = Vec::with_capacity(18);
+    actions.push(FileContextAction::Open);
+    if !entry.is_dir {
+        actions.push(FileContextAction::AttachToChat);
     }
-    actions.push(InspectorAction::Move);
-    actions.push(InspectorAction::Rename);
-    actions.push(InspectorAction::Delete);
+    actions.push(FileContextAction::Copy);
+    actions.push(FileContextAction::Move);
+    actions.push(FileContextAction::Transfer);
+    actions.push(FileContextAction::Rename);
     if files.source == FilesSourceKind::Sifs {
         let metadata_needs_connection = files
             .details_error
             .as_deref()
             .is_some_and(sifs_metadata_error_needs_connection);
         if metadata_needs_connection {
-            actions.push(InspectorAction::ConnectionSettings);
+            actions.push(FileContextAction::ConnectionSettings);
         }
-        if files
+        let details = files
             .selected_details
             .as_ref()
-            .is_some_and(|details| details.path == entry.path && details.placement.is_some())
-        {
-            actions.push(InspectorAction::EditPlacement);
+            .filter(|details| details.path == entry.path);
+        if details.is_some_and(|details| details.placement.is_some()) {
+            actions.push(FileContextAction::EditPlacement);
         }
-        actions.push(InspectorAction::RefreshPlacement);
+        actions.push(FileContextAction::RefreshPlacement);
         if !metadata_needs_connection && !files.details_loading {
-            if let Some(details) = files.selected_details.as_ref() {
-                actions.push(InspectorAction::CopyIdentifiers);
-                actions.push(InspectorAction::RepairReplicas);
+            if let Some(details) = details {
+                actions.push(FileContextAction::RepairReplicas);
                 if sifs_can_make_metadata_primary(details) {
-                    actions.push(InspectorAction::MakeMetadataPrimary);
+                    actions.push(FileContextAction::MakeMetadataPrimary);
                 }
                 if sifs_has_local_pin(details, "metadata") {
-                    actions.push(InspectorAction::UnpinMetadata);
+                    actions.push(FileContextAction::UnpinMetadata);
                 } else {
-                    actions.push(InspectorAction::PinMetadata);
+                    actions.push(FileContextAction::PinMetadata);
                 }
                 if !entry.is_dir && !entry.is_link {
                     if sifs_has_local_pin(details, "content") {
-                        actions.push(InspectorAction::UnpinContent);
+                        actions.push(FileContextAction::UnpinContent);
                     } else {
-                        actions.push(InspectorAction::PinContent);
+                        actions.push(FileContextAction::PinContent);
                     }
                 }
+                actions.push(FileContextAction::CopyIdentifiers);
             }
         }
     }
+    actions.push(FileContextAction::Delete);
     actions
+}
+
+fn current_location_context_actions(files: &FilesState) -> Vec<FileContextAction> {
+    let mut actions = vec![
+        FileContextAction::NewFile,
+        FileContextAction::NewFolder,
+        FileContextAction::ImportFiles,
+        FileContextAction::ImportFolder,
+        FileContextAction::RefreshFolder,
+    ];
+    if files.source == FilesSourceKind::Sifs {
+        if files
+            .sifs_health
+            .as_ref()
+            .is_some_and(|health| health.pending_repair_count > 0)
+        {
+            actions.push(FileContextAction::RepairCurrentLocation);
+        }
+        if files.sifs_health.as_ref().is_some_and(|health| {
+            sifs_health_has_attention(health) || sifs_health_has_activity(health)
+        }) {
+            actions.push(FileContextAction::OpenCluster);
+        }
+        if files.sifs_health_error.is_some() || files.error.is_some() {
+            actions.push(FileContextAction::ConnectionSettings);
+        }
+    }
+    actions
+}
+
+fn file_context_menu_entries(
+    files: &FilesState,
+    target: FileContextMenuTarget,
+) -> Vec<FileContextMenuEntry> {
+    let actions = match target {
+        FileContextMenuTarget::Selection => selection_context_actions(files),
+        FileContextMenuTarget::CurrentLocation => current_location_context_actions(files),
+    };
+    let mut previous_group = None;
+    actions
+        .into_iter()
+        .map(|action| {
+            let group = action.group();
+            let separator_before = previous_group.is_some_and(|previous| previous != group);
+            previous_group = Some(group);
+            let mut item = MenuItem::new(action.label(files.source));
+            if separator_before {
+                item = item.separator_before();
+            }
+            if !action.enabled(files) {
+                item = item.disabled();
+            }
+            if action.destructive() {
+                item = item.destructive();
+            }
+            FileContextMenuEntry { action, item }
+        })
+        .collect()
 }
 
 fn sifs_identifiers_for_clipboard(details: &SifsObjectDetails) -> String {
@@ -13021,6 +13052,18 @@ fn inspector_summary(shared: &Shared) -> String {
             files.source, files.path, error, files.inspector_details_open
         );
     }
+    if let Some(selection) = marked_selection_summary(&files) {
+        return format!(
+            "selection|{:?}|{}|{}|{}|{}|{}|{}",
+            files.source,
+            files.path,
+            selection.count,
+            selection.file_count,
+            selection.folder_count,
+            selection.link_count,
+            files.inspector_details_open
+        );
+    }
     match files.selected_entry() {
         Some(entry) => format!(
             "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
@@ -13126,219 +13169,88 @@ fn inspector_details_button(
         })
 }
 
-fn root_inspector_buttons(
-    shared: &Shared,
-    reader: &ThemeReader,
-    actions: Vec<RootInspectorAction>,
-) -> Flex {
-    let mut row = Flex::horizontal()
-        .wrap(FlexWrap::Wrap)
-        .gap(8.0)
-        .align_items(Alignment::Center);
-    for action in actions {
-        let s = shared.clone();
-        let (appearance, tone) = match action {
-            RootInspectorAction::RefreshFolder | RootInspectorAction::OpenCluster => {
-                (ButtonAppearance::Outline, SemanticTone::Neutral)
-            }
-            RootInspectorAction::RepairReplicas => (ButtonAppearance::Tonal, SemanticTone::Accent),
-            RootInspectorAction::ConnectionSettings => {
-                (ButtonAppearance::Tonal, SemanticTone::Warning)
-            }
-        };
-        row = row.with_child(
-            sui::Button::new(action.label())
-                .semantic_name(action.label())
-                .description(action.description())
-                .icon(action.glyph())
-                .appearance(appearance)
-                .tone(tone)
-                .min_width(132.0)
-                .theme_when(clone_reader(reader))
-                .on_press_with_ctx(move |ctx| {
-                    activate_root_inspector_action(&s, action, ctx);
-                }),
-        );
-    }
-    row
-}
-
-fn activate_root_inspector_action(
-    shared: &Shared,
-    action: RootInspectorAction,
-    ctx: &mut EventCtx,
-) {
+fn activate_file_context_action(shared: &Shared, action: FileContextAction, ctx: &mut EventCtx) {
     match action {
-        RootInspectorAction::RefreshFolder => shared.files_mut().reload(),
-        RootInspectorAction::RepairReplicas => {
-            let waker = { shared.borrow().waker.clone() };
-            shared
-                .files_mut()
-                .start_current_location_replica_repair(waker);
-        }
-        RootInspectorAction::OpenCluster => open_cluster_tab(shared),
-        RootInspectorAction::ConnectionSettings => {
-            open_settings_section(shared, SettingsSection::Connection);
-        }
-    }
-    request_files_overlay_rebuild(ctx);
-}
-
-fn inspector_action_description(action: InspectorAction, entry: &SifsEntry) -> String {
-    match action {
-        InspectorAction::OpenFolder => format!("Open {}", entry.path),
-        InspectorAction::ViewFile => format!(
-            "Open the complete text contents of {} in the selectable document viewer",
-            entry.path
-        ),
-        InspectorAction::AttachToChat => format!(
-            "Read a verified snapshot of {} and attach it to the current chat",
-            entry.path
-        ),
-        InspectorAction::RefreshPlacement => {
-            format!("Refresh SIFS placement metadata for {}", entry.path)
-        }
-        InspectorAction::EditPlacement => format!(
-            "Preview and edit inherited W/N, node, and zone placement for {}",
-            entry.path
-        ),
-        InspectorAction::RepairReplicas => {
-            format!("Request SIFS replica repair for {}", entry.path)
-        }
-        InspectorAction::MakeMetadataPrimary => format!(
-            "Transfer the SIFS metadata shard primary for {} to this node",
-            entry.path
-        ),
-        InspectorAction::PinMetadata => {
-            format!("Pin SIFS metadata on this node for {}", entry.path)
-        }
-        InspectorAction::UnpinMetadata => {
-            format!("Remove this node's SIFS metadata pin for {}", entry.path)
-        }
-        InspectorAction::PinContent => {
-            format!("Pin SIFS content on this node for {}", entry.path)
-        }
-        InspectorAction::UnpinContent => {
-            format!("Remove this node's SIFS content pin for {}", entry.path)
-        }
-        InspectorAction::ConnectionSettings => {
-            "Open Connection settings for SIFS authorization and daemon recovery".to_string()
-        }
-        InspectorAction::CopyToSifs => format!("Copy local {} into SIFS", entry.path),
-        InspectorAction::CopyToLocal => format!("Download SIFS {} to a local path", entry.path),
-        InspectorAction::Copy => format!("Copy {}", entry.path),
-        InspectorAction::CopyIdentifiers => format!(
-            "Copy the full SIFS object, version, and hash IDs for {}",
-            entry.path
-        ),
-        InspectorAction::Move => format!("Move {}", entry.path),
-        InspectorAction::Rename => format!("Rename {}", entry.path),
-        InspectorAction::Delete => format!("Delete {}", entry.path),
-    }
-}
-
-fn inspector_buttons(
-    shared: &Shared,
-    reader: &ThemeReader,
-    entry: &SifsEntry,
-    actions: Vec<InspectorAction>,
-) -> Flex {
-    let mut row = Flex::horizontal()
-        .wrap(FlexWrap::Wrap)
-        .gap(8.0)
-        .align_items(Alignment::Center);
-    for action in actions {
-        let s = shared.clone();
-        let action_entry = entry.clone();
-        let path = entry.path.clone();
-        let (appearance, tone) = match action {
-            InspectorAction::OpenFolder | InspectorAction::ViewFile => {
-                (ButtonAppearance::Filled, SemanticTone::Accent)
+        FileContextAction::Open => {
+            let selected = shared.files().selected;
+            if let Some(index) = selected {
+                shared.files_mut().activate_row(index);
             }
-            InspectorAction::AttachToChat => (ButtonAppearance::Tonal, SemanticTone::Accent),
-            InspectorAction::Delete => (ButtonAppearance::Tonal, SemanticTone::Danger),
-            InspectorAction::RefreshPlacement
-            | InspectorAction::EditPlacement
-            | InspectorAction::RepairReplicas
-            | InspectorAction::MakeMetadataPrimary
-            | InspectorAction::PinMetadata
-            | InspectorAction::UnpinMetadata
-            | InspectorAction::PinContent
-            | InspectorAction::UnpinContent
-            | InspectorAction::ConnectionSettings
-            | InspectorAction::CopyToSifs
-            | InspectorAction::CopyToLocal => (ButtonAppearance::Tonal, SemanticTone::Accent),
-            InspectorAction::Copy
-            | InspectorAction::CopyIdentifiers
-            | InspectorAction::Move
-            | InspectorAction::Rename => (ButtonAppearance::Outline, SemanticTone::Neutral),
-        };
-        row = row.with_child(
-            sui::Button::new(action.label())
-                .semantic_name(action.semantic_name(entry))
-                .description(inspector_action_description(action, entry))
-                .icon(action.glyph())
-                .appearance(appearance)
-                .tone(tone)
-                .min_width(132.0)
-                .theme_when(clone_reader(reader))
-                .on_press_with_ctx(move |ctx| {
-                    activate_inspector_action(&s, action, &action_entry, &path, ctx);
-                }),
-        );
-    }
-    row
-}
-
-fn activate_inspector_action(
-    shared: &Shared,
-    action: InspectorAction,
-    _entry: &SifsEntry,
-    path: &str,
-    ctx: &mut EventCtx,
-) {
-    match action {
-        InspectorAction::OpenFolder => shared.files_mut().navigate(path.to_string()),
-        InspectorAction::ViewFile => {
-            let waker = { shared.borrow().waker.clone() };
-            shared.files_mut().open_selected_document(waker);
         }
-        InspectorAction::AttachToChat => {
+        FileContextAction::AttachToChat => {
             let waker = { shared.borrow().waker.clone() };
             shared.files_mut().start_attach_selected(waker);
         }
-        InspectorAction::RefreshPlacement => {
+        FileContextAction::Copy => shared
+            .files_mut()
+            .open_action_prompt(FileActionPromptKind::Copy),
+        FileContextAction::CopySelected => shared
+            .files_mut()
+            .open_action_prompt(FileActionPromptKind::CopySelected),
+        FileContextAction::Transfer => {
+            let kind = match shared.files().source {
+                FilesSourceKind::Local => FileActionPromptKind::CopyToSifs,
+                FilesSourceKind::Sifs => FileActionPromptKind::CopyToLocal,
+            };
+            shared.files_mut().open_action_prompt(kind);
+        }
+        FileContextAction::TransferSelected => shared
+            .files_mut()
+            .open_action_prompt(FileActionPromptKind::TransferSelected),
+        FileContextAction::Move => shared
+            .files_mut()
+            .open_action_prompt(FileActionPromptKind::Move),
+        FileContextAction::MoveSelected => shared
+            .files_mut()
+            .open_action_prompt(FileActionPromptKind::MoveSelected),
+        FileContextAction::Rename => shared
+            .files_mut()
+            .open_action_prompt(FileActionPromptKind::Rename),
+        FileContextAction::Delete => shared
+            .files_mut()
+            .open_action_prompt(FileActionPromptKind::Delete),
+        FileContextAction::DeleteSelected => shared
+            .files_mut()
+            .open_action_prompt(FileActionPromptKind::DeleteSelected),
+        FileContextAction::EditPlacement => {
+            shared
+                .files_mut()
+                .open_action_prompt(FileActionPromptKind::Placement);
+            let waker = { shared.borrow().waker.clone() };
+            shared.files_mut().start_placement_preview(waker);
+        }
+        FileContextAction::RefreshPlacement => {
             let waker = { shared.borrow().waker.clone() };
             shared.files_mut().start_placement_refresh(waker);
         }
-        InspectorAction::RepairReplicas => {
+        FileContextAction::RepairReplicas => {
             let waker = { shared.borrow().waker.clone() };
             shared.files_mut().start_replica_repair(waker);
         }
-        InspectorAction::MakeMetadataPrimary => {
+        FileContextAction::MakeMetadataPrimary => {
             let waker = { shared.borrow().waker.clone() };
             shared.files_mut().start_make_metadata_primary(waker);
         }
-        InspectorAction::PinMetadata => {
+        FileContextAction::PinMetadata => {
             let waker = { shared.borrow().waker.clone() };
             shared.files_mut().start_pin_metadata(waker);
         }
-        InspectorAction::UnpinMetadata => {
+        FileContextAction::UnpinMetadata => {
             let waker = { shared.borrow().waker.clone() };
             shared.files_mut().start_unpin_metadata(waker);
         }
-        InspectorAction::PinContent => {
+        FileContextAction::PinContent => {
             let waker = { shared.borrow().waker.clone() };
             shared.files_mut().start_pin_content(waker);
         }
-        InspectorAction::UnpinContent => {
+        FileContextAction::UnpinContent => {
             let waker = { shared.borrow().waker.clone() };
             shared.files_mut().start_unpin_content(waker);
         }
-        InspectorAction::ConnectionSettings => {
+        FileContextAction::ConnectionSettings => {
             open_settings_section(shared, SettingsSection::Connection);
         }
-        InspectorAction::CopyIdentifiers => {
+        FileContextAction::CopyIdentifiers => {
             let value = shared
                 .files()
                 .selected_details
@@ -13348,23 +13260,31 @@ fn activate_inspector_action(
                 ctx.set_clipboard_text(value);
             }
         }
-        InspectorAction::EditPlacement => {
+        FileContextAction::NewFile => shared
+            .files_mut()
+            .open_action_prompt(FileActionPromptKind::NewFile),
+        FileContextAction::NewFolder => shared
+            .files_mut()
+            .open_action_prompt(FileActionPromptKind::NewFolder),
+        FileContextAction::ImportFiles | FileContextAction::ImportFolder => {
+            let picker_action = if action == FileContextAction::ImportFiles {
+                FilesPickerAction::ImportFiles
+            } else {
+                FilesPickerAction::ImportFolder
+            };
+            let waker = { shared.borrow().waker.clone() };
             shared
                 .files_mut()
-                .open_action_prompt(FileActionPromptKind::Placement);
+                .request_native_picker(picker_action, waker);
+        }
+        FileContextAction::RefreshFolder => shared.files_mut().reload(),
+        FileContextAction::RepairCurrentLocation => {
             let waker = { shared.borrow().waker.clone() };
-            shared.files_mut().start_placement_preview(waker);
+            shared
+                .files_mut()
+                .start_current_location_replica_repair(waker);
         }
-        InspectorAction::Copy
-        | InspectorAction::CopyToSifs
-        | InspectorAction::CopyToLocal
-        | InspectorAction::Move
-        | InspectorAction::Rename
-        | InspectorAction::Delete => {
-            if let Some(kind) = action.prompt_kind() {
-                shared.files_mut().open_action_prompt(kind);
-            }
-        }
+        FileContextAction::OpenCluster => open_cluster_tab(shared),
     }
     request_files_overlay_rebuild(ctx);
 }
@@ -13472,16 +13392,107 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
         ));
     }
 
+    if let Some(selection) = marked_selection_summary(&files) {
+        let theme = reader();
+        let mut summary_style = theme.text_style(theme.palette.text_muted);
+        summary_style.font_size = theme.text.sm.size;
+        summary_style.line_height = theme.text.sm.line_height;
+        let summary_line = marked_selection_composition(&selection);
+        let overview_rows = vec![
+            ("Total size", marked_selection_size(&selection)),
+            ("Location", files.path.clone()),
+            ("Source", files.source.label().to_string()),
+        ];
+        let selected_body = Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .spacing(10.0)
+            .with_child(Label::new(summary_line).style(summary_style))
+            .with_child(detail_rows_widget(overview_rows, reader));
+        let mut content = Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .spacing(12.0)
+            .with_child(inspector_card(
+                marked_entries_label(selection.count),
+                selected_body,
+                reader,
+                Some(details_button()),
+                true,
+            ));
+
+        if files.source == FilesSourceKind::Sifs {
+            let (status, tone) = if selection.placement_attention_count > 0 {
+                (
+                    format!(
+                        "{} {}",
+                        selection.placement_attention_count,
+                        if selection.placement_attention_count == 1 {
+                            "needs attention"
+                        } else {
+                            "need attention"
+                        }
+                    ),
+                    SemanticTone::Warning,
+                )
+            } else if selection.placement_syncing_count > 0 {
+                (
+                    format!("{} syncing", selection.placement_syncing_count),
+                    SemanticTone::Accent,
+                )
+            } else if selection.placement_known_count == selection.count {
+                ("Selection available".to_string(), SemanticTone::Success)
+            } else {
+                (
+                    "Availability partly known".to_string(),
+                    SemanticTone::Neutral,
+                )
+            };
+            let rows = vec![
+                ("Placement", marked_selection_placement(&selection)),
+                (
+                    "Metadata",
+                    format!(
+                        "{} of {} items loaded",
+                        selection.placement_known_count, selection.count
+                    ),
+                ),
+                (
+                    "This device",
+                    format!(
+                        "{} of {} items available here",
+                        selection.local_available_count, selection.count
+                    ),
+                ),
+            ];
+            let body = Stack::vertical()
+                .alignment(Alignment::Stretch)
+                .spacing(8.0)
+                .with_child(
+                    StatusBadge::new(status)
+                        .tone(tone)
+                        .theme_when(clone_reader(reader)),
+                )
+                .with_child(detail_rows_widget(rows, reader));
+            content = content.with_child(inspector_card("Availability", body, reader, None, false));
+        }
+
+        if files.inspector_details_open {
+            content = content.with_child(inspector_card(
+                "Selected items",
+                detail_rows_widget(vec![("Paths", marked_selection_paths(&selection))], reader),
+                reader,
+                None,
+                false,
+            ));
+        }
+        return WidgetPod::new(content);
+    }
+
     let Some(entry) = files.selected_entry().cloned() else {
         let rows = unselected_inspector_rows(&files);
-        let actions = unselected_inspector_actions(&files);
-        let mut body = Stack::vertical()
+        let body = Stack::vertical()
             .alignment(Alignment::Stretch)
             .spacing(10.0)
             .with_child(detail_rows_widget(rows, reader));
-        if !actions.is_empty() {
-            body = body.with_child(root_inspector_buttons(shared, reader, actions));
-        }
         let header_action = (files.source == FilesSourceKind::Sifs).then(details_button);
         return WidgetPod::new(inspector_card(
             unselected_inspector_title(files.source),
@@ -13519,12 +13530,10 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
     let mut kind_style = theme.text_style(theme.palette.text_muted);
     kind_style.font_size = theme.text.sm.size;
     kind_style.line_height = theme.text.sm.line_height;
-    let actions = inspector_actions(&files, &entry);
     let mut selected_body = Stack::vertical()
         .alignment(Alignment::Stretch)
         .spacing(10.0)
         .with_child(Label::new(kind_line).style(kind_style))
-        .with_child(inspector_buttons(shared, reader, &entry, actions))
         .with_child(
             DetailRow::new("Path", entry.path.clone())
                 .theme_when(clone_reader(reader))
@@ -13553,6 +13562,16 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
         .alignment(Alignment::Stretch)
         .spacing(12.0)
         .with_child(selected_card);
+
+    if !entry.is_dir {
+        content = content.with_child(preview_card(
+            files.source,
+            files.preview_loading,
+            files.preview_error.as_deref(),
+            files.selected_preview.as_ref(),
+            reader,
+        ));
+    }
 
     if files.source == FilesSourceKind::Local {
         let local = files.selected_local_details.as_ref();
@@ -13849,16 +13868,6 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
         }
     }
 
-    if !entry.is_dir {
-        content = content.with_child(preview_card(
-            files.source,
-            files.preview_loading,
-            files.preview_error.as_deref(),
-            files.selected_preview.as_ref(),
-            reader,
-        ));
-    }
-
     WidgetPod::new(content)
 }
 
@@ -13871,8 +13880,8 @@ fn inspector(
     let header = WidgetPadding::horizontal(
         CONTENT_PAD,
         SizedBox::new().height(18.0).with_child(
-            SectionLabel::new("Inspector")
-                .semantic_name("Inspector")
+            SectionLabel::new("Selection info")
+                .semantic_name("Selection info")
                 .theme_when(clone_reader(reader)),
         ),
     )
@@ -13895,7 +13904,7 @@ fn inspector(
         SurfaceRole::Sidebar,
         ScrollView::vertical(body)
             .state(scroll_state.clone())
-            .name("File inspector")
+            .name("Selection info")
             .viewport_width_hint(true),
     )
     .border(SurfaceBorder::Left)
@@ -14034,7 +14043,7 @@ fn wide_pod(
         list_with_places,
         inspector(shared, reader, inspector_scroll_state),
     )
-    .name("File inspector sidebar")
+    .name("Selection info sidebar")
     .ratio(1.0 - inspector_ratio)
     .min_first(PLACES_SIDEBAR_MIN_W + FILE_LIST_MIN_W)
     .min_second(INSPECTOR_SIDEBAR_MIN_W)
@@ -14288,135 +14297,6 @@ fn compact_files_commands(shared: &Shared, reader: &ThemeReader) -> impl Widget 
             },
         )
     };
-    let copy = {
-        let enabled = shared.clone();
-        let action = shared.clone();
-        compact_command_button(
-            "Copy to",
-            reader,
-            move || {
-                let files = enabled.files();
-                files.can_modify_current_location()
-                    && (files.marked_count() > 0 || files.selected_entry().is_some())
-            },
-            move |ctx| {
-                let kind = if action.files().marked_count() > 0 {
-                    FileActionPromptKind::CopySelected
-                } else {
-                    FileActionPromptKind::Copy
-                };
-                action.files_mut().open_action_prompt(kind);
-                request_files_overlay_rebuild(ctx);
-            },
-        )
-    };
-    let move_to = {
-        let enabled = shared.clone();
-        let action = shared.clone();
-        compact_command_button(
-            "Move to",
-            reader,
-            move || {
-                let files = enabled.files();
-                files.can_modify_current_location()
-                    && (files.marked_count() > 0 || files.selected_entry().is_some())
-            },
-            move |ctx| {
-                let kind = if action.files().marked_count() > 0 {
-                    FileActionPromptKind::MoveSelected
-                } else {
-                    FileActionPromptKind::Move
-                };
-                action.files_mut().open_action_prompt(kind);
-                request_files_overlay_rebuild(ctx);
-            },
-        )
-    };
-    let refresh_placement = {
-        let enabled = shared.clone();
-        let action = shared.clone();
-        compact_command_button(
-            "Refresh placement",
-            reader,
-            move || {
-                let files = enabled.files();
-                files.source == FilesSourceKind::Sifs
-                    && files.can_modify_current_location()
-                    && files.selected_entry().is_some()
-            },
-            move |ctx| {
-                let waker = { action.borrow().waker.clone() };
-                let mut files = action.files_mut();
-                files.close_compact_overlay();
-                files.start_placement_refresh(waker);
-                drop(files);
-                request_files_overlay_rebuild(ctx);
-            },
-        )
-    };
-    let repair = {
-        let enabled = shared.clone();
-        let action = shared.clone();
-        compact_command_button(
-            "Repair replicas",
-            reader,
-            move || {
-                let files = enabled.files();
-                files.source == FilesSourceKind::Sifs
-                    && files.can_modify_current_location()
-                    && files.selected_entry().is_some()
-            },
-            move |ctx| {
-                let waker = { action.borrow().waker.clone() };
-                let mut files = action.files_mut();
-                files.close_compact_overlay();
-                files.start_replica_repair(waker);
-                drop(files);
-                request_files_overlay_rebuild(ctx);
-            },
-        )
-    };
-    let rename = {
-        let enabled = shared.clone();
-        let action = shared.clone();
-        compact_command_button(
-            "Rename",
-            reader,
-            move || {
-                let files = enabled.files();
-                files.can_modify_current_location() && files.selected_entry().is_some()
-            },
-            move |ctx| {
-                action
-                    .files_mut()
-                    .open_action_prompt(FileActionPromptKind::Rename);
-                request_files_overlay_rebuild(ctx);
-            },
-        )
-    };
-    let delete = {
-        let enabled = shared.clone();
-        let action = shared.clone();
-        compact_command_button(
-            "Delete selected item",
-            reader,
-            move || {
-                let files = enabled.files();
-                files.can_modify_current_location()
-                    && (files.marked_count() > 0 || files.selected_entry().is_some())
-            },
-            move |ctx| {
-                let kind = if action.files().marked_count() > 0 {
-                    FileActionPromptKind::DeleteSelected
-                } else {
-                    FileActionPromptKind::Delete
-                };
-                action.files_mut().open_action_prompt(kind);
-                request_files_overlay_rebuild(ctx);
-            },
-        )
-    };
-
     let content = Stack::vertical()
         .alignment(Alignment::Stretch)
         .spacing(6.0)
@@ -14430,13 +14310,7 @@ fn compact_files_commands(shared: &Shared, reader: &ThemeReader) -> impl Widget 
         .with_child(import_folder)
         .with_child(go_to)
         .with_child(new_file)
-        .with_child(new_folder)
-        .with_child(copy)
-        .with_child(move_to)
-        .with_child(refresh_placement)
-        .with_child(repair)
-        .with_child(rename)
-        .with_child(delete);
+        .with_child(new_folder);
     ScrollView::vertical(WidgetPadding::new(
         Insets {
             left: 2.0,
@@ -17316,6 +17190,53 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
     )
 }
 
+fn compact_file_selection_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared.files().source;
+    let entries = file_context_menu_entries(&shared.files(), FileContextMenuTarget::Selection);
+    let mut previous_group = None;
+    let mut actions = Stack::vertical().alignment(Alignment::Stretch).spacing(6.0);
+
+    for entry in entries {
+        let group = entry.action.group();
+        if previous_group.is_some_and(|previous| previous != group) {
+            actions = actions.with_child(Separator::horizontal().theme_when(clone_reader(reader)));
+        }
+        previous_group = Some(group);
+
+        let action = entry.action;
+        let enabled = action.enabled(&shared.files());
+        let destructive = action.destructive();
+        let action_shared = shared.clone();
+        let mut button = sui::Button::new(action.label(source))
+            .min_height(36.0)
+            .theme_when(clone_reader(reader))
+            .enabled(enabled)
+            .on_press_with_ctx(move |ctx| {
+                action_shared.files_mut().close_compact_overlay();
+                activate_file_context_action(&action_shared, action, ctx);
+                request_files_overlay_rebuild(ctx);
+            });
+        if destructive {
+            button = button
+                .appearance(ButtonAppearance::Outline)
+                .tone(SemanticTone::Warning);
+        }
+        actions = actions.with_child(button);
+    }
+
+    ScrollView::vertical(WidgetPadding::new(
+        Insets {
+            left: 2.0,
+            top: 2.0,
+            right: 10.0,
+            bottom: 12.0,
+        },
+        actions,
+    ))
+    .name("Selected item actions")
+    .viewport_width_hint(true)
+}
+
 fn compact_files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
     let overlay = shared.files().compact_overlay?;
     let (title, description, selected) = match overlay {
@@ -17324,16 +17245,22 @@ fn compact_files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
             "Commands hidden from the compact file toolbar",
             0,
         ),
-        CompactFilesOverlay::Inspector => (
-            "File inspector",
-            "Preview, placement, metadata, recovery actions, and file tasks",
+        CompactFilesOverlay::SelectionActions => (
+            "Selected item actions",
+            "Actions for the selected file, folder, or marked items",
             1,
+        ),
+        CompactFilesOverlay::Inspector => (
+            "Selection info",
+            "Preview, placement, metadata, identity, and selection summaries",
+            2,
         ),
     };
     let inspector_scroll_state = ScrollState::new();
     let body = SwitchView::new()
         .selected(selected)
         .with_child(compact_files_commands(shared, reader))
+        .with_child(compact_file_selection_actions(shared, reader))
         .with_child(inspector(shared, reader, &inspector_scroll_state));
     let dismiss_shared = shared.clone();
     Some(WidgetPod::new(
@@ -17577,6 +17504,38 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("create temp dir");
         root
+    }
+
+    fn current_location_context_menu_for_test(shared: &Shared) -> ContextMenu {
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme().with_size(ControlSize::Small))
+        };
+        file_context_menu(
+            "test-current-location-context-menu",
+            shared,
+            &reader,
+            Rc::new(Cell::new(FileContextMenuTarget::CurrentLocation)),
+            PointerButton::Primary,
+            false,
+            sui::Button::new("Open current location menu").theme_when(clone_reader(&reader)),
+        )
+    }
+
+    fn selection_context_menu_for_test(shared: &Shared) -> ContextMenu {
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme().with_size(ControlSize::Small))
+        };
+        file_context_menu(
+            "test-selection-context-menu",
+            shared,
+            &reader,
+            Rc::new(Cell::new(FileContextMenuTarget::Selection)),
+            PointerButton::Primary,
+            false,
+            sui::Button::new("Open selection actions").theme_when(clone_reader(&reader)),
+        )
     }
 
     fn test_sifs_details(local_pins: Vec<SifsPinDetails>) -> SifsObjectDetails {
@@ -19164,17 +19123,19 @@ mod tests {
             is_link: false,
             size: Some(5),
         };
+        state.entries = vec![entry];
+        state.selected = Some(0);
 
-        assert!(!inspector_actions(&state, &entry).contains(&InspectorAction::EditPlacement));
+        assert!(!selection_context_actions(&state).contains(&FileContextAction::EditPlacement));
         let mut stale = test_sifs_details(Vec::new());
         stale.path = "/other.txt".to_string();
         state.selected_details = Some(stale);
-        assert!(!inspector_actions(&state, &entry).contains(&InspectorAction::EditPlacement));
+        assert!(!selection_context_actions(&state).contains(&FileContextAction::EditPlacement));
 
         let mut ready = test_sifs_details(Vec::new());
         ready.placement = Some(unsatisfiable_placement_preview().resolved);
         state.selected_details = Some(ready);
-        assert!(inspector_actions(&state, &entry).contains(&InspectorAction::EditPlacement));
+        assert!(selection_context_actions(&state).contains(&FileContextAction::EditPlacement));
     }
 
     fn unsatisfiable_placement_preview() -> SifsPlacementPreview {
@@ -20096,21 +20057,21 @@ mod tests {
         app.run_until_idle()?;
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Open file inspector")
+            .with_name("Open selection info")
             .click()?;
         app.run_until_idle()?;
 
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::Dialog)
-                .with_name("File inspector")
+                .with_name("Selection info")
                 .count()?,
             1
         );
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::ScrollView)
-                .with_name("File inspector")
+                .with_name("Selection info")
                 .count()?,
             1,
             "compact inspector sheet should expose the same preview and recovery surface"
@@ -20758,7 +20719,7 @@ mod tests {
             .iter()
             .find(|node| {
                 node.role == SemanticsRole::Splitter
-                    && node.name.as_deref() == Some("File inspector sidebar")
+                    && node.name.as_deref() == Some("Selection info sidebar")
             })
             .expect("Inspector should expose a native splitter")
             .bounds;
@@ -21534,7 +21495,7 @@ mod tests {
                 && value == "Not checked yet; refresh this folder to update health"
         }));
         assert!(rows.iter().any(|(label, value)| {
-            *label == "Next step"
+            *label == "About"
                 && value.contains("created SIFS objects expose placement and replica actions")
         }));
 
@@ -21547,7 +21508,7 @@ mod tests {
         }];
         let rows = unselected_inspector_rows(&files);
         assert!(rows.iter().any(|(label, value)| {
-            *label == "Next step" && value.contains("refresh placement, repair replicas")
+            *label == "About" && value.contains("refresh placement, repair replicas")
         }));
 
         files.source = FilesSourceKind::Local;
@@ -21559,7 +21520,7 @@ mod tests {
                 .any(|(label, value)| *label == "Scope" && value == "host filesystem")
         );
         assert!(rows.iter().any(|(label, value)| {
-            *label == "Next step" && value.contains("switch places to browse another filesystem")
+            *label == "About" && value.contains("switch places to browse another filesystem")
         }));
         assert!(!rows.iter().any(|(label, _)| *label == "SIFS health"));
     }
@@ -21664,7 +21625,7 @@ mod tests {
     }
 
     #[test]
-    fn unselected_sifs_inspector_actions_refresh_current_folder() -> sui::Result<()> {
+    fn current_location_context_menu_refreshes_current_folder() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         let (tx, rx) = mpsc::channel();
@@ -21692,12 +21653,7 @@ mod tests {
             .window(
                 sui::WindowBuilder::new()
                     .title("Files root refresh action")
-                    .root(
-                        SizedBox::new()
-                            .width(INSPECTOR_W)
-                            .height(720.0)
-                            .with_child(InspectorView::new(shared.clone())),
-                    ),
+                    .root(current_location_context_menu_for_test(&shared)),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
@@ -21705,7 +21661,11 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Refresh folder")
+            .with_name("Open current location menu")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::MenuItem)
+            .with_name("Refresh current folder")
             .click()?;
 
         match rx.try_recv().expect("folder refresh command") {
@@ -21736,7 +21696,7 @@ mod tests {
     }
 
     #[test]
-    fn unselected_sifs_inspector_action_repairs_current_location() -> sui::Result<()> {
+    fn current_location_context_menu_repairs_current_location() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         let (tx, rx) = mpsc::channel();
@@ -21764,12 +21724,7 @@ mod tests {
             .window(
                 sui::WindowBuilder::new()
                     .title("Files root repair action")
-                    .root(
-                        SizedBox::new()
-                            .width(INSPECTOR_W)
-                            .height(720.0)
-                            .with_child(InspectorView::new(shared.clone())),
-                    ),
+                    .root(current_location_context_menu_for_test(&shared)),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
@@ -21777,7 +21732,11 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Repair replicas")
+            .with_name("Open current location menu")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::MenuItem)
+            .with_name("Repair current folder replicas")
             .click()?;
 
         assert_eq!(shared.files().tasks[0].title, "Repair replicas");
@@ -21803,7 +21762,7 @@ mod tests {
     }
 
     #[test]
-    fn unselected_sifs_inspector_action_opens_cluster() -> sui::Result<()> {
+    fn current_location_context_menu_opens_cluster() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -21827,12 +21786,7 @@ mod tests {
             .window(
                 sui::WindowBuilder::new()
                     .title("Files root recovery actions")
-                    .root(
-                        SizedBox::new()
-                            .width(INSPECTOR_W)
-                            .height(720.0)
-                            .with_child(InspectorView::new(shared.clone())),
-                    ),
+                    .root(current_location_context_menu_for_test(&shared)),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
@@ -21840,6 +21794,10 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open current location menu")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::MenuItem)
             .with_name("Open Cluster")
             .click()?;
         assert_eq!(shared.borrow().active_tab, Tab::Cluster);
@@ -21848,7 +21806,7 @@ mod tests {
     }
 
     #[test]
-    fn unselected_sifs_inspector_action_opens_connection_settings() -> sui::Result<()> {
+    fn current_location_context_menu_opens_connection_settings() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -21872,12 +21830,7 @@ mod tests {
             .window(
                 sui::WindowBuilder::new()
                     .title("Files root connection action")
-                    .root(
-                        SizedBox::new()
-                            .width(INSPECTOR_W)
-                            .height(720.0)
-                            .with_child(InspectorView::new(shared.clone())),
-                    ),
+                    .root(current_location_context_menu_for_test(&shared)),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
@@ -21885,6 +21838,10 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open current location menu")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::MenuItem)
             .with_name("Connection settings")
             .click()?;
         assert_eq!(shared.borrow().active_tab, Tab::Settings);
@@ -22170,6 +22127,88 @@ mod tests {
                 replicas: Some((1, 2)),
             }
         );
+    }
+
+    #[test]
+    fn marked_selection_summary_aggregates_content_and_availability() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.source = FilesSourceKind::Sifs;
+        state.node_id = "node-a".to_string();
+        state.entries = vec![
+            SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            },
+            SifsEntry {
+                name: "logs".to_string(),
+                path: "/logs".to_string(),
+                is_dir: true,
+                is_link: false,
+                size: None,
+            },
+            SifsEntry {
+                name: "latest".to_string(),
+                path: "/latest".to_string(),
+                is_dir: false,
+                is_link: true,
+                size: None,
+            },
+        ];
+        state.marked_entries = BTreeSet::from([0, 1, 2]);
+        state.entry_metadata.insert(
+            "/artifact.txt".to_string(),
+            SifsEntryMetadata {
+                path: "/artifact.txt".to_string(),
+                object_id: "object-artifact".to_string(),
+                version: "version-1".to_string(),
+                modified_at_unix_nanos: 0,
+                policy: "replicated-eventual".to_string(),
+                current_locations: vec!["node-a".to_string()],
+                placement: Some(SifsEntryPlacement {
+                    agent_state: "current".to_string(),
+                    desired_replicas: 1,
+                }),
+            },
+        );
+        state.entry_metadata.insert(
+            "/logs".to_string(),
+            SifsEntryMetadata {
+                path: "/logs".to_string(),
+                object_id: "object-logs".to_string(),
+                version: "version-1".to_string(),
+                modified_at_unix_nanos: 0,
+                policy: "replicated-eventual".to_string(),
+                current_locations: vec!["node-b".to_string()],
+                placement: Some(SifsEntryPlacement {
+                    agent_state: "pending-repair".to_string(),
+                    desired_replicas: 2,
+                }),
+            },
+        );
+
+        let summary = marked_selection_summary(&state).expect("marked selection summary");
+        assert_eq!(summary.count, 3);
+        assert_eq!(summary.file_count, 1);
+        assert_eq!(summary.folder_count, 1);
+        assert_eq!(summary.link_count, 1);
+        assert_eq!(summary.known_size_bytes, 5);
+        assert_eq!(summary.unknown_size_count, 1);
+        assert_eq!(summary.placement_known_count, 2);
+        assert_eq!(summary.placement_attention_count, 1);
+        assert_eq!(summary.local_available_count, 1);
+        assert_eq!(
+            marked_selection_composition(&summary),
+            "1 file · 1 folder · 1 link"
+        );
+        assert_eq!(
+            marked_selection_placement(&summary),
+            "1 available · 1 needs attention"
+        );
+        assert!(marked_selection_paths(&summary).contains("/logs"));
     }
 
     #[test]
@@ -24501,7 +24540,7 @@ mod tests {
     }
 
     #[test]
-    fn files_header_keeps_commands_usable_for_long_paths() -> sui::Result<()> {
+    fn files_header_keeps_global_commands_usable_for_long_paths() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         let long_path =
@@ -24539,7 +24578,10 @@ mod tests {
         let window = app.main_window()?;
         let snapshot = window.snapshot()?;
 
-        for (label, name) in [("Rename", "Rename"), ("Delete", "Delete selected item")] {
+        for (label, name) in [
+            ("Open local file", "Open local file"),
+            ("New folder", "New folder"),
+        ] {
             let node = snapshot
                 .accessibility
                 .nodes
@@ -24557,6 +24599,16 @@ mod tests {
                 node.bounds.max_x() <= 1280.0 && node.bounds.max_y() <= HEADER_H,
                 "{label} command should stay inside the header, got {:?}",
                 node.bounds
+            );
+        }
+        for item_action in ["Rename", "Delete selected item", "Repair replicas"] {
+            assert_eq!(
+                window
+                    .get_by_role(sui::SemanticsRole::Button)
+                    .with_name(item_action)
+                    .count()?,
+                0,
+                "{item_action} belongs in the item context menu, not the header"
             );
         }
 
@@ -24685,7 +24737,9 @@ mod tests {
     }
 
     #[test]
-    fn files_toolbar_repairs_replicas_while_row_placement_stays_stable() -> sui::Result<()> {
+    fn file_context_menu_repairs_replicas_while_row_placement_stays_stable() -> sui::Result<()> {
+        use sui::{PointerButtons, PointerEvent};
+
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -24765,9 +24819,24 @@ mod tests {
             "selected SIFS row should keep page-level placement metadata, got {:?}",
             row.description
         );
+        let position = Point::new(
+            row.bounds.x() + row.bounds.width() * 0.5,
+            row.bounds.y() + row.bounds.height() * 0.5,
+        );
+        let window_root = window.root();
+        let mut down = PointerEvent::new(PointerEventKind::Down, position);
+        down.pointer_id = 1;
+        down.button = Some(PointerButton::Secondary);
+        down.buttons = PointerButtons::new(2);
+        window_root.dispatch_event(Event::Pointer(down))?;
+        let mut up = PointerEvent::new(PointerEventKind::Up, position);
+        up.pointer_id = 1;
+        up.button = Some(PointerButton::Secondary);
+        window_root.dispatch_event(Event::Pointer(up))?;
+        app.run_until_idle()?;
 
         window
-            .get_by_role(sui::SemanticsRole::Button)
+            .get_by_role(sui::SemanticsRole::MenuItem)
             .with_name("Repair replicas")
             .click()?;
 
@@ -24777,7 +24846,7 @@ mod tests {
                 .tasks
                 .iter()
                 .any(|task| task.title == "Repair replicas"),
-            "toolbar repair action should queue a background file task"
+            "context-menu repair action should queue a background file task"
         );
 
         Ok(())
@@ -24806,7 +24875,7 @@ mod tests {
             .window(
                 sui::WindowBuilder::new().title("Files row actions").root(
                     SizedBox::new()
-                        .width(1180.0)
+                        .width(760.0)
                         .height(720.0)
                         .with_child(view(shared.clone())),
                 ),
@@ -24838,6 +24907,11 @@ mod tests {
             .click()?;
         window
             .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Selected item actions")
+            .click()?;
+        window.advance_time(1.0)?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
             .with_name("Copy to")
             .click()?;
         let files = shared.files();
@@ -24850,7 +24924,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_row_toolbar_actions_open_item_prompts() -> sui::Result<()> {
+    fn compact_selection_action_sheet_opens_item_prompts() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -24880,7 +24954,7 @@ mod tests {
             .window(
                 sui::WindowBuilder::new().title("Files batch actions").root(
                     SizedBox::new()
-                        .width(1180.0)
+                        .width(760.0)
                         .height(720.0)
                         .with_child(view(shared.clone())),
                 ),
@@ -24895,6 +24969,11 @@ mod tests {
             .click()?;
         assert_eq!(shared.files().selected, Some(0));
 
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Selected item actions")
+            .click()?;
+        window.advance_time(1.0)?;
         window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Copy to")
@@ -24913,6 +24992,11 @@ mod tests {
             .with_name("Cancel")
             .click()?;
 
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Selected item actions")
+            .click()?;
+        window.advance_time(1.0)?;
         window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Move to")
@@ -24934,6 +25018,11 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Selected item actions")
+            .click()?;
+        window.advance_time(1.0)?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
             .with_name("Rename")
             .click()?;
         {
@@ -24953,7 +25042,12 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Delete selected item")
+            .with_name("Selected item actions")
+            .click()?;
+        window.advance_time(1.0)?;
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Delete")
             .click()?;
         {
             let files = shared.files();
@@ -25575,7 +25669,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_directory_inspector_exposes_open_folder_action() -> sui::Result<()> {
+    fn selected_directory_actions_live_in_context_menu() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -25598,7 +25692,12 @@ mod tests {
             .window(
                 sui::WindowBuilder::new()
                     .title("Files inspector open folder")
-                    .root(view(shared.clone())),
+                    .root(
+                        SizedBox::new()
+                            .width(760.0)
+                            .height(720.0)
+                            .with_child(view(shared.clone())),
+                    ),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
@@ -25609,34 +25708,30 @@ mod tests {
             .with_name("dir")
             .click()?;
         assert_eq!(shared.files().path, "/");
-        assert!(
+        assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::Button)
                 .with_name("Copy dir")
-                .count()?
-                >= 1,
-            "selected directories should expose recursive copy"
-        );
-        assert_eq!(
-            window
-                .get_by_role(sui::SemanticsRole::Button)
-                .with_name("Pin content dir")
                 .count()?,
             0,
-            "directories do not have file content pins"
+            "the selection info panel must not expose file action buttons"
         );
-        assert_eq!(
-            window
-                .get_by_role(sui::SemanticsRole::Button)
-                .with_name("Unpin content dir")
-                .count()?,
-            0,
-            "directories do not have file content pins"
-        );
-
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Open folder")
+            .with_name("Selected item actions")
+            .click()?;
+        window.advance_time(1.0)?;
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::Button)
+                .with_name("Pin content")
+                .count()?,
+            0,
+            "directories do not have file content pins"
+        );
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open")
             .click()?;
 
         let files = shared.files();
@@ -25647,7 +25742,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_file_inspector_exposes_management_actions() -> sui::Result<()> {
+    fn selected_file_context_menu_exposes_management_actions() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         let (tx, rx) = mpsc::channel();
@@ -25667,6 +25762,7 @@ mod tests {
             }];
             files.selected = Some(0);
             let mut details = test_sifs_details(Vec::new());
+            details.path = "/services/artifact.txt".to_string();
             details.metadata_shard = Some(SifsMetadataShardDetails {
                 shard_id: "root".to_string(),
                 primary_node_id: "node-b".to_string(),
@@ -25685,12 +25781,7 @@ mod tests {
             .window(
                 sui::WindowBuilder::new()
                     .title("Files inspector selected file actions")
-                    .root(
-                        SizedBox::new()
-                            .width(INSPECTOR_W)
-                            .height(720.0)
-                            .with_child(InspectorView::new(shared.clone())),
-                    ),
+                    .root(selection_context_menu_for_test(&shared)),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
@@ -25698,7 +25789,11 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Copy artifact.txt")
+            .with_name("Open selection actions")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::MenuItem)
+            .with_name("Copy to")
             .click()?;
         {
             let files = shared.files();
@@ -25713,7 +25808,11 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Download artifact.txt")
+            .with_name("Open selection actions")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::MenuItem)
+            .with_name("Download")
             .click()?;
         {
             let files = shared.files();
@@ -25729,7 +25828,11 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Refresh placement artifact.txt")
+            .with_name("Open selection actions")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::MenuItem)
+            .with_name("Refresh placement")
             .click()?;
 
         assert_eq!(shared.files().tasks[0].title, "Refresh placement");
@@ -25752,7 +25855,11 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Repair replicas artifact.txt")
+            .with_name("Open selection actions")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::MenuItem)
+            .with_name("Repair replicas")
             .click()?;
 
         assert_eq!(shared.files().tasks[0].title, "Repair replicas");
@@ -25775,7 +25882,11 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Make metadata primary artifact.txt")
+            .with_name("Open selection actions")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::MenuItem)
+            .with_name("Make metadata primary")
             .click()?;
 
         assert_eq!(shared.files().tasks[0].title, "Make metadata primary");
@@ -25796,17 +25907,21 @@ mod tests {
             _ => panic!("expected operation command"),
         }
 
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open selection actions")
+            .click()?;
         assert_eq!(
             window
-                .get_by_role(sui::SemanticsRole::Button)
-                .with_name("Unpin metadata artifact.txt")
+                .get_by_role(sui::SemanticsRole::MenuItem)
+                .with_name("Unpin metadata")
                 .count()?,
             0,
             "unpinned metadata should expose pin, not unpin"
         );
         window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Pin metadata artifact.txt")
+            .get_by_role(sui::SemanticsRole::MenuItem)
+            .with_name("Pin metadata")
             .click()?;
 
         assert_eq!(shared.files().tasks[0].title, "Pin metadata");
@@ -25827,17 +25942,21 @@ mod tests {
             _ => panic!("expected operation command"),
         }
 
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open selection actions")
+            .click()?;
         assert_eq!(
             window
-                .get_by_role(sui::SemanticsRole::Button)
-                .with_name("Unpin content artifact.txt")
+                .get_by_role(sui::SemanticsRole::MenuItem)
+                .with_name("Unpin content")
                 .count()?,
             0,
             "unpinned content should expose pin, not unpin"
         );
         window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Pin content artifact.txt")
+            .get_by_role(sui::SemanticsRole::MenuItem)
+            .with_name("Pin content")
             .click()?;
 
         assert_eq!(shared.files().tasks[0].title, "Pin content");
@@ -25862,7 +25981,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_pinned_sifs_file_inspector_exposes_unpin_actions() -> sui::Result<()> {
+    fn selected_pinned_sifs_file_context_menu_exposes_unpin_actions() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         let (tx, rx) = mpsc::channel();
@@ -25881,7 +26000,7 @@ mod tests {
                 size: Some(5),
             }];
             files.selected = Some(0);
-            files.selected_details = Some(test_sifs_details(vec![
+            let mut details = test_sifs_details(vec![
                 SifsPinDetails {
                     pinned_by_node_id: "node-a".to_string(),
                     mode: "metadata".to_string(),
@@ -25892,7 +26011,9 @@ mod tests {
                     mode: "content".to_string(),
                     created_at_unix_nanos: Some(0),
                 },
-            ]));
+            ]);
+            details.path = "/services/artifact.txt".to_string();
+            files.selected_details = Some(details);
             files.worker_tx = Some(tx);
             files.worker_rx = Some(result_rx);
         }
@@ -25901,28 +26022,27 @@ mod tests {
             .window(
                 sui::WindowBuilder::new()
                     .title("Files inspector pinned file actions")
-                    .root(
-                        SizedBox::new()
-                            .width(INSPECTOR_W)
-                            .height(720.0)
-                            .with_child(InspectorView::new(shared.clone())),
-                    ),
+                    .root(selection_context_menu_for_test(&shared)),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open selection actions")
+            .click()?;
         assert_eq!(
             window
-                .get_by_role(sui::SemanticsRole::Button)
-                .with_name("Pin metadata artifact.txt")
+                .get_by_role(sui::SemanticsRole::MenuItem)
+                .with_name("Pin metadata")
                 .count()?,
             0,
             "pinned metadata should expose unpin, not pin"
         );
         window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Unpin metadata artifact.txt")
+            .get_by_role(sui::SemanticsRole::MenuItem)
+            .with_name("Unpin metadata")
             .click()?;
 
         assert_eq!(shared.files().tasks[0].title, "Unpin metadata");
@@ -25943,17 +26063,21 @@ mod tests {
             _ => panic!("expected operation command"),
         }
 
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open selection actions")
+            .click()?;
         assert_eq!(
             window
-                .get_by_role(sui::SemanticsRole::Button)
-                .with_name("Pin content artifact.txt")
+                .get_by_role(sui::SemanticsRole::MenuItem)
+                .with_name("Pin content")
                 .count()?,
             0,
             "pinned content should expose unpin, not pin"
         );
         window
-            .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Unpin content artifact.txt")
+            .get_by_role(sui::SemanticsRole::MenuItem)
+            .with_name("Unpin content")
             .click()?;
 
         assert_eq!(shared.files().tasks[0].title, "Unpin content");
@@ -25978,7 +26102,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_sifs_metadata_error_offers_connection_recovery() -> sui::Result<()> {
+    fn selected_sifs_metadata_error_context_menu_offers_connection_recovery() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -26001,36 +26125,35 @@ mod tests {
             .window(
                 sui::WindowBuilder::new()
                     .title("Files inspector SIFS metadata recovery")
-                    .root(
-                        SizedBox::new()
-                            .width(INSPECTOR_W)
-                            .height(720.0)
-                            .with_child(InspectorView::new(shared.clone())),
-                    ),
+                    .root(selection_context_menu_for_test(&shared)),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
+        window
+            .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open selection actions")
+            .click()?;
         assert_eq!(
             window
-                .get_by_role(sui::SemanticsRole::Button)
-                .with_name("Repair replicas artifact.txt")
+                .get_by_role(sui::SemanticsRole::MenuItem)
+                .with_name("Repair replicas")
                 .count()?,
             0,
             "metadata connection errors should hide replica repair"
         );
         assert_eq!(
             window
-                .get_by_role(sui::SemanticsRole::Button)
-                .with_name("Pin metadata artifact.txt")
+                .get_by_role(sui::SemanticsRole::MenuItem)
+                .with_name("Pin metadata")
                 .count()?,
             0,
             "metadata connection errors should hide pin actions"
         );
 
         window
-            .get_by_role(sui::SemanticsRole::Button)
+            .get_by_role(sui::SemanticsRole::MenuItem)
             .with_name("Connection settings")
             .click()?;
 
@@ -26043,7 +26166,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_local_file_inspector_exposes_copy_to_sifs() -> sui::Result<()> {
+    fn selected_local_file_context_menu_exposes_copy_to_sifs() -> sui::Result<()> {
         let root = files_test_temp_dir("local-inspector-copy-to-sifs");
         let path = root.join("artifact.txt");
         fs::write(&path, b"hello").expect("write local file");
@@ -26073,12 +26196,7 @@ mod tests {
             .window(
                 sui::WindowBuilder::new()
                     .title("Files inspector local copy to SIFS")
-                    .root(
-                        SizedBox::new()
-                            .width(INSPECTOR_W)
-                            .height(720.0)
-                            .with_child(InspectorView::new(shared.clone())),
-                    ),
+                    .root(selection_context_menu_for_test(&shared)),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
@@ -26086,7 +26204,11 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Copy to SIFS artifact.txt")
+            .with_name("Open selection actions")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::MenuItem)
+            .with_name("Copy to SIFS")
             .click()?;
 
         let files = shared.files();
@@ -26540,22 +26662,29 @@ mod tests {
             if width < WIDE_THRESHOLD {
                 let more =
                     named_bounds(&snapshot, sui::SemanticsRole::Button, "More file commands");
+                let actions = named_bounds(
+                    &snapshot,
+                    sui::SemanticsRole::Button,
+                    "Selected item actions",
+                );
                 let inspector =
-                    named_bounds(&snapshot, sui::SemanticsRole::Button, "Open file inspector");
+                    named_bounds(&snapshot, sui::SemanticsRole::Button, "Open selection info");
                 let location = named_bounds(
                     &snapshot,
                     sui::SemanticsRole::Text,
                     r"Current Local files path C:\workspace\sinomo\src",
                 );
                 eprintln!(
-                    "compact header width={width:.0} location={location:?} more={more:?} inspector={inspector:?}"
+                    "compact header width={width:.0} location={location:?} more={more:?} actions={actions:?} inspector={inspector:?}"
                 );
                 assert!(
-                    more.x() >= width - 80.0,
+                    more.x() >= width - 120.0,
                     "compact commands did not trail the filling location: {more:?}"
                 );
-                assert!(more.max_x() <= inspector.x());
+                assert!(more.max_x() <= actions.x());
+                assert!(actions.max_x() <= inspector.x());
                 assert_inside(inspector, width, HEADER_H, "compact inspector");
+                assert_inside(actions, width, HEADER_H, "compact selection actions");
                 assert!(location.width() >= 200.0 && location.height() <= HEADER_H);
                 assert_inside(more, width, 720.0, "compact command overflow");
                 window
@@ -26595,7 +26724,7 @@ mod tests {
                 window.advance_time(1.0)?;
                 window.run_until_idle()?;
                 snapshot = window.snapshot()?;
-                for name in ["Go to path", "Rename", "Delete selected item"] {
+                for name in ["Go to path", "New file", "New folder"] {
                     let bounds = named_bounds(&snapshot, sui::SemanticsRole::Button, name);
                     eprintln!("overflow width={width:.0} {name}: {bounds:?}");
                     assert_inside(bounds, width, 720.0, name);
