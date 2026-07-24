@@ -2607,11 +2607,24 @@ impl ReplicatedKvNode {
                 }
                 continue;
             }
-            if self
+            if let Ok(existing_position) = self
                 .log
-                .iter()
-                .any(|existing| existing.index == entry.index)
+                .binary_search_by_key(&entry.index, |existing| existing.index)
             {
+                let existing = &self.log[existing_position];
+                if existing.term != entry.term
+                    || existing.request_id != entry.request_id
+                    || existing.command != entry.command
+                {
+                    // Conflict replacement is append-only in the live WAL. If a
+                    // snapshot becomes durable before compaction rewrites that WAL,
+                    // recovery can see both the superseded entry and its replacement
+                    // below applied_index. Replay must preserve the later record just
+                    // as AppendEntries did, then rewrite the canonical tail.
+                    self.log.truncate(existing_position);
+                    self.log.push(entry);
+                    truncated = true;
+                }
                 continue;
             }
             let contiguous = match self.log.last() {
