@@ -10054,113 +10054,6 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             })
     };
 
-    let placement_activity = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::History, "Reconciliation activity")
-            .theme_when(clone_reader(reader))
-            .selected_when({
-                let s = s.clone();
-                move || s.files().placement_activity_open
-            })
-            .on_press_with_ctx(move |ctx| {
-                let waker = { s.borrow().waker.clone() };
-                s.files_mut().open_placement_activity(waker);
-                request_files_overlay_rebuild(ctx);
-            })
-    };
-
-    let go_to = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::Search, "Go to path")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || !s.files().loading
-            })
-            .on_press_with_ctx(move |ctx| {
-                s.files_mut().open_action_prompt(FileActionPromptKind::GoTo);
-                request_files_overlay_rebuild(ctx);
-            })
-    };
-
-    let open_local_file = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::FileText, "Open local file")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || !s.files().picker_lane.is_pending()
-            })
-            .on_press(move || {
-                let waker = { s.borrow().waker.clone() };
-                s.files_mut()
-                    .request_native_picker(FilesPickerAction::OpenFile, waker);
-            })
-    };
-
-    let open_local_folder = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::Folder, "Choose local folder")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || !s.files().picker_lane.is_pending()
-            })
-            .on_press(move || {
-                let waker = { s.borrow().waker.clone() };
-                s.files_mut()
-                    .request_native_picker(FilesPickerAction::OpenFolder, waker);
-            })
-    };
-
-    let import_files = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::Attach, "Import files")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || {
-                    let files = s.files();
-                    files.can_modify_current_location() && !files.picker_lane.is_pending()
-                }
-            })
-            .on_press(move || {
-                let waker = { s.borrow().waker.clone() };
-                s.files_mut()
-                    .request_native_picker(FilesPickerAction::ImportFiles, waker);
-            })
-    };
-
-    let new_file = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::File, "New file")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || s.files().can_modify_current_location()
-            })
-            .on_press_with_ctx(move |ctx| {
-                s.files_mut()
-                    .open_action_prompt(FileActionPromptKind::NewFile);
-                request_files_overlay_rebuild(ctx);
-            })
-    };
-
-    let new_folder = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::Folder, "New folder")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || s.files().can_modify_current_location()
-            })
-            .on_press_with_ctx(move |ctx| {
-                s.files_mut()
-                    .open_action_prompt(FileActionPromptKind::NewFolder);
-                request_files_overlay_rebuild(ctx);
-            })
-    };
-
     let toolbar_row = Flex::horizontal()
         .main_gap(HEADER_COMMAND_GAP)
         .align_items(Alignment::Center)
@@ -10188,34 +10081,6 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 reader,
             ),
             FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("Reconciliation activity", placement_activity, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("Open local file", open_local_file, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("Choose local folder", open_local_folder, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("Import files", import_files, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("Go to path", go_to, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("New file", new_file, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("New folder", new_folder, reader),
-            FlexItem::new().no_shrink(),
         );
 
     Stack::vertical()
@@ -10226,8 +10091,8 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 }
 
 /// Intermediate desktop header used while the inspector is still visible but the complete
-/// command row would overflow. File/folder pickers stay first-class; path entry and mutation
-/// commands remain available through the same keyboard-focusable overflow sheet as narrow Files.
+/// command row would overflow. It preserves navigation and moves location commands into the same
+/// context menu as the full desktop header.
 fn picker_first_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let crumbs = shared.files().crumbs();
     let current = crumbs.len().saturating_sub(1);
@@ -10308,51 +10173,6 @@ fn picker_first_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
                 }
             })
     };
-    let open_local_file = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::FileText, "Open local file")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || !s.files().picker_lane.is_pending()
-            })
-            .on_press(move || {
-                let waker = { s.borrow().waker.clone() };
-                s.files_mut()
-                    .request_native_picker(FilesPickerAction::OpenFile, waker);
-            })
-    };
-    let open_local_folder = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::Folder, "Choose local folder")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || !s.files().picker_lane.is_pending()
-            })
-            .on_press(move || {
-                let waker = { s.borrow().waker.clone() };
-                s.files_mut()
-                    .request_native_picker(FilesPickerAction::OpenFolder, waker);
-            })
-    };
-    let import_files = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::Attach, "Import files")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || {
-                    let files = s.files();
-                    files.can_modify_current_location() && !files.picker_lane.is_pending()
-                }
-            })
-            .on_press(move || {
-                let waker = { s.borrow().waker.clone() };
-                s.files_mut()
-                    .request_native_picker(FilesPickerAction::ImportFiles, waker);
-            })
-    };
     let refresh = {
         let s = shared.clone();
         IconButton::new(
@@ -10373,35 +10193,6 @@ fn picker_first_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
             s.files_mut().refresh(waker);
         })
     };
-    let placement_activity = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::History, "Reconciliation activity")
-            .theme_when(clone_reader(reader))
-            .selected_when({
-                let s = s.clone();
-                move || s.files().placement_activity_open
-            })
-            .on_press_with_ctx(move |ctx| {
-                let waker = { s.borrow().waker.clone() };
-                s.files_mut().open_placement_activity(waker);
-                request_files_overlay_rebuild(ctx);
-            })
-    };
-    let commands = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::MoreHorizontal, "More file commands")
-            .theme_when(clone_reader(reader))
-            .selected_when({
-                let s = s.clone();
-                move || s.files().compact_overlay == Some(CompactFilesOverlay::Commands)
-            })
-            .on_press_with_ctx(move |ctx| {
-                s.files_mut()
-                    .open_compact_overlay(CompactFilesOverlay::Commands);
-                request_files_overlay_rebuild(ctx);
-            })
-    };
-
     let toolbar_row = Flex::horizontal()
         .main_gap(HEADER_COMMAND_GAP)
         .align_items(Alignment::Center)
@@ -10414,31 +10205,11 @@ fn picker_first_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         )
         .with_item(breadcrumb, FlexItem::fill().min_width(96.0))
         .with_item(
-            toolbar_tooltip("Open local file", open_local_file, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("Choose local folder", open_local_folder, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("Import files", import_files, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
             toolbar_tooltip(
                 format!("Refresh {}", shared.files().source.label()),
                 refresh,
                 reader,
             ),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("Reconciliation activity", placement_activity, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("More file commands", commands, reader),
             FlexItem::new().no_shrink(),
         );
 
@@ -10851,6 +10622,7 @@ impl Widget for FileListContextTarget {
     }
 }
 
+#[cfg(test)]
 fn files_context_menu_items(files: &FilesState) -> Vec<MenuItem> {
     file_context_menu_entries(files, FileContextMenuTarget::Selection)
         .into_iter()
@@ -10882,11 +10654,11 @@ where
                 .map(|entry| entry.item)
                 .collect()
         })
-        .on_activate_with_ctx(move |ctx, index, item| {
-            let action = file_context_menu_entries(&action_shared.files(), action_target.get())
-                .get(index)
-                .filter(|entry| entry.item.label() == item.label())
-                .map(|entry| entry.action);
+        .on_activate_path_with_ctx(move |ctx, path, _item| {
+            let action = file_context_action_at_path(
+                &file_context_menu_entries(&action_shared.files(), action_target.get()),
+                &path,
+            );
             if let Some(action) = action {
                 activate_file_context_action(&action_shared, action, ctx);
             }
@@ -12645,6 +12417,8 @@ enum FileContextAction {
     AttachToChat,
     Copy,
     CopySelected,
+    CopyPath,
+    CopyPaths,
     CopyIdentifiers,
     Transfer,
     TransferSelected,
@@ -12666,7 +12440,11 @@ enum FileContextAction {
     NewFolder,
     ImportFiles,
     ImportFolder,
+    GoToPath,
+    OpenLocalFile,
+    OpenLocalFolder,
     RefreshFolder,
+    OpenPlacementActivity,
     RepairCurrentLocation,
     OpenCluster,
 }
@@ -12678,6 +12456,8 @@ impl FileContextAction {
             Self::AttachToChat => "Attach to current chat",
             Self::Copy => "Copy to",
             Self::CopySelected => "Copy selected to",
+            Self::CopyPath => "Copy path",
+            Self::CopyPaths => "Copy paths",
             Self::CopyIdentifiers => "Copy DFS identifiers",
             Self::Transfer => match source {
                 FilesSourceKind::Local => "Copy to SIFS",
@@ -12705,7 +12485,11 @@ impl FileContextAction {
             Self::NewFolder => "New folder",
             Self::ImportFiles => "Import files",
             Self::ImportFolder => "Import folder",
+            Self::GoToPath => "Go to path",
+            Self::OpenLocalFile => "Open local file",
+            Self::OpenLocalFolder => "Choose local folder",
             Self::RefreshFolder => "Refresh current folder",
+            Self::OpenPlacementActivity => "View reconciliation activity",
             Self::RepairCurrentLocation => "Repair current folder replicas",
             Self::OpenCluster => "Open Cluster",
         }
@@ -12726,7 +12510,9 @@ impl FileContextAction {
             | Self::NewFolder
             | Self::ImportFiles
             | Self::ImportFolder => 1,
-            Self::EditPlacement
+            Self::CopyPath
+            | Self::CopyPaths
+            | Self::EditPlacement
             | Self::RefreshPlacement
             | Self::RepairReplicas
             | Self::MakeMetadataPrimary
@@ -12736,21 +12522,22 @@ impl FileContextAction {
             | Self::UnpinContent
             | Self::CopyIdentifiers
             | Self::RefreshFolder
+            | Self::OpenPlacementActivity
             | Self::RepairCurrentLocation
             | Self::OpenCluster
-            | Self::ConnectionSettings => 2,
+            | Self::ConnectionSettings
+            | Self::GoToPath
+            | Self::OpenLocalFile
+            | Self::OpenLocalFolder => 2,
             Self::Delete | Self::DeleteSelected => 3,
         }
     }
 
     fn enabled(self, files: &FilesState) -> bool {
+        let can_read = files.loaded && !files.loading && files.error.is_none();
         let can_modify = files.can_modify_current_location();
         match self {
-            Self::Copy
-            | Self::CopySelected
-            | Self::Transfer
-            | Self::TransferSelected
-            | Self::Move
+            Self::Move
             | Self::MoveSelected
             | Self::Rename
             | Self::Delete
@@ -12759,8 +12546,12 @@ impl FileContextAction {
             | Self::NewFolder => can_modify,
             Self::ImportFiles | Self::ImportFolder => can_modify && !files.picker_lane.is_pending(),
             Self::RefreshFolder => !files.loading,
-            Self::AttachToChat => !files.attachment_loading,
+            Self::AttachToChat => can_read && !files.attachment_loading,
+            Self::OpenLocalFile | Self::OpenLocalFolder => !files.picker_lane.is_pending(),
+            Self::GoToPath => !files.loading,
             Self::Open
+            | Self::CopyPath
+            | Self::CopyPaths
             | Self::CopyIdentifiers
             | Self::EditPlacement
             | Self::RefreshPlacement
@@ -12771,8 +12562,10 @@ impl FileContextAction {
             | Self::PinContent
             | Self::UnpinContent
             | Self::ConnectionSettings
+            | Self::OpenPlacementActivity
             | Self::RepairCurrentLocation
             | Self::OpenCluster => true,
+            Self::Copy | Self::CopySelected | Self::Transfer | Self::TransferSelected => can_read,
         }
     }
 
@@ -12782,8 +12575,54 @@ impl FileContextAction {
 }
 
 struct FileContextMenuEntry {
-    action: FileContextAction,
+    action: Option<FileContextAction>,
     item: MenuItem,
+    children: Vec<FileContextMenuEntry>,
+}
+
+impl FileContextMenuEntry {
+    fn action(
+        action: FileContextAction,
+        files: &FilesState,
+        separator_before: bool,
+    ) -> FileContextMenuEntry {
+        let mut item = MenuItem::new(action.label(files.source));
+        if separator_before {
+            item = item.separator_before();
+        }
+        if !action.enabled(files) {
+            item = item.disabled();
+        }
+        if action.destructive() {
+            item = item.destructive();
+        }
+        FileContextMenuEntry {
+            action: Some(action),
+            item,
+            children: Vec::new(),
+        }
+    }
+
+    fn submenu(
+        label: impl Into<String>,
+        children: Vec<FileContextMenuEntry>,
+        separator_before: bool,
+    ) -> FileContextMenuEntry {
+        let mut item = MenuItem::new(label).submenu(
+            children
+                .iter()
+                .map(|entry| entry.item.clone())
+                .collect::<Vec<_>>(),
+        );
+        if separator_before {
+            item = item.separator_before();
+        }
+        FileContextMenuEntry {
+            action: None,
+            item,
+            children,
+        }
+    }
 }
 
 fn selection_context_actions(files: &FilesState) -> Vec<FileContextAction> {
@@ -12792,6 +12631,7 @@ fn selection_context_actions(files: &FilesState) -> Vec<FileContextAction> {
             FileContextAction::CopySelected,
             FileContextAction::MoveSelected,
             FileContextAction::TransferSelected,
+            FileContextAction::CopyPaths,
             FileContextAction::DeleteSelected,
         ];
     }
@@ -12808,6 +12648,7 @@ fn selection_context_actions(files: &FilesState) -> Vec<FileContextAction> {
     actions.push(FileContextAction::Move);
     actions.push(FileContextAction::Transfer);
     actions.push(FileContextAction::Rename);
+    actions.push(FileContextAction::CopyPath);
     if files.source == FilesSourceKind::Sifs {
         let metadata_needs_connection = files
             .details_error
@@ -12826,7 +12667,9 @@ fn selection_context_actions(files: &FilesState) -> Vec<FileContextAction> {
         actions.push(FileContextAction::RefreshPlacement);
         if !metadata_needs_connection && !files.details_loading {
             if let Some(details) = details {
-                actions.push(FileContextAction::RepairReplicas);
+                if sifs_needs_replica_repair(details) {
+                    actions.push(FileContextAction::RepairReplicas);
+                }
                 if sifs_can_make_metadata_primary(details) {
                     actions.push(FileContextAction::MakeMetadataPrimary);
                 }
@@ -12850,62 +12693,212 @@ fn selection_context_actions(files: &FilesState) -> Vec<FileContextAction> {
     actions
 }
 
-fn current_location_context_actions(files: &FilesState) -> Vec<FileContextAction> {
-    let mut actions = vec![
-        FileContextAction::NewFile,
-        FileContextAction::NewFolder,
-        FileContextAction::ImportFiles,
-        FileContextAction::ImportFolder,
-        FileContextAction::RefreshFolder,
-    ];
-    if files.source == FilesSourceKind::Sifs {
-        if files
-            .sifs_health
-            .as_ref()
-            .is_some_and(|health| health.pending_repair_count > 0)
-        {
-            actions.push(FileContextAction::RepairCurrentLocation);
-        }
-        if files.sifs_health.as_ref().is_some_and(|health| {
-            sifs_health_has_attention(health) || sifs_health_has_activity(health)
-        }) {
-            actions.push(FileContextAction::OpenCluster);
-        }
-        if files.sifs_health_error.is_some() || files.error.is_some() {
-            actions.push(FileContextAction::ConnectionSettings);
-        }
-    }
-    actions
+fn sifs_needs_replica_repair(details: &SifsObjectDetails) -> bool {
+    details.health.as_ref().is_some_and(|health| {
+        health.pending_repair_count > 0 || !health.missing_replica_nodes.is_empty()
+    })
 }
 
 fn file_context_menu_entries(
     files: &FilesState,
     target: FileContextMenuTarget,
 ) -> Vec<FileContextMenuEntry> {
-    let actions = match target {
-        FileContextMenuTarget::Selection => selection_context_actions(files),
-        FileContextMenuTarget::CurrentLocation => current_location_context_actions(files),
+    match target {
+        FileContextMenuTarget::Selection => selection_context_menu_entries(files),
+        FileContextMenuTarget::CurrentLocation => current_location_context_menu_entries(files),
+    }
+}
+
+fn action_entry(
+    action: FileContextAction,
+    files: &FilesState,
+    separator_before: bool,
+) -> FileContextMenuEntry {
+    FileContextMenuEntry::action(action, files, separator_before)
+}
+
+fn selection_context_menu_entries(files: &FilesState) -> Vec<FileContextMenuEntry> {
+    if files.marked_count() > 0 {
+        return vec![
+            action_entry(FileContextAction::CopySelected, files, false),
+            action_entry(FileContextAction::MoveSelected, files, false),
+            action_entry(FileContextAction::TransferSelected, files, false),
+            action_entry(FileContextAction::CopyPaths, files, true),
+            action_entry(FileContextAction::DeleteSelected, files, true),
+        ];
+    }
+
+    let Some(entry) = files.selected_entry() else {
+        return Vec::new();
     };
-    let mut previous_group = None;
-    actions
-        .into_iter()
-        .map(|action| {
-            let group = action.group();
-            let separator_before = previous_group.is_some_and(|previous| previous != group);
-            previous_group = Some(group);
-            let mut item = MenuItem::new(action.label(files.source));
-            if separator_before {
-                item = item.separator_before();
+    let mut entries = vec![action_entry(FileContextAction::Open, files, false)];
+    if !entry.is_dir {
+        entries.push(action_entry(FileContextAction::AttachToChat, files, false));
+    }
+    entries.extend([
+        action_entry(FileContextAction::Copy, files, true),
+        action_entry(FileContextAction::Move, files, false),
+        action_entry(FileContextAction::Transfer, files, false),
+        action_entry(FileContextAction::Rename, files, false),
+        action_entry(FileContextAction::CopyPath, files, true),
+    ]);
+
+    if files.source == FilesSourceKind::Sifs {
+        let details = files
+            .selected_details
+            .as_ref()
+            .filter(|details| details.path == entry.path);
+        let metadata_needs_connection = files
+            .details_error
+            .as_deref()
+            .is_some_and(sifs_metadata_error_needs_connection);
+        let mut placement = Vec::new();
+        if details.is_some_and(|details| details.placement.is_some()) {
+            placement.push(action_entry(FileContextAction::EditPlacement, files, false));
+        }
+        placement.push(action_entry(
+            FileContextAction::RefreshPlacement,
+            files,
+            false,
+        ));
+        if details.is_some_and(sifs_needs_replica_repair) {
+            placement.push(action_entry(
+                FileContextAction::RepairReplicas,
+                files,
+                false,
+            ));
+        }
+
+        let mut device = Vec::new();
+        if let Some(details) = details.filter(|_| !metadata_needs_connection) {
+            device.push(action_entry(
+                if sifs_has_local_pin(details, "metadata") {
+                    FileContextAction::UnpinMetadata
+                } else {
+                    FileContextAction::PinMetadata
+                },
+                files,
+                false,
+            ));
+            if !entry.is_dir && !entry.is_link {
+                device.push(action_entry(
+                    if sifs_has_local_pin(details, "content") {
+                        FileContextAction::UnpinContent
+                    } else {
+                        FileContextAction::PinContent
+                    },
+                    files,
+                    false,
+                ));
             }
-            if !action.enabled(files) {
-                item = item.disabled();
+            if sifs_can_make_metadata_primary(details) {
+                device.push(action_entry(
+                    FileContextAction::MakeMetadataPrimary,
+                    files,
+                    false,
+                ));
             }
-            if action.destructive() {
-                item = item.destructive();
-            }
-            FileContextMenuEntry { action, item }
-        })
-        .collect()
+        }
+
+        let mut sifs = vec![FileContextMenuEntry::submenu("Placement", placement, false)];
+        if !device.is_empty() {
+            sifs.push(FileContextMenuEntry::submenu("This device", device, false));
+        }
+        if details.is_some() && !metadata_needs_connection {
+            sifs.push(action_entry(
+                FileContextAction::CopyIdentifiers,
+                files,
+                true,
+            ));
+        }
+        if metadata_needs_connection {
+            sifs.push(action_entry(
+                FileContextAction::ConnectionSettings,
+                files,
+                true,
+            ));
+        }
+        entries.push(FileContextMenuEntry::submenu("SIFS", sifs, false));
+    }
+    entries.push(action_entry(FileContextAction::Delete, files, true));
+    entries
+}
+
+fn current_location_context_menu_entries(files: &FilesState) -> Vec<FileContextMenuEntry> {
+    let mut entries = vec![
+        FileContextMenuEntry::submenu(
+            "New",
+            vec![
+                action_entry(FileContextAction::NewFile, files, false),
+                action_entry(FileContextAction::NewFolder, files, false),
+            ],
+            false,
+        ),
+        FileContextMenuEntry::submenu(
+            "Import",
+            vec![
+                action_entry(FileContextAction::ImportFiles, files, false),
+                action_entry(FileContextAction::ImportFolder, files, false),
+            ],
+            false,
+        ),
+        FileContextMenuEntry::submenu(
+            "Open local",
+            vec![
+                action_entry(FileContextAction::OpenLocalFile, files, false),
+                action_entry(FileContextAction::OpenLocalFolder, files, false),
+            ],
+            false,
+        ),
+        action_entry(FileContextAction::GoToPath, files, true),
+        action_entry(FileContextAction::RefreshFolder, files, false),
+    ];
+
+    if files.source == FilesSourceKind::Sifs {
+        let mut sifs = vec![action_entry(
+            FileContextAction::OpenPlacementActivity,
+            files,
+            false,
+        )];
+        if files
+            .sifs_health
+            .as_ref()
+            .is_some_and(|health| health.pending_repair_count > 0)
+        {
+            sifs.push(action_entry(
+                FileContextAction::RepairCurrentLocation,
+                files,
+                false,
+            ));
+        }
+        if files.sifs_health.as_ref().is_some_and(|health| {
+            sifs_health_has_attention(health) || sifs_health_has_activity(health)
+        }) {
+            sifs.push(action_entry(FileContextAction::OpenCluster, files, false));
+        }
+        if files.sifs_health_error.is_some() || files.error.is_some() {
+            sifs.push(action_entry(
+                FileContextAction::ConnectionSettings,
+                files,
+                true,
+            ));
+        }
+        entries.push(FileContextMenuEntry::submenu("SIFS", sifs, true));
+    }
+    entries
+}
+
+fn file_context_action_at_path(
+    entries: &[FileContextMenuEntry],
+    path: &[usize],
+) -> Option<FileContextAction> {
+    let (index, rest) = path.split_first()?;
+    let entry = entries.get(*index)?;
+    if rest.is_empty() {
+        entry.action
+    } else {
+        file_context_action_at_path(&entry.children, rest)
+    }
 }
 
 fn sifs_identifiers_for_clipboard(details: &SifsObjectDetails) -> String {
@@ -13187,6 +13180,27 @@ fn activate_file_context_action(shared: &Shared, action: FileContextAction, ctx:
         FileContextAction::CopySelected => shared
             .files_mut()
             .open_action_prompt(FileActionPromptKind::CopySelected),
+        FileContextAction::CopyPath => {
+            let value = shared
+                .files()
+                .selected_entry()
+                .map(|entry| entry.path.clone());
+            if let Some(value) = value {
+                ctx.set_clipboard_text(value);
+            }
+        }
+        FileContextAction::CopyPaths => {
+            let value = shared
+                .files()
+                .marked_targets()
+                .into_iter()
+                .map(|target| target.path)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !value.is_empty() {
+                ctx.set_clipboard_text(value);
+            }
+        }
         FileContextAction::Transfer => {
             let kind = match shared.files().source {
                 FilesSourceKind::Local => FileActionPromptKind::CopyToSifs,
@@ -13277,7 +13291,25 @@ fn activate_file_context_action(shared: &Shared, action: FileContextAction, ctx:
                 .files_mut()
                 .request_native_picker(picker_action, waker);
         }
+        FileContextAction::GoToPath => shared
+            .files_mut()
+            .open_action_prompt(FileActionPromptKind::GoTo),
+        FileContextAction::OpenLocalFile | FileContextAction::OpenLocalFolder => {
+            let picker_action = if action == FileContextAction::OpenLocalFile {
+                FilesPickerAction::OpenFile
+            } else {
+                FilesPickerAction::OpenFolder
+            };
+            let waker = { shared.borrow().waker.clone() };
+            shared
+                .files_mut()
+                .request_native_picker(picker_action, waker);
+        }
         FileContextAction::RefreshFolder => shared.files_mut().reload(),
+        FileContextAction::OpenPlacementActivity => {
+            let waker = { shared.borrow().waker.clone() };
+            shared.files_mut().open_placement_activity(waker);
+        }
         FileContextAction::RepairCurrentLocation => {
             let waker = { shared.borrow().waker.clone() };
             shared
@@ -13539,6 +13571,23 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
                 .theme_when(clone_reader(reader))
                 .max_value_lines(6),
         );
+    let modified = match files.source {
+        FilesSourceKind::Sifs => {
+            details.map(|details| unix_nanos_label(details.modified_at_unix_nanos))
+        }
+        FilesSourceKind::Local => files
+            .selected_local_details
+            .as_ref()
+            .and_then(|details| details.modified_at_unix_nanos)
+            .map(unix_nanos_label),
+    };
+    if let Some(modified) = modified {
+        selected_body = selected_body.with_child(
+            DetailRow::new("Modified", modified)
+                .theme_when(clone_reader(reader))
+                .max_value_lines(2),
+        );
+    }
     if files.attachment_loading {
         selected_body = selected_body.with_child(
             StatusBadge::new("Preparing chat attachment")
@@ -17192,18 +17241,17 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
 
 fn compact_file_selection_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let source = shared.files().source;
-    let entries = file_context_menu_entries(&shared.files(), FileContextMenuTarget::Selection);
+    let actions_for_selection = selection_context_actions(&shared.files());
     let mut previous_group = None;
     let mut actions = Stack::vertical().alignment(Alignment::Stretch).spacing(6.0);
 
-    for entry in entries {
-        let group = entry.action.group();
+    for action in actions_for_selection {
+        let group = action.group();
         if previous_group.is_some_and(|previous| previous != group) {
             actions = actions.with_child(Separator::horizontal().theme_when(clone_reader(reader)));
         }
         previous_group = Some(group);
 
-        let action = entry.action;
         let enabled = action.enabled(&shared.files());
         let destructive = action.destructive();
         let action_shared = shared.clone();
@@ -17536,6 +17584,16 @@ mod tests {
             false,
             sui::Button::new("Open selection actions").theme_when(clone_reader(&reader)),
         )
+    }
+
+    fn hover_menu_path(window: &sui_testing::TestWindow, labels: &[&str]) -> sui::Result<()> {
+        for label in labels {
+            window
+                .get_by_role(sui::SemanticsRole::MenuItem)
+                .with_name(*label)
+                .hover()?;
+        }
+        Ok(())
     }
 
     fn test_sifs_details(local_pins: Vec<SifsPinDetails>) -> SifsObjectDetails {
@@ -20133,20 +20191,10 @@ mod tests {
                 720.0,
             ))))?;
         app.run_until_idle()?;
-        let wide_id = window
-            .snapshot()?
-            .accessibility
-            .nodes
-            .into_iter()
-            .find(|node| {
-                node.role == SemanticsRole::Button
-                    && node.name.as_deref() == Some("More file commands")
-            })
-            .expect("wide file command semantics")
-            .id;
-        assert_ne!(
-            wide_id, compact_id,
-            "each retained branch has its own controls"
+        assert_eq!(
+            more().count()?,
+            0,
+            "desktop Files should reserve commands for context menus"
         );
 
         window
@@ -21734,6 +21782,7 @@ mod tests {
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Open current location menu")
             .click()?;
+        hover_menu_path(&window, &["SIFS"])?;
         window
             .get_by_role(sui::SemanticsRole::MenuItem)
             .with_name("Repair current folder replicas")
@@ -21796,6 +21845,7 @@ mod tests {
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Open current location menu")
             .click()?;
+        hover_menu_path(&window, &["SIFS"])?;
         window
             .get_by_role(sui::SemanticsRole::MenuItem)
             .with_name("Open Cluster")
@@ -21840,6 +21890,7 @@ mod tests {
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Open current location menu")
             .click()?;
+        hover_menu_path(&window, &["SIFS"])?;
         window
             .get_by_role(sui::SemanticsRole::MenuItem)
             .with_name("Connection settings")
@@ -23731,16 +23782,21 @@ mod tests {
         let window = app.main_window()?;
         let snapshot = window.snapshot()?;
 
-        for name in ["New file", "New folder"] {
+        let files = shared.files();
+        let entries = current_location_context_menu_entries(&files);
+        let new_actions = entries
+            .iter()
+            .find(|entry| entry.item.label() == "New")
+            .expect("New submenu");
+        for entry in &new_actions.children {
+            let action = entry.action.expect("New submenu action");
             assert!(
-                snapshot.accessibility.nodes.iter().any(|node| {
-                    node.role == sui::SemanticsRole::Button
-                        && node.name.as_deref() == Some(name)
-                        && node.state.disabled
-                }),
-                "{name} should be disabled while the current SIFS location is unavailable"
+                !action.enabled(&files),
+                "{} should be disabled while the current SIFS location is unavailable",
+                action.label(files.source)
             );
         }
+        drop(files);
         for name in ["Retry SIFS", "Connection settings", "Browse local files"] {
             assert!(
                 snapshot.accessibility.nodes.iter().any(|node| {
@@ -23912,7 +23968,8 @@ mod tests {
                 .get_by_role(sui::SemanticsRole::Button)
                 .with_name("Go to path")
                 .count()?,
-            1
+            0,
+            "path entry belongs in the current-location context menu"
         );
 
         Ok(())
@@ -23988,7 +24045,7 @@ mod tests {
     }
 
     #[test]
-    fn header_go_to_path_opens_current_path_prompt() -> sui::Result<()> {
+    fn current_location_context_menu_go_to_path_opens_current_path_prompt() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -24003,7 +24060,7 @@ mod tests {
             .window(
                 sui::WindowBuilder::new()
                     .title("Files go to path")
-                    .root(view(shared.clone())),
+                    .root(current_location_context_menu_for_test(&shared)),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
@@ -24011,6 +24068,10 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
+            .with_name("Open current location menu")
+            .click()?;
+        window
+            .get_by_role(sui::SemanticsRole::MenuItem)
             .with_name("Go to path")
             .click()?;
 
@@ -24273,11 +24334,28 @@ mod tests {
         }];
         files.selected = Some(0);
 
-        let labels = files_context_menu_items(&files)
-            .into_iter()
+        let items = files_context_menu_items(&files);
+        let labels = items
+            .iter()
             .map(|item| item.label().to_string())
             .collect::<Vec<_>>();
         assert!(labels.iter().any(|label| label == "Download"));
+        assert!(labels.iter().any(|label| label == "Copy path"));
+        let sifs = items
+            .iter()
+            .find(|item| item.label() == "SIFS")
+            .expect("SIFS submenu");
+        let placement = sifs
+            .submenu_items()
+            .iter()
+            .find(|item| item.label() == "Placement")
+            .expect("Placement submenu");
+        assert!(
+            placement
+                .submenu_items()
+                .iter()
+                .any(|item| item.label() == "Refresh placement")
+        );
         assert!(!labels.iter().any(|label| label == "Copy to SIFS"));
 
         files.marked_entries.insert(0);
@@ -24289,6 +24367,7 @@ mod tests {
             "Copy selected to",
             "Move selected to",
             "Download selected",
+            "Copy paths",
             "Delete selected",
         ] {
             assert!(labels.iter().any(|item| item == label));
@@ -24540,7 +24619,7 @@ mod tests {
     }
 
     #[test]
-    fn files_header_keeps_global_commands_usable_for_long_paths() -> sui::Result<()> {
+    fn files_header_keeps_navigation_usable_for_long_paths() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         let long_path =
@@ -24579,8 +24658,9 @@ mod tests {
         let snapshot = window.snapshot()?;
 
         for (label, name) in [
-            ("Open local file", "Open local file"),
-            ("New folder", "New folder"),
+            ("Back", "Back"),
+            ("Up", "Up"),
+            ("Refresh", "Refresh Local files"),
         ] {
             let node = snapshot
                 .accessibility
@@ -24601,7 +24681,13 @@ mod tests {
                 node.bounds
             );
         }
-        for item_action in ["Rename", "Delete selected item", "Repair replicas"] {
+        for item_action in [
+            "Open local file",
+            "New folder",
+            "Rename",
+            "Delete selected item",
+            "Repair replicas",
+        ] {
             assert_eq!(
                 window
                     .get_by_role(sui::SemanticsRole::Button)
@@ -24835,6 +24921,7 @@ mod tests {
         window_root.dispatch_event(Event::Pointer(up))?;
         app.run_until_idle()?;
 
+        hover_menu_path(&window, &["SIFS", "Placement"])?;
         window
             .get_by_role(sui::SemanticsRole::MenuItem)
             .with_name("Repair replicas")
@@ -25772,6 +25859,15 @@ mod tests {
                 local_is_primary: false,
                 local_is_replica: true,
             });
+            details.health = Some(SifsObjectHealth {
+                agent_state: "pending-repair".to_string(),
+                version_count: 1,
+                receipt_count: 1,
+                intent_count: 1,
+                open_conflict_count: 0,
+                pending_repair_count: 1,
+                missing_replica_nodes: vec!["node-c".to_string()],
+            });
             files.selected_details = Some(details);
             files.worker_tx = Some(tx);
             files.worker_rx = Some(result_rx);
@@ -25830,6 +25926,7 @@ mod tests {
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Open selection actions")
             .click()?;
+        hover_menu_path(&window, &["SIFS", "Placement"])?;
         window
             .get_by_role(sui::SemanticsRole::MenuItem)
             .with_name("Refresh placement")
@@ -25857,6 +25954,7 @@ mod tests {
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Open selection actions")
             .click()?;
+        hover_menu_path(&window, &["SIFS", "Placement"])?;
         window
             .get_by_role(sui::SemanticsRole::MenuItem)
             .with_name("Repair replicas")
@@ -25884,6 +25982,7 @@ mod tests {
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Open selection actions")
             .click()?;
+        hover_menu_path(&window, &["SIFS", "This device"])?;
         window
             .get_by_role(sui::SemanticsRole::MenuItem)
             .with_name("Make metadata primary")
@@ -25911,6 +26010,7 @@ mod tests {
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Open selection actions")
             .click()?;
+        hover_menu_path(&window, &["SIFS", "This device"])?;
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::MenuItem)
@@ -25946,6 +26046,7 @@ mod tests {
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Open selection actions")
             .click()?;
+        hover_menu_path(&window, &["SIFS", "This device"])?;
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::MenuItem)
@@ -26032,6 +26133,7 @@ mod tests {
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Open selection actions")
             .click()?;
+        hover_menu_path(&window, &["SIFS", "This device"])?;
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::MenuItem)
@@ -26067,6 +26169,7 @@ mod tests {
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Open selection actions")
             .click()?;
+        hover_menu_path(&window, &["SIFS", "This device"])?;
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::MenuItem)
@@ -26135,6 +26238,7 @@ mod tests {
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Open selection actions")
             .click()?;
+        hover_menu_path(&window, &["SIFS"])?;
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::MenuItem)
@@ -26712,28 +26816,24 @@ mod tests {
                     "Import files",
                     "More file commands",
                 ] {
-                    let bounds = named_bounds(&snapshot, sui::SemanticsRole::Button, name);
-                    eprintln!("toolbar width={width:.0} {name}: {bounds:?}");
-                    assert_inside(bounds, width, HEADER_H, name);
-                    assert!(bounds.width() >= 28.0 && bounds.height() >= 28.0);
+                    assert_eq!(
+                        window
+                            .get_by_role(sui::SemanticsRole::Button)
+                            .with_name(name)
+                            .count()?,
+                        0,
+                        "{name} should not duplicate the desktop context menu"
+                    );
                 }
-                window
-                    .get_by_role(sui::SemanticsRole::Button)
-                    .with_name("More file commands")
-                    .click()?;
-                window.advance_time(1.0)?;
-                window.run_until_idle()?;
-                snapshot = window.snapshot()?;
-                for name in ["Go to path", "New file", "New folder"] {
+                for name in ["Back", "Forward", "Up", "Refresh Local files"] {
                     let bounds = named_bounds(&snapshot, sui::SemanticsRole::Button, name);
-                    eprintln!("overflow width={width:.0} {name}: {bounds:?}");
-                    assert_inside(bounds, width, 720.0, name);
-                    assert!(bounds.width() >= 32.0 && bounds.height() >= 32.0);
+                    assert_inside(bounds, width, HEADER_H, name);
+                    assert!(bounds.width() >= 32.0 && bounds.height() >= 28.0);
                 }
             }
             window
                 .capture_screenshot()?
-                .write_png(artifact_dir.join(format!("command-overflow-{width:.0}.png")))?;
+                .write_png(artifact_dir.join(format!("toolbar-state-{width:.0}.png")))?;
 
             let shared = prepared_shared(true);
             let runtime = sui::Application::new()
