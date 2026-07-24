@@ -359,11 +359,46 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         created_object_path = routed_object_path;
                     }
                     if let Some((content_hash, content_size_bytes)) = manifest {
-                        self.write_distributed_eventual_from_remote_manifest_with_base_and_parent_touch(
+                        if command.requester_blob_pre_staged {
+                            self.write_distributed_eventual_from_remote_manifest_with_base_and_parent_touch(
+                                command.request,
+                                command.expected_base_version,
+                                content_hash,
+                                content_size_bytes,
+                                command.desired_replica_nodes,
+                                command.policy,
+                                created_object_path.is_some(),
+                                command.exclusive_create,
+                                write_foreground_replica_repair,
+                            )
+                        } else {
+                            self.write_distributed_eventual_from_ingested_manifest_with_base_and_parent_touch(
+                                command.request,
+                                command.expected_base_version,
+                                content_hash,
+                                content_size_bytes,
+                                command.desired_replica_nodes,
+                                command.policy,
+                                created_object_path.is_some(),
+                                command.exclusive_create,
+                                write_foreground_replica_repair,
+                            )
+                        }
+                    } else if !command.requester_blob_pre_staged {
+                        // Compatibility transports may materialize the owned
+                        // attachment back into the command. It is still a
+                        // primary-owned ingest: persist it once here and never
+                        // credit the requester with a replica it did not store.
+                        let manifest = self.content.put_object_version(
+                            command.request.object_id.as_str(),
+                            command.request.target_version.as_str(),
+                            &command.bytes,
+                        )?;
+                        self.write_distributed_eventual_from_ingested_manifest_with_base_and_parent_touch(
                             command.request,
                             command.expected_base_version,
-                            content_hash,
-                            content_size_bytes,
+                            manifest.content_hash,
+                            manifest.size_bytes,
                             command.desired_replica_nodes,
                             command.policy,
                             created_object_path.is_some(),
@@ -1012,6 +1047,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         command: &DfsDistributedWriteCommand,
         outcome: &NetworkedDfsWriteOutcome,
     ) {
+        if !command.requester_blob_pre_staged {
+            // A direct-to-primary streamed write leaves no payload on the
+            // requester. Publishing a manifest there would claim local
+            // readability for a blob the node does not own; the normal stage
+            // path publishes both blob and manifest if this node is selected
+            // as a replica.
+            return;
+        }
         let NetworkedDfsWriteOutcome::Committed {
             version,
             content_hash,

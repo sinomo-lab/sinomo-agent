@@ -23,20 +23,21 @@ use sinomo_core::network::{
 use sinomo_core::node::NodeId;
 
 use crate::{
-    AsyncDfsMessageTransport, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES, DfsBlobTransferResult,
-    DfsDirectReadClientResponse, DfsDirectReadClientResult, DfsDirectReadRequest, DfsError,
-    DfsMessageCommand, DfsMessageProcessReport, DfsMessageProcessResult, DfsMessageResponse,
-    DfsMessageTransport, DfsMessageTransportFuture, DfsMetadataJournalBatchCommand,
-    DfsMetadataJournalBatchResponse, DfsNetworkMessage, DfsOutboundAttachment, DfsReadData,
-    DfsReadResponse, DfsReadResult, DfsRoutedCall, DfsRoutedMessage, DfsRoutedSend,
-    DfsRoutedSendOutcome, DfsTransportIdentity, DistributedRepairJob, NetworkedDfsService,
-    NetworkedDfsServiceEvent, decode_dfs_message_rpc_response,
-    decode_dfs_metadata_journal_batch_rpc_response, dfs_direct_read_request_from_read_request,
-    dfs_direct_read_response_from_rpc_result, dfs_direct_read_rpc_call,
-    dfs_message_is_read_only_request, dfs_message_rpc_call, dfs_message_rpc_request,
-    dfs_metadata_journal_batch_rpc_call, dfs_network_message_allows_write_repair_progress,
-    dfs_perf_trace, dfs_perf_trace_enabled, dfs_rejection_is_commit_content_repair_pending,
-    dfs_rejection_is_replica_not_desired, retained_networked_dfs_service_events,
+    AsyncDfsMessageTransport, ContentManifest, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES,
+    DfsBlobTransferResult, DfsDirectReadClientResponse, DfsDirectReadClientResult,
+    DfsDirectReadRequest, DfsError, DfsMessageCommand, DfsMessageProcessReport,
+    DfsMessageProcessResult, DfsMessageResponse, DfsMessageTransport, DfsMessageTransportFuture,
+    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsNetworkMessage,
+    DfsOutboundAttachment, DfsReadData, DfsReadResponse, DfsReadResult, DfsRoutedCall,
+    DfsRoutedMessage, DfsRoutedSend, DfsRoutedSendOutcome, DfsTransportIdentity,
+    DistributedRepairJob, NetworkedDfsService, NetworkedDfsServiceEvent,
+    decode_dfs_message_rpc_response, decode_dfs_metadata_journal_batch_rpc_response,
+    dfs_direct_read_request_from_read_request, dfs_direct_read_response_from_rpc_result,
+    dfs_direct_read_rpc_call, dfs_message_is_read_only_request, dfs_message_rpc_call,
+    dfs_message_rpc_request, dfs_metadata_journal_batch_rpc_call,
+    dfs_network_message_allows_write_repair_progress, dfs_perf_trace, dfs_perf_trace_enabled,
+    dfs_rejection_is_commit_content_repair_pending, dfs_rejection_is_replica_not_desired,
+    retained_networked_dfs_service_events,
 };
 #[cfg(test)]
 use crate::{
@@ -3252,6 +3253,7 @@ mod tests {
                 bytes: Vec::new(),
                 content_hash: Some(format!("blake3:write-{frame_id}")),
                 content_size_bytes: Some(0),
+                requester_blob_pre_staged: true,
                 desired_replica_nodes: vec![source.clone()],
                 policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
                 object_metadata: None,
@@ -6638,8 +6640,16 @@ impl NetworkedDfsService<DfsNodeServedMessageTransport> {
         &mut self,
         command: DfsMessageCommand,
     ) -> DfsMessageProcessReport {
+        self.process_message_command_report_with_preingested_stage_blob(command, None)
+    }
+
+    pub fn process_message_command_report_with_preingested_stage_blob(
+        &mut self,
+        command: DfsMessageCommand,
+        preingested_stage_blob: Option<ContentManifest>,
+    ) -> DfsMessageProcessReport {
         self.begin_message_committed_work();
-        let outcome = self.process_message_command_inner(command);
+        let outcome = self.process_message_command_inner(command, preingested_stage_blob);
         let committed_work = self.take_message_committed_work();
         DfsMessageProcessReport {
             outcome,
@@ -6650,6 +6660,7 @@ impl NetworkedDfsService<DfsNodeServedMessageTransport> {
     fn process_message_command_inner(
         &mut self,
         command: DfsMessageCommand,
+        preingested_stage_blob: Option<ContentManifest>,
     ) -> Result<DfsMessageProcessResult, DfsError> {
         let request_id = command.request_id;
         let allow_write_repair_progress =
@@ -6659,7 +6670,28 @@ impl NetworkedDfsService<DfsNodeServedMessageTransport> {
         self.transport
             .begin_message(&command.routed_message)
             .map_err(DfsError::from_network)?;
-        let mut events = match self.process_served_routed_messages(vec![command.routed_message]) {
+        let initial = if let Some(manifest) = preingested_stage_blob {
+            let routed = command.routed_message;
+            if routed.target_node_id != self.node_id {
+                Err(DfsError::Network {
+                    message: format!(
+                        "dfs message target {} does not match local node {}",
+                        routed.target_node_id, self.node_id
+                    ),
+                })
+            } else if let DfsNetworkMessage::StageBlob(command) = routed.message {
+                self.handle_preingested_stage_blob(routed.source_node_id, command, manifest)
+                    .map(|event| vec![event])
+            } else {
+                Err(DfsError::Distributed {
+                    message: "preingested DFS attachment did not carry a stage-blob command"
+                        .to_string(),
+                })
+            }
+        } else {
+            self.process_served_routed_messages(vec![command.routed_message])
+        };
+        let mut events = match initial {
             Ok(events) => events,
             Err(error) => {
                 self.transport.finish_message();

@@ -6,10 +6,12 @@
 
 use crate::{
     DfsMessageCommand, DfsMessageResponse, DfsNamespaceOperation, DfsNamespaceTransaction,
-    DfsNetworkMessage, DfsReadResult, content_hash,
+    DfsNetworkMessage, DfsReadResult,
 };
 use serde::{Deserialize, Serialize};
-use sinomo_core::network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse, SinomoObjectCodec};
+use sinomo_core::network::{
+    NetworkError, ObjectRpcIncomingBody, ObjectRpcRequest, ObjectRpcResponse, SinomoObjectCodec,
+};
 
 /// Integrity contract for one DFS request or response attachment.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -215,13 +217,21 @@ fn validate_attachment(
             descriptor.total_size_bytes
         )));
     }
-    if let Some(expected_hash) = descriptor.content_hash.as_deref() {
-        let actual_hash = content_hash(bytes);
-        if actual_hash != expected_hash {
-            return Err(serialization_error(format!(
-                "{operation} attachment hash mismatch: expected {expected_hash}, actual {actual_hash}"
-            )));
-        }
+    Ok(())
+}
+
+pub(crate) fn validate_incoming_attachment_length(
+    descriptor: &DfsRpcAttachmentDescriptor,
+    body: &ObjectRpcIncomingBody,
+    operation: &str,
+) -> Result<(), NetworkError> {
+    if let Some(actual_size) = body.total_bytes()
+        && actual_size != descriptor.total_size_bytes
+    {
+        return Err(serialization_error(format!(
+            "{operation} attachment length mismatch: expected {}, actual {actual_size}",
+            descriptor.total_size_bytes
+        )));
     }
     Ok(())
 }
@@ -246,7 +256,10 @@ fn serialization_error(detail: impl Into<String>) -> NetworkError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DfsFileSystemId, DfsObjectId, DfsRoutedMessage, DfsStageBlobCommand, DfsVersion};
+    use crate::{
+        DfsFileSystemId, DfsObjectId, DfsRoutedMessage, DfsStageBlobCommand, DfsVersion,
+        content_hash,
+    };
     use sinomo_core::node::NodeId;
 
     fn stage_blob_command(bytes: Vec<u8>) -> DfsMessageCommand {
@@ -302,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn request_attachment_rejects_hash_mismatch() {
+    fn request_attachment_defers_content_hash_validation_to_dfs_storage() {
         let mut bytes = vec![1, 2, 3, 4];
         let command = stage_blob_command(Vec::new());
         let descriptor = DfsRpcAttachmentDescriptor {
@@ -310,15 +323,18 @@ mod tests {
             content_hash: Some(content_hash(&bytes)),
         };
         bytes[0] ^= 0xff;
-        let error = attach_dfs_message_request_attachment(
+        let attached = attach_dfs_message_request_attachment(
             DfsAttachmentMessageCommand {
                 command,
                 attachment: descriptor,
             },
-            bytes,
+            bytes.clone(),
         )
-        .expect_err("hash mismatch");
-        assert!(error.to_string().contains("hash mismatch"));
+        .expect("reliable transport does not duplicate application digest validation");
+        let DfsNetworkMessage::StageBlob(command) = attached.routed_message.message else {
+            panic!("expected stage blob");
+        };
+        assert_eq!(command.bytes, bytes);
     }
 
     #[test]

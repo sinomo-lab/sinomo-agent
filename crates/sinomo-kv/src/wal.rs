@@ -513,18 +513,18 @@ pub(crate) fn read_wal_entries(
     let mut entries = Vec::new();
     let mut truncated = false;
     let mut record_number = 0;
+    let file_len = file
+        .metadata()
+        .map_err(|source| KvError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?
+        .len();
     loop {
         let record_start = file.stream_position().map_err(|source| KvError::Io {
             path: path.display().to_string(),
             detail: source.to_string(),
         })?;
-        let file_len = file
-            .metadata()
-            .map_err(|source| KvError::Io {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            })?
-            .len();
         let record = match durable_file::read_length_prefixed_record(
             &mut file,
             path,

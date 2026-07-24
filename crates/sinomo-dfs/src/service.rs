@@ -39,7 +39,7 @@ use crate::{
 use sinomo_core::local::SinomoDataDir;
 #[cfg(test)]
 use sinomo_core::network::ObjectRpcResponse;
-use sinomo_core::network::{ClusterPaths, ObjectRpcRequest};
+use sinomo_core::network::{ClusterPaths, ObjectRpcIncomingBody, ObjectRpcRequest};
 use sinomo_core::node::NodeId;
 
 use sinomo_core::service::{
@@ -176,8 +176,20 @@ pub trait DfsDataPlaneHost: Send + Sync {
     fn handle_message<'a>(
         &'a self,
         command: DfsMessageCommand,
+        attachment: Option<DfsInboundAttachment>,
         traceparent: Option<String>,
     ) -> DfsDataPlaneHostFuture<'a, DfsDataPlaneResponse>;
+}
+
+/// An ownership-preserving DFS request attachment.
+///
+/// Whole-object data-plane handlers consume these chunks directly into the
+/// content store. Other attachment kinds retain their specialized decoding
+/// paths at the service boundary.
+#[derive(Debug)]
+pub struct DfsInboundAttachment {
+    pub descriptor: crate::DfsRpcAttachmentDescriptor,
+    pub body: ObjectRpcIncomingBody,
 }
 
 #[derive(Debug)]
@@ -397,21 +409,47 @@ impl Service for DfsDataPlaneService {
                     let authenticated_source_node_id =
                         authenticated_dfs_cluster_source_node_id(&ctx, route)?;
                     let traceparent = request.traceparent().map(ToString::to_string);
-                    let command = if !ctx.has_request_attachment() {
-                        ctx.decode_request_body::<DfsMessageCommand>(&request)
-                            .await?
+                    let (command, attachment) = if !ctx.has_request_attachment() {
+                        (
+                            ctx.decode_request_body::<DfsMessageCommand>(&request)
+                                .await?,
+                            None,
+                        )
                     } else {
                         let head: crate::body_rpc::DfsAttachmentMessageCommand =
                             ctx.decode_request_body(&request).await?;
                         let request_attachment = ctx.take_request_body();
-                        let max_bytes =
-                            usize::try_from(head.attachment.total_size_bytes).map_err(|_| {
+                        crate::body_rpc::validate_incoming_attachment_length(
+                            &head.attachment,
+                            &request_attachment,
+                            "DFS request",
+                        )?;
+                        if matches!(
+                            &head.command.routed_message.message,
+                            crate::DfsNetworkMessage::StageBlob(_)
+                                | crate::DfsNetworkMessage::DistributedWriteRequest(_)
+                                | crate::DfsNetworkMessage::ExclusiveCreateRequest(_)
+                        ) {
+                            let attachment = DfsInboundAttachment {
+                                descriptor: head.attachment,
+                                body: request_attachment,
+                            };
+                            (head.command, Some(attachment))
+                        } else {
+                            let max_bytes = usize::try_from(head.attachment.total_size_bytes)
+                                .map_err(|_| {
                                 ServiceError::Service(format!(
                                     "DFS request attachment for {route} does not fit this platform address space"
                                 ))
                             })?;
-                        let bytes = request_attachment.collect_to_vec(max_bytes).await?;
-                        crate::body_rpc::attach_dfs_message_request_attachment(head, bytes)?
+                            let bytes = request_attachment.collect_to_vec(max_bytes).await?;
+                            (
+                                crate::body_rpc::attach_dfs_message_request_attachment(
+                                    head, bytes,
+                                )?,
+                                None,
+                            )
+                        }
                     };
                     if command.routed_message.source_node_id != authenticated_source_node_id {
                         return Err(ServiceError::Service(format!(
@@ -421,7 +459,7 @@ impl Service for DfsDataPlaneService {
                     }
                     let message_response = service
                         .host
-                        .handle_message(command, traceparent)
+                        .handle_message(command, attachment, traceparent)
                         .await
                         .map_err(service_error)?;
                     if let Some(attachment) = message_response.attachment {
@@ -810,6 +848,7 @@ mod tests {
         fn handle_message<'a>(
             &'a self,
             command: DfsMessageCommand,
+            _attachment: Option<DfsInboundAttachment>,
             traceparent: Option<String>,
         ) -> DfsDataPlaneHostFuture<'a, DfsDataPlaneResponse> {
             Box::pin(async move {

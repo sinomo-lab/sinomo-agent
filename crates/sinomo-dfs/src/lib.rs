@@ -500,7 +500,8 @@ pub type DfsVersion = sinomo_core::Id;
 
 pub use service::{
     DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture, DfsDataPlaneResponse,
-    DfsDataPlaneService, DfsService, register_data_plane_services, register_services,
+    DfsDataPlaneService, DfsInboundAttachment, DfsService, register_data_plane_services,
+    register_services,
 };
 pub(crate) use service_state::{
     ActiveReplicaStage, DFS_CONFLICT_SCAN_PAGE_SIZE, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES,

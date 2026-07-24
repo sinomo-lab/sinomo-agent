@@ -885,6 +885,7 @@ mod tests {
             bytes: Vec::new(),
             content_hash: Some("blake3:scope".to_string()),
             content_size_bytes: Some(0),
+            requester_blob_pre_staged: true,
             desired_replica_nodes: vec![requester],
             policy: DfsReplicationPolicy::new(1, 1).expect("replication policy"),
             object_metadata: None,

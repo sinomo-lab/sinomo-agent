@@ -30,7 +30,7 @@ use sinomo_runtime::dfs::{
     publish_cluster_dfs_metadata_journal_with_peer_transports_async,
     refresh_cluster_dfs_kv_snapshot_with_peer_transport, sifs_file_system_id,
 };
-use sinomo_runtime::kv::{KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
+use sinomo_runtime::kv::{KvError, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
@@ -2151,12 +2151,20 @@ fn refresh_sifs_cluster_kv_snapshot(
 #[derive(Clone, Debug)]
 struct SifsSnapshotControlPlaneKvClient {
     cluster_paths: ClusterPaths,
+    snapshot: Arc<Mutex<SifsKvSnapshotCache>>,
+}
+
+#[derive(Debug, Default)]
+struct SifsKvSnapshotCache {
+    loaded: bool,
+    snapshot: Option<Arc<KvSnapshot>>,
 }
 
 impl SifsSnapshotControlPlaneKvClient {
     fn new(cluster_paths: &ClusterPaths) -> Self {
         Self {
             cluster_paths: cluster_paths.clone(),
+            snapshot: Arc::new(Mutex::new(SifsKvSnapshotCache::default())),
         }
     }
 
@@ -2166,17 +2174,47 @@ impl SifsSnapshotControlPlaneKvClient {
             detail: detail.into(),
         }
     }
+
+    fn cached_snapshot(&self) -> Result<Option<Arc<KvSnapshot>>, KvError> {
+        {
+            let cache = self
+                .snapshot
+                .lock()
+                .map_err(|_| self.kv_error("SIFS snapshot cache lock is poisoned"))?;
+            if cache.loaded {
+                return Ok(cache.snapshot.clone());
+            }
+        }
+        let snapshot =
+            cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(&self.cluster_paths)
+                .map_err(|source| self.kv_error(source.to_string()))?;
+        let mut cache = self
+            .snapshot
+            .lock()
+            .map_err(|_| self.kv_error("SIFS snapshot cache lock is poisoned"))?;
+        cache.loaded = true;
+        cache.snapshot = snapshot.clone();
+        Ok(snapshot)
+    }
 }
 
 impl DfsControlPlaneKvClient for SifsSnapshotControlPlaneKvClient {
     fn get(&self, key: &str) -> Result<Option<sinomo_runtime::kv::KvEntry>, KvError> {
-        cluster::read_cluster_kv_latest_observed_entry(&self.cluster_paths, key)
-            .map_err(|source| self.kv_error(source.to_string()))
+        Ok(self
+            .cached_snapshot()?
+            .and_then(|snapshot| snapshot.get(key).cloned()))
     }
 
     fn range_prefix(&self, prefix: &str) -> Result<Vec<sinomo_runtime::kv::KvEntry>, KvError> {
-        cluster::read_cluster_kv_latest_observed_prefix_entries(&self.cluster_paths, prefix)
-            .map_err(|source| self.kv_error(source.to_string()))
+        self.cached_snapshot()?.map_or_else(
+            || Ok(Vec::new()),
+            |snapshot| {
+                snapshot.range_prefix_limited(
+                    prefix,
+                    sinomo_runtime::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+                )
+            },
+        )
     }
 
     fn put(&mut self, _key: String, _value: Vec<u8>) -> Result<KvRevision, KvError> {
@@ -2192,6 +2230,7 @@ impl DfsControlPlaneKvClient for SifsSnapshotControlPlaneKvClient {
 struct SifsControlPlaneKvClient {
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
+    snapshot: Arc<Mutex<SifsKvSnapshotCache>>,
 }
 
 impl SifsControlPlaneKvClient {
@@ -2199,6 +2238,7 @@ impl SifsControlPlaneKvClient {
         Self {
             data_dir: data_dir.clone(),
             cluster_paths: cluster_paths.clone(),
+            snapshot: Arc::new(Mutex::new(SifsKvSnapshotCache::default())),
         }
     }
 
@@ -2208,32 +2248,68 @@ impl SifsControlPlaneKvClient {
             detail: source.to_string(),
         }
     }
-}
 
-impl DfsControlPlaneKvClient for SifsControlPlaneKvClient {
-    fn get(&self, key: &str) -> Result<Option<sinomo_runtime::kv::KvEntry>, KvError> {
-        let entry = cluster::read_cluster_kv_latest_observed_entry(&self.cluster_paths, key)
-            .map_err(|source| self.kv_error(source))?;
-        if entry.is_some() {
-            return Ok(entry);
-        }
-        refresh_sifs_cluster_kv_snapshot(&self.data_dir, &self.cluster_paths)
-            .map_err(|source| self.kv_error(source))?;
-        cluster::read_cluster_kv_latest_observed_entry(&self.cluster_paths, key)
+    fn read_latest_snapshot(&self) -> Result<Option<Arc<KvSnapshot>>, KvError> {
+        cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(&self.cluster_paths)
             .map_err(|source| self.kv_error(source))
     }
 
-    fn range_prefix(&self, prefix: &str) -> Result<Vec<sinomo_runtime::kv::KvEntry>, KvError> {
-        let entries =
-            cluster::read_cluster_kv_latest_observed_prefix_entries(&self.cluster_paths, prefix)
+    fn replace_cached_snapshot(&self, refresh_daemon: bool) -> Result<(), KvError> {
+        if refresh_daemon {
+            refresh_sifs_cluster_kv_snapshot(&self.data_dir, &self.cluster_paths)
                 .map_err(|source| self.kv_error(source))?;
-        if !entries.is_empty() {
-            return Ok(entries);
         }
-        refresh_sifs_cluster_kv_snapshot(&self.data_dir, &self.cluster_paths)
-            .map_err(|source| self.kv_error(source))?;
-        cluster::read_cluster_kv_latest_observed_prefix_entries(&self.cluster_paths, prefix)
-            .map_err(|source| self.kv_error(source))
+        let snapshot = self.read_latest_snapshot()?;
+        let mut cache = self
+            .snapshot
+            .lock()
+            .map_err(|_| self.kv_error("SIFS snapshot cache lock is poisoned"))?;
+        cache.loaded = true;
+        cache.snapshot = snapshot;
+        Ok(())
+    }
+
+    fn cached_snapshot(&self) -> Result<Option<Arc<KvSnapshot>>, KvError> {
+        {
+            let cache = self
+                .snapshot
+                .lock()
+                .map_err(|_| self.kv_error("SIFS snapshot cache lock is poisoned"))?;
+            if cache.loaded {
+                return Ok(cache.snapshot.clone());
+            }
+        }
+        // A CLI operation refreshes through the long-lived daemon once, then
+        // all of its DFS lookups share this immutable snapshot.
+        self.replace_cached_snapshot(true)?;
+        self.snapshot
+            .lock()
+            .map_err(|_| self.kv_error("SIFS snapshot cache lock is poisoned"))
+            .map(|cache| cache.snapshot.clone())
+    }
+}
+
+impl DfsControlPlaneKvClient for SifsControlPlaneKvClient {
+    fn refresh_latest(&mut self) -> Result<(), KvError> {
+        self.replace_cached_snapshot(true)
+    }
+
+    fn get(&self, key: &str) -> Result<Option<sinomo_runtime::kv::KvEntry>, KvError> {
+        Ok(self
+            .cached_snapshot()?
+            .and_then(|snapshot| snapshot.get(key).cloned()))
+    }
+
+    fn range_prefix(&self, prefix: &str) -> Result<Vec<sinomo_runtime::kv::KvEntry>, KvError> {
+        self.cached_snapshot()?.map_or_else(
+            || Ok(Vec::new()),
+            |snapshot| {
+                snapshot.range_prefix_limited(
+                    prefix,
+                    sinomo_runtime::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+                )
+            },
+        )
     }
 
     fn put(
@@ -2259,10 +2335,12 @@ impl DfsControlPlaneKvClient for SifsControlPlaneKvClient {
         let result =
             cli_commit_cluster_kv_txn_with_quorum_response(&self.cluster_paths, &mut state, txn)
                 .map_err(|source| self.kv_error(source))?;
-        result.txn_response.ok_or_else(|| KvError::Serialization {
+        let response = result.txn_response.ok_or_else(|| KvError::Serialization {
             detail: "cluster KV returned a barrier result for a SIFS control-plane transaction"
                 .to_string(),
-        })
+        })?;
+        self.replace_cached_snapshot(false)?;
+        Ok(response)
     }
 }
 

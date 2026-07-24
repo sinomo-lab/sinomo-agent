@@ -106,6 +106,125 @@ pub struct ContentManifest {
     pub extents: Vec<ContentExtent>,
 }
 
+/// One-pass object-version ingest into transport-independent content storage.
+///
+/// Callers write each borrowed chunk directly while they own it. The ingest
+/// hashes and writes that range once, then atomically publishes the finalized
+/// blob and manifest at EOF. Dropping an unfinished ingest removes its
+/// temporary file.
+pub struct ContentStoreObjectIngest<'a> {
+    store: &'a LocalContentStore,
+    object_id: String,
+    version: String,
+    expected_size_bytes: u64,
+    expected_hash: Option<String>,
+    received_size_bytes: u64,
+    hasher: blake3::Hasher,
+    file: Option<fs::File>,
+    temporary_path: PathBuf,
+    finished: bool,
+}
+
+impl std::fmt::Debug for ContentStoreObjectIngest<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ContentStoreObjectIngest")
+            .field("object_id", &self.object_id)
+            .field("version", &self.version)
+            .field("expected_size_bytes", &self.expected_size_bytes)
+            .field("received_size_bytes", &self.received_size_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ContentStoreObjectIngest<'_> {
+    /// Appends one producer-owned range without retaining or copying it.
+    pub fn write_chunk(&mut self, bytes: &[u8]) -> Result<()> {
+        let chunk_bytes =
+            u64::try_from(bytes.len()).map_err(|_| ContentStoreError::InvalidContentLayout {
+                message: "content ingest chunk length does not fit u64".to_string(),
+            })?;
+        let next_size = self
+            .received_size_bytes
+            .checked_add(chunk_bytes)
+            .ok_or_else(|| ContentStoreError::InvalidContentLayout {
+                message: "content ingest length overflow".to_string(),
+            })?;
+        if next_size > self.expected_size_bytes {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: format!(
+                    "content ingest exceeded declared length: expected {}, received at least {next_size}",
+                    self.expected_size_bytes
+                ),
+            });
+        }
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| ContentStoreError::InvalidContentLayout {
+                message: "content ingest was already finished".to_string(),
+            })?;
+        file.write_all(bytes)
+            .map_err(|source| ContentStoreError::Io {
+                path: self.temporary_path.clone(),
+                source,
+            })?;
+        self.hasher.update(bytes);
+        self.received_size_bytes = next_size;
+        Ok(())
+    }
+
+    /// Finalizes the one application digest and publishes the blob and manifest.
+    pub fn finish(mut self) -> Result<ContentManifest> {
+        if self.received_size_bytes != self.expected_size_bytes {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: format!(
+                    "content ingest length mismatch: expected {}, received {}",
+                    self.expected_size_bytes, self.received_size_bytes
+                ),
+            });
+        }
+        let hash = format!("{HASH_PREFIX}{}", self.hasher.finalize().to_hex());
+        if let Some(expected_hash) = self.expected_hash.as_deref()
+            && expected_hash != hash
+        {
+            return Err(ContentStoreError::BlobHashMismatch {
+                expected: expected_hash.to_string(),
+                actual: hash,
+            });
+        }
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| ContentStoreError::InvalidContentLayout {
+                message: "content ingest was already finished".to_string(),
+            })?;
+        file.sync_all().map_err(|source| ContentStoreError::Io {
+            path: self.temporary_path.clone(),
+            source,
+        })?;
+        drop(file);
+        let manifest = self.store.publish_prehashed_object_version_file(
+            &self.object_id,
+            &self.version,
+            hash,
+            self.received_size_bytes,
+            &self.temporary_path,
+        )?;
+        self.finished = true;
+        Ok(manifest)
+    }
+}
+
+impl Drop for ContentStoreObjectIngest<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.file.take();
+            remove_file_if_exists(&self.temporary_path).ok();
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentPatchManifest {
     pub manifest: ContentManifest,
@@ -542,6 +661,66 @@ impl LocalContentStore {
         bytes: &[u8],
     ) -> Result<ContentManifest> {
         self.write_object_version(object_id, version, bytes)
+    }
+
+    /// Starts a one-pass streamed ingest for an object version.
+    ///
+    /// `expected_hash` is an application-level DFS identity, not a transport
+    /// checksum. The final comparison happens once at EOF using the same digest
+    /// that names the published content-addressed blob.
+    pub fn begin_object_version_ingest(
+        &self,
+        object_id: &str,
+        version: &str,
+        expected_size_bytes: u64,
+        expected_hash: Option<&str>,
+    ) -> Result<ContentStoreObjectIngest<'_>> {
+        let temporary_anchor = self.root.join("blob-tmp").join("stream-ingest");
+        let temporary_path = temporary_path_for(&temporary_anchor);
+        if let Some(parent) = temporary_path.parent() {
+            create_dir_all(parent.to_owned())?;
+        }
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .map_err(|source| ContentStoreError::Io {
+                path: temporary_path.clone(),
+                source,
+            })?;
+        Ok(ContentStoreObjectIngest {
+            store: self,
+            object_id: object_id.to_string(),
+            version: version.to_string(),
+            expected_size_bytes,
+            expected_hash: expected_hash.map(ToString::to_string),
+            received_size_bytes: 0,
+            hasher: blake3::Hasher::new(),
+            file: Some(file),
+            temporary_path,
+            finished: false,
+        })
+    }
+
+    /// Stores one already-materialized DFS value while computing its
+    /// application digest exactly once and publishing only after it matches.
+    pub fn put_object_version_with_expected_hash(
+        &self,
+        object_id: &str,
+        version: &str,
+        expected_hash: &str,
+        bytes: &[u8],
+    ) -> Result<ContentManifest> {
+        let mut ingest = self.begin_object_version_ingest(
+            object_id,
+            version,
+            u64::try_from(bytes.len()).map_err(|_| ContentStoreError::InvalidContentLayout {
+                message: "content length does not fit u64".to_string(),
+            })?,
+            Some(expected_hash),
+        )?;
+        ingest.write_chunk(bytes)?;
+        ingest.finish()
     }
 
     pub fn put_object_versions<'a, I>(&self, versions: I) -> Result<Vec<ContentManifest>>
@@ -2172,6 +2351,131 @@ impl LocalContentStore {
         ))?;
         self.ensure_content_manifest_index_best_effort(&manifest);
         Ok(manifest)
+    }
+
+    fn publish_prehashed_object_version_file(
+        &self,
+        object_id: &str,
+        version: &str,
+        hash: String,
+        size_bytes: u64,
+        temporary_path: &Path,
+    ) -> Result<ContentManifest> {
+        let manifest_path = self.manifest_path(object_id, version);
+        if manifest_path.is_file() {
+            let existing = decode_manifest(&read_file(&manifest_path)?)?;
+            if existing.content_hash != hash {
+                return Err(ContentStoreError::VersionHashConflict {
+                    object_id: object_id.to_owned(),
+                    version: version.to_owned(),
+                    existing_hash: existing.content_hash,
+                    new_hash: hash,
+                });
+            }
+            if existing.size_bytes != size_bytes {
+                return Err(ContentStoreError::InvalidContentLayout {
+                    message: format!(
+                        "object {object_id} version {version} manifest size {} does not match ingested size {size_bytes}",
+                        existing.size_bytes
+                    ),
+                });
+            }
+            if !self.has_blob(&existing.content_hash)? {
+                let blob_path = self.blob_path(&existing.content_hash)?;
+                self.ensure_quota_delta(ContentStoreQuotaDelta {
+                    blob_bytes: projected_file_growth(&blob_path, size_bytes)?,
+                    ..ContentStoreQuotaDelta::default()
+                })?;
+                self.publish_prehashed_temporary_blob(temporary_path, &blob_path)?;
+            } else {
+                remove_file_if_exists(temporary_path)?;
+            }
+            self.ensure_content_manifest_index_best_effort(&existing);
+            return Ok(existing);
+        }
+
+        let blob_path = self.blob_path(&hash)?;
+        let blob_needs_write = !self.has_blob(&hash)?;
+        let manifest = ContentManifest {
+            object_id: object_id.to_owned(),
+            version: version.to_owned(),
+            content_hash: hash,
+            size_bytes,
+            extents: Vec::new(),
+        };
+        let manifest_bytes = encode_manifest(&manifest)?;
+        self.ensure_quota_delta(ContentStoreQuotaDelta {
+            blob_bytes: if blob_needs_write {
+                projected_file_growth(&blob_path, size_bytes)?
+            } else {
+                0
+            },
+            logical_object_bytes: manifest.size_bytes,
+            manifest_bytes: manifest_bytes.len() as u64,
+            ..ContentStoreQuotaDelta::default()
+        })?;
+        if blob_needs_write {
+            self.publish_prehashed_temporary_blob(temporary_path, &blob_path)?;
+        } else {
+            remove_file_if_exists(temporary_path)?;
+        }
+
+        if let Err(error) = write_file_create_new_atomic(&manifest_path, &manifest_bytes) {
+            if let ContentStoreError::Io { source, .. } = &error
+                && source.kind() == io::ErrorKind::AlreadyExists
+            {
+                let existing = decode_manifest(&read_file(&manifest_path)?)?;
+                if existing.content_hash != manifest.content_hash {
+                    return Err(ContentStoreError::VersionHashConflict {
+                        object_id: object_id.to_owned(),
+                        version: version.to_owned(),
+                        existing_hash: existing.content_hash,
+                        new_hash: manifest.content_hash,
+                    });
+                }
+                self.ensure_content_manifest_index_best_effort(&existing);
+                return Ok(existing);
+            }
+            return Err(error);
+        }
+        self.apply_stats_delta(ContentStoreStatsDelta::manifest_created(
+            &manifest,
+            manifest_bytes.len() as u64,
+        ))?;
+        self.ensure_content_manifest_index_best_effort(&manifest);
+        Ok(manifest)
+    }
+
+    fn publish_prehashed_temporary_blob(
+        &self,
+        temporary_path: &Path,
+        blob_path: &Path,
+    ) -> Result<()> {
+        if let Some(parent) = blob_path.parent() {
+            create_dir_all(parent.to_owned())?;
+        }
+        let before_len = file_len_if_exists(blob_path)?;
+        match fs::hard_link(temporary_path, blob_path) {
+            Ok(()) => {
+                remove_file_if_exists(temporary_path)?;
+                if let Some(parent) = blob_path.parent() {
+                    sync_dir(parent)?;
+                }
+            }
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                remove_file_if_exists(temporary_path)?;
+            }
+            Err(source) => {
+                return Err(ContentStoreError::Io {
+                    path: blob_path.to_owned(),
+                    source,
+                });
+            }
+        }
+        let after_len = file_len_if_exists(blob_path)?;
+        self.apply_stats_delta(ContentStoreStatsDelta::blob_file_change(
+            before_len, after_len,
+        ))
     }
 
     fn write_object_version_blob_only(
@@ -4226,6 +4530,74 @@ fn write_content_addressed_blob_bytes_prehashed_defer_dir_sync_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_object_ingest_hashes_and_publishes_incremental_chunks() {
+        let root = temp_root("streamed_object_ingest_incremental");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let bytes = (0..(3 * 64 * 1024 + 17))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let expected_hash = content_hash(&bytes);
+        let mut ingest = store
+            .begin_object_version_ingest(
+                "stream-object",
+                "v1",
+                bytes.len() as u64,
+                Some(&expected_hash),
+            )
+            .expect("begin ingest");
+        for chunk in bytes.chunks(8191) {
+            ingest.write_chunk(chunk).expect("write chunk");
+        }
+        let manifest = ingest.finish().expect("finish ingest");
+
+        assert_eq!(manifest.content_hash, expected_hash);
+        assert_eq!(manifest.size_bytes, bytes.len() as u64);
+        let (_, stored_bytes) = store
+            .read_object_version("stream-object", "v1")
+            .expect("read ingested object");
+        assert_eq!(stored_bytes, bytes);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn streamed_object_ingest_rejects_application_hash_at_eof() {
+        let root = temp_root("streamed_object_ingest_hash_mismatch");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let bytes = b"streamed payload";
+        let actual_hash = content_hash(bytes);
+        let expected_hash = content_hash(b"different payload");
+        let mut ingest = store
+            .begin_object_version_ingest(
+                "stream-object",
+                "v-bad",
+                bytes.len() as u64,
+                Some(&expected_hash),
+            )
+            .expect("begin ingest");
+        ingest.write_chunk(bytes).expect("write chunk");
+        let error = ingest.finish().expect_err("hash mismatch");
+
+        assert!(matches!(
+            error,
+            ContentStoreError::BlobHashMismatch {
+                expected,
+                actual,
+            } if expected == expected_hash && actual == actual_hash
+        ));
+        assert!(
+            !store.has_blob(&actual_hash).expect("blob check"),
+            "a rejected ingest must not publish its temporary blob"
+        );
+        assert!(
+            store.read_manifest("stream-object", "v-bad").is_err(),
+            "a rejected ingest must not publish a manifest"
+        );
+
+        cleanup(&root);
+    }
 
     #[test]
     fn blob_storage_candidate_is_presence_only_and_does_not_claim_integrity() {
