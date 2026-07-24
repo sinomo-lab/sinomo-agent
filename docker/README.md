@@ -308,8 +308,8 @@ cover shadow or helper processes and are never substituted for the aggregate qui
 The network baseline keeps embedded-SOBJ payload throughput and semantic-attachment
 throughput as separate measurements. The attachment leg uses small request/response SOBJ
 heads plus streamed 8 MiB attachments in each direction, four calls at a time by default.
-It validates the signed head and the declared and delivered byte counts without adding a
-content hash or transport-integrity layer. Tune it with the
+It validates the bounded head and the declared and delivered byte counts without
+adding a content hash or transport-integrity layer. Tune it with the
 `SINOMO_TEST_NETWORK_ATTACHMENT_*` variables documented at the top of
 `docker/test-cluster.sh`; each direction is capped at 64 MiB by the benchmark route.
 

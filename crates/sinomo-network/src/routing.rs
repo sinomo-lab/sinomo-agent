@@ -55,7 +55,7 @@ impl Default for RouteConstraints {
     fn default() -> Self {
         Self {
             require_full_duplex: true,
-            require_confidentiality: true,
+            require_confidentiality: false,
             require_relay_forwarding: false,
             max_hops: 8,
         }
@@ -261,24 +261,28 @@ const ROUTED_STREAM_MUX_HEADER_BYTES: usize = MUX_RECORD_HEADER_BYTES;
 #[cfg(test)]
 const ROUTED_SESSION_DATA_FRAME_BYTES: usize = MUX_RECORD_MAX;
 const ROUTED_SESSION_DATA_WIRE_PREFIX: [u8; 4] = *b"SRE1";
+const ROUTED_SESSION_PLAINTEXT_WIRE_PREFIX: [u8; 4] = *b"SRP1";
+const ROUTED_SESSION_PLAINTEXT_HEADER_BYTES: usize = 8;
 const ROUTED_SESSION_DATA_CONTROL_FLAG: u32 = 1 << 31;
 const ROUTED_SESSION_DATA_LENGTH_MASK: u32 = !ROUTED_SESSION_DATA_CONTROL_FLAG;
 const ROUTED_SESSION_BINDING_DOMAIN: &[u8] = b"sinomo.routed-session.binding.v1\0";
 const ROUTED_SESSION_KEY_DOMAIN: &[u8] = b"sinomo.routed-session.data-key.v1\0";
 const ROUTED_SESSION_AAD_DOMAIN: &[u8] = b"sinomo.routed-session.data-frame.v1\0";
 
-/// Signing boundary for routed-session establishment.
+/// Local identity boundary for routed-session establishment.
 ///
-/// The routing layer receives authorized public-key material from the
-/// directory, but does not own key storage or a concrete identity primitive.
-/// Implementations may use the daemon identity, a hardware key, or a
-/// transport-native identity as long as they sign the exact bounded
-/// transcript supplied here.
+/// Adjacent peers are identified once by the direct transport. Routed-session
+/// setup therefore needs only the local node identity for path validation; it
+/// does not sign every logical session or RPC.
 pub trait RoutedSessionIdentity: Send + Sync {
     fn local_node_id(&self) -> &NodeId;
 
+    /// Signs direct-transport establishment metadata. Routed-session and RPC
+    /// records do not call this method.
     fn sign(&self, transcript: &[u8]) -> Result<Vec<u8>, NetworkError>;
 
+    /// Verifies direct-transport establishment metadata once per adjacent
+    /// transport. Routed-session and RPC records do not call this method.
     fn verify(
         &self,
         signer_node_id: &NodeId,
@@ -286,6 +290,20 @@ pub trait RoutedSessionIdentity: Send + Sync {
         transcript: &[u8],
         signature: &[u8],
     ) -> Result<(), NetworkError>;
+}
+
+/// Payload protection applied after the direct transport has established its
+/// peer identity.
+///
+/// Trusted cluster transports default to plaintext. AEAD is retained for
+/// endpoints whose operator explicitly requests end-to-end routed-session
+/// encryption.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RoutedSessionProtection {
+    #[default]
+    Plaintext,
+    Aead,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -296,15 +314,16 @@ struct RoutedSessionDescriptor {
     session_id: Id,
     path: Vec<NodeId>,
     endpoint_ids: Vec<Id>,
-    source_ephemeral_public_key: [u8; 32],
+    protection: RoutedSessionProtection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_ephemeral_public_key: Option<[u8; 32]>,
     hop_limit: u16,
     deadline_unix_millis: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct SignedRoutedSessionOpen {
+struct RoutedSessionOpen {
     descriptor: RoutedSessionDescriptor,
-    signature: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -313,14 +332,9 @@ struct RoutedSessionAcceptance {
     source_node_id: NodeId,
     destination_node_id: NodeId,
     session_id: Id,
-    open_transcript_digest: [u8; 32],
-    destination_ephemeral_public_key: [u8; 32],
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct SignedRoutedSessionAcceptance {
-    acceptance: RoutedSessionAcceptance,
-    signature: Vec<u8>,
+    protection: RoutedSessionProtection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    destination_ephemeral_public_key: Option<[u8; 32]>,
 }
 
 fn routed_session_encode<T: Serialize>(value: &T) -> Result<Vec<u8>, NetworkError> {
@@ -452,6 +466,14 @@ fn routed_session_channel_binding(
     input.extend_from_slice(open_transcript);
     input.extend_from_slice(acceptance_transcript);
     *blake3::hash(&input).as_bytes()
+}
+
+fn plaintext_routed_session_binding(session_id: &Id) -> [u8; 32] {
+    let mut binding = [0_u8; 32];
+    let session_bytes = session_id.as_str().as_bytes();
+    let copied = session_bytes.len().min(binding.len());
+    binding[..copied].copy_from_slice(&session_bytes[..copied]);
+    binding
 }
 
 struct RoutedSessionEphemeralKey {
@@ -808,6 +830,216 @@ impl AuthenticatedChunkWriter for EncryptedRoutedChunkWriter {
     }
 }
 
+struct PlainRoutedChunkReader {
+    reader: RoutedSessionReadHalf,
+    allocator: ChunkAllocator,
+    read_closed: bool,
+}
+
+impl PlainRoutedChunkReader {
+    async fn recv_record(&mut self) -> Result<Option<ChunkLease>, NetworkError> {
+        if self.read_closed {
+            return Ok(None);
+        }
+        let mut header = [0_u8; ROUTED_SESSION_PLAINTEXT_HEADER_BYTES];
+        self.reader
+            .read_exact(&mut header)
+            .await
+            .map_err(|error| NetworkError::Io {
+                operation: "read routed-session record header".to_string(),
+                detail: error.to_string(),
+            })?;
+        if header[..4] != ROUTED_SESSION_PLAINTEXT_WIRE_PREFIX {
+            return Err(NetworkError::Serialization {
+                detail: "invalid routed-session plaintext record prefix".to_string(),
+            });
+        }
+        let encoded_length =
+            u32::from_be_bytes(header[4..].try_into().expect("plaintext record length"));
+        let class = if encoded_length & ROUTED_SESSION_DATA_CONTROL_FLAG == 0 {
+            ChunkClass::Data
+        } else {
+            ChunkClass::Control
+        };
+        let plaintext_bytes = usize::try_from(encoded_length & ROUTED_SESSION_DATA_LENGTH_MASK)
+            .expect("u32 length fits usize");
+        let class_plaintext_max = match class {
+            ChunkClass::Data => SECURE_PLAINTEXT_MAX,
+            ChunkClass::Control => {
+                MUX_RECORD_HEADER_BYTES + RPC_RECORD_HEADER_BYTES + RPC_CONTROL_PAYLOAD_MAX
+            }
+        };
+        if plaintext_bytes > class_plaintext_max {
+            return Err(NetworkError::FrameTooLarge {
+                actual_bytes: plaintext_bytes,
+                max_bytes: class_plaintext_max,
+            });
+        }
+        if plaintext_bytes == 0 {
+            if class != ChunkClass::Control {
+                return Err(NetworkError::Serialization {
+                    detail: "routed-session final record used the data slab class".to_string(),
+                });
+            }
+            self.read_closed = true;
+            return Ok(None);
+        }
+        let mut chunk = match class {
+            ChunkClass::Data => self.allocator.allocate_data(0).await?,
+            ChunkClass::Control => self.allocator.allocate_control(0).await?,
+        };
+        let wire_bytes = ROUTED_SESSION_PLAINTEXT_HEADER_BYTES.saturating_add(plaintext_bytes);
+        chunk.set_range(0, wire_bytes)?;
+        chunk.as_mut_slice()[..ROUTED_SESSION_PLAINTEXT_HEADER_BYTES].copy_from_slice(&header);
+        self.reader
+            .read_exact(&mut chunk.as_mut_slice()[ROUTED_SESSION_PLAINTEXT_HEADER_BYTES..])
+            .await
+            .map_err(|error| NetworkError::Io {
+                operation: "read routed-session plaintext record".to_string(),
+                detail: error.to_string(),
+            })?;
+        chunk.strip_prefix(ROUTED_SESSION_PLAINTEXT_HEADER_BYTES)?;
+        observe_chunk_identity(chunk.slab_id(), "plaintext-record-received");
+        Ok(Some(chunk.into_lease()))
+    }
+}
+
+impl AuthenticatedChunkReader for PlainRoutedChunkReader {
+    fn allocator(&self) -> &ChunkAllocator {
+        &self.allocator
+    }
+
+    fn max_payload_bytes(&self) -> usize {
+        SECURE_PLAINTEXT_MAX
+    }
+
+    fn recv_chunk(&mut self) -> ChunkStreamFuture<'_, Option<ChunkLease>> {
+        Box::pin(self.recv_record())
+    }
+}
+
+struct PlainRoutedChunkWriter {
+    writer: RoutedSessionWriteHalf,
+    allocator: ChunkAllocator,
+    write_closed: bool,
+}
+
+impl PlainRoutedChunkWriter {
+    async fn send_record(
+        &mut self,
+        mut chunk: OwnedChunk,
+        final_record: bool,
+    ) -> Result<(), NetworkError> {
+        if self.write_closed {
+            return Err(NetworkError::Io {
+                operation: "write routed-session record".to_string(),
+                detail: "write direction is closed".to_string(),
+            });
+        }
+        let plaintext_bytes = chunk.len();
+        if plaintext_bytes > SECURE_PLAINTEXT_MAX {
+            return Err(NetworkError::FrameTooLarge {
+                actual_bytes: plaintext_bytes,
+                max_bytes: SECURE_PLAINTEXT_MAX,
+            });
+        }
+        if final_record && plaintext_bytes != 0 {
+            return Err(NetworkError::Serialization {
+                detail: "routed-session final record carried payload".to_string(),
+            });
+        }
+        let plaintext_u32 =
+            u32::try_from(plaintext_bytes).map_err(|_| NetworkError::FrameTooLarge {
+                actual_bytes: plaintext_bytes,
+                max_bytes: SECURE_PLAINTEXT_MAX,
+            })?;
+        let class_flag = match chunk.class() {
+            ChunkClass::Data => 0,
+            ChunkClass::Control => ROUTED_SESSION_DATA_CONTROL_FLAG,
+        };
+        let encoded_length = plaintext_u32 | class_flag;
+        let mut header = [0_u8; ROUTED_SESSION_PLAINTEXT_HEADER_BYTES];
+        header[..4].copy_from_slice(&ROUTED_SESSION_PLAINTEXT_WIRE_PREFIX);
+        header[4..].copy_from_slice(&encoded_length.to_be_bytes());
+        chunk.prepend(&header)?;
+        observe_chunk_identity(chunk.slab_id(), "plaintext-record-socket-staging");
+        self.writer
+            .write_all(chunk.as_slice())
+            .await
+            .map_err(|error| NetworkError::Io {
+                operation: "write routed-session plaintext record".to_string(),
+                detail: error.to_string(),
+            })?;
+        if final_record {
+            self.write_closed = true;
+            self.writer
+                .shutdown()
+                .await
+                .map_err(|error| NetworkError::Io {
+                    operation: "half-close routed-session".to_string(),
+                    detail: error.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+}
+
+impl AuthenticatedChunkWriter for PlainRoutedChunkWriter {
+    fn max_payload_bytes(&self) -> usize {
+        SECURE_PLAINTEXT_MAX
+    }
+
+    fn allocator(&self) -> &ChunkAllocator {
+        &self.allocator
+    }
+
+    fn send_chunk(&mut self, chunk: OwnedChunk) -> ChunkStreamFuture<'_, ()> {
+        Box::pin(self.send_record(chunk, false))
+    }
+
+    fn finish(&mut self) -> ChunkStreamFuture<'_, ()> {
+        Box::pin(async move {
+            if self.write_closed {
+                return Ok(());
+            }
+            let final_record = self.allocator.allocate_control(0).await?;
+            self.send_record(final_record, true).await
+        })
+    }
+
+    fn reset(&mut self, reason: ResetReason) -> ChunkStreamFuture<'_, ()> {
+        Box::pin(async move {
+            self.write_closed = true;
+            self.writer
+                .shutdown()
+                .await
+                .map_err(|error| NetworkError::Io {
+                    operation: format!("reset routed-session: {}", reason.detail),
+                    detail: error.to_string(),
+                })
+        })
+    }
+}
+
+fn plaintext_routed_session_chunk_stream(
+    io: BoxedNetworkStream,
+) -> Result<AuthenticatedChunkStream, NetworkError> {
+    let allocator = ChunkAllocator::default();
+    let (reader, writer) = split_routed_session_io(io);
+    AuthenticatedChunkStream::new(
+        Box::new(PlainRoutedChunkReader {
+            reader,
+            allocator: allocator.clone(),
+            read_closed: false,
+        }),
+        Box::new(PlainRoutedChunkWriter {
+            writer,
+            allocator,
+            write_closed: false,
+        }),
+    )
+}
+
 pub(crate) fn encrypted_routed_session_chunk_stream(
     io: BoxedNetworkStream,
     shared_secret: [u8; 32],
@@ -891,6 +1123,9 @@ impl From<&CandidatePath> for RouteTrace {
 pub struct ConnectOptions {
     pub constraints: RouteConstraints,
     pub timeout: Duration,
+    /// End-to-end routed-session payload protection. The direct transport
+    /// remains responsible for authenticating its adjacent peer.
+    pub protection: RoutedSessionProtection,
 }
 
 impl Default for ConnectOptions {
@@ -898,6 +1133,7 @@ impl Default for ConnectOptions {
         Self {
             constraints: RouteConstraints::default(),
             timeout: Duration::from_secs(10),
+            protection: RoutedSessionProtection::Plaintext,
         }
     }
 }
@@ -910,6 +1146,7 @@ pub struct PeerStream {
     pub peer_node_id: NodeId,
     pub session_id: Id,
     pub channel_binding: [u8; 32],
+    pub protection: RoutedSessionProtection,
     pub route_trace: RouteTrace,
 }
 
@@ -920,6 +1157,26 @@ impl PeerStream {
         peer_node_id: NodeId,
         session_id: Id,
         channel_binding: [u8; 32],
+        route_trace: RouteTrace,
+    ) -> Result<Self, NetworkError> {
+        Self::new_with_protection(
+            io,
+            local_node_id,
+            peer_node_id,
+            session_id,
+            channel_binding,
+            RoutedSessionProtection::Plaintext,
+            route_trace,
+        )
+    }
+
+    pub fn new_with_protection(
+        io: BoxedNetworkStream,
+        local_node_id: NodeId,
+        peer_node_id: NodeId,
+        session_id: Id,
+        channel_binding: [u8; 32],
+        protection: RoutedSessionProtection,
         route_trace: RouteTrace,
     ) -> Result<Self, NetworkError> {
         if local_node_id == peer_node_id {
@@ -943,6 +1200,7 @@ impl PeerStream {
             peer_node_id,
             session_id,
             channel_binding,
+            protection,
             route_trace,
         })
     }
@@ -955,13 +1213,34 @@ impl PeerStream {
         channel_binding: [u8; 32],
         route_trace: RouteTrace,
     ) -> Result<Self, NetworkError> {
+        Self::new_owned_with_protection(
+            chunk_io,
+            local_node_id,
+            peer_node_id,
+            session_id,
+            channel_binding,
+            RoutedSessionProtection::Plaintext,
+            route_trace,
+        )
+    }
+
+    pub(crate) fn new_owned_with_protection(
+        chunk_io: AuthenticatedChunkStream,
+        local_node_id: NodeId,
+        peer_node_id: NodeId,
+        session_id: Id,
+        channel_binding: [u8; 32],
+        protection: RoutedSessionProtection,
+        route_trace: RouteTrace,
+    ) -> Result<Self, NetworkError> {
         let chunk_io = Arc::new(Mutex::new(Some(chunk_io)));
-        let mut stream = Self::new(
+        let mut stream = Self::new_with_protection(
             Box::new(LazyChunkByteStream::new(Arc::clone(&chunk_io))),
             local_node_id,
             peer_node_id,
             session_id,
             channel_binding,
+            protection,
             route_trace,
         )?;
         stream.chunk_io = Some(chunk_io);
@@ -1253,6 +1532,12 @@ fn validate_routed_session_descriptor(
     descriptor: &RoutedSessionDescriptor,
 ) -> Result<(), NetworkError> {
     let hop_count = descriptor.path.len().saturating_sub(1);
+    let key_configuration_valid = match descriptor.protection {
+        RoutedSessionProtection::Plaintext => descriptor.source_ephemeral_public_key.is_none(),
+        RoutedSessionProtection::Aead => descriptor
+            .source_ephemeral_public_key
+            .is_some_and(|key| key != [0; 32]),
+    };
     if descriptor.protocol != ROUTED_SESSION_PROTOCOL
         || descriptor.path.len() < 2
         || hop_count > MAX_ROUTED_SESSION_HOPS
@@ -1262,7 +1547,7 @@ fn validate_routed_session_descriptor(
         || usize::from(descriptor.hop_limit) < hop_count
         || usize::from(descriptor.hop_limit) > MAX_ROUTED_SESSION_HOPS
         || descriptor.deadline_unix_millis < routed_session_now_unix_millis()
-        || descriptor.source_ephemeral_public_key == [0; 32]
+        || !key_configuration_valid
     {
         return Err(NetworkError::AuthDenied);
     }
@@ -1322,55 +1607,32 @@ fn incoming_routed_session_position(
 
 fn verify_routed_session_open(
     directory: &DirectorySnapshot,
-    identity: &dyn RoutedSessionIdentity,
-    open: &SignedRoutedSessionOpen,
+    open: &RoutedSessionOpen,
 ) -> Result<Vec<u8>, NetworkError> {
     validate_routed_session_descriptor(directory, &open.descriptor)?;
-    let source = directory
-        .node(&open.descriptor.source_node_id)
-        .ok_or_else(|| NetworkError::UnauthorizedNode {
-            node_id: open.descriptor.source_node_id.clone(),
-        })?;
-    let transcript = routed_session_encode(&open.descriptor)?;
-    identity.verify(
-        &source.node_id,
-        &source.public_key,
-        &transcript,
-        &open.signature,
-    )?;
-    Ok(transcript)
+    routed_session_encode(&open.descriptor)
 }
 
 fn verify_routed_session_acceptance(
-    directory: &DirectorySnapshot,
-    identity: &dyn RoutedSessionIdentity,
     descriptor: &RoutedSessionDescriptor,
-    descriptor_transcript: &[u8],
-    signed: &SignedRoutedSessionAcceptance,
+    acceptance: &RoutedSessionAcceptance,
 ) -> Result<Vec<u8>, NetworkError> {
-    let acceptance = &signed.acceptance;
+    let key_configuration_valid = match descriptor.protection {
+        RoutedSessionProtection::Plaintext => acceptance.destination_ephemeral_public_key.is_none(),
+        RoutedSessionProtection::Aead => acceptance
+            .destination_ephemeral_public_key
+            .is_some_and(|key| key != [0; 32]),
+    };
     if acceptance.protocol != ROUTED_SESSION_PROTOCOL
         || acceptance.source_node_id != descriptor.source_node_id
         || acceptance.destination_node_id != descriptor.destination_node_id
         || acceptance.session_id != descriptor.session_id
-        || acceptance.open_transcript_digest != *blake3::hash(descriptor_transcript).as_bytes()
-        || acceptance.destination_ephemeral_public_key == [0; 32]
+        || acceptance.protection != descriptor.protection
+        || !key_configuration_valid
     {
         return Err(NetworkError::AuthDenied);
     }
-    let destination = directory
-        .node(&descriptor.destination_node_id)
-        .ok_or_else(|| NetworkError::UnauthorizedNode {
-            node_id: descriptor.destination_node_id.clone(),
-        })?;
-    let transcript = routed_session_encode(acceptance)?;
-    identity.verify(
-        &destination.node_id,
-        &destination.public_key,
-        &transcript,
-        &signed.signature,
-    )?;
-    Ok(transcript)
+    routed_session_encode(acceptance)
 }
 
 async fn initiate_routed_session(
@@ -1379,6 +1641,7 @@ async fn initiate_routed_session(
     path: &CandidatePath,
     identity: &dyn RoutedSessionIdentity,
     deadline_unix_millis: i64,
+    protection: RoutedSessionProtection,
 ) -> Result<PeerStream, NetworkError> {
     let Some(hop) = path.hops.first() else {
         return Err(NetworkError::Serialization {
@@ -1396,7 +1659,10 @@ async fn initiate_routed_session(
             detail: "routed-session path does not match its first authenticated link".to_string(),
         });
     }
-    let ephemeral = routed_session_ephemeral_key()?;
+    let ephemeral = match protection {
+        RoutedSessionProtection::Plaintext => None,
+        RoutedSessionProtection::Aead => Some(routed_session_ephemeral_key()?),
+    };
     let descriptor = RoutedSessionDescriptor {
         protocol: ROUTED_SESSION_PROTOCOL.to_string(),
         source_node_id: stream.local_node_id.clone(),
@@ -1408,62 +1674,62 @@ async fn initiate_routed_session(
             .iter()
             .map(|hop| hop.endpoint.endpoint_id.clone())
             .collect(),
-        source_ephemeral_public_key: ephemeral.public,
+        protection,
+        source_ephemeral_public_key: ephemeral.as_ref().map(|key| key.public),
         hop_limit: u16::try_from(path.hops.len()).map_err(|_| NetworkError::AuthDenied)?,
         deadline_unix_millis,
     };
     validate_routed_session_descriptor(directory, &descriptor)?;
     let descriptor_transcript = routed_session_encode(&descriptor)?;
-    let open = SignedRoutedSessionOpen {
-        signature: identity.sign(&descriptor_transcript)?,
-        descriptor,
-    };
+    let open = RoutedSessionOpen { descriptor };
     let open_frame = routed_session_encode(&open)?;
     write_routed_session_frame(&mut *stream.io, ROUTED_SESSION_OPEN_FRAME, &open_frame).await?;
 
     let acceptance_frame =
         read_routed_session_frame(&mut *stream.io, ROUTED_SESSION_ACCEPT_FRAME).await?;
-    let signed_acceptance: SignedRoutedSessionAcceptance =
-        routed_session_decode(&acceptance_frame)?;
-    let acceptance_transcript = verify_routed_session_acceptance(
-        directory,
-        identity,
-        &open.descriptor,
-        &descriptor_transcript,
-        &signed_acceptance,
-    )?;
-    let shared_secret = routed_session_agree(
-        ephemeral.private,
-        &signed_acceptance
-            .acceptance
-            .destination_ephemeral_public_key,
-    )?;
-    let channel_binding = routed_session_channel_binding(
-        &shared_secret,
-        &descriptor_transcript,
-        &acceptance_transcript,
-    );
-    let io = encrypted_routed_session_chunk_stream(
-        stream.io,
-        shared_secret,
-        open.descriptor.session_id.clone(),
-        channel_binding,
-        true,
-    )?;
-    PeerStream::new_owned(
+    let acceptance: RoutedSessionAcceptance = routed_session_decode(&acceptance_frame)?;
+    let acceptance_transcript = verify_routed_session_acceptance(&open.descriptor, &acceptance)?;
+    let (channel_binding, io) = match protection {
+        RoutedSessionProtection::Plaintext => {
+            let binding = plaintext_routed_session_binding(&open.descriptor.session_id);
+            (binding, plaintext_routed_session_chunk_stream(stream.io)?)
+        }
+        RoutedSessionProtection::Aead => {
+            let ephemeral = ephemeral.expect("AEAD routed session generated an ephemeral key");
+            let destination_key = acceptance
+                .destination_ephemeral_public_key
+                .as_ref()
+                .expect("validated AEAD acceptance key");
+            let shared_secret = routed_session_agree(ephemeral.private, destination_key)?;
+            let binding = routed_session_channel_binding(
+                &shared_secret,
+                &descriptor_transcript,
+                &acceptance_transcript,
+            );
+            let io = encrypted_routed_session_chunk_stream(
+                stream.io,
+                shared_secret,
+                open.descriptor.session_id.clone(),
+                binding,
+                true,
+            )?;
+            (binding, io)
+        }
+    };
+    PeerStream::new_owned_with_protection(
         io,
         open.descriptor.source_node_id,
         open.descriptor.destination_node_id,
         open.descriptor.session_id,
         channel_binding,
+        open.descriptor.protection,
         RouteTrace::from(path),
     )
 }
 
 async fn accept_routed_session_destination(
     mut stream: AuthenticatedDirectStream,
-    identity: &dyn RoutedSessionIdentity,
-    open: SignedRoutedSessionOpen,
+    open: RoutedSessionOpen,
     descriptor_transcript: Vec<u8>,
 ) -> Result<PeerStream, NetworkError> {
     let descriptor = &open.descriptor;
@@ -1473,51 +1739,64 @@ async fn accept_routed_session_destination(
             frame_target_node_id: descriptor.destination_node_id.clone(),
         });
     }
-    let ephemeral = routed_session_ephemeral_key()?;
-    let shared_secret =
-        routed_session_agree(ephemeral.private, &descriptor.source_ephemeral_public_key)?;
+    let ephemeral = match descriptor.protection {
+        RoutedSessionProtection::Plaintext => None,
+        RoutedSessionProtection::Aead => Some(routed_session_ephemeral_key()?),
+    };
     let acceptance = RoutedSessionAcceptance {
         protocol: ROUTED_SESSION_PROTOCOL.to_string(),
         source_node_id: descriptor.source_node_id.clone(),
         destination_node_id: descriptor.destination_node_id.clone(),
         session_id: descriptor.session_id.clone(),
-        open_transcript_digest: *blake3::hash(&descriptor_transcript).as_bytes(),
-        destination_ephemeral_public_key: ephemeral.public,
+        protection: descriptor.protection,
+        destination_ephemeral_public_key: ephemeral.as_ref().map(|key| key.public),
     };
     let acceptance_transcript = routed_session_encode(&acceptance)?;
-    let signed_acceptance = SignedRoutedSessionAcceptance {
-        signature: identity.sign(&acceptance_transcript)?,
-        acceptance,
-    };
-    let acceptance_frame = routed_session_encode(&signed_acceptance)?;
+    let acceptance_frame = routed_session_encode(&acceptance)?;
     write_routed_session_frame(
         &mut *stream.io,
         ROUTED_SESSION_ACCEPT_FRAME,
         &acceptance_frame,
     )
     .await?;
-    let channel_binding = routed_session_channel_binding(
-        &shared_secret,
-        &descriptor_transcript,
-        &acceptance_transcript,
-    );
-    let io = encrypted_routed_session_chunk_stream(
-        stream.io,
-        shared_secret,
-        descriptor.session_id.clone(),
-        channel_binding,
-        false,
-    )?;
+    let (channel_binding, io) = match descriptor.protection {
+        RoutedSessionProtection::Plaintext => {
+            let binding = plaintext_routed_session_binding(&descriptor.session_id);
+            (binding, plaintext_routed_session_chunk_stream(stream.io)?)
+        }
+        RoutedSessionProtection::Aead => {
+            let ephemeral = ephemeral.expect("AEAD routed session generated an ephemeral key");
+            let source_key = descriptor
+                .source_ephemeral_public_key
+                .as_ref()
+                .expect("validated AEAD source key");
+            let shared_secret = routed_session_agree(ephemeral.private, source_key)?;
+            let binding = routed_session_channel_binding(
+                &shared_secret,
+                &descriptor_transcript,
+                &acceptance_transcript,
+            );
+            let io = encrypted_routed_session_chunk_stream(
+                stream.io,
+                shared_secret,
+                descriptor.session_id.clone(),
+                binding,
+                false,
+            )?;
+            (binding, io)
+        }
+    };
     let mut nodes = descriptor.path.clone();
     nodes.reverse();
     let mut endpoint_ids = descriptor.endpoint_ids.clone();
     endpoint_ids.reverse();
-    PeerStream::new_owned(
+    PeerStream::new_owned_with_protection(
         io,
         descriptor.destination_node_id.clone(),
         descriptor.source_node_id.clone(),
         descriptor.session_id.clone(),
         channel_binding,
+        descriptor.protection,
         RouteTrace {
             nodes,
             endpoint_ids,
@@ -1531,7 +1810,7 @@ async fn accept_routed_session_destination(
 /// This is the direct-path execution primitive shared by the route-planning
 /// connector and composition boundaries that already hold a generation-fenced
 /// endpoint choice. It still rechecks current directory authority, transport
-/// authentication, capabilities, and the signed routed-session handshake.
+/// authentication, capabilities, and the routed-session handshake.
 pub async fn connect_direct_routed_endpoint(
     directory: &DirectorySnapshot,
     endpoint: &ClusterEndpointRecord,
@@ -1582,7 +1861,15 @@ pub async fn connect_direct_routed_endpoint(
             }],
         };
         let stream = link.open_stream().await?;
-        initiate_routed_session(stream, directory, &path, identity, deadline_unix_millis).await
+        initiate_routed_session(
+            stream,
+            directory,
+            &path,
+            identity,
+            deadline_unix_millis,
+            options.protection,
+        )
+        .await
     };
     tokio::time::timeout(options.timeout, establish)
         .await
@@ -1598,9 +1885,9 @@ pub async fn connect_direct_routed_endpoint(
 
 /// Accepts one direct routed-session handshake before application bytes.
 ///
-/// The direct transport supplies the authenticated adjacent peer. The signed
-/// open must describe exactly one hop from that peer to this destination. Only
-/// after those checks and a destination-signed acceptance does the function
+/// The direct transport supplies the authenticated adjacent peer. The open
+/// must describe exactly one hop from that peer to this destination. Only
+/// after those checks and a matching destination acceptance does the function
 /// return a socket-like [`PeerStream`]. Multi-hop ingress uses
 /// [`accept_or_relay_routed_session`] instead.
 pub async fn accept_direct_routed_session(
@@ -1612,19 +1899,19 @@ pub async fn accept_direct_routed_session(
         return Err(NetworkError::AuthDenied);
     }
     let open_frame = read_routed_session_frame(&mut *stream.io, ROUTED_SESSION_OPEN_FRAME).await?;
-    let signed_open: SignedRoutedSessionOpen = routed_session_decode(&open_frame)?;
-    let descriptor_transcript = verify_routed_session_open(directory, identity, &signed_open)?;
-    if signed_open.descriptor.path.len() != 2 {
+    let open: RoutedSessionOpen = routed_session_decode(&open_frame)?;
+    let descriptor_transcript = verify_routed_session_open(directory, &open)?;
+    if open.descriptor.path.len() != 2 {
         return Err(NetworkError::AuthDenied);
     }
-    let position = incoming_routed_session_position(&stream, &signed_open.descriptor)?;
-    if position + 1 != signed_open.descriptor.path.len() {
+    let position = incoming_routed_session_position(&stream, &open.descriptor)?;
+    if position + 1 != open.descriptor.path.len() {
         return Err(NetworkError::FrameTargetMismatch {
             requested_target_node_id: stream.local_node_id,
-            frame_target_node_id: signed_open.descriptor.destination_node_id.clone(),
+            frame_target_node_id: open.descriptor.destination_node_id.clone(),
         });
     }
-    accept_routed_session_destination(stream, identity, signed_open, descriptor_transcript).await
+    accept_routed_session_destination(stream, open, descriptor_transcript).await
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2041,12 +2328,13 @@ fn routed_relay_copy_error(
     }
 }
 
-/// Accepts a signed routed-session open at either an intermediate relay or the
-/// named destination.
+/// Accepts a routed-session open at either an intermediate relay or the named
+/// destination.
 ///
-/// Relays validate the immutable path and both endpoint signatures, establish
-/// exactly the next direct edge, and then copy only bounded encrypted frames.
-/// They never construct a [`PeerStream`] or receive endpoint key material.
+/// Relays validate the immutable path, establish exactly the next
+/// transport-authenticated direct edge, and then copy only bounded opaque
+/// frames. They never construct a [`PeerStream`] or receive endpoint key
+/// material.
 pub async fn accept_or_relay_routed_session(
     mut stream: AuthenticatedDirectStream,
     directory: &DirectorySnapshot,
@@ -2058,21 +2346,16 @@ pub async fn accept_or_relay_routed_session(
         return Err(NetworkError::AuthDenied);
     }
     let open_frame = read_routed_session_frame(&mut *stream.io, ROUTED_SESSION_OPEN_FRAME).await?;
-    let signed_open: SignedRoutedSessionOpen = routed_session_decode(&open_frame)?;
-    let descriptor_transcript = verify_routed_session_open(directory, identity, &signed_open)?;
-    let position = incoming_routed_session_position(&stream, &signed_open.descriptor)?;
-    if position + 1 == signed_open.descriptor.path.len() {
-        return accept_routed_session_destination(
-            stream,
-            identity,
-            signed_open,
-            descriptor_transcript,
-        )
-        .await
-        .map(RoutedSessionDisposition::Destination);
+    let open: RoutedSessionOpen = routed_session_decode(&open_frame)?;
+    let descriptor_transcript = verify_routed_session_open(directory, &open)?;
+    let position = incoming_routed_session_position(&stream, &open.descriptor)?;
+    if position + 1 == open.descriptor.path.len() {
+        return accept_routed_session_destination(stream, open, descriptor_transcript)
+            .await
+            .map(RoutedSessionDisposition::Destination);
     }
 
-    let descriptor = &signed_open.descriptor;
+    let descriptor = &open.descriptor;
     let relay_node_id = stream.local_node_id.clone();
     let next_node_id = descriptor.path[position + 1].clone();
     let endpoint_id = descriptor.endpoint_ids[position].clone();
@@ -2122,17 +2405,10 @@ pub async fn accept_or_relay_routed_session(
             read_routed_session_frame(&mut *outgoing.io, ROUTED_SESSION_ACCEPT_FRAME)
                 .await
                 .map_err(RelayEstablishmentError::DownstreamSession)?;
-        let signed_acceptance: SignedRoutedSessionAcceptance =
-            routed_session_decode(&acceptance_frame)
-                .map_err(RelayEstablishmentError::DownstreamSession)?;
-        verify_routed_session_acceptance(
-            directory,
-            identity,
-            descriptor,
-            &descriptor_transcript,
-            &signed_acceptance,
-        )
-        .map_err(RelayEstablishmentError::DownstreamSession)?;
+        let acceptance: RoutedSessionAcceptance = routed_session_decode(&acceptance_frame)
+            .map_err(RelayEstablishmentError::DownstreamSession)?;
+        verify_routed_session_acceptance(descriptor, &acceptance)
+            .map_err(RelayEstablishmentError::DownstreamSession)?;
         Ok::<_, RelayEstablishmentError>((outgoing, acceptance_frame))
     };
     let (outgoing, acceptance_frame) = match tokio::time::timeout(connect_time, establish).await {
@@ -2313,6 +2589,7 @@ impl DirectRoutedConnector {
                 &path,
                 self.identity.as_ref(),
                 deadline_unix_millis,
+                options.protection,
             )
             .await
             {
@@ -2505,6 +2782,7 @@ impl MultiHopRoutedConnector {
                     &path,
                     self.identity.as_ref(),
                     attempt_deadline_unix_millis,
+                    options.protection,
                 )
                 .await
                 .map_err(PathAttemptError::RoutedSession)
@@ -3050,7 +3328,10 @@ mod tests {
                 &connectivity,
                 &a,
                 &b,
-                RouteConstraints::default(),
+                RouteConstraints {
+                    require_confidentiality: true,
+                    ..RouteConstraints::default()
+                },
             )
             .is_empty()
         );
@@ -3873,10 +4154,6 @@ mod tests {
             ],
         )
         .expect("directory");
-        let identity = TestRoutedIdentity {
-            local_node_id: source.clone(),
-        };
-        let ephemeral = routed_session_ephemeral_key().expect("source ephemeral key");
         let descriptor = RoutedSessionDescriptor {
             protocol: ROUTED_SESSION_PROTOCOL.to_string(),
             source_node_id: source.clone(),
@@ -3884,15 +4161,12 @@ mod tests {
             session_id: Id::generate(),
             path: vec![source.clone(), requested_destination.clone()],
             endpoint_ids: vec![endpoint.endpoint_id],
-            source_ephemeral_public_key: ephemeral.public,
+            protection: RoutedSessionProtection::Plaintext,
+            source_ephemeral_public_key: None,
             hop_limit: 1,
             deadline_unix_millis: routed_session_deadline_unix_millis(Duration::from_secs(10)),
         };
-        let transcript = routed_session_encode(&descriptor).expect("descriptor transcript");
-        let open = SignedRoutedSessionOpen {
-            signature: identity.sign(&transcript).expect("open signature"),
-            descriptor,
-        };
+        let open = RoutedSessionOpen { descriptor };
         let open = routed_session_encode(&open).expect("open frame");
         let (mut client, server) = tokio::io::duplex(4096);
         let server_stream = AuthenticatedDirectStream {
@@ -3982,6 +4256,7 @@ mod tests {
                 &path,
                 &identity,
                 routed_session_deadline_unix_millis(Duration::from_secs(2)),
+                RoutedSessionProtection::Plaintext,
             )
             .await
             .expect("realize planned route");
@@ -4280,7 +4555,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_planned_line_ring_star_and_mesh_path_is_realizable_and_opaque() {
+    async fn every_planned_line_ring_star_and_mesh_path_is_realizable() {
         let topologies = vec![
             ("line", vec![(0, 1), (1, 2), (2, 3)]),
             ("ring", vec![(0, 1), (1, 2), (2, 3), (3, 0)]),
@@ -4344,22 +4619,104 @@ mod tests {
                 "{label} errors: {:?}",
                 network.errors.lock().expect("relay errors lock")
             );
-            assert!(
-                network
-                    .wire_writes
-                    .lock()
-                    .expect("wire writes lock")
-                    .iter()
-                    .all(|write| !write
-                        .windows(TEST_ROUTED_PAYLOAD.len())
-                        .any(|window| window == TEST_ROUTED_PAYLOAD)),
-                "{label} exposed application plaintext on a direct edge"
-            );
         }
     }
 
+    #[tokio::test]
+    async fn routed_session_protection_defaults_to_plaintext() {
+        let (nodes, directory, connectivity) =
+            topology_fixture("plaintext-default", 55, 2, &[(0, 1)]);
+        let network = TestRelayNetwork::new(directory.clone(), connectivity);
+        let connector = MultiHopRoutedConnector::new(
+            nodes[0].clone(),
+            Arc::new(FixedDirectory(directory)),
+            network.connectivity.clone(),
+            network.connectivity.clone(),
+            Arc::new(network.provider(nodes[0].clone())),
+            Arc::new(TestRoutedIdentity {
+                local_node_id: nodes[0].clone(),
+            }),
+        )
+        .expect("plaintext connector");
+        let mut stream = connector
+            .connect(nodes[1].clone(), ConnectOptions::default())
+            .await
+            .expect("connect plaintext route");
+        stream
+            .write_all(TEST_ROUTED_PAYLOAD)
+            .await
+            .expect("write plaintext payload");
+        let mut response = [0_u8; TEST_ROUTED_PAYLOAD.len()];
+        stream
+            .read_exact(&mut response)
+            .await
+            .expect("read plaintext echo");
+        assert_eq!(response, *TEST_ROUTED_PAYLOAD);
+        stream.shutdown().await.expect("close plaintext route");
+        network.wait_idle().await;
+        assert!(
+            network
+                .wire_writes
+                .lock()
+                .expect("wire writes lock")
+                .iter()
+                .any(|write| write
+                    .windows(TEST_ROUTED_PAYLOAD.len())
+                    .any(|window| window == TEST_ROUTED_PAYLOAD))
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_session_aead_remains_an_explicit_opt_in() {
+        let (nodes, directory, connectivity) = topology_fixture("aead-opt-in", 56, 2, &[(0, 1)]);
+        let network = TestRelayNetwork::new(directory.clone(), connectivity);
+        let connector = MultiHopRoutedConnector::new(
+            nodes[0].clone(),
+            Arc::new(FixedDirectory(directory)),
+            network.connectivity.clone(),
+            network.connectivity.clone(),
+            Arc::new(network.provider(nodes[0].clone())),
+            Arc::new(TestRoutedIdentity {
+                local_node_id: nodes[0].clone(),
+            }),
+        )
+        .expect("AEAD connector");
+        let mut stream = connector
+            .connect(
+                nodes[1].clone(),
+                ConnectOptions {
+                    protection: RoutedSessionProtection::Aead,
+                    ..ConnectOptions::default()
+                },
+            )
+            .await
+            .expect("connect AEAD route");
+        stream
+            .write_all(TEST_ROUTED_PAYLOAD)
+            .await
+            .expect("write AEAD payload");
+        let mut response = [0_u8; TEST_ROUTED_PAYLOAD.len()];
+        stream
+            .read_exact(&mut response)
+            .await
+            .expect("read AEAD echo");
+        assert_eq!(response, *TEST_ROUTED_PAYLOAD);
+        stream.shutdown().await.expect("close AEAD route");
+        network.wait_idle().await;
+        assert!(
+            network
+                .wire_writes
+                .lock()
+                .expect("wire writes lock")
+                .iter()
+                .all(|write| !write
+                    .windows(TEST_ROUTED_PAYLOAD.len())
+                    .any(|window| window == TEST_ROUTED_PAYLOAD))
+        );
+    }
+
     #[test]
-    fn signed_route_rejects_tampering_impersonation_loops_expiry_and_hop_exhaustion() {
+    fn route_rejects_loops_expiry_and_hop_exhaustion() {
         let (nodes, directory, connectivity) =
             topology_fixture("validation", 51, 3, &[(0, 1), (1, 2)]);
         let path = plan_routes(
@@ -4372,7 +4729,6 @@ mod tests {
         .into_iter()
         .next()
         .expect("validation path");
-        let ephemeral = routed_session_ephemeral_key().expect("source ephemeral key");
         let descriptor = RoutedSessionDescriptor {
             protocol: ROUTED_SESSION_PROTOCOL.to_string(),
             source_node_id: nodes[0].clone(),
@@ -4384,66 +4740,11 @@ mod tests {
                 .iter()
                 .map(|hop| hop.endpoint.endpoint_id.clone())
                 .collect(),
-            source_ephemeral_public_key: ephemeral.public,
+            protection: RoutedSessionProtection::Plaintext,
+            source_ephemeral_public_key: None,
             hop_limit: 2,
             deadline_unix_millis: routed_session_deadline_unix_millis(Duration::from_secs(5)),
         };
-        let source_identity = TestRoutedIdentity {
-            local_node_id: nodes[0].clone(),
-        };
-        let transcript = routed_session_encode(&descriptor).expect("route transcript");
-        let signature = source_identity.sign(&transcript).expect("route signature");
-
-        let mut tampered = SignedRoutedSessionOpen {
-            descriptor: descriptor.clone(),
-            signature: signature.clone(),
-        };
-        tampered.descriptor.hop_limit = 3;
-        assert_eq!(
-            verify_routed_session_open(&directory, &source_identity, &tampered),
-            Err(NetworkError::AuthDenied)
-        );
-
-        let impersonator = TestRoutedIdentity {
-            local_node_id: nodes[1].clone(),
-        };
-        let impersonated = SignedRoutedSessionOpen {
-            descriptor: descriptor.clone(),
-            signature: impersonator
-                .sign(&transcript)
-                .expect("impersonated signature"),
-        };
-        assert_eq!(
-            verify_routed_session_open(&directory, &source_identity, &impersonated),
-            Err(NetworkError::AuthDenied)
-        );
-
-        let acceptance = RoutedSessionAcceptance {
-            protocol: ROUTED_SESSION_PROTOCOL.to_string(),
-            source_node_id: descriptor.source_node_id.clone(),
-            destination_node_id: descriptor.destination_node_id.clone(),
-            session_id: descriptor.session_id.clone(),
-            open_transcript_digest: *blake3::hash(&transcript).as_bytes(),
-            destination_ephemeral_public_key: [3; 32],
-        };
-        let acceptance_transcript =
-            routed_session_encode(&acceptance).expect("acceptance transcript");
-        let forged_acceptance = SignedRoutedSessionAcceptance {
-            signature: impersonator
-                .sign(&acceptance_transcript)
-                .expect("forged acceptance signature"),
-            acceptance,
-        };
-        assert_eq!(
-            verify_routed_session_acceptance(
-                &directory,
-                &source_identity,
-                &descriptor,
-                &transcript,
-                &forged_acceptance,
-            ),
-            Err(NetworkError::AuthDenied)
-        );
 
         let mut looped = descriptor.clone();
         looped.path = vec![
@@ -4609,44 +4910,6 @@ mod tests {
                 .iter()
                 .any(|error| error.contains(nodes[0].as_str())),
             "the destination must still report the unauthorized routed origin"
-        );
-    }
-
-    #[tokio::test]
-    async fn altered_relay_ciphertext_never_reaches_the_destination_application() {
-        let (nodes, directory, connectivity) = topology_fixture("tamper", 54, 3, &[(0, 1), (1, 2)]);
-        let network = TestRelayNetwork::new(directory.clone(), connectivity);
-        let connector = MultiHopRoutedConnector::new(
-            nodes[0].clone(),
-            Arc::new(FixedDirectory(directory)),
-            network.connectivity.clone(),
-            network.connectivity.clone(),
-            Arc::new(network.provider(nodes[0].clone())),
-            Arc::new(TestRoutedIdentity {
-                local_node_id: nodes[0].clone(),
-            }),
-        )
-        .expect("multi-hop connector");
-        let mut stream = connector
-            .connect(nodes[2].clone(), ConnectOptions::default())
-            .await
-            .expect("connect tampered route");
-        network.tamper_next_data_frame.store(true, Ordering::SeqCst);
-        stream
-            .write_all(TEST_ROUTED_PAYLOAD)
-            .await
-            .expect("write payload before wire tamper");
-        let mut response = [0_u8; TEST_ROUTED_PAYLOAD.len()];
-        let result = tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut response))
-            .await
-            .expect("tampered stream terminated");
-        assert!(result.is_err());
-        drop(stream);
-        network.wait_idle().await;
-        assert_eq!(network.accepted_payloads.load(Ordering::SeqCst), 0);
-        assert!(
-            !network.errors.lock().expect("relay errors lock").is_empty(),
-            "destination did not report the rejected protected payload"
         );
     }
 

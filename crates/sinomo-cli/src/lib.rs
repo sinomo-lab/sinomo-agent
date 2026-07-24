@@ -158,7 +158,6 @@ use sinomo_runtime::daemon::{
     send_daemon_shutdown_request,
     shadow_main_binary_from_env as daemon_shadow_main_binary_from_env,
     shadow_main_options_from_env as daemon_shadow_main_options_from_env,
-    sign_daemon_rpc_request_for_local_node as daemon_sign_daemon_rpc_request_for_local_node,
     sleep_for_shadow_start_delay as daemon_sleep_for_shadow_start_delay,
     stage_rollout_main_activation as daemon_stage_rollout_main_activation,
     start_daemon_command_process as daemon_start_daemon_command_process,

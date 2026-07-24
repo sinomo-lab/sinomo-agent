@@ -182,7 +182,7 @@ pub use auth::{
     sign_daemon_rpc_request_for_local_node, sign_daemon_rpc_request_from_data_dir,
 };
 pub(crate) use client::{
-    DaemonSignedObjectRpcAsyncHost, cluster_paths_from_env,
+    DaemonObjectRpcAsyncHost, cluster_paths_from_env,
     fetch_cluster_kv_local_snapshot_from_endpoint_on_runtime,
     fetch_daemon_status_from_endpoint_on_runtime, send_cluster_member_publish_async,
     send_cluster_raft_append_on_runtime, send_cluster_raft_vote_on_runtime,

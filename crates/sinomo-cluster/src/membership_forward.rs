@@ -7,9 +7,7 @@ use serde::Serialize;
 use sinomo_base::ClusterBootstrapState;
 use sinomo_network::ClusterPaths;
 use sinomo_network::{ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector};
-use sinomo_network::{
-    ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterSignedObjectRpcAsyncHost,
-};
+use sinomo_network::{ClusterObjectRpcAsyncHost, ClusterObjectRpcClient, ClusterObjectRpcOptions};
 use sinomo_network::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
 use sinomo_network::{ObjectRpcCall, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcResult};
 use sinomo_node::NodeId;
@@ -151,7 +149,7 @@ pub async fn forward_cluster_membership_rpc_to_state_authority_async_with_host(
     state: &ClusterBootstrapState,
     request: &ObjectRpcRequest,
     failure_detail: &str,
-    host: &mut (impl ClusterSignedObjectRpcAsyncHost + Send),
+    host: &mut (impl ClusterObjectRpcAsyncHost + Send),
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let result = forward_cluster_membership_rpc_to_state_authority_async_with_call_factory(
         runtime,
@@ -174,7 +172,7 @@ pub(crate) async fn forward_cluster_membership_value_to_state_authority_async_wi
     request_head: &ObjectRpcRequest,
     request_value: &Q,
     failure_detail: &str,
-    host: &mut (impl ClusterSignedObjectRpcAsyncHost + Send),
+    host: &mut (impl ClusterObjectRpcAsyncHost + Send),
 ) -> Result<R, NetworkError>
 where
     Q: Serialize + Sync + ?Sized,
@@ -209,7 +207,7 @@ async fn forward_cluster_membership_rpc_to_state_authority_async_with_call_facto
     state: &ClusterBootstrapState,
     request: &ObjectRpcRequest,
     failure_detail: &str,
-    host: &mut (impl ClusterSignedObjectRpcAsyncHost + Send),
+    host: &mut (impl ClusterObjectRpcAsyncHost + Send),
     timeout: Duration,
     mut make_call: F,
 ) -> Result<ObjectRpcResult, NetworkError>
@@ -449,7 +447,7 @@ pub async fn forward_cluster_join_challenge_rpc_to_state_authority_async_with_ho
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     request: &ObjectRpcRequest,
-    host: &mut (impl ClusterSignedObjectRpcAsyncHost + Send),
+    host: &mut (impl ClusterObjectRpcAsyncHost + Send),
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let state_paths = paths.clone();
     let state = runtime

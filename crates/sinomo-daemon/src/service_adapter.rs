@@ -194,15 +194,13 @@ pub(crate) async fn forward_object_rpc_call_from_daemon_control(
         options = options.with_overall_timeout(Duration::from_millis(overall_timeout_millis));
     }
 
-    // This is a trusted proxy boundary, not a signed relay. Rebind both body
-    // finish proofs to the route signed on their next hop instead of carrying
-    // the outer daemon-forward proof into the inner object-RPC call (or vice
-    // versa).
-    let call = match payload.streamed_value_digest_sha256 {
-        Some(digest) => {
-            ObjectRpcCall::from_forwarded_streamed_value(payload.request, request_body, digest)?
-        }
-        None => ObjectRpcCall::from_forwarded_body(payload.request, request_body),
+    // The proxy transfers the body allocation directly into the next
+    // transport. Reliable transports preserve ordering and length, so this
+    // boundary does not hash or sign the body again.
+    let call = if payload.streamed_value_body {
+        ObjectRpcCall::from_forwarded_streamed_value(payload.request, request_body)?
+    } else {
+        ObjectRpcCall::from_forwarded_body(payload.request, request_body)
     };
     let forward_started = std::time::Instant::now();
     match crate::client::send_object_rpc_call_to_target_async_with_daemon_paths_and_network_error(
@@ -5858,93 +5856,12 @@ pub(crate) fn authenticate_daemon_control_request_via_registry(
     request: &DaemonControlRequest,
     service_host: &DaemonServiceRegistryHost,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
-    authenticate_daemon_control_request_via_registry_inner(paths, request, None, service_host)
-}
-
-pub(crate) fn authenticate_daemon_control_request_via_registry_with_digest(
-    paths: &DaemonPaths,
-    request: &DaemonControlRequest,
-    request_digest_sha256: &[u8; 32],
-    service_host: &DaemonServiceRegistryHost,
-) -> Result<AuthenticatedDaemonCommand, DaemonError> {
-    authenticate_daemon_control_request_via_registry_inner(
-        paths,
-        request,
-        Some(request_digest_sha256),
-        service_host,
-    )
-}
-
-fn authenticate_daemon_control_request_via_registry_inner(
-    paths: &DaemonPaths,
-    request: &DaemonControlRequest,
-    request_digest_sha256: Option<&[u8; 32]>,
-    service_host: &DaemonServiceRegistryHost,
-) -> Result<AuthenticatedDaemonCommand, DaemonError> {
-    let authenticate = |authorize_route| match (request_digest_sha256, authorize_route) {
-        (Some(digest), true) => {
-            crate::auth::authenticate_daemon_control_request_with_digest(paths, request, digest)
-        }
-        (Some(digest), false) => {
-            crate::auth::authenticate_daemon_control_request_without_route_authorization_with_digest(
-                paths, request, digest,
-            )
-        }
-        (None, true) => crate::auth::authenticate_daemon_control_request(paths, request),
-        (None, false) => {
+    let authenticate = |authorize_route| {
+        if authorize_route {
+            crate::auth::authenticate_daemon_control_request(paths, request)
+        } else {
             crate::auth::authenticate_daemon_control_request_without_route_authorization(
                 paths, request,
-            )
-        }
-    };
-    let Some(descriptor) = service_host.object_rpc_route_descriptor(&request.route) else {
-        return authenticate(true);
-    };
-    if descriptor.auth_scope.is_none() {
-        let authenticated = authenticate(true)?;
-        return daemon_route_local_permissions_are_granted(paths, &descriptor)
-            .then_some(authenticated)
-            .ok_or(DaemonError::AuthDenied);
-    }
-    let authenticated = authenticate(false)?;
-    if daemon_authenticated_command_authorizes_route_descriptor(paths, &authenticated, &descriptor)
-    {
-        Ok(authenticated)
-    } else {
-        Err(DaemonError::AuthDenied)
-    }
-}
-
-/// Applies the live route catalog after the routed-session layer has already
-/// authenticated the exact origin node and membership record for this stream.
-pub(crate) fn authenticate_routed_daemon_control_request_via_registry(
-    paths: &DaemonPaths,
-    request: &DaemonControlRequest,
-    request_digest_sha256: Option<&[u8; 32]>,
-    service_host: &DaemonServiceRegistryHost,
-    peer_node_id: &str,
-    peer_public_key: &str,
-    peer_is_raft_voter: bool,
-) -> Result<AuthenticatedDaemonCommand, DaemonError> {
-    let authenticate = |authorize_route| {
-        if let Some(digest) = request_digest_sha256 {
-            crate::auth::authenticate_verified_cluster_peer_request_with_digest(
-                paths,
-                request,
-                digest,
-                peer_node_id,
-                peer_public_key,
-                peer_is_raft_voter,
-                authorize_route,
-            )
-        } else {
-            crate::auth::authenticate_verified_cluster_peer_request(
-                paths,
-                request,
-                peer_node_id,
-                peer_public_key,
-                peer_is_raft_voter,
-                authorize_route,
             )
         }
     };
@@ -7581,7 +7498,7 @@ mod tests {
                 &(),
             )
             .expect("request"),
-            streamed_value_digest_sha256: None,
+            streamed_value_body: false,
             connect_timeout_millis: 5_000,
             idle_timeout_millis: Some(310_000),
             overall_timeout_millis: None,
@@ -7607,7 +7524,7 @@ mod tests {
                 &(),
             )
             .expect("request"),
-            streamed_value_digest_sha256: None,
+            streamed_value_body: false,
             connect_timeout_millis: 7_000,
             idle_timeout_millis: None,
             overall_timeout_millis: None,
@@ -9280,49 +9197,6 @@ mod tests {
             observations[2].1,
             "a rebuilt route registry observes the committed cluster identity"
         );
-    }
-
-    #[test]
-    fn local_streamed_request_authentication_uses_preserved_signed_digest() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-local-streamed-auth");
-        let data_dir = SinomoDataDir::new(&root);
-        let paths = DaemonPaths::new(&data_dir);
-        let registry = ServiceRegistry::builder()
-            .register(DaemonControlService {
-                paths: paths.clone(),
-                runtime: None,
-            })
-            .build();
-        let host = test_service_host(&root, registry);
-        let mut request =
-            ObjectRpcRequest::encode_body(DAEMON_STATUS_ROUTE, DAEMON_RPC_CATEGORY, &())
-                .expect("status request");
-        let request_digest: [u8; 32] = sinomo_core::network::daemon_rpc_body_sha256(&request)
-            .try_into()
-            .expect("request digest");
-        request.auth = Some(
-            crate::auth::sign_daemon_rpc_request_from_data_dir(&data_dir, &request)
-                .expect("sign streamed status request"),
-        );
-        request.body.clear();
-
-        assert!(matches!(
-            authenticate_daemon_control_request_via_registry_with_digest(
-                &paths,
-                &request,
-                &[0x55; 32],
-                &host,
-            ),
-            Err(DaemonError::AuthDenied)
-        ));
-        let authenticated = authenticate_daemon_control_request_via_registry_with_digest(
-            &paths,
-            &request,
-            &request_digest,
-            &host,
-        )
-        .expect("authenticate preserved streamed request digest");
-        assert_eq!(authenticated.signer, DaemonSignerAuthority::Local);
     }
 
     #[test]
@@ -11907,12 +11781,6 @@ mod tests {
                     sinomo_core::network::ObjectFrameIoOptions::default(),
                     move |incoming, _peer| async move {
                         assert_eq!(incoming.request.route, forward_route);
-                        let authenticated = crate::authenticate_daemon_control_request(
-                            &handler_paths,
-                            &incoming.request,
-                        )
-                        .expect("outer local forward signer");
-                        assert_eq!(authenticated.signer, crate::DaemonSignerAuthority::Local);
                         let payload: crate::DaemonObjectRpcForwardRequest =
                             incoming.request.decode_body().expect("forward payload");
                         let (response, body) = forward_object_rpc_call_from_daemon_control(
@@ -11937,7 +11805,7 @@ mod tests {
 
         let runtime = tokio::runtime::Handle::current();
         let mut host =
-            crate::client::DaemonSignedObjectRpcAsyncHost::new(&runtime, false).with_paths(&paths);
+            crate::client::DaemonObjectRpcAsyncHost::new(&runtime, false).with_paths(&paths);
         let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
         for (index, ((request_body, expected_response), inner_route)) in request_bodies
             .into_iter()
@@ -11953,34 +11821,16 @@ mod tests {
             } else {
                 "test"
             };
-            let (inner_request, streamed_value_digest_sha256) = if index == 1 {
-                let contiguous = ObjectRpcRequest::from_encoded_body(
-                    inner_route.clone(),
-                    category,
-                    request_body.clone(),
-                );
-                let digest = sinomo_core::network::daemon_rpc_body_sha256(&contiguous)
-                    .try_into()
-                    .expect("daemon request digest");
-                (
-                    ObjectRpcRequest::from_encoded_body(inner_route, category, Vec::new()),
-                    Some(digest),
-                )
+            let inner_request = if index == 1 {
+                ObjectRpcRequest::from_encoded_body(inner_route, category, Vec::new())
             } else {
-                (
-                    ObjectRpcRequest::encode_body(
-                        inner_route,
-                        category,
-                        &format!("request-{index}"),
-                    )
-                    .expect("inner request head"),
-                    None,
-                )
+                ObjectRpcRequest::encode_body(inner_route, category, &format!("request-{index}"))
+                    .expect("inner request head")
             };
             let payload = crate::DaemonObjectRpcForwardRequest {
                 target_node_id: target_node.clone(),
                 request: inner_request,
-                streamed_value_digest_sha256,
+                streamed_value_body: index == 1,
                 connect_timeout_millis: 5_000,
                 idle_timeout_millis: Some(310_000),
                 overall_timeout_millis: None,

@@ -43,8 +43,8 @@ use sinomo_kv::{
 use sinomo_kv::{KvAuthoritativeRead, KvAuthorityBasis, KvCommand};
 use sinomo_kv::{KvCommandRequest, KvSnapshot, KvTxnRequest};
 use sinomo_network::ClusterMembershipRpcFuture;
+use sinomo_network::ClusterObjectRpcAsyncHost;
 use sinomo_network::ClusterPaths;
-use sinomo_network::ClusterSignedObjectRpcAsyncHost;
 use sinomo_network::NetworkError;
 use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse};
 use std::time::{Duration, Instant};
@@ -178,7 +178,7 @@ where
 }
 
 pub trait ClusterKvTxnQuorumAsyncHost:
-    ClusterSignedObjectRpcAsyncHost
+    ClusterObjectRpcAsyncHost
     + ClusterKvQuorumAsyncHost
     + ClusterStateAuthorityReachabilityAsyncHost
     + Send

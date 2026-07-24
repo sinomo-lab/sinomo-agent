@@ -13,17 +13,18 @@ completed migration stages and deletion criteria are recorded in the
 
 ## Purpose
 
-Sinomo networking has one fundamental responsibility: establish an
-authenticated communication path from one authorized node to another. Object
-RPC is a protocol that may use that path; it is not part of path discovery or
-relay routing.
+Sinomo networking has one fundamental responsibility: establish an efficient
+communication path from one authorized node to another. Adjacent-peer identity
+is established once by transports that provide authentication. Object RPC uses
+that established path without signing, hashing, or encrypting each call.
 
 The design separates five contracts:
 
 1. direct link transports connect adjacent nodes;
 2. connectivity tracking records fresh, directed reachability evidence;
 3. node routing turns that evidence into target-bound duplex streams;
-4. object RPC exchanges SOBJ values over any authenticated duplex stream; and
+4. object RPC exchanges SOBJ values over any reliable duplex stream with an
+   established peer context; and
 5. domain services own methods, authorization, idempotency, and side effects.
 
 Networking does not interpret KV, DFS, agent, or application semantics. It does
@@ -37,7 +38,7 @@ domain services and the service registry
                   |
                   v
         SOBJ object-RPC protocol
-      one call per authenticated stream
+         one call per stream
                   |
                   v
        routed connector and peer stream
@@ -57,7 +58,7 @@ domain services and the service registry
 | Layer | Owns | Must not own |
 |---|---|---|
 | Domain service | Target selection, typed request and response values, method semantics, authorization, operation identity, idempotency, and side effects. | Endpoint choice, relay paths, transport framing, or connectivity mutation. |
-| Object RPC | Method and request identifiers, SOBJ request and response framing, streamed bodies, application authentication context, and RPC failure classification. | Node path selection, endpoint dialing, relay forwarding, membership, or transport-specific limits. |
+| Object RPC | Method and request identifiers, SOBJ request and response framing, streamed bodies, and RPC failure classification. | Node path selection, endpoint dialing, relay forwarding, membership, content verification, signatures, encryption, or transport-specific limits. |
 | Node routing | Transitive reachability, authorized path planning, path realization, routed-session establishment, relay execution, target identity, connection pooling, and stream lifecycle. | SOBJ, RPC methods, handler retries, service catalogs, or domain authorization. |
 | Connectivity | Direct-edge observations, freshness, provenance, path metrics, immutable snapshots, and watches. | Transitive reachability, membership authority, service dispatch, route execution, or application retries. |
 | Direct transport | Dialing, listening, adjacent-peer authentication, transport capabilities, and multiplexed direct streams. | Multi-hop route choice, cluster status, SOBJ, or RPC. |
@@ -167,15 +168,15 @@ override a newer non-empty authoritative projection.
 ## Routing Contract
 
 The routing layer is the sole owner of transitive reachability. It turns paths
-through the direct connectivity graph into actual node-addressed,
-authenticated, socket-like streams. A caller supplies a destination node and
+through the direct connectivity graph into actual node-addressed socket-like
+streams. A caller supplies a destination node and
 connection constraints; it never chooses LAN versus Iroh, direct versus relay,
 or a specific intermediate node.
 
 The primary routing liveness goal is component-wide communication: every pair
 of authorized nodes in the same current routable connected component can obtain
-an authenticated duplex stream, regardless of the number or arrangement of
-intermediate relays.
+a duplex stream with an established endpoint identity, regardless of the
+number or arrangement of intermediate relays.
 
 ```rust,ignore
 trait RoutedConnector {
@@ -199,8 +200,8 @@ struct PeerStream {
 `route_trace` is diagnostic evidence. It cannot be used by an application to
 grant authority or select a different service behavior.
 
-The connector may cache an authenticated routed connection and open cheap
-logical streams over it. Each returned `PeerStream` nevertheless has ordinary
+The connector may cache an established routed connection and open cheap logical
+streams over it. Each returned `PeerStream` nevertheless has ordinary
 socket failure semantics: it is bound to one destination, never silently moves
 to another destination, and fails if its underlying routed session cannot
 continue.
@@ -217,7 +218,7 @@ usable relationship:
 | State | Meaning |
 |---|---|
 | Candidate path | The current authorized snapshots contain at least one directed path that routing can attempt. |
-| Connected | Routing established an authenticated direct or relayed session and can open streams to the destination. |
+| Connected | Routing established a direct or relayed session and can open streams to the destination. |
 | No path | The current snapshots contain no authorized candidate path. |
 | Unknown | Directory or direct-edge evidence is absent, expired, or changing. |
 
@@ -275,8 +276,8 @@ step that the planner may emit.
 
 If the directory and connectivity snapshot remain valid for the duration of an
 attempt, every edge continues to satisfy its advertised direct-link contract,
-and each relay cooperates, then `connect(source, destination)` must establish an
-authenticated session for every node pair in the same current component.
+and each relay cooperates, then `connect(source, destination)` must establish a
+session for every node pair in the same current component.
 Routing cannot report `No path` or leave the relationship as graph-only state
 without attempting an eligible candidate.
 
@@ -293,27 +294,31 @@ For any source and destination in one routable component, all transitive
 establishment is performed by the routing system:
 
 1. The source selects an ordered candidate path from a current snapshot.
-2. The source creates an origin-signed `OpenSession` binding the source,
-   destination, unique session ID, ordered path, hop limit, connection deadline,
-   and end-to-end key material.
-3. Every intermediate relay verifies membership, signatures, path position,
-   loop freedom, deadline, and hop limit. It may reject the session but cannot
-   change either endpoint or the session identity.
+2. The source creates an `OpenSession` containing the source, destination,
+   unique session ID, ordered path, hop limit, connection deadline, and selected
+   record protection.
+3. Every intermediate relay validates membership, path position, loop freedom,
+   deadline, and hop limit. It may reject the session but cannot change either
+   endpoint or the session identity.
 4. Each relay establishes or reuses the next direct link and forwards the
    unchanged end-to-end session descriptor.
 5. The destination accepts only when the descriptor targets its local identity
-   and returns a destination-signed acceptance bound to the same session.
-6. The endpoints derive end-to-end authenticated-encryption keys and a channel
-   binding. Only then may `connect` return a `PeerStream`.
+   and returns acceptance for the same session.
+6. Plaintext records are the default. When the caller explicitly selects
+   `RoutedSessionProtection::Aead`, the endpoints derive end-to-end AEAD keys.
+   Only then may `connect` return a `PeerStream`.
 
 The accepted endpoint relationship lives in routing's session pool. Routing can
 open additional logical streams over it without asking connectivity to create
-or persist a synthetic endpoint edge.
+or persist a synthetic endpoint edge. Protection is part of the pool identity:
+an AEAD call cannot reuse a plaintext carrier. Low-level callers select it with
+`ConnectOptions::protection`; service-RPC callers use
+`ClusterObjectRpcOptions::with_routed_session_protection`.
 
-Intermediate relays forward opaque encrypted stream data. They may observe the
-path identities and bounded traffic metadata required for forwarding, but they
-cannot inspect RPC values, alter the destination, impersonate either endpoint,
-or produce a successful end-to-end acceptance.
+Intermediate relays forward stream records without decoding mux, RPC, SOBJ, or
+service data. With default plaintext protection this opacity is a layer
+boundary, not a security guarantee; trusted relays could inspect bytes. AEAD is
+available only for callers that explicitly require confidentiality.
 
 A routed session is not inserted as a new direct connectivity edge. Routing
 reports its active session state. Measurements from establishment and delivery
@@ -348,18 +353,16 @@ possibly executed RPC operation.
 
 ## Object-RPC Contract
 
-Object RPC is a transport-independent protocol over one authenticated duplex
-stream per call. It can run over a `PeerStream`, an authenticated direct stream,
-an in-memory duplex stream, or another adapter satisfying the same peer-context
-contract.
+Object RPC is a transport-independent protocol over one reliable duplex stream
+per call. It can run over a `PeerStream`, a direct stream, an in-memory duplex
+stream, or another adapter satisfying the same peer-context contract.
 
-Plain `AsyncRead + AsyncWrite` is insufficient for remote calls because it does
-not identify the peer. An RPC transport also supplies:
+The canonical owned-chunk contract supplies:
 
-- verified local and peer identities, or an explicit unauthenticated-local
+- transport-established local and peer identities, or an explicit local
   classification;
 - a unique session or connection identifier;
-- a channel binding derived from the authenticated stream; and
+- a diagnostic channel binding; and
 - the stream's close/reset result.
 
 The client writes one request direction and reads one response direction. The
@@ -367,10 +370,8 @@ server may respond before consuming the complete request body. Independent
 calls use independent logical streams; object RPC does not implement another
 connection multiplexer.
 
-Authenticated control records carry a fixed authentication tag followed by
-the canonical unsigned SOBJ bytes covered by that tag. Receivers authenticate
-the transmitted bytes before decoding them; they do not decode and re-encode a
-control value to reconstruct its authentication transcript.
+Control records are length-delimited canonical SOBJ values. Object RPC does not
+add an authentication tag, signature, content digest, or encryption layer.
 
 Object RPC owns:
 
@@ -378,8 +379,7 @@ Object RPC owns:
 - method and request identifiers;
 - bounded request and response heads;
 - incrementally encoded SOBJ values and optional attachments;
-- explicit body completion and cancellation;
-- application authentication and authorization context; and
+- explicit body completion and cancellation; and
 - failure classification needed for domain retry decisions.
 
 The service dispatch name is a `method` or `service method`, not a network
@@ -400,36 +400,24 @@ Every request and response uses the same RPC framing at every size:
 - a response may be larger or smaller than its request without changing
   protocol or delivery semantics.
 
-RPC framing includes an end-to-end content length when known and a cryptographic
-content digest for transported SOBJ bytes. A one-pass body whose length or
-digest is not known at the start declares deferred completion; its
-origin-authenticated finish record supplies the final length and digest bound to
-the request and channel. The receiver computes both while consuming the stream
-and verifies completion before accepting the value. A handler may process
-streamed bytes speculatively, but it cannot commit an irreversible effect based
-on unverified content unless its domain protocol supplies an independently
-verified chunk or content contract.
+RPC framing includes the body length when known. A one-pass body with an
+unknown length declares deferred completion; its finish record supplies the
+observed final length. On reliable ordered transports such as TCP, framing and
+length are sufficient for transport completion. Object RPC does not reread the
+payload for a checksum or cryptographic digest.
 
-The routed stream's authenticated encryption protects bytes in transit. The
-content digest additionally binds application authentication and stable object
-identity independently of carrier framing. Responses apply the same rule with
-the target as the authenticated producer.
+Applications that need stable object identity, corruption detection beyond the
+selected transport, or artifact verification must carry and verify that digest
+in their own typed protocol. A transport digest could not replace that
+application-level contract.
 
-### Authentication and Destination Binding
+### Peer Identity and Authorization
 
-An authenticated RPC request binds at least:
-
-- caller and intended peer identity;
-- channel binding and RPC request ID;
-- service method and operation identity;
-- request-head digest and body content descriptor;
-- freshness and replay data; and
-- relevant authorization context.
-
-Binding the intended peer prevents a valid request from being re-enveloped for
-another node. The target service verifies the request again at the final effect
-boundary. Transport authentication never replaces domain authorization or
-node-local consent.
+RPC reads caller identity from the already-established transport context. It
+does not copy that identity into a signed request envelope or authenticate the
+same call again. The final service boundary maps the transport peer to local,
+member, or voter authority and applies the live route catalog and node-local
+consent. Domain authorization remains independent of transport framing.
 
 ### Retry and Idempotency
 
@@ -438,13 +426,13 @@ returns one of the domain-relevant delivery states:
 
 | State | Meaning |
 |---|---|
-| Not sent | The caller has definitive evidence that no request bytes crossed the authenticated stream boundary. |
-| Rejected | The peer returned a verified rejection before handler execution. |
-| Possibly applied | Request delivery or handler execution may have occurred, but no verified completion was received. |
-| Completed | A response and its integrity checks completed successfully. |
+| Not sent | The caller has definitive evidence that no request bytes crossed the stream boundary. |
+| Rejected | The peer returned a protocol rejection before handler execution. |
+| Possibly applied | Request delivery or handler execution may have occurred, but no completion was received. |
+| Completed | A complete response was received. |
 
 Only `Not sent` is generically safe to retry. Once any request byte is handed to
-an established stream, a failure is `Possibly applied` unless a verified peer
+an established stream, a failure is `Possibly applied` unless a peer
 rejection proves otherwise. A domain may retry `Possibly applied` only with a
 stable operation identity and an idempotency or outcome query contract.
 Networking does not provide a universal response replay cache.
@@ -498,7 +486,7 @@ graph:
 | Direct link | Authenticated adjacent transports, listeners, connection pools, and streams. |
 | Connectivity | Direct-edge evidence validation, immutable snapshots, watches, and direct status. |
 | Routing | Pure planning, routed sessions, relays, and `RoutedConnector`. |
-| Object RPC | SOBJ RPC over authenticated duplex streams. |
+| Object RPC | SOBJ RPC over reliable duplex streams with an established peer context. |
 | Public facade | Stable exports and composition types without a second implementation path. |
 
 The exact file layout may evolve, but the dependency direction is fixed.
@@ -519,7 +507,8 @@ dependency on one another, and `sinomo-cluster` is their only bridge.
 
 ## Architectural Invariants
 
-1. Object RPC depends on an authenticated duplex-stream contract, never on node
+1. Object RPC depends on a reliable duplex-stream contract with an established
+   peer context, never on node
    routing, endpoint selection, connectivity stores, or a specific transport.
 2. Routing forwards opaque bytes and never imports SOBJ, RPC methods, service
    catalogs, body modes, or domain retry policy.
@@ -530,12 +519,12 @@ dependency on one another, and `sinomo-cluster` is their only bridge.
    executor under the same directory, edge-capability, and relay assumptions.
    Graph reachability that fails realization produces specific edge feedback.
 5. Every authorized node pair in the same current routable connected component
-   can establish an authenticated direct or relayed duplex stream under stable
+   can establish a direct or relayed duplex stream under stable
    path-realization assumptions.
-6. A routed stream is end-to-end bound to its source, destination, session, and
-   channel binding before application bytes are accepted.
-7. Relays cannot change the destination, authenticate as the origin or target,
-   or inspect or alter end-to-end protected application bytes.
+6. A routed stream is bound to its source, destination, session, and selected
+   protection mode before application bytes are accepted.
+7. Relays never decode mux, RPC, SOBJ, or service payloads. Confidentiality
+   against relays is guaranteed only when the caller explicitly enables AEAD.
 8. One RPC call uses one logical duplex stream and the same protocol at every
    request and response size.
 9. Frame, queue, window, and buffer limits bound resident resources, not total

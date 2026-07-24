@@ -1,17 +1,16 @@
 //! Stream-native SOBJ object RPC.
 //!
-//! One authenticated duplex byte stream carries exactly one request direction
+//! One established duplex byte stream carries exactly one request direction
 //! and one response direction. This module deliberately knows nothing about
 //! route selection, relay topology, endpoint discovery, or service catalogs.
-//! The authenticated stream supplies peer identity and a unique channel
-//! binding; this protocol binds its request, body, and response transcripts to
-//! that context.
+//! Peer identity belongs to the transport. Object RPC adds only bounded
+//! request/response framing and length-based stream completion.
 
 use crate::error::NetworkError;
 use crate::object::{ObjectFrameIoOptions, SinomoObjectCodec};
 use crate::owned_chunk::{
-    AuthenticatedChunkReader, AuthenticatedChunkStream, AuthenticatedChunkWriter, ChunkAllocator,
-    OwnedChunk, RPC_CONTROL_PAYLOAD_MAX, observe_chunk_identity,
+    AuthenticatedChunkReader, AuthenticatedChunkStream, AuthenticatedChunkWriter, BODY_CHUNK_MAX,
+    ChunkAllocator, OwnedChunk, RPC_CONTROL_PAYLOAD_MAX, observe_chunk_identity,
 };
 use crate::rpc_body::{
     ObjectRpcBodyChunk, ObjectRpcBodyReceiver, ObjectRpcBodyReceiverFuture, ObjectRpcBodySource,
@@ -26,13 +25,13 @@ use std::future::Future;
 use std::io::{self, IoSlice};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::watch;
 
 pub const OBJECT_RPC_STREAM_MAX_HEAD_BYTES: usize = RPC_CONTROL_PAYLOAD_MAX;
 pub const OBJECT_RPC_STREAM_INLINE_BODY_BYTES: usize = 8 * 1024;
-pub const OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES: usize = 64 * 1024;
+pub const OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES: usize = BODY_CHUNK_MAX;
 #[cfg(test)]
 pub const OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES: usize = 256 * 1024;
 
@@ -40,9 +39,7 @@ const OBJECT_RPC_STREAM_PROTOCOL: &str = "sinomo.object-rpc.stream.v2";
 const OBJECT_RPC_STREAM_WIRE_MAGIC: [u8; 4] = *b"SOR2";
 const OBJECT_RPC_STREAM_WIRE_PREFIX_BYTES: usize = 9;
 const OBJECT_RPC_STREAM_MAX_TERMINAL_BYTES: usize = 16 * 1024;
-const OBJECT_RPC_STREAM_MAX_HEAD_CLOCK_SKEW_MILLIS: u64 = 5 * 60 * 1000;
 const OBJECT_RPC_STREAM_MIN_PROGRESS_INTERVAL: Duration = Duration::from_millis(10);
-const AUTHENTICATED_CONTROL_TAG_BYTES: usize = 32;
 
 const FRAME_REQUEST_HEAD: u8 = 1;
 const FRAME_REQUEST_DATA: u8 = 2;
@@ -52,13 +49,6 @@ const FRAME_RESPONSE_DATA: u8 = 5;
 const FRAME_RESPONSE_FINISH: u8 = 6;
 const FRAME_REQUEST_PROGRESS: u8 = 7;
 const FRAME_RESPONSE_PROGRESS: u8 = 8;
-
-const AUTH_REQUEST_HEAD: &[u8] = b"sinomo-object-rpc-request-head-v2";
-const AUTH_REQUEST_FINISH: &[u8] = b"sinomo-object-rpc-request-finish-v2";
-const AUTH_RESPONSE_HEAD: &[u8] = b"sinomo-object-rpc-response-head-v2";
-const AUTH_RESPONSE_FINISH: &[u8] = b"sinomo-object-rpc-response-finish-v2";
-const AUTH_REQUEST_PROGRESS: &[u8] = b"sinomo-object-rpc-request-progress-v2";
-const AUTH_RESPONSE_PROGRESS: &[u8] = b"sinomo-object-rpc-response-progress-v2";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RpcPeerIdentity {
@@ -105,37 +95,12 @@ impl RpcPeerContext {
             channel_binding,
         }
     }
-
-    fn wire_endpoints(&self) -> (Option<NodeId>, Option<NodeId>) {
-        match &self.identity {
-            RpcPeerIdentity::Authenticated {
-                local_node_id,
-                peer_node_id,
-            } => (Some(local_node_id.clone()), Some(peer_node_id.clone())),
-            RpcPeerIdentity::UnauthenticatedLocal => (None, None),
-        }
-    }
-
-    fn expected_incoming_endpoints(&self) -> (Option<&NodeId>, Option<&NodeId>) {
-        match &self.identity {
-            RpcPeerIdentity::Authenticated {
-                local_node_id,
-                peer_node_id,
-            } => (Some(peer_node_id), Some(local_node_id)),
-            RpcPeerIdentity::UnauthenticatedLocal => (None, None),
-        }
-    }
 }
 
 /// A request or response body supplied through the same API whether its final
-/// length and digest are known at head time or deferred to the finish record.
-///
-/// Replayable sources are hashed in a bounded-memory pre-pass so their length
-/// and digest are authenticated in the head. One-pass sources are streamed
-/// once and authenticate their observed length and digest in the finish record.
+/// length is known at head time or supplied by the finish record.
 pub struct ObjectRpcStreamBody {
     kind: OutgoingBodyKind,
-    supplied_digest: Option<[u8; 32]>,
 }
 
 enum OutgoingBodyKind {
@@ -153,7 +118,6 @@ impl std::fmt::Debug for ObjectRpcStreamBody {
             .debug_struct("ObjectRpcStreamBody")
             .field("kind", &kind)
             .field("total_bytes", &total_bytes)
-            .field("has_supplied_digest", &self.supplied_digest.is_some())
             .finish()
     }
 }
@@ -170,39 +134,17 @@ impl ObjectRpcStreamBody {
         if bytes.len() <= OBJECT_RPC_STREAM_INLINE_BODY_BYTES {
             return Self {
                 kind: OutgoingBodyKind::Inline(Bytes::from(bytes)),
-                supplied_digest: None,
             };
         }
         Self {
             kind: OutgoingBodyKind::Source(ObjectRpcBodySource::bytes(bytes)),
-            supplied_digest: None,
         }
     }
 
     pub fn source(source: ObjectRpcBodySource) -> Self {
         Self {
             kind: OutgoingBodyKind::Source(source),
-            supplied_digest: None,
         }
-    }
-
-    /// Supplies a producer-computed digest for a source with a known length.
-    /// This avoids a replayable pre-pass and lets a one-pass producer use a
-    /// known descriptor when its domain already owns a stable content digest.
-    #[cfg(test)]
-    pub(crate) fn known(
-        source: ObjectRpcBodySource,
-        digest: [u8; 32],
-    ) -> Result<Self, NetworkError> {
-        if source.total_bytes().is_none() {
-            return Err(serialization_error(
-                "a known object RPC stream body digest requires a known length",
-            ));
-        }
-        Ok(Self {
-            kind: OutgoingBodyKind::Source(source),
-            supplied_digest: Some(digest),
-        })
     }
 
     #[cfg(test)]
@@ -228,7 +170,7 @@ pub struct ObjectRpcStreamCall {
     pub method: String,
     pub operation_id: Option<String>,
     pub metadata: BTreeMap<String, String>,
-    /// Opaque, bounded service head authenticated with the RPC head.
+    /// Opaque, bounded service head carried with the RPC head.
     ///
     /// Object RPC does not interpret this value. Service adapters use it for
     /// their typed request head while the body remains incrementally framed.
@@ -273,7 +215,7 @@ pub struct ObjectRpcStreamIncomingCall {
     pub metadata: BTreeMap<String, String>,
     pub application_head: Vec<u8>,
     pub body: ObjectRpcStreamIncomingBody,
-    /// Time from the server record reader starting until the authenticated
+    /// Time from the server record reader starting until the
     /// request head and body descriptor are ready for the service adapter.
     #[doc(hidden)]
     pub request_ingress_duration_ns: u64,
@@ -304,7 +246,7 @@ impl ObjectRpcStreamReply {
     }
 }
 
-/// Client-visible authenticated response head and incremental body.
+/// Client-visible response head and incremental body.
 #[derive(Debug)]
 pub struct ObjectRpcStreamResponse {
     pub metadata: BTreeMap<String, String>,
@@ -329,26 +271,15 @@ pub(crate) enum RpcResponseConsumption<T> {
 enum BodyDescriptor {
     Inline {
         length: u64,
-        digest: [u8; 32],
-    },
-    Known {
-        length: u64,
-        digest: [u8; 32],
     },
     /// A one-pass producer whose length is known before the stream begins.
-    ///
-    /// The authenticated head commits to the length while the authenticated
-    /// finish record commits to the digest observed during the single pass.
-    /// This is distinct from `Deferred`: trusted proxy hops can preserve an
-    /// incoming attachment's declared length without buffering or hashing it
-    /// before forwarding.
     KnownLength {
         length: u64,
     },
     Deferred,
 }
 
-// Inline bytes are stored separately in the authenticated head. Keeping the
+// Inline bytes are stored separately in the bounded head. Keeping the
 // descriptor shape free of a Vec makes accidental unbounded descriptor use
 // impossible; the head's explicit allocation bound remains authoritative.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -360,17 +291,12 @@ struct InlineBody {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct RequestHeadUnsigned {
     protocol: String,
-    origin_node_id: Option<NodeId>,
-    destination_node_id: Option<NodeId>,
-    session_id: Id,
-    channel_binding: [u8; 32],
     request_id: Id,
     method: String,
     operation_id: Option<String>,
     metadata: BTreeMap<String, String>,
     #[serde(with = "serde_bytes")]
     application_head: Vec<u8>,
-    issued_at_unix_millis: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     response_progress_interval_millis: Option<u64>,
     descriptor: BodyDescriptor,
@@ -394,24 +320,14 @@ enum ResponseDisposition {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct ResponseHeadUnsigned {
     protocol: String,
-    origin_node_id: Option<NodeId>,
-    destination_node_id: Option<NodeId>,
-    session_id: Id,
-    channel_binding: [u8; 32],
     request_id: Id,
-    request_head_digest: [u8; 32],
     disposition: ResponseDisposition,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct StreamProgressUnsigned {
     protocol: String,
-    origin_node_id: Option<NodeId>,
-    destination_node_id: Option<NodeId>,
-    session_id: Id,
-    channel_binding: [u8; 32],
     request_id: Id,
-    head_digest: [u8; 32],
     nonce: u64,
 }
 
@@ -424,13 +340,7 @@ enum FinishStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct BodyFinishUnsigned {
     request_id: Id,
-    session_id: Id,
-    channel_binding: [u8; 32],
-    origin_node_id: Option<NodeId>,
-    destination_node_id: Option<NodeId>,
-    head_digest: [u8; 32],
     length: u64,
-    content_digest: [u8; 32],
     status: FinishStatus,
 }
 
@@ -443,34 +353,31 @@ struct PreparedOutgoingBody {
 struct IncomingBodySpec {
     direction: IncomingDirection,
     request_id: Id,
-    head_digest: [u8; 32],
-    progress_head_digest: [u8; 32],
     last_progress_nonce: u64,
     descriptor: BodyDescriptor,
     inline_body: Option<InlineBody>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ObjectRpcBodyVerification {
+pub struct ObjectRpcBodyCompletion {
     pub length: u64,
-    pub digest: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
-pub struct ObjectRpcStreamBodyVerifier {
+pub struct ObjectRpcStreamBodyCompletion {
     receiver: watch::Receiver<Option<Result<IncomingTerminal, NetworkError>>>,
 }
 
-impl ObjectRpcStreamBodyVerifier {
-    pub async fn verify(mut self) -> Result<ObjectRpcBodyVerification, NetworkError> {
+impl ObjectRpcStreamBodyCompletion {
+    pub async fn wait(mut self) -> Result<ObjectRpcBodyCompletion, NetworkError> {
         loop {
             if let Some(result) = self.receiver.borrow().clone() {
-                return incoming_body_verification(&result);
+                return incoming_body_completion(&result);
             }
             self.receiver.changed().await.map_err(|_| {
                 delivery_error(
-                    "verify object RPC stream body",
-                    "body reader ended without a verification result",
+                    "wait for object RPC stream body",
+                    "body reader ended without a completion result",
                 )
             })?;
         }
@@ -479,11 +386,11 @@ impl ObjectRpcStreamBodyVerifier {
 
 /// Incremental incoming body. Natural backpressure is bounded to one receive
 /// window. Dropping the reader makes the protocol pump discard further data
-/// while it still authenticates the finish record.
+/// while it still validates the terminal length record.
 #[derive(Debug)]
 pub struct ObjectRpcStreamIncomingBody {
     body: ObjectRpcIncomingBody,
-    verifier: ObjectRpcStreamBodyVerifier,
+    completion: ObjectRpcStreamBodyCompletion,
 }
 
 impl ObjectRpcStreamIncomingBody {
@@ -491,7 +398,7 @@ impl ObjectRpcStreamIncomingBody {
         self.body.total_bytes()
     }
 
-    /// Materializes the complete authenticated body without imposing a size
+    /// Materializes the complete body without imposing a size
     /// policy. Allocation remains fallible, so a body larger than the process
     /// can represent or reserve returns `ResourceExhausted` instead of
     /// aborting the daemon.
@@ -500,9 +407,9 @@ impl ObjectRpcStreamIncomingBody {
     }
 
     pub async fn collect_to_vec(self, max_bytes: usize) -> Result<Vec<u8>, NetworkError> {
-        let verifier = self.verifier;
+        let completion = self.completion;
         let output = self.body.collect_to_vec(max_bytes).await?;
-        verifier.verify().await?;
+        completion.wait().await?;
         Ok(output)
     }
 
@@ -542,31 +449,17 @@ impl IncomingDirection {
         }
     }
 
-    fn finish_domain(self) -> &'static [u8] {
-        match self {
-            Self::Request => AUTH_REQUEST_FINISH,
-            Self::Response => AUTH_RESPONSE_FINISH,
-        }
-    }
-
     fn progress_kind(self) -> u8 {
         match self {
             Self::Request => FRAME_REQUEST_PROGRESS,
             Self::Response => FRAME_RESPONSE_PROGRESS,
         }
     }
-
-    fn progress_domain(self) -> &'static [u8] {
-        match self {
-            Self::Request => AUTH_REQUEST_PROGRESS,
-            Self::Response => AUTH_RESPONSE_PROGRESS,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
 enum IncomingTerminal {
-    Completed(ObjectRpcBodyVerification),
+    Completed(ObjectRpcBodyCompletion),
     Rejected(String),
 }
 
@@ -661,79 +554,25 @@ impl Drop for RpcTimelineStageGuard {
     }
 }
 
-fn now_unix_millis() -> Result<u64, NetworkError> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| {
-            serialization_error(format!("system clock precedes Unix epoch: {error}"))
-        })?;
-    u64::try_from(duration.as_millis())
-        .map_err(|_| serialization_error("current Unix time does not fit u64 milliseconds"))
-}
-
 fn decode_control<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, NetworkError> {
     SinomoObjectCodec::network_frame().decode(payload)
 }
 
-fn authenticated_control_tag(
-    channel_binding: &[u8; 32],
-    domain: &[u8],
-    unsigned_payload: &[u8],
-) -> blake3::Hash {
-    let mut hasher = blake3::Hasher::new_keyed(channel_binding);
-    hasher.update(domain);
-    hasher.update(unsigned_payload);
-    hasher.finalize()
-}
-
-/// Encodes an authenticated control as `tag || canonical unsigned SOBJ`.
-///
-/// The unsigned value is deliberately serialized exactly once. The receiver
-/// authenticates those same wire bytes before asking SOBJ to decode them, so
-/// neither side has to reconstruct the authentication transcript.
-fn encode_authenticated_control<T: Serialize>(
-    channel_binding: &[u8; 32],
-    domain: &[u8],
-    value: &T,
-    max_bytes: usize,
-) -> Result<Vec<u8>, NetworkError> {
-    let unsigned_payload = SinomoObjectCodec::network_frame().encode(value)?;
-    let payload_len = AUTHENTICATED_CONTROL_TAG_BYTES
-        .checked_add(unsigned_payload.len())
-        .ok_or(NetworkError::FrameTooLarge {
-            actual_bytes: usize::MAX,
-            max_bytes,
-        })?;
-    if payload_len > max_bytes {
+/// Encodes one bounded RPC control record. The reliable transport owns byte
+/// delivery and any optional channel protection, so RPC does not add a tag.
+fn encode_rpc_control<T: Serialize>(value: &T, max_bytes: usize) -> Result<Vec<u8>, NetworkError> {
+    let payload = SinomoObjectCodec::network_frame().encode(value)?;
+    if payload.len() > max_bytes {
         return Err(NetworkError::FrameTooLarge {
-            actual_bytes: payload_len,
+            actual_bytes: payload.len(),
             max_bytes,
         });
     }
-    let authentication_tag = authenticated_control_tag(channel_binding, domain, &unsigned_payload);
-    let mut payload = Vec::with_capacity(payload_len);
-    payload.extend_from_slice(authentication_tag.as_bytes());
-    payload.extend_from_slice(&unsigned_payload);
     Ok(payload)
 }
 
-fn decode_authenticated_control<T: serde::de::DeserializeOwned>(
-    channel_binding: &[u8; 32],
-    domain: &[u8],
-    payload: &[u8],
-) -> Result<T, NetworkError> {
-    if payload.len() < AUTHENTICATED_CONTROL_TAG_BYTES {
-        return Err(serialization_error(
-            "authenticated object RPC control is shorter than its tag",
-        ));
-    }
-    let (actual_tag, unsigned_payload) = payload.split_at(AUTHENTICATED_CONTROL_TAG_BYTES);
-    let expected_tag = authenticated_control_tag(channel_binding, domain, unsigned_payload);
-    // `blake3::Hash` compares byte slices in constant time.
-    if !expected_tag.eq(actual_tag) {
-        return Err(NetworkError::AuthDenied);
-    }
-    decode_control(unsigned_payload)
+fn decode_rpc_control<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, NetworkError> {
+    decode_control(payload)
 }
 
 async fn write_wire_frame<W: AsyncWrite + Unpin>(
@@ -1169,20 +1008,11 @@ fn owned_record_halves(
 async fn read_response_head_with_progress<R: RpcRecordReader>(
     reader: &mut R,
     options: ObjectFrameIoOptions,
-    context: &RpcPeerContext,
     request_id: &Id,
-    request_head_digest: [u8; 32],
     timeline_trace: Option<crate::NetworkTimelineTraceContext>,
 ) -> Result<(RpcRecord, u64), NetworkError> {
     let started_ns = timeline_started_ns(timeline_trace);
-    let result = read_response_head_with_progress_inner(
-        reader,
-        options,
-        context,
-        request_id,
-        request_head_digest,
-    )
-    .await;
+    let result = read_response_head_with_progress_inner(reader, options, request_id).await;
     record_rpc_timeline_duration(
         timeline_trace,
         crate::network_timeline_stage::RPC_RESPONSE_WAIT,
@@ -1196,9 +1026,7 @@ async fn read_response_head_with_progress<R: RpcRecordReader>(
 async fn read_response_head_with_progress_inner<R: RpcRecordReader>(
     reader: &mut R,
     options: ObjectFrameIoOptions,
-    context: &RpcPeerContext,
     request_id: &Id,
-    request_head_digest: [u8; 32],
 ) -> Result<(RpcRecord, u64), NetworkError> {
     let mut last_progress_nonce = 0;
     loop {
@@ -1206,25 +1034,8 @@ async fn read_response_head_with_progress_inner<R: RpcRecordReader>(
         if frame.kind != FRAME_RESPONSE_PROGRESS {
             return Ok((frame, last_progress_nonce));
         }
-        validate_stream_progress(
-            context,
-            IncomingDirection::Response,
-            request_id,
-            request_head_digest,
-            &mut last_progress_nonce,
-            &frame.payload,
-        )?;
+        validate_stream_progress(request_id, &mut last_progress_nonce, &frame.payload)?;
     }
-}
-
-async fn hash_source(source: ObjectRpcBodySource) -> Result<[u8; 32], NetworkError> {
-    let mut producer = source.producer(OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES)?;
-    let mut hasher = blake3::Hasher::new();
-    while let Some(chunk) = producer.next().await? {
-        hasher.update(&chunk);
-    }
-    producer.finish().await?;
-    Ok(*hasher.finalize().as_bytes())
 }
 
 async fn prepare_outgoing_body(
@@ -1234,9 +1045,8 @@ async fn prepare_outgoing_body(
         OutgoingBodyKind::Inline(bytes) => {
             let length = u64::try_from(bytes.len())
                 .map_err(|_| serialization_error("inline body length does not fit u64"))?;
-            let digest = *blake3::hash(&bytes).as_bytes();
             Ok(PreparedOutgoingBody {
-                descriptor: BodyDescriptor::Inline { length, digest },
+                descriptor: BodyDescriptor::Inline { length },
                 inline_body: Some(InlineBody {
                     bytes: bytes.to_vec(),
                 }),
@@ -1244,20 +1054,9 @@ async fn prepare_outgoing_body(
             })
         }
         OutgoingBodyKind::Source(source) => {
-            let total_bytes = source.total_bytes();
-            let digest = if let Some(digest) = body.supplied_digest {
-                Some(digest)
-            } else if let Some(digest) = source.known_digest() {
-                Some(digest)
-            } else if let Some(replay) = source.try_clone_replayable() {
-                Some(hash_source(replay).await?)
-            } else {
-                None
-            };
-            let descriptor = match (total_bytes, digest) {
-                (Some(length), Some(digest)) => BodyDescriptor::Known { length, digest },
-                (Some(length), None) => BodyDescriptor::KnownLength { length },
-                _ => BodyDescriptor::Deferred,
+            let descriptor = match source.total_bytes() {
+                Some(length) => BodyDescriptor::KnownLength { length },
+                None => BodyDescriptor::Deferred,
             };
             Ok(PreparedOutgoingBody {
                 descriptor,
@@ -1273,11 +1072,13 @@ fn validate_descriptor_inline(
     inline_body: &Option<InlineBody>,
 ) -> Result<(), NetworkError> {
     match (descriptor, inline_body) {
-        (BodyDescriptor::Inline { length, digest, .. }, Some(InlineBody { bytes })) => {
+        (BodyDescriptor::Inline { length }, Some(InlineBody { bytes })) => {
             let actual_length = u64::try_from(bytes.len())
                 .map_err(|_| serialization_error("inline body length does not fit u64"))?;
-            if actual_length != *length || blake3::hash(bytes).as_bytes() != digest {
-                return Err(NetworkError::AuthDenied);
+            if actual_length != *length {
+                return Err(serialization_error(
+                    "object RPC inline body length does not match its descriptor",
+                ));
             }
             if bytes.len() > OBJECT_RPC_STREAM_INLINE_BODY_BYTES {
                 return Err(NetworkError::FrameTooLarge {
@@ -1296,9 +1097,7 @@ fn validate_descriptor_inline(
 
 fn descriptor_total_bytes(descriptor: &BodyDescriptor) -> Option<u64> {
     match descriptor {
-        BodyDescriptor::Inline { length, .. }
-        | BodyDescriptor::Known { length, .. }
-        | BodyDescriptor::KnownLength { length } => Some(*length),
+        BodyDescriptor::Inline { length } | BodyDescriptor::KnownLength { length } => Some(*length),
         BodyDescriptor::Deferred => None,
     }
 }
@@ -1329,11 +1128,11 @@ impl IncomingBodyCompletion {
     }
 }
 
-fn incoming_body_verification(
+fn incoming_body_completion(
     result: &Result<IncomingTerminal, NetworkError>,
-) -> Result<ObjectRpcBodyVerification, NetworkError> {
+) -> Result<ObjectRpcBodyCompletion, NetworkError> {
     match result {
-        Ok(IncomingTerminal::Completed(verification)) => Ok(verification.clone()),
+        Ok(IncomingTerminal::Completed(completion)) => Ok(completion.clone()),
         Ok(IncomingTerminal::Rejected(detail)) => Err(serialization_error(format!(
             "object RPC body rejected: {detail}"
         ))),
@@ -1344,14 +1143,10 @@ fn incoming_body_verification(
 struct PullIncomingBodyState<R> {
     reader: R,
     options: ObjectFrameIoOptions,
-    context: RpcPeerContext,
     direction: IncomingDirection,
     request_id: Id,
-    head_digest: [u8; 32],
-    progress_head_digest: [u8; 32],
     last_progress_nonce: u64,
     descriptor: BodyDescriptor,
-    hasher: blake3::Hasher,
     observed_length: u64,
     pending_chunk: Option<ObjectRpcBodyChunk>,
     terminal_sender: watch::Sender<Option<Result<IncomingTerminal, NetworkError>>>,
@@ -1388,10 +1183,7 @@ impl<R: RpcRecordReader> PullIncomingBodyState<R> {
             let RpcRecord { kind, payload } = self.reader.read_record(self.options).await?;
             if kind == self.direction.progress_kind() {
                 validate_stream_progress(
-                    &self.context,
-                    self.direction,
                     &self.request_id,
-                    self.progress_head_digest,
                     &mut self.last_progress_nonce,
                     &payload,
                 )?;
@@ -1414,17 +1206,11 @@ impl<R: RpcRecordReader> PullIncomingBodyState<R> {
                         "object RPC body exceeded declared length {declared}"
                     )));
                 }
-                self.hasher.update(&payload);
-                if let BodyDescriptor::Known { length, digest } = self.descriptor
+                if let BodyDescriptor::KnownLength { length } = self.descriptor
                     && self.observed_length == length
                 {
-                    let observed_digest = *self.hasher.finalize().as_bytes();
-                    if observed_digest != digest {
-                        return Err(NetworkError::AuthDenied);
-                    }
-                    self.publish(Ok(IncomingTerminal::Completed(ObjectRpcBodyVerification {
+                    self.publish(Ok(IncomingTerminal::Completed(ObjectRpcBodyCompletion {
                         length: self.observed_length,
-                        digest: observed_digest,
                     })));
                 }
                 if payload.is_empty() {
@@ -1438,27 +1224,19 @@ impl<R: RpcRecordReader> PullIncomingBodyState<R> {
                     self.direction
                 )));
             }
-            let finish: BodyFinishUnsigned = decode_authenticated_control(
-                &self.context.channel_binding,
-                self.direction.finish_domain(),
-                &payload,
-            )?;
+            let finish: BodyFinishUnsigned = decode_rpc_control(&payload)?;
             validate_incoming_finish(
-                &self.context,
                 &self.request_id,
-                self.head_digest,
                 self.observed_length,
-                &self.hasher.finalize(),
                 &self.descriptor,
                 &finish,
             )?;
-            let verification = ObjectRpcBodyVerification {
+            let completion = ObjectRpcBodyCompletion {
                 length: self.observed_length,
-                digest: finish.content_digest,
             };
             match finish.status {
                 FinishStatus::Completed => {
-                    self.publish(Ok(IncomingTerminal::Completed(verification)));
+                    self.publish(Ok(IncomingTerminal::Completed(completion)));
                     return Ok(None);
                 }
                 FinishStatus::Rejected { detail } => {
@@ -1532,12 +1310,11 @@ impl<R: RpcRecordReader> Drop for PullIncomingBodyReceiver<R> {
 async fn make_incoming_body<R>(
     reader: R,
     options: ObjectFrameIoOptions,
-    context: RpcPeerContext,
     spec: IncomingBodySpec,
     inline_completes_without_finish: bool,
 ) -> (
     ObjectRpcStreamIncomingBody,
-    ObjectRpcStreamBodyVerifier,
+    ObjectRpcStreamBodyCompletion,
     IncomingBodyCompletion,
 )
 where
@@ -1545,26 +1322,24 @@ where
 {
     let total_bytes = descriptor_total_bytes(&spec.descriptor);
     let (terminal_sender, terminal_receiver) = watch::channel(None);
-    let verifier = ObjectRpcStreamBodyVerifier {
+    let body_completion = ObjectRpcStreamBodyCompletion {
         receiver: terminal_receiver.clone(),
     };
-    let completion = IncomingBodyCompletion {
+    let receive_completion = IncomingBodyCompletion {
         receiver: terminal_receiver,
     };
     let descriptor_validation = validate_descriptor_inline(&spec.descriptor, &spec.inline_body);
     let incoming_body = match (descriptor_validation, spec.descriptor, spec.inline_body) {
-        (Ok(()), BodyDescriptor::Inline { length, digest }, Some(InlineBody { bytes }))
+        (Ok(()), BodyDescriptor::Inline { length }, Some(InlineBody { bytes }))
             if inline_completes_without_finish =>
         {
             terminal_sender.send_replace(Some(Ok(IncomingTerminal::Completed(
-                ObjectRpcBodyVerification { length, digest },
+                ObjectRpcBodyCompletion { length },
             ))));
             ObjectRpcIncomingBody::bytes(bytes)
         }
         (Ok(()), descriptor @ BodyDescriptor::Inline { .. }, Some(InlineBody { bytes })) => {
             let observed_length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(&bytes);
             let pending_chunk =
                 (!bytes.is_empty()).then(|| ObjectRpcBodyChunk::bytes(Bytes::from(bytes)));
             ObjectRpcIncomingBody::receiver(
@@ -1573,14 +1348,10 @@ where
                     state: Some(PullIncomingBodyState {
                         reader,
                         options,
-                        context,
                         direction: spec.direction,
                         request_id: spec.request_id,
-                        head_digest: spec.head_digest,
-                        progress_head_digest: spec.progress_head_digest,
                         last_progress_nonce: spec.last_progress_nonce,
                         descriptor,
-                        hasher,
                         observed_length,
                         pending_chunk,
                         terminal_sender,
@@ -1589,17 +1360,10 @@ where
                 }),
             )
         }
-        (Ok(()), BodyDescriptor::Known { length: 0, digest }, None) => {
-            let observed_digest = *blake3::hash(&[]).as_bytes();
-            let result = if observed_digest == digest {
-                Ok(IncomingTerminal::Completed(ObjectRpcBodyVerification {
-                    length: 0,
-                    digest: observed_digest,
-                }))
-            } else {
-                Err(NetworkError::AuthDenied)
-            };
-            terminal_sender.send_replace(Some(result));
+        (Ok(()), BodyDescriptor::KnownLength { length: 0 }, None) => {
+            terminal_sender.send_replace(Some(Ok(IncomingTerminal::Completed(
+                ObjectRpcBodyCompletion { length: 0 },
+            ))));
             ObjectRpcIncomingBody::empty()
         }
         (Ok(()), descriptor, None) => ObjectRpcIncomingBody::receiver(
@@ -1608,14 +1372,10 @@ where
                 state: Some(PullIncomingBodyState {
                     reader,
                     options,
-                    context,
                     direction: spec.direction,
                     request_id: spec.request_id,
-                    head_digest: spec.head_digest,
-                    progress_head_digest: spec.progress_head_digest,
                     last_progress_nonce: spec.last_progress_nonce,
                     descriptor,
-                    hasher: blake3::Hasher::new(),
                     observed_length: 0,
                     pending_chunk: None,
                     terminal_sender,
@@ -1631,42 +1391,28 @@ where
     };
     let body = ObjectRpcStreamIncomingBody {
         body: incoming_body,
-        verifier: verifier.clone(),
+        completion: body_completion.clone(),
     };
-    (body, verifier, completion)
+    (body, body_completion, receive_completion)
 }
 
 fn validate_incoming_finish(
-    context: &RpcPeerContext,
     request_id: &Id,
-    head_digest: [u8; 32],
     observed_length: u64,
-    observed_digest: &blake3::Hash,
     descriptor: &BodyDescriptor,
     finish: &BodyFinishUnsigned,
 ) -> Result<(), NetworkError> {
-    let (expected_origin, expected_destination) = context.expected_incoming_endpoints();
-    if &finish.request_id != request_id
-        || finish.session_id != context.session_id
-        || finish.channel_binding != context.channel_binding
-        || finish.origin_node_id.as_ref() != expected_origin
-        || finish.destination_node_id.as_ref() != expected_destination
-        || finish.head_digest != head_digest
-        || finish.length != observed_length
-        || finish.content_digest.as_slice() != observed_digest.as_bytes()
-    {
-        return Err(NetworkError::AuthDenied);
+    if &finish.request_id != request_id || finish.length != observed_length {
+        return Err(serialization_error(
+            "object RPC finish does not match the active request or observed length",
+        ));
     }
     match descriptor {
-        BodyDescriptor::Inline { length, digest, .. }
-        | BodyDescriptor::Known { length, digest } => {
-            if *length != observed_length || digest.as_slice() != observed_digest.as_bytes() {
-                return Err(NetworkError::AuthDenied);
-            }
-        }
-        BodyDescriptor::KnownLength { length } => {
+        BodyDescriptor::Inline { length } | BodyDescriptor::KnownLength { length } => {
             if *length != observed_length {
-                return Err(NetworkError::AuthDenied);
+                return Err(serialization_error(
+                    "object RPC body length does not match its descriptor",
+                ));
             }
         }
         BodyDescriptor::Deferred => {}
@@ -1706,19 +1452,15 @@ async fn next_outgoing_body_chunk(
 
 async fn write_prepared_body_data<W: RpcRecordWriter>(
     writer: &mut W,
-    context: &RpcPeerContext,
     direction: IncomingDirection,
     request_id: &Id,
-    progress_head_digest: [u8; 32],
     progress_interval: Option<Duration>,
     progress_nonce: &mut u64,
     data_kind: u8,
     body: &mut PreparedOutgoingBody,
-) -> Result<ObjectRpcBodyVerification, SendFailure> {
-    let mut hasher = blake3::Hasher::new();
+) -> Result<ObjectRpcBodyCompletion, SendFailure> {
     let mut length = 0_u64;
     if let Some(inline) = body.inline_body.as_ref() {
-        hasher.update(&inline.bytes);
         length = inline.bytes.len() as u64;
     }
     if let Some(source) = body.source.as_ref() {
@@ -1734,10 +1476,8 @@ async fn write_prepared_body_data<W: RpcRecordWriter>(
                 std::pin::pin!(next_outgoing_body_chunk(&mut producer, allocator.as_ref()));
             let next = await_with_stream_progress(
                 writer,
-                context,
                 direction,
                 request_id,
-                progress_head_digest,
                 progress_interval,
                 progress_nonce,
                 next_chunk.as_mut(),
@@ -1765,7 +1505,12 @@ async fn write_prepared_body_data<W: RpcRecordWriter>(
                     error: serialization_error("object RPC body length overflow"),
                     wrote_any: true,
                 })?;
-            hasher.update(chunk.as_slice());
+            let reached_declared_end = matches!(
+                body.descriptor,
+                BodyDescriptor::KnownLength {
+                    length: expected_length
+                } if length == expected_length
+            );
             match chunk {
                 OutgoingRpcData::Bytes(bytes) => {
                     writer
@@ -1782,14 +1527,15 @@ async fn write_prepared_body_data<W: RpcRecordWriter>(
                         .await?;
                 }
             }
+            if reached_declared_end {
+                break;
+            }
         }
         let mut finish_producer = std::pin::pin!(producer.finish());
         await_with_stream_progress(
             writer,
-            context,
             direction,
             request_id,
-            progress_head_digest,
             progress_interval,
             progress_nonce,
             finish_producer.as_mut(),
@@ -1800,32 +1546,17 @@ async fn write_prepared_body_data<W: RpcRecordWriter>(
             wrote_any: length != 0,
         })?;
     }
-    let digest = *hasher.finalize().as_bytes();
     match body.descriptor {
         BodyDescriptor::Inline {
             length: expected_length,
-            digest: expected_digest,
         }
-        | BodyDescriptor::Known {
-            length: expected_length,
-            digest: expected_digest,
-        } => {
-            if length != expected_length || digest != expected_digest {
-                return Err(SendFailure {
-                    error: serialization_error(
-                        "object RPC body changed after its authenticated descriptor was prepared",
-                    ),
-                    wrote_any: length != 0,
-                });
-            }
-        }
-        BodyDescriptor::KnownLength {
+        | BodyDescriptor::KnownLength {
             length: expected_length,
         } => {
             if length != expected_length {
                 return Err(SendFailure {
                     error: serialization_error(
-                        "object RPC body length changed after its authenticated descriptor was prepared",
+                        "object RPC body length changed after its descriptor was prepared",
                     ),
                     wrote_any: length != 0,
                 });
@@ -1833,54 +1564,39 @@ async fn write_prepared_body_data<W: RpcRecordWriter>(
         }
         BodyDescriptor::Deferred => {}
     }
-    Ok(ObjectRpcBodyVerification { length, digest })
+    Ok(ObjectRpcBodyCompletion { length })
 }
 
 fn make_finish(
-    context: &RpcPeerContext,
     request_id: Id,
-    head_digest: [u8; 32],
-    verification: ObjectRpcBodyVerification,
+    completion: ObjectRpcBodyCompletion,
     status: FinishStatus,
 ) -> BodyFinishUnsigned {
-    let (origin_node_id, destination_node_id) = context.wire_endpoints();
     BodyFinishUnsigned {
         request_id,
-        session_id: context.session_id.clone(),
-        channel_binding: context.channel_binding,
-        origin_node_id,
-        destination_node_id,
-        head_digest,
-        length: verification.length,
-        content_digest: verification.digest,
+        length: completion.length,
         status,
     }
 }
 
 async fn write_finish<W: RpcRecordWriter>(
     writer: &mut W,
-    context: &RpcPeerContext,
     kind: u8,
-    domain: &[u8],
     finish: &BodyFinishUnsigned,
 ) -> Result<(), SendFailure> {
-    let payload = encode_authenticated_control(
-        &context.channel_binding,
-        domain,
-        finish,
-        OBJECT_RPC_STREAM_MAX_TERMINAL_BYTES,
-    )
-    .map_err(|error| SendFailure {
-        error,
-        wrote_any: false,
-    })?;
+    let payload =
+        encode_rpc_control(finish, OBJECT_RPC_STREAM_MAX_TERMINAL_BYTES).map_err(|error| {
+            SendFailure {
+                error,
+                wrote_any: false,
+            }
+        })?;
     writer
         .write_record(kind, &payload, "write object RPC body finish")
         .await
 }
 
 fn request_head(
-    context: &RpcPeerContext,
     request_id: Id,
     method: String,
     operation_id: Option<String>,
@@ -1889,102 +1605,48 @@ fn request_head(
     options: ObjectFrameIoOptions,
     body: &PreparedOutgoingBody,
 ) -> Result<(RequestHeadUnsigned, Vec<u8>), NetworkError> {
-    let (origin_node_id, destination_node_id) = context.wire_endpoints();
     let unsigned = RequestHeadUnsigned {
         protocol: OBJECT_RPC_STREAM_PROTOCOL.to_string(),
-        origin_node_id,
-        destination_node_id,
-        session_id: context.session_id.clone(),
-        channel_binding: context.channel_binding,
         request_id,
         method,
         operation_id,
         metadata,
         application_head,
-        issued_at_unix_millis: now_unix_millis()?,
         response_progress_interval_millis: advertised_progress_interval_millis(options),
         descriptor: body.descriptor,
         inline_body: body.inline_body.clone(),
     };
-    let payload = encode_authenticated_control(
-        &context.channel_binding,
-        AUTH_REQUEST_HEAD,
-        &unsigned,
-        OBJECT_RPC_STREAM_MAX_HEAD_BYTES,
-    )?;
+    let payload = encode_rpc_control(&unsigned, OBJECT_RPC_STREAM_MAX_HEAD_BYTES)?;
     Ok((unsigned, payload))
 }
 
-fn validate_request_head(
-    context: &RpcPeerContext,
-    unsigned: &RequestHeadUnsigned,
-) -> Result<(), NetworkError> {
-    let (expected_origin, expected_destination) = context.expected_incoming_endpoints();
-    if unsigned.protocol != OBJECT_RPC_STREAM_PROTOCOL
-        || unsigned.origin_node_id.as_ref() != expected_origin
-        || unsigned.destination_node_id.as_ref() != expected_destination
-        || unsigned.session_id != context.session_id
-        || unsigned.channel_binding != context.channel_binding
-        || unsigned.method.trim().is_empty()
-    {
-        return Err(NetworkError::AuthDenied);
+fn validate_request_head(unsigned: &RequestHeadUnsigned) -> Result<(), NetworkError> {
+    if unsigned.protocol != OBJECT_RPC_STREAM_PROTOCOL || unsigned.method.trim().is_empty() {
+        return Err(serialization_error("invalid object RPC request head"));
     }
     validate_descriptor_inline(&unsigned.descriptor, &unsigned.inline_body)?;
-    let now = now_unix_millis()?;
-    if unsigned.issued_at_unix_millis
-        > now.saturating_add(OBJECT_RPC_STREAM_MAX_HEAD_CLOCK_SKEW_MILLIS)
-        || now
-            > unsigned
-                .issued_at_unix_millis
-                .saturating_add(OBJECT_RPC_STREAM_MAX_HEAD_CLOCK_SKEW_MILLIS)
-    {
-        return Err(NetworkError::AuthExpired);
-    }
     Ok(())
 }
 
 fn response_head(
-    context: &RpcPeerContext,
     request_id: Id,
-    request_head_digest: [u8; 32],
     disposition: ResponseDisposition,
 ) -> Result<(ResponseHeadUnsigned, Vec<u8>), NetworkError> {
-    let (origin_node_id, destination_node_id) = context.wire_endpoints();
     let unsigned = ResponseHeadUnsigned {
         protocol: OBJECT_RPC_STREAM_PROTOCOL.to_string(),
-        origin_node_id,
-        destination_node_id,
-        session_id: context.session_id.clone(),
-        channel_binding: context.channel_binding,
         request_id,
-        request_head_digest,
         disposition,
     };
-    let payload = encode_authenticated_control(
-        &context.channel_binding,
-        AUTH_RESPONSE_HEAD,
-        &unsigned,
-        OBJECT_RPC_STREAM_MAX_HEAD_BYTES,
-    )?;
+    let payload = encode_rpc_control(&unsigned, OBJECT_RPC_STREAM_MAX_HEAD_BYTES)?;
     Ok((unsigned, payload))
 }
 
 fn validate_response_head(
-    context: &RpcPeerContext,
     request_id: &Id,
-    request_head_digest: [u8; 32],
     unsigned: &ResponseHeadUnsigned,
 ) -> Result<(), NetworkError> {
-    let (expected_origin, expected_destination) = context.expected_incoming_endpoints();
-    if unsigned.protocol != OBJECT_RPC_STREAM_PROTOCOL
-        || unsigned.origin_node_id.as_ref() != expected_origin
-        || unsigned.destination_node_id.as_ref() != expected_destination
-        || unsigned.session_id != context.session_id
-        || unsigned.channel_binding != context.channel_binding
-        || &unsigned.request_id != request_id
-        || unsigned.request_head_digest != request_head_digest
-    {
-        return Err(NetworkError::AuthDenied);
+    if unsigned.protocol != OBJECT_RPC_STREAM_PROTOCOL || &unsigned.request_id != request_id {
+        return Err(serialization_error("invalid object RPC response head"));
     }
     if let ResponseDisposition::Accepted {
         descriptor,
@@ -1997,57 +1659,27 @@ fn validate_response_head(
     Ok(())
 }
 
-fn stream_progress(
-    context: &RpcPeerContext,
-    direction: IncomingDirection,
-    request_id: Id,
-    head_digest: [u8; 32],
-    nonce: u64,
-) -> Result<Vec<u8>, NetworkError> {
-    let (origin_node_id, destination_node_id) = context.wire_endpoints();
+fn stream_progress(request_id: Id, nonce: u64) -> Result<Vec<u8>, NetworkError> {
     let unsigned = StreamProgressUnsigned {
         protocol: OBJECT_RPC_STREAM_PROTOCOL.to_string(),
-        origin_node_id,
-        destination_node_id,
-        session_id: context.session_id.clone(),
-        channel_binding: context.channel_binding,
         request_id,
-        head_digest,
         nonce,
     };
-    encode_authenticated_control(
-        &context.channel_binding,
-        direction.progress_domain(),
-        &unsigned,
-        OBJECT_RPC_STREAM_MAX_TERMINAL_BYTES,
-    )
+    encode_rpc_control(&unsigned, OBJECT_RPC_STREAM_MAX_TERMINAL_BYTES)
 }
 
 fn validate_stream_progress(
-    context: &RpcPeerContext,
-    direction: IncomingDirection,
     request_id: &Id,
-    head_digest: [u8; 32],
     last_nonce: &mut u64,
     payload: &[u8],
 ) -> Result<(), NetworkError> {
-    let unsigned: StreamProgressUnsigned = decode_authenticated_control(
-        &context.channel_binding,
-        direction.progress_domain(),
-        payload,
-    )?;
-    let (expected_origin, expected_destination) = context.expected_incoming_endpoints();
+    let unsigned: StreamProgressUnsigned = decode_rpc_control(payload)?;
     if unsigned.protocol != OBJECT_RPC_STREAM_PROTOCOL
-        || unsigned.origin_node_id.as_ref() != expected_origin
-        || unsigned.destination_node_id.as_ref() != expected_destination
-        || unsigned.session_id != context.session_id
-        || unsigned.channel_binding != context.channel_binding
         || &unsigned.request_id != request_id
-        || unsigned.head_digest != head_digest
         || unsigned.nonce == 0
         || unsigned.nonce <= *last_nonce
     {
-        return Err(NetworkError::AuthDenied);
+        return Err(serialization_error("invalid object RPC progress record"));
     }
     *last_nonce = unsigned.nonce;
     Ok(())
@@ -2086,17 +1718,14 @@ fn response_progress_interval(
 
 async fn write_stream_progress<W: RpcRecordWriter>(
     writer: &mut W,
-    context: &RpcPeerContext,
     direction: IncomingDirection,
     request_id: &Id,
-    head_digest: [u8; 32],
     nonce: u64,
 ) -> Result<(), SendFailure> {
-    let payload = stream_progress(context, direction, request_id.clone(), head_digest, nonce)
-        .map_err(|error| SendFailure {
-            error,
-            wrote_any: false,
-        })?;
+    let payload = stream_progress(request_id.clone(), nonce).map_err(|error| SendFailure {
+        error,
+        wrote_any: false,
+    })?;
     writer
         .write_record(
             direction.progress_kind(),
@@ -2109,10 +1738,8 @@ async fn write_stream_progress<W: RpcRecordWriter>(
 
 async fn await_with_stream_progress<W, F, T>(
     writer: &mut W,
-    context: &RpcPeerContext,
     direction: IncomingDirection,
     request_id: &Id,
-    head_digest: [u8; 32],
     progress_interval: Option<Duration>,
     next_nonce: &mut u64,
     mut future: Pin<&mut F>,
@@ -2131,10 +1758,8 @@ where
             () = tokio::time::sleep(interval) => {
                 write_stream_progress(
                     writer,
-                    context,
                     direction,
                     request_id,
-                    head_digest,
                     *next_nonce,
                 )
                 .await?;
@@ -2146,9 +1771,7 @@ where
 
 async fn send_request<W: RpcRecordWriter>(
     mut writer: W,
-    context: RpcPeerContext,
     request_id: Id,
-    request_head_digest: [u8; 32],
     head_payload: Vec<u8>,
     mut body: PreparedOutgoingBody,
     options: ObjectFrameIoOptions,
@@ -2156,16 +1779,8 @@ async fn send_request<W: RpcRecordWriter>(
 ) -> Result<(), SendFailure> {
     let started_ns = timeline_started_ns(timeline_trace);
     let result = async {
-        let result = write_request_frames(
-            &mut writer,
-            &context,
-            request_id,
-            request_head_digest,
-            &head_payload,
-            &mut body,
-            options,
-        )
-        .await;
+        let result =
+            write_request_frames(&mut writer, request_id, &head_payload, &mut body, options).await;
         if result.is_ok() {
             writer.flush_record().await?;
             writer.finish_records().await?;
@@ -2187,9 +1802,7 @@ async fn send_request<W: RpcRecordWriter>(
 
 async fn write_request_frames<W: RpcRecordWriter>(
     writer: &mut W,
-    context: &RpcPeerContext,
     request_id: Id,
-    request_head_digest: [u8; 32],
     head_payload: &[u8],
     body: &mut PreparedOutgoingBody,
     options: ObjectFrameIoOptions,
@@ -2205,12 +1818,10 @@ async fn write_request_frames<W: RpcRecordWriter>(
         return Ok(());
     }
     let mut progress_nonce = 1;
-    let verification = write_prepared_body_data(
+    let completion = write_prepared_body_data(
         writer,
-        context,
         IncomingDirection::Request,
         &request_id,
-        request_head_digest,
         stream_progress_interval(options),
         &mut progress_nonce,
         FRAME_REQUEST_DATA,
@@ -2221,48 +1832,31 @@ async fn write_request_frames<W: RpcRecordWriter>(
         error: failure.error,
         wrote_any: true,
     })?;
-    // A Known descriptor is already authenticated in the request head and
-    // commits to both the exact length and digest. The final data record
-    // therefore closes the body at its declared byte boundary; the logical
-    // mux can combine that record with stream FINISH. Length-only and deferred
-    // producers still need the authenticated finish to publish their digest.
-    if matches!(body.descriptor, BodyDescriptor::Known { .. }) {
+    if matches!(body.descriptor, BodyDescriptor::KnownLength { .. }) {
         return Ok(());
     }
-    let finish = make_finish(
-        context,
-        request_id,
-        request_head_digest,
-        verification,
-        FinishStatus::Completed,
-    );
-    write_finish(
-        writer,
-        context,
-        FRAME_REQUEST_FINISH,
-        AUTH_REQUEST_FINISH,
-        &finish,
-    )
-    .await
-    .map_err(|failure| SendFailure {
-        error: failure.error,
-        wrote_any: true,
-    })?;
+    let finish = make_finish(request_id, completion, FinishStatus::Completed);
+    write_finish(writer, FRAME_REQUEST_FINISH, &finish)
+        .await
+        .map_err(|failure| SendFailure {
+            error: failure.error,
+            wrote_any: true,
+        })?;
     Ok(())
 }
 
-/// Executes one call over one authenticated duplex stream.
+/// Executes one call over one peer-bound duplex stream.
 ///
 /// A complete consumer keeps the delivery outcome pending until the
-/// authenticated response finish verifies. A streaming consumer transfers the
-/// incremental body to its caller immediately; the body retains the verifier,
-/// and any terminal authentication or transport failure is delivered by its
+/// response terminal length arrives. A streaming consumer transfers the
+/// incremental body to its caller immediately; the body retains the completion,
+/// and any terminal framing or transport failure is delivered by its
 /// read path. This function never reconnects, reroutes, or automatically
 /// resends a possibly applied call.
 async fn call_object_rpc_records_with_consumption<R, W, F, Fut, T>(
     mut reader: R,
     writer: W,
-    context: &RpcPeerContext,
+    _context: &RpcPeerContext,
     call: ObjectRpcStreamCall,
     options: ObjectFrameIoOptions,
     response_consumer: F,
@@ -2291,7 +1885,6 @@ where
         Err(error) => return RpcDeliveryOutcome::NotSent { error },
     };
     let (_head, head_payload) = match request_head(
-        context,
         request_id.clone(),
         method,
         operation_id,
@@ -2303,7 +1896,6 @@ where
         Ok(head) => head,
         Err(error) => return RpcDeliveryOutcome::NotSent { error },
     };
-    let request_head_digest = *blake3::hash(&head_payload).as_bytes();
     record_rpc_timeline_duration(
         timeline_trace,
         crate::network_timeline_stage::RPC_PREPARE,
@@ -2316,9 +1908,7 @@ where
         if request_is_inline {
             match send_request(
                 writer,
-                context.clone(),
                 request_id.clone(),
-                request_head_digest,
                 head_payload,
                 body,
                 options,
@@ -2342,9 +1932,7 @@ where
             match read_response_head_with_progress(
                 &mut reader,
                 options,
-                context,
                 &request_id,
-                request_head_digest,
                 timeline_trace,
             )
             .await
@@ -2355,9 +1943,7 @@ where
         } else {
             let mut task = tokio::spawn(send_request(
                 writer,
-                context.clone(),
                 request_id.clone(),
-                request_head_digest,
                 head_payload,
                 body,
                 options,
@@ -2369,9 +1955,7 @@ where
                         Ok(Ok(())) => match read_response_head_with_progress(
                             &mut reader,
                             options,
-                            context,
                             &request_id,
-                            request_head_digest,
                             timeline_trace,
                         ).await {
                             Ok((frame, last_nonce)) => (frame, last_nonce, true),
@@ -2390,9 +1974,7 @@ where
                 response = read_response_head_with_progress(
                     &mut reader,
                     options,
-                    context,
                     &request_id,
-                    request_head_digest,
                     timeline_trace,
                 ) => {
                     match response {
@@ -2419,11 +2001,7 @@ where
             error: serialization_error("expected object RPC response head"),
         };
     }
-    let response_head: ResponseHeadUnsigned = match decode_authenticated_control(
-        &context.channel_binding,
-        AUTH_RESPONSE_HEAD,
-        &response_frame.payload,
-    ) {
+    let response_head: ResponseHeadUnsigned = match decode_rpc_control(&response_frame.payload) {
         Ok(head) => head,
         Err(error) => {
             if let Some(task) = &send_task {
@@ -2432,15 +2010,12 @@ where
             return RpcDeliveryOutcome::PossiblyApplied { error };
         }
     };
-    if let Err(error) =
-        validate_response_head(context, &request_id, request_head_digest, &response_head)
-    {
+    if let Err(error) = validate_response_head(&request_id, &response_head) {
         if let Some(task) = &send_task {
             task.abort();
         }
         return RpcDeliveryOutcome::PossiblyApplied { error };
     }
-    let response_head_digest = *blake3::hash(&response_frame.payload).as_bytes();
     let (metadata, application_head, descriptor, inline_body) = match response_head.disposition {
         ResponseDisposition::Accepted {
             metadata,
@@ -2455,15 +2030,12 @@ where
             return RpcDeliveryOutcome::Rejected { detail };
         }
     };
-    let (body, _verifier, receive_completion) = make_incoming_body(
+    let (body, _body_completion, receive_completion) = make_incoming_body(
         reader,
         options,
-        context.clone(),
         IncomingBodySpec {
             direction: IncomingDirection::Response,
             request_id: request_id.clone(),
-            head_digest: response_head_digest,
-            progress_head_digest: request_head_digest,
             last_progress_nonce: last_response_progress_nonce,
             descriptor,
             inline_body,
@@ -2480,7 +2052,7 @@ where
     {
         Ok(RpcResponseConsumption::Complete(value)) => Ok(value),
         Ok(RpcResponseConsumption::Streaming(value)) => {
-            // The returned application body now owns the authenticated record
+            // The returned application body now owns the record
             // reader and drives it directly. Only an independently running
             // request producer still needs to be detached here.
             if !request_send_completed {
@@ -2604,17 +2176,10 @@ where
 
 async fn write_rejection<W: RpcRecordWriter>(
     writer: &mut W,
-    context: &RpcPeerContext,
     request_id: Id,
-    request_head_digest: [u8; 32],
     detail: String,
 ) -> Result<(), NetworkError> {
-    let (_, payload) = response_head(
-        context,
-        request_id,
-        request_head_digest,
-        ResponseDisposition::Rejected { detail },
-    )?;
+    let (_, payload) = response_head(request_id, ResponseDisposition::Rejected { detail })?;
     writer
         .write_record(FRAME_RESPONSE_HEAD, &payload, "write object RPC rejection")
         .await
@@ -2625,11 +2190,11 @@ async fn write_rejection<W: RpcRecordWriter>(
         .map_err(|failure| failure.error)
 }
 
-/// Serves exactly one call from one authenticated duplex stream. The handler
-/// starts after the bounded request head is authenticated, while the body pump
+/// Serves exactly one call from one peer-bound duplex stream. The handler
+/// starts after the bounded request head is decoded, while the body pump
 /// continues independently. Response data may therefore start before the full
-/// request is consumed, but a successful response finish is withheld until the
-/// request's content proof verifies.
+/// request is consumed, but a successful response finish is withheld until
+/// request framing reaches a valid terminal length.
 async fn serve_object_rpc_records<R, W, F, Fut>(
     mut reader: R,
     mut writer: W,
@@ -2655,23 +2220,18 @@ where
     if kind != FRAME_REQUEST_HEAD {
         return Err(serialization_error("expected object RPC request head"));
     }
-    let head: RequestHeadUnsigned =
-        decode_authenticated_control(&context.channel_binding, AUTH_REQUEST_HEAD, &head_payload)?;
-    validate_request_head(context, &head)?;
+    let head: RequestHeadUnsigned = decode_rpc_control(&head_payload)?;
+    validate_request_head(&head)?;
     let request_is_inline = matches!(head.descriptor, BodyDescriptor::Inline { .. });
-    let request_head_digest = *blake3::hash(&head_payload).as_bytes();
     let request_id = head.request_id.clone();
     let negotiated_response_progress_interval =
         response_progress_interval(options, head.response_progress_interval_millis);
-    let (body, request_verifier, request_completion) = make_incoming_body(
+    let (body, request_body_completion, request_receive_completion) = make_incoming_body(
         reader,
         options,
-        context.clone(),
         IncomingBodySpec {
             direction: IncomingDirection::Request,
             request_id: request_id.clone(),
-            head_digest: request_head_digest,
-            progress_head_digest: request_head_digest,
             last_progress_nonce: 0,
             descriptor: head.descriptor,
             inline_body: head.inline_body,
@@ -2702,10 +2262,8 @@ where
         let mut handler_future = std::pin::pin!(handler(incoming, context.clone()));
         match await_with_stream_progress(
             &mut writer,
-            context,
             IncomingDirection::Response,
             &request_id,
-            request_head_digest,
             negotiated_response_progress_interval,
             &mut response_progress_nonce,
             handler_future.as_mut(),
@@ -2721,22 +2279,13 @@ where
         Ok(_) => {
             return write_rejection(
                 &mut writer,
-                context,
                 request_id,
-                request_head_digest,
                 "object RPC handler response used the wrong request id".to_string(),
             )
             .await;
         }
         Err(error) => {
-            return write_rejection(
-                &mut writer,
-                context,
-                request_id,
-                request_head_digest,
-                error.to_string(),
-            )
-            .await;
+            return write_rejection(&mut writer, request_id, error.to_string()).await;
         }
     };
     let mut response_stage = RpcTimelineStageGuard::new(
@@ -2747,10 +2296,8 @@ where
     let mut prepare_response_body = std::pin::pin!(prepare_outgoing_body(reply.body));
     let prepared_response_body = match await_with_stream_progress(
         &mut writer,
-        context,
         IncomingDirection::Response,
         &request_id,
-        request_head_digest,
         negotiated_response_progress_interval,
         &mut response_progress_nonce,
         prepare_response_body.as_mut(),
@@ -2763,52 +2310,39 @@ where
     let mut response_body = match prepared_response_body {
         Ok(body) => body,
         Err(error) => {
-            return write_rejection(
-                &mut writer,
-                context,
-                request_id,
-                request_head_digest,
-                error.to_string(),
-            )
-            .await;
+            return write_rejection(&mut writer, request_id, error.to_string()).await;
         }
     };
     let response_completes_at_known_boundary =
-        matches!(response_body.descriptor, BodyDescriptor::Known { .. });
+        matches!(response_body.descriptor, BodyDescriptor::KnownLength { .. });
     if response_completes_at_known_boundary {
         // A known response needs no terminal record, so establish the request
-        // body's verified outcome before publishing the accepted response
+        // body's terminal outcome before publishing the accepted response
         // head. Unknown/length-only responses keep the terminal status record
-        // and may still begin while a long request is being verified.
-        let mut verify_request = std::pin::pin!(request_verifier.clone().verify());
+        // and may still begin while a long request is being consumed.
+        let mut wait_request = std::pin::pin!(request_body_completion.clone().wait());
         let request_result = await_with_stream_progress(
             &mut writer,
-            context,
             IncomingDirection::Response,
             &request_id,
-            request_head_digest,
             negotiated_response_progress_interval,
             &mut response_progress_nonce,
-            verify_request.as_mut(),
+            wait_request.as_mut(),
         )
         .await
         .map_err(|failure| failure.error)?;
         if let Err(error) = request_result {
             return write_rejection(
                 &mut writer,
-                context,
                 request_id,
-                request_head_digest,
-                format!("request body verification failed: {error}"),
+                format!("request body completion failed: {error}"),
             )
             .await;
         }
     }
     let buffer_entire_response = request_is_inline && response_body.source.is_none();
     let (_, response_payload) = response_head(
-        context,
         request_id.clone(),
-        request_head_digest,
         ResponseDisposition::Accepted {
             metadata: reply.metadata,
             application_head: reply.application_head,
@@ -2816,7 +2350,6 @@ where
             inline_body: response_body.inline_body.clone(),
         },
     )?;
-    let response_head_digest = *blake3::hash(&response_payload).as_bytes();
     writer
         .write_record(
             FRAME_RESPONSE_HEAD,
@@ -2830,7 +2363,7 @@ where
             .finish_records()
             .await
             .map_err(|failure| failure.error)?;
-        let result = match request_completion.join().await {
+        let result = match request_receive_completion.join().await {
             Ok(IncomingTerminal::Completed(_)) => Ok(()),
             Ok(IncomingTerminal::Rejected(detail)) => Err(serialization_error(format!(
                 "request body rejected: {detail}"
@@ -2846,12 +2379,10 @@ where
         .flush_record()
         .await
         .map_err(|failure| failure.error)?;
-    let response_verification = write_prepared_body_data(
+    let response_completion = write_prepared_body_data(
         &mut writer,
-        context,
         IncomingDirection::Response,
         &request_id,
-        request_head_digest,
         negotiated_response_progress_interval,
         &mut response_progress_nonce,
         FRAME_RESPONSE_DATA,
@@ -2864,7 +2395,7 @@ where
             .finish_records()
             .await
             .map_err(|failure| failure.error)?;
-        let result = match request_completion.join().await {
+        let result = match request_receive_completion.join().await {
             Ok(IncomingTerminal::Completed(_)) => Ok(()),
             Ok(IncomingTerminal::Rejected(detail)) => Err(serialization_error(format!(
                 "request body rejected: {detail}"
@@ -2876,46 +2407,32 @@ where
         }
         return result;
     }
-    let mut verify_request = std::pin::pin!(request_verifier.verify());
+    let mut wait_request = std::pin::pin!(request_body_completion.wait());
     let request_result = await_with_stream_progress(
         &mut writer,
-        context,
         IncomingDirection::Response,
         &request_id,
-        request_head_digest,
         negotiated_response_progress_interval,
         &mut response_progress_nonce,
-        verify_request.as_mut(),
+        wait_request.as_mut(),
     )
     .await
     .map_err(|failure| failure.error)?;
     let finish_status = match &request_result {
         Ok(_) => FinishStatus::Completed,
         Err(error) => FinishStatus::Rejected {
-            detail: format!("request body verification failed: {error}"),
+            detail: format!("request body completion failed: {error}"),
         },
     };
-    let finish = make_finish(
-        context,
-        request_id,
-        response_head_digest,
-        response_verification,
-        finish_status,
-    );
-    write_finish(
-        &mut writer,
-        context,
-        FRAME_RESPONSE_FINISH,
-        AUTH_RESPONSE_FINISH,
-        &finish,
-    )
-    .await
-    .map_err(|failure| failure.error)?;
+    let finish = make_finish(request_id, response_completion, finish_status);
+    write_finish(&mut writer, FRAME_RESPONSE_FINISH, &finish)
+        .await
+        .map_err(|failure| failure.error)?;
     writer
         .finish_records()
         .await
         .map_err(|failure| failure.error)?;
-    let result = match request_completion.join().await {
+    let result = match request_receive_completion.join().await {
         Ok(IncomingTerminal::Completed(_)) if request_result.is_ok() => Ok(()),
         Ok(IncomingTerminal::Rejected(detail)) => Err(serialization_error(format!(
             "request body rejected: {detail}"
@@ -3218,11 +2735,11 @@ mod tests {
             .await
             .expect("finish body");
         drop(sender);
-        let (_verification_sender, verification_receiver) = watch::channel(None);
+        let (_completion_sender, completion_receiver) = watch::channel(None);
         let stream_body = ObjectRpcStreamIncomingBody {
             body: incoming,
-            verifier: ObjectRpcStreamBodyVerifier {
-                receiver: verification_receiver,
+            completion: ObjectRpcStreamBodyCompletion {
+                receiver: completion_receiver,
             },
         };
 
@@ -3238,10 +2755,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn known_body_is_pulled_by_the_application_without_a_receive_task() {
+    async fn known_length_body_is_pulled_by_the_application_without_a_receive_task() {
         let expected = Bytes::from_static(b"already buffered typed body");
-        let digest = *blake3::hash(&expected).as_bytes();
-        let (_, server_context) = peer_contexts();
         let request_id = Id::from_legacy_named("request_buffered_known_body").expect("request id");
         let reader = ReadyRecordReader {
             records: VecDeque::from([RpcRecord {
@@ -3250,19 +2765,15 @@ mod tests {
             }]),
         };
 
-        let (body, verifier, completion) = make_incoming_body(
+        let (body, body_completion, receive_completion) = make_incoming_body(
             reader,
             ObjectFrameIoOptions::default(),
-            server_context,
             IncomingBodySpec {
                 direction: IncomingDirection::Request,
                 request_id,
-                head_digest: [0x31; 32],
-                progress_head_digest: [0x31; 32],
                 last_progress_nonce: 0,
-                descriptor: BodyDescriptor::Known {
+                descriptor: BodyDescriptor::KnownLength {
                     length: expected.len() as u64,
-                    digest,
                 },
                 inline_body: None,
             },
@@ -3271,7 +2782,7 @@ mod tests {
         .await;
 
         assert!(
-            !completion.is_ready(),
+            !receive_completion.is_ready(),
             "constructing the body must not run or spawn its record reader"
         );
         assert_eq!(
@@ -3279,18 +2790,23 @@ mod tests {
             expected
         );
         assert!(
-            completion.is_ready(),
-            "the application pull must publish terminal verification"
+            receive_completion.is_ready(),
+            "the application pull must publish terminal completion"
         );
         assert_eq!(
-            verifier.verify().await.expect("verify buffered body"),
-            ObjectRpcBodyVerification {
+            body_completion
+                .wait()
+                .await
+                .expect("wait for buffered body"),
+            ObjectRpcBodyCompletion {
                 length: expected.len() as u64,
-                digest,
             }
         );
         assert!(matches!(
-            completion.join().await.expect("complete pulled body"),
+            receive_completion
+                .join()
+                .await
+                .expect("complete pulled body"),
             IncomingTerminal::Completed(_)
         ));
     }
@@ -3425,7 +2941,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_control_serializes_once_and_authenticates_wire_bytes() {
+    fn rpc_control_serializes_once_without_a_transport_redundant_tag() {
         struct Counted<'a> {
             value: &'a StreamProgressUnsigned,
             serializations: &'a AtomicUsize,
@@ -3441,86 +2957,40 @@ mod tests {
             }
         }
 
-        let (client_context, _) = peer_contexts();
-        let (origin_node_id, destination_node_id) = client_context.wire_endpoints();
         let unsigned = StreamProgressUnsigned {
             protocol: OBJECT_RPC_STREAM_PROTOCOL.to_string(),
-            origin_node_id,
-            destination_node_id,
-            session_id: client_context.session_id.clone(),
-            channel_binding: client_context.channel_binding,
-            request_id: Id::from_legacy_named("request_authenticated_control").expect("request id"),
-            head_digest: [0x41; 32],
+            request_id: Id::from_legacy_named("request_control").expect("request id"),
             nonce: 1,
         };
         let serializations = AtomicUsize::new(0);
-        let payload = encode_authenticated_control(
-            &client_context.channel_binding,
-            AUTH_REQUEST_PROGRESS,
+        let payload = encode_rpc_control(
             &Counted {
                 value: &unsigned,
                 serializations: &serializations,
             },
             OBJECT_RPC_STREAM_MAX_TERMINAL_BYTES,
         )
-        .expect("authenticated control");
+        .expect("RPC control");
 
         assert_eq!(serializations.load(Ordering::Relaxed), 1);
         let canonical_unsigned = SinomoObjectCodec::network_frame()
             .encode(&unsigned)
             .expect("canonical unsigned control");
-        assert_eq!(
-            &payload[AUTHENTICATED_CONTROL_TAG_BYTES..],
-            canonical_unsigned
-        );
-        assert_eq!(
-            &payload[..AUTHENTICATED_CONTROL_TAG_BYTES],
-            authenticated_control_tag(
-                &client_context.channel_binding,
-                AUTH_REQUEST_PROGRESS,
-                &canonical_unsigned,
-            )
-            .as_bytes()
-        );
-        let decoded: StreamProgressUnsigned = decode_authenticated_control(
-            &client_context.channel_binding,
-            AUTH_REQUEST_PROGRESS,
-            &payload,
-        )
-        .expect("verified control");
+        assert_eq!(payload, canonical_unsigned);
+        let decoded: StreamProgressUnsigned =
+            decode_rpc_control(&payload).expect("decoded control");
         assert_eq!(decoded, unsigned);
-
-        let mut tampered_tag = payload.clone();
-        tampered_tag[0] ^= 1;
-        assert_eq!(
-            decode_authenticated_control::<StreamProgressUnsigned>(
-                &client_context.channel_binding,
-                AUTH_REQUEST_PROGRESS,
-                &tampered_tag,
-            ),
-            Err(NetworkError::AuthDenied)
-        );
-        let mut tampered_unsigned = payload;
-        tampered_unsigned[AUTHENTICATED_CONTROL_TAG_BYTES] ^= 1;
-        assert_eq!(
-            decode_authenticated_control::<StreamProgressUnsigned>(
-                &client_context.channel_binding,
-                AUTH_REQUEST_PROGRESS,
-                &tampered_unsigned,
-            ),
-            Err(NetworkError::AuthDenied)
-        );
     }
 
     #[tokio::test]
     async fn unlimited_materialization_reports_unrepresentable_allocation() {
         let (_sender, incoming) =
             ObjectRpcIncomingBody::multiplexed_chunk_ring_with_depth(Some(u64::MAX), 1);
-        let (_verification_sender, verification_receiver) = watch::channel(None);
+        let (_completion_sender, completion_receiver) = watch::channel(None);
         let body = ObjectRpcStreamIncomingBody {
             body: incoming,
-            verifier: ObjectRpcStreamBodyVerifier {
-                receiver: verification_receiver,
+            completion: ObjectRpcStreamBodyCompletion {
+                receiver: completion_receiver,
             },
         };
 
@@ -3664,44 +3134,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_stale_request_head_is_expired() {
-        let (client_context, server_context) = peer_contexts();
-        let body = prepare_outgoing_body(ObjectRpcStreamBody::bytes(Vec::new()))
-            .await
-            .expect("body");
-        let (mut head, _) = request_head(
-            &client_context,
-            Id::generate(),
-            "test.stale".to_string(),
-            None,
-            BTreeMap::new(),
-            Vec::new(),
-            ObjectFrameIoOptions::none(),
-            &body,
-        )
-        .expect("head");
-        head.issued_at_unix_millis = 0;
-        let payload = encode_authenticated_control(
-            &client_context.channel_binding,
-            AUTH_REQUEST_HEAD,
-            &head,
-            OBJECT_RPC_STREAM_MAX_HEAD_BYTES,
-        )
-        .expect("authenticated head");
-        let decoded: RequestHeadUnsigned = decode_authenticated_control(
-            &server_context.channel_binding,
-            AUTH_REQUEST_HEAD,
-            &payload,
-        )
-        .expect("verified head");
-        assert_eq!(
-            validate_request_head(&server_context, &decoded),
-            Err(NetworkError::AuthExpired)
-        );
-    }
-
-    #[tokio::test]
-    async fn authenticated_handler_rejection_is_not_ambiguous_delivery() {
+    async fn handler_rejection_is_not_ambiguous_delivery() {
         let (client, server) = tokio::io::duplex(4096);
         let (client_context, server_context) = peer_contexts();
         let server_task = tokio::spawn(async move {
@@ -3730,7 +3163,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn authenticated_progress_preserves_a_healthy_long_running_handler() {
+    async fn progress_preserves_a_healthy_long_running_handler() {
         const IDLE_TIMEOUT: Duration = Duration::from_millis(20);
         const HANDLER_DELAY: Duration = Duration::from_millis(100);
 
@@ -3767,40 +3200,17 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_progress_rejects_a_replayed_nonce() {
-        let (client_context, server_context) = peer_contexts();
+    fn progress_rejects_a_replayed_nonce() {
         let request_id = Id::generate();
-        let head_digest = *blake3::hash(b"progress-head").as_bytes();
-        let payload = stream_progress(
-            &client_context,
-            IncomingDirection::Request,
-            request_id.clone(),
-            head_digest,
-            1,
-        )
-        .expect("progress frame");
+        let payload = stream_progress(request_id.clone(), 1).expect("progress frame");
         let mut last_nonce = 0;
 
-        validate_stream_progress(
-            &server_context,
-            IncomingDirection::Request,
-            &request_id,
-            head_digest,
-            &mut last_nonce,
-            &payload,
-        )
-        .expect("first authenticated progress frame");
+        validate_stream_progress(&request_id, &mut last_nonce, &payload)
+            .expect("first progress frame");
         assert_eq!(last_nonce, 1);
         assert_eq!(
-            validate_stream_progress(
-                &server_context,
-                IncomingDirection::Request,
-                &request_id,
-                head_digest,
-                &mut last_nonce,
-                &payload,
-            ),
-            Err(NetworkError::AuthDenied)
+            validate_stream_progress(&request_id, &mut last_nonce, &payload,),
+            Err(serialization_error("invalid object RPC progress record"))
         );
     }
 
@@ -3855,7 +3265,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn authenticated_progress_covers_slow_one_pass_body_producers() {
+    async fn progress_covers_slow_one_pass_body_producers() {
         const IDLE_TIMEOUT: Duration = Duration::from_millis(20);
         const PRODUCER_DELAY: Duration = Duration::from_millis(100);
         let request_bytes = b"slow request body".to_vec();
@@ -3912,7 +3322,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn authenticated_progress_keeps_an_early_response_alive_until_request_verification() {
+    async fn progress_keeps_an_early_response_alive_until_request_completion() {
         const IDLE_TIMEOUT: Duration = Duration::from_millis(20);
         const PRODUCER_DELAY: Duration = Duration::from_millis(100);
         let request_bytes = b"slow request behind an early response".to_vec();
@@ -4068,11 +3478,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupted_known_body_is_rejected_at_completion() {
+    async fn known_length_mismatch_is_rejected_at_completion() {
         let bytes = body_bytes(OBJECT_RPC_STREAM_INLINE_BODY_BYTES + 1, 9);
-        let source = ObjectRpcBodySource::bytes(bytes);
-        let wrong_digest = [0x42; 32];
-        let body = ObjectRpcStreamBody::known(source, wrong_digest).expect("known body");
+        let body = ObjectRpcStreamBody::one_pass_reader(
+            io::Cursor::new(bytes.clone()),
+            Some(bytes.len() as u64 + 1),
+        );
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (client_context, server_context) = peer_contexts();
         let server_task = tokio::spawn(async move {
@@ -4184,7 +3595,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn destination_or_channel_binding_mismatch_is_denied() {
+    async fn rpc_does_not_reauthenticate_transport_context() {
         let (client, server) = tokio::io::duplex(4096);
         let (client_context, mut server_context) = peer_contexts();
         server_context.channel_binding = [0x77; 32];
@@ -4193,7 +3604,12 @@ mod tests {
                 server,
                 &server_context,
                 ObjectFrameIoOptions { idle_timeout: None },
-                |_call, _| async { unreachable!("mismatched context must not reach handler") },
+                |call, _| async move {
+                    Ok(ObjectRpcStreamReply::new(
+                        call.request_id,
+                        ObjectRpcStreamBody::bytes(b"ok".to_vec()),
+                    ))
+                },
             )
             .await
         });
@@ -4202,71 +3618,29 @@ mod tests {
             &client_context,
             ObjectRpcStreamCall::new("test.binding", ObjectRpcStreamBody::bytes(Vec::new())),
             ObjectFrameIoOptions { idle_timeout: None },
-            |_response| async { Ok(()) },
+            |response| async move {
+                assert_eq!(response.body.collect_to_vec(2).await?, b"ok");
+                Ok(())
+            },
         )
         .await;
-        assert!(matches!(
-            outcome,
-            RpcDeliveryOutcome::PossiblyApplied { .. }
-        ));
-        assert_eq!(
-            server_task.await.expect("server task"),
-            Err(NetworkError::AuthDenied)
-        );
+        assert!(matches!(outcome, RpcDeliveryOutcome::Completed(())));
+        server_task.await.expect("server task").expect("serve RPC");
     }
 
-    #[tokio::test]
-    async fn deferred_finish_is_bound_to_request_destination_and_channel() {
-        let (client_context, _) = peer_contexts();
-        let verification = ObjectRpcBodyVerification {
-            length: 3,
-            digest: *blake3::hash(b"abc").as_bytes(),
-        };
+    #[test]
+    fn deferred_finish_validates_request_and_observed_length() {
+        let request_id = Id::from_legacy_named("request_finish_length").expect("request id");
         let finish = make_finish(
-            &client_context,
-            Id::from_legacy_named("request_finish_binding").expect("request id"),
-            [0x11; 32],
-            verification,
+            request_id.clone(),
+            ObjectRpcBodyCompletion { length: 3 },
             FinishStatus::Completed,
         );
-        let payload = encode_authenticated_control(
-            &client_context.channel_binding,
-            AUTH_REQUEST_FINISH,
-            &finish,
-            OBJECT_RPC_STREAM_MAX_TERMINAL_BYTES,
-        )
-        .expect("finish payload");
-        let mut tampered = finish.clone();
-        tampered.destination_node_id = Some(node("node_wrong_destination"));
-        let mut tampered_payload = payload[..AUTHENTICATED_CONTROL_TAG_BYTES].to_vec();
-        tampered_payload.extend(
-            SinomoObjectCodec::network_frame()
-                .encode(&tampered)
-                .expect("tampered finish"),
+        assert!(
+            validate_incoming_finish(&request_id, 3, &BodyDescriptor::Deferred, &finish,).is_ok()
         );
-        assert_eq!(
-            decode_authenticated_control::<BodyFinishUnsigned>(
-                &client_context.channel_binding,
-                AUTH_REQUEST_FINISH,
-                &tampered_payload,
-            ),
-            Err(NetworkError::AuthDenied)
-        );
-        let mut tampered = finish;
-        tampered.channel_binding = [0x99; 32];
-        let mut tampered_payload = payload[..AUTHENTICATED_CONTROL_TAG_BYTES].to_vec();
-        tampered_payload.extend(
-            SinomoObjectCodec::network_frame()
-                .encode(&tampered)
-                .expect("tampered finish"),
-        );
-        assert_eq!(
-            decode_authenticated_control::<BodyFinishUnsigned>(
-                &client_context.channel_binding,
-                AUTH_REQUEST_FINISH,
-                &tampered_payload,
-            ),
-            Err(NetworkError::AuthDenied)
+        assert!(
+            validate_incoming_finish(&request_id, 4, &BodyDescriptor::Deferred, &finish,).is_err()
         );
     }
 

@@ -13024,15 +13024,7 @@ impl ClusterMemberMutationAsyncHost for RecordingJoinRegistrationHost {
     }
 }
 
-impl ClusterSignedObjectRpcAsyncHost for RecordingJoinRegistrationHost {
-    fn sign_object_rpc_request_async<'a>(
-        &'a mut self,
-        _request: &'a ObjectRpcRequest,
-        _request_digest_sha256: [u8; 32],
-    ) -> ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
-        Box::pin(async { panic!("voter-local join registration should not forward object RPCs") })
-    }
-}
+impl ClusterObjectRpcAsyncHost for RecordingJoinRegistrationHost {}
 
 impl ClusterJoinRegistrationAsyncHost for RecordingJoinRegistrationHost {
     fn local_daemon_membership_observation_async<'a>(

@@ -7,8 +7,8 @@
 # from different nodes to verify network health and cluster-wide POSIX behavior:
 #
 #   1. DFS protocol codec — in-memory DFS data-plane frame encode/decode baseline
-#   2. network latency — signed object-RPC latency/RPS with no failed requests
-#   3. network payload — signed object-RPC payload throughput with no failed requests
+#   2. network latency — transport-bound object-RPC latency/RPS with no failed requests
+#   3. network payload — object-RPC payload throughput with no failed requests
 #   4. cluster KV     — daemon-mediated quorum commit latency and throughput
 #                       from a direct and a deep-segment node
 #   5. invariants     — per-node DFS operational invariants (baseline)
@@ -234,9 +234,9 @@ NETWORK_WARMUP_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_WARMUP_REQUESTS_PER_TA
 NETWORK_CONCURRENCY="${SINOMO_TEST_NETWORK_CONCURRENCY:-16}"
 NETWORK_TIMEOUT_MS="${SINOMO_TEST_NETWORK_TIMEOUT_MS:-2000}"
 NETWORK_MAX_FAILURES="${SINOMO_TEST_NETWORK_MAX_FAILURES:-0}"
-# Every stream-native service call authenticates a fresh logical duplex stream
-# over a persistent routed carrier. This loaded gate runs sixteen such calls
-# concurrently across five targets;
+# Every stream-native service call opens a logical duplex stream over a
+# persistent transport-authenticated routed carrier. This loaded gate runs
+# sixteen such calls concurrently across five targets;
 # keep its latency ceiling distinct from the tighter, concurrency-one direct
 # and one-forward realtime gates below.
 NETWORK_MAX_P50_US="${SINOMO_TEST_NETWORK_MAX_P50_US:-60000}"

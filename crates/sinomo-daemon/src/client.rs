@@ -129,7 +129,7 @@ async fn send_daemon_rpc_result_async(
     send_daemon_rpc_call_async(address, call, options, runtime).await
 }
 
-/// Send one signed object-RPC call through a daemon address. Loopback
+/// Send one object-RPC call through a daemon address. Loopback
 /// addresses use the local daemon directly; remote addresses retain endpoint
 /// authentication and routing.
 pub async fn send_daemon_rpc_call_async(
@@ -140,8 +140,7 @@ pub async fn send_daemon_rpc_call_async(
 ) -> Result<ObjectRpcResult, DaemonError> {
     let data_dir = local_session_data_dir()?;
     let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
-    let mut host =
-        DaemonSignedObjectRpcAsyncHost::new(runtime, false).with_cluster_paths(&cluster_paths);
+    let mut host = DaemonObjectRpcAsyncHost::new(runtime, false).with_cluster_paths(&cluster_paths);
     call.request.auth = None;
     if sinomo_core::network::is_loopback_connect_address(address) {
         sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host)
@@ -305,7 +304,7 @@ pub async fn send_daemon_rpc_stream_async(
     let runtime = tokio::runtime::Handle::current();
     let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
     let mut host =
-        DaemonSignedObjectRpcAsyncHost::new(&runtime, false).with_cluster_paths(&cluster_paths);
+        DaemonObjectRpcAsyncHost::new(&runtime, false).with_cluster_paths(&cluster_paths);
     let mut request = request.clone();
     request.auth = None;
     let call = ObjectRpcCall::value(request);
@@ -508,12 +507,12 @@ async fn send_daemon_join_bootstrap_to_endpoint_async(
         } else {
             request.auth = None;
         }
-        let mut host = DaemonSignedObjectRpcAsyncHost::new(runtime, false).with_paths(daemon_paths);
+        let mut host = DaemonObjectRpcAsyncHost::new(runtime, false).with_paths(daemon_paths);
         let open_started_ns = timeline
             .map(|_| sinomo_core::network::network_timeline_monotonic_ns())
             .unwrap_or(0);
         let open_result =
-            sinomo_core::network::ClusterSignedObjectRpcAsyncHost::open_object_rpc_stream_async(
+            sinomo_core::network::ClusterObjectRpcAsyncHost::open_object_rpc_stream_async(
                 &mut host,
                 endpoint,
                 sinomo_core::network::NetworkHealthPolicy::new(timeout, timeout),
@@ -707,11 +706,11 @@ async fn send_daemon_rpc_call_to_endpoint_with_options_and_connectivity_async(
 ) -> Result<ObjectRpcResult, DaemonError> {
     let paths = cluster_paths_from_env().ok_or_else(|| DaemonError::Network {
         address: endpoint.address.clone(),
-        detail: "authenticated endpoint RPC requires a local cluster state".to_string(),
+        detail: "routed endpoint RPC requires a local cluster state".to_string(),
     })?;
     let state = sinomo_core::cluster::read_cluster_state_cached(&paths)?;
-    let mut host = DaemonSignedObjectRpcAsyncHost::new(runtime, observe_connectivity)
-        .with_cluster_paths(&paths);
+    let mut host =
+        DaemonObjectRpcAsyncHost::new(runtime, observe_connectivity).with_cluster_paths(&paths);
     let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &paths);
     client
         .call_endpoint(&state, endpoint, call, options)
@@ -753,8 +752,8 @@ pub async fn send_object_rpc_call_to_target_async_with_cluster_paths_and_options
 ) -> Result<ObjectRpcResult, DaemonError> {
     let state =
         sinomo_core::cluster::read_cluster_state_cached(paths).map_err(DaemonError::from)?;
-    let mut host = DaemonSignedObjectRpcAsyncHost::new(runtime, observe_connectivity)
-        .with_cluster_paths(paths);
+    let mut host =
+        DaemonObjectRpcAsyncHost::new(runtime, observe_connectivity).with_cluster_paths(paths);
     let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, paths);
     client
         .call_target(&state, target_node_id, call, options)
@@ -794,7 +793,7 @@ pub(crate) async fn send_object_rpc_call_to_target_async_with_daemon_paths_and_n
     let paths = sinomo_core::network::ClusterPaths::new(&data_dir);
     let state = sinomo_core::cluster::read_cluster_state_cached_shared(&paths)?;
     let mut host =
-        DaemonSignedObjectRpcAsyncHost::new(runtime, observe_connectivity).with_paths(daemon_paths);
+        DaemonObjectRpcAsyncHost::new(runtime, observe_connectivity).with_paths(daemon_paths);
     let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &paths);
     client
         .call_target(&state, target_node_id, call, options)
@@ -875,13 +874,13 @@ where
     output
 }
 
-pub(crate) struct DaemonSignedObjectRpcAsyncHost {
+pub(crate) struct DaemonObjectRpcAsyncHost {
     runtime: tokio::runtime::Handle,
     observe_connectivity: bool,
     paths: Option<DaemonPaths>,
 }
 
-impl DaemonSignedObjectRpcAsyncHost {
+impl DaemonObjectRpcAsyncHost {
     pub(crate) fn new(runtime: &tokio::runtime::Handle, observe_connectivity: bool) -> Self {
         Self {
             runtime: runtime.clone(),
@@ -908,12 +907,12 @@ impl DaemonSignedObjectRpcAsyncHost {
         self
     }
 
-    fn signing_data_dir(&self) -> Result<sinomo_core::local::SinomoDataDir, NetworkError> {
+    fn identity_data_dir(&self) -> Result<sinomo_core::local::SinomoDataDir, NetworkError> {
         if let Some(paths) = self.paths.as_ref() {
             return daemon_data_dir_from_paths(paths);
         }
         sinomo_core::local::SinomoDataDir::from_env_or_home().map_err(|source| NetworkError::Io {
-            operation: "cluster object RPC signing data directory".to_string(),
+            operation: "cluster transport identity data directory".to_string(),
             detail: source.to_string(),
         })
     }
@@ -1254,56 +1253,12 @@ where
     decode(&response).map_err(Into::into)
 }
 
-impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonSignedObjectRpcAsyncHost {
-    fn sign_object_rpc_request_async<'a>(
-        &'a mut self,
-        request: &'a ObjectRpcRequest,
-        request_digest_sha256: [u8; 32],
-    ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
-        let route = request.route.clone();
-        let category = request.category.clone();
-        let data_dir = match self.signing_data_dir() {
-            Ok(data_dir) => data_dir,
-            Err(error) => return Box::pin(async move { Err(error) }),
-        };
-        match sinomo_core::network::try_sign_daemon_rpc_request_digest_from_cached_data_dir(
-            &data_dir,
-            &route,
-            &category,
-            &request_digest_sha256,
-        ) {
-            Ok(Some(signature)) => Box::pin(async move { Ok(signature) }),
-            Err(error) => Box::pin(async move { Err(error) }),
-            Ok(None) => {
-                // Refreshing the cached identity can stat/read/create durable
-                // files. Keep that rare path off latency-sensitive Tokio
-                // workers while cache hits sign inline.
-                let runtime = self.runtime.clone();
-                Box::pin(async move {
-                    runtime
-                        .spawn_blocking(move || {
-                            sinomo_core::network::sign_daemon_rpc_request_digest_from_data_dir(
-                                &data_dir,
-                                &route,
-                                &category,
-                                request_digest_sha256.to_vec(),
-                            )
-                        })
-                        .await
-                        .map_err(|source| sinomo_core::network::NetworkError::Io {
-                            operation: "cluster object RPC signing".to_string(),
-                            detail: format!("object RPC signing task failed: {source}"),
-                        })?
-                })
-            }
-        }
-    }
-
-    fn observe_signed_endpoint_rpc_async<'a>(
+impl sinomo_core::network::ClusterObjectRpcAsyncHost for DaemonObjectRpcAsyncHost {
+    fn observe_endpoint_rpc_async<'a>(
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
-        observation: sinomo_core::network::ClusterSignedObjectRpcObservation,
-    ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<'a, ()> {
+        observation: sinomo_core::network::ClusterObjectRpcObservation,
+    ) -> sinomo_core::network::ClusterObjectRpcFuture<'a, ()> {
         if !self.observe_connectivity {
             return Box::pin(async { Ok(()) });
         }
@@ -1366,14 +1321,14 @@ impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonSignedObjec
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
         health: sinomo_core::network::NetworkHealthPolicy,
-    ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<
+    ) -> sinomo_core::network::ClusterObjectRpcFuture<
         'a,
         Box<dyn sinomo_core::network::NetworkDuplexStream>,
     > {
         let module_backed = sinomo_core::network::network_module_registry()
             .and_then(|registry| registry.module_for_endpoint(endpoint))
             .is_some();
-        let routed_data_dir = module_backed.then(|| self.signing_data_dir());
+        let routed_data_dir = module_backed.then(|| self.identity_data_dir());
         let endpoint = endpoint.clone();
         Box::pin(async move {
             if let Some(data_dir) = routed_data_dir {
@@ -1664,7 +1619,7 @@ fn daemon_paths_from_cluster_paths(
 }
 
 fn daemon_rpc_connectivity_observation(
-    observation: sinomo_core::network::ClusterSignedObjectRpcObservation,
+    observation: sinomo_core::network::ClusterObjectRpcObservation,
 ) -> (
     sinomo_core::network::ClusterConnectivityState,
     Option<u64>,
@@ -2485,7 +2440,7 @@ pub fn send_daemon_build_submit(
         let runtime = tokio::runtime::Handle::current();
         let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
         let mut host =
-            DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+            DaemonObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
         let call = build_submit_rpc_call(&request, source_bundle.as_deref())?;
         let result = if sinomo_core::network::is_loopback_connect_address(&address) {
             let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
@@ -2528,7 +2483,7 @@ pub fn send_daemon_build_submit_to_endpoint(
         let runtime = tokio::runtime::Handle::current();
         let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
         let mut host =
-            DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+            DaemonObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
         let call = build_submit_rpc_call(&request, source_bundle.as_deref())?;
         let result = if sinomo_core::network::is_loopback_connect_address(&endpoint.address) {
             let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
@@ -2569,7 +2524,7 @@ pub fn send_daemon_build_submit_to_target(
     block_on_rollout_session(async move {
         let runtime = tokio::runtime::Handle::current();
         let mut host =
-            DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+            DaemonObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
         let mut client =
             sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &cluster_paths);
         let result = client
@@ -2630,7 +2585,7 @@ pub fn send_daemon_build_artifact(
         let runtime = tokio::runtime::Handle::current();
         let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
         let mut host =
-            DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+            DaemonObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
         let call = build_artifact_rpc_call(&request)?;
         let result = if sinomo_core::network::is_loopback_connect_address(&address) {
             let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
@@ -2673,7 +2628,7 @@ pub fn send_daemon_build_artifact_to_endpoint(
         let runtime = tokio::runtime::Handle::current();
         let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
         let mut host =
-            DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+            DaemonObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
         let call = build_artifact_rpc_call(&request)?;
         let result = if sinomo_core::network::is_loopback_connect_address(&endpoint.address) {
             let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
@@ -2714,7 +2669,7 @@ pub fn send_daemon_build_artifact_to_target(
     block_on_rollout_session(async move {
         let runtime = tokio::runtime::Handle::current();
         let mut host =
-            DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+            DaemonObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
         let mut client =
             sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &cluster_paths);
         let result = client
@@ -3073,8 +3028,7 @@ async fn send_daemon_rollout_binary_to_loopback_async(
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
     let runtime = tokio::runtime::Handle::current();
     let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
-    let mut host =
-        DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+    let mut host = DaemonObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
     let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
     let result = client
         .call_loopback(
@@ -3101,8 +3055,7 @@ async fn send_daemon_rollout_binary_to_endpoint_async(
     attachment_path: std::path::PathBuf,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
     let runtime = tokio::runtime::Handle::current();
-    let mut host =
-        DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+    let mut host = DaemonObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
     let mut client =
         sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &cluster_paths);
     let result = client
@@ -3124,8 +3077,7 @@ async fn send_daemon_rollout_binary_to_target_async(
     attachment_path: std::path::PathBuf,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
     let runtime = tokio::runtime::Handle::current();
-    let mut host =
-        DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+    let mut host = DaemonObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
     let mut client =
         sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &cluster_paths);
     let result = client
@@ -3192,7 +3144,7 @@ pub fn send_daemon_rollout_build(
         let runtime = tokio::runtime::Handle::current();
         let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
         let mut host =
-            DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+            DaemonObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
         let result = if sinomo_core::network::is_loopback_connect_address(&address) {
             let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
             client
@@ -3232,7 +3184,7 @@ pub fn send_daemon_rollout_build_to_endpoint(
         let runtime = tokio::runtime::Handle::current();
         let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
         let mut host =
-            DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+            DaemonObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
         let result = if sinomo_core::network::is_loopback_connect_address(&endpoint.address) {
             let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
             client
@@ -3270,7 +3222,7 @@ pub fn send_daemon_rollout_build_to_target(
     block_on_rollout_session(async move {
         let runtime = tokio::runtime::Handle::current();
         let mut host =
-            DaemonSignedObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
+            DaemonObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
         let mut client =
             sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &cluster_paths);
         let result = client
@@ -3985,7 +3937,7 @@ mod tests {
             .build()
             .expect("runtime");
         let mut host =
-            super::DaemonSignedObjectRpcAsyncHost::new(runtime.handle(), true).with_paths(&paths);
+            super::DaemonObjectRpcAsyncHost::new(runtime.handle(), true).with_paths(&paths);
         let mut client =
             sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &cluster_paths);
 
@@ -4242,15 +4194,9 @@ mod tests {
                                 peer_node_id: server_local_node,
                             }
                         );
-                        let auth: sinomo_core::network::SignedDaemonCommand =
-                            sinomo_core::network::SinomoObjectCodec::default()
-                                .decode(request.request.auth.as_deref().expect("signed request"))
-                                .expect("auth envelope");
-                        assert_eq!(
-                            auth.rpc_body_sha256.as_deref(),
-                            request
-                                .value_auth_digest_sha256()
-                                .map(|digest| digest.as_slice())
+                        assert!(
+                            request.request.auth.is_none(),
+                            "ordinary service RPC must not add a per-call signature"
                         );
                         Err::<sinomo_core::network::ObjectRpcOutgoingResponse, _>(
                             sinomo_core::network::NetworkError::AuthDenied,
@@ -4267,7 +4213,7 @@ mod tests {
                 );
             });
 
-            let mut host = super::DaemonSignedObjectRpcAsyncHost::new(runtime.handle(), true)
+            let mut host = super::DaemonObjectRpcAsyncHost::new(runtime.handle(), true)
                 .with_paths(&daemon_paths);
             // Bind request authentication and routed-stream proofs to the same
             // test identity; an endpoint-only client would resolve proofs from
@@ -4323,7 +4269,7 @@ mod tests {
     #[test]
     fn daemon_rpc_connectivity_observation_classifies_endpoint_failures() {
         let healthy = super::daemon_rpc_connectivity_observation(
-            sinomo_core::network::ClusterSignedObjectRpcObservation::success(Some(5)),
+            sinomo_core::network::ClusterObjectRpcObservation::success(Some(5)),
         );
         assert_eq!(
             healthy.0,
@@ -4332,11 +4278,11 @@ mod tests {
         assert_eq!(healthy.1, Some(5));
 
         let degraded = super::daemon_rpc_connectivity_observation(
-            sinomo_core::network::ClusterSignedObjectRpcObservation::io_failure(),
+            sinomo_core::network::ClusterObjectRpcObservation::io_failure(),
         );
 
         let hard_failure = super::daemon_rpc_connectivity_observation(
-            sinomo_core::network::ClusterSignedObjectRpcObservation::hard_io_failure(),
+            sinomo_core::network::ClusterObjectRpcObservation::hard_io_failure(),
         );
         assert_eq!(
             hard_failure,
@@ -4358,7 +4304,7 @@ mod tests {
         );
 
         let auth_denied = super::daemon_rpc_connectivity_observation(
-            sinomo_core::network::ClusterSignedObjectRpcObservation::auth_denied(),
+            sinomo_core::network::ClusterObjectRpcObservation::auth_denied(),
         );
         assert_eq!(
             auth_denied,

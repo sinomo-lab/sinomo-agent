@@ -753,10 +753,8 @@ impl CliClusterControlPlaneTransport {
                 operation: "cli daemon node object rpc runtime".to_string(),
                 detail: error.to_string(),
             })?;
-        let mut host = CliSignedEndpointRpcHost::new(
-            Some(state.cluster_id.clone()),
-            "cli endpoint rpc signing",
-        );
+        let mut host =
+            CliEndpointRpcHost::new(Some(state.cluster_id.clone()), "cli endpoint rpc signing");
         if let Some(data_dir) = self.matching_data_dir() {
             host = host.with_data_dir(data_dir);
         }
@@ -842,7 +840,7 @@ impl cluster::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
                 detail: error.to_string(),
             })?;
         let state = cluster::read_cluster_state_without_kv(&self.cluster_paths)?;
-        let mut host = CliSignedEndpointRpcHost::new(None, "cli endpoint rpc signing");
+        let mut host = CliEndpointRpcHost::new(None, "cli endpoint rpc signing");
         if let Some(data_dir) = self.matching_data_dir() {
             host = host.with_data_dir(data_dir);
         }

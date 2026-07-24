@@ -35,12 +35,6 @@ struct ServiceRequestHead {
     schema: String,
     request: ObjectRpcRequest,
     body_role: ObjectRpcBodyRole,
-    /// Digest over the encoded value and request metadata before the value is
-    /// moved into the body stream. This field sits inside the authenticated
-    /// object-RPC head, allowing daemon authorization to bind the signed
-    /// request without materializing the streamed value first.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    request_digest_sha256: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -212,7 +206,6 @@ async fn service_request_from_stream(
                 Ok(ObjectRpcIncomingRequest::streamed_value(
                     head.request,
                     bridge_stream_body(body),
-                    head.request_digest_sha256,
                 ))
             } else {
                 head.request.body = body.materialize_to_vec().await?;
@@ -318,8 +311,6 @@ pub(crate) async fn call_service_rpc_stream<S>(
     stream: S,
     context: &RpcPeerContext,
     call: ObjectRpcCall,
-    request_auth: Vec<u8>,
-    request_digest_sha256: [u8; 32],
     options: ObjectFrameIoOptions,
 ) -> Result<ObjectRpcResult, NetworkError>
 where
@@ -328,14 +319,12 @@ where
     let timeline_trace = crate::network_timeline_trace_context_for_request(&call.request);
     let operation_id = call.request.operation_id().map(str::to_string);
     let route = call.request.route.clone();
-    let (mut request, body_role, body) = call.into_stream_native_parts();
-    request.auth = Some(request_auth);
+    let (request, body_role, body) = call.into_stream_native_parts();
     let encode_started_ns = service_timeline_started_ns(timeline_trace);
     let application_head_result = encode_service_head(&ServiceRequestHead {
         schema: SERVICE_RPC_HEAD_SCHEMA.to_string(),
         request,
         body_role,
-        request_digest_sha256: Some(request_digest_sha256),
     });
     record_service_timeline_since(
         timeline_trace,
@@ -396,8 +385,6 @@ pub async fn call_service_rpc_peer_stream(
     stream: PeerStream,
     context: &RpcPeerContext,
     call: ObjectRpcCall,
-    request_auth: Vec<u8>,
-    request_digest_sha256: [u8; 32],
     options: ObjectFrameIoOptions,
 ) -> Result<ObjectRpcResult, NetworkError> {
     if !stream.has_owned_chunks() {
@@ -410,14 +397,12 @@ pub async fn call_service_rpc_peer_stream(
     let timeline_trace = crate::network_timeline_trace_context_for_request(&call.request);
     let operation_id = call.request.operation_id().map(str::to_string);
     let route = call.request.route.clone();
-    let (mut request, body_role, body) = call.into_stream_native_parts();
-    request.auth = Some(request_auth);
+    let (request, body_role, body) = call.into_stream_native_parts();
     let encode_started_ns = service_timeline_started_ns(timeline_trace);
     let application_head_result = encode_service_head(&ServiceRequestHead {
         schema: SERVICE_RPC_HEAD_SCHEMA.to_string(),
         request,
         body_role,
-        request_digest_sha256: Some(request_digest_sha256),
     });
     record_service_timeline_since(
         timeline_trace,
@@ -607,13 +592,10 @@ mod tests {
             vec![7; request_bytes],
         );
         let call = ObjectRpcCall::value(request);
-        let request_digest_sha256 = crate::daemon_auth::daemon_rpc_call_sha256(&call)?;
         let result = call_service_rpc_stream(
             client,
             &client_context,
             call,
-            b"test-auth".to_vec(),
-            request_digest_sha256,
             ObjectFrameIoOptions::default(),
         )
         .await?;
@@ -706,21 +688,19 @@ mod tests {
             )
             .await
         });
-        let call = ObjectRpcCall::new(
-            ObjectRpcRequest::from_encoded_body(
-                "/test/service-attachment",
-                "test.service-attachment",
-                b"typed-head".to_vec(),
-            ),
-            crate::ObjectRpcBodySource::bytes(vec![3; bytes]),
+        let mut request = ObjectRpcRequest::from_encoded_body(
+            "/test/service-attachment",
+            "test.service-attachment",
+            b"typed-head".to_vec(),
         );
-        let request_digest_sha256 = crate::daemon_auth::daemon_rpc_call_sha256(&call)?;
+        // Authentication data is application-owned and is transported only
+        // when the caller explicitly supplies it.
+        request.auth = Some(b"origin-auth".to_vec());
+        let call = ObjectRpcCall::new(request, crate::ObjectRpcBodySource::bytes(vec![3; bytes]));
         let result = call_service_rpc_stream(
             client,
             &client_context,
             call,
-            b"origin-auth".to_vec(),
-            request_digest_sha256,
             ObjectFrameIoOptions::default(),
         )
         .await?;
@@ -751,85 +731,6 @@ mod tests {
             assert_eq!(direct, vec![5; bytes + 1]);
             assert_eq!(relayed, direct);
         }
-    }
-
-    #[tokio::test]
-    async fn streaming_service_attachment_reports_a_known_digest_failure() {
-        let bytes = crate::object_rpc_stream::OBJECT_RPC_STREAM_MAX_DATA_FRAME_BYTES + 1;
-        let (client, server) = tokio::io::duplex(2 * OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES);
-        let client_context = local_context();
-        let server_context = client_context.clone();
-        let server_task = tokio::spawn(async move {
-            serve_object_rpc_stream(
-                server,
-                &server_context,
-                ObjectFrameIoOptions::default(),
-                move |incoming, _| async move {
-                    let application_head = encode_service_head(&ServiceResponseHead {
-                        schema: SERVICE_RPC_HEAD_SCHEMA.to_string(),
-                        response: ObjectRpcResponse::from_encoded_body(
-                            "/test/service-corrupt-attachment",
-                            b"typed-response-head".to_vec(),
-                        ),
-                        body_role: ObjectRpcBodyRole::Attachment,
-                    })?;
-                    let body = ObjectRpcStreamBody::known(
-                        crate::ObjectRpcBodySource::bytes(vec![5; bytes]),
-                        [7; 32],
-                    )?;
-                    Ok(ObjectRpcStreamReply {
-                        request_id: incoming.request_id,
-                        metadata: Default::default(),
-                        application_head,
-                        body,
-                        timeline_trace: None,
-                    })
-                },
-            )
-            .await
-        });
-
-        let call = ObjectRpcCall::value(ObjectRpcRequest::from_encoded_body(
-            "/test/service-corrupt-attachment",
-            "test.service-corrupt-attachment",
-            b"typed-request-head".to_vec(),
-        ));
-        let request_digest_sha256 =
-            crate::daemon_auth::daemon_rpc_call_sha256(&call).expect("request digest");
-        let result = call_service_rpc_stream(
-            client,
-            &client_context,
-            call,
-            b"origin-auth".to_vec(),
-            request_digest_sha256,
-            ObjectFrameIoOptions::default(),
-        )
-        .await
-        .expect("response head is available before attachment completion");
-        let error = result
-            .body
-            .collect_to_vec(bytes)
-            .await
-            .expect_err("corrupt response attachment must fail while streaming");
-        assert!(
-            error
-                .to_string()
-                .contains("network authorization was denied")
-                || error.to_string().contains("body reader ended")
-                || error
-                    .to_string()
-                    .contains("changed after its authenticated descriptor")
-                || error.to_string().contains("early eof"),
-            "unexpected attachment verification failure: {error}"
-        );
-        assert!(
-            server_task
-                .await
-                .expect("server task")
-                .expect_err("server must reject its mismatched declared digest")
-                .to_string()
-                .contains("changed after its authenticated descriptor")
-        );
     }
 
     #[tokio::test]
@@ -882,13 +783,10 @@ mod tests {
                 move |request, _| async move {
                     assert_eq!(request.body.total_bytes(), Some(request_bytes as u64));
                     let call = ObjectRpcCall::from_forwarded_body(request.request, request.body);
-                    let request_digest_sha256 = crate::daemon_auth::daemon_rpc_call_sha256(&call)?;
                     let result = call_service_rpc_stream(
                         proxy_outgoing,
                         &downstream_proxy_context,
                         call,
-                        b"proxy-auth".to_vec(),
-                        request_digest_sha256,
                         ObjectFrameIoOptions::default(),
                     )
                     .await?;
@@ -907,14 +805,10 @@ mod tests {
             ),
             crate::ObjectRpcBodySource::zeroes(request_bytes as u64),
         );
-        let request_digest_sha256 =
-            crate::daemon_auth::daemon_rpc_call_sha256(&call).expect("request digest");
         let result = call_service_rpc_stream(
             client,
             &upstream_client_context,
             call,
-            b"origin-auth".to_vec(),
-            request_digest_sha256,
             ObjectFrameIoOptions::default(),
         )
         .await

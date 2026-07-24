@@ -13,9 +13,7 @@ use sinomo_network::{
     ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector,
     cluster_node_blocks_leader_preference, cluster_node_blocks_leader_preference_async,
 };
-use sinomo_network::{
-    ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterSignedObjectRpcAsyncHost,
-};
+use sinomo_network::{ClusterObjectRpcAsyncHost, ClusterObjectRpcClient, ClusterObjectRpcOptions};
 use sinomo_network::{NetworkDeliveryState, NetworkError};
 use sinomo_network::{ObjectRpcCall, ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_node::NodeId;
@@ -285,7 +283,7 @@ pub async fn forward_cluster_kv_txn_to_state_authority_async_with_host<H>(
     host: &mut H,
 ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError>
 where
-    H: ClusterSignedObjectRpcAsyncHost + Send,
+    H: ClusterObjectRpcAsyncHost + Send,
 {
     let mut targets = ClusterEndpointSelector::select_internal_unique_node_ids_async(
         runtime,
@@ -381,7 +379,7 @@ pub async fn forward_cluster_kv_authoritative_snapshot_to_state_authority_async_
     host: &mut H,
 ) -> Result<Option<KvAuthoritativeRead<KvSnapshot>>, NetworkError>
 where
-    H: ClusterSignedObjectRpcAsyncHost + Send,
+    H: ClusterObjectRpcAsyncHost + Send,
 {
     let mut targets = ClusterEndpointSelector::select_internal_unique_node_ids_async(
         runtime,
@@ -530,7 +528,7 @@ async fn forward_cluster_kv_txn_to_state_authority_node_async_with_host<H>(
     host: &mut H,
 ) -> Result<ClusterKvTxnCommitResult, NetworkError>
 where
-    H: ClusterSignedObjectRpcAsyncHost + Send,
+    H: ClusterObjectRpcAsyncHost + Send,
 {
     let mut client = ClusterObjectRpcClient::routed(host, paths);
     let txn_response = client
@@ -713,7 +711,7 @@ async fn fetch_cluster_kv_snapshot_from_node_async_with_host<H>(
     host: &mut H,
 ) -> Result<KvSnapshot, NetworkError>
 where
-    H: ClusterSignedObjectRpcAsyncHost + Send,
+    H: ClusterObjectRpcAsyncHost + Send,
 {
     let mut call = ObjectRpcCall::encode_value(
         sinomo_kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE,

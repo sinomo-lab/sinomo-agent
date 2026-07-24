@@ -1,8 +1,8 @@
-//! Daemon-identity adapter for routed-session transcript authentication.
+//! Daemon-identity adapter for direct-transport authentication.
 //!
-//! Routing owns the transcript and directory lookup. This module only adapts
-//! the existing node identity primitive to [`crate::routing::RoutedSessionIdentity`];
-//! it does not open streams, choose paths, or dispatch application methods.
+//! Built-in transports authenticate their adjacent peer once. Routed sessions
+//! and object RPC reuse that established identity and do not sign their own
+//! records.
 
 use crate::daemon_auth::{
     DAEMON_AUTH_PROTOCOL, SignedDaemonCommand, cached_daemon_signing_public_key,
@@ -15,21 +15,19 @@ use ring::signature::{ED25519, UnparsedPublicKey};
 use sinomo_local::SinomoDataDir;
 use sinomo_node::NodeId;
 
-const ROUTED_SESSION_AUTH_ROUTE: &str = "/internal/network/routed-session-transcript";
-const ROUTED_SESSION_AUTH_CATEGORY: &str = "network.routed-session";
+const TRANSPORT_AUTH_ROUTE: &str = "/internal/network/transport-transcript";
+const TRANSPORT_AUTH_CATEGORY: &str = "network.transport";
 
-fn routed_session_auth_request(transcript: &[u8]) -> ObjectRpcRequest {
+fn transport_auth_request(transcript: &[u8]) -> ObjectRpcRequest {
     ObjectRpcRequest::from_encoded_body(
-        ROUTED_SESSION_AUTH_ROUTE,
-        ROUTED_SESSION_AUTH_CATEGORY,
+        TRANSPORT_AUTH_ROUTE,
+        TRANSPORT_AUTH_CATEGORY,
         transcript.to_vec(),
     )
 }
 
-/// Uses the process-cached main-daemon identity for routed-session opens and
-/// acceptances. The opaque signature bytes carry the existing signed-command
-/// envelope so verifiers receive the public key, nonce, and timestamp needed
-/// by the established identity primitive.
+/// Uses the process-cached main-daemon identity only for adjacent transport
+/// establishment.
 pub struct DaemonRoutedSessionIdentity {
     local_node_id: NodeId,
     data_dir: SinomoDataDir,
@@ -51,7 +49,7 @@ impl RoutedSessionIdentity for DaemonRoutedSessionIdentity {
     }
 
     fn sign(&self, transcript: &[u8]) -> Result<Vec<u8>, NetworkError> {
-        let request = routed_session_auth_request(transcript);
+        let request = transport_auth_request(transcript);
         let encoded = sign_daemon_rpc_request_from_data_dir(&self.data_dir, &request)?;
         let signed: SignedDaemonCommand = SinomoObjectCodec::default().decode(&encoded)?;
         if signed.node_id != self.local_node_id.as_str() {
@@ -69,7 +67,7 @@ impl RoutedSessionIdentity for DaemonRoutedSessionIdentity {
     ) -> Result<(), NetworkError> {
         let signed: SignedDaemonCommand = SinomoObjectCodec::default().decode(signature)?;
         let expected_public_key = daemon_auth_decode_public_key(authorized_public_key)?;
-        let request = routed_session_auth_request(transcript);
+        let request = transport_auth_request(transcript);
         let body_sha256 = daemon_rpc_body_sha256(&request);
         if signed.protocol != DAEMON_AUTH_PROTOCOL
             || signed.node_id != signer_node_id.as_str()
@@ -83,8 +81,8 @@ impl RoutedSessionIdentity for DaemonRoutedSessionIdentity {
             &expected_public_key,
             &signed.timestamp,
             &signed.nonce,
-            ROUTED_SESSION_AUTH_ROUTE,
-            ROUTED_SESSION_AUTH_CATEGORY,
+            TRANSPORT_AUTH_ROUTE,
+            TRANSPORT_AUTH_CATEGORY,
             Some(&body_sha256),
         );
         UnparsedPublicKey::new(&ED25519, expected_public_key)
@@ -99,36 +97,34 @@ mod tests {
     use crate::daemon_auth::daemon_auth_encode_public_key;
 
     #[test]
-    fn daemon_identity_signs_exact_routed_transcript() {
-        let root = sinomo_testdir::TestDir::new("sinomo-network-routed-session-identity");
+    fn daemon_identity_signs_exact_transport_transcript() {
+        let root = sinomo_testdir::TestDir::new("sinomo-network-transport-identity");
         let data_dir = SinomoDataDir::new(root.path());
         data_dir.ensure_root_layout().expect("data root");
         let node_identity = sinomo_node::load_or_create_main_node_identity(&data_dir.root())
             .expect("main node identity");
-        let node_id =
-            NodeId::from_legacy_named("node_routed_session_identity").expect("local node id");
-        let cluster_id =
-            sinomo_node::ClusterId::from_legacy_named("cluster_routed_session_identity")
-                .expect("cluster id");
+        let node_id = NodeId::from_legacy_named("node_transport_identity").expect("local node id");
+        let cluster_id = sinomo_node::ClusterId::from_legacy_named("cluster_transport_identity")
+            .expect("cluster id");
         let cluster_paths = crate::ClusterPaths::new(&data_dir);
         cluster_paths.ensure().expect("cluster paths");
         let state = sinomo_base::ClusterBootstrapState::initialized_locally(
             cluster_id,
-            "routed session identity",
+            "transport identity",
             node_id.clone(),
-            "routed-session-node",
+            "transport-node",
             node_identity.public_key,
             time::OffsetDateTime::now_utc(),
         );
         crate::object_file_store::write_object_file(&cluster_paths.state, &state)
             .expect("cluster state");
         let identity = DaemonRoutedSessionIdentity::new(node_id.clone(), data_dir.clone())
-            .expect("routed identity");
+            .expect("transport identity");
         let public_key = daemon_auth_encode_public_key(
             &cached_daemon_signing_public_key(&data_dir).expect("public key"),
         );
-        let transcript = b"bounded-routed-session-transcript";
-        let signature = identity.sign(transcript).expect("transcript signature");
+        let transcript = b"bounded-transport-transcript";
+        let signature = identity.sign(transcript).expect("transport signature");
 
         identity
             .verify(&node_id, &public_key, transcript, &signature)

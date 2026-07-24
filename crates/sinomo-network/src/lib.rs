@@ -125,7 +125,7 @@ pub use connectivity_store::{
 pub use daemon_auth::{
     DAEMON_AUTH_PROTOCOL, SignedDaemonCommand, cached_daemon_signing_public_key,
     daemon_auth_decode_public_key, daemon_auth_encode_public_key, daemon_auth_signing_payload,
-    daemon_rpc_body_sha256, daemon_rpc_call_sha256, invalidate_cached_daemon_signing_identity,
+    daemon_rpc_body_sha256, invalidate_cached_daemon_signing_identity,
     sign_daemon_rpc_request_digest_for_local_node, sign_daemon_rpc_request_digest_from_data_dir,
     sign_daemon_rpc_request_for_local_node, sign_daemon_rpc_request_from_data_dir,
     try_sign_daemon_rpc_request_digest_from_cached_data_dir,
@@ -246,17 +246,19 @@ pub use routed_stream_pool::{
     RoutedStreamAcceptor, RoutedStreamIncoming, accept_local_object_rpc_stream_carrier,
     accept_pooled_routed_stream_carrier, accept_routed_stream_carrier,
     local_object_rpc_carrier_prelude_prefix_matches, open_pooled_local_object_rpc_stream,
-    open_pooled_routed_stream, pooled_routed_relationship_is_active,
-    read_local_object_rpc_carrier_prelude, register_routed_stream_incoming,
-    retire_pooled_routed_streams, serve_local_object_rpc_stream_carrier,
-    serve_routed_stream_carrier, write_local_object_rpc_carrier_prelude,
+    open_pooled_routed_stream, open_pooled_routed_stream_with_protection,
+    pooled_routed_relationship_is_active, read_local_object_rpc_carrier_prelude,
+    register_routed_stream_incoming, retire_pooled_routed_streams,
+    serve_local_object_rpc_stream_carrier, serve_routed_stream_carrier,
+    write_local_object_rpc_carrier_prelude,
 };
 pub use routing::{
     CandidatePath, ConnectOptions, DirectRoutedConnector, MAX_ROUTE_CANDIDATES,
     MultiHopRoutedConnector, PeerStream, RouteConstraints, RouteHop, RouteTrace,
     RoutedAvailability, RoutedConnectFuture, RoutedConnector, RoutedRelayReport,
-    RoutedSessionDisposition, RoutedSessionIdentity, accept_direct_routed_session,
-    accept_or_relay_routed_session, connect_direct_routed_endpoint, plan_routes,
+    RoutedSessionDisposition, RoutedSessionIdentity, RoutedSessionProtection,
+    accept_direct_routed_session, accept_or_relay_routed_session, connect_direct_routed_endpoint,
+    plan_routes,
 };
 pub use rpc::{
     CLUSTER_HEALTH_INCLUDE_PEER_VIEWS_METADATA_KEY, CLUSTER_HEALTH_SCOPE_LOCAL,
@@ -281,9 +283,8 @@ pub use peer::{
 };
 pub use roaming::open_daemon_rpc_stream_to_cluster_endpoint_async;
 pub use route::{
-    ClusterObjectRpcClient, ClusterObjectRpcOptions, ClusterSignedObjectRpcAsyncHost,
-    ClusterSignedObjectRpcFuture, ClusterSignedObjectRpcObservation,
-    stream_native_service_route_constraints,
+    ClusterObjectRpcAsyncHost, ClusterObjectRpcClient, ClusterObjectRpcFuture,
+    ClusterObjectRpcObservation, ClusterObjectRpcOptions, stream_native_service_route_constraints,
 };
 pub use rpc::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_INVITE_PUBLISH_ROUTE,

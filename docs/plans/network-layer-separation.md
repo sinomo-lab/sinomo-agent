@@ -2,23 +2,27 @@
 
 Status: completed.
 
-Last reviewed: 2026-07-22.
+Last reviewed: 2026-07-23.
 
 Stage G completed on 2026-07-22. The production path now has one routed-stream
 executor, one stream-native object-RPC protocol, and one service registry. The
 staged sections below are retained as implementation history and acceptance
-criteria.
+criteria. The trusted-transport cleanup completed afterward makes routed
+session AEAD an explicit opt-in and removes RPC-level signatures and content
+digests; those current contracts supersede the earlier cryptographic wording
+in the historical stages below.
 
 ## Goal
 
 Replace the current combined networking implementation with the contracts in
-the [network architecture](../network-architecture.md): direct authenticated
-links, connectivity snapshots, node-addressed routed streams, and object RPC
-over an arbitrary authenticated duplex stream.
+the [network architecture](../network-architecture.md): direct transports with
+per-transport peer identity, connectivity snapshots, node-addressed routed
+streams, and object RPC over an arbitrary reliable duplex stream.
 
 The central acceptance property is component-wide path realization: every pair
 of authorized nodes in the same current routable connected component must be
-able to establish an authenticated direct or relayed session. Connectivity
+able to establish a direct or relayed session with established endpoint
+identity. Connectivity
 records direct edges; routing derives component membership, owns every
 transitive relationship, and makes those relationships usable.
 
@@ -45,8 +49,7 @@ network and test code. The remaining implementation still has migration seams:
   terminology;
 - the network layer still owns a service-method catalog in addition to
   `sinomo-service` dispatch state;
-- payload integrity and confidentiality depend on properties of the selected
-  transport rather than one end-to-end routed-session contract; and
+- routed-session protection policy was not yet explicit at the endpoint; and
 - the current data path may spill slow-consumer bodies to local temporary
   storage instead of relying on bounded stream backpressure.
 
@@ -173,10 +176,10 @@ node pairs in a routable connected component. This stage absorbs transitive
 connectivity establishment entirely into routing: a component is useful only
 when the routing executor can realize its eligible paths as endpoint sessions.
 
-The signed session descriptor binds source, destination, session ID, ordered
-path, hop limit, deadline, and end-to-end key material. The destination returns
-a signed acceptance. Relays validate only routing authority and forward bounded
-encrypted data under stream backpressure.
+The session descriptor carries source, destination, session ID, ordered path,
+hop limit, deadline, and selected protection. Relays validate routing state and
+forward bounded records under stream backpressure. Plaintext is the default;
+AEAD is available only when the endpoint explicitly selects it.
 
 The first implementation deliberately fails a stream when any path edge fails.
 It does not migrate or resume the stream. A later proposal may add those
@@ -192,8 +195,8 @@ Exit criteria:
   next connectivity snapshot;
 - connectivity never stores synthetic transitive edges, derives component
   membership, or reports routed sessions as its own state;
-- an intermediate relay cannot retarget a session, impersonate an endpoint,
-  alter protected bytes, or create a successful destination acceptance;
+- an intermediate relay cannot retarget a session or create a successful
+  destination acceptance for another node;
 - loops, repeated nodes, expired deadlines, and exhausted hop limits fail
   before stream acceptance;
 - relay memory remains bounded under a stalled next hop; and
@@ -201,18 +204,19 @@ Exit criteria:
 
 ## Stage E: Stream-native Object RPC
 
-Implement the new SOBJ RPC protocol over one authenticated duplex stream per
-call. The service method catalog remains in `sinomo-service`; object RPC carries
-method identifiers but owns no second registry.
+Implement the new SOBJ RPC protocol over one reliable logical duplex stream per
+call. Persistent peer carriers multiplex those logical streams without
+repeating transport authentication. The service method catalog remains in
+`sinomo-service`; object RPC carries method identifiers but owns no second
+registry.
 
 Request and response heads are bounded. Bodies are incremental and
-content-digested. Inline encoding is allowed only as an encoding optimization;
-it cannot select another protocol or limit the response.
+length-framed. Inline encoding is allowed only as an encoding optimization; it
+cannot select another protocol or limit the response.
 
-Known bodies bind their length and digest in the authenticated head. One-pass
-unknown bodies use an origin-authenticated finish record bound to the request
-and channel; the target cannot commit an irreversible effect based on those
-bytes before verifying completion.
+Known bodies complete at their declared length. One-pass unknown bodies use a
+finish record carrying the observed length. Reliable transports provide byte
+ordering and delivery integrity; applications own any semantic content digest.
 
 Exit criteria:
 
@@ -220,11 +224,11 @@ Exit criteria:
   the same protocol;
 - a one-byte request can receive a response larger than every in-memory window;
 - known and unknown lengths share the same public call API;
-- deferred finish records bind unknown-length content to the authenticated
-  request and destination;
+- deferred finish records complete unknown-length content with its observed
+  length;
 - response production can begin before the complete request body is consumed;
 - malformed or oversized heads fail before large allocation;
-- body corruption and destination/channel-binding mismatch are detected; and
+- invalid lengths, methods, request IDs, and record ordering are rejected; and
 - a possibly applied operation is never automatically resent.
 
 Required payload matrix includes at least zero, one byte, the inline boundary
@@ -306,7 +310,7 @@ The migration is not complete without all of the following:
 | Object RPC | In-memory conformance tests plus the complete request/response payload matrix. |
 | Retry safety | Not-sent versus possibly-applied fault injection around every request phase. |
 | Performance | Raw direct-link baseline, direct routed stream, relayed stream, and object-RPC measurements by target. |
-| Resource safety | Bounded unauthenticated heads, streams, queues, relay buffers, and cancellation cleanup. |
+| Resource safety | Bounded heads, streams, queues, relay buffers, and cancellation cleanup. |
 | Live cluster | Current-commit cluster health, doctor, node status, and targeted direct/relay probes. |
 
 Performance acceptance must report per-target results rather than only an

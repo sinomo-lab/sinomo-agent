@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 
 /// How long daemon discovery waits for the status probe.
 pub const DAEMON_API_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
-/// Typed daemon API client: daemon discovery plus signed object RPC.
+/// Typed daemon API client: daemon discovery plus object RPC.
 #[derive(Clone, Debug)]
 pub struct DaemonApiClient {
     address: String,
@@ -144,7 +144,7 @@ impl DaemonApiClient {
         .map_err(Into::into)
     }
 
-    /// Generic signed object-RPC passthrough for routes without a typed
+    /// Generic object-RPC passthrough for routes without a typed
     /// wrapper. `body` must already be encoded for the route's codec.
     pub fn call(
         &self,
@@ -156,7 +156,7 @@ impl DaemonApiClient {
         send_daemon_rpc(&self.address, &request, self.timeout)
     }
 
-    /// Generic signed object-RPC passthrough for an already built request.
+    /// Generic object-RPC passthrough for an already built request.
     pub fn call_request(
         &self,
         request: &ObjectRpcRequest,
@@ -683,7 +683,6 @@ fn object_rpc_forward_request(
     route: &str,
     target_node_id: &NodeId,
     request: &ObjectRpcRequest,
-    streamed_value_digest_sha256: Option<[u8; 32]>,
     connect_timeout: Duration,
     idle_timeout: Option<Duration>,
     overall_timeout: Option<Duration>,
@@ -692,7 +691,7 @@ fn object_rpc_forward_request(
     let payload = object_rpc_forward_payload(
         target_node_id,
         request,
-        streamed_value_digest_sha256,
+        false,
         connect_timeout,
         idle_timeout,
         overall_timeout,
@@ -706,7 +705,7 @@ fn object_rpc_forward_request(
 fn object_rpc_forward_payload(
     target_node_id: &NodeId,
     request: &ObjectRpcRequest,
-    streamed_value_digest_sha256: Option<[u8; 32]>,
+    streamed_value_body: bool,
     connect_timeout: Duration,
     idle_timeout: Option<Duration>,
     overall_timeout: Option<Duration>,
@@ -715,7 +714,7 @@ fn object_rpc_forward_payload(
     DaemonObjectRpcForwardRequest {
         target_node_id: target_node_id.clone(),
         request: request.clone(),
-        streamed_value_digest_sha256,
+        streamed_value_body,
         connect_timeout_millis: u64::try_from(connect_timeout.as_millis()).unwrap_or(u64::MAX),
         idle_timeout_millis: idle_timeout
             .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
@@ -886,12 +885,9 @@ async fn call_daemon_address_rpc_async(
     address: &str,
     call: ObjectRpcCall,
     options: sinomo_core::network::ClusterObjectRpcOptions,
-    runtime: &tokio::runtime::Handle,
+    _runtime: &tokio::runtime::Handle,
 ) -> Result<ObjectRpcResult, DaemonApiError> {
-    let mut host = DaemonApiRpcHost {
-        data_dir: data_dir.clone(),
-        runtime: runtime.clone(),
-    };
+    let mut host = DaemonApiRpcHost;
     let mut call = call;
     call.request.auth = None;
     if sinomo_core::network::is_loopback_connect_address(address) {
@@ -977,15 +973,10 @@ async fn send_daemon_object_rpc_call_with_forward_elapsed_async(
         .await
         .map(|result| (result, None));
     }
-    let streamed_value_digest_sha256 = if call.has_streamed_value_body() {
-        Some(sinomo_core::network::daemon_rpc_call_sha256(&call)?)
-    } else {
-        None
-    };
     let forward_payload = object_rpc_forward_payload(
         target_node_id,
         &call.request,
-        streamed_value_digest_sha256,
+        call.has_streamed_value_body(),
         connect_timeout,
         forwarded_idle_timeout,
         overall_timeout,
@@ -1469,10 +1460,7 @@ pub async fn send_daemon_rpc_stream_from_data_dir_async(
     }
 }
 
-struct DaemonApiRpcHost {
-    data_dir: SinomoDataDir,
-    runtime: tokio::runtime::Handle,
-}
+struct DaemonApiRpcHost;
 
 const DAEMON_API_CANONICAL_ROOT_CACHE_MAX_ENTRIES: usize = 64;
 
@@ -1700,45 +1688,7 @@ fn daemon_api_cluster_state_read_count(data_dir: &SinomoDataDir) -> usize {
         .unwrap_or_default()
 }
 
-impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for DaemonApiRpcHost {
-    fn sign_object_rpc_request_async<'a>(
-        &'a mut self,
-        request: &'a ObjectRpcRequest,
-        request_digest_sha256: [u8; 32],
-    ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
-        let route = request.route.clone();
-        let category = request.category.clone();
-        match sinomo_core::network::try_sign_daemon_rpc_request_digest_from_cached_data_dir(
-            &self.data_dir,
-            &route,
-            &category,
-            &request_digest_sha256,
-        ) {
-            Ok(Some(signature)) => Box::pin(async move { Ok(signature) }),
-            Err(error) => Box::pin(async move { Err(error) }),
-            Ok(None) => {
-                let data_dir = self.data_dir.clone();
-                let runtime = self.runtime.clone();
-                Box::pin(async move {
-                    runtime
-                        .spawn_blocking(move || {
-                            sinomo_core::network::sign_daemon_rpc_request_digest_from_data_dir(
-                                &data_dir,
-                                &route,
-                                &category,
-                                request_digest_sha256.to_vec(),
-                            )
-                        })
-                        .await
-                        .map_err(|source| sinomo_core::network::NetworkError::Io {
-                            operation: "daemon API RPC signing".to_string(),
-                            detail: format!("RPC signing task failed: {source}"),
-                        })?
-                })
-            }
-        }
-    }
-}
+impl sinomo_core::network::ClusterObjectRpcAsyncHost for DaemonApiRpcHost {}
 
 fn daemon_api_rpc_endpoint_for_address(
     state: &sinomo_core::ClusterBootstrapState,
@@ -2133,9 +2083,7 @@ mod tests {
                             .decode_body::<DaemonObjectRpcForwardRequest>()
                             .expect("forward request");
                         assert_eq!(forward.target_node_id, expected_target);
-                        let streamed_value_digest_sha256 = forward
-                            .streamed_value_digest_sha256
-                            .expect("authenticated one-pass inner value proof");
+                        assert!(forward.streamed_value_body);
                         assert!(inbound.body.is_attachment());
                         let encoded_request = std::mem::take(&mut inbound.body)
                             .collect_to_vec(512 * 1024)
@@ -2145,12 +2093,8 @@ mod tests {
                             sinomo_core::network::ObjectRpcIncomingBody::bytes(
                                 encoded_request.clone(),
                             ),
-                            streamed_value_digest_sha256,
                         )?;
-                        assert_eq!(
-                            sinomo_core::network::daemon_rpc_call_sha256(&rebuilt)?,
-                            streamed_value_digest_sha256
-                        );
+                        assert!(rebuilt.has_streamed_value_body());
                         let actual_request = ObjectRpcRequest::from_encoded_body(
                             "/test/api-forward-cache",
                             "test",
@@ -3004,7 +2948,6 @@ mod tests {
             DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
             &target_node_id,
             &inner_request,
-            None,
             Duration::from_secs(5),
             Some(Duration::from_secs(9)),
             Some(Duration::from_secs(30)),
@@ -3104,7 +3047,6 @@ mod tests {
             DAEMON_OBJECT_RPC_FORWARD_ROUTE,
             &target_node_id,
             &inner_request,
-            None,
             sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
             Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
             Some(Duration::from_secs(10)),
@@ -3129,7 +3071,6 @@ mod tests {
             DAEMON_OBJECT_RPC_FORWARD_ROUTE,
             &target_node_id,
             &inner_request,
-            None,
             sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
             Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
             Some(Duration::from_secs(10)),
@@ -3155,7 +3096,6 @@ mod tests {
             DAEMON_OBJECT_RPC_FORWARD_ROUTE,
             &target_node_id,
             &inner_request,
-            None,
             sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
             Some(Duration::from_secs(310)),
             None,

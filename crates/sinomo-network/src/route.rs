@@ -4,7 +4,7 @@ use crate::prelude::*;
 use crate::{
     ClusterConnectivityGraph, ClusterPaths, DaemonRpcTimeouts, NetworkCallPolicy,
     NetworkDeliveryState, NetworkDuplexStream, NetworkError, NetworkHealthPolicy,
-    NetworkTimeoutPhase, ObjectRpcCall, ObjectRpcRequest, ObjectRpcResult,
+    NetworkTimeoutPhase, ObjectRpcCall, ObjectRpcResult,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
@@ -160,10 +160,10 @@ fn record_network_rpc_metrics(
 
 pub fn stream_native_service_route_constraints() -> crate::RouteConstraints {
     crate::RouteConstraints {
-        // The routed-session layer encrypts and authenticates the complete
-        // endpoint stream. Requiring the adjacent link to be confidential
-        // as well would incorrectly exclude the built-in LAN TCP link while
-        // adding no service-RPC confidentiality.
+        // Ordinary trusted-cluster RPC is plaintext and does not require a
+        // confidential adjacent link. Explicit routed-session AEAD, when
+        // selected by the caller, protects the complete endpoint stream
+        // without changing which reliable links may carry it.
         require_confidentiality: false,
         ..crate::RouteConstraints::default()
     }
@@ -179,10 +179,7 @@ pub fn stream_native_service_route_constraints() -> crate::RouteConstraints {
 /// capture. Ordinary traffic still pays only the timeline's relaxed atomic
 /// active check.
 fn prepare_call_for_active_network_timeline(call: &mut ObjectRpcCall) {
-    if !crate::network_timeline_capture_is_active()
-        || call.request.auth.is_some()
-        || !call.body.allows_request_metadata_mutation()
-    {
+    if !crate::network_timeline_capture_is_active() || call.request.auth.is_some() {
         return;
     }
     call.request.ensure_trace_context();
@@ -466,6 +463,7 @@ fn route_from_predecessors(
 pub struct ClusterObjectRpcOptions {
     timeouts: DaemonRpcTimeouts,
     overall_timeout: Option<Duration>,
+    protection: crate::RoutedSessionProtection,
 }
 
 impl ClusterObjectRpcOptions {
@@ -476,6 +474,7 @@ impl ClusterObjectRpcOptions {
         Self {
             timeouts,
             overall_timeout: None,
+            protection: crate::RoutedSessionProtection::Plaintext,
         }
     }
 
@@ -490,10 +489,20 @@ impl ClusterObjectRpcOptions {
 
     /// Override the whole-call delivery deadline.
     ///
-    /// The deadline covers route planning, signing, connecting, writing, and
+    /// The deadline covers route planning, connecting, writing, and
     /// receiving the response.
     pub fn with_overall_timeout(mut self, timeout: Duration) -> Self {
         self.overall_timeout = Some(timeout);
+        self
+    }
+
+    /// Selects end-to-end routed-session protection for this call's reusable
+    /// carrier. Plaintext is the default; AEAD must be requested explicitly.
+    pub fn with_routed_session_protection(
+        mut self,
+        protection: crate::RoutedSessionProtection,
+    ) -> Self {
+        self.protection = protection;
         self
     }
 
@@ -528,15 +537,16 @@ impl Default for ClusterObjectRpcOptions {
         Self {
             timeouts: DaemonRpcTimeouts::default(),
             overall_timeout: None,
+            protection: crate::RoutedSessionProtection::Plaintext,
         }
     }
 }
 
-pub type ClusterSignedObjectRpcFuture<'a, T> =
+pub type ClusterObjectRpcFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, NetworkError>> + Send + 'a>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ClusterSignedObjectRpcObservationKind {
+enum ClusterObjectRpcObservationKind {
     Success,
     IoFailure,
     HardIoFailure,
@@ -544,22 +554,22 @@ enum ClusterSignedObjectRpcObservationKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ClusterSignedObjectRpcObservation {
-    kind: ClusterSignedObjectRpcObservationKind,
+pub struct ClusterObjectRpcObservation {
+    kind: ClusterObjectRpcObservationKind,
     latency_ms: Option<u64>,
 }
 
-impl ClusterSignedObjectRpcObservation {
+impl ClusterObjectRpcObservation {
     pub fn success(latency_ms: Option<u64>) -> Self {
         Self {
-            kind: ClusterSignedObjectRpcObservationKind::Success,
+            kind: ClusterObjectRpcObservationKind::Success,
             latency_ms,
         }
     }
 
     pub fn io_failure() -> Self {
         Self {
-            kind: ClusterSignedObjectRpcObservationKind::IoFailure,
+            kind: ClusterObjectRpcObservationKind::IoFailure,
             latency_ms: None,
         }
     }
@@ -569,39 +579,36 @@ impl ClusterSignedObjectRpcObservation {
     /// through the single-failure grace period.
     pub fn hard_io_failure() -> Self {
         Self {
-            kind: ClusterSignedObjectRpcObservationKind::HardIoFailure,
+            kind: ClusterObjectRpcObservationKind::HardIoFailure,
             latency_ms: None,
         }
     }
 
     pub fn auth_denied() -> Self {
         Self {
-            kind: ClusterSignedObjectRpcObservationKind::AuthDenied,
+            kind: ClusterObjectRpcObservationKind::AuthDenied,
             latency_ms: None,
         }
     }
 
     pub fn is_success(&self) -> bool {
-        matches!(self.kind, ClusterSignedObjectRpcObservationKind::Success)
+        matches!(self.kind, ClusterObjectRpcObservationKind::Success)
     }
 
     pub fn is_io_failure(&self) -> bool {
         matches!(
             self.kind,
-            ClusterSignedObjectRpcObservationKind::IoFailure
-                | ClusterSignedObjectRpcObservationKind::HardIoFailure
+            ClusterObjectRpcObservationKind::IoFailure
+                | ClusterObjectRpcObservationKind::HardIoFailure
         )
     }
 
     pub fn is_hard_io_failure(&self) -> bool {
-        matches!(
-            self.kind,
-            ClusterSignedObjectRpcObservationKind::HardIoFailure
-        )
+        matches!(self.kind, ClusterObjectRpcObservationKind::HardIoFailure)
     }
 
     pub fn is_auth_denied(&self) -> bool {
-        matches!(self.kind, ClusterSignedObjectRpcObservationKind::AuthDenied)
+        matches!(self.kind, ClusterObjectRpcObservationKind::AuthDenied)
     }
 
     pub fn latency_ms(&self) -> Option<u64> {
@@ -609,18 +616,12 @@ impl ClusterSignedObjectRpcObservation {
     }
 }
 
-pub trait ClusterSignedObjectRpcAsyncHost: Send {
-    fn sign_object_rpc_request_async<'a>(
-        &'a mut self,
-        request: &'a ObjectRpcRequest,
-        request_digest_sha256: [u8; 32],
-    ) -> ClusterSignedObjectRpcFuture<'a, Vec<u8>>;
-
-    fn observe_signed_endpoint_rpc_async<'a>(
+pub trait ClusterObjectRpcAsyncHost: Send {
+    fn observe_endpoint_rpc_async<'a>(
         &'a mut self,
         _endpoint: &'a ClusterEndpointRecord,
-        _observation: ClusterSignedObjectRpcObservation,
-    ) -> ClusterSignedObjectRpcFuture<'a, ()> {
+        _observation: ClusterObjectRpcObservation,
+    ) -> ClusterObjectRpcFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
 
@@ -631,25 +632,25 @@ pub trait ClusterSignedObjectRpcAsyncHost: Send {
         &'a mut self,
         endpoint: &'a ClusterEndpointRecord,
         health: NetworkHealthPolicy,
-    ) -> ClusterSignedObjectRpcFuture<'a, Box<dyn NetworkDuplexStream>> {
+    ) -> ClusterObjectRpcFuture<'a, Box<dyn NetworkDuplexStream>> {
         Box::pin(async move {
             crate::roaming::open_daemon_rpc_stream_to_cluster_endpoint_async(endpoint, health).await
         })
     }
 }
 
-fn cluster_signed_endpoint_rpc_observation(
+fn cluster_endpoint_rpc_observation(
     result: Result<&ObjectRpcResult, &NetworkError>,
     started: Instant,
-) -> Option<ClusterSignedObjectRpcObservation> {
+) -> Option<ClusterObjectRpcObservation> {
     match result {
         // Completing an authenticated stream proves that the immediate endpoint is
         // reachable even when the application response denies the requested operation.
         // Session/link authentication failures arrive through the `Err` branch below.
-        Ok(_) => Some(ClusterSignedObjectRpcObservation::success(Some(
-            cluster_signed_endpoint_rpc_elapsed_latency_ms(started),
+        Ok(_) => Some(ClusterObjectRpcObservation::success(Some(
+            cluster_endpoint_rpc_elapsed_latency_ms(started),
         ))),
-        Err(error) => cluster_signed_endpoint_rpc_error_observation(error),
+        Err(error) => cluster_endpoint_rpc_error_observation(error),
     }
 }
 
@@ -672,21 +673,19 @@ fn cluster_paths_data_dir(
     })
 }
 
-fn cluster_signed_endpoint_rpc_error_observation(
+fn cluster_endpoint_rpc_error_observation(
     error: &NetworkError,
-) -> Option<ClusterSignedObjectRpcObservation> {
+) -> Option<ClusterObjectRpcObservation> {
     match error {
         NetworkError::Io { .. }
         | NetworkError::Timeout { .. }
-        | NetworkError::DeliveryFailed { .. } => {
-            Some(ClusterSignedObjectRpcObservation::io_failure())
-        }
-        NetworkError::AuthDenied => Some(ClusterSignedObjectRpcObservation::auth_denied()),
+        | NetworkError::DeliveryFailed { .. } => Some(ClusterObjectRpcObservation::io_failure()),
+        NetworkError::AuthDenied => Some(ClusterObjectRpcObservation::auth_denied()),
         _ => None,
     }
 }
 
-fn cluster_signed_endpoint_rpc_elapsed_latency_ms(started: Instant) -> u64 {
+fn cluster_endpoint_rpc_elapsed_latency_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
@@ -705,7 +704,7 @@ pub struct ClusterObjectRpcClient<'a, H> {
     route_context: Option<ClusterObjectRpcRouteContext<'a>>,
 }
 
-impl<'a, H: ClusterSignedObjectRpcAsyncHost> ClusterObjectRpcClient<'a, H> {
+impl<'a, H: ClusterObjectRpcAsyncHost> ClusterObjectRpcClient<'a, H> {
     /// Build a client for a caller that intentionally has only a concrete endpoint.
     pub fn endpoint_only(host: &'a mut H) -> Self {
         Self {
@@ -725,12 +724,12 @@ impl<'a, H: ClusterSignedObjectRpcAsyncHost> ClusterObjectRpcClient<'a, H> {
 
 impl<'a, H> ClusterObjectRpcClient<'a, H>
 where
-    H: ClusterSignedObjectRpcAsyncHost + Send,
+    H: ClusterObjectRpcAsyncHost + Send,
 {
     /// Runs one body-aware RPC call against a concrete endpoint.
     ///
-    /// The request head is signed before stream setup. The transport owns
-    /// chunking, flow control, health checks, and
+    /// The transport authenticates the endpoint while opening the reusable
+    /// carrier. It then owns chunking, flow control, health checks, and
     /// response-body delivery after this method opens the duplex stream.
     pub async fn call_endpoint(
         &mut self,
@@ -768,13 +767,6 @@ where
         prepare_call_for_active_network_timeline(&mut call);
         let data_dir = cluster_paths_data_dir(self.route_context.map(|context| context.paths))?;
         let policy = options.call_policy();
-        let request_digest_sha256 = crate::daemon_auth::daemon_rpc_call_sha256(&call)?;
-        let request_auth = cluster_object_rpc_sign_with_deadline(
-            self.host
-                .sign_object_rpc_request_async(&call.request, request_digest_sha256),
-            deadline,
-        )
-        .await?;
         let directory = crate::DirectorySnapshot::try_from_records(
             crate::DirectoryVersion(0),
             state.members.clone(),
@@ -817,7 +809,7 @@ where
             endpoint_pool_identity.update(field.as_bytes());
         }
         endpoint_pool_identity.update(format!("{:?}", endpoint.transport).as_bytes());
-        let stream = crate::open_pooled_routed_stream(
+        let stream = crate::open_pooled_routed_stream_with_protection(
             format!(
                 "{}:direct-endpoint:{}",
                 state.cluster_id,
@@ -827,6 +819,7 @@ where
             constraints,
             state.local_node_id.clone(),
             endpoint.node_id.clone(),
+            options.protection,
             connect_timeout,
             crate::connect_direct_routed_endpoint(
                 &directory,
@@ -836,6 +829,7 @@ where
                 crate::ConnectOptions {
                     constraints,
                     timeout: connect_timeout,
+                    protection: options.protection,
                 },
             ),
         )
@@ -854,8 +848,6 @@ where
                     stream,
                     &context,
                     call,
-                    request_auth,
-                    request_digest_sha256,
                     crate::ObjectFrameIoOptions::idle_timeout(policy.health.no_progress_timeout),
                 )
                 .await
@@ -868,16 +860,16 @@ where
             // A final service rejection is sent only after both routed
             // endpoints have authenticated. It proves endpoint reachability
             // even though the requested operation was denied.
-            Some(ClusterSignedObjectRpcObservation::success(Some(
-                cluster_signed_endpoint_rpc_elapsed_latency_ms(started),
+            Some(ClusterObjectRpcObservation::success(Some(
+                cluster_endpoint_rpc_elapsed_latency_ms(started),
             )))
         } else {
-            cluster_signed_endpoint_rpc_observation(result.as_ref(), started)
+            cluster_endpoint_rpc_observation(result.as_ref(), started)
         };
         if let Some(observation) = observation {
             let _ = self
                 .host
-                .observe_signed_endpoint_rpc_async(endpoint, observation)
+                .observe_endpoint_rpc_async(endpoint, observation)
                 .await;
         }
         let result = result?;
@@ -940,13 +932,6 @@ where
         );
         prepare_call_for_active_network_timeline(&mut call);
         let policy = options.call_policy();
-        let request_digest_sha256 = crate::daemon_auth::daemon_rpc_call_sha256(&call)?;
-        let request_auth = cluster_object_rpc_sign_with_deadline(
-            self.host
-                .sign_object_rpc_request_async(&call.request, request_digest_sha256),
-            deadline,
-        )
-        .await?;
         let connect_timeout = match deadline.checked_remaining() {
             Some(Some(remaining)) => remaining.min(policy.health.connect_timeout),
             Some(None) => policy.health.connect_timeout,
@@ -982,8 +967,6 @@ where
             stream,
             &context,
             call,
-            request_auth,
-            request_digest_sha256,
             crate::ObjectFrameIoOptions::idle_timeout(policy.health.no_progress_timeout),
         )
         .await?;
@@ -1061,23 +1044,6 @@ where
         }
         let policy = options.call_policy();
         let trace = crate::network_timeline_trace_context_for_request(&call.request);
-        let sign_started_ns = trace
-            .map(|_| crate::network_timeline_monotonic_ns())
-            .unwrap_or(0);
-        let request_digest_sha256 = crate::daemon_auth::daemon_rpc_call_sha256(&call)?;
-        let request_auth_result = cluster_object_rpc_sign_with_deadline(
-            self.host
-                .sign_object_rpc_request_async(&call.request, request_digest_sha256),
-            deadline,
-        )
-        .await;
-        record_routed_rpc_timeline_stage(
-            trace,
-            crate::network_timeline_stage::REQUEST_SIGN,
-            sign_started_ns,
-            request_auth_result.is_ok(),
-        );
-        let request_auth = request_auth_result?;
         let directory = crate::cluster_directory_with_bootstrap_state(
             crate::cluster_directory_for(paths),
             state,
@@ -1185,12 +1151,13 @@ where
         let open_started_ns = trace
             .map(|_| crate::network_timeline_monotonic_ns())
             .unwrap_or(0);
-        let stream_result = crate::open_pooled_routed_stream(
+        let stream_result = crate::open_pooled_routed_stream_with_protection(
             state.cluster_id.to_string(),
             directory_generation,
             constraints,
             state.local_node_id.clone(),
             target_node_id.clone(),
+            options.protection,
             connect_timeout,
             crate::RoutedConnector::connect(
                 connector.as_ref(),
@@ -1198,6 +1165,7 @@ where
                 crate::ConnectOptions {
                     constraints,
                     timeout: connect_timeout,
+                    protection: options.protection,
                 },
             ),
         )
@@ -1222,8 +1190,6 @@ where
             stream,
             &context,
             call,
-            request_auth,
-            request_digest_sha256,
             crate::ObjectFrameIoOptions::idle_timeout(policy.health.no_progress_timeout),
         )
         .await;
@@ -1295,26 +1261,6 @@ where
     }
 }
 
-async fn cluster_object_rpc_sign_with_deadline<T, F>(
-    sign: F,
-    deadline: ClusterEndpointRpcDeadline,
-) -> Result<T, NetworkError>
-where
-    F: Future<Output = Result<T, NetworkError>>,
-{
-    let Some(deadline_at) = deadline.deadline_at else {
-        return sign.await;
-    };
-    match tokio::time::timeout_at(deadline_at, sign).await {
-        Ok(result) => result,
-        Err(_) => Err(deadline.timeout_error(
-            "cluster object rpc signing",
-            NetworkTimeoutPhase::Signing,
-            NetworkDeliveryState::DefinitelyNotSent,
-        )),
-    }
-}
-
 fn cluster_target_rpc_timeout_error(
     target_node_id: &NodeId,
     timeout: Option<Duration>,
@@ -1340,9 +1286,25 @@ fn cluster_target_rpc_timeout_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ObjectRpcRequest;
 
     #[test]
-    fn active_timeline_does_not_mutate_forwarded_streamed_value_metadata() {
+    fn cluster_rpc_protection_is_plaintext_unless_explicitly_enabled() {
+        let defaults = ClusterObjectRpcOptions::default();
+        assert_eq!(
+            defaults.protection,
+            crate::RoutedSessionProtection::Plaintext
+        );
+        assert_eq!(
+            defaults
+                .with_routed_session_protection(crate::RoutedSessionProtection::Aead)
+                .protection,
+            crate::RoutedSessionProtection::Aead
+        );
+    }
+
+    #[test]
+    fn active_timeline_can_annotate_forwarded_streamed_value_metadata() {
         let _capture_guard = crate::timeline::network_timeline_test_capture_guard();
         if crate::network_timeline_capture_is_active() {
             let _ = crate::stop_network_timeline_capture();
@@ -1355,22 +1317,15 @@ mod tests {
             &vec![0x5a_u8; crate::owned_chunk::BODY_CHUNK_MAX + 17],
         )
         .expect("encode forwarded request");
-        let digest: [u8; 32] = crate::daemon_rpc_body_sha256(&request)
-            .try_into()
-            .expect("request digest");
         let encoded = std::mem::take(&mut request.body);
         let body = crate::ObjectRpcIncomingBody::bytes(encoded);
-        let mut call = ObjectRpcCall::from_forwarded_streamed_value(request, body, digest)
+        let mut call = ObjectRpcCall::from_forwarded_streamed_value(request, body)
             .expect("forward streamed value");
-        let metadata = call.request.metadata.clone();
 
         prepare_call_for_active_network_timeline(&mut call);
 
-        assert_eq!(call.request.metadata, metadata);
-        assert_eq!(
-            crate::daemon_rpc_call_sha256(&call).expect("reuse forwarded proof"),
-            digest
-        );
+        assert!(call.request.traceparent().is_some());
+        assert!(call.request.observe_sampled());
         crate::stop_network_timeline_capture().expect("stop timeline capture");
     }
 

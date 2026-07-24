@@ -46,8 +46,8 @@ fn mux_io_error(operation: &str, error: std::io::Error) -> NetworkError {
 }
 
 /// Identifies a loopback-only multiplexed carrier before any logical RPC is
-/// accepted. Each logical stream still carries its own per-call transcript and
-/// signed service request; this routing prelude grants no service authority.
+/// accepted. Each logical stream carries its own service request; the local
+/// carrier context grants only local service authority.
 pub fn local_object_rpc_carrier_prelude_prefix_matches(prefix: &[u8]) -> bool {
     prefix.len() <= LOCAL_OBJECT_RPC_CARRIER_PRELUDE_MAGIC.len()
         && LOCAL_OBJECT_RPC_CARRIER_PRELUDE_MAGIC.starts_with(prefix)
@@ -518,6 +518,7 @@ struct PoolKey {
     directory_generation: u64,
     local_node_id: NodeId,
     peer_node_id: NodeId,
+    protection: crate::RoutedSessionProtection,
     require_full_duplex: bool,
     require_confidentiality: bool,
     require_relay_forwarding: bool,
@@ -531,12 +532,14 @@ impl PoolKey {
         constraints: RouteConstraints,
         local_node_id: NodeId,
         peer_node_id: NodeId,
+        protection: crate::RoutedSessionProtection,
     ) -> Self {
         Self {
             scope,
             directory_generation,
             local_node_id,
             peer_node_id,
+            protection,
             require_full_duplex: constraints.require_full_duplex,
             require_confidentiality: constraints.require_confidentiality,
             require_relay_forwarding: constraints.require_relay_forwarding,
@@ -548,6 +551,7 @@ impl PoolKey {
         self.scope == other.scope
             && self.local_node_id == other.local_node_id
             && self.peer_node_id == other.peer_node_id
+            && self.protection == other.protection
             && self.require_full_duplex == other.require_full_duplex
             && self.require_confidentiality == other.require_confidentiality
             && self.require_relay_forwarding == other.require_relay_forwarding
@@ -624,12 +628,42 @@ pub async fn open_pooled_routed_stream<F>(
 where
     F: Future<Output = Result<PeerStream, NetworkError>>,
 {
+    open_pooled_routed_stream_with_protection(
+        scope,
+        directory_generation,
+        constraints,
+        local_node_id,
+        peer_node_id,
+        crate::RoutedSessionProtection::Plaintext,
+        timeout,
+        establish,
+    )
+    .await
+}
+
+/// Opens a logical stream whose persistent carrier uses the selected
+/// routed-session protection. Protection is part of the pool key, so an AEAD
+/// call can never reuse a plaintext carrier (or vice versa).
+pub async fn open_pooled_routed_stream_with_protection<F>(
+    scope: String,
+    directory_generation: u64,
+    constraints: RouteConstraints,
+    local_node_id: NodeId,
+    peer_node_id: NodeId,
+    protection: crate::RoutedSessionProtection,
+    timeout: Duration,
+    establish: F,
+) -> Result<PeerStream, NetworkError>
+where
+    F: Future<Output = Result<PeerStream, NetworkError>>,
+{
     let key = PoolKey::new(
         scope,
         directory_generation,
         constraints,
         local_node_id,
         peer_node_id,
+        protection,
     );
     let existing = {
         let mut pool = routed_stream_pool().lock().await;
@@ -670,6 +704,7 @@ where
             let carrier = establish.await?;
             if carrier.local_node_id != key.local_node_id
                 || carrier.peer_node_id != key.peer_node_id
+                || carrier.protection != key.protection
             {
                 return Err(NetworkError::AuthDenied);
             }
@@ -793,6 +828,7 @@ pub async fn accept_pooled_routed_stream_carrier(
         constraints,
         carrier.local_node_id.clone(),
         carrier.peer_node_id.clone(),
+        carrier.protection,
     );
     let (acceptor, client) = routed_stream_acceptor_and_client(carrier)?;
     let connect_lock = {
@@ -1020,7 +1056,7 @@ mod tests {
         .await
         .expect("second logical stream");
 
-        assert_ne!(first.session_id, second.session_id);
+        assert_eq!(first.session_id, second.session_id);
         first
             .write_all(b"a")
             .await
@@ -1231,7 +1267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_rpc_pool_reuses_carrier_but_not_call_context() {
+    async fn local_rpc_pool_reuses_transport_peer_context() {
         let scope = Id::generate().to_string();
         let establishments = Arc::new(AtomicUsize::new(0));
         let (mut client_carrier, mut server_carrier) = tokio::io::duplex(256 * 1024);
@@ -1309,8 +1345,8 @@ mod tests {
         let (server_first, server_second) = server.await.expect("server task");
         assert_eq!(first_context, server_first);
         assert_eq!(second_context, server_second);
-        assert_ne!(first_context.session_id, second_context.session_id);
-        assert_ne!(
+        assert_eq!(first_context.session_id, second_context.session_id);
+        assert_eq!(
             first_context.channel_binding,
             second_context.channel_binding
         );
@@ -1555,4 +1591,28 @@ mod tests {
         let _ = stalled_writer.await;
         retire_pooled_routed_streams(&scope).await;
     }
+}
+#[test]
+fn routed_carrier_pool_never_crosses_protection_modes() {
+    let local = NodeId::from_legacy_named("pool-protection-local").expect("local node id");
+    let peer = NodeId::from_legacy_named("pool-protection-peer").expect("peer node id");
+    let plaintext = PoolKey::new(
+        "pool-protection".to_string(),
+        1,
+        RouteConstraints::default(),
+        local.clone(),
+        peer.clone(),
+        crate::RoutedSessionProtection::Plaintext,
+    );
+    let aead = PoolKey::new(
+        "pool-protection".to_string(),
+        1,
+        RouteConstraints::default(),
+        local,
+        peer,
+        crate::RoutedSessionProtection::Aead,
+    );
+
+    assert_ne!(plaintext, aead);
+    assert!(!plaintext.same_relationship(&aead));
 }

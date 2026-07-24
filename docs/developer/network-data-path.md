@@ -12,7 +12,7 @@ sinomo-service registry
         |
 typed request/response head plus optional body
         |
-object_rpc_stream.rs -- one call per authenticated duplex stream
+object_rpc_stream.rs -- one call per reliable duplex stream
         |
 routing.rs -- direct or multi-hop routed stream
         |
@@ -51,7 +51,7 @@ slot of the object-RPC protocol. It does not implement routing or keep a service
 catalog. The single method registry, route policy, concurrency admission,
 readiness, and final handler dispatch live in `sinomo-service`.
 
-Received body chunks move from the authenticated object-RPC pump directly into
+Received body chunks move from the object-RPC pump directly into
 the application body. The service adapter does not spawn a second body pump or
 copy chunks through an `AsyncRead` scratch buffer. Incremental SOBJ decoding
 retains one bounded chunk at a time, and internal proxy forwarding can transfer
@@ -66,13 +66,17 @@ compatibility adapters.
 `routing.rs` is the only production node-routing executor. A
 `MultiHopRoutedConnector` plans against one immutable connectivity snapshot and
 realizes either a direct stream or a relay chain. The routed-session handshake
-binds source, destination, session identity, and channel binding before
-application bytes are accepted.
+binds source, destination, session identity, and selected record protection
+before application bytes are accepted. `ConnectOptions::protection` defaults
+to `RoutedSessionProtection::Plaintext`; AEAD is an explicit per-endpoint
+opt-in. Service-RPC callers select the same policy with
+`ClusterObjectRpcOptions::with_routed_session_protection`. Protection is part
+of the persistent carrier pool key, so modes are never mixed by reuse.
 
 Intermediate nodes run `accept_or_relay_routed_session`. They authenticate the
-adjacent links and validate the routed envelope. Linux TCP-to-TCP relays use
-`splice` in both directions; portable relays move each opaque ciphertext block
-through one pooled slab. Relay memory is constant per direction. Relays do not
+adjacent links once and validate the routed envelope. Linux TCP-to-TCP relays
+use `splice` in both directions; portable relays move each record through one
+pooled slab. Relay memory is constant per direction. Relays do not
 decode SOBJ heads, inspect service methods, or select an RPC implementation.
 
 `route.rs` composes routing with object RPC through `ClusterObjectRpcClient`.
@@ -87,30 +91,30 @@ bounds are:
 
 - 16 KiB maximum request or response control head;
 - 8 KiB inline-body allowance;
-- 64 KiB maximum data frame; and
+- 256 KiB maximum data frame; and
 - 256 KiB receive window.
 
 These are resident-resource bounds, not total payload limits. Receive credit
 and bounded ownership rings apply backpressure across direct and relayed calls. The
 network layer does not spool application bodies to temporary files.
 
-Record capacities are derived from the inside out. A 64 KiB body frame plus
+Record capacities are derived from the inside out. A 256 KiB body frame plus
 its nine-byte object prefix fits one mux record; that record plus its 17-byte
-mux prefix fits one encrypted routed-session record. Adding an outer header
-does not split an otherwise maximum-sized inner record.
+mux prefix fits one routed-session record. Adding an outer header does not
+split an otherwise maximum-sized inner record.
 
 The canonical path shares one pooled allocation:
 
 ```text
-[secure headroom][mux headroom][RPC headroom][payload][AEAD tailroom]
+[session headroom][mux headroom][RPC headroom][payload][optional AEAD tailroom]
 ```
 
 The producer fills the payload region. Object RPC and the mux move the
-allocation's start backward to prepend their headers. The routed-session writer
-hashes the plaintext, encrypts it in place, prepends the secure header, appends
-the detached tag, and retains that slab across partial socket writes. Receive
-performs the inverse operations in the same slab and exposes only initialized
-payload ranges.
+allocation's start backward to prepend their headers. The default routed-session
+writer prepends a plaintext record header and retains that slab across partial
+socket writes. In explicitly selected AEAD mode it encrypts in place and
+appends the detached tag. Receive performs the corresponding operation in the
+same slab and exposes only initialized payload ranges.
 
 Small typed request and response values are encoded into one
 transport-shaped SOBJ allocation and adopted without normalization. Large
@@ -124,13 +128,12 @@ request/oneshot bridge. Generated repeated-byte bodies also fill complete
 owned slabs directly; only callers that choose the byte compatibility view
 receive immutable `Bytes` slices.
 
-For a body whose authenticated head already commits to both its exact length
-and digest, the receiver verifies completion at that byte boundary. A small
-typed call is therefore a request head plus one owned data record, and likewise
-for its response; it does not add a redundant object-level finish record.
-Known-length and unknown-length producers still send an authenticated finish
-record because that record publishes the body digest. Inline byte bodies remain
-the explicit byte-compatibility form.
+For a known-length body, the receiver completes at the declared byte boundary.
+A small typed call is therefore a request head plus one owned data record, and
+likewise for its response; it does not add a redundant object-level finish
+record. Unknown-length producers send a finish record carrying the observed
+length. Object RPC does not compute or transmit a content digest. Inline byte
+bodies remain the explicit byte-compatibility form.
 
 Data and control slabs use separate pools, per-connection and process byte
 limits, and bounded retained free lists. The owned mux has one persistent RX
@@ -140,6 +143,11 @@ the delivered chunk lease and returns only when the downstream consumer drops
 or transfers the chunk. Aggregated window returns, RESET, ready stream FINISH,
 and front-of-stream object-RPC control records are prioritized over body data
 without reordering records inside a stream.
+
+Current mux credit permits 64 MiB per stream and 512 MiB per carrier.
+Receivers aggregate ordinary stream and connection credit returns to 8 MiB and
+32 MiB respectively, but flush sub-threshold credit immediately when a sender
+is blocked.
 
 A caller that supplies shared immutable bytes may pay one normalization copy.
 A caller that chooses `AsyncRead`, `AsyncWrite`, or contiguous service-value
@@ -169,12 +177,11 @@ still own a typed value use `ObjectRpcCall::encode_value`,
 `ObjectRpcResult::decode_body` so large values are decoded from chunks instead
 of first being gathered into a second full-size vector.
 
-Authenticated progress frames distinguish transport health from application
-silence. Dropping an incoming body cancels or drains the same call; it does not
-switch to another protocol. Request and response completion remain bound to the
-peer context and verified body transcript. Every authenticated control payload
-is encoded as its fixed-size tag followed by the canonical unsigned SOBJ bytes;
-the tag is verified over those exact bytes before SOBJ decoding.
+Progress frames distinguish transport health from application silence.
+Dropping an incoming body cancels or drains the same call; it does not switch
+to another protocol. Request and response completion use ordered framing and
+declared or observed lengths. Control payloads are canonical SOBJ bytes without
+an RPC authentication tag, signature, or checksum.
 
 ## Retry Boundary
 

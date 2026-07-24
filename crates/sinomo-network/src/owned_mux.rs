@@ -19,6 +19,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
@@ -35,13 +36,14 @@ const FRAME_OPEN_DATA: u8 = 9;
 const FRAME_CONNECTION_WINDOW: u8 = 10;
 const FRAME_WINDOW_REQUEST: u8 = 11;
 const FRAME_CONNECTION_WINDOW_REQUEST: u8 = 12;
-const STREAM_WINDOW_BYTES: usize = 4 * crate::owned_chunk::SECURE_WIRE_MAX;
-const CONNECTION_WINDOW_BYTES: usize = 128 * crate::owned_chunk::SECURE_WIRE_MAX;
-const WINDOW_RETURN_THRESHOLD_BYTES: usize = 2 * crate::owned_chunk::SECURE_WIRE_MAX;
-const CONNECTION_WINDOW_RETURN_THRESHOLD_BYTES: usize = 8 * crate::owned_chunk::SECURE_WIRE_MAX;
-const TX_QUANTUM_BYTES: usize = 16 * 1024;
+const STREAM_WINDOW_BYTES: usize = 64 * 1024 * 1024;
+const CONNECTION_WINDOW_BYTES: usize = 512 * 1024 * 1024;
+const WINDOW_RETURN_THRESHOLD_BYTES: usize = 8 * 1024 * 1024;
+const CONNECTION_WINDOW_RETURN_THRESHOLD_BYTES: usize = 32 * 1024 * 1024;
+const TX_QUANTUM_BYTES: usize = crate::owned_chunk::BODY_CHUNK_MAX;
 const MAX_CONTROL_COMMANDS: usize = 1024;
 const MAX_ACCEPTED_STREAMS: usize = 32;
+const INCOMING_DISPATCHER_ACTIVATION_GRACE: Duration = Duration::from_millis(150);
 
 fn mux_error(operation: &str, detail: impl std::fmt::Display) -> NetworkError {
     NetworkError::Io {
@@ -313,7 +315,8 @@ impl StreamSlot {
         let weak_connection = Arc::downgrade(&connection);
         let lease = ReceiveCreditLease::new(
             charged_bytes,
-            vec![stream_permit, connection_permit],
+            Some(stream_permit),
+            Some(connection_permit),
             Some(Arc::new(move |bytes| {
                 if let Some(slot) = weak_slot.upgrade() {
                     slot.return_stream_receive_credit(bytes);
@@ -754,8 +757,8 @@ impl TxScheduler {
         }
 
         // Advance deficits synchronously until at least one already-queued
-        // record is eligible. A 64 KiB record therefore does not require four
-        // Tokio task yields merely because the scheduling quantum is 16 KiB.
+        // record is eligible. A full body record therefore does not require
+        // several Tokio task yields merely because it exceeds one quantum.
         // The loop is bounded by the maximum mux record size.
         loop {
             let candidates = state.active.len();
@@ -892,6 +895,10 @@ impl Drop for LogicalChunkWriter {
         if !self.finished
             && let Some(tx) = self.slot.tx.upgrade()
         {
+            tracing::debug!(
+                stream_id = self.slot.stream_id,
+                "resetting owned logical stream because its writer was dropped before finish"
+            );
             tx.reset_stream(self.slot.stream_id);
         }
     }
@@ -1197,10 +1204,7 @@ fn lookup_slot(streams: &StreamMap, stream_id: u64) -> Option<Arc<StreamSlot>> {
     streams
         .lock()
         .ok()
-        .and_then(|mut streams| {
-            streams.retain(|_, slot| slot.strong_count() != 0);
-            streams.get(&stream_id).cloned()
-        })
+        .and_then(|streams| streams.get(&stream_id).cloned())
         .and_then(|slot| slot.upgrade())
 }
 
@@ -1231,26 +1235,8 @@ struct CarrierMetadata {
     peer_node_id: NodeId,
     session_id: Id,
     channel_binding: [u8; 32],
+    protection: crate::RoutedSessionProtection,
     route_trace: RouteTrace,
-}
-
-fn logical_stream_metadata(
-    carrier_session_id: &Id,
-    carrier_binding: &[u8; 32],
-    stream_id: u64,
-) -> (Id, [u8; 32]) {
-    let mut id_hasher = blake3::Hasher::new();
-    id_hasher.update(carrier_session_id.as_str().as_bytes());
-    id_hasher.update(&stream_id.to_be_bytes());
-    let session_id = Id::derived(
-        "sinomo.network.routed-logical-stream",
-        id_hasher.finalize().as_bytes(),
-    );
-    let mut binding_hasher = blake3::Hasher::new();
-    binding_hasher.update(b"sinomo.network.routed-logical-stream.binding.v1\0");
-    binding_hasher.update(carrier_binding);
-    binding_hasher.update(&stream_id.to_be_bytes());
-    (session_id, *binding_hasher.finalize().as_bytes())
 }
 
 fn peer_stream_for_slot(
@@ -1260,17 +1246,13 @@ fn peer_stream_for_slot(
     connection: Arc<CarrierCredits>,
     owner: Arc<OwnedCarrierOwner>,
 ) -> Result<PeerStream, NetworkError> {
-    let (session_id, channel_binding) = logical_stream_metadata(
-        &metadata.session_id,
-        &metadata.channel_binding,
-        slot.stream_id,
-    );
-    PeerStream::new_owned(
+    PeerStream::new_owned_with_protection(
         logical_chunk_stream(slot, allocator, connection, owner)?,
         metadata.local_node_id.clone(),
         metadata.peer_node_id.clone(),
-        session_id,
-        channel_binding,
+        metadata.session_id.clone(),
+        metadata.channel_binding,
+        metadata.protection,
         metadata.route_trace.clone(),
     )
 }
@@ -1284,6 +1266,10 @@ async fn process_common_record(
     match record.kind {
         FRAME_DATA | FRAME_DATA_FINISH => {
             let Some(slot) = lookup_slot(streams, record.stream_id) else {
+                tracing::debug!(
+                    stream_id = record.stream_id,
+                    "resetting peer data for an inactive owned logical stream"
+                );
                 tx.enqueue_control(ControlCommand::reset(record.stream_id));
                 return Ok(true);
             };
@@ -1356,6 +1342,27 @@ impl IncomingLogicalStreamSink {
             Self::Resolve(resolve) => resolve(),
         }
     }
+
+    async fn sender_after_activation_grace(
+        &self,
+    ) -> Option<mpsc::Sender<Result<PeerStream, NetworkError>>> {
+        if let Some(sender) = self.sender() {
+            return Some(sender);
+        }
+        if !matches!(self, Self::Resolve(_)) {
+            return None;
+        }
+        let deadline = tokio::time::Instant::now() + INCOMING_DISPATCHER_ACTIVATION_GRACE;
+        loop {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            if let Some(sender) = self.sender() {
+                return Some(sender);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+        }
+    }
 }
 
 async fn run_owned_carrier_receiver(
@@ -1384,13 +1391,30 @@ async fn run_owned_carrier_receiver(
             {
                 return Err(NetworkError::AuthDenied);
             }
-            let Some(accepted) = incoming.sender() else {
+            // During cluster formation the listener can acquire its node
+            // identity a few milliseconds before its process-local routed
+            // service dispatcher is registered. A stable carrier always hits
+            // the immediate branch; only that activation edge waits briefly
+            // instead of permanently poisoning the first logical stream.
+            let Some(accepted) = incoming.sender_after_activation_grace().await else {
+                tracing::warn!(
+                    stream_id = record.stream_id,
+                    local_node_id = %metadata.local_node_id,
+                    peer_node_id = %metadata.peer_node_id,
+                    "resetting peer-opened logical stream because no service dispatcher is registered"
+                );
                 tx.enqueue_control(ControlCommand::reset(record.stream_id));
                 continue;
             };
             let permit = match accepted.reserve().await {
                 Ok(permit) => permit,
                 Err(_) => {
+                    tracing::warn!(
+                        stream_id = record.stream_id,
+                        local_node_id = %metadata.local_node_id,
+                        peer_node_id = %metadata.peer_node_id,
+                        "resetting peer-opened logical stream because the service dispatcher closed"
+                    );
                     tx.enqueue_control(ControlCommand::reset(record.stream_id));
                     continue;
                 }
@@ -1503,6 +1527,7 @@ impl OwnedRoutedStreamClient {
             peer_node_id: carrier.peer_node_id.clone(),
             session_id: carrier.session_id.clone(),
             channel_binding: carrier.channel_binding,
+            protection: carrier.protection,
             route_trace: carrier.route_trace.clone(),
         };
         let chunk_stream = carrier.into_chunk_stream()?;
@@ -1661,6 +1686,29 @@ pub(crate) fn owned_routed_stream_acceptor_and_client(
 mod tests {
     use super::*;
     use crate::owned_chunk::{BODY_CHUNK_MAX, ChunkPool, PayloadCopyReason, SECURE_WIRE_MAX};
+
+    #[tokio::test(start_paused = true)]
+    async fn resolved_incoming_sink_tolerates_dispatcher_activation_gap() {
+        let registration = Arc::new(Mutex::new(None));
+        let resolver_registration = Arc::clone(&registration);
+        let sink = IncomingLogicalStreamSink::Resolve(Arc::new(move || {
+            resolver_registration
+                .lock()
+                .expect("lock test dispatcher registration")
+                .clone()
+        }));
+        let install_registration = Arc::clone(&registration);
+        let (sender, _incoming) = mpsc::channel::<Result<PeerStream, NetworkError>>(1);
+
+        let (resolved, ()) = tokio::join!(sink.sender_after_activation_grace(), async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            *install_registration
+                .lock()
+                .expect("install test dispatcher registration") = Some(sender);
+        });
+
+        assert!(resolved.is_some());
+    }
 
     #[tokio::test]
     async fn lease_drop_returns_stream_and_connection_byte_credit() {

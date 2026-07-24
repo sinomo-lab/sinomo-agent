@@ -2736,6 +2736,22 @@ pub(crate) async fn run_daemon_control_accept_loop(
         if *shutdown_rx.borrow() {
             break;
         }
+        // A daemon can acquire its cluster identity while this listener is
+        // still serving the final requests of the pre-join process. Register
+        // the reverse logical-stream dispatcher as soon as that identity
+        // becomes visible so a persistent carrier cannot observe a clustered
+        // endpoint with no service sink.
+        if routed_stream_incoming.is_none() {
+            match sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths) {
+                Ok(state) => {
+                    routed_stream_incoming = Some(
+                        sinomo_core::network::register_routed_stream_incoming(state.local_node_id)?,
+                    );
+                }
+                Err(sinomo_core::network::NetworkError::ClusterOrphan) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         tokio::select! {
             biased;
 
@@ -2745,6 +2761,9 @@ pub(crate) async fn run_daemon_control_accept_loop(
                     Ok(()) => continue,
                     Err(_) => break,
                 }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)), if routed_stream_incoming.is_none() => {
+                continue;
             }
             routed = async {
                 match routed_stream_incoming.as_mut() {
@@ -3419,30 +3438,13 @@ async fn handle_daemon_local_stream_native_service_rpc_with_context_async(
         ) {
             return Err(sinomo_core::network::NetworkError::AuthDenied);
         }
-        let authenticated = if let Some(digest) = request.value_auth_digest_sha256() {
-            crate::service_adapter::authenticate_daemon_control_request_via_registry_with_digest(
-                &handler_paths,
-                &request.request,
-                digest,
-                &handler_host,
-            )
-        } else {
-            crate::service_adapter::authenticate_daemon_control_request_via_registry(
-                &handler_paths,
-                &request.request,
-                &handler_host,
-            )
-        }
-        .map_err(|_| sinomo_core::network::NetworkError::AuthDenied)?;
-        if authenticated.signer != DaemonSignerAuthority::Local
-            || authenticated.signer_public_key != local_public_key
-            || responder_node_id
-                .as_deref()
-                .is_some_and(|node_id| authenticated.signer_node_id.as_str() != node_id)
-        {
-            return Err(sinomo_core::network::NetworkError::AuthDenied);
-        }
         let route = request.request.route.clone();
+        let authenticated = crate::AuthenticatedDaemonCommand {
+            route: route.clone(),
+            signer: DaemonSignerAuthority::Local,
+            signer_node_id: local_node_id.clone(),
+            signer_public_key: local_public_key.clone(),
+        };
         let dispatch = dispatch_daemon_object_rpc_call_request_async(
             &handler_paths,
             &handler_host,
@@ -3490,10 +3492,9 @@ async fn handle_daemon_local_stream_native_service_rpc_with_context_async(
     finish_daemon_object_rpc_stream_response(&effective_route, stop, &paths, result)
 }
 
-/// Final service boundary for one authenticated routed stream. Routing has
-/// already proven the end-to-end source and destination identities; this
-/// layer independently verifies that the typed request is signed by that
-/// source before consulting the service registry.
+/// Final service boundary for one authenticated routed stream. The transport
+/// identity is the request authority; the service registry applies route and
+/// node-local policy without signing or hashing each RPC.
 async fn handle_daemon_stream_native_service_rpc_async(
     stream: sinomo_core::network::PeerStream,
     directory: sinomo_core::network::DirectorySnapshot,
@@ -3515,8 +3516,6 @@ async fn handle_daemon_stream_native_service_rpc_async(
         }
     })?;
     let peer_public_key_encoded = peer_directory_node.public_key.clone();
-    let peer_public_key =
-        sinomo_core::network::daemon_auth_decode_public_key(&peer_public_key_encoded)?;
     let peer_is_raft_voter = peer_directory_node.has_raft_vote();
     let completion = Arc::new(Mutex::new(("<unavailable>".to_string(), false)));
     let handler_completion = Arc::clone(&completion);
@@ -3535,24 +3534,6 @@ async fn handle_daemon_stream_native_service_rpc_async(
             let auth_started_ns = timeline
                 .map(|_| sinomo_core::network::network_timeline_monotonic_ns())
                 .unwrap_or(0);
-            let authenticated_result =
-                crate::service_adapter::authenticate_routed_daemon_control_request_via_registry(
-                    &handler_paths,
-                    &request.request,
-                    request.value_auth_digest_sha256(),
-                    &handler_host,
-                    handler_peer_node_id.as_str(),
-                    &handler_peer_public_key,
-                    peer_is_raft_voter,
-                )
-                .map_err(|_| sinomo_core::network::NetworkError::AuthDenied);
-            record_daemon_stream_timeline_stage(
-                timeline,
-                sinomo_core::network::network_timeline_stage::DAEMON_AUTH,
-                auth_started_ns,
-                authenticated_result.is_ok(),
-            );
-            let authenticated = authenticated_result?;
             let context_peer = match peer.identity {
                 sinomo_core::network::RpcPeerIdentity::Authenticated { peer_node_id, .. } => {
                     peer_node_id
@@ -3561,15 +3542,25 @@ async fn handle_daemon_stream_native_service_rpc_async(
                     return Err(sinomo_core::network::NetworkError::AuthDenied);
                 }
             };
-            let signer_public_key = sinomo_core::network::daemon_auth_decode_public_key(
-                &authenticated.signer_public_key,
-            )?;
-            if context_peer != handler_peer_node_id
-                || authenticated.signer_node_id != context_peer.as_str()
-                || signer_public_key != peer_public_key
-            {
-                return Err(sinomo_core::network::NetworkError::AuthDenied);
-            }
+            let authenticated_result = (context_peer == handler_peer_node_id)
+                .then(|| crate::AuthenticatedDaemonCommand {
+                    route: request.request.route.clone(),
+                    signer: if peer_is_raft_voter {
+                        DaemonSignerAuthority::Voter
+                    } else {
+                        DaemonSignerAuthority::Member
+                    },
+                    signer_node_id: context_peer.to_string(),
+                    signer_public_key: handler_peer_public_key.clone(),
+                })
+                .ok_or(sinomo_core::network::NetworkError::AuthDenied);
+            record_daemon_stream_timeline_stage(
+                timeline,
+                sinomo_core::network::network_timeline_stage::DAEMON_AUTH,
+                auth_started_ns,
+                authenticated_result.is_ok(),
+            );
+            let authenticated = authenticated_result?;
             let route = request.request.route.clone();
             let dispatch_started_ns = timeline
                 .map(|_| sinomo_core::network::network_timeline_monotonic_ns())
@@ -7139,7 +7130,7 @@ mod tests {
             let payload = crate::DaemonObjectRpcForwardRequest {
                 target_node_id: target_node.clone(),
                 request: inner.clone(),
-                streamed_value_digest_sha256: None,
+                streamed_value_body: false,
                 connect_timeout_millis: 5_000,
                 idle_timeout_millis: None,
                 overall_timeout_millis: None,
@@ -7796,9 +7787,8 @@ mod tests {
             .build()
             .expect("client runtime");
         let client_paths = DaemonPaths::new(&data_dir);
-        let mut host =
-            crate::client::DaemonSignedObjectRpcAsyncHost::new(client_runtime.handle(), false)
-                .with_paths(&client_paths);
+        let mut host = crate::client::DaemonObjectRpcAsyncHost::new(client_runtime.handle(), false)
+            .with_paths(&client_paths);
         let error = client_runtime
             .block_on(
                 sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host)
@@ -7882,9 +7872,8 @@ mod tests {
             .build()
             .expect("client runtime");
         let client_paths = DaemonPaths::new(&data_dir);
-        let mut host =
-            crate::client::DaemonSignedObjectRpcAsyncHost::new(client_runtime.handle(), false)
-                .with_paths(&client_paths);
+        let mut host = crate::client::DaemonObjectRpcAsyncHost::new(client_runtime.handle(), false)
+            .with_paths(&client_paths);
         let error = client_runtime
             .block_on(
                 sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host)
@@ -10089,7 +10078,7 @@ mod tests {
                 detail: source.to_string(),
             })?;
         let paths = DaemonPaths::new(data_dir);
-        let mut host = crate::client::DaemonSignedObjectRpcAsyncHost::new(runtime.handle(), false)
+        let mut host = crate::client::DaemonObjectRpcAsyncHost::new(runtime.handle(), false)
             .with_paths(&paths);
         let mut request = request.clone();
         request.auth = None;

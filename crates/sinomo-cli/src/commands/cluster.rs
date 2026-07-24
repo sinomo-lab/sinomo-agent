@@ -1906,7 +1906,7 @@ async fn send_join_endpoint_rpc_async(
     request: &network::ObjectRpcRequest,
     timeout: Duration,
 ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
-    let mut host = CliSignedEndpointRpcHost::new(None, "cluster join endpoint rpc signing");
+    let mut host = CliEndpointRpcHost::new(None, "cluster join endpoint rpc signing");
     let mut client = network::ClusterObjectRpcClient::endpoint_only(&mut host);
     let options = network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout);
     let result = client
@@ -2979,7 +2979,7 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
                     operation: "cluster kv snapshot refresh runtime".to_string(),
                     detail: source.to_string(),
                 })?;
-            let mut host = CliSignedEndpointRpcHost::new(
+            let mut host = CliEndpointRpcHost::new(
                 Some(state.cluster_id.clone()),
                 "cluster kv snapshot refresh signing",
             );

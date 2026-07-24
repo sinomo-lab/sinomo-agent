@@ -288,7 +288,7 @@ sinomo_runtime::test::sinomo_test_case! {
 sinomo_runtime::test::sinomo_test_case! {
     pub fn network_ping_benchmark(ctx) {
         id: "cluster.network.ping-benchmark",
-        summary: "Concurrent signed cluster network ping RPCs to every remote main daemon",
+        summary: "Concurrent transport-bound cluster network ping RPCs to every remote main daemon",
         tags: ["cluster-network", "probe", "performance", "cluster-network-dfs-acceptance"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {

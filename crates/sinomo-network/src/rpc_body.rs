@@ -155,7 +155,7 @@ impl std::ops::Deref for ObjectRpcBodyChunk {
 pub(crate) type ObjectRpcBodyReceiverFuture<'a> =
     Pin<Box<dyn Future<Output = std::io::Result<Option<ObjectRpcBodyChunk>>> + Send + 'a>>;
 
-/// Pull-native source for one authenticated object-RPC body.
+/// Pull-native source for one object-RPC body.
 ///
 /// The canonical routed path installs the RPC record reader directly here, so
 /// application reads consume the mux slot's ownership-bearing chunks without a
@@ -256,13 +256,6 @@ struct OnePassAsyncReader {
 struct OnePassIncomingChunkStream {
     stream: Option<ObjectRpcIncomingBodyChunkStream>,
     total_bytes: Option<u64>,
-    forwarded_request_digest: Option<ForwardedRequestDigest>,
-}
-
-#[derive(Clone, Debug)]
-struct ForwardedRequestDigest {
-    digest: [u8; 32],
-    metadata: BTreeMap<String, String>,
 }
 
 struct AdoptableSobjBuffer {
@@ -274,7 +267,6 @@ struct AdoptableSobjBuffer {
 struct AdoptableSobjSource {
     buffers: Mutex<Option<VecDeque<AdoptableSobjBuffer>>>,
     total_bytes: u64,
-    digest: [u8; 32],
 }
 
 impl fmt::Debug for AdoptableSobjSource {
@@ -326,7 +318,6 @@ struct SobjPatch {
 struct SobjEncodingPlan {
     total_bytes: usize,
     patches: Arc<[SobjPatch]>,
-    digest: [u8; 32],
 }
 
 struct DeferredSobjSource {
@@ -363,7 +354,6 @@ impl SobjPlanningOutput {
                 .into_iter()
                 .map(|(offset, bytes)| SobjPatch { offset, bytes })
                 .collect(),
-            digest: [0; 32],
         }
     }
 }
@@ -555,83 +545,6 @@ impl<O: SobjOutput + ?Sized> SobjOutput for PlannedSobjOutput<'_, O> {
     }
 }
 
-#[derive(Default)]
-struct HashingSobjOutput {
-    len: usize,
-    hasher: blake3::Hasher,
-    truncated: bool,
-}
-
-impl HashingSobjOutput {
-    fn finish(self) -> Result<[u8; 32], NetworkError> {
-        if self.truncated {
-            return Err(NetworkError::Serialization {
-                detail: "deferred SOBJ hashing pass attempted to roll back emitted bytes"
-                    .to_string(),
-            });
-        }
-        Ok(*self.hasher.finalize().as_bytes())
-    }
-}
-
-impl SobjOutput for HashingSobjOutput {
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn append(&mut self, bytes: &[u8], _context: &'static str) -> sinomo_object::Result<()> {
-        self.len = self
-            .len
-            .checked_add(bytes.len())
-            .ok_or(sinomo_object::Error::SizeOverflow)?;
-        self.hasher.update(bytes);
-        Ok(())
-    }
-
-    fn patch(&mut self, _offset: usize, _bytes: &[u8]) -> sinomo_object::Result<()> {
-        Err(sinomo_object::Error::Serde(
-            "planned SOBJ output forwarded a backpatch".to_string(),
-        ))
-    }
-
-    fn truncate(&mut self, _len: usize) {
-        self.truncated = true;
-    }
-}
-
-struct VisitingSobjOutput<'a> {
-    len: usize,
-    visitor: &'a mut dyn FnMut(AuthValuePayloadPart<'_>),
-    truncated: bool,
-}
-
-impl SobjOutput for VisitingSobjOutput<'_> {
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn append(&mut self, bytes: &[u8], _context: &'static str) -> sinomo_object::Result<()> {
-        self.len = self
-            .len
-            .checked_add(bytes.len())
-            .ok_or(sinomo_object::Error::SizeOverflow)?;
-        if !bytes.is_empty() {
-            (self.visitor)(AuthValuePayloadPart::Bytes(bytes));
-        }
-        Ok(())
-    }
-
-    fn patch(&mut self, _offset: usize, _bytes: &[u8]) -> sinomo_object::Result<()> {
-        Err(sinomo_object::Error::Serde(
-            "planned SOBJ visitor received a backpatch".to_string(),
-        ))
-    }
-
-    fn truncate(&mut self, _len: usize) {
-        self.truncated = true;
-    }
-}
-
 fn plan_deferred_sobj(
     value: &dyn DeferredSobjValue,
 ) -> Result<Arc<SobjEncodingPlan>, NetworkError> {
@@ -642,23 +555,7 @@ fn plan_deferred_sobj(
             detail: "deferred SOBJ plan did not describe one complete document".to_string(),
         });
     }
-    let mut plan = planning.finish();
-    let mut hashing = HashingSobjOutput::default();
-    let mut planned = PlannedSobjOutput::new(&mut hashing, &plan);
-    let range = value.encode_into(&mut planned)?;
-    if range != (0..plan.total_bytes) {
-        return Err(NetworkError::Serialization {
-            detail: "deferred SOBJ hashing pass changed the document range".to_string(),
-        });
-    }
-    planned.finish()?;
-    if hashing.len != plan.total_bytes {
-        return Err(NetworkError::Serialization {
-            detail: "deferred SOBJ hashing pass changed the document length".to_string(),
-        });
-    }
-    plan.digest = hashing.finish()?;
-    Ok(Arc::new(plan))
+    Ok(Arc::new(planning.finish()))
 }
 
 #[derive(Default)]
@@ -832,22 +729,13 @@ enum ObjectRpcBodySourceKind {
     IncomingChunkStream(Mutex<OnePassIncomingChunkStream>),
 }
 
-/// A whole RPC attachment source.
-///
-/// `Bytes` and `File` sources can be reopened for the bounded digest pre-pass
-/// performed before this call writes its authenticated head. A one-pass reader
-/// is consumed exactly once and reports an explicit reuse error instead of
-/// silently buffering the complete input. Reconnect and replay are outside
-/// this contract.
+/// A whole RPC body source. A one-pass reader is consumed exactly once and
+/// reports an explicit reuse error instead of silently buffering the complete
+/// input. Reconnect and replay are outside this contract.
 pub struct ObjectRpcBodySource {
     kind: ObjectRpcBodySourceKind,
     role: ObjectRpcBodyRole,
     lifetime_guards: Arc<Mutex<Vec<Box<dyn Any + Send>>>>,
-}
-
-pub(crate) enum AuthValuePayloadPart<'a> {
-    Length(usize),
-    Bytes(&'a [u8]),
 }
 
 impl fmt::Debug for ObjectRpcBodySource {
@@ -884,14 +772,9 @@ impl ObjectRpcBodySource {
             Ok(range) => {
                 let payload_bytes = range.len();
                 let buffers = output.finish()?;
-                let mut hasher = blake3::Hasher::new();
-                for buffer in &buffers {
-                    hasher.update(&buffer.storage[buffer.start..buffer.end]);
-                }
                 Ok(Some(AdoptableSobjSource {
                     buffers: Mutex::new(Some(buffers)),
                     total_bytes: payload_bytes as u64,
-                    digest: *hasher.finalize().as_bytes(),
                 }))
             }
             Err(_) if output.overflowed => Ok(None),
@@ -942,15 +825,10 @@ impl ObjectRpcBodySource {
         let range = SinomoObjectCodec::network_frame().append_to_output(&mut output, value)?;
         let payload_bytes = range.len();
         let buffers = output.finish()?;
-        let mut hasher = blake3::Hasher::new();
-        for buffer in &buffers {
-            hasher.update(&buffer.storage[buffer.start..buffer.end]);
-        }
         Ok(Self {
             kind: ObjectRpcBodySourceKind::AdoptableSobj(AdoptableSobjSource {
                 buffers: Mutex::new(Some(buffers)),
                 total_bytes: payload_bytes as u64,
-                digest: *hasher.finalize().as_bytes(),
             }),
             role: ObjectRpcBodyRole::Value,
             lifetime_guards: Arc::new(Mutex::new(Vec::new())),
@@ -961,8 +839,8 @@ impl ObjectRpcBodySource {
     /// credit when it exceeds one body record.
     ///
     /// A one-record document keeps the low-latency adoptable representation.
-    /// Larger documents retain only the Rust value, a compact backpatch plan,
-    /// and their digest until the body producer acquires each destination slab.
+    /// Larger documents retain only the Rust value and a compact backpatch
+    /// plan until the body producer acquires each destination slab.
     /// The encoder then fills those slabs directly and hands ownership to the
     /// object-RPC writer through a bounded one-chunk queue.
     pub fn sobj_value<T>(value: T) -> Result<Self, NetworkError>
@@ -1114,7 +992,6 @@ impl ObjectRpcBodySource {
                 OnePassIncomingChunkStream {
                     stream: Some(body.into_chunk_stream()),
                     total_bytes,
-                    forwarded_request_digest: None,
                 },
             )),
             role,
@@ -1122,25 +999,14 @@ impl ObjectRpcBodySource {
         }
     }
 
-    fn from_forwarded_request_body(
-        body: ObjectRpcIncomingBody,
-        metadata: &BTreeMap<String, String>,
-    ) -> Self {
+    fn from_forwarded_request_body(body: ObjectRpcIncomingBody) -> Self {
         let total_bytes = body.total_bytes();
         let role = body.role;
-        let forwarded_request_digest =
-            body.value_auth_digest_sha256()
-                .copied()
-                .map(|digest| ForwardedRequestDigest {
-                    digest,
-                    metadata: metadata.clone(),
-                });
         Self {
             kind: ObjectRpcBodySourceKind::IncomingChunkStream(Mutex::new(
                 OnePassIncomingChunkStream {
                     stream: Some(body.into_chunk_stream()),
                     total_bytes,
-                    forwarded_request_digest,
                 },
             )),
             role,
@@ -1326,12 +1192,9 @@ impl ObjectRpcBodySource {
                     });
                 }
                 planned.finish()?;
-                if output.len() != plan.total_bytes
-                    || blake3::hash(&output).as_bytes() != &plan.digest
-                {
+                if output.len() != plan.total_bytes {
                     return Err(NetworkError::Serialization {
-                        detail: "materialized deferred SOBJ changed after authentication planning"
-                            .to_string(),
+                        detail: "materialized deferred SOBJ changed its planned length".to_string(),
                     });
                 }
                 Ok(output)
@@ -1468,182 +1331,6 @@ impl ObjectRpcBodySource {
         let reader = self.open()?;
         SyncBodyProducer::spawn(reader, max_chunk_bytes, Arc::clone(&self.lifetime_guards))
             .map(BodyProducer::Sync)
-    }
-
-    pub(crate) fn try_clone_replayable(&self) -> Option<Self> {
-        let kind = match &self.kind {
-            ObjectRpcBodySourceKind::Empty => ObjectRpcBodySourceKind::Empty,
-            ObjectRpcBodySourceKind::Bytes(source) => {
-                ObjectRpcBodySourceKind::Bytes(source.clone())
-            }
-            ObjectRpcBodySourceKind::AdoptableSobj(_) => return None,
-            ObjectRpcBodySourceKind::DeferredSobj(_) => return None,
-            ObjectRpcBodySourceKind::RepeatedBytes(source) => {
-                ObjectRpcBodySourceKind::RepeatedBytes(source.clone())
-            }
-            ObjectRpcBodySourceKind::File(source) => ObjectRpcBodySourceKind::File(source.clone()),
-            ObjectRpcBodySourceKind::Reader(_)
-            | ObjectRpcBodySourceKind::AsyncReader(_)
-            | ObjectRpcBodySourceKind::IncomingChunkStream(_) => {
-                return None;
-            }
-        };
-        Some(Self {
-            kind,
-            role: self.role,
-            lifetime_guards: Arc::clone(&self.lifetime_guards),
-        })
-    }
-
-    /// Returns whether request metadata can still be changed without
-    /// invalidating an authenticated one-pass body proof.
-    ///
-    /// A trusted proxy can forward a streamed typed value only by retaining
-    /// the digest verified on the previous hop. That digest binds the exact
-    /// metadata map, so diagnostic or routing layers must not append metadata
-    /// after adopting the stream.
-    pub(crate) fn allows_request_metadata_mutation(&self) -> bool {
-        let ObjectRpcBodySourceKind::IncomingChunkStream(source) = &self.kind else {
-            return true;
-        };
-        source
-            .lock()
-            .map(|source| source.forwarded_request_digest.is_none())
-            .unwrap_or(false)
-    }
-
-    pub(crate) fn known_digest(&self) -> Option<[u8; 32]> {
-        match &self.kind {
-            ObjectRpcBodySourceKind::AdoptableSobj(source) => Some(source.digest),
-            ObjectRpcBodySourceKind::DeferredSobj(source) => Some(source.plan.digest),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn forwarded_request_digest(
-        &self,
-        metadata: &BTreeMap<String, String>,
-    ) -> Result<Option<[u8; 32]>, NetworkError> {
-        if self.role != ObjectRpcBodyRole::Value {
-            return Ok(None);
-        }
-        let ObjectRpcBodySourceKind::IncomingChunkStream(source) = &self.kind else {
-            return Ok(None);
-        };
-        let source = source.lock().map_err(|_| NetworkError::Io {
-            operation: "read forwarded request authentication digest".to_string(),
-            detail: "incoming chunk stream lock poisoned".to_string(),
-        })?;
-        let proof = source.forwarded_request_digest.as_ref().ok_or_else(|| {
-            NetworkError::Serialization {
-                detail: "cannot authenticate a forwarded streamed value without its verified request digest"
-                    .to_string(),
-            }
-        })?;
-        if &proof.metadata != metadata {
-            return Err(NetworkError::Serialization {
-                detail: "cannot mutate request metadata after adopting a forwarded streamed value"
-                    .to_string(),
-            });
-        }
-        Ok(Some(proof.digest))
-    }
-
-    pub(crate) fn visit_auth_value_payload(
-        &self,
-        visitor: &mut dyn FnMut(AuthValuePayloadPart<'_>),
-    ) -> Result<bool, NetworkError> {
-        if self.role != ObjectRpcBodyRole::Value {
-            return Ok(false);
-        }
-        match &self.kind {
-            ObjectRpcBodySourceKind::Empty => Ok(false),
-            ObjectRpcBodySourceKind::Bytes(source) => {
-                visitor(AuthValuePayloadPart::Length(source.bytes.len()));
-                visitor(AuthValuePayloadPart::Bytes(&source.bytes));
-                Ok(true)
-            }
-            ObjectRpcBodySourceKind::AdoptableSobj(source) => {
-                let total_bytes = usize::try_from(source.total_bytes).map_err(|_| {
-                    NetworkError::FrameTooLarge {
-                        actual_bytes: usize::MAX,
-                        max_bytes: usize::MAX,
-                    }
-                })?;
-                let buffers = source.buffers.lock().map_err(|_| NetworkError::Io {
-                    operation: "hash transport-shaped SOBJ request".to_string(),
-                    detail: "SOBJ value lock poisoned".to_string(),
-                })?;
-                let buffers = buffers.as_ref().ok_or_else(|| {
-                    body_consumed_error(
-                        "transport-shaped SOBJ value was consumed before authentication",
-                    )
-                })?;
-                visitor(AuthValuePayloadPart::Length(total_bytes));
-                let mut observed_bytes = 0_usize;
-                for buffer in buffers {
-                    let bytes = &buffer.storage[buffer.start..buffer.end];
-                    observed_bytes = observed_bytes.checked_add(bytes.len()).ok_or_else(|| {
-                        NetworkError::Serialization {
-                            detail: "transport-shaped SOBJ length overflow".to_string(),
-                        }
-                    })?;
-                    visitor(AuthValuePayloadPart::Bytes(bytes));
-                }
-                if observed_bytes != total_bytes {
-                    return Err(NetworkError::Serialization {
-                        detail: format!(
-                            "transport-shaped SOBJ declared {total_bytes} bytes but retained {observed_bytes}"
-                        ),
-                    });
-                }
-                Ok(true)
-            }
-            ObjectRpcBodySourceKind::DeferredSobj(source) => {
-                let total_bytes = source.plan.total_bytes;
-                let value = source.value.lock().map_err(|_| NetworkError::Io {
-                    operation: "hash deferred SOBJ request".to_string(),
-                    detail: "deferred SOBJ value lock poisoned".to_string(),
-                })?;
-                let value = value.as_ref().ok_or_else(|| {
-                    body_consumed_error("deferred SOBJ value was consumed before authentication")
-                })?;
-                visitor(AuthValuePayloadPart::Length(total_bytes));
-                let mut output = VisitingSobjOutput {
-                    len: 0,
-                    visitor,
-                    truncated: false,
-                };
-                let mut planned = PlannedSobjOutput::new(&mut output, &source.plan);
-                let range = value.encode_into(&mut planned)?;
-                if range != (0..total_bytes) {
-                    return Err(NetworkError::Serialization {
-                        detail: "deferred SOBJ authentication pass changed its planned range"
-                            .to_string(),
-                    });
-                }
-                planned.finish()?;
-                if output.truncated || output.len != total_bytes {
-                    return Err(NetworkError::Serialization {
-                        detail: "deferred SOBJ authentication pass changed its document length"
-                            .to_string(),
-                    });
-                }
-                Ok(true)
-            }
-            ObjectRpcBodySourceKind::IncomingChunkStream(_) => Err(NetworkError::Serialization {
-                detail:
-                    "forwarded streamed request authentication must use its verified digest proof"
-                        .to_string(),
-            }),
-            ObjectRpcBodySourceKind::RepeatedBytes(_)
-            | ObjectRpcBodySourceKind::File(_)
-            | ObjectRpcBodySourceKind::Reader(_)
-            | ObjectRpcBodySourceKind::AsyncReader(_) => Err(NetworkError::Serialization {
-                detail: "one-pass typed request values require a pre-authenticated owned producer"
-                    .to_string(),
-            }),
-        }
     }
 }
 
@@ -2005,10 +1692,6 @@ pub struct ObjectRpcIncomingBody {
     // early application drop leaves them here so Drop cancels that work.
     total_bytes: Option<u64>,
     role: ObjectRpcBodyRole,
-    /// Digest of the complete request value plus request metadata before the
-    /// value moved out of the service head. The enclosing object-RPC head
-    /// authenticates this claim together with the transport body descriptor.
-    value_auth_digest_sha256: Option<[u8; 32]>,
     multiplexed_terminal: Option<Arc<Mutex<MultiplexedBodyTerminal>>>,
 }
 
@@ -2024,7 +1707,6 @@ impl ObjectRpcIncomingBody {
             inner: ObjectRpcIncomingBodyInner::Empty,
             total_bytes: Some(0),
             role: ObjectRpcBodyRole::None,
-            value_auth_digest_sha256: None,
             multiplexed_terminal: None,
         }
     }
@@ -2040,7 +1722,6 @@ impl ObjectRpcIncomingBody {
             )),
             total_bytes,
             role: ObjectRpcBodyRole::Attachment,
-            value_auth_digest_sha256: None,
             multiplexed_terminal: None,
         }
     }
@@ -2064,7 +1745,6 @@ impl ObjectRpcIncomingBody {
                 },
                 total_bytes,
                 role: ObjectRpcBodyRole::Attachment,
-                value_auth_digest_sha256: None,
                 multiplexed_terminal: Some(terminal),
             },
         )
@@ -2081,7 +1761,6 @@ impl ObjectRpcIncomingBody {
             },
             total_bytes,
             role: ObjectRpcBodyRole::Attachment,
-            value_auth_digest_sha256: None,
             multiplexed_terminal: None,
         }
     }
@@ -2102,24 +1781,11 @@ impl ObjectRpcIncomingBody {
         self.role == ObjectRpcBodyRole::Attachment && !self.is_empty()
     }
 
-    pub fn value_auth_digest_sha256(&self) -> Option<&[u8; 32]> {
-        self.value_auth_digest_sha256.as_ref()
-    }
-
     pub(crate) fn with_role(mut self, role: ObjectRpcBodyRole) -> Self {
         self.role = if self.is_empty() {
             ObjectRpcBodyRole::None
         } else {
             role
-        };
-        self
-    }
-
-    pub(crate) fn with_value_auth_digest_sha256(mut self, digest: Option<[u8; 32]>) -> Self {
-        self.value_auth_digest_sha256 = if self.role == ObjectRpcBodyRole::Value {
-            digest
-        } else {
-            None
         };
         self
     }
@@ -2608,8 +2274,8 @@ impl ObjectRpcCall {
     }
 
     /// Encodes an ordinary typed request directly into transport-shaped
-    /// segments. The request head remains small and authentication hashes the
-    /// segmented value in place before the first record is sent.
+    /// segments. The request head remains small while the segmented value is
+    /// produced directly into transport-owned storage.
     pub fn encode_borrowed_value<T: Serialize + ?Sized>(
         route: impl Into<String>,
         category: impl Into<String>,
@@ -2686,32 +2352,24 @@ impl ObjectRpcCall {
         if body.is_empty() {
             Self::value(request)
         } else {
-            let body = ObjectRpcBodySource::from_forwarded_request_body(body, &request.metadata);
+            let body = ObjectRpcBodySource::from_forwarded_request_body(body);
             Self { request, body }
         }
     }
 
     /// Restores a one-pass typed request body at a trusted proxy boundary.
-    ///
-    /// The supplied digest must have been authenticated as part of the proxy
-    /// envelope. It is reused when the outgoing request is signed because the
-    /// same owned chunks cannot be consumed once for hashing and again for
-    /// transmission.
     #[doc(hidden)]
     pub fn from_forwarded_streamed_value(
         request: crate::ObjectRpcRequest,
         body: ObjectRpcIncomingBody,
-        request_digest_sha256: [u8; 32],
     ) -> Result<Self, NetworkError> {
         if body.is_empty() {
             return Err(NetworkError::Serialization {
                 detail: "forwarded streamed request value had no body".to_string(),
             });
         }
-        let body = body
-            .with_role(ObjectRpcBodyRole::Value)
-            .with_value_auth_digest_sha256(Some(request_digest_sha256));
-        let body = ObjectRpcBodySource::from_forwarded_request_body(body, &request.metadata);
+        let body = body.with_role(ObjectRpcBodyRole::Value);
+        let body = ObjectRpcBodySource::from_forwarded_request_body(body);
         Ok(Self { request, body })
     }
 
@@ -2746,7 +2404,7 @@ impl ObjectRpcCall {
     }
 }
 
-/// Server-side authenticated request head and received body.
+/// Server-side request head and received body.
 #[derive(Debug)]
 pub struct ObjectRpcIncomingRequest {
     pub request: crate::ObjectRpcRequest,
@@ -2765,21 +2423,12 @@ impl ObjectRpcIncomingRequest {
     pub(crate) fn streamed_value(
         request: crate::ObjectRpcRequest,
         body: ObjectRpcIncomingBody,
-        value_auth_digest_sha256: Option<[u8; 32]>,
     ) -> Self {
-        Self::new(
-            request,
-            body.with_role(ObjectRpcBodyRole::Value)
-                .with_value_auth_digest_sha256(value_auth_digest_sha256),
-        )
+        Self::new(request, body.with_role(ObjectRpcBodyRole::Value))
     }
 
     pub fn has_streamed_value(&self) -> bool {
         self.body.is_streamed_value()
-    }
-
-    pub fn value_auth_digest_sha256(&self) -> Option<&[u8; 32]> {
-        self.body.value_auth_digest_sha256()
     }
 
     /// Decodes the ordinary typed request value without first gathering a
@@ -3224,7 +2873,6 @@ struct OwnedChunkSobjOutput {
     sender: tokio::sync::mpsc::Sender<Result<OwnedChunk, NetworkError>>,
     current: Option<OwnedChunk>,
     len: usize,
-    hasher: blake3::Hasher,
     error: Option<NetworkError>,
 }
 
@@ -3242,7 +2890,6 @@ impl OwnedChunkSobjOutput {
             sender,
             current: None,
             len: 0,
-            hasher: blake3::Hasher::new(),
             error: None,
         }
     }
@@ -3284,10 +2931,9 @@ impl OwnedChunkSobjOutput {
 
     fn finish(&mut self, plan: &SobjEncodingPlan) -> Result<(), NetworkError> {
         self.flush().map_err(NetworkError::object)?;
-        if self.len != plan.total_bytes || self.hasher.finalize().as_bytes() != &plan.digest {
+        if self.len != plan.total_bytes {
             return Err(NetworkError::Serialization {
-                detail: "credit-bounded SOBJ bytes changed after authentication planning"
-                    .to_string(),
+                detail: "credit-bounded SOBJ bytes changed their planned length".to_string(),
             });
         }
         Ok(())
@@ -3312,7 +2958,6 @@ impl SobjOutput for OwnedChunkSobjOutput {
             chunk
                 .commit_payload(written)
                 .map_err(|error| self.fail(error))?;
-            self.hasher.update(&bytes[..written]);
             self.len = self
                 .len
                 .checked_add(written)
@@ -3885,10 +3530,6 @@ mod tests {
             ObjectRpcBodySourceKind::DeferredSobj(_)
         ));
         assert_eq!(source.total_bytes(), Some(expected.len() as u64));
-        assert_eq!(
-            source.known_digest(),
-            Some(*blake3::hash(&expected).as_bytes())
-        );
 
         let pool = crate::owned_chunk::ChunkPool::new(8 * SECURE_WIRE_MAX, SECURE_WIRE_MAX, 0, 0);
         let allocator = ChunkAllocator::new(pool, 2 * SECURE_WIRE_MAX, SECURE_WIRE_MAX);
@@ -4045,7 +3686,6 @@ mod tests {
             )),
             total_bytes: Some(payload.len() as u64),
             role: ObjectRpcBodyRole::Attachment,
-            value_auth_digest_sha256: None,
             multiplexed_terminal: None,
         };
         let source = ObjectRpcBodySource::from_incoming_body(incoming);

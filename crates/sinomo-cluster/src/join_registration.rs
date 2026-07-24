@@ -36,8 +36,8 @@ use sinomo_kv::{
 };
 use sinomo_network::ClusterConnectivityState;
 use sinomo_network::ClusterMembershipRpcFuture;
+use sinomo_network::ClusterObjectRpcAsyncHost;
 use sinomo_network::ClusterPaths;
-use sinomo_network::ClusterSignedObjectRpcAsyncHost;
 use sinomo_network::NetworkError;
 use sinomo_network::{
     CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY,
@@ -3075,7 +3075,7 @@ where
     }
 }
 
-pub trait ClusterJoinRegistrationAsyncHost: ClusterSignedObjectRpcAsyncHost {
+pub trait ClusterJoinRegistrationAsyncHost: ClusterObjectRpcAsyncHost {
     fn local_daemon_membership_observation_async<'a>(
         &'a mut self,
         _paths: &'a ClusterPaths,

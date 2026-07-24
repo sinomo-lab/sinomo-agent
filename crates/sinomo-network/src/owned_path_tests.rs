@@ -204,18 +204,10 @@ async fn owned_service_values_decode_incrementally_without_byte_fallback() {
         expected_request,
     )
     .expect("encode transport-owned request");
-    let request_digest_sha256 =
-        crate::daemon_auth::daemon_rpc_call_sha256(&call).expect("request digest");
-    let result = call_service_rpc_peer_stream(
-        stream,
-        &context,
-        call,
-        b"owned-service-auth".to_vec(),
-        request_digest_sha256,
-        ObjectFrameIoOptions::default(),
-    )
-    .await
-    .expect("call owned service RPC");
+    let result =
+        call_service_rpc_peer_stream(stream, &context, call, ObjectFrameIoOptions::default())
+            .await
+            .expect("call owned service RPC");
     assert!(result.has_streamed_value());
     assert!(result.response.body.is_empty());
     assert_eq!(

@@ -66,7 +66,7 @@ pub(crate) fn observe_chunk_identity(slab_id: u64, stage: &'static str) {
     let _ = (slab_id, stage);
 }
 
-pub(crate) const BODY_CHUNK_MAX: usize = 64 * 1024;
+pub(crate) const BODY_CHUNK_MAX: usize = 256 * 1024;
 pub(crate) const RPC_RECORD_HEADER_BYTES: usize = 9;
 pub(crate) const RPC_CONTROL_PAYLOAD_MAX: usize = 16 * 1024;
 pub(crate) const RPC_RECORD_MAX: usize = RPC_RECORD_HEADER_BYTES + BODY_CHUNK_MAX;
@@ -906,7 +906,8 @@ impl Drop for PooledSlab {
 
 struct ReceiveCreditLeaseInner {
     bytes: usize,
-    _permits: Vec<ByteCreditPermit>,
+    _primary_permit: Option<ByteCreditPermit>,
+    _secondary_permit: Option<ByteCreditPermit>,
     return_credit: Option<CreditReturn>,
 }
 
@@ -915,7 +916,11 @@ impl fmt::Debug for ReceiveCreditLeaseInner {
         formatter
             .debug_struct("ReceiveCreditLease")
             .field("bytes", &self.bytes)
-            .field("permit_count", &self._permits.len())
+            .field(
+                "permit_count",
+                &(usize::from(self._primary_permit.is_some())
+                    + usize::from(self._secondary_permit.is_some())),
+            )
             .field("returns_remote_credit", &self.return_credit.is_some())
             .finish()
     }
@@ -937,20 +942,22 @@ pub(crate) struct ReceiveCreditLease {
 impl ReceiveCreditLease {
     pub(crate) fn new(
         bytes: usize,
-        permits: Vec<ByteCreditPermit>,
+        primary_permit: Option<ByteCreditPermit>,
+        secondary_permit: Option<ByteCreditPermit>,
         return_credit: Option<CreditReturn>,
     ) -> Self {
         Self {
             inner: Arc::new(ReceiveCreditLeaseInner {
                 bytes,
-                _permits: permits,
+                _primary_permit: primary_permit,
+                _secondary_permit: secondary_permit,
                 return_credit,
             }),
         }
     }
 
     pub(crate) fn untracked(bytes: usize) -> Self {
-        Self::new(bytes, Vec::new(), None)
+        Self::new(bytes, None, None, None)
     }
 }
 
@@ -1385,7 +1392,8 @@ mod tests {
         let returned_for_drop = Arc::clone(&returned);
         let credit = ReceiveCreditLease::new(
             BODY_CHUNK_MAX,
-            vec![permit],
+            Some(permit),
+            None,
             Some(Arc::new(move |bytes| {
                 returned_for_drop.fetch_add(bytes, Ordering::Relaxed);
             })),

@@ -10,9 +10,7 @@ use sinomo_core::kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_core::local::SinomoDataDir;
 #[cfg(test)]
 use sinomo_core::network::ObjectRpcResponse;
-use sinomo_core::network::{
-    ClusterPaths, NetworkError, ObjectRpcCall, ObjectRpcRequest, ObjectRpcResult,
-};
+use sinomo_core::network::{ClusterPaths, NetworkError, ObjectRpcCall, ObjectRpcResult};
 use sinomo_core::node::NodeId;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -113,7 +111,6 @@ pub fn open_mounted_sifs_service_with_cancellation(
     let (cluster_paths, cluster_state, local_node_id, peer_node_ids) =
         mounted_sifs_cluster_context(&data_dir)?;
     let peer_transport = Arc::new(MountedSifsPeerTransport {
-        data_dir: data_dir.clone(),
         cluster_paths: cluster_paths.clone(),
     });
     let sync_peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
@@ -840,7 +837,6 @@ fn mounted_sifs_kv_io_error(
 
 #[derive(Clone, Debug)]
 struct MountedSifsPeerTransport {
-    data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
 }
 
@@ -850,13 +846,10 @@ impl MountedSifsPeerTransport {
         target_node_id: &NodeId,
         call: ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
-        runtime: &tokio::runtime::Handle,
+        _runtime: &tokio::runtime::Handle,
     ) -> Result<ObjectRpcResult, NetworkError> {
         let state = sinomo_core::cluster::read_cluster_state(&self.cluster_paths)?;
-        let mut host = MountedSifsObjectRpcHost {
-            data_dir: self.data_dir.clone(),
-            runtime: runtime.clone(),
-        };
+        let mut host = MountedSifsObjectRpcHost;
         let mut client =
             sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &self.cluster_paths);
         let result = client
@@ -927,36 +920,6 @@ impl AsyncDfsPeerTransport for MountedSifsPeerTransport {
     }
 }
 
-struct MountedSifsObjectRpcHost {
-    data_dir: SinomoDataDir,
-    runtime: tokio::runtime::Handle,
-}
+struct MountedSifsObjectRpcHost;
 
-impl sinomo_core::network::ClusterSignedObjectRpcAsyncHost for MountedSifsObjectRpcHost {
-    fn sign_object_rpc_request_async<'a>(
-        &'a mut self,
-        request: &'a ObjectRpcRequest,
-        request_digest_sha256: [u8; 32],
-    ) -> sinomo_core::network::ClusterSignedObjectRpcFuture<'a, Vec<u8>> {
-        let data_dir = self.data_dir.clone();
-        let route = request.route.clone();
-        let category = request.category.clone();
-        let runtime = self.runtime.clone();
-        Box::pin(async move {
-            runtime
-                .spawn_blocking(move || {
-                    sinomo_core::network::sign_daemon_rpc_request_digest_from_data_dir(
-                        &data_dir,
-                        &route,
-                        &category,
-                        request_digest_sha256.to_vec(),
-                    )
-                })
-                .await
-                .map_err(|source| NetworkError::Io {
-                    operation: "mounted SIFS object RPC signing".to_string(),
-                    detail: format!("object RPC signing task failed: {source}"),
-                })?
-        })
-    }
-}
+impl sinomo_core::network::ClusterObjectRpcAsyncHost for MountedSifsObjectRpcHost {}

@@ -144,17 +144,19 @@ consensus, identity, and failure semantics.
 ### Network Boundary
 
 Cluster communication is composed from independent contracts. Direct transports
-connect authenticated adjacent peers. Connectivity tracking publishes fresh,
+establish adjacent-peer identity once. Connectivity tracking publishes fresh,
 directed evidence without granting membership. Routing uses the authorized
 directory and connectivity snapshots to establish target-bound duplex streams,
-including through relays. Object RPC carries SOBJ requests and responses over
-any authenticated duplex stream and does not know endpoints or node paths.
-Domain crates own target selection, typed values, service methods, authorization,
+including through relays. Routed records are plaintext by default; endpoint
+callers may explicitly enable AEAD. Object RPC carries length-framed SOBJ
+requests and responses without per-call signatures, encryption, or content
+digests and does not know endpoints or node paths. Domain crates own target
+selection, typed values, content verification, service methods, authorization,
 idempotency, and side effects.
 
 Connectivity contains direct observed edges only. Routing owns transitive
-reachability and must realize an authorized graph path as an authenticated
-direct or relayed stream; graph reachability is not a substitute for a usable
+reachability and must realize an authorized graph path as a direct or relayed
+stream with established endpoint identity; graph reachability is not a substitute for a usable
 data path. Every authorized node pair in the same current routable connected
 component must be able to communicate through routing.
 

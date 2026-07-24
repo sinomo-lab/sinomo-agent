@@ -157,11 +157,11 @@ pub enum DaemonEventStreamItem {
 pub struct DaemonObjectRpcForwardRequest {
     pub target_node_id: sinomo_core::node::NodeId,
     pub request: sinomo_core::network::ObjectRpcRequest,
-    /// Authentication proof for an ordinary typed value carried in the outer
-    /// proxy body. `None` means that body, when present, is a semantic
-    /// attachment.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub streamed_value_digest_sha256: Option<[u8; 32]>,
+    /// The outer proxy body carries the inner call's typed value rather than a
+    /// semantic attachment. This is framing metadata only; it adds no digest
+    /// or content verification.
+    #[serde(default)]
+    pub streamed_value_body: bool,
     pub connect_timeout_millis: u64,
     /// Overrides the routed session's no-progress timeout. Missing values from
     /// older callers retain the daemon's default network timeout.
