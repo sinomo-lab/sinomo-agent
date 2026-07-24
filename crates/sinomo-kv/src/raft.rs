@@ -494,12 +494,26 @@ pub fn validate_cluster_kv_raft_config_transition(
     }
     if !removed_voters.is_empty() {
         let retained_voters = unique_node_id_overlap_count(&current.voters, &next.voters);
-        let current_quorum = cluster_kv_raft_quorum_size(unique_node_id_count(&current.voters));
-        let next_quorum = cluster_kv_raft_quorum_size(unique_node_id_count(&next.voters));
-        if retained_voters < current_quorum || retained_voters < next_quorum {
+        let current_voter_count = unique_node_id_count(&current.voters);
+        let next_voter_count = unique_node_id_count(&next.voters);
+        let current_quorum = cluster_kv_raft_quorum_size(current_voter_count);
+        let next_quorum = cluster_kv_raft_quorum_size(next_voter_count);
+        let voter_union = current_voter_count
+            .saturating_add(next_voter_count)
+            .saturating_sub(retained_voters);
+        // Every old quorum must intersect every new quorum. Retaining enough
+        // individual voters to form both quorums is not sufficient: for example,
+        // shrinking five voters to three retains three voters but still permits
+        // disjoint old/new quorums of sizes three and two.
+        let every_quorum_overlaps =
+            current_quorum.saturating_add(next_quorum) > voter_union;
+        if retained_voters < current_quorum
+            || retained_voters < next_quorum
+            || !every_quorum_overlaps
+        {
             return Err(KvError::InvalidRaftConfigTransition {
                 detail: format!(
-                    "raft voter removal requires overlapping old/new quorum; refusing to remove {}",
+                    "raft voter removal must retain both quorum thresholds and guarantee every old/new quorum overlaps; refusing to remove {} (retained {retained_voters}, old quorum {current_quorum}, new quorum {next_quorum}, voter union {voter_union})",
                     removed_voters
                         .iter()
                         .map(NodeId::as_str)

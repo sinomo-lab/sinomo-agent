@@ -346,8 +346,10 @@ Raft configuration validator from the broader membership lifecycle:
 
 - adding a voter requires that node to be a committed learner or non-voting
   member, and at most one voter may be added per transition;
-- removing voters requires the retained set to satisfy both the old and new
-  quorum sizes, rejecting the unsafe two-voter-to-one-voter transition;
+- removing voters requires the retained set to satisfy both quorum sizes and
+  requires `Q_old + Q_new > |V_old union V_new|`, so every old quorum intersects
+  every new quorum; this rejects both the conservative two-to-one case and the
+  disjoint-quorum five-to-three counterexample;
 - committing a valid proposal still requires acknowledgements from a quorum of
   the current configuration;
 - health observations do not mutate the committed Raft configuration;
@@ -360,7 +362,10 @@ focused configuration-validator proof from the broader membership lifecycle's
 catch-up certificate. Both are current-behavior refinements. The Rust table test
 `cluster_kv_raft_config_transition_matches_bounded_model_cases` covers the same
 learner/non-voting promotion, direct and multiple addition rejection, and
-three-to-two versus two-to-one shrink cases.
+three-to-two versus two-to-one shrink cases. The Rust
+`cluster_kv_raft_config_transition_enforces_quorum_intersection_inequality`
+regression additionally covers the five-to-three rejection and a safe
+six-to-four multi-removal transition.
 
 The `dfs_metadata_safety.safety` invariant combines these properties:
 

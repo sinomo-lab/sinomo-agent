@@ -196,6 +196,44 @@ mod tests {
     }
 
     #[test]
+    fn cluster_kv_raft_config_transition_enforces_quorum_intersection_inequality() {
+        let cluster_id =
+            Id::from_legacy_named("cluster_config_transition_overlap").expect("cluster");
+        let voters = ["a", "b", "c", "d", "e", "f"].map(|suffix| {
+            NodeId::from_legacy_named(format!("node_config_transition_overlap_{suffix}"))
+                .expect("voter")
+        });
+        let config = |voters: Vec<NodeId>| ClusterKvRaftConfigRecord {
+            cluster_id: cluster_id.clone(),
+            term: 3,
+            kv_revision: 9,
+            voters,
+            learners: Vec::new(),
+            non_voting: Vec::new(),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+
+        let five_voters = config(voters[..5].to_vec());
+        let three_voters = config(voters[..3].to_vec());
+        let error = validate_cluster_kv_raft_config_transition(&five_voters, &three_voters)
+            .expect_err("five-to-three shrink permits disjoint old and new quorums");
+        assert!(
+            error
+                .to_string()
+                .contains("guarantee every old/new quorum overlaps"),
+            "unexpected transition error: {error}"
+        );
+
+        // This is intentionally the exact intersection inequality rather than a
+        // blanket one-removal cap: 4 + 3 > 6, so every old quorum in a six-voter
+        // configuration intersects every new quorum after a six-to-four shrink.
+        let six_voters = config(voters.to_vec());
+        let four_voters = config(voters[..4].to_vec());
+        validate_cluster_kv_raft_config_transition(&six_voters, &four_voters)
+            .expect("six-to-four shrink preserves universal quorum intersection");
+    }
+
+    #[test]
     fn raft_config_change_lifecycle_requires_catch_up_before_learner_promotion() {
         let voter = NodeId::from_legacy_named("node_config_lifecycle_voter").expect("voter");
         let learner = NodeId::from_legacy_named("node_config_lifecycle_learner").expect("learner");
