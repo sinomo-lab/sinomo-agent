@@ -10132,6 +10132,62 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_recovers_lost_relaxed_table_log_after_cursor_checkpoint() {
+        let root = temp_root("local_backend_lost_relaxed_table_log");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        let mut expected_edge_objects = Vec::new();
+        for index in 0..520 {
+            let mut object = object(version("version_1"));
+            object.object_id = DfsObjectId::from_legacy_named(format!("obj_relaxed_table_{index}"))
+                .expect("object id");
+            object.path = format!("/services/relaxed-table/{index}.txt");
+            backend.put_object(&object).expect("object");
+            if matches!(index, 0 | 519) {
+                expected_edge_objects.push(object);
+            }
+        }
+        let final_sequence = backend
+            .journal_since(0)
+            .expect("journal")
+            .last()
+            .expect("journal entry")
+            .sequence;
+        let checkpoint =
+            read_sobj::<DfsMetadataReplayCursor>(&backend.local_materialization_cursor_path())
+                .expect("materialization cursor");
+        assert!(
+            checkpoint.last_sequence > 0 && checkpoint.last_sequence <= final_sequence,
+            "the test must lose a table log after a durable cursor checkpoint"
+        );
+        drop(backend);
+
+        fs::remove_file(metadata_table_path(&root)).expect("simulate lost rebuildable table log");
+
+        let reopened =
+            LocalSobjMetadataBackend::new(shard_id, &root).expect("recover from journal");
+        for expected in expected_edge_objects {
+            assert_eq!(
+                reopened
+                    .get_object(&expected.object_id)
+                    .expect("recovered object"),
+                Some(expected)
+            );
+        }
+        assert_eq!(reopened.materialized_through_sequence, final_sequence);
+        assert_eq!(
+            reopened
+                .metadata_prefix_proof()
+                .expect("recovered prefix proof")
+                .journal_sequence,
+            final_sequence
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn local_backend_replays_already_materialized_visible_commits_after_newer_head() {
         fn commit_test_version(
             backend: &mut LocalSobjMetadataBackend,

@@ -337,7 +337,6 @@ pub(crate) fn append_metadata_table_batch(
 ) -> Result<u64> {
     let trace_started = Instant::now();
     let path = metadata_table_path(root);
-    let existed = path.exists();
     let create_dir_started = Instant::now();
     if let Some(parent) = path.parent() {
         create_dir_all(parent.to_owned())?;
@@ -354,36 +353,34 @@ pub(crate) fn append_metadata_table_batch(
         ))
     })?;
     let encode_ms = encode_started.elapsed().as_millis();
-    let write_sync_started = Instant::now();
+    let write_started = Instant::now();
     let mut append = durable_file::open_file_for_append_with_options(
         &path,
         durable_file::DurableAppendFileOptions::new().without_parent_sync(),
     )
     .map_err(metadata_durable_file_error)?;
+    // The shard journal is synchronized before this function is called and is
+    // the replay/replication source of truth. `materialized.slog` is only a
+    // rebuildable read cache: reopen truncates a torn tail, rewinds a cursor
+    // that is ahead of the surviving table head, and replays the durable
+    // journal. Synchronizing this second copy would add one storage barrier to
+    // every metadata mutation without making the acknowledged state safer.
     let record_bytes = durable_file::append_length_prefixed_records(
         &mut append.file,
         &path,
         [bytes.as_slice()],
-        durable_file::DurableRecordAppendOptions::new(durable_file::DurableLengthEndian::Little)
-            .sync(durable_file::DurableFileSync::All),
+        durable_file::DurableRecordAppendOptions::new(durable_file::DurableLengthEndian::Little),
     )
     .map_err(metadata_durable_file_error)?;
-    let write_sync_ms = write_sync_started.elapsed().as_millis();
-    let sync_dir_started = Instant::now();
-    if !existed && let Some(parent) = path.parent() {
-        sync_dir(parent)?;
-    }
-    let sync_dir_ms = sync_dir_started.elapsed().as_millis();
+    let write_ms = write_started.elapsed().as_millis();
     metadata_table_perf_trace(format_args!(
-        "metadata-table-batch sequence={} ops={} bytes={} existed={} create_dir_ms={} encode_ms={} write_sync_ms={} sync_dir_ms={} total_ms={}",
+        "metadata-table-batch sequence={} ops={} bytes={} create_dir_ms={} encode_ms={} write_ms={} durability=journal-replay total_ms={}",
         batch.sequence,
         batch.ops.len(),
         record_bytes,
-        existed,
         create_dir_ms,
         encode_ms,
-        write_sync_ms,
-        sync_dir_ms,
+        write_ms,
         trace_started.elapsed().as_millis()
     ));
     Ok(record_bytes)
