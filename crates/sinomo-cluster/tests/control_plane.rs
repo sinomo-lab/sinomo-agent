@@ -13901,6 +13901,60 @@ fn cluster_join_registration_async_coalesces_waiting_admission_authority() {
 }
 
 #[test]
+fn cluster_join_registration_async_reuses_authority_between_sequential_join_waves() {
+    let fixture = join_authority_fixture("join_async_sequential_admission");
+    let first_request = join_authority_fixture_request(&fixture);
+    let mut second_request = first_request.clone();
+    let second_node_id = NodeId::from_legacy_named("node_join_async_sequential_admission_second")
+        .expect("second joiner id");
+    second_request.members[0].node_id = second_node_id.clone();
+    second_request.members[0].display_name = "second joined".to_string();
+    second_request.members[0].node_public_key = format!("pk-{second_node_id}");
+    let mut first_host = RecordingJoinRegistrationHost::default();
+    let mut second_host = RecordingJoinRegistrationHost::default();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let first_response = runtime
+        .block_on(handle_cluster_join_registration_request_async_with_host(
+            runtime.handle(),
+            &fixture.paths,
+            first_request,
+            fixture.now,
+            &mut first_host,
+        ))
+        .expect("first sequential join");
+    let second_response = runtime
+        .block_on(handle_cluster_join_registration_request_async_with_host(
+            runtime.handle(),
+            &fixture.paths,
+            second_request,
+            fixture.now + time::Duration::milliseconds(1),
+            &mut second_host,
+        ))
+        .expect("second sequential join");
+
+    assert!(first_response.accepted, "{}", first_response.detail);
+    assert!(second_response.accepted, "{}", second_response.detail);
+    assert_eq!(first_host.authoritative_reads, 1);
+    assert_eq!(
+        second_host.authoritative_reads, 0,
+        "the completed admission must retain its current-term quorum snapshot for the next join wave"
+    );
+    assert_eq!(first_host.quorum_commits, 2);
+    assert_eq!(second_host.quorum_commits, 2);
+    let snapshot = read_cluster_kv_current_snapshot(&fixture.paths).expect("sequential snapshot");
+    assert!(
+        snapshot
+            .get(&cluster_member_key(&fixture.joined_node_id))
+            .is_some()
+    );
+    assert!(snapshot.get(&cluster_member_key(&second_node_id)).is_some());
+}
+
+#[test]
 fn cluster_join_registration_async_does_not_coalesce_exact_request_proof() {
     let fixture = join_authority_fixture("join_async_exact_proof_admission");
     let first_request = join_authority_fixture_request(&fixture);
