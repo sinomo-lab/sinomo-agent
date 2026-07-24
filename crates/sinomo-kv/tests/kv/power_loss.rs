@@ -177,6 +177,154 @@ fn hard_state_commit_index_ahead_of_wal_is_repaired_on_reopen() {
 }
 
 #[test]
+fn snapshot_crash_before_wal_rewrite_keeps_replacement_entries() {
+    let root = temp_root("sinomo-kv-power-loss-snapshot-before-wal-rewrite");
+    let paths = KvWalPaths::new(root.join("raft"));
+    let follower_id = node_id("kv_power_loss_snapshot_rewrite_follower");
+    let replacement_leader_id = node_id("kv_power_loss_snapshot_rewrite_leader");
+    let replacements = vec![
+        KvLogEntry {
+            index: 5,
+            term: 3,
+            request_id: KvRequestId::generate(),
+            command: put_command("/power-loss/snapshot/5", b"replacement-5"),
+            revision: KvRevision::ZERO,
+        },
+        KvLogEntry {
+            index: 6,
+            term: 3,
+            request_id: KvRequestId::generate(),
+            command: put_command("/power-loss/snapshot/6", b"replacement-6"),
+            revision: KvRevision::ZERO,
+        },
+        KvLogEntry {
+            index: 7,
+            term: 3,
+            request_id: KvRequestId::generate(),
+            command: put_command("/power-loss/snapshot/7", b"replacement-7"),
+            revision: KvRevision::ZERO,
+        },
+    ];
+
+    let wal_before_snapshot_rewrite = {
+        let mut node =
+            DurableRaftKvNode::open(follower_id.clone(), paths.clone()).expect("open follower");
+        for index in 1..=6 {
+            let entry = node
+                .append_local_command(
+                    2,
+                    put_command(
+                        &format!("/power-loss/snapshot/{index}"),
+                        format!("stale-{index}").as_bytes(),
+                    ),
+                )
+                .expect("append old-term entry");
+            if index <= 4 {
+                node.commit_to(entry.index).expect("commit common prefix");
+            }
+        }
+
+        let response = node
+            .append_entries(RaftAppendEntriesRequest {
+                term: 3,
+                leader_id: replacement_leader_id,
+                prev_log_index: 4,
+                prev_log_term: 2,
+                entries: replacements.clone(),
+                leader_commit: 7,
+            })
+            .expect("replace old-term suffix");
+        assert!(response.success);
+        assert_eq!(node.applied_index(), 7);
+        assert_eq!(
+            entry_value(node.store(), "/power-loss/snapshot/5"),
+            b"replacement-5"
+        );
+        assert_eq!(
+            entry_value(node.store(), "/power-loss/snapshot/6"),
+            b"replacement-6"
+        );
+
+        // Conflict replacement is append-only until snapshot compaction rewrites the
+        // WAL, so the durable file currently contains A5,A6 followed by B5,B6,B7.
+        let wal = fs::read(&paths.wal).expect("read pre-compaction wal");
+        let before = read_wal_entries(&paths.wal, None, 0).expect("read wal records");
+        assert_eq!(
+            before
+                .entries
+                .iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6, 5, 6, 7]
+        );
+
+        let snapshot = node.save_snapshot().expect("persist snapshot");
+        assert_eq!(snapshot.last_included_index, 7);
+        wal
+    };
+
+    // Model power loss after the snapshot replacement is durable but before the
+    // second, independent WAL replacement lands.
+    {
+        let mut wal = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&paths.wal)
+            .expect("restore pre-rewrite wal");
+        wal.write_all(&wal_before_snapshot_rewrite)
+            .expect("restore append-only wal");
+        wal.sync_all().expect("sync restored wal");
+    }
+
+    let recovered =
+        DurableRaftKvNode::open(follower_id.clone(), paths.clone()).expect("recover follower");
+    assert_eq!(recovered.applied_index(), 7);
+    for replacement in &replacements {
+        let loaded = recovered
+            .log_entry_at(replacement.index)
+            .expect("replacement retained for replication");
+        assert_eq!(loaded.term, replacement.term);
+        assert_eq!(loaded.request_id, replacement.request_id);
+        assert_eq!(loaded.command, replacement.command);
+    }
+    assert_eq!(
+        entry_value(recovered.store(), "/power-loss/snapshot/5"),
+        b"replacement-5"
+    );
+    assert_eq!(
+        entry_value(recovered.store(), "/power-loss/snapshot/6"),
+        b"replacement-6"
+    );
+    drop(recovered);
+
+    let repaired = read_wal_entries(&paths.wal, None, 0).expect("read repaired wal");
+    assert_eq!(
+        repaired
+            .entries
+            .iter()
+            .map(|entry| entry.index)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5, 6, 7]
+    );
+    for replacement in replacements {
+        let persisted = repaired
+            .entries
+            .iter()
+            .find(|entry| entry.index == replacement.index)
+            .expect("replacement persisted in repaired wal");
+        assert_eq!(persisted.term, replacement.term);
+        assert_eq!(persisted.request_id, replacement.request_id);
+        assert_eq!(persisted.command, replacement.command);
+    }
+    assert!(!repaired.truncated);
+
+    let reopened = DurableRaftKvNode::open(follower_id, paths).expect("reopen repaired follower");
+    assert_eq!(reopened.last_log_index(), 7);
+    assert_eq!(reopened.term_at(5), Some(3));
+    assert_eq!(reopened.term_at(6), Some(3));
+}
+
+#[test]
 fn snapshot_wal_compaction_ignores_leftover_artifacts_after_reopen() {
     let root = temp_root("sinomo-kv-power-loss-compaction-artifacts");
     let paths = KvWalPaths::new(root.join("raft"));

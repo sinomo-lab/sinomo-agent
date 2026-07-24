@@ -136,6 +136,16 @@ module raft_config_transition {
   pure def retainedVoters(current: RaftConfig, candidate: RaftConfig): Set[Node] =
     current.voters.intersect(candidate.voters)
 
+  /// Any majority from the current configuration intersects every majority
+  /// from the candidate configuration exactly when their quorum sizes sum to
+  /// more than the number of voters in the union.
+  pure def everyOldAndNewQuorumOverlaps(
+    current: RaftConfig,
+    candidate: RaftConfig
+  ): bool =
+    quorumSize(current.voters) + quorumSize(candidate.voters)
+      > current.voters.union(candidate.voters).size()
+
   /// Exact voter-addition rules from the Rust transition validator: a single
   /// new voter at most, already present in the committed learner/non-voting
   /// base configuration.
@@ -147,15 +157,16 @@ module raft_config_transition {
     }
   }
 
-  /// Removing any voter requires the retained set to satisfy both the old and
-  /// new quorum thresholds. This is the overlapping-quorum check implemented
-  /// by `validate_cluster_kv_raft_config_transition`.
+  /// Removing any voter requires the retained set to satisfy both quorum
+  /// thresholds and every possible old quorum to intersect every possible new
+  /// quorum. This mirrors `validate_cluster_kv_raft_config_transition`.
   pure def voterRemovalIsValid(current: RaftConfig, candidate: RaftConfig): bool = {
     val removed = removedVoters(current, candidate)
     val retained = retainedVoters(current, candidate)
     removed.size() == 0 or all {
       retained.size() >= quorumSize(current.voters),
       retained.size() >= quorumSize(candidate.voters),
+      everyOldAndNewQuorumOverlaps(current, candidate),
     }
   }
 

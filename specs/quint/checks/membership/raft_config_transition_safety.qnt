@@ -43,8 +43,9 @@ module raft_config_transition_safety {
     }
   }
 
-  /// A committed voter removal retains a quorum under both configurations.
-  def committedVoterRemovalHasOldAndNewQuorum: bool = {
+  /// A committed voter removal retains both quorum thresholds and guarantees
+  /// that every old quorum intersects every new quorum.
+  def committedVoterRemovalHasUniversalQuorumOverlap: bool = {
     val removed = removedVoters(baseConfig, committedConfig)
     val retained = retainedVoters(baseConfig, committedConfig)
     all {
@@ -53,6 +54,7 @@ module raft_config_transition_safety {
     } implies all {
       retained.size() >= quorumSize(baseConfig.voters),
       retained.size() >= quorumSize(committedConfig.voters),
+      everyOldAndNewQuorumOverlaps(baseConfig, committedConfig),
     }
   }
 
@@ -168,7 +170,7 @@ module raft_config_transition_safety {
     committedConfigChangesOnlyAfterValidation,
     invalidProposalNeverCommits,
     committedVoterAdditionsHavePriorBase,
-    committedVoterRemovalHasOldAndNewQuorum,
+    committedVoterRemovalHasUniversalQuorumOverlap,
     commitUsesCurrentConfigQuorum,
     healthObservationIsNotCommitAuthority,
     rejectionPreservesCommittedConfig,
