@@ -1358,10 +1358,20 @@ pub trait ClusterKvRaftQuorumCommitAsyncHost: Send {
         Box::pin(async move {
             let deadline = Instant::now() + timeout;
             let mut accepted = 0_usize;
+            let mut attempted_node_ids = RaftNodeIdSet::default();
             let mut attempts = Vec::new();
             for target in targets {
                 if accepted >= required_remote_acks {
                     break;
+                }
+                if !attempted_node_ids
+                    .try_insert_clone(
+                        self.target_node_id(&target),
+                        "dedupe default async raft replication target",
+                    )
+                    .map_err(Self::kv_error)?
+                {
+                    continue;
                 }
                 let remaining = deadline
                     .checked_duration_since(Instant::now())
@@ -1753,11 +1763,28 @@ where
     let deadline = Instant::now() + options.timeout;
     let quorum_metrics = KvCommandPhaseMetricGuard::start("quorum");
     let targets = host.remote_voter_targets_async(state).await?;
-    let replication_targets = targets
-        .iter()
-        .filter(|target| !voter_acks.contains(host.target_node_id(target)))
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut replication_node_ids = RaftNodeIdSet::default();
+    let mut replication_targets = Vec::new();
+    for target in &targets {
+        let target_node_id = host.target_node_id(target);
+        if voter_acks.contains(target_node_id)
+            || !replication_node_ids
+                .try_insert_clone(
+                    target_node_id,
+                    "dedupe async raft quorum replication target",
+                )
+                .map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?
+        {
+            continue;
+        }
+        try_reserve_kv_items(
+            &mut replication_targets,
+            1,
+            "collect unique async raft quorum replication target",
+        )
+        .map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?;
+        replication_targets.push(target.clone());
+    }
     let required_remote_acks = quorum_size.saturating_sub(voter_acks.len());
     let attempts = host
         .replicate_cluster_raft_to_quorum_async(

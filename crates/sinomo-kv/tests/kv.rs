@@ -9598,6 +9598,122 @@ mod tests {
     }
 
     #[test]
+    fn default_async_raft_replication_counts_unique_node_acknowledgements() {
+        let local =
+            NodeId::from_legacy_named("node_kv_default_replication_dedupe_local").expect("local");
+        let remote_a =
+            NodeId::from_legacy_named("node_kv_default_replication_dedupe_a").expect("remote a");
+        let remote_b =
+            NodeId::from_legacy_named("node_kv_default_replication_dedupe_b").expect("remote b");
+        let state = quorum_commit_test_state(&local, &remote_a);
+        let mut host = QuorumCommitTestHost {
+            accepting_targets: [remote_a.clone(), remote_b.clone()].into_iter().collect(),
+            ..QuorumCommitTestHost::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let attempts = runtime
+            .block_on(
+                <QuorumCommitTestHost as ClusterKvRaftQuorumCommitAsyncHost>::replicate_cluster_raft_to_quorum_async(
+                    &mut host,
+                    &state,
+                    vec![remote_a.clone(), remote_a.clone(), remote_b.clone()],
+                    2,
+                    Duration::from_secs(1),
+                ),
+            )
+            .expect("default replication");
+
+        assert_eq!(
+            attempts
+                .into_iter()
+                .map(|attempt| attempt.target)
+                .collect::<Vec<_>>(),
+            vec![remote_a.clone(), remote_b.clone()]
+        );
+        assert_eq!(host.replicated_targets, vec![remote_a, remote_b]);
+    }
+
+    #[test]
+    fn cluster_kv_raft_quorum_async_driver_deduplicates_replication_targets() {
+        let local = NodeId::from_legacy_named("node_kv_quorum_async_dedupe_local").expect("local");
+        let remote_a =
+            NodeId::from_legacy_named("node_kv_quorum_async_dedupe_a").expect("remote a");
+        let remote_b =
+            NodeId::from_legacy_named("node_kv_quorum_async_dedupe_b").expect("remote b");
+        let remote_c =
+            NodeId::from_legacy_named("node_kv_quorum_async_dedupe_c").expect("remote c");
+        let mut state = quorum_commit_test_state(&local, &remote_a);
+        for (node_id, name) in [
+            (remote_b.clone(), "remote b"),
+            (remote_c.clone(), "remote c"),
+        ] {
+            let mut member = state.members[1].clone();
+            member.node_id = node_id;
+            member.display_name = name.to_string();
+            member.node_public_key = format!("pk-{name}");
+            state.members.push(member);
+        }
+        assert_eq!(cluster_kv_raft_quorum_size_for_state(&state), 3);
+
+        let mut host = QuorumCommitTestHost {
+            targets: vec![remote_a.clone(), remote_a.clone(), remote_b.clone()],
+            accepting_targets: [remote_a.clone(), remote_b.clone()].into_iter().collect(),
+            ..QuorumCommitTestHost::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let result = runtime
+            .block_on(commit_cluster_kv_raft_command_with_quorum_async(
+                &mut state,
+                KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                    key: "/kv/quorum/async-deduplicated".to_string(),
+                    value: b"ok".to_vec(),
+                    lease_id: None,
+                })),
+                ClusterKvRaftQuorumCommitOptions {
+                    timeout: Duration::from_secs(1),
+                },
+                &mut host,
+            ))
+            .expect("two unique remote acknowledgements should reach quorum");
+
+        assert_eq!(
+            result.authority.basis,
+            KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks: 3,
+                required_quorum: 3,
+            }
+        );
+        assert_eq!(
+            host.replicated_targets,
+            vec![remote_a.clone(), remote_b.clone()],
+            "the duplicate target must not consume an acknowledgement slot"
+        );
+        assert_eq!(
+            host.statuses,
+            vec![
+                (
+                    remote_a.clone(),
+                    ClusterKvRaftTargetReplicationStatus::Accepted,
+                ),
+                (
+                    remote_b.clone(),
+                    ClusterKvRaftTargetReplicationStatus::Accepted,
+                ),
+            ]
+        );
+        assert_eq!(host.fanout_targets, vec![remote_a, remote_b]);
+        assert!(!host.discarded);
+    }
+
+    #[test]
     fn cluster_kv_raft_quorum_driver_discards_uncommitted_entry_without_quorum() {
         let local =
             NodeId::from_legacy_named("node_kv_quorum_driver_no_quorum_local").expect("local");
