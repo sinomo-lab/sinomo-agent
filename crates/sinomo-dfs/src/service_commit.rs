@@ -1773,21 +1773,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         expected_hash: &str,
         bytes: &[u8],
     ) -> Result<(), DfsError> {
-        let actual_hash = content_hash(bytes);
-        if actual_hash != expected_hash {
-            return Err(DfsError::ContentHashMismatch {
-                expected: expected_hash.to_string(),
-                actual: actual_hash,
-            });
-        }
-        let manifest =
-            self.content
-                .put_object_version(object_id.as_str(), version.as_str(), bytes)?;
-        if manifest.content_hash != expected_hash {
-            return Err(DfsError::ContentHashMismatch {
-                expected: expected_hash.to_string(),
-                actual: manifest.content_hash,
-            });
+        if let Err(error) = self.content.put_object_version_with_expected_hash(
+            object_id.as_str(),
+            version.as_str(),
+            expected_hash,
+            bytes,
+        ) {
+            return match error {
+                ContentStoreError::BlobHashMismatch { expected, actual } => {
+                    Err(DfsError::ContentHashMismatch { expected, actual })
+                }
+                error => Err(error.into()),
+            };
         }
         Ok(())
     }

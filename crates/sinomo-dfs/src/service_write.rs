@@ -1196,8 +1196,68 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
         touch_parent_on_create: bool,
+        exclusive_create: bool,
+        foreground_replica_repair: bool,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        let requester_node_id = request.requesting_node_id.clone();
+        self.write_distributed_eventual_from_manifest_with_initial_receipts(
+            request,
+            expected_base_version,
+            content_hash,
+            content_size_bytes,
+            desired_replica_nodes,
+            policy,
+            touch_parent_on_create,
+            exclusive_create,
+            foreground_replica_repair,
+            vec![requester_node_id],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_distributed_eventual_from_ingested_manifest_with_base_and_parent_touch(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        content_hash: String,
+        content_size_bytes: u64,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
+        exclusive_create: bool,
+        foreground_replica_repair: bool,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        let initial_receipt_node_ids = desired_replica_nodes
+            .contains(&self.node_id)
+            .then(|| vec![self.node_id.clone()])
+            .unwrap_or_default();
+        self.write_distributed_eventual_from_manifest_with_initial_receipts(
+            request,
+            expected_base_version,
+            content_hash,
+            content_size_bytes,
+            desired_replica_nodes,
+            policy,
+            touch_parent_on_create,
+            exclusive_create,
+            foreground_replica_repair,
+            initial_receipt_node_ids,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_distributed_eventual_from_manifest_with_initial_receipts(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        content_hash: String,
+        content_size_bytes: u64,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
         _exclusive_create: bool,
         foreground_replica_repair: bool,
+        initial_receipt_node_ids: Vec<NodeId>,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let trace_started = Instant::now();
         let trace_object_id = request.object_id.clone();
@@ -1237,11 +1297,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         validate_replication_plan(&desired_replica_nodes, &policy)?;
         let desired_replica_nodes =
             self.normalize_desired_replica_nodes(&object, desired_replica_nodes, &policy);
-        if !desired_replica_nodes.contains(&request.requesting_node_id) {
+        if let Some(invalid_receipt_node_id) = initial_receipt_node_ids
+            .iter()
+            .find(|node_id| !desired_replica_nodes.contains(node_id))
+        {
             return Err(DfsError::Distributed {
                 message: format!(
-                    "reader-backed routed write for {} must include requesting node {} as a desired replica",
-                    request.object_id, request.requesting_node_id
+                    "routed write for {} cannot record initial receipt for non-replica {}",
+                    request.object_id, invalid_receipt_node_id
                 ),
             });
         }
@@ -1342,12 +1405,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         );
 
         let record_receipt_started = Instant::now();
-        let updated_intent = self
-            .coordinator
-            .record_durable_receipt(&intent.intent_id, request.requesting_node_id.clone())?;
+        let mut updated_intent = intent.clone();
+        for node_id in &initial_receipt_node_ids {
+            updated_intent = self
+                .coordinator
+                .record_durable_receipt(&intent.intent_id, node_id.clone())?;
+        }
         let record_receipt_elapsed = record_receipt_started.elapsed();
         let commit_started = Instant::now();
-        let receipt_node_ids = vec![request.requesting_node_id.clone()];
+        let receipt_node_ids = initial_receipt_node_ids;
         if !foreground_replica_repair
             && updated_intent.policy.min_commit_replicas <= 1
             && self.can_commit_ready_intent_batched(&updated_intent)?
@@ -1820,23 +1886,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             None
         };
         let primary_node_id = shard.primary_node_id.clone();
-        if request.requesting_node_id == self.node_id
-            && desired_replica_nodes.contains(&self.node_id)
-        {
-            self.content.put_object_version_blob_only(
-                request.object_id.as_str(),
-                request.target_version.as_str(),
-                &bytes,
-            )?;
-        }
+        let attachment = DfsOutboundAttachment::from_bytes_with_transport_integrity(bytes);
         let command = DfsDistributedWriteCommand {
             request_id: request_id.clone(),
             request,
             expected_base_version,
             metadata_journal_after_sequence,
-            bytes,
+            bytes: Vec::new(),
             content_hash: None,
             content_size_bytes: None,
+            requester_blob_pre_staged: false,
             desired_replica_nodes,
             policy,
             object_metadata: Some(object.clone()),
@@ -1850,10 +1909,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             DfsNetworkMessage::DistributedWriteRequest(command.clone())
         };
-        let sent = if detach_request {
-            self.send_dfs_message_if_routable_detached(&primary_node_id, message)?
-        } else {
-            self.send_dfs_message_if_routable(&primary_node_id, message)?
+        let routed = self.next_dfs_routed_message(&primary_node_id, message);
+        // The primary-bound body owns the caller's only payload allocation.
+        // Dispatch it before returning even for a logically detached metadata
+        // request; queueing it would require persisting or cloning the complete
+        // payload on the requester, defeating direct streamed ingest.
+        let sent = match self.transport.send_routed_call(
+            &primary_node_id,
+            DfsRoutedCall::with_attachment(routed, attachment),
+        ) {
+            Ok(()) => true,
+            Err(NetworkError::UnknownNode { .. }) => false,
+            Err(error) => return Err(DfsError::from_network(error)),
         };
         if !sent {
             return Err(Self::metadata_primary_unroutable_error(
@@ -1902,6 +1969,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             bytes: Vec::new(),
             content_hash: Some(content_hash),
             content_size_bytes: Some(content_size_bytes),
+            requester_blob_pre_staged: true,
             desired_replica_nodes,
             policy,
             object_metadata: Some(object.clone()),
@@ -1988,6 +2056,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             bytes: Vec::new(),
             content_hash,
             content_size_bytes,
+            requester_blob_pre_staged: true,
             desired_replica_nodes,
             policy,
             object_metadata: Some(object.clone()),

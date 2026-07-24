@@ -101,8 +101,6 @@ pub(crate) enum DaemonClusterMaintenanceReason {
     LifecycleWake,
     /// A local interface/address generation changed.
     NetworkEnvironmentChanged,
-    /// The bounded join connectivity handoff could not publish its generation.
-    JoinConnectivityPublishFailed,
     /// An accepted join changed membership and graph topology.
     JoinAccepted,
     /// A committed member/endpoint projection changed the set of direct probe
@@ -132,9 +130,6 @@ const fn daemon_cluster_maintenance_request_plan(
         Reason::NetworkEnvironmentChanged => DaemonClusterMaintenanceRequestPlan {
             dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY
                 | DAEMON_CLUSTER_MAINTENANCE_DIRTY_NETWORK_ENVIRONMENT,
-        },
-        Reason::JoinConnectivityPublishFailed => DaemonClusterMaintenanceRequestPlan {
-            dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY,
         },
         Reason::JoinAccepted => DaemonClusterMaintenanceRequestPlan {
             dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH

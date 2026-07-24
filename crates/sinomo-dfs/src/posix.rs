@@ -271,25 +271,40 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut plan =
             self.plan_distributed_eventual_replicas(&request, candidates, options.policy.clone())?;
 
-        // Strict confirmed writes keep the metadata primary in the synchronous
-        // set when there is an unconstrained slot. Managed required/forbidden
-        // placement remains authoritative over this locality preference.
-        if options.policy.is_strict_confirmed()
-            && options.policy.desired_replicas >= 2
-            && let Some(shard) = self.select_metadata_shard_for_object(object)?
+        // A remote metadata primary now ingests the only sender-owned payload
+        // directly. Represent that durable copy honestly by replacing an
+        // unconstrained requester slot with the primary; the sender is no
+        // longer a replica merely because it originated the bytes.
+        if let Some(shard) = self.select_metadata_shard_for_object(object)?
             && shard.primary_node_id != self.node_id
             && !options
                 .policy
                 .forbidden_node_ids
                 .contains(&shard.primary_node_id)
             && !plan.desired_replica_nodes.contains(&shard.primary_node_id)
-            && let Some(replica_slot) =
-                plan.desired_replica_nodes.iter_mut().rev().find(|node_id| {
-                    **node_id != self.node_id
-                        && !options.policy.required_node_ids.contains(*node_id)
-                })
         {
-            *replica_slot = shard.primary_node_id;
+            let replacement_index = if options.policy.is_strict_confirmed()
+                && options.policy.desired_replicas >= 2
+            {
+                plan.desired_replica_nodes.iter().rposition(|node_id| {
+                    *node_id != self.node_id && !options.policy.required_node_ids.contains(node_id)
+                })
+            } else {
+                plan.desired_replica_nodes
+                    .iter()
+                    .position(|node_id| {
+                        *node_id == self.node_id
+                            && !options.policy.required_node_ids.contains(node_id)
+                    })
+                    .or_else(|| {
+                        plan.desired_replica_nodes.iter().rposition(|node_id| {
+                            !options.policy.required_node_ids.contains(node_id)
+                        })
+                    })
+            };
+            if let Some(index) = replacement_index {
+                plan.desired_replica_nodes[index] = shard.primary_node_id;
+            }
             crate::validate_replication_plan(&plan.desired_replica_nodes, &options.policy)?;
         }
 
@@ -1845,23 +1860,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let detach_request = !options.wait_for_commit
             && !options.foreground_replica_repair
             && !remote_metadata_primary;
-        let materialized_remote_primary_write = remote_metadata_primary;
+        let streamed_remote_primary_write = remote_metadata_primary;
         let content_started = Instant::now();
-        let manifest_result = self.content.put_object_version_blob_only(
-            object.object_id.as_str(),
-            target_version.as_str(),
-            bytes,
-        );
-        let manifest = match manifest_result {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                if transient_create {
-                    self.remove_transient_object_metadata(&object.object_id);
+        let manifest = if streamed_remote_primary_write {
+            None
+        } else {
+            match self.content.put_object_version_blob_only(
+                object.object_id.as_str(),
+                target_version.as_str(),
+                bytes,
+            ) {
+                Ok(manifest) => Some(manifest),
+                Err(error) => {
+                    if transient_create {
+                        self.remove_transient_object_metadata(&object.object_id);
+                    }
+                    return Err(DfsPosixError::Dfs(error.into()));
                 }
-                return Err(DfsPosixError::Dfs(error.into()));
             }
         };
         let content_elapsed = content_started.elapsed();
+        let content_size_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let distributed_started = Instant::now();
         let request = DfsWriteRequest {
             file_system_id: object.file_system_id.clone(),
@@ -1869,7 +1888,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             target_version: target_version.clone(),
             requesting_node_id: self.node_id.clone(),
         };
-        let outcome = if materialized_remote_primary_write {
+        let outcome = if streamed_remote_primary_write {
             self.write_distributed_eventual_with_base_and_parent_touch_and_repair_mode(
                 request,
                 Some(object.version.clone()),
@@ -1883,6 +1902,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 replay_response_journal,
             )
         } else {
+            let manifest = manifest
+                .as_ref()
+                .expect("local metadata-primary write published a blob-only manifest");
             self.write_distributed_eventual_from_local_manifest_with_candidates_and_parent_touch(
                 request,
                 Some(object.version.clone()),
@@ -1926,7 +1948,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             object.object_id,
             target_version,
             trace_bytes,
-            materialized_remote_primary_write,
+            streamed_remote_primary_write,
             content_elapsed.as_millis(),
             distributed_elapsed.as_millis(),
             trace_started.elapsed().as_millis()
@@ -1949,7 +1971,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             .any(|job| job.missing_replica_node_id == *node_id)
                     })
                     .collect();
-                committed_object.content_size_bytes = Some(manifest.size_bytes);
+                committed_object.content_size_bytes = Some(content_size_bytes);
                 let now = now_unix_nanos();
                 committed_object.modified_at_unix_nanos = now;
                 committed_object.changed_at_unix_nanos = now;
@@ -2004,9 +2026,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             } if !options.wait_for_commit && !options.foreground_replica_repair => {
                 let mut pending_object = object.clone();
                 pending_object.version = target_version;
-                pending_object.content_hash = Some(manifest.content_hash);
-                pending_object.current_locations = vec![self.node_id.clone()];
-                pending_object.content_size_bytes = Some(manifest.size_bytes);
+                pending_object.content_hash = manifest
+                    .as_ref()
+                    .map(|manifest| manifest.content_hash.clone());
+                pending_object.current_locations = if streamed_remote_primary_write {
+                    Vec::new()
+                } else {
+                    vec![self.node_id.clone()]
+                };
+                pending_object.content_size_bytes = Some(content_size_bytes);
                 let now = now_unix_nanos();
                 pending_object.modified_at_unix_nanos = now;
                 pending_object.changed_at_unix_nanos = now;
@@ -2046,14 +2074,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     mode: object.mode,
                     uid: object.uid,
                     gid: object.gid,
-                    size_bytes: Some(manifest.size_bytes),
+                    size_bytes: Some(content_size_bytes),
                     link_count: 1,
                     version: target_version,
                     modified_at_unix_nanos: object.modified_at_unix_nanos,
                     accessed_at_unix_nanos: object.accessed_at_unix_nanos,
                     created_at_unix_nanos: object.created_at_unix_nanos,
                     changed_at_unix_nanos: object.changed_at_unix_nanos,
-                    content_hash: Some(manifest.content_hash),
+                    content_hash: manifest
+                        .as_ref()
+                        .map(|manifest| manifest.content_hash.clone()),
                     policy: object.policy,
                     current_locations: object.current_locations,
                 })

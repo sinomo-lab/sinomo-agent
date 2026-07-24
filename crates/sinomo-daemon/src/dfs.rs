@@ -22,17 +22,18 @@ use sinomo_dfs::{
     ContentStoreError, ContentStoreStagingGcOptions, DfsCommittedWorkTracker, DfsConflictRecord,
     DfsConflictStatus, DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture,
     DfsDataPlaneResponse, DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions,
-    DfsFileSystemId, DfsMaintenanceExecutionExclusions, DfsMaintenanceRunOptions,
-    DfsMaintenanceTickOptions, DfsMaintenanceTickReport, DfsMessageCommand,
-    DfsMessageCommittedWork, DfsMessageExecutionScope, DfsMessageProcessResult, DfsMessageResponse,
-    DfsMetadataBackend, DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
-    DfsMetadataPublishScheduleOptions, DfsMetadataPublishScheduleStart, DfsMetadataShardId,
-    DfsMetadataShardMembershipHandoff, DfsMetadataShardStatus, DfsNodeDetachedSendState,
-    DfsNodeDetachedSendWorker, DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectMetadata,
-    DfsObjectRpcSendOptions, DfsOperatorInspector, DfsOperatorRepairView, DfsPeerTransport,
-    DfsPeerTransportError, DfsPlacementReconciliationJob, DfsPlacementReconciliationState,
-    DfsRepairAttemptRecord, DfsReplicaReceiptRecord, DfsTombstoneCompactionOptions,
-    DfsWriteIntentRecord, DfsWriteIntentStatus, LocalContentStore, NetworkedDfsService,
+    DfsFileSystemId, DfsInboundAttachment, DfsMaintenanceExecutionExclusions,
+    DfsMaintenanceRunOptions, DfsMaintenanceTickOptions, DfsMaintenanceTickReport,
+    DfsMessageCommand, DfsMessageCommittedWork, DfsMessageExecutionScope, DfsMessageProcessResult,
+    DfsMessageResponse, DfsMetadataBackend, DfsMetadataJournalReplicationOptions,
+    DfsMetadataJournalReplicationReport, DfsMetadataPublishScheduleOptions,
+    DfsMetadataPublishScheduleStart, DfsMetadataShardId, DfsMetadataShardMembershipHandoff,
+    DfsMetadataShardStatus, DfsNodeDetachedSendState, DfsNodeDetachedSendWorker,
+    DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectMetadata, DfsObjectRpcSendOptions,
+    DfsOperatorInspector, DfsOperatorRepairView, DfsPeerTransport, DfsPeerTransportError,
+    DfsPlacementReconciliationJob, DfsPlacementReconciliationState, DfsRepairAttemptRecord,
+    DfsReplicaReceiptRecord, DfsTombstoneCompactionOptions, DfsWriteIntentRecord,
+    DfsWriteIntentStatus, LocalContentStore, NetworkedDfsService,
     default_dfs_repair_attempt_snapshot_path, dfs_message_execution_scope,
     read_dfs_repair_attempt_snapshot,
 };
@@ -836,6 +837,10 @@ async fn acquire_daemon_dfs_maintenance_admission(
 struct DaemonDfsControlPlaneKvClient {
     cluster_paths: ClusterPaths,
     runtime: tokio::runtime::Handle,
+    /// One immutable latest-observed view is shared by all reads in an
+    /// operation. Refreshes and local commits replace it atomically instead of
+    /// replaying the Raft WAL for every `get` and `range_prefix`.
+    snapshot: Arc<Mutex<Option<Arc<KvSnapshot>>>>,
     /// Cached and short-lived services normally retain only a weak capability;
     /// their surrounding blocking task owns the strong guard. This prevents a
     /// static message cache from pinning an old daemon's OS lock after shutdown.
@@ -851,6 +856,7 @@ impl DaemonDfsControlPlaneKvClient {
         Self {
             cluster_paths: cluster_paths.clone(),
             runtime: runtime.clone(),
+            snapshot: Arc::new(Mutex::new(None)),
             data_owner_lock: data_owner_lock.as_ref().map(Arc::downgrade),
             _owned_data_owner_lock: None,
         }
@@ -864,6 +870,7 @@ impl DaemonDfsControlPlaneKvClient {
         Self {
             cluster_paths: cluster_paths.clone(),
             runtime: runtime.clone(),
+            snapshot: Arc::new(Mutex::new(None)),
             data_owner_lock: data_owner_lock.as_ref().map(Arc::downgrade),
             _owned_data_owner_lock: data_owner_lock,
         }
@@ -887,6 +894,57 @@ impl DaemonDfsControlPlaneKvClient {
             path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
             detail: source.to_string(),
         }
+    }
+
+    fn snapshot_lock_error(&self) -> KvError {
+        KvError::Io {
+            path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
+            detail: "DFS cluster KV snapshot cache lock is poisoned".to_string(),
+        }
+    }
+
+    fn load_latest_snapshot(&self) -> Result<Option<Arc<KvSnapshot>>, KvError> {
+        sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(
+            &self.cluster_paths,
+        )
+        .map_err(|source| self.daemon_error(source.into()))
+    }
+
+    fn cached_snapshot(&self) -> Result<Option<Arc<KvSnapshot>>, KvError> {
+        if let Some(snapshot) = self
+            .snapshot
+            .lock()
+            .map_err(|_| self.snapshot_lock_error())?
+            .as_ref()
+            .cloned()
+        {
+            return Ok(Some(snapshot));
+        }
+        let snapshot = self.load_latest_snapshot()?;
+        if let Some(snapshot) = snapshot.as_ref() {
+            *self
+                .snapshot
+                .lock()
+                .map_err(|_| self.snapshot_lock_error())? = Some(Arc::clone(snapshot));
+        }
+        Ok(snapshot)
+    }
+
+    fn replace_cached_snapshot(&self) -> Result<(), KvError> {
+        let snapshot = self.load_latest_snapshot()?;
+        *self
+            .snapshot
+            .lock()
+            .map_err(|_| self.snapshot_lock_error())? = snapshot;
+        Ok(())
+    }
+
+    fn invalidate_cached_snapshot(&self) -> Result<(), KvError> {
+        *self
+            .snapshot
+            .lock()
+            .map_err(|_| self.snapshot_lock_error())? = None;
+        Ok(())
     }
 }
 
@@ -1055,8 +1113,8 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
             &self.cluster_paths,
             &self.runtime,
         )
-        .map(drop)
-        .map_err(|source| self.daemon_error(source))
+        .map_err(|source| self.daemon_error(source))?;
+        self.replace_cached_snapshot()
     }
 
     fn placement_authority_process_identity(
@@ -1095,16 +1153,21 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
     }
 
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
-        sinomo_core::cluster::read_cluster_kv_latest_observed_entry(&self.cluster_paths, key)
-            .map_err(|source| self.daemon_error(source.into()))
+        Ok(self
+            .cached_snapshot()?
+            .and_then(|snapshot| snapshot.get(key).cloned()))
     }
 
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
-        sinomo_core::cluster::read_cluster_kv_latest_observed_prefix_entries(
-            &self.cluster_paths,
-            prefix,
+        self.cached_snapshot()?.map_or_else(
+            || Ok(Vec::new()),
+            |snapshot| {
+                snapshot.range_prefix_limited(
+                    prefix,
+                    sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+                )
+            },
         )
-        .map_err(|source| self.daemon_error(source.into()))
     }
 
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
@@ -1133,6 +1196,7 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
         if response.succeeded && notify_handoff {
             notify_daemon_dfs_maintenance_work();
         }
+        self.invalidate_cached_snapshot()?;
         Ok(response)
     }
 }
@@ -1145,8 +1209,8 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
                 &self.runtime,
             )
             .await
-            .map(drop)
-            .map_err(|source| self.daemon_error(source))
+            .map_err(|source| self.daemon_error(source))?;
+            self.replace_cached_snapshot()
         })
     }
 
@@ -1155,8 +1219,9 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
         key: &'a str,
     ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, Option<KvEntry>> {
         Box::pin(async move {
-            sinomo_core::cluster::read_cluster_kv_latest_observed_entry(&self.cluster_paths, key)
-                .map_err(|source| self.daemon_error(source.into()))
+            Ok(self
+                .cached_snapshot()?
+                .and_then(|snapshot| snapshot.get(key).cloned()))
         })
     }
 
@@ -1165,11 +1230,15 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
         prefix: &'a str,
     ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, Vec<KvEntry>> {
         Box::pin(async move {
-            sinomo_core::cluster::read_cluster_kv_latest_observed_prefix_entries(
-                &self.cluster_paths,
-                prefix,
+            self.cached_snapshot()?.map_or_else(
+                || Ok(Vec::new()),
+                |snapshot| {
+                    snapshot.range_prefix_limited(
+                        prefix,
+                        sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+                    )
+                },
             )
-            .map_err(|source| self.daemon_error(source.into()))
         })
     }
 
@@ -1213,6 +1282,7 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
             if response.succeeded && notify_handoff {
                 notify_daemon_dfs_maintenance_work();
             }
+            self.invalidate_cached_snapshot()?;
             Ok(response)
         })
     }
@@ -1247,12 +1317,13 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
     fn handle_message<'a>(
         &'a self,
         command: DfsMessageCommand,
+        attachment: Option<DfsInboundAttachment>,
         traceparent: Option<String>,
     ) -> DfsDataPlaneHostFuture<'a, DfsDataPlaneResponse> {
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            handle_daemon_dfs_message_async(&paths, command, traceparent, &runtime)
+            handle_daemon_dfs_message_async(&paths, command, attachment, traceparent, &runtime)
                 .await
                 .map_err(daemon_dfs_data_plane_error)
         })
@@ -3295,6 +3366,7 @@ fn process_daemon_dfs_message_command_on_runtime(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     command: DfsMessageCommand,
+    preingested_stage_blob: Option<sinomo_dfs::ContentManifest>,
     execution_scope: &DfsMessageExecutionScope,
     runtime: &tokio::runtime::Handle,
     traceparent: Option<String>,
@@ -3522,7 +3594,12 @@ fn process_daemon_dfs_message_command_on_runtime(
         hydrate.as_micros(),
         trace_started.elapsed().as_millis()
     ));
-    let process_report = service_lane.service.process_message_command_report(command);
+    let process_report = service_lane
+        .service
+        .process_message_command_report_with_preingested_stage_blob(
+            command,
+            preingested_stage_blob,
+        );
     let deferred_work = if is_read_only {
         Ok(None)
     } else {
@@ -3678,15 +3755,105 @@ fn emit_daemon_dfs_committed_edges(
     }
 }
 
+async fn ingest_daemon_dfs_message_attachment(
+    data_dir: &SinomoDataDir,
+    mut command: DfsMessageCommand,
+    attachment: Option<DfsInboundAttachment>,
+    runtime: &tokio::runtime::Handle,
+) -> Result<(DfsMessageCommand, Option<sinomo_dfs::ContentManifest>), DaemonError> {
+    let Some(attachment) = attachment else {
+        return Ok((command, None));
+    };
+    let task_data_dir = data_dir.clone();
+    let task_runtime = runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        let (object_id, version, expected_hash, stage_blob) = match &command.routed_message.message
+        {
+            sinomo_dfs::DfsNetworkMessage::StageBlob(stage) => (
+                stage.object_id.clone(),
+                stage.version.clone(),
+                Some(stage.content_hash.clone()),
+                true,
+            ),
+            sinomo_dfs::DfsNetworkMessage::DistributedWriteRequest(write)
+            | sinomo_dfs::DfsNetworkMessage::ExclusiveCreateRequest(write) => (
+                write.request.object_id.clone(),
+                write.request.target_version.clone(),
+                attachment.descriptor.content_hash.clone(),
+                false,
+            ),
+            other => {
+                return Err(sinomo_dfs::DfsError::Distributed {
+                    message: format!("streamed DFS attachment is not supported for {other:?}"),
+                });
+            }
+        };
+        if stage_blob
+            && let Some(descriptor_hash) = attachment.descriptor.content_hash.as_deref()
+            && Some(descriptor_hash) != expected_hash.as_deref()
+        {
+            return Err(sinomo_dfs::DfsError::ContentHashMismatch {
+                expected: expected_hash.unwrap_or_default(),
+                actual: descriptor_hash.to_string(),
+            });
+        }
+
+        let content = LocalContentStore::new(task_data_dir.dfs_dir().join("content"))?;
+        let mut ingest = content.begin_object_version_ingest(
+            object_id.as_str(),
+            version.as_str(),
+            attachment.descriptor.total_size_bytes,
+            expected_hash.as_deref(),
+        )?;
+        let mut body = attachment.body;
+        loop {
+            let chunk = task_runtime.block_on(body.next_chunk()).map_err(|source| {
+                sinomo_dfs::DfsError::Network {
+                    message: format!("read streamed DFS request attachment: {source}"),
+                }
+            })?;
+            let Some(chunk) = chunk else {
+                break;
+            };
+            ingest.write_chunk(chunk.as_ref())?;
+        }
+        let manifest = ingest.finish()?;
+        let preingested_stage_blob = if stage_blob {
+            Some(manifest)
+        } else {
+            match &mut command.routed_message.message {
+                sinomo_dfs::DfsNetworkMessage::DistributedWriteRequest(write)
+                | sinomo_dfs::DfsNetworkMessage::ExclusiveCreateRequest(write) => {
+                    write.bytes.clear();
+                    write.content_hash = Some(manifest.content_hash);
+                    write.content_size_bytes = Some(manifest.size_bytes);
+                }
+                _ => unreachable!("streamed distributed write kind was checked before ingest"),
+            }
+            None
+        };
+        Ok((command, preingested_stage_blob))
+    })
+    .await
+    .map_err(|source| DaemonError::Network {
+        address: "DFS streamed attachment ingest".to_string(),
+        detail: format!("DFS streamed attachment task failed: {source}"),
+    })?
+    .map_err(Into::into)
+}
+
 async fn handle_daemon_dfs_message_async(
     paths: &DaemonPaths,
     command: DfsMessageCommand,
+    attachment: Option<DfsInboundAttachment>,
     traceparent: Option<String>,
     runtime: &tokio::runtime::Handle,
 ) -> Result<DfsDataPlaneResponse, DaemonError> {
     let trace_started = Instant::now();
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
+    let (command, preingested_stage_blob) =
+        ingest_daemon_dfs_message_attachment(&data_dir, command, attachment, runtime).await?;
     let cluster_paths = ClusterPaths::new(&data_dir);
     let request_id = command.request_id.clone();
     let source_node_id = command.routed_message.source_node_id.clone();
@@ -3746,6 +3913,7 @@ async fn handle_daemon_dfs_message_async(
                 &process_data_dir,
                 &process_cluster_paths,
                 command,
+                preingested_stage_blob,
                 &process_execution_scope,
                 &process_runtime,
                 process_traceparent.clone(),
@@ -3814,6 +3982,7 @@ fn handle_daemon_dfs_message_on_runtime(
         &data_dir,
         &cluster_paths,
         command,
+        None,
         &execution_scope,
         runtime,
         None,
@@ -6781,6 +6950,7 @@ mod tests {
             bytes,
             content_hash: None,
             content_size_bytes: None,
+            requester_blob_pre_staged: true,
             desired_replica_nodes: vec![source_node_id.clone()],
             policy: DfsReplicationPolicy::new(1, 1).expect("replication policy"),
             object_metadata: Some(object),
@@ -6849,6 +7019,57 @@ mod tests {
 
     fn daemon_test_runtime(name: &str) -> tokio::runtime::Runtime {
         crate::build_daemon_async_runtime(name).expect("test daemon runtime")
+    }
+
+    #[test]
+    fn daemon_streams_owned_dfs_attachment_into_primary_content_ingest() {
+        let root = temp_root("streamed-primary-content-ingest");
+        let data_dir = SinomoDataDir::new(root.path());
+        let source = NodeId::from_legacy_named("node_streamed_ingest_source").expect("source");
+        let target = NodeId::from_legacy_named("node_streamed_ingest_target").expect("target");
+        let mut routed =
+            test_dfs_write_routed_message(&source, &target, 71_001, "/services/streamed.bin");
+        let DfsNetworkMessage::DistributedWriteRequest(write) = &mut routed.message else {
+            panic!("distributed write request");
+        };
+        let bytes = std::mem::take(&mut write.bytes);
+        let object_id = write.request.object_id.clone();
+        let version = write.request.target_version.clone();
+        write.requester_blob_pre_staged = false;
+        let command = test_dfs_message_command("streamed-primary-content-ingest", routed);
+        let attachment = DfsInboundAttachment {
+            descriptor: sinomo_dfs::DfsRpcAttachmentDescriptor {
+                total_size_bytes: bytes.len() as u64,
+                content_hash: None,
+            },
+            body: sinomo_core::network::ObjectRpcIncomingBody::bytes(bytes.clone()),
+        };
+        let runtime = daemon_test_runtime("daemon-dfs-streamed-primary-content-ingest");
+
+        let (command, preingested_stage_blob) = runtime
+            .block_on(ingest_daemon_dfs_message_attachment(
+                &data_dir,
+                command,
+                Some(attachment),
+                runtime.handle(),
+            ))
+            .expect("stream attachment into content store");
+
+        assert!(preingested_stage_blob.is_none());
+        let DfsNetworkMessage::DistributedWriteRequest(write) = command.routed_message.message
+        else {
+            panic!("distributed write request");
+        };
+        assert!(write.bytes.is_empty());
+        assert_eq!(write.content_size_bytes, Some(bytes.len() as u64));
+        let content_hash = write.content_hash.expect("primary finalized hash");
+        let content =
+            LocalContentStore::new(data_dir.dfs_dir().join("content")).expect("content store");
+        let (manifest, stored) = content
+            .read_object_version(object_id.as_str(), version.as_str())
+            .expect("read streamed object");
+        assert_eq!(stored, bytes);
+        assert_eq!(content_hash, manifest.content_hash);
     }
 
     fn run_daemon_dfs_maintenance_body_for_test(
@@ -10662,7 +10883,7 @@ mod tests {
         let task_paths = paths.clone();
         let task_runtime = runtime.handle().clone();
         let rpc = runtime.handle().spawn(async move {
-            handle_daemon_dfs_message_async(&task_paths, command, None, &task_runtime).await
+            handle_daemon_dfs_message_async(&task_paths, command, None, None, &task_runtime).await
         });
 
         committed_rx
@@ -10801,7 +11022,7 @@ mod tests {
         let task_paths = paths.clone();
         let task_runtime = runtime.handle().clone();
         let rpc = runtime.handle().spawn(async move {
-            handle_daemon_dfs_message_async(&task_paths, command, None, &task_runtime).await
+            handle_daemon_dfs_message_async(&task_paths, command, None, None, &task_runtime).await
         });
 
         committed_rx

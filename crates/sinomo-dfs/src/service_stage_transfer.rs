@@ -15,43 +15,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester_node_id: NodeId,
         command: DfsStageBlobCommand,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
-        let result = match self
-            .ensure_replica_command_authorized_with_metadata(
-                &requester_node_id,
-                &command.intent_id,
-                &command.object_id,
-                command.object_metadata.as_ref(),
-                command.authority_shard.as_ref(),
-            )
-            .and_then(|()| self.ensure_replica_object_metadata(command.object_metadata.as_ref()))
-            .and_then(|()| {
-                self.ensure_no_conflicting_pending_replica_write(
-                    "stage",
-                    &requester_node_id,
-                    &command.intent_id,
-                    &command.object_id,
-                    &command.version,
-                    &command.content_hash,
-                )
-            })
-            .and_then(|()| {
-                self.ensure_command_base_matches_current(
-                    "stage",
-                    &command.object_id,
-                    command.expected_base_version.as_ref(),
-                    &command.version,
-                    &command.content_hash,
-                )
-            })
-            .and_then(|()| {
-                let local_node_id = self.node_id.clone();
-                self.ensure_metadata_receipt_accepts(
-                    &command.object_id,
-                    &command.version,
-                    &local_node_id,
-                    &command.content_hash,
-                )
-            })
+        let storage_result = self
+            .validate_stage_blob_command(&requester_node_id, &command)
             .and_then(|()| {
                 self.store_command_bytes(
                     &command.object_id,
@@ -59,7 +24,83 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &command.content_hash,
                     &command.bytes,
                 )
-            }) {
+            });
+        self.finish_stage_blob(requester_node_id, command, storage_result)
+    }
+
+    pub(crate) fn handle_preingested_stage_blob(
+        &mut self,
+        requester_node_id: NodeId,
+        command: DfsStageBlobCommand,
+        manifest: ContentManifest,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let storage_result = self
+            .validate_stage_blob_command(&requester_node_id, &command)
+            .and_then(|()| {
+                if manifest.object_id != command.object_id.as_str()
+                    || manifest.version != command.version.as_str()
+                    || manifest.content_hash != command.content_hash
+                {
+                    return Err(DfsError::ContentHashMismatch {
+                        expected: command.content_hash.clone(),
+                        actual: manifest.content_hash,
+                    });
+                }
+                Ok(())
+            });
+        self.finish_stage_blob(requester_node_id, command, storage_result)
+    }
+
+    fn validate_stage_blob_command(
+        &mut self,
+        requester_node_id: &NodeId,
+        command: &DfsStageBlobCommand,
+    ) -> Result<(), DfsError> {
+        self.ensure_replica_command_authorized_with_metadata(
+            requester_node_id,
+            &command.intent_id,
+            &command.object_id,
+            command.object_metadata.as_ref(),
+            command.authority_shard.as_ref(),
+        )
+        .and_then(|()| self.ensure_replica_object_metadata(command.object_metadata.as_ref()))
+        .and_then(|()| {
+            self.ensure_no_conflicting_pending_replica_write(
+                "stage",
+                requester_node_id,
+                &command.intent_id,
+                &command.object_id,
+                &command.version,
+                &command.content_hash,
+            )
+        })
+        .and_then(|()| {
+            self.ensure_command_base_matches_current(
+                "stage",
+                &command.object_id,
+                command.expected_base_version.as_ref(),
+                &command.version,
+                &command.content_hash,
+            )
+        })
+        .and_then(|()| {
+            let local_node_id = self.node_id.clone();
+            self.ensure_metadata_receipt_accepts(
+                &command.object_id,
+                &command.version,
+                &local_node_id,
+                &command.content_hash,
+            )
+        })
+    }
+
+    fn finish_stage_blob(
+        &mut self,
+        requester_node_id: NodeId,
+        command: DfsStageBlobCommand,
+        storage_result: Result<(), DfsError>,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let result = match storage_result {
             Ok(()) => {
                 let local_node_id = self.node_id.clone();
                 self.put_replica_receipt_if_authoritative(

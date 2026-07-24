@@ -149,6 +149,11 @@ const CLUSTER_NETWORK_PENDING_MEMBER_PUBLISH_TIMEOUT: Duration =
     CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT;
 const CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT: Duration =
     CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT;
+// A freshly activated daemon first commits the liveness record that formation
+// and operators consume. Slow-changing network metadata follows on a separate
+// maintenance generation so six simultaneous replacements do not double the
+// quorum-commit load on the join critical path.
+const CLUSTER_NETWORK_INITIAL_PRESENCE_METADATA_FOLLOWUP_DELAY: Duration = Duration::from_secs(5);
 const CLUSTER_NETWORK_PENDING_SERVICE_PUBLISH_TIMEOUT: Duration =
     CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT;
 // A stale node-status publication can itself depend on the route that this
@@ -345,6 +350,12 @@ struct ClusterNodeStatusPendingRefresh {
     label: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ClusterNodeStatusPendingOutcome {
+    succeeded: bool,
+    metadata_followup_needed: bool,
+}
+
 /// Owns a separately scheduled daemon operation and aborts it when its caller
 /// is cancelled. This keeps task boundaries from detaching uncertain cluster
 /// mutations when an enclosing deadline expires.
@@ -382,14 +393,6 @@ static PUBLISHED_NODE_STATUS: OnceLock<Mutex<BTreeMap<String, ClusterNodeStatusR
     OnceLock::new();
 static PUBLISHED_CONNECTIVITY: OnceLock<
     Mutex<BTreeMap<PublishedConnectivitySourceKey, PublishedConnectivitySourceCache>>,
-> = OnceLock::new();
-// The generation is incremented after every locally recorded join endpoint.
-// A publisher snapshots it before reading the local source set and only
-// retires the entry if the generation is still unchanged after quorum commit.
-// This makes the coalescer lossless: an endpoint recorded while a publish is
-// in flight forces another pass instead of being stranded until maintenance.
-static JOIN_CONNECTIVITY_SYNC_IN_FLIGHT: OnceLock<
-    Mutex<BTreeMap<PublishedConnectivitySourceKey, u64>>,
 > = OnceLock::new();
 
 thread_local! {
@@ -956,57 +959,6 @@ fn remember_connectivity_record_set(
     }
 }
 
-fn mark_join_connectivity_sync_in_flight(
-    paths: &ClusterPaths,
-    source_node_id: &NodeId,
-) -> Option<PublishedConnectivitySourceKey> {
-    let source_key = connectivity_cache_source_key(paths, source_node_id);
-    let mut guard = JOIN_CONNECTIVITY_SYNC_IN_FLIGHT
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .ok()?;
-    if let Some(generation) = guard.get_mut(&source_key) {
-        *generation = generation.saturating_add(1);
-        return None;
-    }
-    guard.insert(source_key.clone(), 1);
-    Some(source_key)
-}
-
-fn join_connectivity_sync_generation(source_key: &PublishedConnectivitySourceKey) -> Option<u64> {
-    JOIN_CONNECTIVITY_SYNC_IN_FLIGHT
-        .get()?
-        .lock()
-        .ok()?
-        .get(source_key)
-        .copied()
-}
-
-fn finish_join_connectivity_sync_generation(
-    source_key: &PublishedConnectivitySourceKey,
-    published_generation: u64,
-) -> bool {
-    let Some(lock) = JOIN_CONNECTIVITY_SYNC_IN_FLIGHT.get() else {
-        return true;
-    };
-    let Ok(mut guard) = lock.lock() else {
-        return false;
-    };
-    if guard.get(source_key).copied() != Some(published_generation) {
-        return false;
-    }
-    guard.remove(source_key);
-    true
-}
-
-fn clear_join_connectivity_sync_in_flight(source_key: &PublishedConnectivitySourceKey) {
-    if let Some(lock) = JOIN_CONNECTIVITY_SYNC_IN_FLIGHT.get()
-        && let Ok(mut guard) = lock.lock()
-    {
-        guard.remove(source_key);
-    }
-}
-
 fn publish_command_connectivity_if_needed(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -1014,120 +966,6 @@ fn publish_command_connectivity_if_needed(
     runtime: Option<&tokio::runtime::Handle>,
 ) {
     publish_command_connectivity_if_needed_with_policy(paths, state, record, runtime, false);
-}
-
-fn publish_join_connectivity_if_needed(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    record: &ClusterConnectivityRecord,
-    runtime: &tokio::runtime::Handle,
-) {
-    if cached_connectivity_matches(paths, record) {
-        crate::cluster_join_trace(format_args!(
-            "connectivity publish source={} target={} endpoint={} skipped cached",
-            record.source_node_id, record.target_node_id, record.endpoint_id
-        ));
-        return;
-    }
-    let Some(source_key) = mark_join_connectivity_sync_in_flight(paths, &state.local_node_id)
-    else {
-        crate::cluster_join_trace(format_args!(
-            "connectivity publish source={} target={} endpoint={} skipped coalesced",
-            record.source_node_id, record.target_node_id, record.endpoint_id
-        ));
-        return;
-    };
-    let paths = paths.clone();
-    let state = state.clone();
-    let source_node_id = state.local_node_id.clone();
-    let target_node_id = record.target_node_id.clone();
-    let endpoint_id = record.endpoint_id.clone();
-    let observed_record = record.clone();
-    let spawn_runtime = runtime.clone();
-    let task_runtime = runtime.clone();
-    spawn_runtime.spawn(async move {
-        let started = Instant::now();
-        crate::cluster_join_trace(format_args!(
-            "connectivity publish source={source_node_id} target={target_node_id} endpoint={endpoint_id} start"
-        ));
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        loop {
-            // Snapshot the generation before reading. Every caller records its
-            // endpoint before incrementing the generation, so a later change
-            // is either present in this read or forces another loop pass.
-            let Some(generation) = join_connectivity_sync_generation(&source_key) else {
-                return;
-            };
-            let mut records =
-                sinomo_core::network::read_local_cluster_connectivity_records_for_source(
-                    &paths,
-                    &source_node_id,
-                )
-                .unwrap_or_default();
-            if !records.iter().any(|record| {
-                record.target_node_id == observed_record.target_node_id
-                    && record.endpoint_id == observed_record.endpoint_id
-            }) {
-                records.push(observed_record.clone());
-            }
-            let record_count = records.len();
-            let publish_started = Instant::now();
-            crate::cluster_join_trace(format_args!(
-                "connectivity quorum publish source={source_node_id} generation={generation} records={record_count} start"
-            ));
-            let mut publish_host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
-                DaemonClusterRpcMode::new(task_runtime.clone()),
-                cluster_control_plane_timeouts(),
-            );
-            let published =
-                sinomo_core::cluster::sync_cluster_connectivity_records_to_quorum_async_with_state_and_host(
-                    &task_runtime,
-                    &paths,
-                    &source_node_id,
-                    records.clone(),
-                    state.clone(),
-                    &mut publish_host,
-                )
-                .await;
-            let imported = import_peer_connectivity_records_from_reachable_endpoints_async(
-                &paths,
-                &state,
-                &records,
-                task_runtime.clone(),
-            )
-            .await;
-            match published {
-                Ok(snapshot) => {
-                    let revision = snapshot.as_ref().map(|snapshot| snapshot.revision);
-                    crate::cluster_join_trace(format_args!(
-                        "connectivity quorum publish source={source_node_id} generation={generation} records={record_count} revision={revision:?} imported={imported} committed in {:?} total {:?}",
-                        publish_started.elapsed(),
-                        started.elapsed()
-                    ));
-                }
-                Err(error) => {
-                    crate::cluster_join_trace(format_args!(
-                        "connectivity quorum publish source={source_node_id} generation={generation} records={record_count} imported={imported} failed in {:?}: {error}",
-                        publish_started.elapsed()
-                    ));
-                    tracing::warn!(
-                        "sinomo daemon join connectivity quorum publish failed: {error}"
-                    );
-                    clear_join_connectivity_sync_in_flight(&source_key);
-                    crate::control::request_daemon_cluster_maintenance(
-                        crate::control::DaemonClusterMaintenanceReason::JoinConnectivityPublishFailed,
-                    );
-                    return;
-                }
-            }
-            if finish_join_connectivity_sync_generation(&source_key, generation) {
-                return;
-            }
-            crate::cluster_join_trace(format_args!(
-                "connectivity quorum publish source={source_node_id} generation={generation} draining newer observations"
-            ));
-        }
-    });
 }
 
 fn publish_command_connectivity_if_needed_with_policy(
@@ -1171,19 +1009,20 @@ fn remember_successful_join_endpoint_connectivity(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
-    runtime: &tokio::runtime::Handle,
 ) {
-    let Ok(record) = sinomo_core::network::__connectivity_store::record_daemon_owned_local_cluster_endpoint_command_connectivity(
+    // The accepted response path must become locally routable before the
+    // registration returns. Quorum publication is deliberately not performed
+    // here: JoinAccepted wakes the persistent maintenance reactor, which owns
+    // generation-fenced connectivity publication. The former ad-hoc publisher
+    // raced subsequent learner admission commits and duplicated that owner.
+    let _ = sinomo_core::network::__connectivity_store::record_daemon_owned_local_cluster_endpoint_command_connectivity(
         paths,
         state,
         endpoint,
         sinomo_core::network::ClusterConnectivityState::Healthy,
         None,
         true,
-    ) else {
-        return;
-    };
-    publish_join_connectivity_if_needed(paths, state, &record, runtime);
+    );
 }
 
 pub(crate) fn remember_cluster_endpoint_command_connectivity(
@@ -1836,9 +1675,9 @@ impl sinomo_core::cluster::ClusterJoinRegistrationHost for DaemonClusterJoinRegi
     ) -> Result<(), sinomo_core::network::NetworkError> {
         // Joining through a bridge has a narrow ordering window: the voter can
         // accept the member before the rest of the cluster has a routable edge
-        // to it. Publish this accepted response-path observation immediately so
-        // route planning does not wait for the periodic probe publisher.
-        remember_successful_join_endpoint_connectivity(paths, state, endpoint, &self.runtime);
+        // to it. Record this accepted response-path observation immediately so
+        // local route planning does not wait for the maintenance reactor.
+        remember_successful_join_endpoint_connectivity(paths, state, endpoint);
         Ok(())
     }
 }
@@ -1947,9 +1786,8 @@ impl sinomo_core::cluster::ClusterJoinRegistrationAsyncHost
         state: &'a ClusterBootstrapState,
         endpoint: &'a ClusterEndpointRecord,
     ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, ()> {
-        let runtime = self.runtime.clone();
         Box::pin(async move {
-            remember_successful_join_endpoint_connectivity(paths, state, endpoint, &runtime);
+            remember_successful_join_endpoint_connectivity(paths, state, endpoint);
             Ok(())
         })
     }
@@ -3944,6 +3782,7 @@ impl ClusterNetworkMaintenance {
         } = pending;
         let mut publish_succeeded = !publish_planning_failed;
         let mut publish_followup_needed = false;
+        let mut presence_metadata_followup_needed = false;
         let mut probe_succeeded = true;
         // A main daemon's presence is part of join realization, not optional
         // graph maintenance. Publish it before probing so unreachable shadow
@@ -3963,14 +3802,20 @@ impl ClusterNetworkMaintenance {
         };
         let connectivity_probe_deadline = deadline;
         for refresh in node_status_refreshes {
-            publish_succeeded &= cluster_network_pending_step_with_deadline(
+            let outcome = cluster_network_pending_step_with_deadline(
                 "node status refresh",
                 CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT,
                 node_status_deadline,
                 self.run_pending_node_status_refresh_async(refresh, runtime.clone()),
             )
-            .await
-                == Some(true);
+            .await;
+            match outcome {
+                Some(outcome) => {
+                    publish_succeeded &= outcome.succeeded;
+                    presence_metadata_followup_needed |= outcome.metadata_followup_needed;
+                }
+                None => publish_succeeded = false,
+            }
         }
         if let Some(probe) = connectivity_probe {
             let probe_result = self
@@ -4055,19 +3900,30 @@ impl ClusterNetworkMaintenance {
             }
         }
         for refresh in low_priority_node_status_refreshes {
-            publish_succeeded &= cluster_network_pending_step_with_deadline(
+            let outcome = cluster_network_pending_step_with_deadline(
                 "low-priority node status refresh",
                 CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT,
                 deadline,
                 self.run_pending_node_status_refresh_async(refresh, runtime.clone()),
             )
-            .await
-                == Some(true);
+            .await;
+            match outcome {
+                Some(outcome) => {
+                    publish_succeeded &= outcome.succeeded;
+                    presence_metadata_followup_needed |= outcome.metadata_followup_needed;
+                }
+                None => publish_succeeded = false,
+            }
         }
         if publish_claimed {
             if publish_succeeded {
                 self.record_publish_success();
-                if publish_followup_needed {
+                if presence_metadata_followup_needed {
+                    self.defer_publish_retry(
+                        Instant::now(),
+                        CLUSTER_NETWORK_INITIAL_PRESENCE_METADATA_FOLLOWUP_DELAY,
+                    );
+                } else if publish_followup_needed {
                     self.defer_publish_retry(
                         Instant::now(),
                         DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF,
@@ -4236,7 +4092,7 @@ impl ClusterNetworkMaintenance {
         &mut self,
         pending: ClusterNodeStatusPendingRefresh,
         runtime: tokio::runtime::Handle,
-    ) -> bool {
+    ) -> ClusterNodeStatusPendingOutcome {
         let label = pending.label;
         let task_runtime = runtime.clone();
         let mut task = OwnedDaemonTask::new(runtime.spawn(async move {
@@ -4250,15 +4106,18 @@ impl ClusterNetworkMaintenance {
         match task.join().await {
             Ok(Ok(published)) => {
                 self.record_node_status_publish(&published);
-                true
+                ClusterNodeStatusPendingOutcome {
+                    succeeded: true,
+                    metadata_followup_needed: published.network_info_deferred,
+                }
             }
             Ok(Err(error)) => {
                 tracing::warn!("sinomo daemon {label} publish failed: {error}");
-                false
+                ClusterNodeStatusPendingOutcome::default()
             }
             Err(error) => {
                 tracing::warn!("sinomo daemon {label} publish task failed: {error}");
-                false
+                ClusterNodeStatusPendingOutcome::default()
             }
         }
     }
@@ -5827,6 +5686,7 @@ async fn fetch_daemon_status_from_endpoint_direct_async(
 pub(crate) struct NodeStatusPublishOutcome {
     pub network_info_published: bool,
     pub node_status_published: bool,
+    pub network_info_deferred: bool,
 }
 
 pub(crate) fn refresh_daemon_node_status_in_kv(
@@ -5886,7 +5746,9 @@ pub(crate) fn refresh_daemon_node_status_in_kv_on_runtime(
         outcome.node_status_published = true;
     }
     if !publish_matches.network_info_matches {
-        if let Err(error) =
+        if outcome.node_status_published {
+            outcome.network_info_deferred = true;
+        } else if let Err(error) =
             sync_cluster_network_info_to_kv_on_runtime(&cluster_paths, network_info, runtime)
         {
             tracing::warn!("sinomo daemon network info publish failed: {error}");
@@ -6028,25 +5890,29 @@ async fn refresh_daemon_node_status_in_kv_async_with_timeouts(
         outcome.node_status_published = true;
     }
     if !publish_matches.network_info_matches {
-        let publish_result = {
-            let mut phase = DaemonNodeStatusPublishPhaseObservation::start(
-                DaemonNodeStatusPublishPhase::NetworkInfoCommit,
-                operation_budget,
-            );
-            let result = sync_cluster_network_info_to_kv_async_with_timeouts(
-                &cluster_paths,
-                network_info,
-                runtime,
-                timeouts,
-            )
-            .await;
-            phase.complete();
-            result
-        };
-        if let Err(error) = publish_result {
-            tracing::warn!("sinomo daemon network info publish failed: {error}");
+        if outcome.node_status_published {
+            outcome.network_info_deferred = true;
         } else {
-            outcome.network_info_published = true;
+            let publish_result = {
+                let mut phase = DaemonNodeStatusPublishPhaseObservation::start(
+                    DaemonNodeStatusPublishPhase::NetworkInfoCommit,
+                    operation_budget,
+                );
+                let result = sync_cluster_network_info_to_kv_async_with_timeouts(
+                    &cluster_paths,
+                    network_info,
+                    runtime,
+                    timeouts,
+                )
+                .await;
+                phase.complete();
+                result
+            };
+            if let Err(error) = publish_result {
+                tracing::warn!("sinomo daemon network info publish failed: {error}");
+            } else {
+                outcome.network_info_published = true;
+            }
         }
     }
     Ok(outcome)
@@ -10229,39 +10095,6 @@ mod tests {
         assert_eq!(cache.get("c"), Some(&3));
     }
 
-    #[test]
-    fn join_connectivity_publish_coalescer_does_not_strand_late_observations() {
-        let root = unique_cluster_test_root("join-connectivity-publish-coalescer");
-        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-        let node_id =
-            NodeId::from_legacy_named("node_join_connectivity_publish_coalescer").expect("node id");
-        let source_key = mark_join_connectivity_sync_in_flight(&paths, &node_id)
-            .expect("first observation starts publisher");
-        let first_generation =
-            join_connectivity_sync_generation(&source_key).expect("first generation");
-
-        assert!(
-            mark_join_connectivity_sync_in_flight(&paths, &node_id).is_none(),
-            "a concurrent observation must coalesce into the active publisher"
-        );
-        assert!(
-            !finish_join_connectivity_sync_generation(&source_key, first_generation),
-            "the publisher must not retire a source after a newer observation"
-        );
-        let second_generation =
-            join_connectivity_sync_generation(&source_key).expect("newer generation");
-        assert!(second_generation > first_generation);
-        assert!(finish_join_connectivity_sync_generation(
-            &source_key,
-            second_generation
-        ));
-        assert!(
-            mark_join_connectivity_sync_in_flight(&paths, &node_id).is_some(),
-            "a fully drained source must allow a new publisher"
-        );
-        clear_join_connectivity_sync_in_flight(&source_key);
-    }
-
     struct CachedHitPublishHost {
         store: InProcessKvStore,
         commits: usize,
@@ -10721,10 +10554,9 @@ mod tests {
     }
 
     #[test]
-    fn join_connectivity_publisher_commits_local_source_set_to_quorum() {
-        let (_root, paths, mut state) = seeded_single_node_cluster_for_publish_cache_test(
-            "join_connectivity_publisher_commits_quorum",
-        );
+    fn join_connectivity_handoff_records_locally_without_inline_quorum_publish() {
+        let (_root, paths, mut state) =
+            seeded_single_node_cluster_for_publish_cache_test("join_connectivity_handoff_is_local");
         let endpoint = sinomo_core::network::daemon_lan_endpoint(
             &state.local_node_id,
             "127.0.0.1:32154".to_string(),
@@ -10734,9 +10566,8 @@ mod tests {
         sinomo_core::cluster::write_cluster_state(&paths, &state).expect("write endpoint state");
         sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync endpoint state to raft");
-        let runtime = daemon_cluster_test_runtime();
 
-        remember_successful_join_endpoint_connectivity(&paths, &state, &endpoint, runtime.handle());
+        remember_successful_join_endpoint_connectivity(&paths, &state, &endpoint);
         let record = sinomo_core::network::read_local_cluster_connectivity_records_for_source(
             &paths,
             &state.local_node_id,
@@ -10750,31 +10581,11 @@ mod tests {
             &record.target_node_id,
             &record.endpoint_id,
         );
-        let source_key = connectivity_cache_source_key(&paths, &state.local_node_id);
-
-        runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let snapshot =
-                        sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(&paths)
-                            .expect("read published snapshot");
-                    if snapshot.get(&key).is_some()
-                        && join_connectivity_sync_generation(&source_key).is_none()
-                    {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("join connectivity publisher must finish");
-        });
-
         let snapshot = sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(&paths)
-            .expect("published connectivity snapshot");
+            .expect("pre-maintenance connectivity snapshot");
         assert!(
-            snapshot.get(&key).is_some(),
-            "accepted response-path connectivity must cross quorum"
+            snapshot.get(&key).is_none(),
+            "accepted response-path handoff must not launch a competing quorum commit; the maintenance reactor owns publication"
         );
     }
 
@@ -14503,6 +14314,7 @@ mod tests {
         let plan = maintenance.select_connectivity_probe_plan(&cluster_paths, &state);
         assert_eq!(plan.entries.len(), 1, "test needs one stalled probe");
         let pending = ClusterNetworkMaintenancePendingWork {
+            publish_claimed: true,
             connectivity_probe: Some(ClusterConnectivityPendingProbe {
                 paths: cluster_paths.clone(),
                 source_node_id: local_node.clone(),
@@ -14546,6 +14358,44 @@ mod tests {
             "join-critical node-status publication must execute before the stalled probe; statuses={statuses:?} idle={:?} failures={}",
             maintenance.idle_stats.snapshot(),
             maintenance.publish_failure_streak,
+        );
+        let snapshot =
+            sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(&cluster_paths)
+                .expect("post-presence snapshot");
+        assert!(
+            snapshot
+                .get(&cluster_network_info_key(&local_node))
+                .is_none(),
+            "slow-changing network metadata must not add a second quorum commit to the initial presence generation"
+        );
+        assert!(
+            maintenance.next_due_duration(Instant::now())
+                <= CLUSTER_NETWORK_INITIAL_PRESENCE_METADATA_FOLLOWUP_DELAY,
+            "deferred network metadata must retain a bounded maintenance follow-up"
+        );
+        let metadata_followup = runtime
+            .block_on(refresh_daemon_node_status_in_kv_async_with_timeouts(
+                &daemon_paths,
+                runtime.handle().clone(),
+                cluster_control_plane_timeouts(),
+            ))
+            .expect("publish deferred network metadata");
+        assert_eq!(
+            metadata_followup,
+            NodeStatusPublishOutcome {
+                network_info_published: true,
+                node_status_published: false,
+                network_info_deferred: false,
+            }
+        );
+        let snapshot =
+            sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(&cluster_paths)
+                .expect("post-metadata snapshot");
+        assert!(
+            snapshot
+                .get(&cluster_network_info_key(&local_node))
+                .is_some(),
+            "the follow-up generation must publish the deferred network metadata"
         );
     }
 
@@ -19663,7 +19513,7 @@ mod tests {
     }
 
     #[test]
-    fn cold_start_join_handoff_import_bypasses_detached_publish_coalescing() {
+    fn cold_start_join_handoff_import_preserves_local_source_ownership() {
         let root = unique_cluster_test_root("cold-start-join-connectivity-handoff");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -19770,11 +19620,6 @@ mod tests {
         local_source_echo.source_node_id = local_node.clone();
         local_source_echo.last_success_at = Some("peer echo of local source".to_string());
 
-        // Model the detached publish task still owning its per-source
-        // coalescing marker when the identity-changing command reaches the
-        // handoff. The synchronous import must not wait for that task.
-        let in_flight = mark_join_connectivity_sync_in_flight(&paths, &local_node)
-            .expect("mark detached join publisher in flight");
         let expected_introducer = introducer_record.clone();
         let expected_upstream = upstream_record.clone();
         let runtime = daemon_cluster_test_runtime();
@@ -19785,7 +19630,6 @@ mod tests {
             runtime.handle(),
             async move { Ok(vec![introducer_record, upstream_record, local_source_echo]) },
         );
-        clear_join_connectivity_sync_in_flight(&in_flight);
 
         assert_eq!(imported, 2);
         let stored_introducer =

@@ -53,7 +53,7 @@ use sinomo_node::{
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Weak};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 const JOIN_RECONCILIATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -67,7 +67,7 @@ const CLUSTER_JOIN_ADMISSION_MAX_ATTEMPTS: usize = 16;
 const CLUSTER_JOIN_ADMISSION_MAX_RETRY_BACKOFF: Duration = Duration::from_millis(16);
 
 /// Serializes authority-local async join admission preparation while allowing
-/// a request that was already waiting to reuse the preceding admission's
+/// sequential and already-waiting requests to reuse the preceding admission's
 /// current-term quorum result.
 ///
 /// Without this boundary, a burst prepares every learner from the same Raft
@@ -84,8 +84,10 @@ struct AsyncClusterJoinAdmissionCoordinator {
     latest_authoritative: std::sync::Mutex<Option<KvAuthoritativeRead<KvSnapshot>>>,
 }
 
+const ASYNC_CLUSTER_JOIN_ADMISSION_COORDINATOR_CACHE_MAX_ENTRIES: usize = 64;
+
 static ASYNC_CLUSTER_JOIN_ADMISSION_COORDINATORS: LazyLock<
-    std::sync::Mutex<HashMap<PathBuf, Weak<AsyncClusterJoinAdmissionCoordinator>>>,
+    std::sync::Mutex<HashMap<PathBuf, Arc<AsyncClusterJoinAdmissionCoordinator>>>,
 > = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 fn async_cluster_join_admission_coordinator(
@@ -94,15 +96,21 @@ fn async_cluster_join_admission_coordinator(
     let mut coordinators = ASYNC_CLUSTER_JOIN_ADMISSION_COORDINATORS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(coordinator) = coordinators
-        .get(&paths.root)
-        .and_then(std::sync::Weak::upgrade)
-    {
-        return coordinator;
+    if let Some(coordinator) = coordinators.get(&paths.root) {
+        return Arc::clone(coordinator);
     }
-    coordinators.retain(|_, coordinator| coordinator.strong_count() > 0);
+    // Retain the most recent authoritative snapshot between sequential join
+    // waves. The old weak registry discarded it as soon as one admission
+    // returned, forcing the next learner to reconstruct Raft authority from
+    // disk and quorum even though the preceding commit already produced the
+    // exact current-term snapshot. Bound inactive entries for test processes
+    // that exercise many independent data directories; active admissions are
+    // never evicted.
+    if coordinators.len() >= ASYNC_CLUSTER_JOIN_ADMISSION_COORDINATOR_CACHE_MAX_ENTRIES {
+        coordinators.retain(|_, coordinator| Arc::strong_count(coordinator) > 1);
+    }
     let coordinator = Arc::new(AsyncClusterJoinAdmissionCoordinator::default());
-    coordinators.insert(paths.root.clone(), Arc::downgrade(&coordinator));
+    coordinators.insert(paths.root.clone(), Arc::clone(&coordinator));
     coordinator
 }
 
@@ -111,13 +119,7 @@ impl AsyncClusterJoinAdmissionCoordinator {
         self.completed_generation.load(Ordering::Acquire)
     }
 
-    fn authoritative_completed_after(
-        &self,
-        observed_generation: u64,
-    ) -> Option<KvAuthoritativeRead<KvSnapshot>> {
-        if self.generation() <= observed_generation {
-            return None;
-        }
+    fn latest_authoritative(&self) -> Option<KvAuthoritativeRead<KvSnapshot>> {
         self.latest_authoritative
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1714,15 +1716,19 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
         format_args!("waiting for authority-local join admission turn"),
     );
     let admission_turn = admission_coordinator.turn.lock().await;
-    let coalesced_authoritative = admission_coordinator
-        .authoritative_completed_after(observed_admission_generation)
+    let cached_authoritative = admission_coordinator
+        .latest_authoritative()
         .filter(|authoritative| authoritative.authority.term >= state.term);
     let (coordinator_revision, coordinator_term, coordinator_outcome) =
-        match coalesced_authoritative.as_ref() {
+        match cached_authoritative.as_ref() {
             Some(authoritative) => (
                 authoritative.value.revision.0,
                 authoritative.authority.term,
-                "coalesced",
+                if admission_coordinator.generation() > observed_admission_generation {
+                    "coalesced"
+                } else {
+                    "cached"
+                },
             ),
             None => (state.kv_revision, state.term, "acquired"),
         };
@@ -1741,7 +1747,11 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
         ),
     );
 
-    let mut authoritative = if let Some(authoritative) = coalesced_authoritative {
+    // A committed snapshot remains a safe optimistic input after the preceding
+    // request has returned: every admission transaction compares the Raft
+    // generation and invitation/member state, and a concurrent mutation
+    // returns the newer authoritative snapshot for the normal retry path.
+    let mut authoritative = if let Some(authoritative) = cached_authoritative {
         authoritative
     } else {
         let authority_open_started = Instant::now();

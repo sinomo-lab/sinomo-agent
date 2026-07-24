@@ -926,6 +926,7 @@ fn dfs_protocol_binary_payloads_use_native_bytes_codec() {
             bytes: bytes.clone(),
             content_hash: Some("hash".to_string()),
             content_size_bytes: Some(bytes.len() as u64),
+            requester_blob_pre_staged: true,
             desired_replica_nodes: vec![node_id.clone()],
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
             object_metadata: None,
@@ -1463,6 +1464,7 @@ fn test_routed_write_command(
         bytes: Vec::new(),
         content_hash: Some(format!("blake3:{request_id}")),
         content_size_bytes: Some(0),
+        requester_blob_pre_staged: true,
         desired_replica_nodes: vec![requester.clone()],
         policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
         object_metadata: None,
@@ -4365,6 +4367,7 @@ fn served_message_drains_nested_stage_response_before_returning() {
         bytes: b"served routed bytes".to_vec(),
         content_hash: None,
         content_size_bytes: None,
+        requester_blob_pre_staged: true,
         desired_replica_nodes: vec![primary.clone(), replica.clone()],
         policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
         object_metadata: None,
@@ -4622,6 +4625,7 @@ fn served_receipt_returns_before_unrelated_completed_write_response_rpc() {
                     bytes: b"completed response belongs to an earlier caller".to_vec(),
                     content_hash: None,
                     content_size_bytes: None,
+                    requester_blob_pre_staged: true,
                     desired_replica_nodes: vec![primary.clone(), replica.clone()],
                     policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
                     object_metadata: None,
@@ -4845,6 +4849,7 @@ fn served_non_foreground_write_does_not_retry_unrelated_repairs() {
         bytes: b"served routed deferred bytes".to_vec(),
         content_hash: None,
         content_size_bytes: None,
+        requester_blob_pre_staged: true,
         desired_replica_nodes: vec![requester.clone(), replica.clone()],
         policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
         object_metadata: None,
@@ -5008,6 +5013,7 @@ fn served_foreground_write_returns_committed_response_before_replica_repair_comp
         bytes: b"served scoped foreground bytes".to_vec(),
         content_hash: None,
         content_size_bytes: None,
+        requester_blob_pre_staged: true,
         desired_replica_nodes: vec![requester.clone(), replica.clone()],
         policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
         object_metadata: None,
@@ -11524,6 +11530,7 @@ fn promoted_replica_auto_rebinds_cached_lane_before_stamped_routed_write() {
                 bytes: b"first write through the cached promoted lane".to_vec(),
                 content_hash: None,
                 content_size_bytes: None,
+                requester_blob_pre_staged: true,
                 desired_replica_nodes: vec![promoted.clone()],
                 policy: DfsReplicationPolicy::new(1, 1).expect("local write policy"),
                 object_metadata: Some(source_object.clone()),
@@ -12670,6 +12677,7 @@ fn routed_write_replay_uses_existing_committed_intent_after_service_restart() {
         bytes: Vec::new(),
         content_hash: Some(content_hash.clone()),
         content_size_bytes: Some(31),
+        requester_blob_pre_staged: true,
         desired_replica_nodes: vec![requester.clone()],
         policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
         object_metadata: Some(object.clone()),
@@ -12837,6 +12845,7 @@ fn routed_exclusive_create_replays_only_the_exact_request_and_rolls_back_rejecti
             bytes: Vec::new(),
             content_hash: None,
             content_size_bytes: None,
+            requester_blob_pre_staged: true,
             desired_replica_nodes: vec![primary.clone()],
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
             object_metadata: Some(object),
@@ -12978,6 +12987,7 @@ fn routed_write_replay_pending_intent_requires_matching_content_identity() {
         bytes: Vec::new(),
         content_hash: Some(payload_hash.clone()),
         content_size_bytes: Some(payload.len() as u64),
+        requester_blob_pre_staged: true,
         desired_replica_nodes: vec![requester.clone(), replica],
         policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
         object_metadata: Some(object.clone()),
@@ -13986,6 +13996,94 @@ struct StatelessPrimaryPeerTransport {
     trace: Arc<Mutex<Vec<String>>>,
 }
 
+struct AttachmentCapableTestPeerTransport {
+    sender: DfsMessageSender,
+}
+
+impl AttachmentCapableTestPeerTransport {
+    async fn call_inner(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcCall,
+        options: DfsObjectRpcSendOptions,
+    ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+        let streamed_value = call.has_streamed_value_body();
+        let ObjectRpcCall { mut request, body } = call;
+        let command = if streamed_value {
+            request.body = body
+                .collect_to_vec(usize::MAX)
+                .await
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            decode_dfs_message_rpc_request(&request)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
+        } else if body.is_empty() {
+            decode_dfs_message_rpc_request(&request)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
+        } else {
+            let head = crate::body_rpc::decode_dfs_attachment_message_rpc_request(&request)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            let max_bytes = usize::try_from(head.attachment.total_size_bytes).map_err(|_| {
+                DfsPeerTransportError::new(
+                    "test DFS request attachment does not fit this platform address space",
+                )
+            })?;
+            let bytes = body
+                .collect_to_vec(max_bytes)
+                .await
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            crate::body_rpc::attach_dfs_message_request_attachment(head, bytes)
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
+        };
+        let response = (self.sender)(target_node_id, &command, options)?;
+        ObjectRpcResponse::encode_body(&request.route, &response)
+            .map(ObjectRpcResult::value)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+    }
+}
+
+impl DfsPeerTransport for AttachmentCapableTestPeerTransport {
+    fn call_object_rpc(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcCall,
+        options: DfsObjectRpcSendOptions,
+    ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+        let result = runtime.block_on(self.call_inner(target_node_id, call, options));
+        runtime.shutdown_timeout(Duration::from_millis(250));
+        result
+    }
+}
+
+impl AsyncDfsPeerTransport for AttachmentCapableTestPeerTransport {
+    fn call_object_rpc_async<'a>(
+        &'a self,
+        target_node_id: &'a NodeId,
+        call: ObjectRpcCall,
+        options: DfsObjectRpcSendOptions,
+    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>> {
+        Box::pin(self.call_inner(target_node_id, call, options))
+    }
+}
+
+fn node_transport_with_attachment_sender(
+    local_node_id: NodeId,
+    peer_node_ids: Vec<NodeId>,
+    sender: DfsMessageSender,
+) -> DfsNodeTransport {
+    let peer = Arc::new(AttachmentCapableTestPeerTransport { sender });
+    DfsNodeTransport::with_peer_transports_for_nodes(
+        local_node_id,
+        peer_node_ids,
+        Duration::from_millis(1),
+        peer.clone(),
+        peer,
+    )
+}
+
 impl StatelessPrimaryPeerTransport {
     async fn call_object_rpc_inner(
         &self,
@@ -14309,12 +14407,8 @@ fn posix_routed_strict_write_prefers_metadata_primary_replica() {
             outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsNodeTransport::with_connect_timeout(
-        writer.clone(),
-        vec![primary.clone()],
-        Duration::from_millis(1),
-        sender,
-    );
+    let transport =
+        node_transport_with_attachment_sender(writer.clone(), vec![primary.clone()], sender);
     let mut object = file_metadata(primary.clone());
     object.file_system_id = file_system.file_system_id.clone();
     object.path = "/routed-primary-preferred.txt".to_string();
@@ -14355,7 +14449,7 @@ fn posix_routed_strict_write_prefers_metadata_primary_replica() {
 }
 
 #[test]
-fn posix_routed_materialized_write_sends_value() {
+fn posix_routed_write_sends_attachment_without_local_persistence() {
     let root = temp_root("posix-routed-value");
     let writer = NodeId::from_legacy_named("node_posix_routed_inline_writer").expect("writer");
     let primary = NodeId::from_legacy_named("node_posix_routed_inline_primary").expect("primary");
@@ -14391,12 +14485,8 @@ fn posix_routed_materialized_write_sends_value() {
             outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsNodeTransport::with_connect_timeout(
-        writer.clone(),
-        vec![primary.clone()],
-        Duration::from_millis(1),
-        sender,
-    );
+    let transport =
+        node_transport_with_attachment_sender(writer.clone(), vec![primary.clone()], sender);
     let mut object = file_metadata(primary.clone());
     object.file_system_id = file_system.file_system_id.clone();
     object.path = "/routed-value.txt".to_string();
@@ -14438,18 +14528,18 @@ fn posix_routed_materialized_write_sends_value() {
     assert_eq!(command.content_hash, None);
     assert_eq!(command.content_size_bytes, None);
     assert_eq!(command.desired_replica_nodes, vec![writer.clone(), primary]);
-    assert_eq!(
-        dfs.content
-            .read_blob(&expected_hash)
-            .expect("writer retained local blob"),
-        b"materialized routed POSIX bytes"
+    assert!(
+        !dfs.content
+            .has_blob(&expected_hash)
+            .expect("writer blob probe"),
+        "the remote-primary sender must not persist the payload before streaming it"
     );
 
     std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
-fn posix_routed_multimegabyte_write_uses_same_value_path() {
+fn posix_routed_multimegabyte_write_uses_same_attachment_path() {
     let root = temp_root("posix-routed-multimegabyte-value");
     let writer = NodeId::from_legacy_named("node_posix_routed_manifest_writer").expect("writer");
     let primary = NodeId::from_legacy_named("node_posix_routed_manifest_primary").expect("primary");
@@ -14485,12 +14575,8 @@ fn posix_routed_multimegabyte_write_uses_same_value_path() {
             outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsNodeTransport::with_connect_timeout(
-        writer.clone(),
-        vec![primary.clone()],
-        Duration::from_millis(1),
-        sender,
-    );
+    let transport =
+        node_transport_with_attachment_sender(writer.clone(), vec![primary.clone()], sender);
     let mut object = file_metadata(primary.clone());
     object.file_system_id = file_system.file_system_id.clone();
     object.path = "/routed-multimegabyte-value.bin".to_string();
@@ -14532,18 +14618,18 @@ fn posix_routed_multimegabyte_write_uses_same_value_path() {
     assert_eq!(command.content_hash, None);
     assert_eq!(command.content_size_bytes, None);
     assert_eq!(command.desired_replica_nodes, vec![writer, primary]);
-    assert_eq!(
-        dfs.content
-            .read_blob(&expected_hash)
-            .expect("writer retained local blob"),
-        bytes
+    assert!(
+        !dfs.content
+            .has_blob(&expected_hash)
+            .expect("writer blob probe"),
+        "large remote-primary writes must stream without a sender-side blob copy"
     );
 
     std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
-fn posix_remote_primary_deferred_materialized_write_carries_payload() {
+fn posix_remote_primary_deferred_write_carries_streamed_payload() {
     let root = temp_root("posix-remote-primary-deferred-materialized");
     let writer = NodeId::from_legacy_named("node_posix_remote_deferred_materialized_writer")
         .expect("writer");
@@ -14581,12 +14667,8 @@ fn posix_remote_primary_deferred_materialized_write_carries_payload() {
             outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsNodeTransport::with_connect_timeout(
-        writer.clone(),
-        vec![primary.clone()],
-        Duration::from_millis(1),
-        sender,
-    );
+    let transport =
+        node_transport_with_attachment_sender(writer.clone(), vec![primary.clone()], sender);
     let path = "/routed-deferred-materialized.bin";
     let mut object = file_metadata(primary.clone());
     object.file_system_id = file_system.file_system_id.clone();
@@ -14617,7 +14699,10 @@ fn posix_remote_primary_deferred_materialized_write_carries_payload() {
         )
         .expect("pending routed write returns stat for existing object");
 
-    assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str()));
+    assert_eq!(
+        stat.content_hash, None,
+        "the sender cannot report a content identity before the primary's one-pass ingest completes"
+    );
     let command = captured_command
         .lock()
         .expect("capture")
@@ -14641,6 +14726,12 @@ fn posix_remote_primary_deferred_materialized_write_carries_payload() {
     assert!(
         !command.foreground_replica_repair,
         "deferred publish must preserve nonforeground repair mode"
+    );
+    assert!(
+        !dfs.content
+            .has_blob(&expected_hash)
+            .expect("writer blob probe"),
+        "deferred remote-primary writes must not first persist on the sender"
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -14706,12 +14797,8 @@ fn posix_remote_primary_nonforeground_wait_write_requests_bounded_response_journ
             outbound_messages,
         })
     });
-    let transport = DfsNodeTransport::with_connect_timeout(
-        writer.clone(),
-        vec![primary.clone()],
-        Duration::from_millis(1),
-        sender,
-    );
+    let transport =
+        node_transport_with_attachment_sender(writer.clone(), vec![primary.clone()], sender);
     let path = "/routed-materialized-wait-nonforeground.bin";
     let mut object = file_metadata(primary.clone());
     object.file_system_id = file_system.file_system_id.clone();
@@ -14915,12 +15002,8 @@ fn routed_manifest_write_controls_response_journal_replay() {
             outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsNodeTransport::with_connect_timeout(
-        writer.clone(),
-        vec![primary.clone()],
-        Duration::from_millis(1),
-        sender,
-    );
+    let transport =
+        node_transport_with_attachment_sender(writer.clone(), vec![primary.clone()], sender);
     let mut object = file_metadata(primary.clone());
     object.file_system_id = file_system.file_system_id.clone();
     object.path = "/routed-manifest-sync.bin".to_string();
@@ -15027,7 +15110,7 @@ fn routed_manifest_write_controls_response_journal_replay() {
 }
 
 #[test]
-fn routed_inline_write_preserves_nonforeground_repair_mode() {
+fn routed_streamed_write_preserves_nonforeground_repair_mode() {
     let root = temp_root("routed-inline-nonforeground-repair");
     let writer = NodeId::from_legacy_named("node_routed_inline_writer").expect("writer");
     let primary = NodeId::from_legacy_named("node_routed_inline_primary").expect("primary");
@@ -15066,12 +15149,8 @@ fn routed_inline_write_preserves_nonforeground_repair_mode() {
             outbound_messages: Vec::new(),
         })
     });
-    let transport = DfsNodeTransport::with_connect_timeout(
-        writer.clone(),
-        vec![primary.clone()],
-        Duration::from_millis(1),
-        sender,
-    );
+    let transport =
+        node_transport_with_attachment_sender(writer.clone(), vec![primary.clone()], sender);
     let mut object = file_metadata(primary.clone());
     object.file_system_id = file_system.file_system_id.clone();
     object.path = "/routed-inline-nonforeground.bin".to_string();
@@ -15158,14 +15237,20 @@ fn routed_inline_write_preserves_nonforeground_repair_mode() {
 
     assert_eq!(
         captured_commands.lock().expect("capture").len(),
-        2,
-        "detached inline routed writes should not send synchronously"
+        3,
+        "owned payloads are streamed before return even when metadata completion is detached"
     );
     dfs.flush_detached_transport_sends()
-        .expect("flush detached inline write");
+        .expect("streamed write leaves no payload send queued");
 
     let commands = captured_commands.lock().expect("capture").clone();
     assert_eq!(commands.len(), 3);
+    assert!(
+        commands
+            .iter()
+            .all(|command| !command.requester_blob_pre_staged),
+        "the primary must not credit the streaming requester with a local blob"
+    );
     assert!(
         !commands[0].foreground_replica_repair,
         "inline routed writes must preserve nonforeground repair mode"
@@ -15285,6 +15370,7 @@ fn routed_write_nonforeground_response_replay_is_one_batch() {
             bytes: b"bounded nonforeground response replay".to_vec(),
             content_hash: None,
             content_size_bytes: None,
+            requester_blob_pre_staged: true,
             desired_replica_nodes: vec![requester, primary],
             policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
             object_metadata: Some(object),
@@ -31075,10 +31161,11 @@ fn sifs_cluster_routed_posix_write(cluster: &mut SifsPosixCluster, path: &str, b
         Err(error) => panic!("routed POSIX write to {path} failed: {error}"),
     }
     sifs_posix_cluster_pump_until(cluster, path, |cluster| {
-        cluster
-            .writer
-            .posix_stat(path)
-            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
+        sifs_routed_writes_settled(&cluster.writer)
+            && cluster
+                .writer
+                .posix_stat(path)
+                .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
     });
 }
 
@@ -31335,10 +31422,12 @@ fn sifs_cluster_fetch_for_local_read(
 fn sifs_routed_writes_settled(
     service: &NetworkedDfsService<sinomo_core::network::InProcessTransport>,
 ) -> bool {
-    service
-        .pending_routed_writes
-        .values()
-        .all(|pending| pending.result.is_some())
+    service.pending_routed_writes.keys().all(|request_id| {
+        !matches!(
+            service.write_outcome(request_id),
+            Ok(NetworkedDfsWriteOutcome::Pending { .. })
+        )
+    })
 }
 
 #[derive(Debug)]
@@ -33698,7 +33787,6 @@ fn sifs_cluster_writer_recovers_from_local_blob_loss_after_async_repair() {
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
     let expected_hash = content_hash(&bytes);
-
     match cluster.writer.posix_write_file(
         path,
         &bytes,
@@ -33710,9 +33798,8 @@ fn sifs_cluster_writer_recovers_from_local_blob_loss_after_async_repair() {
         },
     ) {
         Ok(stat) => assert_eq!(
-            stat.content_hash.as_deref(),
-            Some(expected_hash.as_str()),
-            "committed writer stat should expose the written content hash"
+            stat.content_hash, None,
+            "a pending remote-primary write has no content identity until primary ingest completes"
         ),
         Err(DfsPosixError::PendingWrite { .. }) => {}
         Err(error) => panic!("async routed write failed: {error}"),
@@ -33777,7 +33864,6 @@ fn sifs_cluster_async_commit_fetches_missing_local_desired_copy_without_maintena
     let bytes = (0..64 * 1024)
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
-    let expected_hash = content_hash(&bytes);
 
     match cluster.writer.posix_write_file(
         path,
@@ -33789,7 +33875,10 @@ fn sifs_cluster_async_commit_fetches_missing_local_desired_copy_without_maintena
             foreground_replica_repair: false,
         },
     ) {
-        Ok(stat) => assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str())),
+        Ok(stat) => assert_eq!(
+            stat.content_hash, None,
+            "a pending remote-primary write has no content identity until primary ingest completes"
+        ),
         Err(DfsPosixError::PendingWrite { .. }) => {}
         Err(error) => panic!("async routed write failed: {error}"),
     }
@@ -39920,8 +40009,8 @@ fn sifs_non_replica_routed_create_is_listed_after_blocking_write() {
 
     assert_eq!(
         observer
-            .posix_read_file(path)
-            .expect("outsider reads its own routed create"),
+            .posix_read_file_distributed(path)
+            .expect("outsider reads its own routed create from the primary"),
         bytes
     );
     let entries = observer
@@ -41427,6 +41516,7 @@ fn served_routed_write_committed_work_tracks_only_authority_owned_repairs() {
                     bytes: Vec::new(),
                     content_hash: Some(content_hash(b"")),
                     content_size_bytes: Some(0),
+                    requester_blob_pre_staged: true,
                     desired_replica_nodes,
                     policy: DfsReplicationPolicy::new(1, desired_replicas).expect("policy"),
                     object_metadata: None,

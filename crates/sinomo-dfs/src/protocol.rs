@@ -153,6 +153,13 @@ pub struct DfsDistributedWriteCommand {
     pub content_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_size_bytes: Option<u64>,
+    /// Whether the requesting node already has this exact blob durably staged.
+    ///
+    /// Legacy and manifest-routed writes retain the original `true` default.
+    /// Direct streamed writes set this to `false`; the metadata primary then
+    /// records only replicas that actually own the ingested content.
+    #[serde(default = "default_true")]
+    pub requester_blob_pre_staged: bool,
     pub desired_replica_nodes: Vec<NodeId>,
     pub policy: DfsReplicationPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
