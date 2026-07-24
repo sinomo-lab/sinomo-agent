@@ -32,20 +32,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         requester_node_id: NodeId,
         command: DfsStageBlobCommand,
-        manifest: ContentManifest,
+        blob: ContentStoreQuarantinedBlob,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let storage_result = self
             .validate_stage_blob_command(&requester_node_id, &command)
             .and_then(|()| {
-                if manifest.object_id != command.object_id.as_str()
-                    || manifest.version != command.version.as_str()
-                    || manifest.content_hash != command.content_hash
-                {
+                if blob.content_hash != command.content_hash {
                     return Err(DfsError::ContentHashMismatch {
                         expected: command.content_hash.clone(),
-                        actual: manifest.content_hash,
+                        actual: blob.content_hash.clone(),
                     });
                 }
+                self.content.bind_quarantined_blob(
+                    command.object_id.as_str(),
+                    command.version.as_str(),
+                    blob,
+                )?;
                 Ok(())
             });
         self.finish_stage_blob(requester_node_id, command, storage_result)

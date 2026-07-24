@@ -275,7 +275,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn handle_distributed_write_request(
         &mut self,
         requester_node_id: NodeId,
+        command: DfsDistributedWriteCommand,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        self.handle_distributed_write_request_with_preingested_blob(
+            requester_node_id,
+            command,
+            None,
+        )
+    }
+
+    pub(crate) fn handle_preingested_distributed_write_request(
+        &mut self,
+        requester_node_id: NodeId,
+        command: DfsDistributedWriteCommand,
+        blob: ContentStoreQuarantinedBlob,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        self.handle_distributed_write_request_with_preingested_blob(
+            requester_node_id,
+            command,
+            Some(blob),
+        )
+    }
+
+    fn handle_distributed_write_request_with_preingested_blob(
+        &mut self,
+        requester_node_id: NodeId,
         mut command: DfsDistributedWriteCommand,
+        mut preingested_blob: Option<ContentStoreQuarantinedBlob>,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let request_id = command.request_id.clone();
         let object_id = command.request.object_id.clone();
@@ -338,10 +364,41 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 command.request.object_id
                             ),
                         })
+                    } else if command.requester_blob_pre_staged && preingested_blob.is_some() {
+                        Err(DfsError::Distributed {
+                            message: format!(
+                                "routed streamed write for {} cannot claim requester-pre-staged content",
+                                command.request.object_id
+                            ),
+                        })
                     } else {
-                        content_size_bytes.map(|size| Some((content_hash, size)))
+                        content_size_bytes.and_then(|size| {
+                            if let Some(blob) = preingested_blob.as_ref() {
+                                if blob.content_hash != content_hash {
+                                    return Err(DfsError::ContentHashMismatch {
+                                        expected: content_hash,
+                                        actual: blob.content_hash.clone(),
+                                    });
+                                }
+                                if blob.size_bytes != size {
+                                    return Err(DfsError::Distributed {
+                                        message: format!(
+                                            "routed streamed write for {} declared {size} bytes but ingested {}",
+                                            command.request.object_id, blob.size_bytes
+                                        ),
+                                    });
+                                }
+                            }
+                            Ok(Some((content_hash, size)))
+                        })
                     }
                 }
+                None if preingested_blob.is_some() => Err(DfsError::Distributed {
+                    message: format!(
+                        "routed streamed write for {} is missing its finalized content identity",
+                        command.request.object_id
+                    ),
+                }),
                 None => Ok(None),
             };
             match authority_validation.and_then(|()| manifest).and_then(|manifest| {
@@ -365,6 +422,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 command.expected_base_version,
                                 content_hash,
                                 content_size_bytes,
+                                command.desired_replica_nodes,
+                                command.policy,
+                                created_object_path.is_some(),
+                                command.exclusive_create,
+                                write_foreground_replica_repair,
+                            )
+                        } else if let Some(blob) = preingested_blob.take() {
+                            self.write_distributed_eventual_from_quarantined_blob_with_base_and_parent_touch(
+                                command.request,
+                                command.expected_base_version,
+                                blob,
                                 command.desired_replica_nodes,
                                 command.policy,
                                 created_object_path.is_some(),

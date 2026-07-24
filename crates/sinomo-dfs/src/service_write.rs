@@ -1205,12 +1205,46 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             expected_base_version,
             content_hash,
             content_size_bytes,
+            None,
             desired_replica_nodes,
             policy,
             touch_parent_on_create,
             exclusive_create,
             foreground_replica_repair,
             vec![requester_node_id],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_distributed_eventual_from_quarantined_blob_with_base_and_parent_touch(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        blob: ContentStoreQuarantinedBlob,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
+        exclusive_create: bool,
+        foreground_replica_repair: bool,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        let content_hash = blob.content_hash.clone();
+        let content_size_bytes = blob.size_bytes;
+        let initial_receipt_node_ids = desired_replica_nodes
+            .contains(&self.node_id)
+            .then(|| vec![self.node_id.clone()])
+            .unwrap_or_default();
+        self.write_distributed_eventual_from_manifest_with_initial_receipts(
+            request,
+            expected_base_version,
+            content_hash,
+            content_size_bytes,
+            Some(blob),
+            desired_replica_nodes,
+            policy,
+            touch_parent_on_create,
+            exclusive_create,
+            foreground_replica_repair,
+            initial_receipt_node_ids,
         )
     }
 
@@ -1236,6 +1270,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             expected_base_version,
             content_hash,
             content_size_bytes,
+            None,
             desired_replica_nodes,
             policy,
             touch_parent_on_create,
@@ -1252,6 +1287,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         expected_base_version: Option<DfsVersion>,
         content_hash: String,
         content_size_bytes: u64,
+        quarantined_blob: Option<ContentStoreQuarantinedBlob>,
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
         touch_parent_on_create: bool,
@@ -1366,6 +1402,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &policy,
         ) {
             return Err(error.into());
+        }
+
+        if let Some(blob) = quarantined_blob {
+            self.content.bind_quarantined_blob(
+                request.object_id.as_str(),
+                request.target_version.as_str(),
+                blob,
+            )?;
         }
 
         let create_intent_started = Instant::now();
