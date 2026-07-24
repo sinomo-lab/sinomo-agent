@@ -888,6 +888,150 @@ mod tests {
         );
     }
 
+    #[test]
+    fn request_attempt_updates_append_without_rewriting_the_checkpoint() {
+        #[derive(Serialize)]
+        struct LegacyRequestAttemptLedger {
+            attempts: Vec<KvRequestAttemptRecord>,
+            expired: Vec<KvRequestId>,
+        }
+
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-request-attempt-append");
+        let paths = ClusterKvPaths::new(&root);
+        let retained_request = KvCommandRequest::generated(KvCommand::Barrier);
+        let retained_attempt = KvRequestAttemptRecord {
+            request_id: retained_request.request_id.clone(),
+            command_digest: retained_request.digest().expect("retained digest"),
+            state: KvRequestAttemptState::Submitted,
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        write_object_file(
+            &paths.request_attempts,
+            &LegacyRequestAttemptLedger {
+                attempts: vec![retained_attempt],
+                expired: Vec::new(),
+            },
+        )
+        .expect("write legacy request-attempt checkpoint");
+        let checkpoint_identity =
+            file_identity(&paths.request_attempts).expect("checkpoint identity");
+
+        let updated_request = KvCommandRequest::generated(KvCommand::Barrier);
+        mark_cluster_kv_request_submitted(&paths, &updated_request).expect("append submitted");
+        let first_log_len = std::fs::metadata(&paths.request_attempts_log)
+            .expect("first log metadata")
+            .len();
+        assert!(first_log_len > 0);
+        assert_eq!(
+            file_identity(&paths.request_attempts),
+            Some(checkpoint_identity),
+            "a normal update must not rewrite the checkpoint"
+        );
+
+        mark_cluster_kv_request_unknown(&paths, &updated_request, "ambiguous response")
+            .expect("append unknown");
+        let second_log_len = std::fs::metadata(&paths.request_attempts_log)
+            .expect("second log metadata")
+            .len();
+        assert!(
+            second_log_len > first_log_len,
+            "each state change should append one bounded record"
+        );
+        assert_eq!(
+            file_identity(&paths.request_attempts),
+            Some(checkpoint_identity),
+            "repeated updates must leave the checkpoint untouched until compaction"
+        );
+        assert!(matches!(
+            read_cluster_kv_request_attempt(&paths, &retained_request.request_id)
+                .expect("read legacy checkpoint attempt"),
+            Some(KvRequestOutcome::Unknown { .. })
+        ));
+        assert_eq!(
+            read_cluster_kv_request_attempt(&paths, &updated_request.request_id)
+                .expect("read appended attempt"),
+            Some(KvRequestOutcome::Unknown {
+                detail: "ambiguous response".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn request_attempt_log_repairs_a_partial_tail_without_losing_safe_records() {
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-request-attempt-partial-tail");
+        let paths = ClusterKvPaths::new(&root);
+        let request = KvCommandRequest::generated(KvCommand::Barrier);
+        mark_cluster_kv_request_unknown(&paths, &request, "durable safe record")
+            .expect("append safe request-attempt record");
+        assert!(
+            !paths.request_attempts.exists(),
+            "the append hot path should not create a checkpoint"
+        );
+
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&paths.request_attempts_log)
+            .expect("open request-attempt log");
+        log.write_all(&9_u32.to_be_bytes())
+            .and_then(|()| log.write_all(&[1, 2, 3]))
+            .and_then(|()| log.sync_data())
+            .expect("append partial tail");
+        drop(log);
+
+        assert_eq!(
+            read_cluster_kv_request_attempt(&paths, &request.request_id)
+                .expect("recover safe request-attempt prefix"),
+            Some(KvRequestOutcome::Unknown {
+                detail: "durable safe record".to_string(),
+            })
+        );
+        assert!(
+            paths.request_attempts.exists(),
+            "repair should checkpoint the safe prefix"
+        );
+        assert_eq!(
+            std::fs::metadata(&paths.request_attempts_log)
+                .expect("repaired log metadata")
+                .len(),
+            0,
+            "repair should discard only the partial tail after checkpointing"
+        );
+    }
+
+    #[test]
+    fn request_attempt_checkpoint_sequence_makes_log_truncation_crash_safe() {
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-request-attempt-stale-log");
+        let paths = ClusterKvPaths::new(&root);
+        let request = KvCommandRequest::generated(KvCommand::Barrier);
+        mark_cluster_kv_request_unknown(&paths, &request, "latest outcome")
+            .expect("append request-attempt record");
+        let stale_log_len = std::fs::metadata(&paths.request_attempts_log)
+            .expect("request-attempt log metadata")
+            .len();
+        assert!(stale_log_len > 0);
+
+        // Model a crash after the atomic checkpoint publish but before log
+        // truncation. Recovery must not apply the same historical mutations a
+        // second time, especially after old expiry tombstones have aged out.
+        crate::request::write_cached_request_attempt_checkpoint_for_test(&paths)
+            .expect("publish checkpoint without truncating log");
+
+        assert_eq!(
+            read_cluster_kv_request_attempt(&paths, &request.request_id)
+                .expect("recover checkpoint with stale log"),
+            Some(KvRequestOutcome::Unknown {
+                detail: "latest outcome".to_string(),
+            })
+        );
+        assert_eq!(
+            std::fs::metadata(&paths.request_attempts_log)
+                .expect("repaired stale log metadata")
+                .len(),
+            0,
+            "records covered by the checkpoint sequence should be truncated"
+        );
+    }
+
     fn committed_request_record_for_byte_accounting(
         log_index: u64,
         payload_bytes: usize,
@@ -1477,6 +1621,18 @@ mod tests {
         assert_eq!(paths.watches_next_id, root.join("watches-next.sobj"));
         assert_eq!(paths.watch_events, root.join("watch-events.sobj"));
         assert_eq!(paths.watch_events_log, root.join("watch-events.sobjlog"));
+        assert_eq!(
+            paths.request_attempts,
+            root.join("kv-request-attempts.sobj")
+        );
+        assert_eq!(
+            paths.request_attempts_log,
+            root.join("kv-request-attempts.sobjlog")
+        );
+        assert_eq!(
+            paths.request_attempts_lock,
+            root.join("kv-request-attempts.lock")
+        );
         let node_id = NodeId::from_legacy_named("node_path_layout").expect("node");
         assert_eq!(
             paths.raft_wal_paths(&node_id).root,
