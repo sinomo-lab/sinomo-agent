@@ -1075,6 +1075,15 @@ mod tests {
             measured_committed_request_bytes(&snapshot),
             "cached committed-request bytes must exactly match the retained records"
         );
+        assert_eq!(
+            store.committed_request_order,
+            snapshot
+                .committed_requests
+                .iter()
+                .map(|record| (record.log_index, record.request_id.clone()))
+                .collect(),
+            "the age index must exactly cover the retained committed requests"
+        );
         snapshot
     }
 
@@ -1220,6 +1229,66 @@ mod tests {
         assert!(oversized_snapshot.committed_requests.is_empty());
         assert_eq!(oversized_store.committed_request_encoded_bytes, 0);
         assert!(oversized_store.request_id_expired(&oversized_id));
+    }
+
+    #[test]
+    fn consuming_snapshot_transfers_owned_payloads_without_cloning() {
+        let mut store = InProcessKvStore::new();
+        store
+            .put("/snapshot/move", vec![7_u8; 4096], None)
+            .expect("put snapshot payload");
+        let entry_value_ptr = store
+            .get("/snapshot/move")
+            .expect("stored snapshot entry")
+            .value
+            .as_ptr();
+        let event_value_ptr = match &store.events[0].kind {
+            KvEventKind::Put { value } => value.as_ptr(),
+            KvEventKind::Delete => panic!("put should record a put event"),
+        };
+
+        let mut committed = committed_request_record_for_byte_accounting(1, 4096);
+        let committed_payload_ptr = match committed
+            .txn_response
+            .as_mut()
+            .and_then(|response| response.responses.first_mut())
+        {
+            Some(KvOpResponse::Delete { key, .. }) => key.as_ptr(),
+            other => panic!("expected committed delete response, got {other:?}"),
+        };
+        store
+            .record_committed_request(committed)
+            .expect("record committed request");
+
+        let snapshot = store
+            .try_into_snapshot()
+            .expect("move store into owned snapshot");
+        assert_eq!(
+            snapshot
+                .get("/snapshot/move")
+                .expect("moved snapshot entry")
+                .value
+                .as_ptr(),
+            entry_value_ptr
+        );
+        assert_eq!(
+            match &snapshot.events[0].kind {
+                KvEventKind::Put { value } => value.as_ptr(),
+                KvEventKind::Delete => panic!("moved event should remain a put"),
+            },
+            event_value_ptr
+        );
+        assert_eq!(
+            match snapshot.committed_requests[0]
+                .txn_response
+                .as_ref()
+                .and_then(|response| response.responses.first())
+            {
+                Some(KvOpResponse::Delete { key, .. }) => key.as_ptr(),
+                other => panic!("expected moved committed response, got {other:?}"),
+            },
+            committed_payload_ptr
+        );
     }
 
     #[test]
@@ -4545,6 +4614,55 @@ mod tests {
                 .expect("range prefix")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn txn_delete_prefix_counts_reinserted_base_key_after_broader_delete() {
+        let mut store = InProcessKvStore::new();
+        store
+            .put("/tree/existing", b"old".to_vec(), None)
+            .expect("initial put");
+        let revision_before = store.revision();
+
+        let response = store
+            .txn(KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    KvOp::DeletePrefix {
+                        prefix: "/tree/".to_string(),
+                    },
+                    KvOp::Put {
+                        key: "/tree/existing".to_string(),
+                        value: b"new".to_vec(),
+                        lease_id: None,
+                    },
+                    KvOp::DeletePrefix {
+                        prefix: "/tree/existing".to_string(),
+                    },
+                ],
+                failure: Vec::new(),
+            })
+            .expect("delete, reinsert, and delete again");
+
+        assert_eq!(
+            response.responses,
+            vec![
+                KvOpResponse::DeletePrefix {
+                    prefix: "/tree/".to_string(),
+                    deleted_count: 1,
+                },
+                KvOpResponse::Put {
+                    key: "/tree/existing".to_string(),
+                    revision: KvRevision(revision_before.0 + 2),
+                },
+                KvOpResponse::DeletePrefix {
+                    prefix: "/tree/existing".to_string(),
+                    deleted_count: 1,
+                },
+            ]
+        );
+        assert_eq!(store.revision(), KvRevision(revision_before.0 + 3));
+        assert!(store.get("/tree/existing").is_none());
     }
 
     #[test]
