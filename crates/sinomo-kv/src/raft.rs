@@ -6,6 +6,30 @@ static CLUSTER_KV_RAFT_OPERATION_LOCKS: LazyLock<
 #[cfg(test)]
 pub(crate) static CLUSTER_KV_RAFT_SNAPSHOT_BYTES_LIMIT_FOR_TEST: AtomicU64 =
     AtomicU64::new(MAX_CLUSTER_KV_RAFT_SNAPSHOT_BYTES);
+#[cfg(test)]
+static CLUSTER_KV_RAFT_APPLY_FAILURES_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn fail_cluster_kv_raft_apply_after_entries_for_test(
+    paths: &KvWalPaths,
+    applied_entries: usize,
+) {
+    assert!(applied_entries > 0, "failure must follow a partial apply");
+    CLUSTER_KV_RAFT_APPLY_FAILURES_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(paths.root.clone(), applied_entries);
+}
+
+#[cfg(test)]
+fn take_cluster_kv_raft_apply_failure_for_test(paths: &KvWalPaths) -> Option<usize> {
+    CLUSTER_KV_RAFT_APPLY_FAILURES_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&paths.root)
+}
 
 struct ClusterKvRaftOperationLock {
     held: Mutex<bool>,
@@ -3967,6 +3991,7 @@ pub struct DurableRaftKvNode {
     pub(crate) paths: KvWalPaths,
     _lock: File,
     node: ReplicatedKvNode,
+    poisoned: bool,
 }
 
 impl DurableRaftKvNode {
@@ -4058,6 +4083,7 @@ impl DurableRaftKvNode {
             paths,
             _lock: lock,
             node,
+            poisoned: false,
         };
         metrics::histogram!("sinomo.kv.raft.open.log_entries").record(opened.log().len() as f64);
         opened.record_live_metrics();
@@ -4140,47 +4166,67 @@ impl DurableRaftKvNode {
         &self.node_id
     }
 
+    /// Reports whether a post-persistence apply failure made this in-memory
+    /// view unsafe to reuse.
+    ///
+    /// The WAL and hard state remain authoritative. Drop and reopen a poisoned
+    /// node to replay the committed prefix into a fresh store.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     pub fn hard_state(&self) -> &RaftHardState {
+        self.assert_healthy();
         &self.node.hard_state
     }
 
     pub fn store(&self) -> &InProcessKvStore {
+        self.assert_healthy();
         &self.node.store
     }
 
     pub(crate) fn try_into_snapshot(self) -> Result<KvSnapshot, KvError> {
+        self.ensure_healthy()?;
         self.node.store.try_into_snapshot()
     }
 
     pub fn log(&self) -> &[KvLogEntry] {
+        self.assert_healthy();
         &self.node.log
     }
 
     pub fn last_log_index(&self) -> u64 {
+        self.assert_healthy();
         self.node.last_log_index()
     }
 
     pub fn last_log_term(&self) -> u64 {
+        self.assert_healthy();
         self.node.last_log_term()
     }
 
     pub fn term_at(&self, index: u64) -> Option<u64> {
+        self.assert_healthy();
         self.node.term_at(index)
     }
 
     pub fn log_entry_at(&self, index: u64) -> Option<&KvLogEntry> {
+        self.assert_healthy();
         self.node.log_entry_at(index)
     }
 
     pub fn applied_index(&self) -> u64 {
+        self.assert_healthy();
         self.node.applied_index
     }
 
     pub fn snapshot_index(&self) -> u64 {
+        self.assert_healthy();
         self.node.snapshot_index
     }
 
     pub fn txn_response_at(&self, index: u64) -> Option<&KvTxnResponse> {
+        self.assert_healthy();
         self.node.txn_responses.get(index)
     }
 
@@ -4188,6 +4234,7 @@ impl DurableRaftKvNode {
         &mut self,
         request: RaftAppendEntriesRequest,
     ) -> Result<RaftAppendEntriesResponse, KvError> {
+        self.ensure_healthy()?;
         if let Some(response) = self.node.read_only_append_entries_response(&request) {
             return Ok(response);
         }
@@ -4273,7 +4320,7 @@ impl DurableRaftKvNode {
         }
         if let Some((commit_index, entries)) = entries_to_apply {
             let mut metric = KvStorageMetricGuard::start("apply", "sinomo.kv.apply.us");
-            self.node.apply_preflighted_commit(entries, commit_index)?;
+            self.apply_persisted_commit(entries, commit_index, "append_entries")?;
             metric.succeed();
         }
         self.record_live_metrics();
@@ -4306,6 +4353,7 @@ impl DurableRaftKvNode {
         snapshot: Option<RaftSnapshot>,
         append: RaftAppendEntriesRequest,
     ) -> Result<(RaftAppendEntriesResponse, bool, KvRevision), KvError> {
+        self.ensure_healthy()?;
         let before_revision = self.store().revision();
         let mut snapshot_restored = false;
         if let Some(snapshot) = snapshot {
@@ -4333,6 +4381,7 @@ impl DurableRaftKvNode {
         &mut self,
         request: RaftRequestVoteRequest,
     ) -> Result<RaftRequestVoteResponse, KvError> {
+        self.ensure_healthy()?;
         let hard_state_before = self.node.hard_state.clone();
         let response = match self.node.handle_request_vote(request) {
             Ok(response) => response,
@@ -4350,6 +4399,7 @@ impl DurableRaftKvNode {
     }
 
     pub fn observe_term(&mut self, term: u64) -> Result<bool, KvError> {
+        self.ensure_healthy()?;
         let hard_state_before = self.node.hard_state.clone();
         if !self.node.observe_term(term) {
             return Ok(false);
@@ -4363,6 +4413,7 @@ impl DurableRaftKvNode {
     }
 
     pub fn become_leader(&mut self, term: u64) -> Result<(), KvError> {
+        self.ensure_healthy()?;
         // Leadership was won for exactly `term`; a higher local term means a
         // concurrent vote or append advanced the node past this election and
         // claiming leadership for the newer term would not be backed by a
@@ -4386,6 +4437,7 @@ impl DurableRaftKvNode {
     }
 
     pub fn clear_known_leader(&mut self) -> Result<(), KvError> {
+        self.ensure_healthy()?;
         let hard_state_before = self.node.hard_state.clone();
         self.node.hard_state.leader_id = None;
         if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
@@ -4409,6 +4461,7 @@ impl DurableRaftKvNode {
         term: u64,
         request: KvCommandRequest,
     ) -> Result<KvLogEntry, KvError> {
+        self.ensure_healthy()?;
         let hard_state_before = self.node.hard_state.clone();
         let log_before = self.node.log.clone();
         let entry = KvLogEntry {
@@ -4440,6 +4493,7 @@ impl DurableRaftKvNode {
     }
 
     pub fn discard_uncommitted_tail(&mut self) -> Result<bool, KvError> {
+        self.ensure_healthy()?;
         let hard_state_before = self.node.hard_state.clone();
         let log_before = self.node.log.clone();
         let txn_responses_before = self.node.txn_responses.clone();
@@ -4463,10 +4517,12 @@ impl DurableRaftKvNode {
     }
 
     pub fn compact_event_history_to(&mut self, max_events: usize) {
+        self.assert_healthy();
         self.node.store.compact_event_history_to(max_events);
     }
 
     pub fn commit_to(&mut self, commit_index: u64) -> Result<(), KvError> {
+        self.ensure_healthy()?;
         let mut metric = KvStorageMetricGuard::start("apply", "sinomo.kv.apply.us");
         let hard_state_before = self.node.hard_state.clone();
         if commit_index <= self.node.applied_index {
@@ -4490,7 +4546,7 @@ impl DurableRaftKvNode {
             self.node.hard_state = hard_state_before;
             return Err(error);
         }
-        let result = self.node.apply_preflighted_commit(entries, commit_index);
+        let result = self.apply_persisted_commit(entries, commit_index, "commit_to");
         if result.is_ok() {
             self.record_live_metrics();
             metric.succeed();
@@ -4499,6 +4555,7 @@ impl DurableRaftKvNode {
     }
 
     pub fn save_snapshot(&mut self) -> Result<RaftSnapshot, KvError> {
+        self.ensure_healthy()?;
         let mut metric =
             KvStorageMetricGuard::start("snapshot_write", "sinomo.kv.snapshot.write.us");
         let node_before = self.node.clone();
@@ -4534,6 +4591,7 @@ impl DurableRaftKvNode {
     }
 
     pub fn restore_snapshot(&mut self, snapshot: RaftSnapshot) -> Result<(), KvError> {
+        self.ensure_healthy()?;
         let mut metric =
             KvStorageMetricGuard::start("snapshot_restore", "sinomo.kv.snapshot.restore.us");
         let node_before = self.node.clone();
@@ -4555,6 +4613,51 @@ impl DurableRaftKvNode {
 
     fn persist_hard_state(&self) -> Result<(), KvError> {
         self.paths.write_persisted_hard_state(&self.node.hard_state)
+    }
+
+    fn apply_persisted_commit(
+        &mut self,
+        entries: CommitEntries,
+        commit_index: u64,
+        phase: &'static str,
+    ) -> Result<(), KvError> {
+        // The commit index is durable before this method runs. If applying the
+        // committed entries fails, rolling only part of the in-memory store
+        // backward would be unsafe and cloning the whole keyspace before every
+        // commit would be prohibitively expensive. Poison this handle instead;
+        // reopening deterministically rebuilds it from the durable prefix.
+        #[cfg(test)]
+        let result =
+            if let Some(fail_after) = take_cluster_kv_raft_apply_failure_for_test(&self.paths) {
+                self.node.apply_preflighted_commit_failing_after_for_test(
+                    entries,
+                    commit_index,
+                    fail_after,
+                )
+            } else {
+                self.node.apply_preflighted_commit(entries, commit_index)
+            };
+        #[cfg(not(test))]
+        let result = self.node.apply_preflighted_commit(entries, commit_index);
+        if result.is_err() {
+            self.poisoned = true;
+            metrics::counter!("sinomo.kv.raft.poisoned_sessions", "phase" => phase).increment(1);
+        }
+        result
+    }
+
+    fn ensure_healthy(&self) -> Result<(), KvError> {
+        if self.poisoned {
+            return Err(KvError::RaftSessionPoisoned);
+        }
+        Ok(())
+    }
+
+    fn assert_healthy(&self) {
+        assert!(
+            !self.poisoned,
+            "durable raft node session is poisoned; drop and reopen the node"
+        );
     }
 
     fn persist_hard_state_if_changed(&self, before: &RaftHardState) -> Result<(), KvError> {

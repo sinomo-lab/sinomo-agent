@@ -11227,6 +11227,141 @@ mod tests {
     }
 
     #[test]
+    fn durable_raft_commit_apply_failure_poisons_session_until_reopen() {
+        let root = temp_raft_root("sinomo-kv-commit-apply-poison");
+        let node_id = NodeId::from_legacy_named("node_commit_apply_poison").expect("node");
+        let paths = KvWalPaths::new(&root);
+        let mut node = DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open node");
+        for (key, value) in [
+            ("/poison/commit/one", b"one".as_slice()),
+            ("/poison/commit/two", b"two".as_slice()),
+        ] {
+            node.append_local_command(
+                1,
+                KvCommand::Op(KvOp::Put {
+                    key: key.to_string(),
+                    value: value.to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append command");
+        }
+        fail_cluster_kv_raft_apply_after_entries_for_test(&paths, 1);
+
+        let error = node
+            .commit_to(2)
+            .expect_err("injected apply failure must escape");
+        assert!(matches!(error, KvError::ResourceExhausted { .. }));
+        assert!(node.is_poisoned());
+        assert_eq!(
+            node.commit_to(2).expect_err("poisoned session must fail"),
+            KvError::RaftSessionPoisoned
+        );
+        drop(node);
+
+        let reopened = DurableRaftKvNode::open(node_id, paths).expect("reopen poisoned node");
+        assert_eq!(reopened.hard_state().commit_index, 2);
+        assert_eq!(reopened.applied_index(), 2);
+        assert_eq!(
+            reopened
+                .store()
+                .get("/poison/commit/one")
+                .expect("first replayed value")
+                .value,
+            b"one"
+        );
+        assert_eq!(
+            reopened
+                .store()
+                .get("/poison/commit/two")
+                .expect("second replayed value")
+                .value,
+            b"two"
+        );
+    }
+
+    #[test]
+    fn durable_raft_append_apply_failure_poisons_session_until_reopen() {
+        let leader_root = temp_raft_root("sinomo-kv-append-apply-poison-leader");
+        let follower_root = temp_raft_root("sinomo-kv-append-apply-poison-follower");
+        let leader_id =
+            NodeId::from_legacy_named("node_append_apply_poison_leader").expect("leader");
+        let follower_id =
+            NodeId::from_legacy_named("node_append_apply_poison_follower").expect("follower");
+        let follower_paths = KvWalPaths::new(&follower_root);
+        let entries = {
+            let mut leader =
+                DurableRaftKvNode::open(leader_id.clone(), KvWalPaths::new(&leader_root))
+                    .expect("open leader");
+            for (key, value) in [
+                ("/poison/append/one", b"one".as_slice()),
+                ("/poison/append/two", b"two".as_slice()),
+            ] {
+                leader
+                    .append_local_command(
+                        1,
+                        KvCommand::Op(KvOp::Put {
+                            key: key.to_string(),
+                            value: value.to_vec(),
+                            lease_id: None,
+                        }),
+                    )
+                    .expect("append leader command");
+            }
+            leader.log().to_vec()
+        };
+        let mut follower = DurableRaftKvNode::open(follower_id.clone(), follower_paths.clone())
+            .expect("open follower");
+        fail_cluster_kv_raft_apply_after_entries_for_test(&follower_paths, 1);
+
+        let error = follower
+            .append_entries(RaftAppendEntriesRequest {
+                term: 1,
+                leader_id,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries,
+                leader_commit: 2,
+            })
+            .expect_err("injected follower apply failure must escape");
+        assert!(matches!(error, KvError::ResourceExhausted { .. }));
+        assert!(follower.is_poisoned());
+        assert_eq!(
+            follower
+                .request_vote(RaftRequestVoteRequest {
+                    term: 2,
+                    candidate_id: follower_id.clone(),
+                    last_log_index: 2,
+                    last_log_term: 1,
+                })
+                .expect_err("poisoned session must reject raft operations"),
+            KvError::RaftSessionPoisoned
+        );
+        drop(follower);
+
+        let reopened =
+            DurableRaftKvNode::open(follower_id, follower_paths).expect("reopen follower");
+        assert_eq!(reopened.hard_state().commit_index, 2);
+        assert_eq!(reopened.applied_index(), 2);
+        assert_eq!(
+            reopened
+                .store()
+                .get("/poison/append/one")
+                .expect("first replayed value")
+                .value,
+            b"one"
+        );
+        assert_eq!(
+            reopened
+                .store()
+                .get("/poison/append/two")
+                .expect("second replayed value")
+                .value,
+            b"two"
+        );
+    }
+
+    #[test]
     fn durable_raft_rejects_commit_beyond_local_log() {
         let root = temp_raft_root("sinomo-kv-commit-beyond-log");
         let node_id = NodeId::from_legacy_named("node_commit_beyond_log").expect("node");

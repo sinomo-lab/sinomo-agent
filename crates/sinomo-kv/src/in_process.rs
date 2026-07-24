@@ -3152,6 +3152,42 @@ impl ReplicatedKvNode {
         Ok(())
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn apply_preflighted_commit_failing_after_for_test(
+        &mut self,
+        entries: CommitEntries,
+        commit_index: u64,
+        fail_after: usize,
+    ) -> Result<(), KvError> {
+        let mut applied_entries = 0_usize;
+        let fail_if_requested = |applied_entries| {
+            if applied_entries == fail_after {
+                return Err(KvError::ResourceExhausted {
+                    operation: "injected durable raft apply failure".to_string(),
+                    requested_bytes: usize::MAX,
+                });
+            }
+            Ok(())
+        };
+        match entries {
+            CommitEntries::Single(entry) => {
+                self.apply_preflighted_commit_entry(entry)?;
+                applied_entries = 1;
+                fail_if_requested(applied_entries)?;
+            }
+            CommitEntries::Batch(entries) => {
+                for entry in entries {
+                    self.apply_preflighted_commit_entry(entry)?;
+                    applied_entries = applied_entries.saturating_add(1);
+                    fail_if_requested(applied_entries)?;
+                }
+            }
+        }
+        self.hard_state.commit_index = commit_index;
+        Ok(())
+    }
+
     pub(crate) fn apply_preflighted_commit_entry(
         &mut self,
         entry: KvLogEntry,
