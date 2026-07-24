@@ -28,6 +28,15 @@ pub enum DurableFileError {
         detail: String,
     },
     #[error(
+        "storage length-prefixed record at {path} is {record_bytes} bytes; max is {max_record_bytes}"
+    )]
+    RecordTooLarge {
+        path: String,
+        record_bytes: usize,
+        max_record_bytes: usize,
+        detail: String,
+    },
+    #[error(
         "storage resource exhausted at {path} during {operation}: requested {requested_bytes} bytes"
     )]
     ResourceExhausted {
@@ -41,13 +50,15 @@ impl DurableFileError {
     pub fn path(&self) -> &str {
         match self {
             DurableFileError::Io { path, .. }
+            | DurableFileError::RecordTooLarge { path, .. }
             | DurableFileError::ResourceExhausted { path, .. } => path,
         }
     }
 
     pub fn detail(&self) -> &str {
         match self {
-            DurableFileError::Io { detail, .. } => detail,
+            DurableFileError::Io { detail, .. }
+            | DurableFileError::RecordTooLarge { detail, .. } => detail,
             DurableFileError::ResourceExhausted { operation, .. } => operation,
         }
     }
@@ -55,6 +66,7 @@ impl DurableFileError {
     pub fn kind(&self) -> io::ErrorKind {
         match self {
             DurableFileError::Io { kind, .. } => *kind,
+            DurableFileError::RecordTooLarge { .. } => io::ErrorKind::InvalidData,
             DurableFileError::ResourceExhausted { .. } => io::ErrorKind::OutOfMemory,
         }
     }
@@ -318,9 +330,10 @@ where
     if let Some(max_record_bytes) = options.max_record_bytes
         && length > max_record_bytes
     {
-        return Err(DurableFileError::Io {
+        return Err(DurableFileError::RecordTooLarge {
             path: path.display().to_string(),
-            kind: io::ErrorKind::InvalidData,
+            record_bytes: length,
+            max_record_bytes,
             detail: format!("length-prefixed record is {length} bytes; max is {max_record_bytes}"),
         });
     }
@@ -2076,6 +2089,30 @@ mod tests {
             file.stream_position().expect("position after torn"),
             torn_start
         );
+    }
+
+    #[test]
+    fn length_prefixed_record_limit_has_typed_error() {
+        let root = sinomo_testdir::TestDir::new("storage-length-prefixed-record-limit");
+        let path = root.join("records.slog");
+        fs::write(&path, 9_u32.to_be_bytes()).expect("write oversized length");
+
+        let mut file = File::open(&path).expect("open read");
+        let error = read_length_prefixed_record(
+            &mut file,
+            &path,
+            DurableRecordReadOptions::new(DurableLengthEndian::Big).max_record_bytes(8),
+        )
+        .expect_err("record length must exceed configured limit");
+
+        assert!(matches!(
+            error,
+            DurableFileError::RecordTooLarge {
+                record_bytes: 9,
+                max_record_bytes: 8,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -538,7 +538,7 @@ pub(crate) fn read_wal_entries(
                 }
                 break;
             }
-            Err(error) if error.detail().contains("length-prefixed record is") => {
+            Err(durable_file::DurableFileError::RecordTooLarge { .. }) => {
                 truncated = true;
                 break;
             }

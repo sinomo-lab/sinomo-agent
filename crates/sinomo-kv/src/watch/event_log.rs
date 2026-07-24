@@ -373,7 +373,7 @@ where
                 }
                 break;
             }
-            Err(error) if error.detail().contains("length-prefixed record is") => {
+            Err(durable_file::DurableFileError::RecordTooLarge { .. }) => {
                 eprintln!(
                     "warning: ignoring corrupt cluster kv watch-event log record {} in {}",
                     next_record_number,

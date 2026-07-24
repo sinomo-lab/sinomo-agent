@@ -6,7 +6,7 @@ pub const MAX_CLUSTER_KV_REQUEST_ATTEMPT_BYTES: usize = 8 * 1024 * 1024;
 
 const MAX_CLUSTER_KV_REQUEST_ATTEMPT_LOG_RECORDS: usize = 4096;
 const MAX_CLUSTER_KV_REQUEST_ATTEMPT_LOG_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_CLUSTER_KV_REQUEST_ATTEMPT_LOG_RECORD_BYTES: usize =
+pub(crate) const MAX_CLUSTER_KV_REQUEST_ATTEMPT_LOG_RECORD_BYTES: usize =
     MAX_CLUSTER_KV_REQUEST_ATTEMPT_BYTES + 64 * 1024;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -434,7 +434,7 @@ fn load_request_attempt_ledger(
                         }
                         break;
                     }
-                    Err(error) if error.detail().contains("length-prefixed record is") => {
+                    Err(durable_file::DurableFileError::RecordTooLarge { .. }) => {
                         repair_log = true;
                         break;
                     }

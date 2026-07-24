@@ -999,6 +999,43 @@ mod tests {
     }
 
     #[test]
+    fn request_attempt_log_repairs_an_oversized_tail_by_typed_error() {
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-request-attempt-oversized-tail");
+        let paths = ClusterKvPaths::new(&root);
+        let request = KvCommandRequest::generated(KvCommand::Barrier);
+        mark_cluster_kv_request_unknown(&paths, &request, "durable safe record")
+            .expect("append safe request-attempt record");
+
+        let oversized_length =
+            u32::try_from(crate::request::MAX_CLUSTER_KV_REQUEST_ATTEMPT_LOG_RECORD_BYTES + 1)
+                .expect("request-attempt record limit fits u32");
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&paths.request_attempts_log)
+            .expect("open request-attempt log");
+        log.write_all(&oversized_length.to_be_bytes())
+            .and_then(|()| log.write_all(b"ignored"))
+            .and_then(|()| log.sync_data())
+            .expect("append oversized tail");
+        drop(log);
+
+        assert_eq!(
+            read_cluster_kv_request_attempt(&paths, &request.request_id)
+                .expect("recover safe request-attempt prefix"),
+            Some(KvRequestOutcome::Unknown {
+                detail: "durable safe record".to_string(),
+            })
+        );
+        assert_eq!(
+            std::fs::metadata(&paths.request_attempts_log)
+                .expect("repaired log metadata")
+                .len(),
+            0,
+            "typed oversized-tail recovery should checkpoint and clear the log"
+        );
+    }
+
+    #[test]
     fn request_attempt_checkpoint_sequence_makes_log_truncation_crash_safe() {
         let root = sinomo_testdir::TestDir::new("sinomo-kv-request-attempt-stale-log");
         let paths = ClusterKvPaths::new(&root);
@@ -2655,6 +2692,38 @@ mod tests {
         let read = read_cluster_kv_watch_event_log(&paths).expect("read log");
         assert_eq!(read.events, events);
         assert_eq!(read.records, 2);
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_log_marks_oversized_tail_truncated_by_typed_error() {
+        let root = temp_raft_root("sinomo-kv-watch-event-log-oversized-tail");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let parent = paths.watch_events_log.parent().expect("log parent");
+        std::fs::create_dir_all(parent).expect("create log parent");
+        let event = test_kv_put_event(1, "/svc/a", b"a");
+        let mut log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&paths.watch_events_log)
+            .expect("open log");
+        let batch =
+            encode_cluster_kv_watch_event_log_batch(std::slice::from_ref(&event)).expect("encode");
+        append_cluster_kv_watch_event_log_batch_to_file(&paths, &mut log_file, &batch)
+            .expect("append valid event");
+        let oversized_length = u32::try_from(MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES + 1)
+            .expect("watch-event record limit fits u32");
+        log_file
+            .write_all(&oversized_length.to_be_bytes())
+            .and_then(|()| log_file.write_all(b"ignored"))
+            .and_then(|()| log_file.sync_data())
+            .expect("append oversized tail");
+        drop(log_file);
+
+        let read = read_cluster_kv_watch_event_log(&paths).expect("read safe event prefix");
+        assert_eq!(read.events, vec![event]);
+        assert_eq!(read.records, 1);
+        assert!(read.truncated);
     }
 
     #[test]
