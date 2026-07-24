@@ -1,11 +1,35 @@
 use crate::internal::*;
 
 static CLUSTER_KV_RAFT_OPERATION_LOCKS: LazyLock<
-    Mutex<HashMap<PathBuf, &'static ClusterKvRaftOperationLock>>,
+    Mutex<HashMap<PathBuf, std::sync::Weak<ClusterKvRaftOperationLock>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 #[cfg(test)]
 pub(crate) static CLUSTER_KV_RAFT_SNAPSHOT_BYTES_LIMIT_FOR_TEST: AtomicU64 =
     AtomicU64::new(MAX_CLUSTER_KV_RAFT_SNAPSHOT_BYTES);
+#[cfg(test)]
+static CLUSTER_KV_RAFT_APPLY_FAILURES_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn fail_cluster_kv_raft_apply_after_entries_for_test(
+    paths: &KvWalPaths,
+    applied_entries: usize,
+) {
+    assert!(applied_entries > 0, "failure must follow a partial apply");
+    CLUSTER_KV_RAFT_APPLY_FAILURES_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(paths.root.clone(), applied_entries);
+}
+
+#[cfg(test)]
+fn take_cluster_kv_raft_apply_failure_for_test(paths: &KvWalPaths) -> Option<usize> {
+    CLUSTER_KV_RAFT_APPLY_FAILURES_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&paths.root)
+}
 
 struct ClusterKvRaftOperationLock {
     held: Mutex<bool>,
@@ -18,18 +42,37 @@ struct ClusterKvRaftOperationLock {
 /// command can retain it while its durable node remains open across blocking
 /// storage phases and network awaits.
 pub struct ClusterKvRaftOperationGuard {
-    lock: &'static ClusterKvRaftOperationLock,
+    root: PathBuf,
+    lock: Arc<ClusterKvRaftOperationLock>,
+}
+
+fn remove_cluster_kv_raft_operation_lock_if_unused(
+    root: &Path,
+    lock: &Arc<ClusterKvRaftOperationLock>,
+) {
+    let mut locks = CLUSTER_KV_RAFT_OPERATION_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let is_registered_lock = locks
+        .get(root)
+        .is_some_and(|registered| registered.as_ptr() == Arc::as_ptr(lock));
+    if is_registered_lock && Arc::strong_count(lock) == 1 {
+        locks.remove(root);
+    }
 }
 
 impl Drop for ClusterKvRaftOperationGuard {
     fn drop(&mut self) {
-        let mut held = self
-            .lock
-            .held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *held = false;
-        self.lock.ready.notify_one();
+        {
+            let mut held = self
+                .lock
+                .held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *held = false;
+            self.lock.ready.notify_one();
+        }
+        remove_cluster_kv_raft_operation_lock_if_unused(&self.root, &self.lock);
     }
 }
 
@@ -44,28 +87,122 @@ pub fn lock_cluster_kv_raft_operation_for_root(
                 path: "cluster kv raft operation locks".to_string(),
                 detail: format!("cluster kv raft operation lock table poisoned: {error}"),
             })?;
-        *guard.entry(root.clone()).or_insert_with(|| {
-            let lock: &'static ClusterKvRaftOperationLock =
-                Box::leak(Box::new(ClusterKvRaftOperationLock {
+        match guard.get(&root).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(ClusterKvRaftOperationLock {
                     held: Mutex::new(false),
                     ready: Condvar::new(),
-                }));
-            lock
-        })
+                });
+                guard.insert(root.clone(), Arc::downgrade(&lock));
+                lock
+            }
+        }
     };
-    let mut held = lock.held.lock().map_err(|error| KvError::Io {
-        path: root.display().to_string(),
-        detail: format!("cluster kv raft operation lock poisoned: {error}"),
-    })?;
+    let mut held = match lock.held.lock() {
+        Ok(held) => held,
+        Err(error) => {
+            let detail = format!("cluster kv raft operation lock poisoned: {error}");
+            drop(error);
+            remove_cluster_kv_raft_operation_lock_if_unused(&root, &lock);
+            return Err(KvError::Io {
+                path: root.display().to_string(),
+                detail,
+            });
+        }
+    };
     while *held {
-        held = lock.ready.wait(held).map_err(|error| KvError::Io {
-            path: root.display().to_string(),
-            detail: format!("cluster kv raft operation lock poisoned while waiting: {error}"),
-        })?;
+        held = match lock.ready.wait(held) {
+            Ok(held) => held,
+            Err(error) => {
+                let detail =
+                    format!("cluster kv raft operation lock poisoned while waiting: {error}");
+                drop(error);
+                remove_cluster_kv_raft_operation_lock_if_unused(&root, &lock);
+                return Err(KvError::Io {
+                    path: root.display().to_string(),
+                    detail,
+                });
+            }
+        };
     }
     *held = true;
     drop(held);
-    Ok(ClusterKvRaftOperationGuard { lock })
+    Ok(ClusterKvRaftOperationGuard { root, lock })
+}
+
+#[cfg(test)]
+fn cluster_kv_raft_operation_lock_is_registered_for_test(root: &Path) -> bool {
+    CLUSTER_KV_RAFT_OPERATION_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(root)
+}
+
+#[cfg(test)]
+mod operation_lock_tests {
+    use super::*;
+
+    #[test]
+    fn operation_lock_registry_releases_churned_roots() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ClusterKvRaftOperationGuard>();
+
+        let base = std::env::temp_dir().join(format!(
+            "sinomo-kv-operation-lock-churn-{}",
+            std::process::id()
+        ));
+        for index in 0..512 {
+            let root = base.join(index.to_string());
+            let guard =
+                lock_cluster_kv_raft_operation_for_root(&root).expect("operation lock acquired");
+            assert!(cluster_kv_raft_operation_lock_is_registered_for_test(
+                &root
+            ));
+            drop(guard);
+            assert!(
+                !cluster_kv_raft_operation_lock_is_registered_for_test(&root),
+                "dropped operation lock root {index} remained registered"
+            );
+        }
+    }
+
+    #[test]
+    fn operation_lock_registry_preserves_waiter_handoff() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-operation-lock-waiter-{}",
+            std::process::id()
+        ));
+        let first =
+            lock_cluster_kv_raft_operation_for_root(&root).expect("first operation lock acquired");
+        let waiter_root = root.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(0);
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).expect("waiter start reported");
+            let guard = lock_cluster_kv_raft_operation_for_root(&waiter_root)
+                .expect("waiting operation lock acquired");
+            acquired_tx.send(()).expect("waiter acquisition reported");
+            drop(guard);
+        });
+
+        started_rx.recv().expect("waiter started");
+        assert!(
+            matches!(
+                acquired_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "waiter acquired while the first operation still held the lock"
+        );
+        drop(first);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("waiter acquired after handoff");
+        waiter.join().expect("waiter completed");
+        assert!(!cluster_kv_raft_operation_lock_is_registered_for_test(
+            &root
+        ));
+    }
 }
 
 pub fn lock_cluster_kv_raft_operation_for_paths(
@@ -1334,10 +1471,20 @@ pub trait ClusterKvRaftQuorumCommitAsyncHost: Send {
         Box::pin(async move {
             let deadline = Instant::now() + timeout;
             let mut accepted = 0_usize;
+            let mut attempted_node_ids = RaftNodeIdSet::default();
             let mut attempts = Vec::new();
             for target in targets {
                 if accepted >= required_remote_acks {
                     break;
+                }
+                if !attempted_node_ids
+                    .try_insert_clone(
+                        self.target_node_id(&target),
+                        "dedupe default async raft replication target",
+                    )
+                    .map_err(Self::kv_error)?
+                {
+                    continue;
                 }
                 let remaining = deadline
                     .checked_duration_since(Instant::now())
@@ -1729,11 +1876,28 @@ where
     let deadline = Instant::now() + options.timeout;
     let quorum_metrics = KvCommandPhaseMetricGuard::start("quorum");
     let targets = host.remote_voter_targets_async(state).await?;
-    let replication_targets = targets
-        .iter()
-        .filter(|target| !voter_acks.contains(host.target_node_id(target)))
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut replication_node_ids = RaftNodeIdSet::default();
+    let mut replication_targets = Vec::new();
+    for target in &targets {
+        let target_node_id = host.target_node_id(target);
+        if voter_acks.contains(target_node_id)
+            || !replication_node_ids
+                .try_insert_clone(
+                    target_node_id,
+                    "dedupe async raft quorum replication target",
+                )
+                .map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?
+        {
+            continue;
+        }
+        try_reserve_kv_items(
+            &mut replication_targets,
+            1,
+            "collect unique async raft quorum replication target",
+        )
+        .map_err(<H as ClusterKvRaftQuorumCommitAsyncHost>::kv_error)?;
+        replication_targets.push(target.clone());
+    }
     let required_remote_acks = quorum_size.saturating_sub(voter_acks.len());
     let attempts = host
         .replicate_cluster_raft_to_quorum_async(
@@ -3967,6 +4131,7 @@ pub struct DurableRaftKvNode {
     pub(crate) paths: KvWalPaths,
     _lock: File,
     node: ReplicatedKvNode,
+    poisoned: bool,
 }
 
 impl DurableRaftKvNode {
@@ -4058,6 +4223,7 @@ impl DurableRaftKvNode {
             paths,
             _lock: lock,
             node,
+            poisoned: false,
         };
         metrics::histogram!("sinomo.kv.raft.open.log_entries").record(opened.log().len() as f64);
         opened.record_live_metrics();
@@ -4140,47 +4306,67 @@ impl DurableRaftKvNode {
         &self.node_id
     }
 
+    /// Reports whether a post-persistence apply failure made this in-memory
+    /// view unsafe to reuse.
+    ///
+    /// The WAL and hard state remain authoritative. Drop and reopen a poisoned
+    /// node to replay the committed prefix into a fresh store.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     pub fn hard_state(&self) -> &RaftHardState {
+        self.assert_healthy();
         &self.node.hard_state
     }
 
     pub fn store(&self) -> &InProcessKvStore {
+        self.assert_healthy();
         &self.node.store
     }
 
     pub(crate) fn try_into_snapshot(self) -> Result<KvSnapshot, KvError> {
+        self.ensure_healthy()?;
         self.node.store.try_into_snapshot()
     }
 
     pub fn log(&self) -> &[KvLogEntry] {
+        self.assert_healthy();
         &self.node.log
     }
 
     pub fn last_log_index(&self) -> u64 {
+        self.assert_healthy();
         self.node.last_log_index()
     }
 
     pub fn last_log_term(&self) -> u64 {
+        self.assert_healthy();
         self.node.last_log_term()
     }
 
     pub fn term_at(&self, index: u64) -> Option<u64> {
+        self.assert_healthy();
         self.node.term_at(index)
     }
 
     pub fn log_entry_at(&self, index: u64) -> Option<&KvLogEntry> {
+        self.assert_healthy();
         self.node.log_entry_at(index)
     }
 
     pub fn applied_index(&self) -> u64 {
+        self.assert_healthy();
         self.node.applied_index
     }
 
     pub fn snapshot_index(&self) -> u64 {
+        self.assert_healthy();
         self.node.snapshot_index
     }
 
     pub fn txn_response_at(&self, index: u64) -> Option<&KvTxnResponse> {
+        self.assert_healthy();
         self.node.txn_responses.get(index)
     }
 
@@ -4188,6 +4374,7 @@ impl DurableRaftKvNode {
         &mut self,
         request: RaftAppendEntriesRequest,
     ) -> Result<RaftAppendEntriesResponse, KvError> {
+        self.ensure_healthy()?;
         if let Some(response) = self.node.read_only_append_entries_response(&request) {
             return Ok(response);
         }
@@ -4273,7 +4460,7 @@ impl DurableRaftKvNode {
         }
         if let Some((commit_index, entries)) = entries_to_apply {
             let mut metric = KvStorageMetricGuard::start("apply", "sinomo.kv.apply.us");
-            self.node.apply_preflighted_commit(entries, commit_index)?;
+            self.apply_persisted_commit(entries, commit_index, "append_entries")?;
             metric.succeed();
         }
         self.record_live_metrics();
@@ -4306,6 +4493,7 @@ impl DurableRaftKvNode {
         snapshot: Option<RaftSnapshot>,
         append: RaftAppendEntriesRequest,
     ) -> Result<(RaftAppendEntriesResponse, bool, KvRevision), KvError> {
+        self.ensure_healthy()?;
         let before_revision = self.store().revision();
         let mut snapshot_restored = false;
         if let Some(snapshot) = snapshot {
@@ -4333,6 +4521,7 @@ impl DurableRaftKvNode {
         &mut self,
         request: RaftRequestVoteRequest,
     ) -> Result<RaftRequestVoteResponse, KvError> {
+        self.ensure_healthy()?;
         let hard_state_before = self.node.hard_state.clone();
         let response = match self.node.handle_request_vote(request) {
             Ok(response) => response,
@@ -4350,6 +4539,7 @@ impl DurableRaftKvNode {
     }
 
     pub fn observe_term(&mut self, term: u64) -> Result<bool, KvError> {
+        self.ensure_healthy()?;
         let hard_state_before = self.node.hard_state.clone();
         if !self.node.observe_term(term) {
             return Ok(false);
@@ -4363,6 +4553,7 @@ impl DurableRaftKvNode {
     }
 
     pub fn become_leader(&mut self, term: u64) -> Result<(), KvError> {
+        self.ensure_healthy()?;
         // Leadership was won for exactly `term`; a higher local term means a
         // concurrent vote or append advanced the node past this election and
         // claiming leadership for the newer term would not be backed by a
@@ -4386,6 +4577,7 @@ impl DurableRaftKvNode {
     }
 
     pub fn clear_known_leader(&mut self) -> Result<(), KvError> {
+        self.ensure_healthy()?;
         let hard_state_before = self.node.hard_state.clone();
         self.node.hard_state.leader_id = None;
         if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
@@ -4409,6 +4601,7 @@ impl DurableRaftKvNode {
         term: u64,
         request: KvCommandRequest,
     ) -> Result<KvLogEntry, KvError> {
+        self.ensure_healthy()?;
         let hard_state_before = self.node.hard_state.clone();
         let log_before = self.node.log.clone();
         let entry = KvLogEntry {
@@ -4440,6 +4633,7 @@ impl DurableRaftKvNode {
     }
 
     pub fn discard_uncommitted_tail(&mut self) -> Result<bool, KvError> {
+        self.ensure_healthy()?;
         let hard_state_before = self.node.hard_state.clone();
         let log_before = self.node.log.clone();
         let txn_responses_before = self.node.txn_responses.clone();
@@ -4463,10 +4657,12 @@ impl DurableRaftKvNode {
     }
 
     pub fn compact_event_history_to(&mut self, max_events: usize) {
+        self.assert_healthy();
         self.node.store.compact_event_history_to(max_events);
     }
 
     pub fn commit_to(&mut self, commit_index: u64) -> Result<(), KvError> {
+        self.ensure_healthy()?;
         let mut metric = KvStorageMetricGuard::start("apply", "sinomo.kv.apply.us");
         let hard_state_before = self.node.hard_state.clone();
         if commit_index <= self.node.applied_index {
@@ -4490,7 +4686,7 @@ impl DurableRaftKvNode {
             self.node.hard_state = hard_state_before;
             return Err(error);
         }
-        let result = self.node.apply_preflighted_commit(entries, commit_index);
+        let result = self.apply_persisted_commit(entries, commit_index, "commit_to");
         if result.is_ok() {
             self.record_live_metrics();
             metric.succeed();
@@ -4499,6 +4695,7 @@ impl DurableRaftKvNode {
     }
 
     pub fn save_snapshot(&mut self) -> Result<RaftSnapshot, KvError> {
+        self.ensure_healthy()?;
         let mut metric =
             KvStorageMetricGuard::start("snapshot_write", "sinomo.kv.snapshot.write.us");
         let node_before = self.node.clone();
@@ -4534,6 +4731,7 @@ impl DurableRaftKvNode {
     }
 
     pub fn restore_snapshot(&mut self, snapshot: RaftSnapshot) -> Result<(), KvError> {
+        self.ensure_healthy()?;
         let mut metric =
             KvStorageMetricGuard::start("snapshot_restore", "sinomo.kv.snapshot.restore.us");
         let node_before = self.node.clone();
@@ -4555,6 +4753,51 @@ impl DurableRaftKvNode {
 
     fn persist_hard_state(&self) -> Result<(), KvError> {
         self.paths.write_persisted_hard_state(&self.node.hard_state)
+    }
+
+    fn apply_persisted_commit(
+        &mut self,
+        entries: CommitEntries,
+        commit_index: u64,
+        phase: &'static str,
+    ) -> Result<(), KvError> {
+        // The commit index is durable before this method runs. If applying the
+        // committed entries fails, rolling only part of the in-memory store
+        // backward would be unsafe and cloning the whole keyspace before every
+        // commit would be prohibitively expensive. Poison this handle instead;
+        // reopening deterministically rebuilds it from the durable prefix.
+        #[cfg(test)]
+        let result =
+            if let Some(fail_after) = take_cluster_kv_raft_apply_failure_for_test(&self.paths) {
+                self.node.apply_preflighted_commit_failing_after_for_test(
+                    entries,
+                    commit_index,
+                    fail_after,
+                )
+            } else {
+                self.node.apply_preflighted_commit(entries, commit_index)
+            };
+        #[cfg(not(test))]
+        let result = self.node.apply_preflighted_commit(entries, commit_index);
+        if result.is_err() {
+            self.poisoned = true;
+            metrics::counter!("sinomo.kv.raft.poisoned_sessions", "phase" => phase).increment(1);
+        }
+        result
+    }
+
+    fn ensure_healthy(&self) -> Result<(), KvError> {
+        if self.poisoned {
+            return Err(KvError::RaftSessionPoisoned);
+        }
+        Ok(())
+    }
+
+    fn assert_healthy(&self) {
+        assert!(
+            !self.poisoned,
+            "durable raft node session is poisoned; drop and reopen the node"
+        );
     }
 
     fn persist_hard_state_if_changed(&self, before: &RaftHardState) -> Result<(), KvError> {

@@ -1150,6 +1150,8 @@ pub enum KvError {
     Io { path: String, detail: String },
     #[error("raft node is busy at {path}")]
     Busy { path: String },
+    #[error("durable raft node session is poisoned; drop and reopen the node")]
+    RaftSessionPoisoned,
     #[error("raft cluster requires at least one voter")]
     NoVoters,
     #[error("unknown replicated node: {node_id}")]

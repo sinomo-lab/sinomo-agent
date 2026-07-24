@@ -106,12 +106,32 @@ pub struct ContentManifest {
     pub extents: Vec<ContentExtent>,
 }
 
+/// Finalized streamed content that is not yet bound to an object version.
+///
+/// The quarantine file is durable and content-addressed by `content_hash`, but
+/// it does not reserve an `(object_id, version)` manifest. Dropping an unbound
+/// value removes the quarantine file.
+#[derive(Debug)]
+pub struct ContentStoreQuarantinedBlob {
+    store_root: PathBuf,
+    temporary_path: PathBuf,
+    pub content_hash: String,
+    pub size_bytes: u64,
+}
+
+impl Drop for ContentStoreQuarantinedBlob {
+    fn drop(&mut self) {
+        remove_file_if_exists(&self.temporary_path).ok();
+    }
+}
+
 /// One-pass object-version ingest into transport-independent content storage.
 ///
 /// Callers write each borrowed chunk directly while they own it. The ingest
-/// hashes and writes that range once, then atomically publishes the finalized
-/// blob and manifest at EOF. Dropping an unfinished ingest removes its
-/// temporary file.
+/// hashes and writes that range once. It may either finalize into an anonymous
+/// quarantine blob for later authorization, or atomically publish the finalized
+/// blob and manifest at EOF. Dropping an unfinished ingest removes its temporary
+/// file.
 pub struct ContentStoreObjectIngest<'a> {
     store: &'a LocalContentStore,
     object_id: String,
@@ -174,8 +194,8 @@ impl ContentStoreObjectIngest<'_> {
         Ok(())
     }
 
-    /// Finalizes the one application digest and publishes the blob and manifest.
-    pub fn finish(mut self) -> Result<ContentManifest> {
+    /// Finalizes the one application digest without reserving an object version.
+    pub fn finish_quarantined(mut self) -> Result<ContentStoreQuarantinedBlob> {
         if self.received_size_bytes != self.expected_size_bytes {
             return Err(ContentStoreError::InvalidContentLayout {
                 message: format!(
@@ -204,15 +224,22 @@ impl ContentStoreObjectIngest<'_> {
             source,
         })?;
         drop(file);
-        let manifest = self.store.publish_prehashed_object_version_file(
-            &self.object_id,
-            &self.version,
-            hash,
-            self.received_size_bytes,
-            &self.temporary_path,
-        )?;
         self.finished = true;
-        Ok(manifest)
+        Ok(ContentStoreQuarantinedBlob {
+            store_root: self.store.root.clone(),
+            temporary_path: self.temporary_path.clone(),
+            content_hash: hash,
+            size_bytes: self.received_size_bytes,
+        })
+    }
+
+    /// Finalizes the one application digest and publishes the blob and manifest.
+    pub fn finish(self) -> Result<ContentManifest> {
+        let store = self.store;
+        let object_id = self.object_id.clone();
+        let version = self.version.clone();
+        let blob = self.finish_quarantined()?;
+        store.bind_quarantined_blob(&object_id, &version, blob)
     }
 }
 
@@ -675,6 +702,26 @@ impl LocalContentStore {
         expected_size_bytes: u64,
         expected_hash: Option<&str>,
     ) -> Result<ContentStoreObjectIngest<'_>> {
+        self.begin_content_ingest(object_id, version, expected_size_bytes, expected_hash)
+    }
+
+    /// Starts a streamed ingest whose finalized bytes do not reserve an object
+    /// version until `bind_quarantined_blob` is called after authorization.
+    pub fn begin_quarantined_blob_ingest(
+        &self,
+        expected_size_bytes: u64,
+        expected_hash: Option<&str>,
+    ) -> Result<ContentStoreObjectIngest<'_>> {
+        self.begin_content_ingest("", "", expected_size_bytes, expected_hash)
+    }
+
+    fn begin_content_ingest(
+        &self,
+        object_id: &str,
+        version: &str,
+        expected_size_bytes: u64,
+        expected_hash: Option<&str>,
+    ) -> Result<ContentStoreObjectIngest<'_>> {
         let temporary_anchor = self.root.join("blob-tmp").join("stream-ingest");
         let temporary_path = temporary_path_for(&temporary_anchor);
         if let Some(parent) = temporary_path.parent() {
@@ -700,6 +747,34 @@ impl LocalContentStore {
             temporary_path,
             finished: false,
         })
+    }
+
+    /// Atomically binds a finalized quarantine blob to one object version.
+    ///
+    /// All admission, authority, base-version, and route-rebase checks must
+    /// complete before calling this method.
+    pub fn bind_quarantined_blob(
+        &self,
+        object_id: &str,
+        version: &str,
+        blob: ContentStoreQuarantinedBlob,
+    ) -> Result<ContentManifest> {
+        if blob.store_root != self.root {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: format!(
+                    "quarantined blob belongs to {}, not content store {}",
+                    blob.store_root.display(),
+                    self.root.display()
+                ),
+            });
+        }
+        self.publish_prehashed_object_version_file(
+            object_id,
+            version,
+            blob.content_hash.clone(),
+            blob.size_bytes,
+            &blob.temporary_path,
+        )
     }
 
     /// Stores one already-materialized DFS value while computing its
@@ -4557,6 +4632,37 @@ mod tests {
         let (_, stored_bytes) = store
             .read_object_version("stream-object", "v1")
             .expect("read ingested object");
+        assert_eq!(stored_bytes, bytes);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn quarantined_stream_ingest_does_not_reserve_version_until_bound() {
+        let root = temp_root("quarantined_stream_ingest_bind");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let bytes = b"validate this streamed value before publication";
+        let expected_hash = content_hash(bytes);
+        let mut ingest = store
+            .begin_quarantined_blob_ingest(bytes.len() as u64, Some(&expected_hash))
+            .expect("begin quarantined ingest");
+        ingest.write_chunk(bytes).expect("write chunk");
+        let blob = ingest.finish_quarantined().expect("finish quarantine");
+
+        assert_eq!(blob.content_hash, expected_hash);
+        assert_eq!(blob.size_bytes, bytes.len() as u64);
+        assert!(
+            store.read_manifest("stream-object", "v1").is_err(),
+            "finishing quarantine must not reserve an object version"
+        );
+
+        let manifest = store
+            .bind_quarantined_blob("stream-object", "v1", blob)
+            .expect("bind validated blob");
+        assert_eq!(manifest.content_hash, expected_hash);
+        let (_, stored_bytes) = store
+            .read_object_version("stream-object", "v1")
+            .expect("read bound object");
         assert_eq!(stored_bytes, bytes);
 
         cleanup(&root);

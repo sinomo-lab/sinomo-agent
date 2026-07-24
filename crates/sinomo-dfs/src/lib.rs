@@ -120,10 +120,11 @@ pub(crate) use cluster_service::{
 pub(crate) use content_store::content_hash;
 pub use content_store::{
     BlobRangeReader, BlobReader, ContentManifest, ContentStoreError, ContentStoreGcOptions,
-    ContentStoreGcReport, ContentStoreQuota, ContentStoreQuotaResource, ContentStoreQuotaUsage,
-    ContentStoreScrubIssue, ContentStoreScrubReport, ContentStoreStagingGcOptions,
-    ContentStoreStagingGcReport, ContentStoreStats, ContentStoreVersionGcOptions,
-    ContentStoreVersionGcReport, ContentVersionIdentity, LocalContentStore, ObjectVersionReader,
+    ContentStoreGcReport, ContentStoreQuarantinedBlob, ContentStoreQuota,
+    ContentStoreQuotaResource, ContentStoreQuotaUsage, ContentStoreScrubIssue,
+    ContentStoreScrubReport, ContentStoreStagingGcOptions, ContentStoreStagingGcReport,
+    ContentStoreStats, ContentStoreVersionGcOptions, ContentStoreVersionGcReport,
+    ContentVersionIdentity, LocalContentStore, ObjectVersionReader,
 };
 pub use control_plane::{
     AsyncDfsControlPlaneKvClient, DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT,

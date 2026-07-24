@@ -23,7 +23,7 @@ use sinomo_core::network::{
 use sinomo_core::node::NodeId;
 
 use crate::{
-    AsyncDfsMessageTransport, ContentManifest, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES,
+    AsyncDfsMessageTransport, ContentStoreQuarantinedBlob, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES,
     DfsBlobTransferResult, DfsDirectReadClientResponse, DfsDirectReadClientResult,
     DfsDirectReadRequest, DfsError, DfsMessageCommand, DfsMessageProcessReport,
     DfsMessageProcessResult, DfsMessageResponse, DfsMessageTransport, DfsMessageTransportFuture,
@@ -6640,16 +6640,16 @@ impl NetworkedDfsService<DfsNodeServedMessageTransport> {
         &mut self,
         command: DfsMessageCommand,
     ) -> DfsMessageProcessReport {
-        self.process_message_command_report_with_preingested_stage_blob(command, None)
+        self.process_message_command_report_with_preingested_blob(command, None)
     }
 
-    pub fn process_message_command_report_with_preingested_stage_blob(
+    pub fn process_message_command_report_with_preingested_blob(
         &mut self,
         command: DfsMessageCommand,
-        preingested_stage_blob: Option<ContentManifest>,
+        preingested_blob: Option<ContentStoreQuarantinedBlob>,
     ) -> DfsMessageProcessReport {
         self.begin_message_committed_work();
-        let outcome = self.process_message_command_inner(command, preingested_stage_blob);
+        let outcome = self.process_message_command_inner(command, preingested_blob);
         let committed_work = self.take_message_committed_work();
         DfsMessageProcessReport {
             outcome,
@@ -6660,7 +6660,7 @@ impl NetworkedDfsService<DfsNodeServedMessageTransport> {
     fn process_message_command_inner(
         &mut self,
         command: DfsMessageCommand,
-        preingested_stage_blob: Option<ContentManifest>,
+        preingested_blob: Option<ContentStoreQuarantinedBlob>,
     ) -> Result<DfsMessageProcessResult, DfsError> {
         let request_id = command.request_id;
         let allow_write_repair_progress =
@@ -6670,7 +6670,7 @@ impl NetworkedDfsService<DfsNodeServedMessageTransport> {
         self.transport
             .begin_message(&command.routed_message)
             .map_err(DfsError::from_network)?;
-        let initial = if let Some(manifest) = preingested_stage_blob {
+        let initial = if let Some(blob) = preingested_blob {
             let routed = command.routed_message;
             if routed.target_node_id != self.node_id {
                 Err(DfsError::Network {
@@ -6679,14 +6679,35 @@ impl NetworkedDfsService<DfsNodeServedMessageTransport> {
                         routed.target_node_id, self.node_id
                     ),
                 })
-            } else if let DfsNetworkMessage::StageBlob(command) = routed.message {
-                self.handle_preingested_stage_blob(routed.source_node_id, command, manifest)
-                    .map(|event| vec![event])
             } else {
-                Err(DfsError::Distributed {
-                    message: "preingested DFS attachment did not carry a stage-blob command"
-                        .to_string(),
-                })
+                match routed.message {
+                    DfsNetworkMessage::StageBlob(command) => self
+                        .handle_preingested_stage_blob(routed.source_node_id, command, blob)
+                        .map(|event| vec![event]),
+                    DfsNetworkMessage::DistributedWriteRequest(mut command) => {
+                        command.exclusive_create = false;
+                        self.handle_preingested_distributed_write_request(
+                            routed.source_node_id,
+                            command,
+                            blob,
+                        )
+                        .map(|event| vec![event])
+                    }
+                    DfsNetworkMessage::ExclusiveCreateRequest(mut command) => {
+                        command.exclusive_create = true;
+                        self.handle_preingested_distributed_write_request(
+                            routed.source_node_id,
+                            command,
+                            blob,
+                        )
+                        .map(|event| vec![event])
+                    }
+                    other => Err(DfsError::Distributed {
+                        message: format!(
+                            "preingested DFS attachment is not supported for {other:?}"
+                        ),
+                    }),
+                }
             }
         } else {
             self.process_served_routed_messages(vec![command.routed_message])

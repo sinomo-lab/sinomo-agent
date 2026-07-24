@@ -999,6 +999,43 @@ mod tests {
     }
 
     #[test]
+    fn request_attempt_log_repairs_an_oversized_tail_by_typed_error() {
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-request-attempt-oversized-tail");
+        let paths = ClusterKvPaths::new(&root);
+        let request = KvCommandRequest::generated(KvCommand::Barrier);
+        mark_cluster_kv_request_unknown(&paths, &request, "durable safe record")
+            .expect("append safe request-attempt record");
+
+        let oversized_length =
+            u32::try_from(crate::request::MAX_CLUSTER_KV_REQUEST_ATTEMPT_LOG_RECORD_BYTES + 1)
+                .expect("request-attempt record limit fits u32");
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&paths.request_attempts_log)
+            .expect("open request-attempt log");
+        log.write_all(&oversized_length.to_be_bytes())
+            .and_then(|()| log.write_all(b"ignored"))
+            .and_then(|()| log.sync_data())
+            .expect("append oversized tail");
+        drop(log);
+
+        assert_eq!(
+            read_cluster_kv_request_attempt(&paths, &request.request_id)
+                .expect("recover safe request-attempt prefix"),
+            Some(KvRequestOutcome::Unknown {
+                detail: "durable safe record".to_string(),
+            })
+        );
+        assert_eq!(
+            std::fs::metadata(&paths.request_attempts_log)
+                .expect("repaired log metadata")
+                .len(),
+            0,
+            "typed oversized-tail recovery should checkpoint and clear the log"
+        );
+    }
+
+    #[test]
     fn request_attempt_checkpoint_sequence_makes_log_truncation_crash_safe() {
         let root = sinomo_testdir::TestDir::new("sinomo-kv-request-attempt-stale-log");
         let paths = ClusterKvPaths::new(&root);
@@ -2655,6 +2692,38 @@ mod tests {
         let read = read_cluster_kv_watch_event_log(&paths).expect("read log");
         assert_eq!(read.events, events);
         assert_eq!(read.records, 2);
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_log_marks_oversized_tail_truncated_by_typed_error() {
+        let root = temp_raft_root("sinomo-kv-watch-event-log-oversized-tail");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let parent = paths.watch_events_log.parent().expect("log parent");
+        std::fs::create_dir_all(parent).expect("create log parent");
+        let event = test_kv_put_event(1, "/svc/a", b"a");
+        let mut log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&paths.watch_events_log)
+            .expect("open log");
+        let batch =
+            encode_cluster_kv_watch_event_log_batch(std::slice::from_ref(&event)).expect("encode");
+        append_cluster_kv_watch_event_log_batch_to_file(&paths, &mut log_file, &batch)
+            .expect("append valid event");
+        let oversized_length = u32::try_from(MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES + 1)
+            .expect("watch-event record limit fits u32");
+        log_file
+            .write_all(&oversized_length.to_be_bytes())
+            .and_then(|()| log_file.write_all(b"ignored"))
+            .and_then(|()| log_file.sync_data())
+            .expect("append oversized tail");
+        drop(log_file);
+
+        let read = read_cluster_kv_watch_event_log(&paths).expect("read safe event prefix");
+        assert_eq!(read.events, vec![event]);
+        assert_eq!(read.records, 1);
+        assert!(read.truncated);
     }
 
     #[test]
@@ -9529,6 +9598,122 @@ mod tests {
     }
 
     #[test]
+    fn default_async_raft_replication_counts_unique_node_acknowledgements() {
+        let local =
+            NodeId::from_legacy_named("node_kv_default_replication_dedupe_local").expect("local");
+        let remote_a =
+            NodeId::from_legacy_named("node_kv_default_replication_dedupe_a").expect("remote a");
+        let remote_b =
+            NodeId::from_legacy_named("node_kv_default_replication_dedupe_b").expect("remote b");
+        let state = quorum_commit_test_state(&local, &remote_a);
+        let mut host = QuorumCommitTestHost {
+            accepting_targets: [remote_a.clone(), remote_b.clone()].into_iter().collect(),
+            ..QuorumCommitTestHost::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let attempts = runtime
+            .block_on(
+                <QuorumCommitTestHost as ClusterKvRaftQuorumCommitAsyncHost>::replicate_cluster_raft_to_quorum_async(
+                    &mut host,
+                    &state,
+                    vec![remote_a.clone(), remote_a.clone(), remote_b.clone()],
+                    2,
+                    Duration::from_secs(1),
+                ),
+            )
+            .expect("default replication");
+
+        assert_eq!(
+            attempts
+                .into_iter()
+                .map(|attempt| attempt.target)
+                .collect::<Vec<_>>(),
+            vec![remote_a.clone(), remote_b.clone()]
+        );
+        assert_eq!(host.replicated_targets, vec![remote_a, remote_b]);
+    }
+
+    #[test]
+    fn cluster_kv_raft_quorum_async_driver_deduplicates_replication_targets() {
+        let local = NodeId::from_legacy_named("node_kv_quorum_async_dedupe_local").expect("local");
+        let remote_a =
+            NodeId::from_legacy_named("node_kv_quorum_async_dedupe_a").expect("remote a");
+        let remote_b =
+            NodeId::from_legacy_named("node_kv_quorum_async_dedupe_b").expect("remote b");
+        let remote_c =
+            NodeId::from_legacy_named("node_kv_quorum_async_dedupe_c").expect("remote c");
+        let mut state = quorum_commit_test_state(&local, &remote_a);
+        for (node_id, name) in [
+            (remote_b.clone(), "remote b"),
+            (remote_c.clone(), "remote c"),
+        ] {
+            let mut member = state.members[1].clone();
+            member.node_id = node_id;
+            member.display_name = name.to_string();
+            member.node_public_key = format!("pk-{name}");
+            state.members.push(member);
+        }
+        assert_eq!(cluster_kv_raft_quorum_size_for_state(&state), 3);
+
+        let mut host = QuorumCommitTestHost {
+            targets: vec![remote_a.clone(), remote_a.clone(), remote_b.clone()],
+            accepting_targets: [remote_a.clone(), remote_b.clone()].into_iter().collect(),
+            ..QuorumCommitTestHost::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let result = runtime
+            .block_on(commit_cluster_kv_raft_command_with_quorum_async(
+                &mut state,
+                KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                    key: "/kv/quorum/async-deduplicated".to_string(),
+                    value: b"ok".to_vec(),
+                    lease_id: None,
+                })),
+                ClusterKvRaftQuorumCommitOptions {
+                    timeout: Duration::from_secs(1),
+                },
+                &mut host,
+            ))
+            .expect("two unique remote acknowledgements should reach quorum");
+
+        assert_eq!(
+            result.authority.basis,
+            KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks: 3,
+                required_quorum: 3,
+            }
+        );
+        assert_eq!(
+            host.replicated_targets,
+            vec![remote_a.clone(), remote_b.clone()],
+            "the duplicate target must not consume an acknowledgement slot"
+        );
+        assert_eq!(
+            host.statuses,
+            vec![
+                (
+                    remote_a.clone(),
+                    ClusterKvRaftTargetReplicationStatus::Accepted,
+                ),
+                (
+                    remote_b.clone(),
+                    ClusterKvRaftTargetReplicationStatus::Accepted,
+                ),
+            ]
+        );
+        assert_eq!(host.fanout_targets, vec![remote_a, remote_b]);
+        assert!(!host.discarded);
+    }
+
+    #[test]
     fn cluster_kv_raft_quorum_driver_discards_uncommitted_entry_without_quorum() {
         let local =
             NodeId::from_legacy_named("node_kv_quorum_driver_no_quorum_local").expect("local");
@@ -11154,6 +11339,141 @@ mod tests {
             node.last_log_index(),
             entry.index,
             "the durable uncommitted WAL entry should remain available in memory"
+        );
+    }
+
+    #[test]
+    fn durable_raft_commit_apply_failure_poisons_session_until_reopen() {
+        let root = temp_raft_root("sinomo-kv-commit-apply-poison");
+        let node_id = NodeId::from_legacy_named("node_commit_apply_poison").expect("node");
+        let paths = KvWalPaths::new(&root);
+        let mut node = DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open node");
+        for (key, value) in [
+            ("/poison/commit/one", b"one".as_slice()),
+            ("/poison/commit/two", b"two".as_slice()),
+        ] {
+            node.append_local_command(
+                1,
+                KvCommand::Op(KvOp::Put {
+                    key: key.to_string(),
+                    value: value.to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append command");
+        }
+        fail_cluster_kv_raft_apply_after_entries_for_test(&paths, 1);
+
+        let error = node
+            .commit_to(2)
+            .expect_err("injected apply failure must escape");
+        assert!(matches!(error, KvError::ResourceExhausted { .. }));
+        assert!(node.is_poisoned());
+        assert_eq!(
+            node.commit_to(2).expect_err("poisoned session must fail"),
+            KvError::RaftSessionPoisoned
+        );
+        drop(node);
+
+        let reopened = DurableRaftKvNode::open(node_id, paths).expect("reopen poisoned node");
+        assert_eq!(reopened.hard_state().commit_index, 2);
+        assert_eq!(reopened.applied_index(), 2);
+        assert_eq!(
+            reopened
+                .store()
+                .get("/poison/commit/one")
+                .expect("first replayed value")
+                .value,
+            b"one"
+        );
+        assert_eq!(
+            reopened
+                .store()
+                .get("/poison/commit/two")
+                .expect("second replayed value")
+                .value,
+            b"two"
+        );
+    }
+
+    #[test]
+    fn durable_raft_append_apply_failure_poisons_session_until_reopen() {
+        let leader_root = temp_raft_root("sinomo-kv-append-apply-poison-leader");
+        let follower_root = temp_raft_root("sinomo-kv-append-apply-poison-follower");
+        let leader_id =
+            NodeId::from_legacy_named("node_append_apply_poison_leader").expect("leader");
+        let follower_id =
+            NodeId::from_legacy_named("node_append_apply_poison_follower").expect("follower");
+        let follower_paths = KvWalPaths::new(&follower_root);
+        let entries = {
+            let mut leader =
+                DurableRaftKvNode::open(leader_id.clone(), KvWalPaths::new(&leader_root))
+                    .expect("open leader");
+            for (key, value) in [
+                ("/poison/append/one", b"one".as_slice()),
+                ("/poison/append/two", b"two".as_slice()),
+            ] {
+                leader
+                    .append_local_command(
+                        1,
+                        KvCommand::Op(KvOp::Put {
+                            key: key.to_string(),
+                            value: value.to_vec(),
+                            lease_id: None,
+                        }),
+                    )
+                    .expect("append leader command");
+            }
+            leader.log().to_vec()
+        };
+        let mut follower = DurableRaftKvNode::open(follower_id.clone(), follower_paths.clone())
+            .expect("open follower");
+        fail_cluster_kv_raft_apply_after_entries_for_test(&follower_paths, 1);
+
+        let error = follower
+            .append_entries(RaftAppendEntriesRequest {
+                term: 1,
+                leader_id,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries,
+                leader_commit: 2,
+            })
+            .expect_err("injected follower apply failure must escape");
+        assert!(matches!(error, KvError::ResourceExhausted { .. }));
+        assert!(follower.is_poisoned());
+        assert_eq!(
+            follower
+                .request_vote(RaftRequestVoteRequest {
+                    term: 2,
+                    candidate_id: follower_id.clone(),
+                    last_log_index: 2,
+                    last_log_term: 1,
+                })
+                .expect_err("poisoned session must reject raft operations"),
+            KvError::RaftSessionPoisoned
+        );
+        drop(follower);
+
+        let reopened =
+            DurableRaftKvNode::open(follower_id, follower_paths).expect("reopen follower");
+        assert_eq!(reopened.hard_state().commit_index, 2);
+        assert_eq!(reopened.applied_index(), 2);
+        assert_eq!(
+            reopened
+                .store()
+                .get("/poison/append/one")
+                .expect("first replayed value")
+                .value,
+            b"one"
+        );
+        assert_eq!(
+            reopened
+                .store()
+                .get("/poison/append/two")
+                .expect("second replayed value")
+                .value,
+            b"two"
         );
     }
 
