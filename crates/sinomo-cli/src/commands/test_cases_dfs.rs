@@ -2178,7 +2178,7 @@ fn run_concurrent_dir_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let create_thread = std::thread::spawn(move || {
         let started = Instant::now();
         let result = SifsFileManagerBackend::open(&create_dir).and_then(|backend| {
-            backend.write_file_wait_for_commit_with_deadline(
+            backend.write_file_with_existing_parent_wait_for_commit_with_deadline(
                 &create_child,
                 b"child",
                 create_deadline,

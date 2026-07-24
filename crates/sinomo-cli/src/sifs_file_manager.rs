@@ -44,6 +44,12 @@ const SIFS_FOREGROUND_METADATA_PUBLISH_MAX_BATCHES_PER_TARGET: usize = 1;
 const SIFS_MAINTENANCE_REFRESH_TIMEOUT: Duration = Duration::from_millis(750);
 const SIFS_PLACEMENT_IMPACT_PAGE_SIZE: usize = 256;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SifsWriteParentPolicy {
+    MaterializeMissing,
+    RequireExisting,
+}
+
 #[derive(Debug)]
 pub(crate) struct SifsFileManagerBackend {
     data_dir: SinomoDataDir,
@@ -989,7 +995,15 @@ impl SifsFileManagerBackend {
     }
 
     pub(crate) fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
-        self.write_file_with_options(path, bytes, false, false, true, None)
+        self.write_file_with_options(
+            path,
+            bytes,
+            false,
+            false,
+            true,
+            SifsWriteParentPolicy::MaterializeMissing,
+            None,
+        )
     }
 
     pub(crate) fn replace_file_if_version(
@@ -1053,7 +1067,15 @@ impl SifsFileManagerBackend {
         bytes: &[u8],
         deadline: Instant,
     ) -> Result<(), String> {
-        self.write_file_with_options(path, bytes, false, false, true, Some(deadline))
+        self.write_file_with_options(
+            path,
+            bytes,
+            false,
+            false,
+            true,
+            SifsWriteParentPolicy::MaterializeMissing,
+            Some(deadline),
+        )
     }
 
     pub(crate) fn write_file_wait_for_commit_with_deadline(
@@ -1062,7 +1084,39 @@ impl SifsFileManagerBackend {
         bytes: &[u8],
         deadline: Instant,
     ) -> Result<(), String> {
-        self.write_file_with_options(path, bytes, false, true, true, Some(deadline))
+        self.write_file_with_options(
+            path,
+            bytes,
+            false,
+            true,
+            true,
+            SifsWriteParentPolicy::MaterializeMissing,
+            Some(deadline),
+        )
+    }
+
+    /// Writes only while the path's parent remains present.
+    ///
+    /// The authoritative DFS create transaction rechecks and touches that
+    /// parent atomically with the child publication. Do not materialize a
+    /// missing parent in this wrapper: if a concurrent `rmdir` wins, recreating
+    /// the directory as a separate mutation can leave it visible when the
+    /// child request later fails or has an indeterminate delivery result.
+    pub(crate) fn write_file_with_existing_parent_wait_for_commit_with_deadline(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<(), String> {
+        self.write_file_with_options(
+            path,
+            bytes,
+            false,
+            true,
+            true,
+            SifsWriteParentPolicy::RequireExisting,
+            Some(deadline),
+        )
     }
 
     pub(crate) fn write_file_with_foreground_replica_repair_deadline(
@@ -1071,7 +1125,15 @@ impl SifsFileManagerBackend {
         bytes: &[u8],
         deadline: Instant,
     ) -> Result<(), String> {
-        self.write_file_with_options(path, bytes, true, true, true, Some(deadline))
+        self.write_file_with_options(
+            path,
+            bytes,
+            true,
+            true,
+            true,
+            SifsWriteParentPolicy::MaterializeMissing,
+            Some(deadline),
+        )
     }
 
     pub(crate) fn rename_with_deadline(
@@ -1197,6 +1259,7 @@ impl SifsFileManagerBackend {
         foreground_replica_repair: bool,
         wait_for_commit: bool,
         publish_metadata: bool,
+        parent_policy: SifsWriteParentPolicy,
         operation_deadline: Option<Instant>,
     ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
@@ -1213,7 +1276,8 @@ impl SifsFileManagerBackend {
                 sifs_deferred_publish_write_options(&mut service, &path, &self.replica_candidates)?
             };
             options.foreground_replica_repair = foreground_replica_repair;
-            if foreground_replica_repair {
+            let create_missing_parents = parent_policy == SifsWriteParentPolicy::MaterializeMissing;
+            if foreground_replica_repair && create_missing_parents {
                 if let Some(parent) = parent_sifs_path(&path) {
                     service.posix_mkdir_all(&parent).map_err(|error| {
                         format!("cannot create SIFS directory {parent}: {error}")
@@ -1223,7 +1287,7 @@ impl SifsFileManagerBackend {
                     .posix_write_file(&path, bytes, options)
                     .map(|_| ())
                     .map_err(|error| format!("cannot write SIFS file {path}: {error}"))
-            } else {
+            } else if create_missing_parents {
                 if let Some(parent) = parent_sifs_path(&path) {
                     ensure_sifs_parent_directory_for_write(&mut service, &parent)?;
                 }
@@ -1242,6 +1306,11 @@ impl SifsFileManagerBackend {
                     }
                     Err(error) => Err(format!("cannot write SIFS file {path}: {error}")),
                 }
+            } else {
+                service
+                    .posix_write_file(&path, bytes, options)
+                    .map(|_| ())
+                    .map_err(|error| format!("cannot write SIFS file {path}: {error}"))
             }
         })();
         if let Some(previous_deadline) = previous_deadline {
@@ -3711,6 +3780,40 @@ mod tests {
         assert!(
             backend.dfs_stat(path).is_err(),
             "expired write became visible"
+        );
+    }
+
+    #[test]
+    fn existing_parent_wait_for_commit_write_does_not_recreate_a_removed_parent() {
+        let root = temp_sifs_data_dir("wait-for-commit-removed-parent");
+        let data_dir = SinomoDataDir::new(&root);
+        let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
+        let parent = "/services/wait-for-commit-removed-parent";
+        let child = "/services/wait-for-commit-removed-parent/child.txt";
+        backend.create_dir(parent).expect("create parent");
+        backend.delete_dir(parent).expect("remove parent");
+
+        let error = backend
+            .write_file_with_existing_parent_wait_for_commit_with_deadline(
+                child,
+                b"must not resurrect parent",
+                Instant::now() + Duration::from_secs(5),
+            )
+            .expect_err("write below a removed parent must fail");
+
+        assert!(
+            error.contains("parent directory does not exist")
+                || error.contains("not found")
+                || error.contains("without parent directory"),
+            "unexpected write error: {error}"
+        );
+        assert!(
+            backend.dfs_stat(parent).is_err(),
+            "strict child write resurrected removed parent"
+        );
+        assert!(
+            backend.dfs_stat(child).is_err(),
+            "strict child write published an orphan"
         );
     }
 
