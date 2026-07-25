@@ -1114,7 +1114,12 @@ impl sinomo_dfs::DfsPeerTransport for DaemonDfsPeerTransport {
             result.response.error_detail()?;
             Ok(result)
         })
-        .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))
+        .map_err(|source| {
+            sinomo_dfs::DfsPeerTransportError::with_delivery_state(
+                source.to_string(),
+                source.delivery_state(),
+            )
+        })
     }
 }
 
@@ -1134,11 +1139,16 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsPeerTransport {
             let result = self
                 .call_rpc_inner(target_node_id, call, options, &runtime)
                 .await
-                .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))?;
+                .map_err(|source| {
+                    sinomo_dfs::DfsPeerTransportError::with_delivery_state(
+                        source.to_string(),
+                        source.delivery_state(),
+                    )
+                })?;
             result
                 .response
                 .error_detail()
-                .map_err(|source| sinomo_dfs::DfsPeerTransportError::new(source.to_string()))?;
+                .map_err(sinomo_dfs::DfsPeerTransportError::from_network)?;
             Ok(result)
         })
     }

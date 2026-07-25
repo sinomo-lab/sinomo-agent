@@ -2903,8 +2903,8 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         dfs_message_rpc_request(&namespace_command).expect("namespace message request");
     assert_eq!(namespace_request.route, DFS_DATA_NAMESPACE_ROUTE);
     assert!(
-        !namespace_request.is_response_retry_safe(),
-        "namespace mutations lack durable replay tracking and must not be redispatched"
+        namespace_request.is_response_retry_safe(),
+        "durably admitted namespace mutations must reconcile an exact retry after a lost response"
     );
     let distributed_command = DfsMessageCommand {
         request_id: "distributed-write-request".to_string(),

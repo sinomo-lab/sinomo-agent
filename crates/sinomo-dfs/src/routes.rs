@@ -411,13 +411,19 @@ pub fn dfs_message_is_read_only_request(command: &DfsMessageCommand) -> bool {
     dfs_network_message_is_read_only_request(&command.routed_message.message)
 }
 
-fn dfs_network_message_response_retry_safe(message: &DfsNetworkMessage) -> bool {
+pub(crate) fn dfs_network_message_response_retry_safe(message: &DfsNetworkMessage) -> bool {
     matches!(
         message,
         DfsNetworkMessage::DistributedWriteRequest(_)
             | DfsNetworkMessage::DistributedWriteResponse(_)
             | DfsNetworkMessage::CommitVersion(_)
             | DfsNetworkMessage::RepairReplica(_)
+    ) || matches!(
+        message,
+        DfsNetworkMessage::NamespaceRequest(command)
+            if crate::service_routed_namespace::namespace_operation_response_retry_safe(
+                &command.operation
+            )
     )
 }
 
@@ -578,17 +584,19 @@ fn prepare_dfs_message_request(
     command: &DfsMessageCommand,
 ) -> ObjectRpcRequest {
     if dfs_network_message_response_retry_safe(&command.routed_message.message) {
-        // Ordinary distributed writes carry a stable request identity and their outcome
-        // is durably reconciled at the metadata primary. Their completed
-        // response is also requester-idempotent: a duplicate either settles
-        // the same pending request or is discarded after it already settled.
+        // Ordinary distributed writes and retry-safe namespace operations
+        // carry stable request identities and their outcomes are durably
+        // reconciled at the metadata primary. Their completed response is also
+        // requester-idempotent: a duplicate either settles the same pending
+        // request or replays/discards it after it already settled.
         // Repair writes are content-addressed and replay-identifiable;
         // completed duplicate requests take idempotent durable fast paths. If
         // a transport loses only the response, sinomo-network may therefore
         // safely redispatch these commands instead of surfacing an ambiguous
-        // timeout. Exclusive creates are intentionally excluded until their
-        // success response is durably replayable: redispatching one after
-        // commit would turn success into AlreadyExists.
+        // timeout. The exceptional lock-bearing cross-shard adoption remains
+        // excluded: unlike ordinary admitted mutations and independently
+        // idempotent lock commands, it does not yet have a canonical completed
+        // response replay.
         request = request.with_response_retry_safe();
     }
     if let Some(traceparent) = crate::current_dfs_traceparent() {

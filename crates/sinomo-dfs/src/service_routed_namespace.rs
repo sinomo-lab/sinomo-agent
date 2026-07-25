@@ -99,6 +99,20 @@ fn namespace_operation_uses_durable_request_admission(operation: &DfsNamespaceOp
         )
 }
 
+pub(crate) fn namespace_operation_response_retry_safe(operation: &DfsNamespaceOperation) -> bool {
+    namespace_operation_uses_durable_request_admission(operation)
+        || matches!(
+            operation,
+            DfsNamespaceOperation::LookupPath { .. }
+                | DfsNamespaceOperation::LookupPaths { .. }
+                | DfsNamespaceOperation::SyncPath { .. }
+                | DfsNamespaceOperation::AdvisoryLock { .. }
+                | DfsNamespaceOperation::FileSync { .. }
+                | DfsNamespaceOperation::DirectorySync { .. }
+                | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. }
+        )
+}
+
 fn namespace_command_digest(command: &DfsNamespaceCommand) -> Result<String, DfsError> {
     let encoded = serde_json::to_vec(&(
         &command.file_system_id,

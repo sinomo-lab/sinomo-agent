@@ -65,6 +65,11 @@ const DFS_METADATA_JOURNAL_DIRECT_FANOUT_BUDGET: Duration = Duration::from_milli
 /// idleness.
 const DFS_DETACHED_SEND_RETRY_DELAY: Duration = Duration::from_secs(5);
 const DFS_DETACHED_SEND_RETRY_MAX_EXPONENT: u32 = 6;
+/// A deadline-bounded, idempotent DFS mutation must retain enough of its
+/// caller budget to ask the authority for the durable result when the first
+/// response is lost. Five seconds matches one normal network health phase;
+/// short operations reserve one quarter instead of starving the first try.
+const DFS_EXACT_RESPONSE_REPLAY_MAX_RESERVE: Duration = Duration::from_secs(5);
 
 fn dfs_detached_send_retry_delay(retry_attempts: u32) -> Duration {
     let exponent = retry_attempts
@@ -76,13 +81,34 @@ fn dfs_detached_send_retry_delay(retry_attempts: u32) -> Duration {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsPeerTransportError {
     detail: String,
+    delivery_state: Option<sinomo_core::network::NetworkDeliveryState>,
 }
 
 impl DfsPeerTransportError {
     pub fn new(detail: impl Into<String>) -> Self {
         Self {
             detail: detail.into(),
+            delivery_state: None,
         }
+    }
+
+    pub fn with_delivery_state(
+        detail: impl Into<String>,
+        delivery_state: Option<sinomo_core::network::NetworkDeliveryState>,
+    ) -> Self {
+        Self {
+            detail: detail.into(),
+            delivery_state,
+        }
+    }
+
+    pub fn from_network(error: sinomo_core::network::NetworkError) -> Self {
+        let delivery_state = error.delivery_state();
+        Self::with_delivery_state(error.to_string(), delivery_state)
+    }
+
+    pub fn delivery_state(&self) -> Option<sinomo_core::network::NetworkDeliveryState> {
+        self.delivery_state
     }
 }
 
@@ -2376,6 +2402,77 @@ fn dfs_direct_read_response_routed_message(
     }
 }
 
+fn dfs_exact_response_replay_attempt_options(
+    message: &DfsNetworkMessage,
+    options: DfsObjectRpcSendOptions,
+) -> (DfsObjectRpcSendOptions, Option<Duration>) {
+    if !crate::routes::dfs_network_message_response_retry_safe(message) {
+        return (options, None);
+    }
+    let Some(total_timeout) = options.overall_timeout else {
+        return (options, None);
+    };
+    let reserve = (total_timeout / 4).min(DFS_EXACT_RESPONSE_REPLAY_MAX_RESERVE);
+    let first_timeout = total_timeout.saturating_sub(reserve);
+    if reserve.is_zero() || first_timeout.is_zero() {
+        return (options, None);
+    }
+    (
+        DfsObjectRpcSendOptions {
+            overall_timeout: Some(first_timeout),
+            ..options
+        },
+        Some(total_timeout),
+    )
+}
+
+fn dfs_exact_response_replay_options(
+    options: DfsObjectRpcSendOptions,
+    total_timeout: Duration,
+    started: Instant,
+) -> Option<DfsObjectRpcSendOptions> {
+    let remaining = total_timeout
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())?;
+    Some(DfsObjectRpcSendOptions {
+        overall_timeout: Some(remaining),
+        ..options
+    })
+}
+
+fn dfs_peer_transport_network_error(
+    operation: String,
+    error: DfsPeerTransportError,
+) -> NetworkError {
+    match error.delivery_state() {
+        Some(delivery_state) => {
+            NetworkError::delivery_failed(operation, delivery_state, error.to_string())
+        }
+        None => NetworkError::Io {
+            operation,
+            detail: error.to_string(),
+        },
+    }
+}
+
+fn dfs_exact_response_replay_exhausted(
+    operation: String,
+    first_error: DfsPeerTransportError,
+    retry_error: DfsPeerTransportError,
+) -> NetworkError {
+    NetworkError::RetryExhausted {
+        operation,
+        attempts: 2,
+        delivery_state: retry_error
+            .delivery_state()
+            .or(first_error.delivery_state())
+            .unwrap_or(sinomo_core::network::NetworkDeliveryState::PossiblyApplied),
+        detail: format!(
+            "initial response was ambiguous: {first_error}; exact request replay failed: {retry_error}"
+        ),
+    }
+}
+
 fn send_dfs_routed_message_to_peer(
     sender: DfsMessageSender,
     options: DfsObjectRpcSendOptions,
@@ -2395,24 +2492,40 @@ fn send_dfs_routed_message_to_peer(
         None
     };
     let send_started = Instant::now();
-    match sender(&target_node_id, &command, options) {
-        Ok(response) => {
-            let outbound_messages = response.outbound_messages;
-            if trace_enabled {
-                let outbound_attachment_bytes =
-                    dfs_message_response_body_bytes(&command.request_id, &outbound_messages)?;
-                dfs_perf_trace(format_args!(
-                    "dfs-message-send local={} target={} request={} request_body_bytes={} outbound_messages={} outbound_attachment_bytes={} elapsed_ms={}",
-                    source_node_id,
-                    target_node_id,
-                    command.request_id,
-                    request_body_bytes.unwrap_or_default(),
-                    outbound_messages.len(),
-                    outbound_attachment_bytes,
-                    send_started.elapsed().as_millis()
+    let (first_options, replay_total_timeout) =
+        dfs_exact_response_replay_attempt_options(&command.routed_message.message, options);
+    let response = match sender(&target_node_id, &command, first_options) {
+        Ok(response) => response,
+        Err(first_error)
+            if first_error.delivery_state()
+                == Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied) =>
+        {
+            let Some(replay_options) = replay_total_timeout.and_then(|total_timeout| {
+                dfs_exact_response_replay_options(options, total_timeout, send_started)
+            }) else {
+                return Err(dfs_peer_transport_network_error(
+                    format!("send DFS message to {target_node_id}"),
+                    first_error,
                 ));
-            }
-            Ok(outbound_messages)
+            };
+            dfs_perf_trace(format_args!(
+                "dfs-message-exact-response-replay local={} target={} request={} remaining_ms={} first_error={}",
+                source_node_id,
+                target_node_id,
+                command.request_id,
+                replay_options
+                    .overall_timeout
+                    .unwrap_or_default()
+                    .as_millis(),
+                first_error
+            ));
+            sender(&target_node_id, &command, replay_options).map_err(|retry_error| {
+                dfs_exact_response_replay_exhausted(
+                    format!("reconcile DFS message response from {target_node_id}"),
+                    first_error,
+                    retry_error,
+                )
+            })?
         }
         Err(error) => {
             if trace_enabled {
@@ -2426,12 +2539,28 @@ fn send_dfs_routed_message_to_peer(
                     error
                 ));
             }
-            Err(NetworkError::Io {
-                operation: format!("send DFS message to {target_node_id}"),
-                detail: error.to_string(),
-            })
+            return Err(dfs_peer_transport_network_error(
+                format!("send DFS message to {target_node_id}"),
+                error,
+            ));
         }
+    };
+    let outbound_messages = response.outbound_messages;
+    if trace_enabled {
+        let outbound_attachment_bytes =
+            dfs_message_response_body_bytes(&command.request_id, &outbound_messages)?;
+        dfs_perf_trace(format_args!(
+            "dfs-message-send local={} target={} request={} request_body_bytes={} outbound_messages={} outbound_attachment_bytes={} elapsed_ms={}",
+            source_node_id,
+            target_node_id,
+            command.request_id,
+            request_body_bytes.unwrap_or_default(),
+            outbound_messages.len(),
+            outbound_attachment_bytes,
+            send_started.elapsed().as_millis()
+        ));
     }
+    Ok(outbound_messages)
 }
 
 fn send_dfs_direct_read_to_peer(
@@ -2526,24 +2655,42 @@ async fn send_dfs_routed_message_to_peer_async(
         None
     };
     let send_started = Instant::now();
-    match sender(&target_node_id, &command, options).await {
-        Ok(response) => {
-            let outbound_messages = response.outbound_messages;
-            if trace_enabled {
-                let outbound_attachment_bytes =
-                    dfs_message_response_body_bytes(&command.request_id, &outbound_messages)?;
-                dfs_perf_trace(format_args!(
-                    "dfs-message-send-async local={} target={} request={} request_body_bytes={} outbound_messages={} outbound_attachment_bytes={} elapsed_ms={}",
-                    source_node_id,
-                    target_node_id,
-                    command.request_id,
-                    request_body_bytes.unwrap_or_default(),
-                    outbound_messages.len(),
-                    outbound_attachment_bytes,
-                    send_started.elapsed().as_millis()
+    let (first_options, replay_total_timeout) =
+        dfs_exact_response_replay_attempt_options(&command.routed_message.message, options);
+    let response = match sender(&target_node_id, &command, first_options).await {
+        Ok(response) => response,
+        Err(first_error)
+            if first_error.delivery_state()
+                == Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied) =>
+        {
+            let Some(replay_options) = replay_total_timeout.and_then(|total_timeout| {
+                dfs_exact_response_replay_options(options, total_timeout, send_started)
+            }) else {
+                return Err(dfs_peer_transport_network_error(
+                    format!("send DFS message to {target_node_id}"),
+                    first_error,
                 ));
-            }
-            Ok(outbound_messages)
+            };
+            dfs_perf_trace(format_args!(
+                "dfs-message-exact-response-replay-async local={} target={} request={} remaining_ms={} first_error={}",
+                source_node_id,
+                target_node_id,
+                command.request_id,
+                replay_options
+                    .overall_timeout
+                    .unwrap_or_default()
+                    .as_millis(),
+                first_error
+            ));
+            sender(&target_node_id, &command, replay_options)
+                .await
+                .map_err(|retry_error| {
+                    dfs_exact_response_replay_exhausted(
+                        format!("reconcile DFS message response from {target_node_id}"),
+                        first_error,
+                        retry_error,
+                    )
+                })?
         }
         Err(error) => {
             if trace_enabled {
@@ -2557,12 +2704,28 @@ async fn send_dfs_routed_message_to_peer_async(
                     error
                 ));
             }
-            Err(NetworkError::Io {
-                operation: format!("send DFS message to {target_node_id}"),
-                detail: error.to_string(),
-            })
+            return Err(dfs_peer_transport_network_error(
+                format!("send DFS message to {target_node_id}"),
+                error,
+            ));
         }
+    };
+    let outbound_messages = response.outbound_messages;
+    if trace_enabled {
+        let outbound_attachment_bytes =
+            dfs_message_response_body_bytes(&command.request_id, &outbound_messages)?;
+        dfs_perf_trace(format_args!(
+            "dfs-message-send-async local={} target={} request={} request_body_bytes={} outbound_messages={} outbound_attachment_bytes={} elapsed_ms={}",
+            source_node_id,
+            target_node_id,
+            command.request_id,
+            request_body_bytes.unwrap_or_default(),
+            outbound_messages.len(),
+            outbound_attachment_bytes,
+            send_started.elapsed().as_millis()
+        ));
     }
+    Ok(outbound_messages)
 }
 
 fn dfs_message_request_body_bytes(command: &DfsMessageCommand) -> Result<usize, NetworkError> {
@@ -3936,6 +4099,59 @@ mod tests {
             observed.as_slice(),
             &[DfsObjectRpcSendOptions::default(); 3],
             "stream-native calls keep transport health independently of application silence"
+        );
+    }
+
+    #[test]
+    fn deadline_bounded_namespace_send_replays_exact_request_after_ambiguous_response() {
+        let local = node_id("node_namespace_reconcile_local");
+        let remote = node_id("node_namespace_reconcile_remote");
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sender_observed = Arc::clone(&observed);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender_calls = Arc::clone(&calls);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, options| {
+            sender_observed
+                .lock()
+                .expect("observed sends")
+                .push((command.clone(), options));
+            if sender_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(DfsPeerTransportError::with_delivery_state(
+                    "response was lost after the authority may have committed",
+                    Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied),
+                ));
+            }
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: Vec::new(),
+            })
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(5),
+            sender,
+        );
+        transport.set_operation_deadline(Some(Instant::now() + Duration::from_secs(2)));
+
+        transport
+            .send_routed_call(
+                &remote,
+                DfsRoutedCall::value(test_namespace_message(&local, &remote, 41)),
+            )
+            .expect("exact namespace replay should reconcile the response");
+
+        let observed = observed.lock().expect("observed sends");
+        assert_eq!(observed.len(), 2);
+        assert_eq!(
+            observed[0].0, observed[1].0,
+            "reconciliation must reuse the exact DFS and namespace request identities"
+        );
+        let first_budget = observed[0].1.overall_timeout.expect("first budget");
+        let replay_budget = observed[1].1.overall_timeout.expect("replay budget");
+        assert!(
+            first_budget < replay_budget && replay_budget <= Duration::from_secs(2),
+            "the first attempt must leave a bounded tail for exact replay: first={first_budget:?}, replay={replay_budget:?}"
         );
     }
 

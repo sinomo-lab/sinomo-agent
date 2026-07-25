@@ -358,7 +358,7 @@ impl SifsFileManagerBackend {
             if self.refresh_service_peer_targets_now(service, operation_deadline)
                 && let Ok(mut refreshed_at) = self.peer_targets_refreshed_at.try_lock()
             {
-                *refreshed_at = Some(now);
+                *refreshed_at = Some(Instant::now());
             }
             return;
         }
@@ -370,7 +370,7 @@ impl SifsFileManagerBackend {
                 return;
             }
             if self.refresh_service_peer_targets_now(service, operation_deadline) {
-                *refreshed_at = Some(now);
+                *refreshed_at = Some(Instant::now());
             }
             return;
         }
@@ -390,19 +390,12 @@ impl SifsFileManagerBackend {
             if sifs_operation_remaining(Some(deadline), "refreshing SIFS peer targets").is_err() {
                 return false;
             }
-            let peer_transport: Arc<dyn DfsPeerTransport> = Arc::new(
-                SifsDfsPeerTransport::new(self.rpc_runtime.clone(), self.data_dir.clone())
-                    .with_operation_deadline(Some(deadline)),
-            );
-            if refresh_cluster_dfs_kv_snapshot_with_peer_transport(&cluster_paths, peer_transport)
-                .is_err()
-            {
-                return false;
-            }
-        } else if refresh_sifs_cluster_kv_snapshot(&self.data_dir, &cluster_paths).is_err() {
-            return false;
         }
-        let Ok(state) = cluster::read_cluster_state(&cluster_paths) else {
+        // Peer discovery is an observational hot path. The daemon already
+        // projects committed membership into the durable bootstrap state; a
+        // file operation must not download and rematerialize the full cluster
+        // KV snapshot merely to refresh the transport's authorized node set.
+        let Ok(state) = cluster::read_cluster_state_without_kv_cached_shared(&cluster_paths) else {
             return false;
         };
         service.refresh_peer_targets(cluster_dfs_peer_node_ids(&state));
@@ -3015,7 +3008,12 @@ fn sifs_send_dfs_object_rpc_via_daemon(
                 options.observe_connectivity,
             )
             .await
-            .map_err(|error| DfsPeerTransportError::new(error.to_string()))
+            .map_err(|error| {
+                DfsPeerTransportError::with_delivery_state(
+                    error.to_string(),
+                    error.delivery_state(),
+                )
+            })
     };
     let result = if let Ok(current) = tokio::runtime::Handle::try_current() {
         if matches!(
@@ -3590,6 +3588,27 @@ mod tests {
             metadata_journal_heads(&data_dir, &shards),
             before,
             "opening a data reader must not bootstrap or recover metadata"
+        );
+    }
+
+    #[test]
+    fn peer_target_refresh_uses_local_membership_without_materializing_cluster_kv() {
+        let root = temp_sifs_data_dir("peer-target-local-membership");
+        let data_dir = SinomoDataDir::new(&root);
+        seed_observation_cluster(&data_dir);
+        let backend = SifsFileManagerBackend::open(&data_dir).expect("SIFS backend");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let kv_snapshot = cluster_paths.kv_paths().snapshot;
+        fs::remove_file(&kv_snapshot).expect("remove materialized KV snapshot");
+
+        let mut service = backend.lock_service().expect("SIFS service");
+        assert!(
+            backend.refresh_service_peer_targets_now(&mut service, None),
+            "peer refresh must consume daemon-projected local membership without requiring a KV snapshot or daemon RPC"
+        );
+        assert!(
+            !kv_snapshot.exists(),
+            "observational peer refresh must not recreate the cluster KV materialization"
         );
     }
 
