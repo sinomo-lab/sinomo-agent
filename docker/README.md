@@ -324,6 +324,41 @@ if the directions serialize), rather than reporting a short burst. The
 `_RESPONSE_BYTES` variables tune the profile while retaining the 64 MiB route cap.
 The ordinary all-node 8 MiB attachment leg remains the default acceptance smoke.
 
+## Cluster KV benchmark suite
+
+`docker/benchmark-cluster-kv.sh` builds and forms the same segmented six-node
+debug cluster, waits for routing, DFS background work, and whole-container CPU
+to stabilize, then runs only the daemon-mediated cluster-KV benchmark suite.
+It does not benchmark an in-process store or read snapshot files from the CLI.
+
+```bash
+docker/benchmark-cluster-kv.sh
+
+# Reuse the current host binary or an already-running benchmark project.
+SINOMO_TEST_BUILD=0 docker/benchmark-cluster-kv.sh
+SINOMO_TEST_REUSE=1 SINOMO_TEST_KEEP=1 docker/benchmark-cluster-kv.sh
+```
+
+The default matrix runs from `node1` and the deeper segmented `node5` path:
+
+- one 256-byte put per quorum commit;
+- 32 256-byte puts in one quorum transaction;
+- one 16 KiB put per quorum commit;
+- a local materialized prefix read returning 64 entries;
+- the same prefix read after a fresh current-term quorum barrier.
+
+Warmups are excluded from every distribution. Each measured response is checked
+for operation count, revision monotonicity, key ordering, and exact value bytes;
+any failed operation fails the suite. Latency and throughput thresholds default
+to informational mode, while `SINOMO_TEST_CLUSTER_KV_MAX_FAILURES=0` remains a
+functional gate. Tune the matrix with the `SINOMO_TEST_CLUSTER_KV_*` variables
+documented at the top of `docker/test-cluster.sh`.
+
+Raw per-profile JSON, aggregated `summary.json`/`summary.tsv`, the complete
+harness log, environment metadata, quiet-gate evidence, and the tested binary
+hash are written under `benchmark-results/cluster-kv/<run>/`. This directory is
+gitignored and should not be committed.
+
 Scenarios: per-node DFS invariants, read-your-write roundtrips (both segments),
 cross-segment write→read in both directions plus a routed delete, a
 /users→/services rename issued by a non-writer node, cross-segment deterministic
