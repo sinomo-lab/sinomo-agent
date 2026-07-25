@@ -114,13 +114,22 @@
 #   SINOMO_TEST_NETWORK_SATURATION_TIMEOUT_MS per-RPC timeout (default 120000)
 #   SINOMO_TEST_NETWORK_SATURATION_REQUEST_BYTES request attachment bytes per RPC (default 67108864)
 #   SINOMO_TEST_NETWORK_SATURATION_RESPONSE_BYTES response attachment bytes per RPC (default 67108864)
-#   SINOMO_TEST_CLUSTER_KV_ITERATIONS        quorum commits per selected node (default 12)
-#   SINOMO_TEST_CLUSTER_KV_VALUE_BYTES       value bytes per quorum commit (default 256)
+#   SINOMO_TEST_CLUSTER_KV_ITERATIONS        measured quorum commits per selected node (default 12)
+#   SINOMO_TEST_CLUSTER_KV_WARMUP_ITERATIONS unmeasured warmup operations per workload (default 4)
+#   SINOMO_TEST_CLUSTER_KV_VALUE_BYTES       small-workload value bytes (default 256)
+#   SINOMO_TEST_CLUSTER_KV_BATCH_ITERATIONS  measured batched quorum commits (default 32)
+#   SINOMO_TEST_CLUSTER_KV_BATCH_OPS         put operations per batched commit (default 32)
+#   SINOMO_TEST_CLUSTER_KV_LARGE_ITERATIONS  measured large-value quorum commits (default 16)
+#   SINOMO_TEST_CLUSTER_KV_LARGE_VALUE_BYTES large-workload value bytes (default 16384)
+#   SINOMO_TEST_CLUSTER_KV_RANGE_ITERATIONS  measured local/authoritative prefix reads (default 64)
+#   SINOMO_TEST_CLUSTER_KV_RANGE_ENTRIES     entries returned per prefix read (default 64)
+#   SINOMO_TEST_CLUSTER_KV_SUITE_NODES       benchmark origins (default "node1 node5")
 #   SINOMO_TEST_CLUSTER_KV_TIMEOUT_MS        per-commit timeout (default 5000)
 #   SINOMO_TEST_CLUSTER_KV_MAX_FAILURES      allowed failed quorum commits per node (default 0)
 #   SINOMO_TEST_CLUSTER_KV_MAX_P50_MS        max quorum commit p50 latency (default 1000)
 #   SINOMO_TEST_CLUSTER_KV_MAX_P95_MS        max quorum commit p95 latency (default 2000)
 #   SINOMO_TEST_CLUSTER_KV_MIN_COMMITS_PER_SECOND min quorum commit throughput (default 1)
+#   SINOMO_TEST_CLUSTER_KV_MIN_READS_PER_SECOND min prefix reads/s (default 0, informational)
 #   SINOMO_TEST_NETWORK_READY_WAIT          network/auth convergence gate seconds (default 120)
 #   SINOMO_TEST_DFS_CONVERGENCE_WAIT        fully distributed DFS shard-layout gate seconds (default 360)
 #   SINOMO_TEST_NETWORK_READY_REQUESTS_PER_TARGET requests per target during readiness warmup (default 20)
@@ -131,6 +140,7 @@
 #   SINOMO_TEST_HOST_TIMEOUT_GRACE          host cleanup grace beyond the container timeout (default 5)
 #   SINOMO_TEST_NETWORK_PARTITION_SECONDS   seconds to keep node6 disconnected in network-heal leg (default 5)
 #   SINOMO_TEST_NETWORK_ONLY=1              stop after network/KV baselines and DFS readiness/mutation/convergence gates
+#   SINOMO_TEST_CLUSTER_KV_ONLY=1           run only the stabilized cluster-KV benchmark suite
 #   SINOMO_TEST_FORMATION_ONLY=1            stop after the ten-second formation gate and optional captures
 #   SINOMO_TEST_BUILD=0         reuse an existing host binary instead of rebuilding
 #   SINOMO_TEST_BINARY          host binary to validate/mount (default target/debug/sinomo)
@@ -167,6 +177,7 @@ FORMATION_WAIT=10
 FORMATION_POLL_MILLIS=100
 FORMATION_OBSERVE="${SINOMO_TEST_FORMATION_OBSERVE:-0}"
 FORMATION_ONLY="${SINOMO_TEST_FORMATION_ONLY:-0}"
+CLUSTER_KV_ONLY="${SINOMO_TEST_CLUSTER_KV_ONLY:-0}"
 FORMATION_OBSERVE_DURATION_SECONDS="${SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS:-12}"
 FORMATION_OBSERVE_FREQUENCY_HZ="${SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ:-49}"
 FORMATION_OBSERVE_CPU_NODES="${SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES:-node1}"
@@ -294,12 +305,21 @@ NETWORK_SATURATION_TIMEOUT_MS="${SINOMO_TEST_NETWORK_SATURATION_TIMEOUT_MS:-1200
 NETWORK_SATURATION_REQUEST_BYTES="${SINOMO_TEST_NETWORK_SATURATION_REQUEST_BYTES:-67108864}"
 NETWORK_SATURATION_RESPONSE_BYTES="${SINOMO_TEST_NETWORK_SATURATION_RESPONSE_BYTES:-67108864}"
 CLUSTER_KV_ITERATIONS="${SINOMO_TEST_CLUSTER_KV_ITERATIONS:-12}"
+CLUSTER_KV_WARMUP_ITERATIONS="${SINOMO_TEST_CLUSTER_KV_WARMUP_ITERATIONS:-4}"
 CLUSTER_KV_VALUE_BYTES="${SINOMO_TEST_CLUSTER_KV_VALUE_BYTES:-256}"
+CLUSTER_KV_BATCH_ITERATIONS="${SINOMO_TEST_CLUSTER_KV_BATCH_ITERATIONS:-32}"
+CLUSTER_KV_BATCH_OPS="${SINOMO_TEST_CLUSTER_KV_BATCH_OPS:-32}"
+CLUSTER_KV_LARGE_ITERATIONS="${SINOMO_TEST_CLUSTER_KV_LARGE_ITERATIONS:-16}"
+CLUSTER_KV_LARGE_VALUE_BYTES="${SINOMO_TEST_CLUSTER_KV_LARGE_VALUE_BYTES:-16384}"
+CLUSTER_KV_RANGE_ITERATIONS="${SINOMO_TEST_CLUSTER_KV_RANGE_ITERATIONS:-64}"
+CLUSTER_KV_RANGE_ENTRIES="${SINOMO_TEST_CLUSTER_KV_RANGE_ENTRIES:-64}"
+CLUSTER_KV_SUITE_NODES="${SINOMO_TEST_CLUSTER_KV_SUITE_NODES:-node1 node5}"
 CLUSTER_KV_TIMEOUT_MS="${SINOMO_TEST_CLUSTER_KV_TIMEOUT_MS:-5000}"
 CLUSTER_KV_MAX_FAILURES="${SINOMO_TEST_CLUSTER_KV_MAX_FAILURES:-0}"
 CLUSTER_KV_MAX_P50_MS="${SINOMO_TEST_CLUSTER_KV_MAX_P50_MS:-1000}"
 CLUSTER_KV_MAX_P95_MS="${SINOMO_TEST_CLUSTER_KV_MAX_P95_MS:-2000}"
 CLUSTER_KV_MIN_COMMITS_PER_SECOND="${SINOMO_TEST_CLUSTER_KV_MIN_COMMITS_PER_SECOND:-1}"
+CLUSTER_KV_MIN_READS_PER_SECOND="${SINOMO_TEST_CLUSTER_KV_MIN_READS_PER_SECOND:-0}"
 NETWORK_READY_WAIT="${SINOMO_TEST_NETWORK_READY_WAIT:-120}"
 NETWORK_READY_REQUESTS_PER_TARGET="${SINOMO_TEST_NETWORK_READY_REQUESTS_PER_TARGET:-20}"
 NETWORK_READY_CONCURRENCY="${SINOMO_TEST_NETWORK_READY_CONCURRENCY:-$NETWORK_CONCURRENCY}"
@@ -381,6 +401,61 @@ validate_network_saturation_config() {
       "$NETWORK_SATURATION_REQUEST_BYTES" 1 67108864 \
     && require_bounded_uint SINOMO_TEST_NETWORK_SATURATION_RESPONSE_BYTES \
       "$NETWORK_SATURATION_RESPONSE_BYTES" 1 67108864
+}
+
+validate_cluster_kv_benchmark_config() {
+  case "$CLUSTER_KV_ONLY" in
+    0|1) ;;
+    *)
+      log "SINOMO_TEST_CLUSTER_KV_ONLY must be 0 or 1, got: $CLUSTER_KV_ONLY"
+      return 1
+      ;;
+  esac
+  if [ "$CLUSTER_KV_ONLY" = 1 ] \
+    && [ "${SINOMO_TEST_NETWORK_ONLY:-0}" = 1 ]; then
+    log "SINOMO_TEST_CLUSTER_KV_ONLY and SINOMO_TEST_NETWORK_ONLY are mutually exclusive"
+    return 1
+  fi
+  if [ -z "$CLUSTER_KV_SUITE_NODES" ]; then
+    log "SINOMO_TEST_CLUSTER_KV_SUITE_NODES must name at least one node"
+    return 1
+  fi
+  local node
+  for node in $CLUSTER_KV_SUITE_NODES; do
+    case " $NODES " in
+      *" $node "*) ;;
+      *)
+        log "SINOMO_TEST_CLUSTER_KV_SUITE_NODES contains unknown node $node; expected a subset of: $NODES"
+        return 1
+        ;;
+    esac
+  done
+  require_bounded_uint SINOMO_TEST_CLUSTER_KV_ITERATIONS \
+    "$CLUSTER_KV_ITERATIONS" 1 128 \
+    && require_bounded_uint SINOMO_TEST_CLUSTER_KV_WARMUP_ITERATIONS \
+      "$CLUSTER_KV_WARMUP_ITERATIONS" 0 64 \
+    && require_bounded_uint SINOMO_TEST_CLUSTER_KV_VALUE_BYTES \
+      "$CLUSTER_KV_VALUE_BYTES" 0 16384 \
+    && require_bounded_uint SINOMO_TEST_CLUSTER_KV_BATCH_ITERATIONS \
+      "$CLUSTER_KV_BATCH_ITERATIONS" 1 128 \
+    && require_bounded_uint SINOMO_TEST_CLUSTER_KV_BATCH_OPS \
+      "$CLUSTER_KV_BATCH_OPS" 1 256 \
+    && require_bounded_uint SINOMO_TEST_CLUSTER_KV_LARGE_ITERATIONS \
+      "$CLUSTER_KV_LARGE_ITERATIONS" 1 128 \
+    && require_bounded_uint SINOMO_TEST_CLUSTER_KV_LARGE_VALUE_BYTES \
+      "$CLUSTER_KV_LARGE_VALUE_BYTES" 0 16384 \
+    && require_bounded_uint SINOMO_TEST_CLUSTER_KV_RANGE_ITERATIONS \
+      "$CLUSTER_KV_RANGE_ITERATIONS" 1 512 \
+    && require_bounded_uint SINOMO_TEST_CLUSTER_KV_RANGE_ENTRIES \
+      "$CLUSTER_KV_RANGE_ENTRIES" 1 1024 \
+    && require_bounded_uint SINOMO_TEST_CLUSTER_KV_TIMEOUT_MS \
+      "$CLUSTER_KV_TIMEOUT_MS" 1 300000 \
+    && require_bounded_uint SINOMO_TEST_CLUSTER_KV_MAX_FAILURES \
+      "$CLUSTER_KV_MAX_FAILURES" 0 128 \
+    && require_bounded_uint SINOMO_TEST_CLUSTER_KV_MAX_P50_MS \
+      "$CLUSTER_KV_MAX_P50_MS" 0 60000 \
+    && require_bounded_uint SINOMO_TEST_CLUSTER_KV_MAX_P95_MS \
+      "$CLUSTER_KV_MAX_P95_MS" 0 60000
 }
 
 validate_formation_observation_config() {
@@ -2565,12 +2640,62 @@ cluster_kv_quorum_baseline() {
   for node in node1 node5; do
     run_probe "$node" cluster.kv.quorum-commit-benchmark \
       --param "iterations=$CLUSTER_KV_ITERATIONS" \
+      --param "warmup-iterations=$CLUSTER_KV_WARMUP_ITERATIONS" \
+      --param ops-per-transaction=1 \
       --param "value-bytes=$CLUSTER_KV_VALUE_BYTES" \
       --param "timeout-ms=$CLUSTER_KV_TIMEOUT_MS" \
       --param "max-failures=$CLUSTER_KV_MAX_FAILURES" \
       --param "max-p50-ms=$CLUSTER_KV_MAX_P50_MS" \
       --param "max-p95-ms=$CLUSTER_KV_MAX_P95_MS" \
       --param "min-commits-per-second=$CLUSTER_KV_MIN_COMMITS_PER_SECOND" || rc=1
+  done
+  return $rc
+}
+
+cluster_kv_commit_benchmark_profile() {
+  local node="$1" profile="$2" iterations="$3" ops_per_transaction="$4" value_bytes="$5"
+  run_probe "$node" cluster.kv.quorum-commit-benchmark \
+    --param "profile=$profile" \
+    --param "iterations=$iterations" \
+    --param "warmup-iterations=$CLUSTER_KV_WARMUP_ITERATIONS" \
+    --param "ops-per-transaction=$ops_per_transaction" \
+    --param "value-bytes=$value_bytes" \
+    --param "timeout-ms=$CLUSTER_KV_TIMEOUT_MS" \
+    --param "max-failures=$CLUSTER_KV_MAX_FAILURES" \
+    --param "max-p50-ms=$CLUSTER_KV_MAX_P50_MS" \
+    --param "max-p95-ms=$CLUSTER_KV_MAX_P95_MS" \
+    --param "min-commits-per-second=$CLUSTER_KV_MIN_COMMITS_PER_SECOND"
+}
+
+cluster_kv_range_benchmark_profile() {
+  local node="$1" consistency="$2"
+  run_probe "$node" cluster.kv.range-read-benchmark \
+    --param "profile=range-$consistency" \
+    --param "consistency=$consistency" \
+    --param "iterations=$CLUSTER_KV_RANGE_ITERATIONS" \
+    --param "warmup-iterations=$CLUSTER_KV_WARMUP_ITERATIONS" \
+    --param "entries=$CLUSTER_KV_RANGE_ENTRIES" \
+    --param "value-bytes=$CLUSTER_KV_VALUE_BYTES" \
+    --param "timeout-ms=$CLUSTER_KV_TIMEOUT_MS" \
+    --param "max-failures=$CLUSTER_KV_MAX_FAILURES" \
+    --param "max-p50-ms=$CLUSTER_KV_MAX_P50_MS" \
+    --param "max-p95-ms=$CLUSTER_KV_MAX_P95_MS" \
+    --param "min-reads-per-second=$CLUSTER_KV_MIN_READS_PER_SECOND"
+}
+
+cluster_kv_benchmark_suite() {
+  local rc=0 node
+  for node in $CLUSTER_KV_SUITE_NODES; do
+    cluster_kv_commit_benchmark_profile \
+      "$node" single-small "$CLUSTER_KV_ITERATIONS" 1 "$CLUSTER_KV_VALUE_BYTES" || rc=1
+    cluster_kv_commit_benchmark_profile \
+      "$node" batch-small "$CLUSTER_KV_BATCH_ITERATIONS" \
+      "$CLUSTER_KV_BATCH_OPS" "$CLUSTER_KV_VALUE_BYTES" || rc=1
+    cluster_kv_commit_benchmark_profile \
+      "$node" single-large "$CLUSTER_KV_LARGE_ITERATIONS" \
+      1 "$CLUSTER_KV_LARGE_VALUE_BYTES" || rc=1
+    cluster_kv_range_benchmark_profile "$node" local || rc=1
+    cluster_kv_range_benchmark_profile "$node" authoritative || rc=1
   done
   return $rc
 }
@@ -3105,6 +3230,7 @@ fi
 
 validate_network_realtime_gate_config || exit 1
 validate_network_saturation_config || exit 1
+validate_cluster_kv_benchmark_config || exit 1
 validate_formation_observation_config || exit 1
 require_no_other_compose_projects || exit 1
 trap teardown EXIT
@@ -3171,6 +3297,19 @@ fi
 if ! wait_for_dfs_converged; then
   FAILED_SCENARIOS="pre-benchmark-dfs-post-daemon-mutation-convergence"
   exit 1
+fi
+
+if [ "$CLUSTER_KV_ONLY" = 1 ]; then
+  scenario "cluster-kv-pre-benchmark-quiet" wait_for_network_quiet cluster-kv
+  if [ -n "$FAILED_SCENARIOS" ]; then
+    exit 1
+  fi
+  scenario "cluster-kv-benchmark-suite" cluster_kv_benchmark_suite
+  if [ -n "$FAILED_SCENARIOS" ]; then
+    exit 1
+  fi
+  log "RESULT: PASS — stabilized daemon-mediated cluster-KV benchmark suite green (reports in $ARTIFACTS)"
+  exit 0
 fi
 
 scenario "network-realtime-latency-gate" network_realtime_latency_gate

@@ -129,6 +129,7 @@ Common harnesses include:
 
 ```sh
 docker/test-cluster.sh
+docker/benchmark-cluster-kv.sh
 docker/test-routing-scenario.sh
 docker/test-cluster-migration.sh
 docker/measure-final.sh 60 90
