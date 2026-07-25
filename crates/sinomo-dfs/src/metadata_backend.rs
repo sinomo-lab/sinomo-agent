@@ -5,6 +5,7 @@
 //! packed table batches, and every mutation is mirrored into an append-only
 //! journal that can later be replicated or replayed by metadata shard peers.
 
+use crate::DfsNamespaceResult;
 #[cfg(test)]
 use crate::DfsReplicationPolicy;
 use crate::advisory_lock::{
@@ -263,6 +264,17 @@ fn namespace_request_immutable_payload_matches(
         && left.created_at == right.created_at
 }
 
+fn completed_namespace_request_outcome_matches(
+    left: &DfsNamespaceRequestRecord,
+    right: &DfsNamespaceRequestRecord,
+) -> bool {
+    namespace_request_immutable_payload_matches(left, right)
+        && left.status == DfsNamespaceRequestStatus::Completed
+        && right.status == DfsNamespaceRequestStatus::Completed
+        && left.result == right.result
+        && left.posix_coordination_result == right.posix_coordination_result
+}
+
 fn validate_namespace_request_shape(request: &DfsNamespaceRequestRecord) -> Result<()> {
     if request.request_id.trim().is_empty()
         || request.operation_id.trim().is_empty()
@@ -304,10 +316,31 @@ fn namespace_request_transition_is_valid(
         }
         (DfsNamespaceRequestStatus::Pending, DfsNamespaceRequestStatus::Completed) => true,
         (DfsNamespaceRequestStatus::Completed, DfsNamespaceRequestStatus::Completed) => {
-            existing == request
+            completed_namespace_request_outcome_matches(existing, request)
         }
         (DfsNamespaceRequestStatus::Completed, DfsNamespaceRequestStatus::Pending) => false,
     }
+}
+
+fn namespace_prepare_can_repair_terminal_request(
+    tables: &DfsMetadataTables,
+    prepare: &DfsNamespacePrepareRecord,
+    existing_request: &DfsNamespaceRequestRecord,
+    prepared_completion: &DfsNamespaceRequestRecord,
+) -> bool {
+    existing_request.status == DfsNamespaceRequestStatus::Completed
+        && prepared_completion.status == DfsNamespaceRequestStatus::Completed
+        && matches!(
+            prepared_completion.result,
+            Some(DfsNamespaceResult::Applied)
+        )
+        && tables
+            .namespace_prepares
+            .get(&prepare.operation_id)
+            .is_some_and(|existing_prepare| {
+                existing_prepare.status != DfsNamespacePrepareStatus::Aborted
+                    && namespace_prepare_payload_matches(existing_prepare, prepare)
+            })
 }
 
 fn prepared_write_intent_rebind_payload_matches(
@@ -573,6 +606,21 @@ fn validate_namespace_prepare_shape(
         match tables.namespace_requests.get(&request_key) {
             Some(existing)
                 if namespace_request_transition_is_valid(existing, completed_request) => {}
+            Some(existing)
+                if namespace_prepare_can_repair_terminal_request(
+                    tables,
+                    prepare,
+                    existing,
+                    completed_request,
+                ) =>
+            {
+                // Once the exact hidden request-owned prepare is durable, its
+                // attached outcome owns crash recovery. An outer ambiguous
+                // failure used to record a contradictory terminal rejection
+                // after this point. Permit only that already-durable prepare
+                // to repair the request when it commits; a newly introduced
+                // prepare still cannot rewrite a terminal request.
+            }
             Some(_) => {
                 return Err(MetadataBackendError::Serde(format!(
                     "namespace prepare {} completed request conflicts with {}/{}",
@@ -599,10 +647,15 @@ fn namespace_prepare_request_completion_is_materialized(
     prepare: &DfsNamespacePrepareRecord,
 ) -> bool {
     prepare.completed_request.as_ref().is_none_or(|completion| {
-        tables.namespace_requests.get(&(
-            completion.requester_node_id.clone(),
-            completion.request_id.clone(),
-        )) == Some(completion)
+        tables
+            .namespace_requests
+            .get(&(
+                completion.requester_node_id.clone(),
+                completion.request_id.clone(),
+            ))
+            .is_some_and(|existing| {
+                completed_namespace_request_outcome_matches(existing, completion)
+            })
     })
 }
 
@@ -813,10 +866,15 @@ fn namespace_prepare_table_ops_for_record(
                 prepare: prepare.clone(),
             });
             if let Some(request) = &prepare.completed_request
-                && tables.namespace_requests.get(&(
-                    request.requester_node_id.clone(),
-                    request.request_id.clone(),
-                )) != Some(request)
+                && !tables
+                    .namespace_requests
+                    .get(&(
+                        request.requester_node_id.clone(),
+                        request.request_id.clone(),
+                    ))
+                    .is_some_and(|existing| {
+                        completed_namespace_request_outcome_matches(existing, request)
+                    })
             {
                 ops.push(DfsMetadataTableOp::PutNamespaceRequest {
                     request: request.clone(),
@@ -1448,6 +1506,7 @@ impl LocalSobjMetadataBackend {
         // A table batch/snapshot can become durable before its replay cursor.
         // The exact prefix is authoritative in that crash window.
         source_cursor.last_sequence = candidate_prefix_proof.journal_sequence;
+        let persisted_through_sequence = source_cursor.last_sequence;
 
         let mut local_cursor = self.local_materialization_cursor()?;
         let mut local_cursor_advanced = false;
@@ -1479,7 +1538,7 @@ impl LocalSobjMetadataBackend {
         // Include already-acknowledged entries in the idempotence check so a
         // stale replay cannot hide a fork behind its cursor.
         let all_entries = batch.entries.iter().collect::<Vec<_>>();
-        self.persist_replayed_journal_entries_unlocked(&all_entries)?;
+        self.persist_replayed_journal_entries_unlocked(&all_entries, persisted_through_sequence)?;
         if replay_entries.is_empty() {
             return Ok(0);
         }
@@ -1811,8 +1870,11 @@ impl LocalSobjMetadataBackend {
     fn persist_replayed_journal_entries_unlocked(
         &mut self,
         entries: &[&DfsMetadataJournalEntry],
+        persisted_through_sequence: u64,
     ) -> Result<()> {
-        if let Some(max_sequence) = persist_replayed_journal_entries(&self.root, entries)? {
+        if let Some(max_sequence) =
+            persist_replayed_journal_entries(&self.root, entries, persisted_through_sequence)?
+        {
             self.advance_journal_head_after_replayed_entry(max_sequence)?;
         }
         Ok(())
@@ -4937,9 +4999,22 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 &mut table_ops,
                 &mut rollback,
             );
-            if let Some(request) = prepare.completed_request {
+            if let Some(request) = prepare.completed_request.as_ref()
+                && !self
+                    .tables
+                    .namespace_requests
+                    .get(&(
+                        request.requester_node_id.clone(),
+                        request.request_id.clone(),
+                    ))
+                    .is_some_and(|existing| {
+                        completed_namespace_request_outcome_matches(existing, request)
+                    })
+            {
                 self.plan_preapplied_table_op(
-                    DfsMetadataTableOp::PutNamespaceRequest { request },
+                    DfsMetadataTableOp::PutNamespaceRequest {
+                        request: request.clone(),
+                    },
                     &mut table_ops,
                     &mut rollback,
                 );
@@ -5695,7 +5770,8 @@ mod tests {
     };
     use crate::{
         DfsAdvisoryLockMode, DfsAdvisoryLockOutcome, DfsAdvisoryLockRequestId,
-        DfsAdvisoryLockSessionId, DfsMetadataShardAssignment, DfsObjectKind,
+        DfsAdvisoryLockSessionId, DfsMetadataShardAssignment, DfsNamespaceOperation,
+        DfsNamespaceResult, DfsObjectKind,
     };
     use sinomo_core::DfsObjectPolicy;
     use std::time::Duration;
@@ -6210,6 +6286,205 @@ mod tests {
             error
                 .to_string()
                 .contains("request-owned but has no completed request attachment")
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn request_owned_prepare_replay_accepts_matching_terminal_outcome_bookkeeping() {
+        let root = temp_root("local_backend_request_prepare_terminal_replay");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        let file_system = file_system();
+        let current = object(version("version_request_prepare_replay_1"));
+        let mut committed = current.clone();
+        committed.version = version("version_request_prepare_replay_2");
+        committed.mode = 0o600;
+        let pending_at = OffsetDateTime::UNIX_EPOCH;
+        let pending_request = DfsNamespaceRequestRecord {
+            file_system_id: current.file_system_id.clone(),
+            requester_node_id: node("node_request_prepare_replay_requester"),
+            request_id: "request-prepare-replay".to_string(),
+            operation_id: "req-request-prepare-replay".to_string(),
+            authority_shard_id: shard_id.clone(),
+            operation: DfsNamespaceOperation::SetMode {
+                path: current.path.clone(),
+                mode: committed.mode,
+            },
+            command_digest: "blake3:request-prepare-replay".to_string(),
+            status: DfsNamespaceRequestStatus::Pending,
+            result: None,
+            posix_coordination_result: None,
+            recovery_attempts: 0,
+            last_recovery_error: None,
+            created_at: pending_at,
+            updated_at: pending_at,
+        };
+        let mut prepared_completion = pending_request.clone();
+        prepared_completion.status = DfsNamespaceRequestStatus::Completed;
+        prepared_completion.result = Some(DfsNamespaceResult::Applied);
+        prepared_completion.updated_at =
+            OffsetDateTime::from_unix_timestamp(1).expect("completion timestamp");
+        let mut prepare = namespace_prepare(
+            &format!(
+                "namespace-request:{}:transaction-request-prepare-replay",
+                pending_request.operation_id
+            ),
+            &shard_id.0,
+            &current,
+            committed.clone(),
+        );
+        prepare.completed_request = Some(prepared_completion.clone());
+        prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+                .expect("request-owned prepare digest");
+
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        backend
+            .put_namespace_request_on_shard(&shard_id, &pending_request)
+            .expect("pending request");
+        backend
+            .prepare_namespace_transaction(&prepare)
+            .expect("durable hidden prepare");
+
+        // A retry can durably observe the same terminal outcome while updating
+        // only recovery diagnostics. Replaying the older prepare must compare
+        // the terminal semantic result, not reject harmless bookkeeping drift.
+        let mut later_completion = prepared_completion;
+        later_completion.recovery_attempts = 2;
+        later_completion.updated_at =
+            OffsetDateTime::from_unix_timestamp(2).expect("later completion timestamp");
+        backend
+            .put_namespace_request_on_shard(&shard_id, &later_completion)
+            .expect("matching later completion");
+
+        backend
+            .commit_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect("replay matching completed request");
+
+        assert_eq!(
+            backend
+                .get_namespace_request(
+                    &later_completion.requester_node_id,
+                    &later_completion.request_id,
+                )
+                .expect("completed request"),
+            Some(later_completion),
+            "replay must retain newer diagnostics for the same terminal outcome"
+        );
+        assert_eq!(
+            backend
+                .get_object(&current.object_id)
+                .expect("committed object"),
+            Some(committed)
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn request_owned_prepare_recovery_repairs_post_prepare_rejection() {
+        let root = temp_root("local_backend_request_prepare_rejected_after_prepare");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        let current = object(version("version_request_prepare_rejected_1"));
+        let mut committed = current.clone();
+        committed.version = version("version_request_prepare_rejected_2");
+        committed.mode = 0o600;
+        let admitted_at = OffsetDateTime::UNIX_EPOCH;
+        let pending_request = DfsNamespaceRequestRecord {
+            file_system_id: current.file_system_id.clone(),
+            requester_node_id: node("node_request_prepare_rejected_requester"),
+            request_id: "request-prepare-rejected".to_string(),
+            operation_id: "req-request-prepare-rejected".to_string(),
+            authority_shard_id: shard_id.clone(),
+            operation: DfsNamespaceOperation::SetMode {
+                path: current.path.clone(),
+                mode: committed.mode,
+            },
+            command_digest: "blake3:request-prepare-rejected".to_string(),
+            status: DfsNamespaceRequestStatus::Pending,
+            result: None,
+            posix_coordination_result: None,
+            recovery_attempts: 0,
+            last_recovery_error: None,
+            created_at: admitted_at,
+            updated_at: admitted_at,
+        };
+        let mut prepared_completion = pending_request.clone();
+        prepared_completion.status = DfsNamespaceRequestStatus::Completed;
+        prepared_completion.result = Some(DfsNamespaceResult::Applied);
+        prepared_completion.updated_at =
+            OffsetDateTime::from_unix_timestamp(1).expect("completion timestamp");
+        let mut prepare = namespace_prepare(
+            &format!(
+                "namespace-request:{}:transaction-request-prepare-rejected",
+                pending_request.operation_id
+            ),
+            &shard_id.0,
+            &current,
+            committed.clone(),
+        );
+        prepare.completed_request = Some(prepared_completion.clone());
+        prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+                .expect("request-owned prepare digest");
+
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        backend
+            .put_namespace_request_on_shard(&shard_id, &pending_request)
+            .expect("pending request");
+        backend
+            .prepare_namespace_transaction(&prepare)
+            .expect("durable hidden prepare");
+
+        // This is the old crash-window failure: an outer operation reported a
+        // transport error after the hidden prepare became durable and wrote a
+        // contradictory terminal rejection.
+        let mut rejected_completion = pending_request;
+        rejected_completion.status = DfsNamespaceRequestStatus::Completed;
+        rejected_completion.result = Some(DfsNamespaceResult::Rejected {
+            reason: "ambiguous downstream timeout".to_string(),
+            posix_error: None,
+            current_primary_node_id: None,
+        });
+        rejected_completion.updated_at =
+            OffsetDateTime::from_unix_timestamp(2).expect("rejection timestamp");
+        backend
+            .put_namespace_request_on_shard(&shard_id, &rejected_completion)
+            .expect("old contradictory rejection");
+
+        backend
+            .prepare_namespace_transaction(&prepare)
+            .expect("recover the exact existing hidden prepare");
+        backend
+            .commit_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect("commit recovered prepare");
+
+        assert_eq!(
+            backend
+                .get_namespace_request(
+                    &prepared_completion.requester_node_id,
+                    &prepared_completion.request_id,
+                )
+                .expect("completed request"),
+            Some(prepared_completion),
+            "the durable prepare attachment is the canonical terminal result"
+        );
+        assert_eq!(
+            backend
+                .get_object(&current.object_id)
+                .expect("committed object"),
+            Some(committed)
         );
         cleanup(&root);
     }

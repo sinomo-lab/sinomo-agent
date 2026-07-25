@@ -1192,6 +1192,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .as_mut()
                 .expect("clustered metadata backend checked above")
                 .prepare_namespace_transaction(&prepare)?;
+            if prepare.completed_request.is_some() {
+                self.active_durable_namespace_prepare_recorded = true;
+            }
             if prepare_entry.shard_id != prepare.shard_id {
                 return Err(DfsError::Metadata {
                     message: format!(

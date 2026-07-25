@@ -71,6 +71,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             deferred_untracked_routed_write_responses: BTreeMap::new(),
             pending_routed_namespace_ops: BTreeMap::new(),
             active_durable_namespace_request: None,
+            active_durable_namespace_prepare_recorded: false,
             routed_namespace_settle_depth: 0,
             cross_shard_namespace_locks: BTreeSet::new(),
             last_events: Vec::new(),

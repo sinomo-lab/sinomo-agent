@@ -2859,13 +2859,12 @@ fn prepare_cluster_dfs_metadata_journal_publish(
     )?
     .map(|snapshot| snapshot.records)
     .unwrap_or_default();
-    let mut host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     let (outcomes, targets) =
-        prepare_dfs_metadata_journal_publish_with_host_and_execution_exclusions(
+        prepare_dfs_metadata_journal_publish_with_cached_backends_and_execution_exclusions(
+            &data_dir,
             file_system_id,
             &state.local_node_id,
             shards,
-            &mut host,
             &metadata_suppressions,
             execution_exclusions,
             options,
@@ -3161,6 +3160,7 @@ pub(crate) fn prepare_dfs_metadata_journal_publish_with_host_and_execution_exclu
         }
 
         let mut backend = host.open_primary_shard_backend(&shard_id)?;
+        let mut payloads_by_after_sequence = BTreeMap::new();
         for target_node_id in shard
             .replica_node_ids
             .into_iter()
@@ -3201,6 +3201,129 @@ pub(crate) fn prepare_dfs_metadata_journal_publish_with_host_and_execution_exclu
                 shard.epoch,
                 after_sequence,
                 options,
+                &mut payloads_by_after_sequence,
+            )? {
+                DfsPreparedMetadataJournalTargetPublishResult::NoChanges { outcome } => {
+                    outcomes.push(outcome);
+                }
+                DfsPreparedMetadataJournalTargetPublishResult::Publish { target } => {
+                    targets.push(target);
+                }
+            }
+        }
+    }
+
+    Ok((outcomes, targets))
+}
+
+fn prepare_dfs_metadata_journal_publish_with_cached_backends_and_execution_exclusions(
+    data_dir: &SinomoDataDir,
+    file_system_id: DfsFileSystemId,
+    local_node_id: &NodeId,
+    mut shards: Vec<DfsMetadataShardConfig>,
+    metadata_suppressions: &[DfsMetadataReplicationSuppressionRecord],
+    execution_exclusions: &DfsMaintenanceExecutionExclusions,
+    options: DfsMetadataJournalReplicationOptions,
+) -> Result<
+    (
+        Vec<DfsMetadataJournalReplicationOutcome>,
+        Vec<DfsPreparedMetadataJournalTargetPublish>,
+    ),
+    DfsError,
+> {
+    shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
+    if shards.is_empty() {
+        return Ok((
+            vec![DfsMetadataJournalReplicationOutcome::MissingShard {
+                file_system_id,
+                shard_id: DfsMetadataShardId::new("root"),
+            }],
+            Vec::new(),
+        ));
+    }
+
+    let mut outcomes = Vec::new();
+    let mut targets = Vec::new();
+    for shard in shards {
+        let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+        if shard.primary_node_id != *local_node_id {
+            outcomes.push(DfsMetadataJournalReplicationOutcome::NotPrimary {
+                file_system_id: shard.file_system_id,
+                shard_id,
+                local_node_id: local_node_id.clone(),
+                primary_node_id: shard.primary_node_id,
+                epoch: shard.epoch,
+            });
+            continue;
+        }
+
+        let backend = match cached_cluster_metadata_backend(data_dir, &shard_id) {
+            Ok(backend) => backend,
+            Err(CachedClusterMetadataBackendError::CachePoisoned) => {
+                return Err(DfsError::Metadata {
+                    message: "cluster metadata backend cache lock is poisoned".to_string(),
+                });
+            }
+            Err(CachedClusterMetadataBackendError::Open(error)) => return Err(error.into()),
+        };
+        let mut backend = backend.lock().map_err(|_| DfsError::Metadata {
+            message: format!(
+                "cluster metadata backend lock is poisoned for shard {}",
+                shard_id.0
+            ),
+        })?;
+        // The retained publisher backend is a durable read model, not a second
+        // metadata authority. Refresh it under the shard's OS-backed write lock
+        // so it observes the exact table/journal head committed by the request
+        // lane without replaying the complete shard on every publication.
+        backend.refresh_metadata_shard_durable_view(&shard_id)?;
+
+        let mut payloads_by_after_sequence = BTreeMap::new();
+        for target_node_id in shard
+            .replica_node_ids
+            .into_iter()
+            .filter(|target_node_id| target_node_id != local_node_id)
+        {
+            if let Some(suppression) = dfs_metadata_replication_suppression_for(
+                metadata_suppressions,
+                &target_node_id,
+                &shard_id,
+                shard.epoch,
+            ) {
+                outcomes.push(
+                    DfsMetadataJournalReplicationOutcome::TopologyMismatchSuppressed {
+                        target_node_id,
+                        shard_id: shard_id.clone(),
+                        epoch: shard.epoch,
+                        reason: suppression.reason.clone(),
+                    },
+                );
+                continue;
+            }
+            let after_sequence = migrate_legacy_dfs_metadata_replication_cursor(
+                &mut *backend,
+                data_dir,
+                &target_node_id,
+                &shard_id,
+            )?;
+            if execution_exclusions.contains(&target_node_id) {
+                outcomes.push(DfsMetadataJournalReplicationOutcome::MissingRoute {
+                    target_node_id,
+                    shard_id: shard_id.clone(),
+                    after_sequence,
+                });
+                continue;
+            }
+            match prepare_dfs_metadata_journal_target_publish(
+                &mut *backend,
+                local_node_id,
+                target_node_id,
+                shard.file_system_id.clone(),
+                shard_id.clone(),
+                shard.epoch,
+                after_sequence,
+                options,
+                &mut payloads_by_after_sequence,
             )? {
                 DfsPreparedMetadataJournalTargetPublishResult::NoChanges { outcome } => {
                     outcomes.push(outcome);
@@ -3224,6 +3347,18 @@ enum DfsPreparedMetadataJournalTargetPublishResult {
     },
 }
 
+#[derive(Clone, Debug)]
+enum DfsPreparedMetadataJournalPayload {
+    NoChanges,
+    CaughtUp {
+        state_fingerprint: String,
+    },
+    Batches {
+        batches: Vec<DfsMetadataJournalBatch>,
+        backlog_after_sequence: Option<u64>,
+    },
+}
+
 fn prepare_dfs_metadata_journal_target_publish(
     backend: &mut dyn DfsMetadataBackend,
     local_node_id: &NodeId,
@@ -3233,87 +3368,128 @@ fn prepare_dfs_metadata_journal_target_publish(
     shard_epoch: u64,
     after_sequence: u64,
     options: DfsMetadataJournalReplicationOptions,
+    payloads_by_after_sequence: &mut BTreeMap<u64, DfsPreparedMetadataJournalPayload>,
 ) -> Result<DfsPreparedMetadataJournalTargetPublishResult, DfsError> {
-    let mut next_after_sequence = after_sequence;
-    let mut commands = Vec::new();
-    let mut backlog_after_sequence = None;
-    loop {
-        let Some(batch) = backend.journal_batch_since_limited(
-            next_after_sequence,
-            options.batch_entry_limit,
-            options.batch_byte_limit,
-        )?
-        else {
-            if commands.is_empty() {
-                if !options.probe_caught_up_replicas {
-                    return Ok(DfsPreparedMetadataJournalTargetPublishResult::NoChanges {
-                        outcome: DfsMetadataJournalReplicationOutcome::NoChanges {
-                            target_node_id,
-                            shard_id,
-                            after_sequence,
-                        },
-                    });
-                }
-                let command = dfs_metadata_caught_up_probe_command(
-                    backend,
-                    local_node_id,
-                    &target_node_id,
-                    &file_system_id,
+    let payload = match payloads_by_after_sequence.get(&after_sequence) {
+        Some(payload) => payload.clone(),
+        None => {
+            let mut next_after_sequence = after_sequence;
+            let mut batches = Vec::new();
+            let mut backlog_after_sequence = None;
+            let payload = loop {
+                let Some(batch) = backend.journal_batch_for_shard_since_limited(
                     &shard_id,
-                    shard_epoch,
-                    after_sequence,
-                )?;
-                return Ok(DfsPreparedMetadataJournalTargetPublishResult::Publish {
-                    target: DfsPreparedMetadataJournalTargetPublish {
-                        target_node_id,
-                        file_system_id,
-                        shard_id,
-                        shard_epoch,
-                        after_sequence,
-                        commands: vec![command],
-                        backlog_after_sequence: None,
-                        caught_up_probe: true,
-                    },
-                });
-            }
-            break;
-        };
-
-        next_after_sequence = batch.next_after_sequence;
-        commands.push(dfs_metadata_journal_batch_command(
-            local_node_id,
-            &target_node_id,
-            &file_system_id,
-            shard_epoch,
-            batch,
-        ));
-        if commands.len() >= options.max_batches_per_target {
-            if backend
-                .journal_batch_since_limited(
                     next_after_sequence,
                     options.batch_entry_limit,
                     options.batch_byte_limit,
                 )?
-                .is_some()
-            {
-                backlog_after_sequence = Some(next_after_sequence);
-            }
-            break;
+                else {
+                    if batches.is_empty() {
+                        if !options.probe_caught_up_replicas {
+                            break DfsPreparedMetadataJournalPayload::NoChanges;
+                        }
+                        let state_fingerprint =
+                            crate::service_sync::metadata_shard_state_fingerprint_at(
+                                backend,
+                                &shard_id,
+                                after_sequence,
+                            )?;
+                        break DfsPreparedMetadataJournalPayload::CaughtUp { state_fingerprint };
+                    }
+                    break DfsPreparedMetadataJournalPayload::Batches {
+                        batches,
+                        backlog_after_sequence,
+                    };
+                };
+
+                next_after_sequence = batch.next_after_sequence;
+                batches.push(batch);
+                if batches.len() >= options.max_batches_per_target {
+                    if backend
+                        .journal_batch_for_shard_since_limited(
+                            &shard_id,
+                            next_after_sequence,
+                            options.batch_entry_limit,
+                            options.batch_byte_limit,
+                        )?
+                        .is_some()
+                    {
+                        backlog_after_sequence = Some(next_after_sequence);
+                    }
+                    break DfsPreparedMetadataJournalPayload::Batches {
+                        batches,
+                        backlog_after_sequence,
+                    };
+                }
+            };
+            payloads_by_after_sequence.insert(after_sequence, payload.clone());
+            payload
+        }
+    };
+
+    match payload {
+        DfsPreparedMetadataJournalPayload::NoChanges => {
+            Ok(DfsPreparedMetadataJournalTargetPublishResult::NoChanges {
+                outcome: DfsMetadataJournalReplicationOutcome::NoChanges {
+                    target_node_id,
+                    shard_id,
+                    after_sequence,
+                },
+            })
+        }
+        DfsPreparedMetadataJournalPayload::CaughtUp { state_fingerprint } => {
+            let command = dfs_metadata_caught_up_probe_command(
+                local_node_id,
+                &target_node_id,
+                &file_system_id,
+                &shard_id,
+                shard_epoch,
+                after_sequence,
+                state_fingerprint,
+            );
+            Ok(DfsPreparedMetadataJournalTargetPublishResult::Publish {
+                target: DfsPreparedMetadataJournalTargetPublish {
+                    target_node_id,
+                    file_system_id,
+                    shard_id,
+                    shard_epoch,
+                    after_sequence,
+                    commands: vec![command],
+                    backlog_after_sequence: None,
+                    caught_up_probe: true,
+                },
+            })
+        }
+        DfsPreparedMetadataJournalPayload::Batches {
+            batches,
+            backlog_after_sequence,
+        } => {
+            let commands = batches
+                .into_iter()
+                .map(|batch| {
+                    dfs_metadata_journal_batch_command(
+                        local_node_id,
+                        &target_node_id,
+                        &file_system_id,
+                        shard_epoch,
+                        batch,
+                    )
+                })
+                .collect();
+            Ok(DfsPreparedMetadataJournalTargetPublishResult::Publish {
+                target: DfsPreparedMetadataJournalTargetPublish {
+                    target_node_id,
+                    file_system_id,
+                    shard_id,
+                    shard_epoch,
+                    after_sequence,
+                    commands,
+                    backlog_after_sequence,
+                    caught_up_probe: false,
+                },
+            })
         }
     }
-
-    Ok(DfsPreparedMetadataJournalTargetPublishResult::Publish {
-        target: DfsPreparedMetadataJournalTargetPublish {
-            target_node_id,
-            file_system_id,
-            shard_id,
-            shard_epoch,
-            after_sequence,
-            commands,
-            backlog_after_sequence,
-            caught_up_probe: false,
-        },
-    })
 }
 
 fn dfs_metadata_replication_suppression_for<'a>(
@@ -8139,21 +8315,16 @@ enum DfsMetadataJournalReplicationStep {
 }
 
 fn dfs_metadata_caught_up_probe_command(
-    backend: &dyn DfsMetadataBackend,
     local_node_id: &NodeId,
     target_node_id: &NodeId,
     file_system_id: &DfsFileSystemId,
     shard_id: &DfsMetadataShardId,
     authority_epoch: u64,
     journal_sequence: u64,
-) -> Result<DfsMetadataJournalBatchCommand, DfsError> {
-    let state_fingerprint = crate::service_sync::metadata_shard_state_fingerprint_at(
-        backend,
-        shard_id,
-        journal_sequence,
-    )?;
+    state_fingerprint: String,
+) -> DfsMetadataJournalBatchCommand {
     let barrier_id = sinomo_core::Id::generate().to_string();
-    Ok(DfsMetadataJournalBatchCommand {
+    DfsMetadataJournalBatchCommand {
         request_id: format!(
             "dfs_meta_probe_{}_{}_{}",
             local_node_id, target_node_id, barrier_id
@@ -8177,7 +8348,7 @@ fn dfs_metadata_caught_up_probe_command(
             entries: Vec::new(),
             next_after_sequence: journal_sequence,
         },
-    })
+    }
 }
 
 fn dfs_metadata_journal_batch_command(
@@ -10404,6 +10575,7 @@ mod cursor_update_tests {
         };
         configure_replica_shard(&receiver_data_dir, &receiver_node_id, &shard);
 
+        let mut payloads_by_after_sequence = BTreeMap::new();
         let target_publish = match prepare_dfs_metadata_journal_target_publish(
             &mut source_backend,
             &source_node_id,
@@ -10416,6 +10588,7 @@ mod cursor_update_tests {
                 probe_caught_up_replicas: true,
                 ..DfsMetadataJournalReplicationOptions::default()
             },
+            &mut payloads_by_after_sequence,
         )
         .expect("prepare caught-up replica probe")
         {
@@ -10592,6 +10765,7 @@ mod cursor_update_tests {
             default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
         };
         configure_replica_shard(&receiver_data_dir, &receiver_node_id, &shard);
+        let mut payloads_by_after_sequence = BTreeMap::new();
         let target_publish = match prepare_dfs_metadata_journal_target_publish(
             &mut source_backend,
             &source_node_id,
@@ -10604,6 +10778,7 @@ mod cursor_update_tests {
                 probe_caught_up_replicas: true,
                 ..DfsMetadataJournalReplicationOptions::default()
             },
+            &mut payloads_by_after_sequence,
         )
         .expect("prepare exact caught-up probe")
         {

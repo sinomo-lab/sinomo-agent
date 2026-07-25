@@ -22,6 +22,27 @@ fn dfs_error_from_posix_namespace_sync(error: posix_model::DfsPosixError) -> Dfs
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_namespace_prepare_keeps_ambiguous_failure_pending() {
+        let error = posix_model::DfsPosixError::Dfs(DfsError::Distributed {
+            message: "downstream operation failed after durable prepare".to_string(),
+        });
+
+        assert!(
+            !namespace_execution_must_remain_pending(&error, false),
+            "an ordinary deterministic distributed rejection remains terminal"
+        );
+        assert!(
+            namespace_execution_must_remain_pending(&error, true),
+            "once a hidden request-owned prepare is durable, recovery—not a contradictory rejection—owns the terminal result"
+        );
+    }
+}
+
 fn namespace_authority_shards_match(
     stamped: &[DfsMetadataShardConfig],
     current: &[DfsMetadataShardConfig],
@@ -260,6 +281,13 @@ fn namespace_execution_error_is_retriable(error: &posix_model::DfsPosixError) ->
                     | DfsError::Cancelled { .. }
             )
     )
+}
+
+fn namespace_execution_must_remain_pending(
+    error: &posix_model::DfsPosixError,
+    durable_prepare_recorded: bool,
+) -> bool {
+    durable_prepare_recorded || namespace_execution_error_is_retriable(error)
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -886,6 +914,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 }
                             }
                             durable_execute => {
+                                self.active_durable_namespace_prepare_recorded = false;
                                 self.active_durable_namespace_request = durable_execute
                                     .as_ref()
                                     .and_then(|admission| match admission {
@@ -971,12 +1000,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         ))
                                     }
                                 };
+                                let durable_prepare_recorded =
+                                    self.active_durable_namespace_prepare_recorded;
                                 self.active_durable_namespace_request = None;
+                                self.active_durable_namespace_prepare_recorded = false;
                                 trace_execute_ms = execute_started.elapsed().as_millis();
-                                let retryable_error = outcome
-                                    .as_ref()
-                                    .err()
-                                    .is_some_and(namespace_execution_error_is_retriable);
+                                let retryable_error = outcome.as_ref().err().is_some_and(|error| {
+                                    namespace_execution_must_remain_pending(
+                                        error,
+                                        durable_prepare_recorded,
+                                    )
+                                });
                                 let mut operation_result = match outcome {
                                     Ok(coordination_result) => {
                                         posix_coordination_result = coordination_result;

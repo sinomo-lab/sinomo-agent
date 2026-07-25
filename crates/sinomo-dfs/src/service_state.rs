@@ -143,6 +143,11 @@ pub struct NetworkedDfsService<T> {
     /// `apply_namespace_transaction_with_selected_shard` uses this context to
     /// place the terminal request result in the same durable prepare commit.
     pub(crate) active_durable_namespace_request: Option<DfsNamespaceRequestRecord>,
+    /// Set once the active request has written a hidden request-owned prepare.
+    /// Any later error is outcome-ambiguous: recovery owns that exact prepare,
+    /// so the request admission must remain pending rather than recording a
+    /// contradictory terminal rejection.
+    pub(crate) active_durable_namespace_prepare_recorded: bool,
     pub(crate) routed_namespace_settle_depth: usize,
     pub(crate) cross_shard_namespace_locks: BTreeSet<(DfsFileSystemId, String)>,
     pub(crate) last_events: Vec<NetworkedDfsServiceEvent>,

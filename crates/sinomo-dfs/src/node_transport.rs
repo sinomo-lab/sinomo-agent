@@ -53,7 +53,12 @@ const DFS_COMMIT_PROMOTION_MAX_INFLIGHT: usize = 2;
 /// Refinement of the bounded metadata-checkpoint fan-out model. Direct
 /// checkpoint RPCs are best-effort accelerators: later catch-up retains
 /// correctness when a sibling is slow or unavailable.
-const DFS_METADATA_JOURNAL_DIRECT_MAX_INFLIGHT: usize = 2;
+const DFS_METADATA_CHECKPOINT_DIRECT_MAX_INFLIGHT: usize = 2;
+/// A healthy metadata-authority proof is deliberately all-member rather than
+/// quorum based. Start one bounded cluster-sized wave so a six-node shard does
+/// not serialize required acknowledgements behind the best-effort checkpoint
+/// cap and then needlessly fall back to cluster KV.
+const DFS_METADATA_AUTHORITY_DIRECT_MAX_INFLIGHT: usize = 8;
 /// Keep one slow checkpoint replica from holding a served mutation lane. The
 /// operation-wide deadline, when shorter, is folded into each RPC below.
 const DFS_METADATA_JOURNAL_DIRECT_FANOUT_BUDGET: Duration = Duration::from_millis(250);
@@ -2862,6 +2867,7 @@ async fn send_direct_metadata_journal_fanout_async(
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     prepared: Vec<DfsPreparedMetadataJournalBatchRpc>,
     deadline: Instant,
+    max_inflight: usize,
 ) -> Vec<(NodeId, DfsMetadataJournalBatchResponse)> {
     let mut pending = VecDeque::from(prepared);
     let mut workers = tokio::task::JoinSet::new();
@@ -2870,7 +2876,7 @@ async fn send_direct_metadata_journal_fanout_async(
     tokio::pin!(deadline_sleep);
 
     loop {
-        while workers.len() < DFS_METADATA_JOURNAL_DIRECT_MAX_INFLIGHT {
+        while workers.len() < max_inflight {
             let Some(prepared) = pending.pop_front() else {
                 break;
             };
@@ -2924,12 +2930,13 @@ fn send_direct_metadata_journal_fanout_blocking(
     prepared: Vec<DfsPreparedMetadataJournalBatchRpc>,
     deadline: Instant,
     worker_slots: Arc<StdAtomicUsize>,
+    max_inflight: usize,
 ) -> Vec<(NodeId, DfsMetadataJournalBatchResponse)> {
     let expected_results = prepared.len();
     if expected_results == 0 {
         return Vec::new();
     }
-    let worker_count = expected_results.min(DFS_METADATA_JOURNAL_DIRECT_MAX_INFLIGHT);
+    let worker_count = expected_results.min(max_inflight);
     let pending = Arc::new(std::sync::Mutex::new(VecDeque::from(prepared)));
     let canceled = Arc::new(AtomicBool::new(false));
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
@@ -2937,10 +2944,10 @@ fn send_direct_metadata_journal_fanout_blocking(
     struct BlockingFanoutWorkerSlot(Arc<StdAtomicUsize>);
 
     impl BlockingFanoutWorkerSlot {
-        fn try_acquire(in_flight: Arc<StdAtomicUsize>) -> Option<Self> {
+        fn try_acquire(in_flight: Arc<StdAtomicUsize>, max_inflight: usize) -> Option<Self> {
             in_flight
                 .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |active| {
-                    (active < DFS_METADATA_JOURNAL_DIRECT_MAX_INFLIGHT).then_some(active + 1)
+                    (active < max_inflight).then_some(active + 1)
                 })
                 .ok()
                 .map(|_| Self(in_flight))
@@ -2955,7 +2962,8 @@ fn send_direct_metadata_journal_fanout_blocking(
 
     let mut spawned_workers = 0usize;
     for worker_index in 0..worker_count {
-        let Some(worker_slot) = BlockingFanoutWorkerSlot::try_acquire(Arc::clone(&worker_slots))
+        let Some(worker_slot) =
+            BlockingFanoutWorkerSlot::try_acquire(Arc::clone(&worker_slots), max_inflight)
         else {
             dfs_perf_trace(format_args!(
                 "direct-metadata-journal-fanout-blocking-worker-cap active={}",
@@ -3175,6 +3183,15 @@ impl DfsMessageTransport for DfsNodeTransport {
         if peer_transport.is_none() && async_peer_transport.is_none() {
             return Ok(None);
         }
+        let max_inflight = if !requests.is_empty()
+            && requests
+                .iter()
+                .all(|(_, command)| command.authority_probe.is_some())
+        {
+            DFS_METADATA_AUTHORITY_DIRECT_MAX_INFLIGHT
+        } else {
+            DFS_METADATA_CHECKPOINT_DIRECT_MAX_INFLIGHT
+        };
         let deadline = Instant::now() + DFS_METADATA_JOURNAL_DIRECT_FANOUT_BUDGET;
         let mut prepared = Vec::with_capacity(requests.len());
         for (target_node_id, command) in requests {
@@ -3218,6 +3235,7 @@ impl DfsMessageTransport for DfsNodeTransport {
                     async_peer_transport,
                     prepared,
                     deadline,
+                    max_inflight,
                 ))
             });
             return Ok(Some(responses));
@@ -3231,6 +3249,7 @@ impl DfsMessageTransport for DfsNodeTransport {
             prepared,
             deadline,
             Arc::clone(&self.blocking_metadata_fanout_workers),
+            max_inflight,
         );
         Ok(Some(responses))
     }
@@ -3277,10 +3296,12 @@ impl NetworkedDfsService<DfsNodeTransport> {
 mod tests {
     use super::*;
     use crate::{
-        DfsDistributedWriteCommand, DfsNamespaceCommand, DfsNamespaceOperation, DfsObjectId,
-        DfsReadResult, DfsReplicationPolicy, DfsStageBlobCommand, DfsVersion, sifs_file_system_id,
+        DfsDistributedWriteCommand, DfsMetadataAuthorityOperation, DfsMetadataAuthorityProbe,
+        DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsNamespaceCommand,
+        DfsNamespaceOperation, DfsObjectId, DfsReadResult, DfsReplicationPolicy,
+        DfsStageBlobCommand, DfsVersion, sifs_file_system_id,
     };
-    use sinomo_core::DfsWriteRequest;
+    use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
 
@@ -3895,6 +3916,42 @@ mod tests {
             .collect()
     }
 
+    fn test_metadata_authority_fanout_requests(
+        local_node_id: &NodeId,
+        targets: &[NodeId],
+    ) -> Vec<(NodeId, DfsMetadataJournalBatchCommand)> {
+        let file_system_id = sifs_file_system_id();
+        let expected_shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: local_node_id.clone(),
+            replica_node_ids: targets.to_vec(),
+            epoch: 7,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        test_metadata_fanout_requests(local_node_id, targets)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (target_node_id, mut command))| {
+                command.file_system_id = Some(file_system_id.clone());
+                command.authority_epoch = Some(expected_shard.epoch);
+                command.authority_probe = Some(DfsMetadataAuthorityProbe {
+                    probe_id: format!("metadata-authority-fanout-{index}"),
+                    expected_shard: expected_shard.clone(),
+                    operation: DfsMetadataAuthorityOperation::NamespaceMutation {
+                        operation_id: "metadata-authority-fanout-operation".to_string(),
+                        file_system_id: file_system_id.clone(),
+                        prepare_sequence: command.batch.next_after_sequence,
+                        payload_digest: "blake3:metadata-authority-fanout".to_string(),
+                    },
+                    prepared_prefix: None,
+                });
+                (target_node_id, command)
+            })
+            .collect()
+    }
+
     #[test]
     fn blocking_metadata_journal_fanout_caps_overlap_and_preserves_partial_success() {
         let local = node_id("node_metadata_fanout_blocking_n1");
@@ -3933,6 +3990,39 @@ mod tests {
     }
 
     #[test]
+    fn blocking_metadata_authority_fanout_starts_the_full_shard_together() {
+        let local = node_id("node_metadata_authority_fanout_blocking_n1");
+        let targets = (2..=6)
+            .map(|index| node_id(&format!("node_metadata_authority_fanout_blocking_n{index}")))
+            .collect::<Vec<_>>();
+        let peer = Arc::new(MetadataFanoutPeerTransport {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            failed_target: None,
+            slow_target: None,
+            fast_delay: Duration::from_millis(25),
+            slow_delay: Duration::from_secs(2),
+        });
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeServedMessageTransport::new_with_peer_transport_for_nodes(
+            local.clone(),
+            targets.clone(),
+            sync_peer,
+            Duration::from_secs(2),
+        );
+
+        let responses = transport
+            .send_metadata_journal_batches_direct(&test_metadata_authority_fanout_requests(
+                &local, &targets,
+            ))
+            .expect("blocking metadata authority fan-out")
+            .expect("blocking peer retained");
+
+        assert_eq!(peer.max_active.load(Ordering::SeqCst), targets.len());
+        assert_eq!(responses.len(), targets.len());
+    }
+
+    #[test]
     fn blocking_metadata_journal_fanout_does_not_accumulate_stalled_threads() {
         let local = node_id("node_metadata_fanout_stalled_n1");
         let targets = (2..=3)
@@ -3967,7 +4057,7 @@ mod tests {
                 .node_transport
                 .blocking_metadata_fanout_workers
                 .load(AtomicOrdering::Acquire),
-            DFS_METADATA_JOURNAL_DIRECT_MAX_INFLIGHT
+            DFS_METADATA_CHECKPOINT_DIRECT_MAX_INFLIGHT
         );
 
         let second_started = Instant::now();
@@ -4025,6 +4115,41 @@ mod tests {
             started.elapsed() < Duration::from_millis(600),
             "slow sibling must be canceled at the total fan-out budget"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn async_metadata_authority_fanout_starts_the_full_shard_together() {
+        let local = node_id("node_metadata_authority_fanout_async_n1");
+        let targets = (2..=6)
+            .map(|index| node_id(&format!("node_metadata_authority_fanout_async_n{index}")))
+            .collect::<Vec<_>>();
+        let peer = Arc::new(MetadataFanoutPeerTransport {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            failed_target: None,
+            slow_target: None,
+            fast_delay: Duration::from_millis(25),
+            slow_delay: Duration::from_secs(2),
+        });
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let async_peer: Arc<dyn AsyncDfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeServedMessageTransport::new_with_peer_transports_for_nodes(
+            local.clone(),
+            targets.clone(),
+            sync_peer,
+            async_peer,
+            Duration::from_secs(2),
+        );
+
+        let responses = transport
+            .send_metadata_journal_batches_direct(&test_metadata_authority_fanout_requests(
+                &local, &targets,
+            ))
+            .expect("async metadata authority fan-out")
+            .expect("async peer retained");
+
+        assert_eq!(peer.max_active.load(Ordering::SeqCst), targets.len());
+        assert_eq!(responses.len(), targets.len());
     }
 
     #[test]

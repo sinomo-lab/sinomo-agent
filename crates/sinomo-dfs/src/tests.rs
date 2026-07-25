@@ -9281,6 +9281,58 @@ fn metadata_execution_exclusions_park_offline_before_planning_healthy_target() {
 }
 
 #[test]
+fn metadata_publish_reuses_one_journal_payload_for_equal_replica_cursors() {
+    let root = temp_root("metadata-publish-shared-cursor-payload");
+    let local = NodeId::from_legacy_named("node_meta_shared_cursor_local").expect("local");
+    let replica_a =
+        NodeId::from_legacy_named("node_meta_shared_cursor_replica_a").expect("replica a");
+    let replica_b =
+        NodeId::from_legacy_named("node_meta_shared_cursor_replica_b").expect("replica b");
+    let shard_id = DfsMetadataShardId::new("root");
+    let file_system = file_system(local.clone());
+    let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("root"))
+        .expect("metadata backend");
+    backend
+        .put_file_system(&file_system)
+        .expect("filesystem metadata");
+    drop(backend);
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: shard_id.0.clone(),
+        primary_node_id: local.clone(),
+        replica_node_ids: vec![replica_a, replica_b],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let mut host = RecordingMetadataJournalPublisherHost::new(root.path().to_path_buf());
+
+    crate::metadata_journal::reset_metadata_journal_segment_scan_calls();
+    let (outcomes, targets) = prepare_dfs_metadata_journal_publish_with_host(
+        file_system.file_system_id,
+        &local,
+        vec![shard],
+        &mut host,
+        &[],
+        DfsMetadataJournalReplicationOptions::default(),
+    )
+    .expect("prepare shared-cursor publish");
+
+    assert!(outcomes.is_empty());
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0].commands.len(), 1);
+    assert_eq!(targets[1].commands.len(), 1);
+    assert_eq!(targets[0].commands[0].batch, targets[1].commands[0].batch);
+    assert_eq!(
+        crate::metadata_journal::metadata_journal_segment_scan_calls(),
+        2,
+        "backend recovery scans once and equal replica cursors share one suffix scan"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn metadata_replication_primary_mismatch_is_topology_mismatch() {
     assert!(metadata_replication_rejection_is_topology_mismatch(
         "metadata journal source node_b is not shard services primary node_a"
