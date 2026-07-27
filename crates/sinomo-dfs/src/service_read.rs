@@ -707,29 +707,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
 
-        if let Ok(manifest) = self
-            .content
-            .read_manifest(object.object_id.as_str(), object.version.as_str())
-            && object
-                .content_hash
-                .as_ref()
-                .is_none_or(|expected_hash| expected_hash == &manifest.content_hash)
+        if let Ok((manifest, reader)) = self.content.open_object_version_range_stream_shared(
+            object.object_id.as_str(),
+            object.version.as_str(),
+            offset,
+            max_bytes,
+        ) && object
+            .content_hash
+            .as_ref()
+            .is_none_or(|expected_hash| expected_hash == &manifest.manifest().content_hash)
         {
+            let manifest = manifest.manifest();
             let range_offset = offset.min(manifest.size_bytes);
             let range_size_bytes =
                 range_transfer_size_bytes(manifest.size_bytes, offset, max_bytes);
-            let (manifest, reader) = self.content.open_object_version_range_stream(
-                object.object_id.as_str(),
-                object.version.as_str(),
-                range_offset,
-                max_bytes,
-            )?;
             return Ok(NetworkedDfsRangeReadStreamOutcome::Found(
                 NetworkedDfsRangeReadStream {
                     data: DfsReadRangeData {
                         object_id: object.object_id.clone(),
                         version: object.version.clone(),
-                        content_hash: Some(manifest.content_hash),
+                        content_hash: Some(manifest.content_hash.clone()),
                         offset: range_offset,
                         total_size_bytes: manifest.size_bytes,
                         bytes: Vec::new(),
