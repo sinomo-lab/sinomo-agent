@@ -757,14 +757,18 @@ pub struct DfsNamespacePrepareRecord {
     /// Authenticated durable-content receipts materialized atomically with the
     /// visible namespace transaction. Namespace-only operations leave this
     /// empty; typed content commits must provide one receipt per visible file
-    /// version before the prepare can commit.
+    /// version before the prepare can commit. Pre-receipt journal entries omit
+    /// this field and replay with an empty receipt set.
+    #[serde(default)]
     pub content_receipts: Vec<DfsReplicaReceiptRecord>,
     pub transaction: DfsNamespaceTransaction,
     /// Terminal routed-request result materialized atomically with the visible
     /// namespace transaction. Standalone and write-intent prepares leave this
     /// empty; request-owned namespace prepares use it to close the crash window
     /// between applying metadata and recording the canonical RPC outcome.
-    #[serde(deserialize_with = "deserialize_explicit_option")]
+    /// Legacy prepares predate routed requests and omit this field; request
+    /// validation still rejects new request-owned prepares without a result.
+    #[serde(default)]
     pub completed_request: Option<DfsNamespaceRequestRecord>,
     pub status: DfsNamespacePrepareStatus,
 }
@@ -1354,15 +1358,9 @@ pub(crate) struct DfsMetadataTableSnapshotTables {
     pub(crate) namespace_prepares: Vec<DfsNamespacePrepareRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) namespace_jobs: Vec<DfsNamespaceJobRecord>,
+    /// Snapshots written before routed namespace requests omit this table.
+    #[serde(default)]
     pub(crate) namespace_requests: Vec<DfsNamespaceRequestRecord>,
-}
-
-fn deserialize_explicit_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(deserializer)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1856,7 +1854,7 @@ mod tests {
     }
 
     #[test]
-    fn namespace_prepare_requires_explicit_atomic_commit_fields() {
+    fn namespace_prepare_defaults_legacy_atomic_commit_fields_but_serializes_them_explicitly() {
         let prepare = DfsNamespacePrepareRecord {
             operation_id: "legacy-namespace-prepare".to_string(),
             file_system_id: file_system_id(),
@@ -1877,7 +1875,7 @@ mod tests {
             completed_request: None,
             status: DfsNamespacePrepareStatus::Prepared,
         };
-        let mut encoded = serde_json::to_value(prepare).expect("serialize namespace prepare");
+        let mut encoded = serde_json::to_value(&prepare).expect("serialize namespace prepare");
         let encoded = encoded.as_object_mut().expect("namespace prepare object");
         assert_eq!(
             encoded.get("content_receipts"),
@@ -1888,34 +1886,54 @@ mod tests {
             Some(&serde_json::Value::Null)
         );
 
-        let mut missing_receipts = encoded.clone();
-        missing_receipts.remove("content_receipts");
-        assert!(
-            serde_json::from_value::<DfsNamespacePrepareRecord>(serde_json::Value::Object(
-                missing_receipts
-            ))
-            .is_err()
-        );
+        let mut legacy = encoded.clone();
+        legacy.remove("content_receipts");
+        legacy.remove("completed_request");
+        let decoded = serde_json::from_value::<DfsNamespacePrepareRecord>(
+            serde_json::Value::Object(legacy.clone()),
+        )
+        .expect("deserialize legacy namespace prepare");
+        assert!(decoded.content_receipts.is_empty());
+        assert!(decoded.completed_request.is_none());
 
-        let mut missing_completion = encoded.clone();
-        missing_completion.remove("completed_request");
-        assert!(
-            serde_json::from_value::<DfsNamespacePrepareRecord>(serde_json::Value::Object(
-                missing_completion
-            ))
-            .is_err()
-        );
+        let mut legacy_entry = serde_json::to_value(DfsMetadataJournalEntry {
+            shard_id: prepare.shard_id.clone(),
+            sequence: 1,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            mutation: DfsMetadataMutation::put_namespace_prepare(&prepare),
+        })
+        .expect("serialize namespace prepare journal entry");
+        let legacy_entry_prepare = legacy_entry
+            .get_mut("mutation")
+            .and_then(|mutation| mutation.get_mut("prepare"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("namespace prepare journal payload");
+        legacy_entry_prepare.remove("content_receipts");
+        legacy_entry_prepare.remove("completed_request");
+        let legacy_bytes = sinomo_core::object::serde_ext::to_bytes(
+            &legacy_entry,
+            1,
+            sinomo_core::object::LengthMode::U32,
+        )
+        .expect("encode legacy namespace prepare journal entry as SOBJ");
+        let decoded: DfsMetadataJournalEntry =
+            sinomo_core::object::serde_ext::from_bytes(&legacy_bytes)
+                .expect("decode legacy namespace prepare journal entry from SOBJ");
+        let DfsMetadataMutation::PutNamespacePrepare {
+            prepare: Some(decoded),
+            ..
+        } = decoded.mutation
+        else {
+            panic!("decoded journal entry should contain namespace prepare payload");
+        };
+        assert!(decoded.content_receipts.is_empty());
+        assert!(decoded.completed_request.is_none());
     }
 
     #[test]
-    fn metadata_table_snapshot_requires_explicit_namespace_requests() {
-        assert!(
-            serde_json::from_value::<DfsMetadataTableSnapshotTables>(serde_json::json!({}))
-                .is_err()
-        );
-        let decoded: DfsMetadataTableSnapshotTables =
-            serde_json::from_value(serde_json::json!({ "namespace_requests": [] }))
-                .expect("deserialize metadata table snapshot");
+    fn metadata_table_snapshot_defaults_legacy_namespace_requests_but_serializes_it_explicitly() {
+        let decoded: DfsMetadataTableSnapshotTables = serde_json::from_value(serde_json::json!({}))
+            .expect("deserialize legacy metadata table snapshot");
         assert!(decoded.namespace_requests.is_empty());
         assert_eq!(
             serde_json::to_value(decoded)
