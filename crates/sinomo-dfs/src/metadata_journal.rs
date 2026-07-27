@@ -802,6 +802,7 @@ pub(crate) fn read_segmented_journal_file_since_limited(
     });
     let can_extend = cached.as_ref().is_some_and(|cached| {
         cached.identity == identity
+            && (cfg!(unix) || cached.modified == modified)
             && cached.indexed_bytes == cached.observed_file_len
             && file_bytes > cached.observed_file_len
     });

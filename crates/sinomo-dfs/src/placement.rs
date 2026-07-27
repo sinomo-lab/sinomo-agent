@@ -1721,17 +1721,36 @@ pub(crate) fn placement_reconciliation_activity_page_from_summaries(
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn current_placement_file_system_config(&mut self) -> Result<DfsFileSystemConfig, DfsError> {
         let file_system_id = crate::sifs_file_system_id();
-        if let Some(control_plane) = self.control_plane.as_mut()
-            && let Some(config) = DfsControlPlaneStore::new(control_plane.as_mut())
-                .get_file_system_config(&file_system_id)?
+        if let Some(config) = self
+            .active_namespace_operation_context
+            .as_ref()
+            .filter(|context| context.file_system_id == file_system_id)
+            .and_then(|context| context.placement_config.clone())
         {
             return Ok(config);
         }
-        self.metadata
-            .filesystems
-            .get(&file_system_id)
-            .map(DfsFileSystemConfig::from)
-            .ok_or(DfsError::UnknownFileSystem { file_system_id })
+        let config = if let Some(control_plane) = self.control_plane.as_mut()
+            && let Some(config) = DfsControlPlaneStore::new(control_plane.as_mut())
+                .get_file_system_config(&file_system_id)?
+        {
+            config
+        } else {
+            self.metadata
+                .filesystems
+                .get(&file_system_id)
+                .map(DfsFileSystemConfig::from)
+                .ok_or_else(|| DfsError::UnknownFileSystem {
+                    file_system_id: file_system_id.clone(),
+                })?
+        };
+        if let Some(context) = self
+            .active_namespace_operation_context
+            .as_mut()
+            .filter(|context| context.file_system_id == file_system_id)
+        {
+            context.placement_config = Some(config.clone());
+        }
+        Ok(config)
     }
 
     pub fn resolved_placement_policy_for_path(

@@ -1291,8 +1291,30 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     ) -> Result<Option<DfsNamespaceRequestRecord>>;
 
     /// Return durable routed namespace requests for bounded autonomous
-    /// recovery. Concrete backends return a stable requester/request-id order.
+    /// inspection. Recovery should use `list_pending_namespace_requests_page`
+    /// so terminal idempotency records are never cloned or filtered.
+    ///
+    /// Completed records remain the canonical exact-retry response. They
+    /// cannot be age-pruned until the namespace protocol defines a requester
+    /// retry watermark or equivalent retention fence.
     fn list_namespace_requests(&self) -> Result<Vec<DfsNamespaceRequestRecord>>;
+
+    /// Return one bounded, oldest-attempt-first page of pending namespace
+    /// requests. Concrete durable backends serve this from a derived status
+    /// index rather than scanning retained terminal idempotency records.
+    fn list_pending_namespace_requests_page(
+        &self,
+        after: Option<&DfsPendingNamespaceRequestPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsPendingNamespaceRequestPage>;
+
+    /// Return the hidden prepared transaction, if any, that owns the terminal
+    /// outcome for an exact still-pending routed namespace request.
+    fn get_prepared_namespace_prepare_for_request(
+        &self,
+        requester_node_id: &NodeId,
+        request_id: &str,
+    ) -> Result<Option<DfsNamespacePrepareRecord>>;
 
     /// Create or replace a namespace maintenance job.
     fn put_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {
@@ -1581,7 +1603,8 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     }
 
     /// Return the durable replay cursor for journal entries originating from
-    /// `source_shard_id`.
+    /// `source_shard_id`. Local durable backends require this to match their
+    /// logical shard identity.
     fn metadata_replay_cursor(&self, source_shard_id: &DfsMetadataShardId) -> Result<u64> {
         Ok(self
             .metadata_shard_statuses()?
@@ -1596,6 +1619,10 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     fn metadata_shard_statuses(&self) -> Result<Vec<DfsMetadataShardStatus>>;
 
     /// Persist and materialize a replicated journal batch.
+    ///
+    /// `batch.shard_id` is the logical shard identity and must match the
+    /// target backend's shard. Replicas use distinct node/storage identities,
+    /// not distinct logical shard IDs.
     fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize>;
 
     /// Persist a replicated batch using exact source evidence validated by the
@@ -1612,6 +1639,9 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     }
 
     /// Replace local metadata tables with a replicated snapshot.
+    ///
+    /// `source_shard_id` must match the target backend's logical shard
+    /// identity; snapshot replication does not adopt or rename shards.
     fn replace_with_replicated_snapshot(
         &mut self,
         source_shard_id: DfsMetadataShardId,

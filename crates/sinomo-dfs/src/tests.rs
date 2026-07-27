@@ -3333,13 +3333,14 @@ fn node_transport_async_read_message_uses_direct_sender_and_queues_response() {
             .await
             .expect("send async routed read message");
 
-        let calls = direct_calls.lock().expect("direct calls");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].object_id, object_id);
-        assert_eq!(calls[0].version, version);
-        assert_eq!(calls[0].content_hash, bytes_hash);
-        assert_eq!(calls[0].content_size_bytes, bytes.len() as u64);
-        drop(calls);
+        {
+            let calls = direct_calls.lock().expect("direct calls");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].object_id, object_id);
+            assert_eq!(calls[0].version, version);
+            assert_eq!(calls[0].content_hash, bytes_hash);
+            assert_eq!(calls[0].content_size_bytes, bytes.len() as u64);
+        }
         assert_eq!(*message_send_calls.lock().expect("message send calls"), 0);
         let messages = AsyncDfsMessageTransport::drain_incoming_messages_async(&mut transport)
             .await
@@ -3477,9 +3478,10 @@ fn node_transport_async_sender_does_not_require_sync_sender() {
         )
         .await
         .expect("async send message");
-        let recorded = calls.lock().expect("calls lock");
-        assert_eq!(recorded.as_slice(), &[(remote.clone(), message)]);
-        drop(recorded);
+        {
+            let recorded = calls.lock().expect("calls lock");
+            assert_eq!(recorded.as_slice(), &[(remote.clone(), message)]);
+        }
         let incoming = AsyncDfsMessageTransport::drain_incoming_messages_async(&mut transport)
             .await
             .expect("incoming messages");
@@ -5724,6 +5726,205 @@ fn mkdir_all_commits_a_missing_chain_in_one_namespace_transaction() {
         crate::metadata_backend::metadata_journal_write_count(),
         0,
         "an already-complete chain must remain a no-op"
+    );
+}
+
+#[test]
+fn mkdir_all_cross_shard_error_names_the_actual_child_parent_pair() {
+    let root = temp_root("mkdir-all-cross-shard-error-paths");
+    let node =
+        NodeId::from_legacy_named("node_mkdir_all_cross_shard_error_paths").expect("node id");
+    let path = "/services/batched/one/two";
+    let parent_path = "/services/batched/one";
+    let path_hash = path
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    let shards = vec![
+        DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: node.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        },
+        DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "hash-selected-leaf".to_string(),
+            primary_node_id: node.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::NameHashRange {
+                start_inclusive: path_hash,
+                end_exclusive: path_hash.wrapping_add(1),
+            },
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        },
+    ];
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        for shard in &shards {
+            control.put_metadata_shard(shard).expect("metadata shard");
+        }
+    });
+    let metadata =
+        open_local_sharded_metadata_backend(root.join("metadata"), shards).expect("metadata");
+    let mut dfs = NetworkedDfsService::new(
+        ReceiveOnlyTransport::new(node),
+        LocalContentStore::new(root.join("content")).expect("content store"),
+    )
+    .with_control_plane(control_plane)
+    .with_metadata_backend(metadata)
+    .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap SIFS");
+
+    let error = dfs
+        .posix_mkdir_all(path)
+        .expect_err("cross-shard child-parent pair must be rejected");
+    let detail = error.to_string();
+    assert!(
+        detail.contains(&format!("created object {path} and parent {parent_path}")),
+        "cross-shard error must name the actual failing pair, got: {detail}"
+    );
+    assert!(
+        dfs.posix_stat("/services/batched").is_err(),
+        "pair validation must finish before publishing the batched chain"
+    );
+}
+
+#[test]
+fn mkdir_all_over_tombstone_uses_new_directory_attributes_and_policy() {
+    let root = temp_root("mkdir-all-tombstone-create-metadata");
+    let node =
+        NodeId::from_legacy_named("node_mkdir_all_tombstone_create_metadata").expect("node id");
+    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let path = "/unmanaged/deleted-file";
+    dfs.posix_mkdir_all("/unmanaged").expect("create parent");
+    let deleted = dfs
+        .posix_write_file_with_create_attrs(
+            path,
+            b"deleted",
+            DfsWriteOptions::replicated_eventual(vec![node]),
+            DfsPosixCreateAttrs::new(0o640, 1001, 1002),
+        )
+        .expect("create file");
+    let mut deleted_metadata = dfs
+        .metadata()
+        .object(&deleted.object_id)
+        .expect("deleted file metadata")
+        .clone();
+    deleted_metadata.policy = DfsObjectPolicy::LocalOwned;
+    dfs.add_object_metadata(deleted_metadata)
+        .expect("install distinct deleted policy");
+    dfs.posix_unlink(path).expect("tombstone file");
+
+    let tombstone = dfs
+        .metadata()
+        .object(&deleted.object_id)
+        .expect("tombstone metadata");
+    assert_eq!(tombstone.kind, DfsObjectKind::Tombstone);
+    assert_eq!(
+        (tombstone.mode, tombstone.uid, tombstone.gid),
+        (0o640, 1001, 1002),
+        "the test must exercise a tombstone retaining the deleted file attributes"
+    );
+    assert_eq!(tombstone.policy, DfsObjectPolicy::LocalOwned);
+
+    dfs.posix_mkdir_all(path)
+        .expect("recreate tombstone as directory");
+    let recreated = dfs.posix_stat(path).expect("recreated directory");
+    assert_eq!(recreated.kind, DfsObjectKind::Directory);
+    assert_eq!(
+        (recreated.mode, recreated.uid, recreated.gid),
+        (0o755, 0, 0),
+        "mkdir-all must apply new-directory attributes instead of the deleted file attributes"
+    );
+    assert_eq!(
+        recreated.policy,
+        DfsObjectPolicy::ReplicatedEventual,
+        "an unmanaged mkdir-all must use the fresh-directory policy fallback"
+    );
+}
+
+#[test]
+fn mkdir_over_tombstone_applies_current_managed_directory_policy() {
+    let root = temp_root("mkdir-tombstone-managed-policy");
+    let node = NodeId::from_legacy_named("node_mkdir_tombstone_managed_policy").expect("node id");
+    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let path = "/services/deleted-file";
+    let deleted = dfs
+        .posix_write_file_with_create_attrs(
+            path,
+            b"deleted",
+            DfsWriteOptions::replicated_eventual(vec![node]),
+            DfsPosixCreateAttrs::new(0o600, 2001, 2002),
+        )
+        .expect("create file");
+    let mut deleted_metadata = dfs
+        .metadata()
+        .object(&deleted.object_id)
+        .expect("deleted file metadata")
+        .clone();
+    deleted_metadata.policy = DfsObjectPolicy::LocalOwned;
+    dfs.add_object_metadata(deleted_metadata)
+        .expect("install distinct deleted policy");
+    dfs.posix_unlink(path).expect("tombstone file");
+
+    let mut file_system = dfs
+        .metadata()
+        .filesystems
+        .get(&sifs_file_system_id())
+        .expect("SIFS metadata")
+        .clone();
+    file_system.subtree_policies.push(DfsSubtreePolicy::legacy(
+        path,
+        DfsObjectPolicy::ReplicatedConfirmed,
+    ));
+    dfs.add_file_system(file_system)
+        .expect("install current managed policy");
+
+    let recreated = dfs.posix_mkdir(path).expect("recreate managed directory");
+    assert_eq!(recreated.kind, DfsObjectKind::Directory);
+    assert_eq!(
+        (recreated.mode, recreated.uid, recreated.gid),
+        (0o755, 0, 0)
+    );
+    assert_eq!(
+        recreated.policy,
+        DfsObjectPolicy::ReplicatedConfirmed,
+        "mkdir must resolve the current managed policy instead of retaining the dead object policy"
+    );
+}
+
+#[test]
+fn mkdir_all_existing_deep_chain_uses_linear_metadata_lookups() {
+    let root = temp_root("mkdir-all-linear-lookups");
+    let node = NodeId::from_legacy_named("node_mkdir_all_linear_lookups").expect("node id");
+    let mut dfs =
+        open_shared_metadata_posix_service(&root, &root.join("metadata"), node, "content");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap SIFS");
+
+    let mut path = "/services".to_string();
+    for depth in 0..32 {
+        path.push_str(&format!("/level-{depth:02}"));
+    }
+    dfs.posix_mkdir_all(&path).expect("create deep chain");
+
+    crate::posix::reset_posix_metadata_raw_lookup_count();
+    dfs.posix_mkdir_all(&path)
+        .expect("repeat existing deep chain");
+    let lookup_count = crate::posix::posix_metadata_raw_lookup_count();
+    let component_count = path.trim_matches('/').split('/').count();
+    let linear_lookup_bound = component_count + 1;
+    assert!(
+        lookup_count <= linear_lookup_bound,
+        "deep-path resolution performed {lookup_count} raw lookups for {component_count} components; \
+         one root ancestor check plus one exact lookup per component is the linear upper bound"
     );
 }
 
@@ -37048,6 +37249,115 @@ fn routed_namespace_without_local_replay_omits_response_journal_batches() {
         "no-local-replay namespace response must not carry journal batches"
     );
 
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn clustered_mkdir_all_fuses_request_admission_with_prepare() {
+    let cluster = sifs_two_primary_cluster("sifs-mkdir-all-fused-admission");
+    let SifsTwoPrimaryCluster {
+        root,
+        replica_node,
+        mut services_primary,
+        replica,
+        ..
+    } = cluster;
+    let path = "/services/fused-admission/child";
+    let request_id = "dfs_net_req_mkdir_all_fused_admission".to_string();
+    let command = DfsNamespaceCommand {
+        request_id: request_id.clone(),
+        file_system_id: sifs_file_system_id(),
+        requesting_node_id: replica_node.clone(),
+        include_metadata_journal_batches: false,
+        metadata_journal_after_sequences: Vec::new(),
+        authority_shards: Vec::new(),
+        operation: DfsNamespaceOperation::MkdirAll {
+            path: path.to_string(),
+        },
+    };
+
+    crate::metadata_backend::reset_metadata_journal_write_count();
+    let event = services_primary
+        .handle_namespace_request(replica_node.clone(), command)
+        .expect("serve fused-admission mkdir-all");
+    assert!(
+        matches!(
+            &event,
+            NetworkedDfsServiceEvent::RemoteNamespaceServed {
+                result: DfsNamespaceResult::Applied,
+                ..
+            }
+        ),
+        "unexpected fused-admission event: {event:?}"
+    );
+    assert_eq!(
+        crate::metadata_backend::metadata_journal_write_count(),
+        2,
+        "the common clustered mkdir-all path should write prepare + commit, not Pending + prepare + commit"
+    );
+    let completed = services_primary
+        .metadata_backend
+        .as_ref()
+        .expect("metadata backend")
+        .get_namespace_request(&replica_node, &request_id)
+        .expect("request lookup")
+        .expect("completed request");
+    assert_eq!(completed.status, DfsNamespaceRequestStatus::Completed);
+    assert_eq!(completed.result, Some(DfsNamespaceResult::Applied));
+    assert_eq!(
+        services_primary
+            .posix_stat(path)
+            .expect("created directory")
+            .kind,
+        DfsObjectKind::Directory
+    );
+
+    let no_op_request_id = "dfs_net_req_mkdir_all_fused_admission_noop".to_string();
+    crate::metadata_backend::reset_metadata_journal_write_count();
+    let no_op = services_primary
+        .handle_namespace_request(
+            replica_node.clone(),
+            DfsNamespaceCommand {
+                request_id: no_op_request_id.clone(),
+                file_system_id: sifs_file_system_id(),
+                requesting_node_id: replica_node.clone(),
+                include_metadata_journal_batches: false,
+                metadata_journal_after_sequences: Vec::new(),
+                authority_shards: Vec::new(),
+                operation: DfsNamespaceOperation::MkdirAll {
+                    path: path.to_string(),
+                },
+            },
+        )
+        .expect("serve already-satisfied mkdir-all");
+    assert!(
+        matches!(
+            &no_op,
+            NetworkedDfsServiceEvent::RemoteNamespaceServed {
+                result: DfsNamespaceResult::Applied,
+                ..
+            }
+        ),
+        "unexpected fused-admission no-op event: {no_op:?}"
+    );
+    assert_eq!(
+        crate::metadata_backend::metadata_journal_write_count(),
+        1,
+        "an already-satisfied mkdir-all should record Completed directly"
+    );
+    assert_eq!(
+        services_primary
+            .metadata_backend
+            .as_ref()
+            .expect("metadata backend")
+            .get_namespace_request(&replica_node, &no_op_request_id)
+            .expect("no-op request lookup")
+            .expect("completed no-op request")
+            .status,
+        DfsNamespaceRequestStatus::Completed
+    );
+
+    drop(replica);
     std::fs::remove_dir_all(&root).ok();
 }
 

@@ -2483,6 +2483,81 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(requests.into_values().collect())
     }
 
+    fn list_pending_namespace_requests_page(
+        &self,
+        after: Option<&DfsPendingNamespaceRequestPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsPendingNamespaceRequestPage> {
+        if max_entries == 0 {
+            return Ok(DfsPendingNamespaceRequestPage {
+                requests: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let mut requests_by_identity =
+            BTreeMap::<(NodeId, String), DfsNamespaceRequestRecord>::new();
+        for backend in self.shards.values() {
+            let page = backend
+                .list_pending_namespace_requests_page(after, max_entries.saturating_add(1))?;
+            for request in page.requests {
+                let request_key = (
+                    request.requester_node_id.clone(),
+                    request.request_id.clone(),
+                );
+                if requests_by_identity.insert(request_key, request).is_some() {
+                    return Err(MetadataBackendError::Serde(
+                        "pending namespace request exists on multiple local shards".to_string(),
+                    ));
+                }
+            }
+        }
+        let entries = requests_by_identity
+            .into_values()
+            .map(|request| {
+                let cursor = DfsPendingNamespaceRequestPageCursor {
+                    updated_at: request.updated_at,
+                    requester_node_id: request.requester_node_id.clone(),
+                    request_id: request.request_id.clone(),
+                };
+                (request, cursor)
+            })
+            .collect::<Vec<_>>();
+        let (requests, next_cursor) =
+            finish_sorted_cursor_page(entries, max_entries, |left, right| {
+                (left.updated_at, &left.requester_node_id, &left.request_id).cmp(&(
+                    right.updated_at,
+                    &right.requester_node_id,
+                    &right.request_id,
+                ))
+            });
+        Ok(DfsPendingNamespaceRequestPage {
+            requests,
+            next_cursor,
+        })
+    }
+
+    fn get_prepared_namespace_prepare_for_request(
+        &self,
+        requester_node_id: &NodeId,
+        request_id: &str,
+    ) -> Result<Option<DfsNamespacePrepareRecord>> {
+        let mut found = None;
+        for backend in self.shards.values() {
+            let Some(prepare) = backend
+                .get_prepared_namespace_prepare_for_request(requester_node_id, request_id)?
+            else {
+                continue;
+            };
+            if found.is_some() {
+                return Err(MetadataBackendError::Serde(format!(
+                    "pending namespace request {requester_node_id}/{request_id} owns prepared transactions on multiple local shards"
+                )));
+            }
+            found = Some(prepare);
+        }
+        Ok(found)
+    }
+
     fn get_namespace_transaction(
         &self,
         transaction_id: &str,

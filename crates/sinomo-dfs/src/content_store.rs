@@ -31,10 +31,12 @@ pub use readers::{BlobRangeReader, BlobReader, ObjectVersionReader};
 use serde::{Deserialize, Serialize};
 use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
 use sinomo_core::storage::durable_file;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -51,6 +53,7 @@ const STREAMED_OBJECT_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
 const STREAMED_BLOB_ONLY_MIN_BYTES: usize = 1024 * 1024;
 const CONTENT_HASH_TREE_VERSION: u32 = 1;
 const CONTENT_HASH_TREE_LEAF_BYTES: u64 = 1024 * 1024;
+const STREAM_MANIFEST_CACHE_MAX_ENTRIES: usize = 1024;
 
 fn content_store_perf_trace(args: std::fmt::Arguments<'_>) {
     tracing::trace!(target: "sinomo.dfs.perf", detail = %args, "dfs content store perf");
@@ -534,6 +537,58 @@ pub struct LocalContentStore {
     quota: Option<ContentStoreQuota>,
     quota_stats_initialized: Arc<AtomicBool>,
     packed_index_cache: Arc<Mutex<PackedBlobIndexCache>>,
+    stream_manifest_cache: Arc<Mutex<StreamManifestCache>>,
+    #[cfg(test)]
+    blob_stream_open_count: Arc<AtomicU64>,
+    #[cfg(test)]
+    stream_manifest_file_read_count: Arc<AtomicU64>,
+}
+
+#[derive(Debug)]
+pub(super) struct ValidatedContentManifest {
+    manifest: ContentManifest,
+}
+
+impl ValidatedContentManifest {
+    pub(super) fn manifest(&self) -> &ContentManifest {
+        &self.manifest
+    }
+}
+
+#[derive(Debug, Default)]
+struct StreamManifestCache {
+    entries: BTreeMap<PathBuf, Arc<ValidatedContentManifest>>,
+    insertion_order: VecDeque<PathBuf>,
+}
+
+impl StreamManifestCache {
+    fn get(&mut self, path: &Path) -> Option<Arc<ValidatedContentManifest>> {
+        self.entries.get(path).map(Arc::clone)
+    }
+
+    fn insert(
+        &mut self,
+        path: PathBuf,
+        manifest: Arc<ValidatedContentManifest>,
+    ) -> Arc<ValidatedContentManifest> {
+        if let Some(entry) = self.entries.get_mut(&path) {
+            return Arc::clone(entry);
+        }
+        while self.entries.len() >= STREAM_MANIFEST_CACHE_MAX_ENTRIES {
+            let Some(oldest_path) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest_path);
+        }
+        self.insertion_order.push_back(path.clone());
+        self.entries.insert(path, Arc::clone(&manifest));
+        manifest
+    }
+
+    fn remove(&mut self, path: &Path) {
+        self.entries.remove(path);
+        self.insertion_order.retain(|cached| cached != path);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -632,6 +687,11 @@ impl LocalContentStore {
             // it from the durable store while quota mode is active.
             quota_stats_initialized: Arc::new(AtomicBool::new(false)),
             packed_index_cache: Arc::new(Mutex::new(PackedBlobIndexCache::default())),
+            stream_manifest_cache: Arc::new(Mutex::new(StreamManifestCache::default())),
+            #[cfg(test)]
+            blob_stream_open_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            stream_manifest_file_read_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1084,6 +1144,8 @@ impl LocalContentStore {
     /// itself (and rotates to another source on mismatch), where the extra read
     /// pass would simply double the I/O for large blobs.
     pub fn open_blob_stream(&self, hash: &str) -> Result<BlobReader> {
+        #[cfg(test)]
+        self.blob_stream_open_count.fetch_add(1, Ordering::Relaxed);
         let path = self.blob_path(hash)?;
         if path.is_file() {
             let file = fs::File::open(&path).map_err(|source| ContentStoreError::Io {
@@ -1118,6 +1180,8 @@ impl LocalContentStore {
         offset: u64,
         max_bytes: usize,
     ) -> Result<BlobRangeReader> {
+        #[cfg(test)]
+        self.blob_stream_open_count.fetch_add(1, Ordering::Relaxed);
         let path = self.blob_path(hash)?;
         if !path.is_file() {
             let Some(location) = self.packed_blob_location(hash)? else {
@@ -1252,54 +1316,66 @@ impl LocalContentStore {
         offset: u64,
         max_bytes: usize,
     ) -> Result<(ContentManifest, ObjectVersionReader)> {
-        let manifest = self.read_manifest(object_id, version)?;
-        let start = offset.min(manifest.size_bytes);
+        let (manifest, reader) =
+            self.open_object_version_range_stream_shared(object_id, version, offset, max_bytes)?;
+        Ok((manifest.manifest.clone(), reader))
+    }
+
+    pub(crate) fn open_object_version_range_stream_shared(
+        &self,
+        object_id: &str,
+        version: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<(Arc<ValidatedContentManifest>, ObjectVersionReader)> {
+        let manifest = self.read_stream_manifest(object_id, version)?;
+        let reader =
+            self.open_validated_manifest_range_stream(Arc::clone(&manifest), offset, max_bytes)?;
+        Ok((manifest, reader))
+    }
+
+    fn open_validated_manifest_range_stream(
+        &self,
+        manifest: Arc<ValidatedContentManifest>,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<ObjectVersionReader> {
+        let manifest_fields = &manifest.manifest;
+        let start = offset.min(manifest_fields.size_bytes);
         let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
-        let end = start.saturating_add(max_bytes_u64).min(manifest.size_bytes);
-        if manifest.extents.is_empty() {
-            let reader = self.open_blob_range_stream(&manifest.content_hash, start, max_bytes)?;
-            return Ok((manifest, ObjectVersionReader::from_blob_range(reader)));
+        let end = start
+            .saturating_add(max_bytes_u64)
+            .min(manifest_fields.size_bytes);
+        if manifest_fields.extents.is_empty() {
+            let reader =
+                self.open_blob_range_stream(&manifest_fields.content_hash, start, max_bytes)?;
+            return Ok(ObjectVersionReader::from_blob_range(reader));
         }
 
-        let mut range_extents = Vec::new();
-        for extent in self.logical_extents_for_manifest(&manifest)? {
-            let extent_end = extent
-                .logical_offset
-                .checked_add(extent.size_bytes)
-                .ok_or_else(|| ContentStoreError::InvalidContentLayout {
-                    message: format!(
-                        "extent range overflows object size: object={}, version={}",
-                        manifest.object_id, manifest.version
-                    ),
-                })?;
+        // Cached stream manifests have already been sorted and validated. Use
+        // the monotonic logical offsets to select only the extents intersecting
+        // this bounded range, without cloning or sorting the complete layout.
+        let first_extent_index = manifest_fields.extents.partition_point(|extent| {
+            extent.logical_offset.saturating_add(extent.size_bytes) <= start
+        });
+        let selected_extent_count = manifest_fields.extents[first_extent_index..]
+            .partition_point(|extent| extent.logical_offset < end);
+        let end_extent_index = first_extent_index.saturating_add(selected_extent_count);
+        for extent in &manifest_fields.extents[first_extent_index..end_extent_index] {
+            let extent_end = extent.logical_offset.saturating_add(extent.size_bytes);
             let range_start = start.max(extent.logical_offset);
             let range_end = end.min(extent_end);
-            if range_start >= range_end {
-                continue;
-            }
-            let extent_delta = range_start - extent.logical_offset;
-            range_extents.push(ContentExtent {
-                logical_offset: range_start - start,
-                size_bytes: range_end - range_start,
-                content_hash: extent.content_hash,
-                blob_offset: extent
-                    .blob_offset
-                    .checked_add(extent_delta)
-                    .ok_or_else(|| ContentStoreError::InvalidContentLayout {
-                        message: format!(
-                            "extent blob offset overflows: object={}, version={}",
-                            manifest.object_id, manifest.version
-                        ),
-                    })?,
-            });
+            self.ensure_extent_subrange_readable(extent, range_start, range_end)?;
         }
-        self.ensure_extents_readable(&range_extents)?;
-        let reader = ObjectVersionReader::from_extents(
+        Ok(ObjectVersionReader::from_manifest_range(
             self.clone(),
+            manifest,
             end.saturating_sub(start),
-            range_extents,
-        );
-        Ok((manifest, reader))
+            first_extent_index,
+            end_extent_index,
+            start,
+            end,
+        ))
     }
 
     /// Open a bounded range stream for a content identity whose visible DFS
@@ -1317,13 +1393,10 @@ impl LocalContentStore {
         else {
             return Ok(None);
         };
-        let (_, reader) = self.open_object_version_range_stream(
-            &manifest.object_id,
-            &manifest.version,
-            offset,
-            max_bytes,
-        )?;
-        Ok(Some((manifest, reader)))
+        let manifest = self.cache_stream_manifest(manifest)?;
+        let reader =
+            self.open_validated_manifest_range_stream(Arc::clone(&manifest), offset, max_bytes)?;
+        Ok(Some((manifest.manifest.clone(), reader)))
     }
 
     pub fn open_object_version_blob_stream(
@@ -1357,6 +1430,66 @@ impl LocalContentStore {
         let path = self.manifest_path(object_id, version);
         let bytes = read_file(&path)?;
         decode_manifest(&bytes)
+    }
+
+    fn read_stream_manifest(
+        &self,
+        object_id: &str,
+        version: &str,
+    ) -> Result<Arc<ValidatedContentManifest>> {
+        let path = self.manifest_path(object_id, version);
+        let cached = {
+            let mut cache = self
+                .stream_manifest_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.get(&path)
+        };
+        if let Some(manifest) = cached {
+            // Object-version manifests are immutable. The existence probe keeps
+            // version collection visible while avoiding another file read,
+            // decode, extent sort, and full layout validation on cache hits.
+            if path.is_file() {
+                return Ok(manifest);
+            }
+            self.evict_stream_manifest(&path);
+        }
+
+        #[cfg(test)]
+        self.stream_manifest_file_read_count
+            .fetch_add(1, Ordering::Relaxed);
+        let manifest = decode_manifest(&read_file(&path)?)?;
+        self.cache_stream_manifest_at(path, manifest)
+    }
+
+    fn cache_stream_manifest(
+        &self,
+        manifest: ContentManifest,
+    ) -> Result<Arc<ValidatedContentManifest>> {
+        let path = self.manifest_path(&manifest.object_id, &manifest.version);
+        self.cache_stream_manifest_at(path, manifest)
+    }
+
+    fn cache_stream_manifest_at(
+        &self,
+        path: PathBuf,
+        manifest: ContentManifest,
+    ) -> Result<Arc<ValidatedContentManifest>> {
+        let manifest = Arc::new(ValidatedContentManifest {
+            manifest: validate_and_order_stream_manifest(manifest)?,
+        });
+        let mut cache = self
+            .stream_manifest_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(cache.insert(path, manifest))
+    }
+
+    fn evict_stream_manifest(&self, path: &Path) {
+        self.stream_manifest_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(path);
     }
 
     pub fn manifests_for_object(&self, object_id: &str) -> Result<Vec<ContentManifest>> {
@@ -1716,6 +1849,7 @@ impl LocalContentStore {
                 }
                 self.remove_content_manifest_index_for_version_if_current(entry)?;
                 if remove_file_if_exists_and_sync_parent(&entry.path)? {
+                    self.evict_stream_manifest(&entry.path);
                     report.deleted_version_count = report.deleted_version_count.saturating_add(1);
                     report.deleted_logical_bytes = report
                         .deleted_logical_bytes
@@ -3557,15 +3691,6 @@ impl LocalContentStore {
     }
 
     fn extent_range_readable(&self, extent: &ContentExtent) -> Result<bool> {
-        let reader = match self.open_blob_stream(&extent.content_hash) {
-            Ok(reader) => reader,
-            Err(ContentStoreError::Io { source, .. })
-                if source.kind() == io::ErrorKind::NotFound =>
-            {
-                return Ok(false);
-            }
-            Err(error) => return Err(error),
-        };
         let required_end = extent
             .blob_offset
             .checked_add(extent.size_bytes)
@@ -3575,7 +3700,62 @@ impl LocalContentStore {
                     extent.content_hash
                 ),
             })?;
-        Ok(required_end <= reader.size_bytes())
+        Ok(self
+            .readable_blob_size(&extent.content_hash)?
+            .is_some_and(|size_bytes| required_end <= size_bytes))
+    }
+
+    fn ensure_extent_subrange_readable(
+        &self,
+        extent: &ContentExtent,
+        logical_start: u64,
+        logical_end: u64,
+    ) -> Result<()> {
+        let extent_delta = logical_start
+            .checked_sub(extent.logical_offset)
+            .ok_or_else(|| ContentStoreError::InvalidContentLayout {
+                message: "extent range starts before its logical offset".to_string(),
+            })?;
+        let blob_start = extent
+            .blob_offset
+            .checked_add(extent_delta)
+            .ok_or_else(|| ContentStoreError::InvalidContentLayout {
+                message: format!(
+                    "extent blob offset overflows for content hash {}",
+                    extent.content_hash
+                ),
+            })?;
+        let required_end = blob_start
+            .checked_add(logical_end.saturating_sub(logical_start))
+            .ok_or_else(|| ContentStoreError::InvalidContentLayout {
+                message: format!(
+                    "extent blob range overflows for content hash {}",
+                    extent.content_hash
+                ),
+            })?;
+        if !self
+            .readable_blob_size(&extent.content_hash)?
+            .is_some_and(|size_bytes| required_end <= size_bytes)
+        {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: "manifest references missing or truncated content extents".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn readable_blob_size(&self, hash: &str) -> Result<Option<u64>> {
+        let path = self.blob_path(hash)?;
+        if let Some(size_bytes) = file_len_if_exists(&path)? {
+            return Ok(Some(size_bytes));
+        }
+        let Some(location) = self.packed_blob_location(hash)? else {
+            return Ok(None);
+        };
+        if !self.packed_blob_location_readable(&location)? {
+            return Ok(None);
+        }
+        Ok(Some(location.size_bytes))
     }
 
     fn read_hash_tree_optional(
@@ -4045,6 +4225,34 @@ fn encode_manifest(manifest: &ContentManifest) -> Result<Vec<u8>> {
 fn decode_manifest(bytes: &[u8]) -> Result<ContentManifest> {
     sinomo_object_serde::from_bytes(bytes)
         .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn validate_and_order_stream_manifest(mut manifest: ContentManifest) -> Result<ContentManifest> {
+    hash_hex(&manifest.content_hash)?;
+    if manifest.extents.is_empty() {
+        return Ok(manifest);
+    }
+    let already_ordered = manifest.extents.windows(2).all(|pair| {
+        pair[0]
+            .logical_offset
+            .cmp(&pair[1].logical_offset)
+            .then_with(|| pair[0].blob_offset.cmp(&pair[1].blob_offset))
+            != std::cmp::Ordering::Greater
+    });
+    if !already_ordered {
+        manifest.extents.sort_by(|left, right| {
+            left.logical_offset
+                .cmp(&right.logical_offset)
+                .then_with(|| left.blob_offset.cmp(&right.blob_offset))
+        });
+    }
+    validate_extents_cover_size(
+        &manifest.extents,
+        manifest.size_bytes,
+        &manifest.object_id,
+        &manifest.version,
+    )?;
+    Ok(manifest)
 }
 
 fn encode_hash_tree(tree: &ContentHashTree) -> Result<Vec<u8>> {
@@ -5248,6 +5456,68 @@ mod tests {
     }
 
     #[test]
+    fn extent_range_stream_reuses_manifest_layout_and_opens_each_extent_once() {
+        let root = temp_root("extent_range_stream_reuses_manifest_layout");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let base = b"0123456789abcdef";
+        store
+            .put_object_version("object-extent-range", "v1", base)
+            .expect("put base version");
+        let patched = store
+            .put_object_version_patch("object-extent-range", "v1", "v2", 6, b"WXYZ")
+            .expect("put extent-backed version");
+        assert!(patched.extents.len() >= 3);
+
+        let manifest_reads_before = store
+            .stream_manifest_file_read_count
+            .load(Ordering::Relaxed);
+        let opens_before = store.blob_stream_open_count.load(Ordering::Relaxed);
+        let (stream_manifest, mut reader) = store
+            .open_object_version_range_stream("object-extent-range", "v2", 0, base.len())
+            .expect("open extent-backed range");
+        assert_eq!(
+            store.blob_stream_open_count.load(Ordering::Relaxed),
+            opens_before,
+            "range construction should validate extent sizes without opening their blobs"
+        );
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).expect("stream range");
+        assert_eq!(bytes, b"012345WXYZabcdef");
+        assert_eq!(
+            store
+                .blob_stream_open_count
+                .load(Ordering::Relaxed)
+                .saturating_sub(opens_before),
+            stream_manifest.extents.len() as u64,
+            "each selected extent should be opened exactly once"
+        );
+        assert_eq!(
+            store
+                .stream_manifest_file_read_count
+                .load(Ordering::Relaxed),
+            manifest_reads_before + 1
+        );
+
+        let (_, mut repeated) = store
+            .open_object_version_range_stream("object-extent-range", "v2", 5, 6)
+            .expect("open cached extent-backed range");
+        let mut repeated_bytes = Vec::new();
+        repeated
+            .read_to_end(&mut repeated_bytes)
+            .expect("stream cached range");
+        assert_eq!(repeated_bytes, b"5WXYZa");
+        assert_eq!(
+            store
+                .stream_manifest_file_read_count
+                .load(Ordering::Relaxed),
+            manifest_reads_before + 1,
+            "repeated ranges should reuse the immutable validated manifest"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn small_object_versions_are_stored_in_packed_segments() {
         let root = temp_root("small_object_versions_are_stored_in_packed_segments");
         let store = LocalContentStore::new(&root).expect("create store");
@@ -6045,6 +6315,42 @@ mod tests {
         assert!(
             final_scrub.is_healthy(),
             "final scrub issues: {final_scrub:?}"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn collect_versions_evicts_deleted_stream_manifest_cache_entry() {
+        let root = temp_root("collect_versions_evicts_stream_manifest_cache");
+        let store = LocalContentStore::new(&root).expect("create store");
+        store
+            .put_object_version("object-cache-gc", "version_1", b"old bytes")
+            .expect("put old version");
+        store
+            .put_object_version("object-cache-gc", "version_2", b"new bytes")
+            .expect("put latest version");
+        let (_, mut old_reader) = store
+            .open_object_version_range_stream("object-cache-gc", "version_1", 0, usize::MAX)
+            .expect("cache old manifest");
+        let mut old_bytes = Vec::new();
+        old_reader
+            .read_to_end(&mut old_bytes)
+            .expect("read old version");
+        assert_eq!(old_bytes, b"old bytes");
+
+        let report = store
+            .collect_versions(ContentStoreVersionGcOptions::delete_eligible(
+                Duration::from_nanos(0),
+                1,
+            ))
+            .expect("collect old version");
+        assert_eq!(report.deleted_version_count, 1);
+        assert!(
+            store
+                .open_object_version_range_stream("object-cache-gc", "version_1", 0, usize::MAX,)
+                .is_err(),
+            "a collected manifest must not remain readable through the stream cache"
         );
 
         cleanup(&root);

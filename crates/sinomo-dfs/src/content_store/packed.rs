@@ -298,8 +298,6 @@ impl LocalContentStore {
             index.next_segment_id = index.next_segment_id.saturating_add(1);
             segment_path = self.packed_blob_segment_path(&segment_id);
             segment_len = 0;
-        } else if index.next_segment_id == 1 {
-            index.next_segment_id = 1;
         }
 
         if let Some(parent) = segment_path.parent() {
@@ -398,8 +396,6 @@ impl LocalContentStore {
                 segment_path = self.packed_blob_segment_path(&segment_id);
                 segment_len = 0;
                 segment_lengths.insert(segment_id.clone(), 0);
-            } else if index.next_segment_id == 1 {
-                index.next_segment_id = 1;
             }
 
             if let Some(parent) = segment_path.parent() {

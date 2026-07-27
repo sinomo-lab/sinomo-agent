@@ -9,10 +9,31 @@
 use sinomo_core::node::NodeId;
 use std::collections::BTreeSet;
 
+use crate::service_state::DfsNamespaceOperationContext;
 use crate::*;
 use crate::{posix_model, posix_path};
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    pub(crate) fn replace_namespace_operation_context(
+        &mut self,
+        file_system_id: DfsFileSystemId,
+        shards: Vec<DfsMetadataShardConfig>,
+    ) -> Option<DfsNamespaceOperationContext> {
+        self.active_namespace_operation_context
+            .replace(DfsNamespaceOperationContext {
+                file_system_id,
+                shards,
+                placement_config: None,
+            })
+    }
+
+    pub(crate) fn restore_namespace_operation_context(
+        &mut self,
+        previous: Option<DfsNamespaceOperationContext>,
+    ) {
+        self.active_namespace_operation_context = previous;
+    }
+
     pub(crate) fn metadata_shard_config_snapshot(
         &mut self,
         file_system_id: &DfsFileSystemId,
@@ -135,34 +156,103 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if self.control_plane.is_none() {
             return Ok(Vec::new());
         }
-        match operation {
+        let Some(shards) = self.metadata_shard_config_snapshot(file_system_id)? else {
+            return Ok(Vec::new());
+        };
+        Self::affected_namespace_shards_from_snapshot(file_system_id, operation, &shards)
+    }
+
+    /// Resolves an operation against one immutable shard configuration view.
+    ///
+    /// Routed handlers use this after validating the request's authority
+    /// stamps, then retain the same snapshot through path planning and the
+    /// durable prepare. This prevents one operation from repeatedly rebuilding
+    /// the same cluster-KV projection and also prevents it from mixing epochs.
+    pub(crate) fn affected_namespace_shards_from_snapshot(
+        file_system_id: &DfsFileSystemId,
+        operation: &DfsNamespaceOperation,
+        shards: &[DfsMetadataShardConfig],
+    ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
+        let candidates = match operation {
             DfsNamespaceOperation::LookupPath { path }
             | DfsNamespaceOperation::SyncPath { path }
             | DfsNamespaceOperation::ReconcilePlacement { path, .. }
             | DfsNamespaceOperation::AdvisoryLock { path, .. }
             | DfsNamespaceOperation::FileSync { path, .. }
             | DfsNamespaceOperation::DirectorySync { path, .. } => {
-                return self.namespace_shards_for_exact_paths(file_system_id, [path.as_str()]);
+                Self::normalized_namespace_paths([path.as_str()], false, "operation")?
             }
-            DfsNamespaceOperation::LookupPaths { paths } => {
-                return self.namespace_shards_for_exact_paths(
+            DfsNamespaceOperation::LookupPaths { paths } => Self::normalized_namespace_paths(
+                paths.iter().map(String::as_str),
+                false,
+                "operation",
+            )?,
+            DfsNamespaceOperation::CommitLocalEventualBatch { transaction, .. } => {
+                return Self::affected_namespace_transaction_shards_from_snapshot(
                     file_system_id,
-                    paths.iter().map(String::as_str),
+                    transaction,
+                    shards,
                 );
             }
-            _ => {}
-        }
-        if let DfsNamespaceOperation::CommitLocalEventualBatch { transaction, .. } = operation {
-            return self.affected_namespace_transaction_shards(file_system_id, transaction);
-        }
-        let candidates =
-            Self::normalized_namespace_paths(operation.involved_paths(), true, "operation")?;
-        let Some(shards) = self.metadata_shard_config_snapshot(file_system_id)? else {
-            return Ok(Vec::new());
+            _ => Self::normalized_namespace_paths(operation.involved_paths(), true, "operation")?,
         };
         Self::namespace_shards_for_normalized_paths_from_snapshot(
             file_system_id,
-            &shards,
+            shards,
+            candidates.iter().map(String::as_str),
+        )
+    }
+
+    pub(crate) fn affected_namespace_transaction_shards_from_snapshot(
+        file_system_id: &DfsFileSystemId,
+        transaction: &DfsNamespaceTransaction,
+        shards: &[DfsMetadataShardConfig],
+    ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
+        if transaction.objects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut candidate_paths = BTreeSet::new();
+        for object in &transaction.objects {
+            let normalized =
+                posix_path::normalized_posix_path_key(&object.path).ok_or_else(|| {
+                    DfsError::Distributed {
+                        message: format!("invalid namespace transaction path: {}", object.path),
+                    }
+                })?;
+            if let Some(parent) = posix_path::parent_posix_path(&normalized) {
+                candidate_paths.insert(parent);
+            }
+            candidate_paths.insert(normalized);
+        }
+
+        Self::namespace_shards_for_normalized_paths_from_snapshot(
+            file_system_id,
+            shards,
+            candidate_paths.iter().map(String::as_str),
+        )
+    }
+
+    /// Resolve the shard that stores the transaction's exact object records.
+    ///
+    /// Unlike affected-operation routing, this deliberately does not add each
+    /// object's parent. A shard-boundary parent touch is deferred to that
+    /// parent's authority and is not part of the child transaction.
+    pub(crate) fn namespace_transaction_shards_from_snapshot(
+        file_system_id: &DfsFileSystemId,
+        transaction: &DfsNamespaceTransaction,
+        shards: &[DfsMetadataShardConfig],
+    ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
+        let candidates = Self::normalized_namespace_paths(
+            transaction
+                .objects
+                .iter()
+                .map(|object| object.path.as_str()),
+            false,
+            "transaction",
+        )?;
+        Self::namespace_shards_for_normalized_paths_from_snapshot(
+            file_system_id,
+            shards,
             candidates.iter().map(String::as_str),
         )
     }
@@ -192,38 +282,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             file_system_id,
             &shards,
             candidates.iter().map(String::as_str),
-        )
-    }
-
-    fn affected_namespace_transaction_shards(
-        &mut self,
-        file_system_id: &DfsFileSystemId,
-        transaction: &DfsNamespaceTransaction,
-    ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
-        if transaction.objects.is_empty() || self.control_plane.is_none() {
-            return Ok(Vec::new());
-        }
-        let Some(shards) = self.metadata_shard_config_snapshot(file_system_id)? else {
-            return Ok(Vec::new());
-        };
-        let mut candidate_paths = BTreeSet::new();
-        for object in &transaction.objects {
-            let normalized =
-                posix_path::normalized_posix_path_key(&object.path).ok_or_else(|| {
-                    DfsError::Distributed {
-                        message: format!("invalid namespace transaction path: {}", object.path),
-                    }
-                })?;
-            if let Some(parent) = posix_path::parent_posix_path(&normalized) {
-                candidate_paths.insert(parent);
-            }
-            candidate_paths.insert(normalized);
-        }
-
-        Self::namespace_shards_for_normalized_paths_from_snapshot(
-            file_system_id,
-            &shards,
-            candidate_paths.iter().map(String::as_str),
         )
     }
 

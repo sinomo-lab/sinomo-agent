@@ -18,6 +18,9 @@ mod read;
 mod routing;
 pub(crate) mod sync;
 
+#[cfg(test)]
+pub(crate) use metadata::{posix_metadata_raw_lookup_count, reset_posix_metadata_raw_lookup_count};
+
 use crate::dfs_now_unix_nanos as now_unix_nanos;
 use crate::metadata_records::object_version_record;
 use crate::namespace::{
@@ -625,15 +628,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             object.current_locations = vec![self.node_id.clone()];
             set_object_create_timestamps(&mut object);
             let attrs = self.posix_inherit_create_attrs_from_parent_local(&path, attrs, true)?;
-            apply_posix_create_attrs(&mut object, attrs);
+            self.apply_posix_new_directory_metadata(&mut object, attrs)?;
             object.version = next_version(&object.version);
             return self.commit_posix_created_directory(object);
         }
         let mut object = new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::Directory);
-        self.apply_managed_policy_to_new_object(&mut object, 2)?;
         let attrs = self.posix_inherit_create_attrs_from_parent_local(&path, attrs, true)?;
-        apply_posix_create_attrs(&mut object, attrs);
+        self.apply_posix_new_directory_metadata(&mut object, attrs)?;
         self.commit_posix_created_directory(object)
+    }
+
+    fn apply_posix_new_directory_metadata(
+        &mut self,
+        object: &mut DfsObjectMetadata,
+        attrs: DfsPosixCreateAttrs,
+    ) -> Result<()> {
+        // A tombstone deliberately retains the deleted object's metadata. Once
+        // the path is created as a new directory, start from the same durable
+        // policy as a fresh directory before resolving current managed rules.
+        // Otherwise an unmanaged resurrection inherits the dead object's
+        // policy, and a managed resurrection can use it as its fallback.
+        object.policy = DfsObjectPolicy::ReplicatedEventual;
+        self.apply_managed_policy_to_new_object(object, 2)?;
+        apply_posix_create_attrs(object, attrs);
+        Ok(())
     }
 
     pub fn posix_mkdir_all(&mut self, path: &str) -> Result<()> {
@@ -842,12 +860,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if path == "/" {
             return Ok(true);
         }
+        let file_system_id = sifs_file_system_id();
+        let mut known_live_ancestors = false;
         let mut current = String::new();
         for part in path.trim_matches('/').split('/') {
             current.push('/');
             current.push_str(part);
-            match self.lookup_sifs_path(&current)? {
-                Some(object) if object.kind == DfsObjectKind::Directory => {}
+            match self.lookup_metadata_path_with_known_live_ancestors(
+                &file_system_id,
+                &current,
+                known_live_ancestors,
+            )? {
+                Some(object) if object.kind == DfsObjectKind::Directory => {
+                    known_live_ancestors = true;
+                }
                 _ => return Ok(false),
             }
         }
@@ -856,19 +882,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub(crate) fn posix_mkdir_all_local(&mut self, path: &str) -> Result<()> {
         let path = normalize_posix_path(path)?;
-        let path = self.resolve_posix_path_distributed(&path, true)?;
+        let resolved = self.resolve_posix_path_distributed_for_mkdir_all(&path)?;
+        let path = resolved.path;
         if path == "/" {
             return Ok(());
         }
+        debug_assert_eq!(
+            resolved
+                .components
+                .last()
+                .map(|component| component.path.as_str()),
+            Some(path.as_str()),
+            "a fully followed path walk must describe its final component"
+        );
 
         let mut parent = None;
         let mut planned = BTreeMap::<String, DfsObjectMetadata>::new();
         let mut durable_parents_to_touch = BTreeMap::<String, DfsObjectMetadata>::new();
-        let mut current = String::new();
-        for part in path.trim_matches('/').split('/') {
-            current.push('/');
-            current.push_str(part);
-            match self.lookup_sifs_path(&current)? {
+        let mut planned_parent_paths = Vec::<(String, String)>::new();
+        for component in resolved.components {
+            let current = component.path;
+            match component.object {
                 Some(object) if object.kind == DfsObjectKind::Directory => {
                     parent = Some(object);
                 }
@@ -897,14 +931,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     object.link_target_object_id = None;
                     object.current_locations = vec![self.node_id.clone()];
                     set_object_create_timestamps(&mut object);
+                    let attrs = inherit_posix_create_attrs(
+                        DfsPosixCreateAttrs::directory_default(),
+                        true,
+                        parent_for_child.mode,
+                        parent_for_child.gid,
+                    );
+                    self.apply_posix_new_directory_metadata(&mut object, attrs)?;
                     object.version = next_version(&object.version);
                     if let Some(planned_parent) = planned.get_mut(&parent_for_child.path) {
                         touch_directory_for_batched_child(planned_parent, false);
                     } else {
                         durable_parents_to_touch
                             .entry(parent_for_child.path.clone())
-                            .or_insert(parent_for_child);
+                            .or_insert(parent_for_child.clone());
                     }
+                    planned_parent_paths.push((current.clone(), parent_for_child.path.clone()));
                     planned.insert(current.clone(), object.clone());
                     parent = Some(object);
                 }
@@ -932,21 +974,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         &current,
                         DfsObjectKind::Directory,
                     );
-                    self.apply_managed_policy_to_new_object(&mut object, 2)?;
                     let attrs = inherit_posix_create_attrs(
                         DfsPosixCreateAttrs::directory_default(),
                         true,
                         parent_for_child.mode,
                         parent_for_child.gid,
                     );
-                    apply_posix_create_attrs(&mut object, attrs);
+                    self.apply_posix_new_directory_metadata(&mut object, attrs)?;
                     if let Some(planned_parent) = planned.get_mut(&parent_for_child.path) {
                         touch_directory_for_batched_child(planned_parent, false);
                     } else {
                         durable_parents_to_touch
                             .entry(parent_for_child.path.clone())
-                            .or_insert(parent_for_child);
+                            .or_insert(parent_for_child.clone());
                     }
+                    planned_parent_paths.push((current.clone(), parent_for_child.path.clone()));
                     planned.insert(current.clone(), object.clone());
                     parent = Some(object);
                 }
@@ -958,27 +1000,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
 
         let file_system_id = sifs_file_system_id();
-        let mut transaction_paths = durable_parents_to_touch
-            .keys()
-            .map(String::as_str)
-            .chain(planned.keys().map(String::as_str))
-            .collect::<Vec<_>>();
-        transaction_paths.sort_unstable();
-        transaction_paths.dedup();
-        let shards =
-            self.namespace_shards_for_exact_paths(&file_system_id, transaction_paths.into_iter())?;
-        let first_parent_path = durable_parents_to_touch
-            .keys()
-            .next()
-            .map(String::as_str)
-            .unwrap_or("/");
-        crate::service_commit::ensure_atomic_create_parent_touch_shard(
-            &file_system_id,
-            &self.node_id,
-            &path,
-            first_parent_path,
-            &shards,
-        )?;
+        // Preserve the same atomic child-plus-parent boundary as repeated
+        // `mkdir` while retaining one transaction for the common same-shard
+        // chain. Validate against one placement snapshot so a deep mkdir does
+        // not reread cluster KV for every component, and report the exact pair
+        // that crosses a shard boundary.
+        let shard_snapshot = self.metadata_shard_config_snapshot(&file_system_id)?;
+        for (child_path, parent_path) in &planned_parent_paths {
+            let shards = match shard_snapshot.as_deref() {
+                Some(shards) => Self::namespace_shards_for_normalized_paths_from_snapshot(
+                    &file_system_id,
+                    shards,
+                    [child_path.as_str(), parent_path.as_str()],
+                )?,
+                None => Vec::new(),
+            };
+            crate::service_commit::ensure_atomic_create_parent_touch_shard(
+                &file_system_id,
+                &self.node_id,
+                child_path,
+                parent_path,
+                &shards,
+            )?;
+        }
 
         for parent in durable_parents_to_touch.values_mut() {
             touch_directory_for_batched_child(parent, true);
