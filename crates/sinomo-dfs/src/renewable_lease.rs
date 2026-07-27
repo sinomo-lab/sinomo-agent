@@ -521,34 +521,22 @@ fn renewed_grant_matches(grant: &DfsAdvisoryLockGrant, token: &DfsAdvisoryLockTo
 
 fn renew_loop<T: DfsMessageTransport + Send + 'static>(shared: Arc<RenewableLeaseShared<T>>) {
     loop {
-        let (grant, wait) = {
-            let mut state = match shared.status.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => {
-                    mark_lost(&shared.status, &mut poisoned.into_inner());
-                    return;
-                }
-            };
-            observe_local_deadline(&shared.status, &mut state);
-            if state.stop || state.released || state.lost {
-                return;
-            }
-            let until_deadline = state
-                .local_lease_deadline
-                .saturating_duration_since(Instant::now());
-            (
-                state.grant.clone(),
-                shared.config.renew_interval.min(until_deadline),
-            )
-        };
-
-        let state = match shared.status.state.lock() {
+        let mut state = match shared.status.state.lock() {
             Ok(state) => state,
             Err(poisoned) => {
                 mark_lost(&shared.status, &mut poisoned.into_inner());
                 return;
             }
         };
+        observe_local_deadline(&shared.status, &mut state);
+        if state.stop || state.released || state.lost {
+            return;
+        }
+        let grant = state.grant.clone();
+        let until_deadline = state
+            .local_lease_deadline
+            .saturating_duration_since(Instant::now());
+        let wait = shared.config.renew_interval.min(until_deadline);
         let (mut state, _) = match shared.status.changed.wait_timeout(state, wait) {
             Ok(result) => result,
             Err(poisoned) => {
@@ -891,6 +879,26 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn release_wakes_a_long_waiting_renewer_promptly() {
+        let (_root, first, _second, anchor) = two_services("renewable-lease-release-wake");
+        let lease = DfsRenewableExclusiveLease::try_acquire(
+            first,
+            anchor,
+            DfsAdvisoryLockSessionId::new("lease-holder-release-wake"),
+            Some(1000),
+            DfsRenewableLeaseConfig {
+                renew_interval: Duration::from_secs(60),
+                command_timeout: Duration::from_secs(1),
+            },
+        )
+        .expect("lease with long renewal interval");
+        let status = lease.status();
+
+        lease.release().expect("release long-waiting renewer");
+        wait_until(|| Arc::strong_count(&status.shared) == 1);
     }
 
     #[test]

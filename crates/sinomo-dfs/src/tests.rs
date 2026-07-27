@@ -3333,13 +3333,14 @@ fn node_transport_async_read_message_uses_direct_sender_and_queues_response() {
             .await
             .expect("send async routed read message");
 
-        let calls = direct_calls.lock().expect("direct calls");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].object_id, object_id);
-        assert_eq!(calls[0].version, version);
-        assert_eq!(calls[0].content_hash, bytes_hash);
-        assert_eq!(calls[0].content_size_bytes, bytes.len() as u64);
-        drop(calls);
+        {
+            let calls = direct_calls.lock().expect("direct calls");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].object_id, object_id);
+            assert_eq!(calls[0].version, version);
+            assert_eq!(calls[0].content_hash, bytes_hash);
+            assert_eq!(calls[0].content_size_bytes, bytes.len() as u64);
+        }
         assert_eq!(*message_send_calls.lock().expect("message send calls"), 0);
         let messages = AsyncDfsMessageTransport::drain_incoming_messages_async(&mut transport)
             .await
@@ -3477,9 +3478,10 @@ fn node_transport_async_sender_does_not_require_sync_sender() {
         )
         .await
         .expect("async send message");
-        let recorded = calls.lock().expect("calls lock");
-        assert_eq!(recorded.as_slice(), &[(remote.clone(), message)]);
-        drop(recorded);
+        {
+            let recorded = calls.lock().expect("calls lock");
+            assert_eq!(recorded.as_slice(), &[(remote.clone(), message)]);
+        }
         let incoming = AsyncDfsMessageTransport::drain_incoming_messages_async(&mut transport)
             .await
             .expect("incoming messages");
@@ -5724,6 +5726,74 @@ fn mkdir_all_commits_a_missing_chain_in_one_namespace_transaction() {
         crate::metadata_backend::metadata_journal_write_count(),
         0,
         "an already-complete chain must remain a no-op"
+    );
+}
+
+#[test]
+fn mkdir_all_cross_shard_error_names_the_actual_child_parent_pair() {
+    let root = temp_root("mkdir-all-cross-shard-error-paths");
+    let node =
+        NodeId::from_legacy_named("node_mkdir_all_cross_shard_error_paths").expect("node id");
+    let path = "/services/batched/one/two";
+    let parent_path = "/services/batched/one";
+    let path_hash = path
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    let shards = vec![
+        DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: node.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        },
+        DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "hash-selected-leaf".to_string(),
+            primary_node_id: node.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::NameHashRange {
+                start_inclusive: path_hash,
+                end_exclusive: path_hash.wrapping_add(1),
+            },
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        },
+    ];
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        for shard in &shards {
+            control.put_metadata_shard(shard).expect("metadata shard");
+        }
+    });
+    let metadata =
+        open_local_sharded_metadata_backend(root.join("metadata"), shards).expect("metadata");
+    let mut dfs = NetworkedDfsService::new(
+        ReceiveOnlyTransport::new(node),
+        LocalContentStore::new(root.join("content")).expect("content store"),
+    )
+    .with_control_plane(control_plane)
+    .with_metadata_backend(metadata)
+    .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap SIFS");
+
+    let error = dfs
+        .posix_mkdir_all(path)
+        .expect_err("cross-shard child-parent pair must be rejected");
+    let detail = error.to_string();
+    assert!(
+        detail.contains(&format!("created object {path} and parent {parent_path}")),
+        "cross-shard error must name the actual failing pair, got: {detail}"
+    );
+    assert!(
+        dfs.posix_stat("/services/batched").is_err(),
+        "pair validation must finish before publishing the batched chain"
     );
 }
 

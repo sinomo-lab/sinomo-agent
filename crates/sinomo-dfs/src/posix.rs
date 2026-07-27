@@ -899,6 +899,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut parent = None;
         let mut planned = BTreeMap::<String, DfsObjectMetadata>::new();
         let mut durable_parents_to_touch = BTreeMap::<String, DfsObjectMetadata>::new();
+        let mut planned_parent_paths = Vec::<(String, String)>::new();
         for component in resolved.components {
             let current = component.path;
             match component.object {
@@ -943,8 +944,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     } else {
                         durable_parents_to_touch
                             .entry(parent_for_child.path.clone())
-                            .or_insert(parent_for_child);
+                            .or_insert(parent_for_child.clone());
                     }
+                    planned_parent_paths.push((current.clone(), parent_for_child.path.clone()));
                     planned.insert(current.clone(), object.clone());
                     parent = Some(object);
                 }
@@ -984,8 +986,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     } else {
                         durable_parents_to_touch
                             .entry(parent_for_child.path.clone())
-                            .or_insert(parent_for_child);
+                            .or_insert(parent_for_child.clone());
                     }
+                    planned_parent_paths.push((current.clone(), parent_for_child.path.clone()));
                     planned.insert(current.clone(), object.clone());
                     parent = Some(object);
                 }
@@ -997,27 +1000,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
 
         let file_system_id = sifs_file_system_id();
-        let mut transaction_paths = durable_parents_to_touch
-            .keys()
-            .map(String::as_str)
-            .chain(planned.keys().map(String::as_str))
-            .collect::<Vec<_>>();
-        transaction_paths.sort_unstable();
-        transaction_paths.dedup();
-        let shards =
-            self.namespace_shards_for_exact_paths(&file_system_id, transaction_paths.into_iter())?;
-        let first_parent_path = durable_parents_to_touch
-            .keys()
-            .next()
-            .map(String::as_str)
-            .unwrap_or("/");
-        crate::service_commit::ensure_atomic_create_parent_touch_shard(
-            &file_system_id,
-            &self.node_id,
-            &path,
-            first_parent_path,
-            &shards,
-        )?;
+        // Preserve the same atomic child-plus-parent boundary as repeated
+        // `mkdir` while retaining one transaction for the common same-shard
+        // chain. Validate against one placement snapshot so a deep mkdir does
+        // not reread cluster KV for every component, and report the exact pair
+        // that crosses a shard boundary.
+        let shard_snapshot = self.metadata_shard_config_snapshot(&file_system_id)?;
+        for (child_path, parent_path) in &planned_parent_paths {
+            let shards = match shard_snapshot.as_deref() {
+                Some(shards) => Self::namespace_shards_for_normalized_paths_from_snapshot(
+                    &file_system_id,
+                    shards,
+                    [child_path.as_str(), parent_path.as_str()],
+                )?,
+                None => Vec::new(),
+            };
+            crate::service_commit::ensure_atomic_create_parent_touch_shard(
+                &file_system_id,
+                &self.node_id,
+                child_path,
+                parent_path,
+                &shards,
+            )?;
+        }
 
         for parent in durable_parents_to_touch.values_mut() {
             touch_directory_for_batched_child(parent, true);
