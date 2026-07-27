@@ -259,7 +259,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.metadata_backend
             .as_mut()
             .expect("metadata backend exists during hydration")
-            .commit_prepared_namespace_transaction(
+            .commit_prepared_namespace_transaction_on_shard(
+                &prepared.shard_id,
                 &prepared.operation_id,
                 &prepared.operation_digest,
                 prepared.owner_epoch,

@@ -20,7 +20,10 @@ pub(crate) mod sync;
 
 use crate::dfs_now_unix_nanos as now_unix_nanos;
 use crate::metadata_records::object_version_record;
-use crate::namespace::{initial_version, namespace_transaction_id_for_object, next_version};
+use crate::namespace::{
+    initial_version, namespace_transaction_id_for_batch, namespace_transaction_id_for_object,
+    next_version,
+};
 use crate::posix_model::{
     DfsPosixCreateAttrs, DfsPosixError, DfsStat, DfsWriteOptions, Result, read_conflict_error,
 };
@@ -45,6 +48,18 @@ use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::time::{Duration, Instant};
+
+fn touch_directory_for_batched_child(directory: &mut DfsObjectMetadata, advance_version: bool) {
+    let touch_time = now_unix_nanos()
+        .max(directory.modified_at_unix_nanos.saturating_add(1))
+        .max(directory.changed_at_unix_nanos.saturating_add(1));
+    directory.modified_at_unix_nanos = touch_time;
+    directory.changed_at_unix_nanos = touch_time;
+    if advance_version {
+        directory.version = next_version(&directory.version);
+    }
+    directory.last_modified_by_event_id = Some(EventId::generate());
+}
 
 const POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT: usize = 8;
 const POSIX_WAIT_FOR_COMMIT_REPAIR_MAX_JOBS_PER_PASS: usize = 1;
@@ -845,13 +860,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if path == "/" {
             return Ok(());
         }
+
+        let mut parent = None;
+        let mut planned = BTreeMap::<String, DfsObjectMetadata>::new();
+        let mut durable_parents_to_touch = BTreeMap::<String, DfsObjectMetadata>::new();
         let mut current = String::new();
         for part in path.trim_matches('/').split('/') {
             current.push('/');
             current.push_str(part);
             match self.lookup_sifs_path(&current)? {
-                Some(object) if object.kind == DfsObjectKind::Directory => {}
+                Some(object) if object.kind == DfsObjectKind::Directory => {
+                    parent = Some(object);
+                }
                 Some(object) if object.kind == DfsObjectKind::Tombstone => {
+                    self.ensure_resolved_path_not_in_cross_shard_flight(&current)?;
+                    if parent.is_none() {
+                        let parent_path = parent_posix_path(&current).unwrap_or_else(|| "/".into());
+                        parent = self.lookup_sifs_path(&parent_path)?;
+                    }
+                    let parent_for_child =
+                        parent
+                            .as_ref()
+                            .cloned()
+                            .ok_or_else(|| DfsPosixError::MissingParent {
+                                path: parent_posix_path(&current).unwrap_or_else(|| "/".into()),
+                            })?;
+                    if parent_for_child.kind != DfsObjectKind::Directory {
+                        return Err(DfsPosixError::NotDirectory {
+                            path: parent_for_child.path,
+                        });
+                    }
                     let mut object = object;
                     object.kind = DfsObjectKind::Directory;
                     object.content_hash = None;
@@ -860,15 +898,112 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     object.current_locations = vec![self.node_id.clone()];
                     set_object_create_timestamps(&mut object);
                     object.version = next_version(&object.version);
-                    self.add_object_metadata(object)?;
-                    self.touch_parent_directory_modified(&current)?;
+                    if let Some(planned_parent) = planned.get_mut(&parent_for_child.path) {
+                        touch_directory_for_batched_child(planned_parent, false);
+                    } else {
+                        durable_parents_to_touch
+                            .entry(parent_for_child.path.clone())
+                            .or_insert(parent_for_child);
+                    }
+                    planned.insert(current.clone(), object.clone());
+                    parent = Some(object);
                 }
                 Some(_) => return Err(DfsPosixError::NotDirectory { path: current }),
                 None => {
-                    self.posix_mkdir_local(&current)?;
+                    self.ensure_resolved_path_not_in_cross_shard_flight(&current)?;
+                    if parent.is_none() {
+                        let parent_path = parent_posix_path(&current).unwrap_or_else(|| "/".into());
+                        parent = self.lookup_sifs_path(&parent_path)?;
+                    }
+                    let parent_for_child =
+                        parent
+                            .as_ref()
+                            .cloned()
+                            .ok_or_else(|| DfsPosixError::MissingParent {
+                                path: parent_posix_path(&current).unwrap_or_else(|| "/".into()),
+                            })?;
+                    if parent_for_child.kind != DfsObjectKind::Directory {
+                        return Err(DfsPosixError::NotDirectory {
+                            path: parent_for_child.path,
+                        });
+                    }
+                    let mut object = new_posix_metadata_object(
+                        &self.node_id,
+                        &current,
+                        DfsObjectKind::Directory,
+                    );
+                    self.apply_managed_policy_to_new_object(&mut object, 2)?;
+                    let attrs = inherit_posix_create_attrs(
+                        DfsPosixCreateAttrs::directory_default(),
+                        true,
+                        parent_for_child.mode,
+                        parent_for_child.gid,
+                    );
+                    apply_posix_create_attrs(&mut object, attrs);
+                    if let Some(planned_parent) = planned.get_mut(&parent_for_child.path) {
+                        touch_directory_for_batched_child(planned_parent, false);
+                    } else {
+                        durable_parents_to_touch
+                            .entry(parent_for_child.path.clone())
+                            .or_insert(parent_for_child);
+                    }
+                    planned.insert(current.clone(), object.clone());
+                    parent = Some(object);
                 }
             }
         }
+
+        if planned.is_empty() {
+            return Ok(());
+        }
+
+        let file_system_id = sifs_file_system_id();
+        let mut transaction_paths = durable_parents_to_touch
+            .keys()
+            .map(String::as_str)
+            .chain(planned.keys().map(String::as_str))
+            .collect::<Vec<_>>();
+        transaction_paths.sort_unstable();
+        transaction_paths.dedup();
+        let shards =
+            self.namespace_shards_for_exact_paths(&file_system_id, transaction_paths.into_iter())?;
+        let first_parent_path = durable_parents_to_touch
+            .keys()
+            .next()
+            .map(String::as_str)
+            .unwrap_or("/");
+        crate::service_commit::ensure_atomic_create_parent_touch_shard(
+            &file_system_id,
+            &self.node_id,
+            &path,
+            first_parent_path,
+            &shards,
+        )?;
+
+        for parent in durable_parents_to_touch.values_mut() {
+            touch_directory_for_batched_child(parent, true);
+        }
+        let objects = durable_parents_to_touch
+            .into_values()
+            .chain(planned.into_values())
+            .collect::<Vec<_>>();
+        let versions = objects
+            .iter()
+            .map(|object| object_version_record(object, object.content_size_bytes))
+            .collect::<Vec<_>>();
+        self.apply_namespace_transaction(DfsNamespaceTransaction {
+            transaction_id: namespace_transaction_id_for_batch(
+                "mkdir-all",
+                &file_system_id,
+                &objects,
+                &versions,
+            ),
+            file_system_id,
+            objects,
+            versions,
+            advisory_lock_states: Vec::new(),
+            created_at: time::OffsetDateTime::now_utc(),
+        })?;
         Ok(())
     }
 

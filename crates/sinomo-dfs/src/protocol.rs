@@ -556,6 +556,11 @@ pub struct DfsNamespaceResponse {
     /// from the requester's reported cursors.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metadata_journal_batches: Vec<DfsMetadataJournalBatch>,
+    /// Whether the authority still had journal history beyond the bounded
+    /// batches carried by this response. `None` identifies an older peer, for
+    /// which the receiver retains the conservative legacy limit heuristic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_journal_has_more: Option<bool>,
     /// Typed result for POSIX coordination operations. Keeping this separate
     /// from `result` preserves the existing namespace success/error contract
     /// while allowing lock and durability certificates to cross the same

@@ -671,8 +671,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: "metadata authority probe has no durable metadata backend".to_string(),
             });
         };
-        let replicated_through_sequence =
+        let durable_replicated_through_sequence =
             backend.metadata_replication_cursor(target_node_id, &prepared_batch.shard_id)?;
+        let replicated_through_sequence = self
+            .metadata_replication_cursors
+            .get(&(target_node_id.clone(), prepared_batch.shard_id.clone()))
+            .copied()
+            .unwrap_or(0)
+            .max(durable_replicated_through_sequence);
         if replicated_through_sequence >= prepared_batch.next_after_sequence {
             // Exact retries still carry the prepare entry so a current peer can
             // re-read it and echo the fresh request nonce without mutating its
@@ -706,27 +712,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shard_id: &DfsMetadataShardId,
         replayed_through_sequence: u64,
     ) {
-        let Some(backend) = self.metadata_backend.as_mut() else {
-            dfs_perf_trace(format_args!(
-                "metadata_authority_cursor action=skip reason=no_backend target={} shard={} sequence={}",
-                target_node_id, shard_id.0, replayed_through_sequence
-            ));
-            return;
-        };
-        if let Err(error) = backend.put_metadata_replication_cursor(
-            target_node_id,
-            shard_id,
-            replayed_through_sequence,
-        ) {
-            // The fresh receiver nonce is the canonical authorization proof.
-            // This sender-side cursor is only a replay-prefix optimization, so
-            // losing it must not turn a valid full-shard proof into a Raft
-            // fallback or a failed filesystem operation.
-            dfs_perf_trace(format_args!(
-                "metadata_authority_cursor action=skip reason=persist_failed target={} shard={} sequence={} error={}",
-                target_node_id, shard_id.0, replayed_through_sequence, error
-            ));
-        }
+        let cursor = self
+            .metadata_replication_cursors
+            .entry((target_node_id.clone(), shard_id.clone()))
+            .or_insert(0);
+        *cursor = (*cursor).max(replayed_through_sequence);
+        // The fresh receiver nonce and full-shard proof authorize this request.
+        // This sender-side cursor only avoids resending an acknowledged prefix;
+        // background journal publication checkpoints it durably. A crash before
+        // that checkpoint safely resends an idempotent prefix.
     }
 
     fn clear_metadata_authority_probe_requests(&mut self, request_ids: &[String]) {

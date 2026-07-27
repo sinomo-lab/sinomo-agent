@@ -525,7 +525,7 @@ pub(crate) struct PendingRoutedNamespaceResult {
     pub(crate) posix_coordination_result: Option<DfsPosixCoordinationResult>,
     pub(crate) synced_path_object: Option<DfsObjectMetadata>,
     pub(crate) synced_path_objects: Vec<DfsObjectMetadata>,
-    pub(crate) journal_batch_limit_reached: bool,
+    pub(crate) metadata_journal_has_more: bool,
 }
 
 #[derive(Clone, Debug)]

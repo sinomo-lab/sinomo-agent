@@ -1066,6 +1066,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         let journal_started = Instant::now();
+        let mut metadata_journal_has_more = false;
         let metadata_journal_batches = if command.include_metadata_journal_batches
             && matches!(result, DfsNamespaceResult::Applied)
             && namespace_operation_should_replay_journal_batches(&command.operation)
@@ -1078,13 +1079,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .find(|cursor| &cursor.shard_id == shard_id)
                     .map(|cursor| cursor.after_sequence)
                     .unwrap_or(0);
-                batches.extend(self.metadata_journal_batches_for_shard_since_limited(
+                let mut shard_batches = self.metadata_journal_batches_for_shard_since_limited(
                     shard_id,
                     after_sequence,
-                    DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT,
+                    DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT.saturating_add(1),
                     DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_ENTRY_LIMIT,
                     DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BYTE_LIMIT,
-                )?);
+                )?;
+                if shard_batches.len() > DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT {
+                    metadata_journal_has_more = true;
+                    shard_batches.truncate(DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT);
+                }
+                batches.extend(shard_batches);
             }
             batches
         } else {
@@ -1116,6 +1122,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             synced_path_object,
             synced_path_objects,
             metadata_journal_batches,
+            metadata_journal_has_more: Some(metadata_journal_has_more),
             posix_coordination_result,
         };
         if !recovering {
@@ -1218,7 +1225,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     posix_coordination_result: None,
                     synced_path_object: None,
                     synced_path_objects: Vec::new(),
-                    journal_batch_limit_reached: false,
+                    metadata_journal_has_more: false,
                 });
             }
             return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
@@ -1248,7 +1255,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     posix_coordination_result: None,
                     synced_path_object: None,
                     synced_path_objects: Vec::new(),
-                    journal_batch_limit_reached: false,
+                    metadata_journal_has_more: false,
                 });
             }
             return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
@@ -1295,7 +1302,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             posix_coordination_result: None,
                             synced_path_object: None,
                             synced_path_objects: Vec::new(),
-                            journal_batch_limit_reached: false,
+                            metadata_journal_has_more: false,
                         });
                     }
                     return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
@@ -1325,7 +1332,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     posix_coordination_result: None,
                     synced_path_object: None,
                     synced_path_objects: Vec::new(),
-                    journal_batch_limit_reached: false,
+                    metadata_journal_has_more: false,
                 });
             }
             return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
@@ -1351,7 +1358,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             posix_coordination_result: None,
                             synced_path_object: None,
                             synced_path_objects: Vec::new(),
-                            journal_batch_limit_reached: false,
+                            metadata_journal_has_more: false,
                         });
                     }
                     return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
@@ -1370,14 +1377,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             posix_coordination_result,
             synced_path_object,
             synced_path_objects,
-            journal_batch_limit_reached,
+            metadata_journal_has_more,
         ) = if response_applied {
             (
                 response.posix_coordination_result.clone(),
                 response.synced_path_object.clone(),
                 response.synced_path_objects.clone(),
-                response.metadata_journal_batches.len()
-                    >= DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT,
+                response.metadata_journal_has_more.unwrap_or_else(|| {
+                    response.metadata_journal_batches.len()
+                        >= DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT
+                }),
             )
         } else {
             (None, None, Vec::new(), false)
@@ -1387,7 +1396,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             posix_coordination_result,
             synced_path_object,
             synced_path_objects,
-            journal_batch_limit_reached,
+            metadata_journal_has_more,
         });
         Ok(NetworkedDfsServiceEvent::RemoteNamespaceCompleted {
             request_id: response.request_id,

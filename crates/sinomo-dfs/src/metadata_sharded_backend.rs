@@ -2288,6 +2288,39 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(entry)
     }
 
+    fn commit_prepared_namespace_transaction_on_shard(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        operation_id: &str,
+        expected_operation_digest: &str,
+        expected_owner_epoch: u64,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let prepare = self
+            .shard_backend(shard_id)?
+            .get_namespace_prepare(operation_id)?
+            .ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "namespace prepare {operation_id} does not exist on shard {}",
+                    shard_id.0
+                ))
+            })?;
+        if &prepare.shard_id != shard_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {operation_id} claims shard {}, not durable shard {}",
+                prepare.shard_id.0, shard_id.0
+            )));
+        }
+        let entry = self
+            .shard_backend_mut(shard_id)?
+            .commit_prepared_namespace_transaction(
+                operation_id,
+                expected_operation_digest,
+                expected_owner_epoch,
+            )?;
+        self.write_transaction_object_shard_indexes(&prepare.transaction.objects, shard_id)?;
+        Ok(entry)
+    }
+
     fn abort_prepared_namespace_transaction(
         &mut self,
         operation_id: &str,

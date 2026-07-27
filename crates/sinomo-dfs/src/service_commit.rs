@@ -1679,7 +1679,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let backend_started = Instant::now();
         if let Some(backend) = self.metadata_backend.as_mut() {
             if let Some((_, _, Some(prepare))) = canonical_authorization.as_ref() {
-                backend.commit_prepared_namespace_transaction(
+                backend.commit_prepared_namespace_transaction_on_shard(
+                    &prepare.shard_id,
                     &prepare.operation_id,
                     &prepare.operation_digest,
                     prepare.owner_epoch,

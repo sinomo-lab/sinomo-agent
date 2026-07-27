@@ -579,7 +579,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation: &DfsNamespaceOperation,
         routed: &PendingRoutedNamespaceResult,
     ) -> Result<()> {
-        if !routed.journal_batch_limit_reached
+        if !routed.metadata_journal_has_more
             || matches!(
                 operation,
                 DfsNamespaceOperation::SyncPath { .. }
@@ -965,7 +965,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map_err(DfsPosixError::Dfs)?;
             match routed.result {
                 DfsNamespaceResult::Applied => {
-                    if !routed.journal_batch_limit_reached {
+                    if !routed.metadata_journal_has_more {
                         return Ok(());
                     }
                 }

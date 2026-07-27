@@ -1221,7 +1221,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.metadata_backend
                 .as_mut()
                 .expect("clustered metadata backend checked above")
-                .commit_prepared_namespace_transaction(
+                .commit_prepared_namespace_transaction_on_shard(
+                    &prepare.shard_id,
                     &prepare.operation_id,
                     &prepare.operation_digest,
                     prepare.owner_epoch,

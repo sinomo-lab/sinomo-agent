@@ -1177,6 +1177,26 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         expected_owner_epoch: u64,
     ) -> Result<DfsMetadataJournalEntry>;
 
+    /// Commit a prepare whose exact durable shard is already known.
+    ///
+    /// The default preserves compatibility for unsharded backends. Sharded
+    /// routers override this to avoid probing every local shard after the
+    /// authority protocol has already returned the prepare and its shard.
+    fn commit_prepared_namespace_transaction_on_shard(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        operation_id: &str,
+        expected_operation_digest: &str,
+        expected_owner_epoch: u64,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let _ = shard_id;
+        self.commit_prepared_namespace_transaction(
+            operation_id,
+            expected_operation_digest,
+            expected_owner_epoch,
+        )
+    }
+
     /// Release an exact hidden namespace prepare without publishing it.
     ///
     /// The digest and owner epoch fence operation-id reuse. Implementations

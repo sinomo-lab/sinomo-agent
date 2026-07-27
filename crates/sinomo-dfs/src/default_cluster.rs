@@ -1201,13 +1201,10 @@ fn metadata_shard_local_replica_failover_ready_from_local_backend(
     else {
         return Ok(false);
     };
-    let replayed_through_sequence = status
-        .replay_cursors
-        .iter()
-        .filter(|cursor| cursor.source_shard_id == shard_id)
-        .map(|cursor| cursor.replayed_through_sequence)
-        .max()
-        .unwrap_or(0);
+    // Cursor files are checkpointed replay hints. Failover readiness must use
+    // the backend's exact durable table-prefix proof, which remains current
+    // between cursor checkpoints.
+    let replayed_through_sequence = backend.metadata_replay_cursor(&shard_id)?;
     if watermark.journal_sequence == 0
         || status.journal_last_sequence < watermark.journal_sequence
         || replayed_through_sequence < watermark.journal_sequence

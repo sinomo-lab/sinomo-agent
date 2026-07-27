@@ -13,7 +13,7 @@ use crate::metadata_records::{
     DfsMetadataShardId,
 };
 
-const LOCAL_MATERIALIZATION_CURSOR_FLUSH_INTERVAL: u64 = 512;
+const REPLAY_CURSOR_FLUSH_INTERVAL: u64 = 512;
 
 pub(crate) fn records_root(root: &Path) -> PathBuf {
     root.join("records")
@@ -107,6 +107,19 @@ pub(crate) fn write_replay_cursor(root: &Path, cursor: &DfsMetadataReplayCursor)
     write_sobj_atomic(&replay_cursor_path(root, &cursor.shard_id), cursor)
 }
 
+pub(crate) fn checkpoint_replay_cursor_if_due(
+    root: &Path,
+    cursor: &DfsMetadataReplayCursor,
+) -> Result<()> {
+    let durable = read_replay_cursor(root, &cursor.shard_id)?;
+    if cursor.last_sequence <= durable.last_sequence
+        || cursor.last_sequence.saturating_sub(durable.last_sequence) < REPLAY_CURSOR_FLUSH_INTERVAL
+    {
+        return Ok(());
+    }
+    write_replay_cursor(root, cursor)
+}
+
 pub(crate) fn ensure_local_materialization_cursor(
     root: &Path,
     shard_id: &DfsMetadataShardId,
@@ -183,8 +196,7 @@ pub(crate) fn checkpoint_local_materialization_cursor_if_due(
 ) -> Result<()> {
     let cursor = local_materialization_cursor(root, shard_id, next_sequence)?;
     if sequence <= cursor.last_sequence
-        || sequence.saturating_sub(cursor.last_sequence)
-            < LOCAL_MATERIALIZATION_CURSOR_FLUSH_INTERVAL
+        || sequence.saturating_sub(cursor.last_sequence) < REPLAY_CURSOR_FLUSH_INTERVAL
     {
         return Ok(());
     }

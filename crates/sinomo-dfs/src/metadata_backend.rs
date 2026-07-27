@@ -1565,9 +1565,12 @@ impl LocalSobjMetadataBackend {
             self.materialized_through_sequence = self
                 .materialized_through_sequence
                 .max(local_cursor.last_sequence);
-            self.write_local_materialization_cursor(&local_cursor)?;
+            self.checkpoint_local_materialization_cursor_if_due(local_cursor.last_sequence)?;
         }
-        metadata_cursor::write_replay_cursor(&self.root, &source_cursor)?;
+        // Both cursors are recovery hints. The durable journal, table log, and
+        // exact prefix proof are authoritative, so checkpointing them in
+        // batches avoids two atomic file rewrites on every replicated commit.
+        metadata_cursor::checkpoint_replay_cursor_if_due(&self.root, &source_cursor)?;
         Ok(applied)
     }
 
@@ -2411,7 +2414,20 @@ impl LocalSobjMetadataBackend {
     }
 
     pub(crate) fn replay_cursor_statuses(&self) -> Result<Vec<DfsMetadataReplayCursorStatus>> {
-        metadata_cursor::replay_cursor_statuses(&self.root)
+        let mut cursors = metadata_cursor::replay_cursor_statuses(&self.root)?;
+        if let Some(prefix_proof) = self.prefix_proof.as_ref()
+            && let Some(cursor) = cursors
+                .iter_mut()
+                .find(|cursor| cursor.source_shard_id == self.shard_id)
+        {
+            // The cursor file is a checkpointed recovery hint. The table
+            // prefix proof is the authoritative durable replay position and
+            // must drive operator/failover status between checkpoints.
+            cursor.replayed_through_sequence = cursor
+                .replayed_through_sequence
+                .max(prefix_proof.journal_sequence);
+        }
+        Ok(cursors)
     }
 
     fn ensure_metadata_prefix_proof_checkpoint_unlocked(&mut self) -> Result<bool> {
@@ -5484,7 +5500,14 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     }
 
     fn metadata_replay_cursor(&self, source_shard_id: &DfsMetadataShardId) -> Result<u64> {
-        Ok(metadata_cursor::read_replay_cursor(&self.root, source_shard_id)?.last_sequence)
+        let checkpoint =
+            metadata_cursor::read_replay_cursor(&self.root, source_shard_id)?.last_sequence;
+        Ok(self
+            .prefix_proof
+            .as_ref()
+            .filter(|_| &self.shard_id == source_shard_id)
+            .map(|proof| proof.journal_sequence.max(checkpoint))
+            .unwrap_or(checkpoint))
     }
 
     fn metadata_shard_statuses(&self) -> Result<Vec<DfsMetadataShardStatus>> {
@@ -13910,8 +13933,8 @@ mod tests {
             )
             .expect("replay cursor")
             .last_sequence,
-            batch.next_after_sequence,
-            "a replicated batch should persist the source cursor once at the batch boundary"
+            source_sequence_base.saturating_sub(1),
+            "a small replicated batch should leave the recovery-hint cursor at its checkpoint"
         );
         let status = follower
             .metadata_shard_statuses()
@@ -13930,8 +13953,30 @@ mod tests {
             status.replay_cursors,
             vec![DfsMetadataReplayCursorStatus {
                 source_shard_id: DfsMetadataShardId::new("shard-leader"),
-                replayed_through_sequence: batch.next_after_sequence,
+                replayed_through_sequence: source_sequence_base.saturating_sub(1),
             }]
+        );
+
+        drop(follower);
+        let mut reopened = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("shard-follower"),
+            &follower_root,
+        )
+        .expect("reopen follower with a lagging replay hint");
+        assert_eq!(
+            reopened
+                .apply_journal_batch(&batch)
+                .expect("reapply batch after reopen"),
+            0,
+            "the exact durable prefix, not the lagging cursor hint, owns replay idempotence"
+        );
+        assert_eq!(
+            reopened
+                .get_object(&committed.object_id)
+                .expect("reopened object")
+                .expect("reopened object")
+                .version,
+            committed.version
         );
 
         cleanup(&leader_root);

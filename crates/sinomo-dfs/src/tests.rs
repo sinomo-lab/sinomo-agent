@@ -1829,6 +1829,7 @@ fn served_message_transport_sends_nested_return_node_requests_synchronously() {
                     synced_path_object: None,
                     synced_path_objects: Vec::new(),
                     metadata_journal_batches: Vec::new(),
+                    metadata_journal_has_more: None,
                     posix_coordination_result: None,
                 }),
             )],
@@ -1925,6 +1926,7 @@ fn served_message_transport_returns_response_frames_to_caller() {
                     synced_path_object: None,
                     synced_path_objects: Vec::new(),
                     metadata_journal_batches: Vec::new(),
+                    metadata_journal_has_more: None,
                     posix_coordination_result: None,
                 }),
             )),
@@ -1956,7 +1958,7 @@ fn dfs_service_advertisements_use_node_identity_only() {
 }
 
 #[test]
-fn routed_namespace_sync_drains_limited_response_backlog() {
+fn routed_namespace_complete_single_response_batch_avoids_follow_up_sync() {
     let writer = NodeId::from_legacy_named("node_routed_sync_writer").expect("writer");
     let primary = NodeId::from_legacy_named("node_routed_sync_primary").expect("primary");
     let file_system_id = sifs_file_system_id();
@@ -2034,10 +2036,12 @@ fn routed_namespace_sync_drains_limited_response_backlog() {
     let primary_service = Arc::new(Mutex::new(primary_service));
     let namespace_calls = Arc::new(Mutex::new(Vec::new()));
     let mkdir_all_response_batches = Arc::new(Mutex::new(Vec::new()));
+    let mkdir_all_response_has_more = Arc::new(Mutex::new(Vec::new()));
     let primary_for_sender = primary.clone();
     let primary_service_for_sender = Arc::clone(&primary_service);
     let namespace_calls_for_sender = Arc::clone(&namespace_calls);
     let mkdir_all_response_batches_for_sender = Arc::clone(&mkdir_all_response_batches);
+    let mkdir_all_response_has_more_for_sender = Arc::clone(&mkdir_all_response_has_more);
     let writer_sender: DfsMessageSender = Arc::new(move |target_node_id, command, _timeout| {
         if target_node_id != &primary_for_sender {
             return Err(DfsPeerTransportError::new(format!(
@@ -2075,6 +2079,10 @@ fn routed_namespace_sync_drains_limited_response_backlog() {
                 let DfsNetworkMessage::NamespaceResponse(response) = &outbound.message else {
                     continue;
                 };
+                mkdir_all_response_has_more_for_sender
+                    .lock()
+                    .expect("mkdir-all response continuation")
+                    .push(response.metadata_journal_has_more);
                 for batch in &response.metadata_journal_batches {
                     let encoded_bytes =
                         crate::metadata_journal::metadata_journal_batch_encoded_len(batch)
@@ -2138,6 +2146,13 @@ fn routed_namespace_sync_drains_limited_response_backlog() {
         encoded_bytes <= DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BYTE_LIMIT,
         "the namespace response exceeded its 4 MiB encoded-byte cap"
     );
+    assert_eq!(
+        *mkdir_all_response_has_more
+            .lock()
+            .expect("mkdir-all response continuation"),
+        vec![Some(false)],
+        "the authority should explicitly report that the single batch covered its journal tail"
+    );
 
     let calls = namespace_calls.lock().expect("namespace calls").clone();
     assert_eq!(
@@ -2146,8 +2161,8 @@ fn routed_namespace_sync_drains_limited_response_backlog() {
         "the mutating operation should be sent first"
     );
     assert!(
-        calls.iter().any(|call| call == "sync-path"),
-        "bounded response replay should continue with follow-up sync-path calls"
+        !calls.iter().any(|call| call == "sync-path"),
+        "a complete one-batch response must not trigger a redundant follow-up sync"
     );
     assert!(
         writer_service
@@ -5673,6 +5688,43 @@ fn open_shared_metadata_posix_service(
     NetworkedDfsService::new(ReceiveOnlyTransport::new(node_id), content)
         .with_metadata_backend(metadata)
         .expect("shared metadata service")
+}
+
+#[test]
+fn mkdir_all_commits_a_missing_chain_in_one_namespace_transaction() {
+    let root = temp_root("mkdir-all-single-transaction");
+    let node = NodeId::from_legacy_named("node_mkdir_all_single_transaction").expect("node id");
+    let mut dfs =
+        open_shared_metadata_posix_service(&root, &root.join("metadata"), node, "content");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap SIFS");
+
+    crate::metadata_backend::reset_metadata_journal_write_count();
+    dfs.posix_mkdir_all("/services/batched/one/two")
+        .expect("create directory chain");
+    assert_eq!(
+        crate::metadata_backend::metadata_journal_write_count(),
+        1,
+        "one mkdir-all operation should publish its complete missing chain atomically"
+    );
+    for path in [
+        "/services/batched",
+        "/services/batched/one",
+        "/services/batched/one/two",
+    ] {
+        assert_eq!(
+            dfs.posix_stat(path).expect("created directory").kind,
+            DfsObjectKind::Directory
+        );
+    }
+
+    crate::metadata_backend::reset_metadata_journal_write_count();
+    dfs.posix_mkdir_all("/services/batched/one/two")
+        .expect("repeat existing directory chain");
+    assert_eq!(
+        crate::metadata_backend::metadata_journal_write_count(),
+        0,
+        "an already-complete chain must remain a no-op"
+    );
 }
 
 #[test]
@@ -13525,6 +13577,7 @@ fn routed_namespace_response_rejects_retired_dispatch_authority_without_mutation
                 synced_path_object: None,
                 synced_path_objects: Vec::new(),
                 metadata_journal_batches: vec![batch],
+                metadata_journal_has_more: None,
                 posix_coordination_result: None,
             },
         )
@@ -13603,6 +13656,7 @@ fn routed_namespace_zero_batch_response_rejects_retired_authority_without_path_m
                 synced_path_object: Some(object),
                 synced_path_objects: Vec::new(),
                 metadata_journal_batches: Vec::new(),
+                metadata_journal_has_more: None,
                 posix_coordination_result: None,
             },
         )
@@ -13689,6 +13743,7 @@ fn routed_namespace_redirect_corroborates_only_the_dispatch_shard_successor() {
                 synced_path_object: None,
                 synced_path_objects: Vec::new(),
                 metadata_journal_batches: Vec::new(),
+                metadata_journal_has_more: None,
                 posix_coordination_result: None,
             },
         )
@@ -39455,6 +39510,7 @@ fn late_routed_responses_are_discarded_without_failing_the_event_loop() {
                 synced_path_object: None,
                 synced_path_objects: Vec::new(),
                 metadata_journal_batches: Vec::new(),
+                metadata_journal_has_more: None,
                 posix_coordination_result: None,
             },
         )
@@ -39588,6 +39644,7 @@ fn sync_path_response_object_updates_outsider_read_view_without_journal_batches(
                 synced_path_object: Some(object.clone()),
                 synced_path_objects: Vec::new(),
                 metadata_journal_batches: Vec::new(),
+                metadata_journal_has_more: None,
                 posix_coordination_result: None,
             },
         )
