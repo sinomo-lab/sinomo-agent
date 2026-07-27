@@ -1603,7 +1603,8 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     }
 
     /// Return the durable replay cursor for journal entries originating from
-    /// `source_shard_id`.
+    /// `source_shard_id`. Local durable backends require this to match their
+    /// logical shard identity.
     fn metadata_replay_cursor(&self, source_shard_id: &DfsMetadataShardId) -> Result<u64> {
         Ok(self
             .metadata_shard_statuses()?
@@ -1618,6 +1619,10 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     fn metadata_shard_statuses(&self) -> Result<Vec<DfsMetadataShardStatus>>;
 
     /// Persist and materialize a replicated journal batch.
+    ///
+    /// `batch.shard_id` is the logical shard identity and must match the
+    /// target backend's shard. Replicas use distinct node/storage identities,
+    /// not distinct logical shard IDs.
     fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize>;
 
     /// Persist a replicated batch using exact source evidence validated by the
@@ -1634,6 +1639,9 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     }
 
     /// Replace local metadata tables with a replicated snapshot.
+    ///
+    /// `source_shard_id` must match the target backend's logical shard
+    /// identity; snapshot replication does not adopt or rename shards.
     fn replace_with_replicated_snapshot(
         &mut self,
         source_shard_id: DfsMetadataShardId,

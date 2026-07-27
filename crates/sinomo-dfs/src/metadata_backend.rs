@@ -1468,10 +1468,13 @@ impl LocalSobjMetadataBackend {
 
     /// Persist and materialize a replicated journal batch from a metadata peer.
     ///
+    /// The peer is another replica of this backend's logical shard; a batch
+    /// naming a different shard is rejected before acquiring the write lock.
     /// Entries whose replay cursor is already past their sequence are skipped.
     /// New entries are written to the local replicated journal, materialized
     /// into table batches, and then acknowledged by advancing replay cursors.
     pub fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
+        self.require_replication_source_shard(&batch.shard_id)?;
         let _lock = self.begin_metadata_write()?;
         self.apply_journal_batch_unlocked(batch)
     }
@@ -1514,20 +1517,11 @@ impl LocalSobjMetadataBackend {
         let replay_cursor_exists =
             metadata_cursor::replay_cursor_path(&self.root, &batch.shard_id).is_file();
         let mut source_cursor = metadata_cursor::read_replay_cursor(&self.root, &batch.shard_id)?;
-        if !replay_cursor_exists && batch.shard_id == self.shard_id {
-            // A local durable prefix is also the exact baseline for receiving
-            // the next same-shard entry, even before a replay cursor exists.
+        if !replay_cursor_exists {
+            // This backend and every replicated journal batch share one
+            // logical shard identity, so the local durable prefix is the exact
+            // baseline even before the checkpointed replay cursor exists.
             source_cursor.last_sequence = candidate_prefix_proof.journal_sequence;
-        } else if !replay_cursor_exists
-            && batch.shard_id != self.shard_id
-            && candidate_prefix_proof.journal_sequence == 0
-            && self.journal_last_sequence() == 0
-            && !self.tables.has_materialized_state()
-        {
-            // A pristine replica may adopt another shard's true genesis. This
-            // is not a gap exception: the first received entry must still be 1.
-            candidate_prefix_proof =
-                self.metadata_prefix_checkpoint_for_shard(&batch.shard_id, 0)?;
         }
         if source_cursor.last_sequence > candidate_prefix_proof.journal_sequence {
             return Err(MetadataBackendError::Serde(format!(
@@ -1643,6 +1637,8 @@ impl LocalSobjMetadataBackend {
 
     /// Replace local shard tables with an authoritative replicated snapshot.
     ///
+    /// The snapshot source must name this backend's logical shard. Cross-shard
+    /// movement uses the explicit migration protocol rather than replication.
     /// The previous shard state is archived before replacement. The return
     /// value reports whether existing local state was archived.
     pub fn replace_with_replicated_snapshot(
@@ -1651,6 +1647,7 @@ impl LocalSobjMetadataBackend {
         replayed_through_sequence: u64,
         snapshot: DfsMetadataTableSnapshot,
     ) -> Result<bool> {
+        self.require_replication_source_shard(&source_shard_id)?;
         let _lock = self.begin_metadata_write()?;
         self.replace_with_replicated_snapshot_unlocked(
             source_shard_id,
@@ -3004,6 +3001,16 @@ impl LocalSobjMetadataBackend {
         let lock = self.metadata_write_lock()?;
         self.refresh_after_metadata_write_lock()?;
         Ok(lock)
+    }
+
+    fn require_replication_source_shard(&self, source_shard_id: &DfsMetadataShardId) -> Result<()> {
+        if source_shard_id != &self.shard_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata backend shard {} cannot ingest replicated state for source shard {}",
+                self.shard_id.0, source_shard_id.0
+            )));
+        }
+        Ok(())
     }
 
     fn begin_metadata_replica_ingest(
@@ -5578,6 +5585,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     }
 
     fn metadata_replay_cursor(&self, source_shard_id: &DfsMetadataShardId) -> Result<u64> {
+        self.require_replication_source_shard(source_shard_id)?;
         let checkpoint =
             metadata_cursor::read_replay_cursor(&self.root, source_shard_id)?.last_sequence;
         Ok(self
@@ -14322,14 +14330,11 @@ mod tests {
     fn local_backend_replays_journal_batch_into_follower_backend() {
         let leader_root = temp_root("local_backend_replays_journal_batch_into_follower_leader");
         let follower_root = temp_root("local_backend_replays_journal_batch_into_follower_follower");
+        let shard_id = DfsMetadataShardId::new("shard-replay");
         let mut leader =
-            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-leader"), &leader_root)
-                .expect("leader backend");
-        let mut follower = LocalSobjMetadataBackend::new(
-            DfsMetadataShardId::new("shard-follower"),
-            &follower_root,
-        )
-        .expect("follower backend");
+            LocalSobjMetadataBackend::new(shard_id.clone(), &leader_root).expect("leader backend");
+        let mut follower = LocalSobjMetadataBackend::new(shard_id.clone(), &follower_root)
+            .expect("follower backend");
 
         let file_system = file_system();
         let initial = object(version("version_1"));
@@ -14443,13 +14448,18 @@ mod tests {
             "idempotent replays must not append duplicate follower journal entries"
         );
         assert_eq!(
-            read_sobj::<DfsMetadataReplayCursor>(
-                &follower.replay_cursor_path(&DfsMetadataShardId::new("shard-leader"))
-            )
-            .expect("replay cursor")
-            .last_sequence,
+            read_sobj::<DfsMetadataReplayCursor>(&follower.replay_cursor_path(&shard_id))
+                .expect("replay cursor")
+                .last_sequence,
             source_sequence_base.saturating_sub(1),
             "a small replicated batch should leave the recovery-hint cursor at its checkpoint"
+        );
+        assert_eq!(
+            follower
+                .metadata_replay_cursor(&shard_id)
+                .expect("authoritative replay position"),
+            batch.next_after_sequence,
+            "the durable prefix must cover a checkpointed cursor between flushes"
         );
         let status = follower
             .metadata_shard_statuses()
@@ -14467,17 +14477,31 @@ mod tests {
         assert_eq!(
             status.replay_cursors,
             vec![DfsMetadataReplayCursorStatus {
-                source_shard_id: DfsMetadataShardId::new("shard-leader"),
-                replayed_through_sequence: source_sequence_base.saturating_sub(1),
+                source_shard_id: shard_id.clone(),
+                replayed_through_sequence: batch.next_after_sequence,
             }]
         );
 
         drop(follower);
-        let mut reopened = LocalSobjMetadataBackend::new(
-            DfsMetadataShardId::new("shard-follower"),
-            &follower_root,
-        )
-        .expect("reopen follower with a lagging replay hint");
+        let mut reopened = LocalSobjMetadataBackend::new(shard_id.clone(), &follower_root)
+            .expect("reopen follower with a lagging replay hint");
+        assert_eq!(
+            reopened
+                .metadata_replay_cursor(&shard_id)
+                .expect("reopened authoritative replay position"),
+            batch.next_after_sequence,
+            "reopen must recover the authoritative replay position from the durable prefix proof"
+        );
+        assert_eq!(
+            reopened
+                .replay_cursor_statuses()
+                .expect("reopened replay cursor status"),
+            vec![DfsMetadataReplayCursorStatus {
+                source_shard_id: shard_id,
+                replayed_through_sequence: batch.next_after_sequence,
+            }],
+            "operator status must not regress to the stale checkpoint after reopen"
+        );
         assert_eq!(
             reopened
                 .apply_journal_batch(&batch)
@@ -14499,17 +14523,83 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_rejects_replication_from_foreign_logical_shard() {
+        let root = temp_root("local_backend_rejects_foreign_replication_shard");
+        let source_shard_id = DfsMetadataShardId::new("source-shard");
+        let target_shard_id = DfsMetadataShardId::new("target-shard");
+        let mut source =
+            LocalSobjMetadataBackend::new(source_shard_id.clone(), root.join("source"))
+                .expect("source backend");
+        let mut target =
+            LocalSobjMetadataBackend::new(target_shard_id.clone(), root.join("target"))
+                .expect("target backend");
+        let file_system = file_system();
+        source
+            .put_file_system(&file_system)
+            .expect("source filesystem");
+        let batch = source
+            .journal_batch_since_limited(0, 16, usize::MAX)
+            .expect("source journal batch")
+            .expect("source journal entries");
+        let snapshot = source.export_table_snapshot();
+
+        let batch_error = target
+            .apply_journal_batch(&batch)
+            .expect_err("foreign-shard journal replay must fail");
+        assert!(
+            batch_error.to_string().contains(target_shard_id.0.as_str())
+                && batch_error.to_string().contains(source_shard_id.0.as_str()),
+            "identity rejection must name both shards: {batch_error}"
+        );
+        let snapshot_error = target
+            .replace_with_replicated_snapshot(
+                source_shard_id.clone(),
+                batch.next_after_sequence,
+                snapshot,
+            )
+            .expect_err("foreign-shard snapshot install must fail");
+        assert!(
+            snapshot_error
+                .to_string()
+                .contains(target_shard_id.0.as_str())
+                && snapshot_error
+                    .to_string()
+                    .contains(source_shard_id.0.as_str()),
+            "identity rejection must name both shards: {snapshot_error}"
+        );
+        assert!(
+            target
+                .metadata_replay_cursor(&source_shard_id)
+                .expect_err("foreign-shard cursor query must fail")
+                .to_string()
+                .contains(source_shard_id.0.as_str()),
+            "cursor lookup must enforce the same logical-shard identity"
+        );
+        assert_eq!(
+            target.journal_last_sequence(),
+            0,
+            "rejected foreign replication must not advance the target journal"
+        );
+        assert!(
+            target
+                .get_file_system(&file_system.file_system_id)
+                .expect("target filesystem lookup")
+                .is_none(),
+            "rejected foreign replication must not mutate target tables"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn local_backend_replays_authoritative_commit_without_receipt_entry() {
         let leader_root = temp_root("local_backend_replays_authoritative_commit_leader");
         let follower_root = temp_root("local_backend_replays_authoritative_commit_follower");
+        let shard_id = DfsMetadataShardId::new("shard-authoritative-commit");
         let mut leader =
-            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-leader"), &leader_root)
-                .expect("leader backend");
-        let mut follower = LocalSobjMetadataBackend::new(
-            DfsMetadataShardId::new("shard-follower"),
-            &follower_root,
-        )
-        .expect("follower backend");
+            LocalSobjMetadataBackend::new(shard_id.clone(), &leader_root).expect("leader backend");
+        let mut follower =
+            LocalSobjMetadataBackend::new(shard_id, &follower_root).expect("follower backend");
 
         let file_system = file_system();
         let initial = object(version("version_1"));
