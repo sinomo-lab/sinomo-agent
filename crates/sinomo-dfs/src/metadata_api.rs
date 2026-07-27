@@ -1291,8 +1291,30 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     ) -> Result<Option<DfsNamespaceRequestRecord>>;
 
     /// Return durable routed namespace requests for bounded autonomous
-    /// recovery. Concrete backends return a stable requester/request-id order.
+    /// inspection. Recovery should use `list_pending_namespace_requests_page`
+    /// so terminal idempotency records are never cloned or filtered.
+    ///
+    /// Completed records remain the canonical exact-retry response. They
+    /// cannot be age-pruned until the namespace protocol defines a requester
+    /// retry watermark or equivalent retention fence.
     fn list_namespace_requests(&self) -> Result<Vec<DfsNamespaceRequestRecord>>;
+
+    /// Return one bounded, oldest-attempt-first page of pending namespace
+    /// requests. Concrete durable backends serve this from a derived status
+    /// index rather than scanning retained terminal idempotency records.
+    fn list_pending_namespace_requests_page(
+        &self,
+        after: Option<&DfsPendingNamespaceRequestPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsPendingNamespaceRequestPage>;
+
+    /// Return the hidden prepared transaction, if any, that owns the terminal
+    /// outcome for an exact still-pending routed namespace request.
+    fn get_prepared_namespace_prepare_for_request(
+        &self,
+        requester_node_id: &NodeId,
+        request_id: &str,
+    ) -> Result<Option<DfsNamespacePrepareRecord>>;
 
     /// Create or replace a namespace maintenance job.
     fn put_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {

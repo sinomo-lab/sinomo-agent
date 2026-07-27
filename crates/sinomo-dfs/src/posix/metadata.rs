@@ -24,6 +24,49 @@ use crate::{
     NetworkedDfsReadOutcome, NetworkedDfsService, sifs_file_system_id,
 };
 
+#[cfg(test)]
+std::thread_local! {
+    static POSIX_METADATA_RAW_LOOKUP_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[derive(Debug)]
+pub(super) struct ResolvedPosixPath {
+    pub(super) path: String,
+    pub(super) components: Vec<ResolvedPosixPathComponent>,
+}
+
+#[derive(Debug)]
+pub(super) struct ResolvedPosixPathComponent {
+    pub(super) path: String,
+    pub(super) object: Option<DfsObjectMetadata>,
+}
+
+#[cfg(test)]
+pub(crate) fn reset_posix_metadata_raw_lookup_count() {
+    POSIX_METADATA_RAW_LOOKUP_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn posix_metadata_raw_lookup_count() -> usize {
+    POSIX_METADATA_RAW_LOOKUP_COUNT.get()
+}
+
+fn append_unobserved_components(
+    observed: &mut Vec<ResolvedPosixPathComponent>,
+    mut path: String,
+    components: &[String],
+) -> String {
+    for component in components {
+        path = join_posix_path(&path, component);
+        observed.push(ResolvedPosixPathComponent {
+            path: path.clone(),
+            object: None,
+        });
+    }
+    path
+}
+
 fn sifs_dir_direct_child_path(
     file_system_id: &DfsFileSystemId,
     path: &str,
@@ -51,7 +94,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.lookup_metadata_path(&sifs_file_system_id(), path)
     }
 
+    /// Look up one component after a caller has already observed every parent
+    /// component as live. The ordinary lookup must scan ancestors so an exact
+    /// child record cannot escape a parent tombstone. A forward component walk
+    /// has already established that invariant, so repeating the scan would
+    /// turn resolving a depth-N path into O(N²) metadata lookups.
+    pub(super) fn lookup_metadata_path_with_known_live_ancestors(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+        known_live_ancestors: bool,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        if known_live_ancestors {
+            self.lookup_metadata_path_raw(file_system_id, path)
+        } else {
+            self.lookup_metadata_path(file_system_id, path)
+        }
+    }
+
     pub(super) fn resolve_posix_path(&self, path: &str, follow_final: bool) -> Result<String> {
+        let file_system_id = sifs_file_system_id();
         let mut current = normalize_posix_path(path)?;
         for _ in 0..40 {
             let components = current
@@ -61,6 +123,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map(str::to_string)
                 .collect::<Vec<_>>();
             let mut resolved = "/".to_string();
+            let mut known_live_ancestors = false;
             let mut restarted = false;
             for (index, component) in components.iter().enumerate() {
                 let candidate = join_posix_path(&resolved, component);
@@ -69,7 +132,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     resolved = candidate;
                     continue;
                 }
-                let Some(object) = self.lookup_sifs_path(&candidate)? else {
+                let Some(object) = self.lookup_metadata_path_with_known_live_ancestors(
+                    &file_system_id,
+                    &candidate,
+                    known_live_ancestors,
+                )?
+                else {
                     resolved = append_posix_components(candidate, &components[index + 1..])?;
                     return Ok(resolved);
                 };
@@ -77,6 +145,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     resolved = append_posix_components(candidate, &components[index + 1..])?;
                     return Ok(resolved);
                 }
+                known_live_ancestors = true;
                 let object = self.resolve_hardlink_target(&object)?;
                 if object.kind == DfsObjectKind::Symlink {
                     let target = self.symlink_target_for_object(&candidate, &object)?;
@@ -104,6 +173,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         follow_final: bool,
     ) -> Result<String> {
+        Ok(self
+            .resolve_posix_path_distributed_walk(path, follow_final, false)?
+            .path)
+    }
+
+    /// Resolve a path and retain the exact component metadata observed during
+    /// the final (post-symlink) walk. `mkdir_all` consumes this result directly
+    /// instead of resolving the path and then looking up the same chain again.
+    pub(super) fn resolve_posix_path_distributed_for_mkdir_all(
+        &mut self,
+        path: &str,
+    ) -> Result<ResolvedPosixPath> {
+        self.resolve_posix_path_distributed_walk(path, true, true)
+    }
+
+    fn resolve_posix_path_distributed_walk(
+        &mut self,
+        path: &str,
+        follow_final: bool,
+        capture_components: bool,
+    ) -> Result<ResolvedPosixPath> {
+        let file_system_id = sifs_file_system_id();
         let mut current = normalize_posix_path(path)?;
         for _ in 0..40 {
             let components = current
@@ -113,6 +204,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map(str::to_string)
                 .collect::<Vec<_>>();
             let mut resolved = "/".to_string();
+            let mut known_live_ancestors = false;
+            let mut observed = capture_components.then(|| Vec::with_capacity(components.len()));
             let mut restarted = false;
             for (index, component) in components.iter().enumerate() {
                 let candidate = join_posix_path(&resolved, component);
@@ -121,14 +214,56 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     resolved = candidate;
                     continue;
                 }
-                let Some(object) = self.lookup_sifs_path(&candidate)? else {
-                    resolved = append_posix_components(candidate, &components[index + 1..])?;
-                    return Ok(resolved);
+                let Some(object) = self.lookup_metadata_path_with_known_live_ancestors(
+                    &file_system_id,
+                    &candidate,
+                    known_live_ancestors,
+                )?
+                else {
+                    if let Some(observed) = observed.as_mut() {
+                        observed.push(ResolvedPosixPathComponent {
+                            path: candidate.clone(),
+                            object: None,
+                        });
+                        resolved = append_unobserved_components(
+                            observed,
+                            candidate,
+                            &components[index + 1..],
+                        );
+                    } else {
+                        resolved = append_posix_components(candidate, &components[index + 1..])?;
+                    }
+                    return Ok(ResolvedPosixPath {
+                        path: resolved,
+                        components: observed.unwrap_or_default(),
+                    });
                 };
                 if object.kind == DfsObjectKind::Tombstone {
-                    resolved = append_posix_components(candidate, &components[index + 1..])?;
-                    return Ok(resolved);
+                    if let Some(observed) = observed.as_mut() {
+                        observed.push(ResolvedPosixPathComponent {
+                            path: candidate.clone(),
+                            object: Some(object),
+                        });
+                        resolved = append_unobserved_components(
+                            observed,
+                            candidate,
+                            &components[index + 1..],
+                        );
+                    } else {
+                        resolved = append_posix_components(candidate, &components[index + 1..])?;
+                    }
+                    return Ok(ResolvedPosixPath {
+                        path: resolved,
+                        components: observed.unwrap_or_default(),
+                    });
                 }
+                if let Some(observed) = observed.as_mut() {
+                    observed.push(ResolvedPosixPathComponent {
+                        path: candidate.clone(),
+                        object: Some(object.clone()),
+                    });
+                }
+                known_live_ancestors = true;
                 let object = self.resolve_hardlink_target(&object)?;
                 if object.kind == DfsObjectKind::Symlink {
                     let target = self.symlink_target_for_object_distributed(&candidate, &object)?;
@@ -143,7 +278,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 resolved = candidate;
             }
             if !restarted {
-                return Ok(resolved);
+                return Ok(ResolvedPosixPath {
+                    path: resolved,
+                    components: observed.unwrap_or_default(),
+                });
             }
         }
         Err(DfsPosixError::InvalidPath {
@@ -257,6 +395,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) -> Result<Option<DfsObjectMetadata>> {
+        #[cfg(test)]
+        POSIX_METADATA_RAW_LOOKUP_COUNT
+            .set(POSIX_METADATA_RAW_LOOKUP_COUNT.get().saturating_add(1));
         let cache_active = self.metadata_lookup_cache_is_active();
         let normalized_metadata_path = metadata_path(path);
         let cache_key = (file_system_id.clone(), normalized_metadata_path.clone());

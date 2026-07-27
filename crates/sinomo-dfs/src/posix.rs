@@ -18,6 +18,9 @@ mod read;
 mod routing;
 pub(crate) mod sync;
 
+#[cfg(test)]
+pub(crate) use metadata::{posix_metadata_raw_lookup_count, reset_posix_metadata_raw_lookup_count};
+
 use crate::dfs_now_unix_nanos as now_unix_nanos;
 use crate::metadata_records::object_version_record;
 use crate::namespace::{
@@ -842,12 +845,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if path == "/" {
             return Ok(true);
         }
+        let file_system_id = sifs_file_system_id();
+        let mut known_live_ancestors = false;
         let mut current = String::new();
         for part in path.trim_matches('/').split('/') {
             current.push('/');
             current.push_str(part);
-            match self.lookup_sifs_path(&current)? {
-                Some(object) if object.kind == DfsObjectKind::Directory => {}
+            match self.lookup_metadata_path_with_known_live_ancestors(
+                &file_system_id,
+                &current,
+                known_live_ancestors,
+            )? {
+                Some(object) if object.kind == DfsObjectKind::Directory => {
+                    known_live_ancestors = true;
+                }
                 _ => return Ok(false),
             }
         }
@@ -856,19 +867,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub(crate) fn posix_mkdir_all_local(&mut self, path: &str) -> Result<()> {
         let path = normalize_posix_path(path)?;
-        let path = self.resolve_posix_path_distributed(&path, true)?;
+        let resolved = self.resolve_posix_path_distributed_for_mkdir_all(&path)?;
+        let path = resolved.path;
         if path == "/" {
             return Ok(());
         }
+        debug_assert_eq!(
+            resolved
+                .components
+                .last()
+                .map(|component| component.path.as_str()),
+            Some(path.as_str()),
+            "a fully followed path walk must describe its final component"
+        );
 
         let mut parent = None;
         let mut planned = BTreeMap::<String, DfsObjectMetadata>::new();
         let mut durable_parents_to_touch = BTreeMap::<String, DfsObjectMetadata>::new();
-        let mut current = String::new();
-        for part in path.trim_matches('/').split('/') {
-            current.push('/');
-            current.push_str(part);
-            match self.lookup_sifs_path(&current)? {
+        for component in resolved.components {
+            let current = component.path;
+            match component.object {
                 Some(object) if object.kind == DfsObjectKind::Directory => {
                     parent = Some(object);
                 }

@@ -1019,6 +1019,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
             let mut shard = selected_shard;
+            if shard.is_none()
+                && !transaction.objects.is_empty()
+                && let Some(context) = self
+                    .active_namespace_operation_context
+                    .as_ref()
+                    .filter(|context| context.file_system_id == transaction.file_system_id)
+            {
+                let shards = Self::namespace_transaction_shards_from_snapshot(
+                    &transaction.file_system_id,
+                    &transaction,
+                    &context.shards,
+                )?;
+                let [selected] = shards.as_slice() else {
+                    let shard_ids = shards
+                        .iter()
+                        .map(|candidate| candidate.shard_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(DfsError::Distributed {
+                        message: format!(
+                            "clustered namespace transaction {} must resolve to exactly one metadata shard, found [{}]",
+                            transaction.transaction_id, shard_ids
+                        ),
+                    });
+                };
+                shard = Some(selected.clone());
+            }
             if shard.is_none() && !transaction.objects.is_empty() {
                 let initial_paths = transaction
                     .objects
@@ -1162,6 +1189,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &transaction,
                 &prepare_shard_id,
             );
+            if completed_request.is_none()
+                && let Some(active_request) = self.active_durable_namespace_request.clone()
+                && self
+                    .metadata_backend
+                    .as_ref()
+                    .expect("clustered metadata backend checked above")
+                    .get_namespace_request(
+                        &active_request.requester_node_id,
+                        &active_request.request_id,
+                    )?
+                    .is_none()
+            {
+                // A deferred admission may share the request-owned prepare
+                // only when this exact transaction proves the operation's
+                // terminal outcome. Preserve the original admission barrier
+                // for symlink-resolved or otherwise non-proving transactions.
+                self.metadata_backend
+                    .as_mut()
+                    .expect("clustered metadata backend checked above")
+                    .put_namespace_request_on_shard(&prepare_shard_id, &active_request)?;
+            }
             let operation_id = if let Some(request) = &completed_request {
                 format!(
                     "namespace-request:{}:{}",

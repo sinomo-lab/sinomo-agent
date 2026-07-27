@@ -805,6 +805,28 @@ pub struct DfsNamespaceRequestRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Cursor for pending routed namespace-request recovery.
+pub struct DfsPendingNamespaceRequestPageCursor {
+    /// Last recovery-attempt timestamp at the end of the current page.
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+    /// Authenticated requester at the end of the current page.
+    pub requester_node_id: NodeId,
+    /// Request id at the end of the current page.
+    pub request_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Page of durable namespace requests which still require recovery.
+pub struct DfsPendingNamespaceRequestPage {
+    /// Pending requests in oldest-attempt-first order.
+    pub requests: Vec<DfsNamespaceRequestRecord>,
+    /// Cursor to pass to the next page request, if more pending requests remain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsPendingNamespaceRequestPageCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 /// Cursor for object scans within one filesystem.
 pub struct DfsObjectPageCursor {
     /// Normalized object path at the end of the current page.

@@ -5728,6 +5728,33 @@ fn mkdir_all_commits_a_missing_chain_in_one_namespace_transaction() {
 }
 
 #[test]
+fn mkdir_all_existing_deep_chain_uses_linear_metadata_lookups() {
+    let root = temp_root("mkdir-all-linear-lookups");
+    let node = NodeId::from_legacy_named("node_mkdir_all_linear_lookups").expect("node id");
+    let mut dfs =
+        open_shared_metadata_posix_service(&root, &root.join("metadata"), node, "content");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap SIFS");
+
+    let mut path = "/services".to_string();
+    for depth in 0..32 {
+        path.push_str(&format!("/level-{depth:02}"));
+    }
+    dfs.posix_mkdir_all(&path).expect("create deep chain");
+
+    crate::posix::reset_posix_metadata_raw_lookup_count();
+    dfs.posix_mkdir_all(&path)
+        .expect("repeat existing deep chain");
+    let lookup_count = crate::posix::posix_metadata_raw_lookup_count();
+    let component_count = path.trim_matches('/').split('/').count();
+    let linear_lookup_bound = component_count + 1;
+    assert!(
+        lookup_count <= linear_lookup_bound,
+        "deep-path resolution performed {lookup_count} raw lookups for {component_count} components; \
+         one root ancestor check plus one exact lookup per component is the linear upper bound"
+    );
+}
+
+#[test]
 fn no_link_beneath_posix_primitives_confine_reads_lists_and_mutations() {
     let root = temp_root("no-link-beneath-primitives");
     let node = NodeId::from_legacy_named("node_no_link_beneath").expect("node id");
@@ -37048,6 +37075,115 @@ fn routed_namespace_without_local_replay_omits_response_journal_batches() {
         "no-local-replay namespace response must not carry journal batches"
     );
 
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn clustered_mkdir_all_fuses_request_admission_with_prepare() {
+    let cluster = sifs_two_primary_cluster("sifs-mkdir-all-fused-admission");
+    let SifsTwoPrimaryCluster {
+        root,
+        replica_node,
+        mut services_primary,
+        replica,
+        ..
+    } = cluster;
+    let path = "/services/fused-admission/child";
+    let request_id = "dfs_net_req_mkdir_all_fused_admission".to_string();
+    let command = DfsNamespaceCommand {
+        request_id: request_id.clone(),
+        file_system_id: sifs_file_system_id(),
+        requesting_node_id: replica_node.clone(),
+        include_metadata_journal_batches: false,
+        metadata_journal_after_sequences: Vec::new(),
+        authority_shards: Vec::new(),
+        operation: DfsNamespaceOperation::MkdirAll {
+            path: path.to_string(),
+        },
+    };
+
+    crate::metadata_backend::reset_metadata_journal_write_count();
+    let event = services_primary
+        .handle_namespace_request(replica_node.clone(), command)
+        .expect("serve fused-admission mkdir-all");
+    assert!(
+        matches!(
+            &event,
+            NetworkedDfsServiceEvent::RemoteNamespaceServed {
+                result: DfsNamespaceResult::Applied,
+                ..
+            }
+        ),
+        "unexpected fused-admission event: {event:?}"
+    );
+    assert_eq!(
+        crate::metadata_backend::metadata_journal_write_count(),
+        2,
+        "the common clustered mkdir-all path should write prepare + commit, not Pending + prepare + commit"
+    );
+    let completed = services_primary
+        .metadata_backend
+        .as_ref()
+        .expect("metadata backend")
+        .get_namespace_request(&replica_node, &request_id)
+        .expect("request lookup")
+        .expect("completed request");
+    assert_eq!(completed.status, DfsNamespaceRequestStatus::Completed);
+    assert_eq!(completed.result, Some(DfsNamespaceResult::Applied));
+    assert_eq!(
+        services_primary
+            .posix_stat(path)
+            .expect("created directory")
+            .kind,
+        DfsObjectKind::Directory
+    );
+
+    let no_op_request_id = "dfs_net_req_mkdir_all_fused_admission_noop".to_string();
+    crate::metadata_backend::reset_metadata_journal_write_count();
+    let no_op = services_primary
+        .handle_namespace_request(
+            replica_node.clone(),
+            DfsNamespaceCommand {
+                request_id: no_op_request_id.clone(),
+                file_system_id: sifs_file_system_id(),
+                requesting_node_id: replica_node.clone(),
+                include_metadata_journal_batches: false,
+                metadata_journal_after_sequences: Vec::new(),
+                authority_shards: Vec::new(),
+                operation: DfsNamespaceOperation::MkdirAll {
+                    path: path.to_string(),
+                },
+            },
+        )
+        .expect("serve already-satisfied mkdir-all");
+    assert!(
+        matches!(
+            &no_op,
+            NetworkedDfsServiceEvent::RemoteNamespaceServed {
+                result: DfsNamespaceResult::Applied,
+                ..
+            }
+        ),
+        "unexpected fused-admission no-op event: {no_op:?}"
+    );
+    assert_eq!(
+        crate::metadata_backend::metadata_journal_write_count(),
+        1,
+        "an already-satisfied mkdir-all should record Completed directly"
+    );
+    assert_eq!(
+        services_primary
+            .metadata_backend
+            .as_ref()
+            .expect("metadata backend")
+            .get_namespace_request(&replica_node, &no_op_request_id)
+            .expect("no-op request lookup")
+            .expect("completed no-op request")
+            .status,
+        DfsNamespaceRequestStatus::Completed
+    );
+
+    drop(replica);
     std::fs::remove_dir_all(&root).ok();
 }
 

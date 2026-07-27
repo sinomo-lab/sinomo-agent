@@ -21,9 +21,9 @@ use crate::metadata_records::{
     DfsConflictScanPage, DfsDirFragmentId, DfsDirectoryPageCursor, DfsNamespaceJobPage,
     DfsNamespaceJobPageCursor, DfsObjectPage, DfsObjectPageCursor, DfsObjectVersionPage,
     DfsObjectVersionPageCursor, DfsObjectVersionScanCursor, DfsObjectVersionScanPage,
-    DfsReplicaReceiptPage, DfsReplicaReceiptPageCursor, DfsReplicaReceiptScanCursor,
-    DfsReplicaReceiptScanPage, DfsWriteIntentPage, DfsWriteIntentPageCursor,
-    DfsWriteIntentScanCursor, DfsWriteIntentScanPage,
+    DfsPendingNamespaceRequestPage, DfsPendingNamespaceRequestPageCursor, DfsReplicaReceiptPage,
+    DfsReplicaReceiptPageCursor, DfsReplicaReceiptScanCursor, DfsReplicaReceiptScanPage,
+    DfsWriteIntentPage, DfsWriteIntentPageCursor, DfsWriteIntentScanCursor, DfsWriteIntentScanPage,
 };
 use crate::metadata_tables::DfsMetadataTables;
 use crate::metadata_visible_commit::object_by_path_from_tables;
@@ -532,6 +532,51 @@ pub(crate) fn namespace_jobs_page_from_tables(
     }
     let (jobs, next_cursor) = finish_cursor_page(entries, max_entries);
     DfsNamespaceJobPage { jobs, next_cursor }
+}
+
+pub(crate) fn pending_namespace_requests_page_from_tables(
+    tables: &DfsMetadataTables,
+    after: Option<&DfsPendingNamespaceRequestPageCursor>,
+    max_entries: usize,
+) -> DfsPendingNamespaceRequestPage {
+    if max_entries == 0 {
+        return DfsPendingNamespaceRequestPage {
+            requests: Vec::new(),
+            next_cursor: None,
+        };
+    }
+    let start = match after {
+        Some(after) => Excluded((
+            after.updated_at,
+            after.requester_node_id.clone(),
+            after.request_id.clone(),
+        )),
+        None => Unbounded,
+    };
+    let mut entries = Vec::new();
+    for (updated_at, requester_node_id, request_id) in tables
+        .pending_namespace_request_order
+        .range((start, Unbounded))
+    {
+        let request_key = (requester_node_id.clone(), request_id.clone());
+        let Some(request) = tables.namespace_requests.get(&request_key) else {
+            continue;
+        };
+        let cursor = DfsPendingNamespaceRequestPageCursor {
+            updated_at: *updated_at,
+            requester_node_id: requester_node_id.clone(),
+            request_id: request_id.clone(),
+        };
+        entries.push((request.clone(), cursor));
+        if entries.len() > max_entries {
+            break;
+        }
+    }
+    let (requests, next_cursor) = finish_cursor_page(entries, max_entries);
+    DfsPendingNamespaceRequestPage {
+        requests,
+        next_cursor,
+    }
 }
 
 pub(crate) fn conflicts_for_object_from_tables(

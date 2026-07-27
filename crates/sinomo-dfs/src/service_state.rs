@@ -11,12 +11,13 @@ use sinomo_core::node::NodeId;
 use crate::transfer::{PendingNetworkedRead, PendingNetworkedWrite};
 use crate::{
     DfsBulkReadItemResponse, DfsConflictRecord, DfsConflictStatus, DfsControlPlaneKvClient,
-    DfsDistributedWriteCommand, DfsDistributedWriteResult, DfsError, DfsFileSystemId,
-    DfsMessageResponse, DfsMetadataBackend, DfsMetadataShardConfig, DfsMetadataShardId,
-    DfsMetadataStore, DfsNamespaceRequestRecord, DfsNamespaceResult, DfsObjectId,
-    DfsObjectMetadata, DfsOutboundAttachment, DfsPosixCoordinationResult, DfsReadData,
-    DfsReadRangeData, DfsReadResult, DfsRepairAttemptRecord, DfsVersion,
-    DistributedEventualCoordinator, DistributedRepairJob, LocalContentStore, ObjectVersionReader,
+    DfsDistributedWriteCommand, DfsDistributedWriteResult, DfsError, DfsFileSystemConfig,
+    DfsFileSystemId, DfsMessageResponse, DfsMetadataBackend, DfsMetadataShardConfig,
+    DfsMetadataShardId, DfsMetadataStore, DfsNamespaceRequestRecord, DfsNamespaceResult,
+    DfsObjectId, DfsObjectMetadata, DfsOutboundAttachment, DfsPendingNamespaceRequestPageCursor,
+    DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData, DfsReadResult,
+    DfsRepairAttemptRecord, DfsVersion, DistributedEventualCoordinator, DistributedRepairJob,
+    LocalContentStore, ObjectVersionReader,
 };
 
 pub(crate) const DFS_REMOTE_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -64,6 +65,22 @@ pub(crate) const DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT: usize = 3;
 pub(crate) const DFS_ROUTED_NAMESPACE_IDLE_WAIT: Duration = Duration::from_millis(10);
 
 pub(crate) const DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES: usize = 64;
+
+/// Immutable control-plane inputs reused by the local planning portion of one
+/// routed namespace command.
+///
+/// The request has already compared its sender's shard stamps with the
+/// receiver's current committed view. Keeping that exact view through path
+/// planning, placement resolution, and prepare avoids repeatedly collecting
+/// and decoding cluster-KV state during the same operation. General authority
+/// lookups deliberately do not consult this context: explicit refresh and
+/// reentrant routed requests must always begin from a fresh committed view.
+#[derive(Clone, Debug)]
+pub(crate) struct DfsNamespaceOperationContext {
+    pub(crate) file_system_id: DfsFileSystemId,
+    pub(crate) shards: Vec<DfsMetadataShardConfig>,
+    pub(crate) placement_config: Option<DfsFileSystemConfig>,
+}
 
 /// Cooperative cancellation handle for a [`NetworkedDfsService`]. Cloneable and
 /// thread-safe: a caller keeps one clone, hands the service the other, and flips
@@ -139,6 +156,11 @@ pub struct NetworkedDfsService<T> {
     pub(crate) deferred_routed_create_parent_touches: BTreeSet<String>,
     pub(crate) deferred_untracked_routed_write_responses: BTreeMap<String, DfsObjectId>,
     pub(crate) pending_routed_namespace_ops: BTreeMap<String, PendingRoutedNamespaceOp>,
+    pub(crate) active_namespace_operation_context: Option<DfsNamespaceOperationContext>,
+    /// In-memory round-robin cursor for bounded pending-request maintenance.
+    /// Durable request status remains the recovery source of truth.
+    pub(crate) pending_namespace_request_recovery_cursor:
+        Option<DfsPendingNamespaceRequestPageCursor>,
     /// Routed request whose exact transaction is currently being planned.
     /// `apply_namespace_transaction_with_selected_shard` uses this context to
     /// place the terminal request result in the same durable prepare commit.

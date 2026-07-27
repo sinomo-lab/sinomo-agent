@@ -70,6 +70,8 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             deferred_routed_create_parent_touches: BTreeSet::new(),
             deferred_untracked_routed_write_responses: BTreeMap::new(),
             pending_routed_namespace_ops: BTreeMap::new(),
+            active_namespace_operation_context: None,
+            pending_namespace_request_recovery_cursor: None,
             active_durable_namespace_request: None,
             active_durable_namespace_prepare_recorded: false,
             routed_namespace_settle_depth: 0,

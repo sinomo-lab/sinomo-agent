@@ -52,9 +52,10 @@ use crate::metadata_pages::{
     first_hardlink_to_object_outside_prefix_from_tables, hardlink_count_to_object_from_tables,
     hardlinks_to_object_page_from_tables, intents_for_object_page_from_tables,
     intents_for_object_version_page_from_tables, namespace_jobs_page_from_tables,
-    objects_for_file_system_page_from_tables, receipt_records_page_from_tables,
-    receipts_for_version_page_from_tables, version_records_page_from_tables,
-    versions_for_object_page_from_tables, write_intents_page_from_tables,
+    objects_for_file_system_page_from_tables, pending_namespace_requests_page_from_tables,
+    receipt_records_page_from_tables, receipts_for_version_page_from_tables,
+    version_records_page_from_tables, versions_for_object_page_from_tables,
+    write_intents_page_from_tables,
 };
 use crate::metadata_read_snapshot;
 use crate::metadata_receipt::{receipt_for_replica_from_backend, replay_receipt_matches_existing};
@@ -320,6 +321,19 @@ fn namespace_request_transition_is_valid(
         }
         (DfsNamespaceRequestStatus::Completed, DfsNamespaceRequestStatus::Pending) => false,
     }
+}
+
+fn pending_namespace_request_admission_from_completion(
+    completion: &DfsNamespaceRequestRecord,
+) -> DfsNamespaceRequestRecord {
+    let mut pending = completion.clone();
+    pending.status = DfsNamespaceRequestStatus::Pending;
+    pending.result = None;
+    pending.posix_coordination_result = None;
+    pending.recovery_attempts = 0;
+    pending.last_recovery_error = None;
+    pending.updated_at = pending.created_at;
+    pending
 }
 
 fn namespace_prepare_can_repair_terminal_request(
@@ -629,6 +643,13 @@ fn validate_namespace_prepare_shape(
                     completed_request.request_id
                 )));
             }
+            None if prepare.status == DfsNamespacePrepareStatus::Prepared => {
+                // A request-owned prepare is itself the first durable
+                // operation boundary for the fused admission path. The table
+                // planner below materializes a derived Pending admission in
+                // the same atomic batch as this hidden prepare. Other prepare
+                // states still require that admission to exist already.
+            }
             None => {
                 return Err(MetadataBackendError::Serde(format!(
                     "namespace prepare {} has no durable admission for completed request {}/{}",
@@ -810,9 +831,22 @@ fn namespace_prepare_table_ops_for_record(
             validate_namespace_prepare_expectations(tables, prepare)?;
             validate_namespace_prepare_does_not_overlap(tables, prepare)?;
             validate_namespace_transaction_preconditions(tables, &prepare.transaction)?;
-            Ok(vec![DfsMetadataTableOp::PutNamespacePrepare {
+            let mut ops = Vec::with_capacity(2);
+            if let Some(completion) = prepare.completed_request.as_ref() {
+                let request_key = (
+                    completion.requester_node_id.clone(),
+                    completion.request_id.clone(),
+                );
+                if !tables.namespace_requests.contains_key(&request_key) {
+                    ops.push(DfsMetadataTableOp::PutNamespaceRequest {
+                        request: pending_namespace_request_admission_from_completion(completion),
+                    });
+                }
+            }
+            ops.push(DfsMetadataTableOp::PutNamespacePrepare {
                 prepare: prepare.clone(),
-            }])
+            });
+            Ok(ops)
         }
         DfsNamespacePrepareStatus::Committed => {
             let existing = existing.ok_or_else(|| {
@@ -5189,6 +5223,50 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         Ok(tables.namespace_requests.values().cloned().collect())
     }
 
+    fn list_pending_namespace_requests_page(
+        &self,
+        after: Option<&DfsPendingNamespaceRequestPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsPendingNamespaceRequestPage> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(pending_namespace_requests_page_from_tables(
+            &tables,
+            after,
+            max_entries,
+        ))
+    }
+
+    fn get_prepared_namespace_prepare_for_request(
+        &self,
+        requester_node_id: &NodeId,
+        request_id: &str,
+    ) -> Result<Option<DfsNamespacePrepareRecord>> {
+        let tables = self.current_tables_snapshot()?;
+        let request_key = (requester_node_id.clone(), request_id.to_string());
+        let Some(operation_ids) = tables.namespace_prepare_request_owners.get(&request_key) else {
+            return Ok(None);
+        };
+        if operation_ids.len() != 1 {
+            return Err(MetadataBackendError::Serde(format!(
+                "pending namespace request {requester_node_id}/{request_id} owns {} prepared transactions",
+                operation_ids.len()
+            )));
+        }
+        let operation_id = operation_ids
+            .first()
+            .expect("non-empty request prepare owner index");
+        let prepare = tables
+            .namespace_prepares
+            .get(operation_id)
+            .cloned()
+            .ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "pending namespace request {requester_node_id}/{request_id} indexes missing prepare {operation_id}"
+                ))
+            })?;
+        Ok(Some(prepare))
+    }
+
     fn get_namespace_transaction(
         &self,
         transaction_id: &str,
@@ -5868,6 +5946,33 @@ mod tests {
         }
     }
 
+    fn namespace_request(
+        index: usize,
+        status: DfsNamespaceRequestStatus,
+    ) -> DfsNamespaceRequestRecord {
+        let timestamp = OffsetDateTime::from_unix_timestamp(index as i64).expect("valid timestamp");
+        let completed = status == DfsNamespaceRequestStatus::Completed;
+        DfsNamespaceRequestRecord {
+            file_system_id: file_system_id(),
+            requester_node_id: node(&format!("node_namespace_request_{index:02}")),
+            request_id: format!("namespace-request-{index:02}"),
+            operation_id: format!("namespace-operation-{index:02}"),
+            authority_shard_id: DfsMetadataShardId::new("root"),
+            operation: DfsNamespaceOperation::SetMode {
+                path: format!("/requests/{index}"),
+                mode: 0o644,
+            },
+            command_digest: format!("blake3:namespace-request-{index:02}"),
+            status,
+            result: completed.then_some(DfsNamespaceResult::Applied),
+            posix_coordination_result: None,
+            recovery_attempts: 0,
+            last_recovery_error: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+        }
+    }
+
     fn namespace_prepare(
         operation_id: &str,
         shard_id: &str,
@@ -6314,6 +6419,247 @@ mod tests {
     }
 
     #[test]
+    fn request_owned_prepare_fuses_admission_and_survives_reopen_before_commit() {
+        let root = temp_root("local_backend_request_prepare_fused_admission");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let current = object(version("version_request_prepare_fused_1"));
+        let mut committed = current.clone();
+        committed.version = version("version_request_prepare_fused_2");
+        committed.mode = 0o600;
+        let admitted_at = OffsetDateTime::UNIX_EPOCH;
+        let completed_at = OffsetDateTime::from_unix_timestamp(1).expect("completion timestamp");
+        let completed_request = DfsNamespaceRequestRecord {
+            file_system_id: current.file_system_id.clone(),
+            requester_node_id: node("node_request_prepare_fused_requester"),
+            request_id: "request-prepare-fused".to_string(),
+            operation_id: "req-request-prepare-fused".to_string(),
+            authority_shard_id: shard_id.clone(),
+            operation: DfsNamespaceOperation::SetMode {
+                path: current.path.clone(),
+                mode: committed.mode,
+            },
+            command_digest: "blake3:request-prepare-fused".to_string(),
+            status: DfsNamespaceRequestStatus::Completed,
+            result: Some(DfsNamespaceResult::Applied),
+            posix_coordination_result: None,
+            recovery_attempts: 0,
+            last_recovery_error: None,
+            created_at: admitted_at,
+            updated_at: completed_at,
+        };
+        let pending_request =
+            pending_namespace_request_admission_from_completion(&completed_request);
+        let mut prepare = namespace_prepare(
+            &format!(
+                "namespace-request:{}:transaction-request-prepare-fused",
+                completed_request.operation_id
+            ),
+            &shard_id.0,
+            &current,
+            committed.clone(),
+        );
+        prepare.completed_request = Some(completed_request.clone());
+        prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+                .expect("request-owned prepare digest");
+
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        assert!(
+            backend
+                .get_namespace_request(
+                    &completed_request.requester_node_id,
+                    &completed_request.request_id,
+                )
+                .expect("request before prepare")
+                .is_none()
+        );
+        let sequence_before_prepare = backend.journal_last_sequence();
+
+        backend
+            .prepare_namespace_transaction(&prepare)
+            .expect("fused request admission and hidden prepare");
+
+        assert_eq!(
+            backend.journal_last_sequence(),
+            sequence_before_prepare.saturating_add(1),
+            "admission and prepare must share one journal mutation"
+        );
+        assert_eq!(
+            backend
+                .get_namespace_request(
+                    &pending_request.requester_node_id,
+                    &pending_request.request_id,
+                )
+                .expect("derived pending request"),
+            Some(pending_request.clone())
+        );
+        assert_eq!(
+            backend
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("hidden prepare"),
+            Some(prepare.clone())
+        );
+        assert_eq!(
+            backend
+                .get_object(&current.object_id)
+                .expect("object remains hidden"),
+            Some(current.clone())
+        );
+
+        // Rewind the materialized table so reopen must derive the Pending row
+        // from the prepare journal payload, matching replica/replay behavior.
+        force_table_replay_from_journal(&backend, &root, 0);
+        drop(backend);
+        let mut reopened =
+            LocalSobjMetadataBackend::new(shard_id, &root).expect("reopened backend");
+        assert_eq!(
+            reopened
+                .get_namespace_request(
+                    &pending_request.requester_node_id,
+                    &pending_request.request_id,
+                )
+                .expect("reopened pending request"),
+            Some(pending_request)
+        );
+        assert_eq!(
+            reopened
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("reopened hidden prepare"),
+            Some(prepare.clone())
+        );
+        assert_eq!(
+            reopened
+                .get_object(&current.object_id)
+                .expect("reopened hidden object"),
+            Some(current.clone())
+        );
+
+        reopened
+            .commit_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect("commit request-owned prepare");
+
+        assert_eq!(
+            reopened
+                .get_namespace_request(
+                    &completed_request.requester_node_id,
+                    &completed_request.request_id,
+                )
+                .expect("completed request"),
+            Some(completed_request)
+        );
+        assert_eq!(
+            reopened
+                .get_object(&current.object_id)
+                .expect("committed object"),
+            Some(committed)
+        );
+        assert_eq!(
+            reopened
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("committed prepare")
+                .map(|record| record.status),
+            Some(DfsNamespacePrepareStatus::Committed)
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn request_owned_prepare_fused_admission_rejects_different_request_digest() {
+        let root = temp_root("local_backend_request_prepare_fused_digest_conflict");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        let current = object(version("version_request_prepare_fused_digest_1"));
+        let mut committed = current.clone();
+        committed.version = version("version_request_prepare_fused_digest_2");
+        committed.mode = 0o600;
+        let mut completed_request = DfsNamespaceRequestRecord {
+            file_system_id: current.file_system_id.clone(),
+            requester_node_id: node("node_request_prepare_fused_digest_requester"),
+            request_id: "request-prepare-fused-digest".to_string(),
+            operation_id: "req-request-prepare-fused-digest".to_string(),
+            authority_shard_id: shard_id.clone(),
+            operation: DfsNamespaceOperation::SetMode {
+                path: current.path.clone(),
+                mode: committed.mode,
+            },
+            command_digest: "blake3:request-prepare-fused-digest".to_string(),
+            status: DfsNamespaceRequestStatus::Completed,
+            result: Some(DfsNamespaceResult::Applied),
+            posix_coordination_result: None,
+            recovery_attempts: 0,
+            last_recovery_error: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::from_unix_timestamp(1).expect("completion timestamp"),
+        };
+        let mut prepare = namespace_prepare(
+            &format!(
+                "namespace-request:{}:transaction-request-prepare-fused-digest",
+                completed_request.operation_id
+            ),
+            &shard_id.0,
+            &current,
+            committed.clone(),
+        );
+        prepare.completed_request = Some(completed_request.clone());
+        prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+                .expect("request-owned prepare digest");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        backend
+            .prepare_namespace_transaction(&prepare)
+            .expect("initial fused admission");
+
+        completed_request.command_digest =
+            "blake3:different-request-prepare-fused-digest".to_string();
+        let mut conflicting_prepare = namespace_prepare(
+            &format!(
+                "namespace-request:{}:transaction-request-prepare-fused-digest-conflict",
+                completed_request.operation_id
+            ),
+            &shard_id.0,
+            &current,
+            committed,
+        );
+        conflicting_prepare.completed_request = Some(completed_request.clone());
+        conflicting_prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&conflicting_prepare)
+                .expect("conflicting request-owned prepare digest");
+
+        let error = backend
+            .prepare_namespace_transaction(&conflicting_prepare)
+            .expect_err("a fused admission must not replace a different request digest");
+
+        assert!(
+            error.to_string().contains("completed request conflicts"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            backend
+                .get_namespace_prepare(&conflicting_prepare.operation_id)
+                .expect("conflicting prepare lookup")
+                .is_none()
+        );
+        assert_eq!(
+            backend
+                .get_namespace_request(
+                    &completed_request.requester_node_id,
+                    &completed_request.request_id,
+                )
+                .expect("original pending request")
+                .map(|request| request.command_digest),
+            Some("blake3:request-prepare-fused-digest".to_string())
+        );
+        cleanup(&root);
+    }
+
+    #[test]
     fn request_owned_prepare_replay_accepts_matching_terminal_outcome_bookkeeping() {
         let root = temp_root("local_backend_request_prepare_terminal_replay");
         let shard_id = DfsMetadataShardId::new("shard-root");
@@ -6370,6 +6716,15 @@ mod tests {
         backend
             .prepare_namespace_transaction(&prepare)
             .expect("durable hidden prepare");
+        assert_eq!(
+            backend
+                .get_prepared_namespace_prepare_for_request(
+                    &pending_request.requester_node_id,
+                    &pending_request.request_id,
+                )
+                .expect("request-owned prepare index"),
+            Some(prepare.clone())
+        );
 
         // A retry can durably observe the same terminal outcome while updating
         // only recovery diagnostics. Replaying the older prepare must compare
@@ -6389,6 +6744,16 @@ mod tests {
                 prepare.owner_epoch,
             )
             .expect("replay matching completed request");
+        assert!(
+            backend
+                .get_prepared_namespace_prepare_for_request(
+                    &later_completion.requester_node_id,
+                    &later_completion.request_id,
+                )
+                .expect("committed request prepare index")
+                .is_none(),
+            "committing a prepare must remove it from the pending request index"
+        );
 
         assert_eq!(
             backend
@@ -8158,6 +8523,68 @@ mod tests {
                 .expect("job")
                 .root_path,
             "/services/jobs/5"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_merges_pending_namespace_request_pages() {
+        let root = temp_root("sharded_backend_pages_pending_namespace_requests");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+
+        for index in 0..6 {
+            let status = if index == 3 {
+                DfsNamespaceRequestStatus::Completed
+            } else {
+                DfsNamespaceRequestStatus::Pending
+            };
+            let mut request = namespace_request(index, status);
+            let shard_id = if index % 2 == 0 {
+                DfsMetadataShardId::new("root")
+            } else {
+                DfsMetadataShardId::new("services")
+            };
+            request.authority_shard_id = shard_id.clone();
+            backend
+                .put_namespace_request_on_shard(&shard_id, &request)
+                .expect("namespace request");
+        }
+
+        let mut cursor = None;
+        let mut request_ids = Vec::new();
+        loop {
+            let page = backend
+                .list_pending_namespace_requests_page(cursor.as_ref(), 2)
+                .expect("pending request page");
+            request_ids.extend(
+                page.requests
+                    .iter()
+                    .map(|request| request.request_id.clone()),
+            );
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        assert_eq!(
+            request_ids,
+            [0, 1, 2, 4, 5]
+                .into_iter()
+                .map(|index| format!("namespace-request-{index:02}"))
+                .collect::<Vec<_>>()
         );
 
         cleanup(&root);
@@ -12402,6 +12829,94 @@ mod tests {
         );
         assert_eq!(pages, 3);
         assert_eq!(backend.list_namespace_jobs().expect("legacy list").len(), 5);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_pages_only_pending_namespace_requests_and_rebuilds_index() {
+        let root = temp_root("local_backend_pages_pending_namespace_requests");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        let pending_later = namespace_request(2, DfsNamespaceRequestStatus::Pending);
+        let pending_earlier = namespace_request(1, DfsNamespaceRequestStatus::Pending);
+        let completed = namespace_request(0, DfsNamespaceRequestStatus::Completed);
+        for request in [&pending_later, &completed, &pending_earlier] {
+            backend
+                .put_namespace_request_on_shard(&shard_id, request)
+                .expect("namespace request");
+        }
+
+        let first = backend
+            .list_pending_namespace_requests_page(None, 1)
+            .expect("first pending request page");
+        assert_eq!(
+            first
+                .requests
+                .iter()
+                .map(|request| request.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![pending_earlier.request_id.as_str()]
+        );
+        let second = backend
+            .list_pending_namespace_requests_page(first.next_cursor.as_ref(), 1)
+            .expect("second pending request page");
+        assert_eq!(
+            second
+                .requests
+                .iter()
+                .map(|request| request.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![pending_later.request_id.as_str()]
+        );
+        assert!(second.next_cursor.is_none());
+
+        let mut retried = pending_earlier.clone();
+        retried.recovery_attempts = 1;
+        retried.updated_at = OffsetDateTime::from_unix_timestamp(3).expect("retry timestamp");
+        backend
+            .put_namespace_request_on_shard(&shard_id, &retried)
+            .expect("retry diagnostics");
+        let reordered = backend
+            .list_pending_namespace_requests_page(None, 8)
+            .expect("reordered pending requests");
+        assert_eq!(
+            reordered
+                .requests
+                .iter()
+                .map(|request| request.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                pending_later.request_id.as_str(),
+                pending_earlier.request_id.as_str()
+            ],
+            "updating recovery diagnostics must replace the old index key"
+        );
+
+        let mut completed_later = pending_later.clone();
+        completed_later.status = DfsNamespaceRequestStatus::Completed;
+        completed_later.result = Some(DfsNamespaceResult::Applied);
+        completed_later.updated_at =
+            OffsetDateTime::from_unix_timestamp(4).expect("completion timestamp");
+        backend
+            .put_namespace_request_on_shard(&shard_id, &completed_later)
+            .expect("completed request");
+        drop(backend);
+
+        let reopened = LocalSobjMetadataBackend::new(shard_id, &root).expect("reopen backend");
+        let pending = reopened
+            .list_pending_namespace_requests_page(None, 8)
+            .expect("pending requests after reopen");
+        assert_eq!(pending.requests, vec![retried]);
+        assert!(pending.next_cursor.is_none());
+        assert_eq!(
+            reopened
+                .list_namespace_requests()
+                .expect("retained idempotency requests")
+                .len(),
+            3,
+            "terminal requests remain available for exact retry replay"
+        );
 
         cleanup(&root);
     }

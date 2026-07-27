@@ -18,9 +18,9 @@ use crate::metadata_keys::{
 use crate::metadata_records::{
     DfsConflictRecord, DfsDirFragmentId, DfsDirFragmentRecord, DfsInodeId, DfsInodeRecord,
     DfsMetadataPrefixProof, DfsMetadataTableOp, DfsNamespaceJobRecord, DfsNamespacePrepareRecord,
-    DfsNamespacePrepareStatus, DfsNamespaceRequestRecord, DfsNamespaceTransaction,
-    DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord, DfsVisibleVersionCommitRecord,
-    DfsWriteIntentRecord, normalized_object_metadata,
+    DfsNamespacePrepareStatus, DfsNamespaceRequestRecord, DfsNamespaceRequestStatus,
+    DfsNamespaceTransaction, DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord,
+    DfsVisibleVersionCommitRecord, DfsWriteIntentRecord, normalized_object_metadata,
 };
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
@@ -52,8 +52,13 @@ pub(crate) struct DfsMetadataTables {
     namespace_prepare_object_owners:
         BTreeMap<DfsFileSystemId, BTreeMap<DfsObjectId, BTreeSet<String>>>,
     namespace_prepare_path_owners: BTreeMap<DfsFileSystemId, BTreeMap<String, BTreeSet<String>>>,
+    /// Derived from active request-owned prepares and rebuilt on snapshot load.
+    pub(crate) namespace_prepare_request_owners: BTreeMap<(NodeId, String), BTreeSet<String>>,
     pub(crate) namespace_jobs: BTreeMap<String, DfsNamespaceJobRecord>,
     pub(crate) namespace_requests: BTreeMap<(NodeId, String), DfsNamespaceRequestRecord>,
+    /// Derived oldest-attempt-first recovery index. Terminal idempotency rows
+    /// stay in `namespace_requests` without participating in maintenance scans.
+    pub(crate) pending_namespace_request_order: BTreeSet<(OffsetDateTime, NodeId, String)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -224,6 +229,72 @@ impl DfsMetadataTables {
         self.namespace_prepare_path_owners = path_owners;
     }
 
+    fn index_namespace_prepare_request(&mut self, prepare: &DfsNamespacePrepareRecord) {
+        if prepare.status != DfsNamespacePrepareStatus::Prepared {
+            return;
+        }
+        let Some(request) = prepare.completed_request.as_ref() else {
+            return;
+        };
+        self.namespace_prepare_request_owners
+            .entry((
+                request.requester_node_id.clone(),
+                request.request_id.clone(),
+            ))
+            .or_default()
+            .insert(prepare.operation_id.clone());
+    }
+
+    fn namespace_prepare_request_index_from_history(
+        namespace_prepares: &BTreeMap<String, DfsNamespacePrepareRecord>,
+    ) -> BTreeMap<(NodeId, String), BTreeSet<String>> {
+        let mut request_owners = BTreeMap::<(NodeId, String), BTreeSet<String>>::new();
+        for prepare in namespace_prepares
+            .values()
+            .filter(|prepare| prepare.status == DfsNamespacePrepareStatus::Prepared)
+        {
+            let Some(request) = prepare.completed_request.as_ref() else {
+                continue;
+            };
+            request_owners
+                .entry((
+                    request.requester_node_id.clone(),
+                    request.request_id.clone(),
+                ))
+                .or_default()
+                .insert(prepare.operation_id.clone());
+        }
+        request_owners
+    }
+
+    fn unindex_namespace_prepare_request(&mut self, prepare: &DfsNamespacePrepareRecord) {
+        if prepare.status != DfsNamespacePrepareStatus::Prepared {
+            return;
+        }
+        let Some(request) = prepare.completed_request.as_ref() else {
+            return;
+        };
+        let request_key = (
+            request.requester_node_id.clone(),
+            request.request_id.clone(),
+        );
+        let remove_request = self
+            .namespace_prepare_request_owners
+            .get_mut(&request_key)
+            .is_some_and(|owners| {
+                owners.remove(&prepare.operation_id);
+                owners.is_empty()
+            });
+        if remove_request {
+            self.namespace_prepare_request_owners.remove(&request_key);
+        }
+    }
+
+    fn rebuild_namespace_prepare_request_index(&mut self) {
+        self.namespace_prepare_request_owners =
+            Self::namespace_prepare_request_index_from_history(&self.namespace_prepares);
+    }
+
     fn index_namespace_prepare_footprint(&mut self, prepare: &DfsNamespacePrepareRecord) {
         if prepare.status != DfsNamespacePrepareStatus::Prepared {
             return;
@@ -296,9 +367,48 @@ impl DfsMetadataTables {
         let operation_id = prepare.operation_id.clone();
         if let Some(previous) = self.namespace_prepares.remove(&operation_id) {
             self.unindex_namespace_prepare_footprint(&previous);
+            self.unindex_namespace_prepare_request(&previous);
         }
         self.index_namespace_prepare_footprint(&prepare);
+        self.index_namespace_prepare_request(&prepare);
         self.namespace_prepares.insert(operation_id, prepare);
+    }
+
+    fn namespace_request_order_key(
+        request: &DfsNamespaceRequestRecord,
+    ) -> (OffsetDateTime, NodeId, String) {
+        (
+            request.updated_at,
+            request.requester_node_id.clone(),
+            request.request_id.clone(),
+        )
+    }
+
+    fn put_namespace_request_indexed(&mut self, request: DfsNamespaceRequestRecord) {
+        let request_key = (
+            request.requester_node_id.clone(),
+            request.request_id.clone(),
+        );
+        if let Some(previous) = self.namespace_requests.remove(&request_key)
+            && previous.status == DfsNamespaceRequestStatus::Pending
+        {
+            self.pending_namespace_request_order
+                .remove(&Self::namespace_request_order_key(&previous));
+        }
+        if request.status == DfsNamespaceRequestStatus::Pending {
+            self.pending_namespace_request_order
+                .insert(Self::namespace_request_order_key(&request));
+        }
+        self.namespace_requests.insert(request_key, request);
+    }
+
+    fn rebuild_pending_namespace_request_index(&mut self) {
+        self.pending_namespace_request_order = self
+            .namespace_requests
+            .values()
+            .filter(|request| request.status == DfsNamespaceRequestStatus::Pending)
+            .map(Self::namespace_request_order_key)
+            .collect();
     }
 
     pub(crate) fn namespace_prepare_object_owner_other_than(
@@ -493,13 +603,7 @@ impl DfsMetadataTables {
                 self.namespace_jobs.insert(job.job_id.clone(), job);
             }
             DfsMetadataTableOp::PutNamespaceRequest { request } => {
-                self.namespace_requests.insert(
-                    (
-                        request.requester_node_id.clone(),
-                        request.request_id.clone(),
-                    ),
-                    request,
-                );
+                self.put_namespace_request_indexed(request);
             }
         }
     }
@@ -872,8 +976,10 @@ impl DfsMetadataTableRollback {
         );
         rollback_map(&mut tables.namespace_prepares, self.namespace_prepares);
         tables.rebuild_namespace_prepare_footprint_indexes();
+        tables.rebuild_namespace_prepare_request_index();
         rollback_map(&mut tables.namespace_jobs, self.namespace_jobs);
         rollback_map(&mut tables.namespace_requests, self.namespace_requests);
+        tables.rebuild_pending_namespace_request_index();
     }
 }
 

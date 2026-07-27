@@ -120,6 +120,19 @@ fn namespace_operation_uses_durable_request_admission(operation: &DfsNamespaceOp
         )
 }
 
+/// `mkdir_all` publishes all missing components in one request-owned namespace
+/// prepare. Its admission can therefore share the prepare's durable table
+/// batch instead of forcing a standalone Pending journal write first.
+///
+/// The transaction planner still verifies that the exact operation is proven
+/// complete. Symlink-resolved or otherwise non-proving transactions fall back
+/// to a standalone Pending admission before their prepare.
+fn namespace_operation_can_fuse_durable_request_admission(
+    operation: &DfsNamespaceOperation,
+) -> bool {
+    matches!(operation, DfsNamespaceOperation::MkdirAll { .. })
+}
+
 pub(crate) fn namespace_operation_response_retry_safe(operation: &DfsNamespaceOperation) -> bool {
     namespace_operation_uses_durable_request_admission(operation)
         || matches!(
@@ -158,6 +171,7 @@ enum DurableNamespaceRequestAdmission {
     Execute {
         shard_id: DfsMetadataShardId,
         record: DfsNamespaceRequestRecord,
+        persisted: bool,
     },
     Replay {
         result: DfsNamespaceResult,
@@ -169,6 +183,7 @@ enum DurableNamespaceRequestAdmission {
 }
 
 pub(crate) const DFS_NAMESPACE_REQUEST_RECOVERY_BATCH_LIMIT: usize = 64;
+const DFS_NAMESPACE_REQUEST_RECOVERY_SCAN_PAGE_LIMIT: usize = 4;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DfsNamespaceRequestRecoveryReport {
@@ -299,23 +314,78 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if max_requests == 0 || self.control_plane.is_none() || self.metadata_backend.is_none() {
             return Ok(report);
         }
-        let mut requests = self
-            .metadata_backend
-            .as_ref()
-            .expect("metadata backend checked above")
-            .list_namespace_requests()?
-            .into_iter()
-            .filter(|request| request.status == DfsNamespaceRequestStatus::Pending)
-            .collect::<Vec<_>>();
-        requests.sort_by(|left, right| {
-            (left.updated_at, &left.requester_node_id, &left.request_id).cmp(&(
-                right.updated_at,
-                &right.requester_node_id,
-                &right.request_id,
-            ))
-        });
-        if !requests.is_empty() {
-            let request_keys = requests
+        let mut locally_authoritative = Vec::new();
+        let mut locally_authoritative_count = 0usize;
+        let mut shard_snapshots = BTreeMap::<DfsFileSystemId, Vec<DfsMetadataShardConfig>>::new();
+        let mut cursor = self.pending_namespace_request_recovery_cursor.take();
+        let scan_started_after_cursor = cursor.is_some();
+        let scan_page_entry_limit = max_requests
+            .max(1)
+            .min(DFS_NAMESPACE_REQUEST_RECOVERY_BATCH_LIMIT);
+        let mut scanned_pages = 0usize;
+        'scan: while scanned_pages < DFS_NAMESPACE_REQUEST_RECOVERY_SCAN_PAGE_LIMIT {
+            let page = self
+                .metadata_backend
+                .as_ref()
+                .expect("metadata backend checked above")
+                .list_pending_namespace_requests_page(cursor.as_ref(), scan_page_entry_limit)?;
+            scanned_pages = scanned_pages.saturating_add(1);
+            let page_len = page.requests.len();
+            let page_next_cursor = page.next_cursor;
+            for (page_index, request) in page.requests.into_iter().enumerate() {
+                let request_cursor = DfsPendingNamespaceRequestPageCursor {
+                    updated_at: request.updated_at,
+                    requester_node_id: request.requester_node_id.clone(),
+                    request_id: request.request_id.clone(),
+                };
+                if !shard_snapshots.contains_key(&request.file_system_id) {
+                    let shards = self
+                        .metadata_shard_config_snapshot(&request.file_system_id)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    shard_snapshots.insert(request.file_system_id.clone(), shards);
+                }
+                let authority_is_local =
+                    shard_snapshots
+                        .get(&request.file_system_id)
+                        .is_some_and(|snapshot| {
+                            Self::affected_namespace_shards_from_snapshot(
+                                &request.file_system_id,
+                                &request.operation,
+                                snapshot,
+                            )
+                            .is_ok_and(|shards| {
+                                shards.iter().any(|shard| {
+                                    shard.shard_id == request.authority_shard_id.0
+                                        && shard.primary_node_id == self.node_id
+                                })
+                            })
+                        });
+                if authority_is_local {
+                    locally_authoritative_count = locally_authoritative_count.saturating_add(1);
+                    locally_authoritative.push(request);
+                    if locally_authoritative.len() >= max_requests {
+                        let has_unscanned_records =
+                            page_index.saturating_add(1) < page_len || page_next_cursor.is_some();
+                        cursor = has_unscanned_records.then_some(request_cursor);
+                        break 'scan;
+                    }
+                }
+            }
+            cursor = page_next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let wrapped_at_end = scan_started_after_cursor && cursor.is_none();
+        self.pending_namespace_request_recovery_cursor = cursor;
+        report.remaining = locally_authoritative_count.saturating_add(usize::from(
+            self.pending_namespace_request_recovery_cursor.is_some() || wrapped_at_end,
+        ));
+
+        if !locally_authoritative.is_empty() {
+            let request_keys = locally_authoritative
                 .iter()
                 .map(|request| {
                     (
@@ -328,39 +398,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.recover_durable_namespace_prepares_for_requests(&request_keys, max_requests)?;
             report.scanned = report.scanned.saturating_add(recovered);
             report.resolved = report.resolved.saturating_add(recovered);
+            report.remaining = report.remaining.saturating_sub(recovered);
             if recovered > 0 {
-                requests = self
-                    .metadata_backend
-                    .as_ref()
-                    .expect("metadata backend checked above")
-                    .list_namespace_requests()?
-                    .into_iter()
-                    .filter(|request| request.status == DfsNamespaceRequestStatus::Pending)
-                    .collect();
-                requests.sort_by(|left, right| {
-                    (left.updated_at, &left.requester_node_id, &left.request_id).cmp(&(
-                        right.updated_at,
-                        &right.requester_node_id,
-                        &right.request_id,
-                    ))
-                });
+                let mut unresolved = Vec::with_capacity(locally_authoritative.len());
+                for request in locally_authoritative {
+                    let current = self
+                        .metadata_backend
+                        .as_ref()
+                        .expect("metadata backend checked above")
+                        .get_namespace_request(&request.requester_node_id, &request.request_id)?
+                        .ok_or_else(|| DfsError::Metadata {
+                            message: format!(
+                                "recovered namespace request {}/{} disappeared from durable metadata",
+                                request.requester_node_id, request.request_id
+                            ),
+                        })?;
+                    if current.status != DfsNamespaceRequestStatus::Completed {
+                        unresolved.push(current);
+                    }
+                }
+                locally_authoritative = unresolved;
             }
         }
-        let mut locally_authoritative = Vec::new();
-        for request in requests {
-            let authority_is_local = self
-                .affected_namespace_shards(&request.file_system_id, &request.operation)
-                .is_ok_and(|shards| {
-                    shards.iter().any(|shard| {
-                        shard.shard_id == request.authority_shard_id.0
-                            && shard.primary_node_id == self.node_id
-                    })
-                });
-            if authority_is_local {
-                locally_authoritative.push(request);
-            }
-        }
-        report.remaining = locally_authoritative.len();
 
         for mut request in locally_authoritative
             .into_iter()
@@ -430,17 +489,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         requester_node_id: &NodeId,
         command: &DfsNamespaceCommand,
         shard_id: DfsMetadataShardId,
+        recovering: bool,
     ) -> Result<DurableNamespaceRequestAdmission, DfsError> {
         let digest = namespace_command_digest(command)?;
-        let backend = self
+        let existing = self
             .metadata_backend
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| DfsError::Metadata {
                 message: "routed namespace mutation requires durable request admission".to_string(),
-            })?;
-        if let Some(existing) =
-            backend.get_namespace_request(requester_node_id, &command.request_id)?
-        {
+            })?
+            .get_namespace_request(requester_node_id, &command.request_id)?;
+        if let Some(mut existing) = existing {
             if existing.file_system_id != command.file_system_id
                 || existing.command_digest != digest
             {
@@ -450,6 +509,45 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         requester_node_id, command.request_id
                     ),
                 });
+            }
+            if existing.status == DfsNamespaceRequestStatus::Pending {
+                let owns_prepare = self
+                    .metadata_backend
+                    .as_ref()
+                    .expect("metadata backend checked above")
+                    .get_prepared_namespace_prepare_for_request(
+                        requester_node_id,
+                        &command.request_id,
+                    )?
+                    .is_some();
+                if owns_prepare {
+                    if !recovering {
+                        let request_key = BTreeSet::from([(
+                            requester_node_id.clone(),
+                            command.request_id.clone(),
+                        )]);
+                        self.recover_durable_namespace_prepares_for_requests(&request_key, 1)?;
+                        existing = self
+                            .metadata_backend
+                            .as_ref()
+                            .expect("metadata backend checked above")
+                            .get_namespace_request(requester_node_id, &command.request_id)?
+                            .ok_or_else(|| DfsError::Metadata {
+                                message: format!(
+                                    "request-owned namespace prepare lost admission {}/{} during recovery",
+                                    requester_node_id, command.request_id
+                                ),
+                            })?;
+                    }
+                    if existing.status == DfsNamespaceRequestStatus::Pending {
+                        return Ok(DurableNamespaceRequestAdmission::Reject {
+                            reason: format!(
+                                "namespace request {}/{} has a durable hidden prepare awaiting recovery",
+                                requester_node_id, command.request_id
+                            ),
+                        });
+                    }
+                }
             }
             return match existing.status {
                 DfsNamespaceRequestStatus::Completed => {
@@ -470,6 +568,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     Ok(DurableNamespaceRequestAdmission::Execute {
                         shard_id: existing.authority_shard_id.clone(),
                         record: existing,
+                        persisted: true,
                     })
                 }
             };
@@ -492,8 +591,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             created_at: now,
             updated_at: now,
         };
-        backend.put_namespace_request_on_shard(&shard_id, &record)?;
-        Ok(DurableNamespaceRequestAdmission::Execute { shard_id, record })
+        let persisted = !namespace_operation_can_fuse_durable_request_admission(&command.operation);
+        if persisted {
+            self.metadata_backend
+                .as_mut()
+                .expect("metadata backend checked above")
+                .put_namespace_request_on_shard(&shard_id, &record)?;
+        }
+        Ok(DurableNamespaceRequestAdmission::Execute {
+            shard_id,
+            record,
+            persisted,
+        })
     }
 
     fn complete_durable_namespace_request(
@@ -814,7 +923,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         } else {
             let affected_started = Instant::now();
-            match self.affected_namespace_shards(&command.file_system_id, &command.operation) {
+            let affected = self
+                .metadata_shard_config_snapshot(&command.file_system_id)
+                .and_then(|snapshot| {
+                    let snapshot = snapshot.unwrap_or_default();
+                    let affected = Self::affected_namespace_shards_from_snapshot(
+                        &command.file_system_id,
+                        &command.operation,
+                        &snapshot,
+                    )?;
+                    Ok((snapshot, affected))
+                });
+            match affected {
                 Err(error) => {
                     trace_affected_ms = affected_started.elapsed().as_millis();
                     DfsNamespaceResult::Rejected {
@@ -823,19 +943,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         current_primary_node_id: None,
                     }
                 }
-                Ok(mut shards) => {
+                Ok((mut shard_snapshot, mut shards)) => {
                     trace_affected_ms = affected_started.elapsed().as_millis();
                     trace_affected_shards = shards.len();
                     if !recovering
                         && !command.authority_shards.is_empty()
                         && !namespace_authority_shards_match(&command.authority_shards, &shards)
                         && self.refresh_control_plane_latest().is_ok()
-                        && let Ok(refreshed) = self
-                            .affected_namespace_shards(&command.file_system_id, &command.operation)
+                        && let Ok(Some(refreshed_snapshot)) =
+                            self.metadata_shard_config_snapshot(&command.file_system_id)
+                        && let Ok(refreshed) = Self::affected_namespace_shards_from_snapshot(
+                            &command.file_system_id,
+                            &command.operation,
+                            &refreshed_snapshot,
+                        )
                     {
                         // A long-lived lane can trail the sender's committed
                         // view. Refresh once before rejecting; matching stamps
                         // stay on the no-refresh hot path.
+                        shard_snapshot = refreshed_snapshot;
                         shards = refreshed;
                         trace_affected_ms = affected_started.elapsed().as_millis();
                         trace_affected_shards = shards.len();
@@ -892,6 +1018,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     &requester_node_id,
                                     &command,
                                     shard_id,
+                                    recovering,
                                 )?)
                             } else {
                                 None
@@ -914,6 +1041,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 }
                             }
                             durable_execute => {
+                                let deferred_admission = durable_execute.as_ref().and_then(
+                                    |admission| match admission {
+                                        DurableNamespaceRequestAdmission::Execute {
+                                            shard_id,
+                                            record,
+                                            persisted: false,
+                                        } => Some((shard_id.clone(), record.clone())),
+                                        DurableNamespaceRequestAdmission::Execute { .. }
+                                        | DurableNamespaceRequestAdmission::Replay { .. }
+                                        | DurableNamespaceRequestAdmission::Reject { .. } => None,
+                                    },
+                                );
                                 self.active_durable_namespace_prepare_recorded = false;
                                 self.active_durable_namespace_request = durable_execute
                                     .as_ref()
@@ -926,6 +1065,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         | DurableNamespaceRequestAdmission::Reject { .. } => None,
                                     });
                                 let execute_started = Instant::now();
+                                let previous_operation_context = if foreign_shard.is_none() {
+                                    self.replace_namespace_operation_context(
+                                        command.file_system_id.clone(),
+                                        shard_snapshot.clone(),
+                                    )
+                                } else {
+                                    // Cross-shard coordinators explicitly
+                                    // refresh authority and may pump nested
+                                    // requests while settling. They must never
+                                    // inherit an outer local planning snapshot.
+                                    self.active_namespace_operation_context.take()
+                                };
                                 let outcome = match (&foreign_shard, &command.operation) {
                                     (
                                         None,
@@ -1000,6 +1151,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         ))
                                     }
                                 };
+                                self.restore_namespace_operation_context(
+                                    previous_operation_context,
+                                );
                                 let durable_prepare_recorded =
                                     self.active_durable_namespace_prepare_recorded;
                                 self.active_durable_namespace_request = None;
@@ -1011,6 +1165,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         durable_prepare_recorded,
                                     )
                                 });
+                                if retryable_error
+                                    && !durable_prepare_recorded
+                                    && let Some((shard_id, record)) = deferred_admission
+                                {
+                                    self.metadata_backend
+                                        .as_mut()
+                                        .expect("durable namespace request backend")
+                                        .put_namespace_request_on_shard(&shard_id, &record)?;
+                                }
                                 let mut operation_result = match outcome {
                                     Ok(coordination_result) => {
                                         posix_coordination_result = coordination_result;
@@ -1027,6 +1190,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 if let Some(DurableNamespaceRequestAdmission::Execute {
                                     shard_id,
                                     record,
+                                    ..
                                 }) = durable_execute
                                     && !retryable_error
                                 {

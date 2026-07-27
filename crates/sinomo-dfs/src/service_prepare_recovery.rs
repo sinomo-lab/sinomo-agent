@@ -163,26 +163,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if request_keys.is_empty() || max_prepares == 0 || self.control_plane.is_none() {
             return Ok(0);
         }
-        let snapshot = self
+        let backend = self
             .metadata_backend
             .as_ref()
-            .expect("metadata backend exists during request recovery")
-            .export_table_snapshot()?;
-        let tables =
-            metadata_tables_from_table_snapshot(snapshot, "DFS request-owned prepare recovery")?;
-        let mut prepares = tables
-            .namespace_prepares
-            .into_values()
-            .filter(|prepare| prepare.status == DfsNamespacePrepareStatus::Prepared)
-            .filter(|prepare| {
-                prepare.completed_request.as_ref().is_some_and(|request| {
-                    request_keys.contains(&(
-                        request.requester_node_id.clone(),
-                        request.request_id.clone(),
-                    ))
-                })
-            })
-            .collect::<Vec<_>>();
+            .expect("metadata backend exists during request recovery");
+        let mut prepares = Vec::new();
+        for (requester_node_id, request_id) in request_keys {
+            let Some(prepare) = backend
+                .get_prepared_namespace_prepare_for_request(requester_node_id, request_id)?
+            else {
+                continue;
+            };
+            prepares.push(prepare);
+        }
         prepares.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
 
         let mut recovered = 0usize;
@@ -654,7 +647,7 @@ mod tests {
             path: current.path.clone(),
             mode: committed.mode,
         };
-        let now = OffsetDateTime::UNIX_EPOCH;
+        let now = OffsetDateTime::from_unix_timestamp(10).expect("request timestamp");
         let pending_request = DfsNamespaceRequestRecord {
             file_system_id: current.file_system_id.clone(),
             requester_node_id: requester.clone(),
@@ -705,19 +698,60 @@ mod tests {
             .metadata_backend
             .as_mut()
             .expect("attached metadata backend");
-        backend
-            .put_namespace_request_on_shard(&DfsMetadataShardId::new("root"), &pending_request)
-            .expect("pending request");
+        for index in 0..5 {
+            let mut foreign_request = pending_request.clone();
+            foreign_request.requester_node_id =
+                node(&format!("node_request_owned_prepare_foreign_{index}"));
+            foreign_request.request_id = format!("request-owned-prepare-foreign-{index}");
+            foreign_request.operation_id = format!("req-request-owned-prepare-foreign-{index}");
+            foreign_request.authority_shard_id = DfsMetadataShardId::new("foreign");
+            foreign_request.command_digest =
+                format!("blake3:request-owned-prepare-foreign-{index}");
+            let timestamp =
+                OffsetDateTime::from_unix_timestamp(index).expect("foreign request timestamp");
+            foreign_request.created_at = timestamp;
+            foreign_request.updated_at = timestamp;
+            backend
+                .put_namespace_request_on_shard(&DfsMetadataShardId::new("root"), &foreign_request)
+                .expect("foreign replica request");
+        }
         backend
             .prepare_namespace_transaction(&prepare)
-            .expect("durable hidden prepare");
+            .expect("fused durable admission and hidden prepare");
+
+        let bounded = service
+            .recover_pending_namespace_requests_bounded(1)
+            .expect("bounded foreign request scan");
+        assert_eq!(bounded.scanned, 0);
+        assert_eq!(bounded.resolved, 0);
+        assert_ne!(
+            bounded.remaining, 0,
+            "an unscanned continuation must keep recovery scheduled"
+        );
+        assert!(
+            service.pending_namespace_request_recovery_cursor.is_some(),
+            "the next pass must resume after the bounded four-page scan"
+        );
+        assert_eq!(
+            service
+                .metadata_backend()
+                .expect("backend")
+                .get_namespace_request(&requester, &pending_request.request_id)
+                .expect("pending request after bounded scan")
+                .expect("durable pending request")
+                .status,
+            DfsNamespaceRequestStatus::Pending
+        );
 
         let report = service
             .recover_pending_namespace_requests_bounded(1)
             .expect("recover exact request-owned prepare");
         assert_eq!(report.scanned, 1);
         assert_eq!(report.resolved, 1);
-        assert_eq!(report.remaining, 0);
+        assert_ne!(
+            report.remaining, 0,
+            "the conservative continuation also accounts for older foreign replica requests"
+        );
         assert!(report.failures.is_empty());
         assert_eq!(
             service
