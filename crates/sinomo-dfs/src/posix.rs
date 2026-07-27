@@ -628,15 +628,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             object.current_locations = vec![self.node_id.clone()];
             set_object_create_timestamps(&mut object);
             let attrs = self.posix_inherit_create_attrs_from_parent_local(&path, attrs, true)?;
-            apply_posix_create_attrs(&mut object, attrs);
+            self.apply_posix_new_directory_metadata(&mut object, attrs)?;
             object.version = next_version(&object.version);
             return self.commit_posix_created_directory(object);
         }
         let mut object = new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::Directory);
-        self.apply_managed_policy_to_new_object(&mut object, 2)?;
         let attrs = self.posix_inherit_create_attrs_from_parent_local(&path, attrs, true)?;
-        apply_posix_create_attrs(&mut object, attrs);
+        self.apply_posix_new_directory_metadata(&mut object, attrs)?;
         self.commit_posix_created_directory(object)
+    }
+
+    fn apply_posix_new_directory_metadata(
+        &mut self,
+        object: &mut DfsObjectMetadata,
+        attrs: DfsPosixCreateAttrs,
+    ) -> Result<()> {
+        // A tombstone deliberately retains the deleted object's metadata. Once
+        // the path is created as a new directory, start from the same durable
+        // policy as a fresh directory before resolving current managed rules.
+        // Otherwise an unmanaged resurrection inherits the dead object's
+        // policy, and a managed resurrection can use it as its fallback.
+        object.policy = DfsObjectPolicy::ReplicatedEventual;
+        self.apply_managed_policy_to_new_object(object, 2)?;
+        apply_posix_create_attrs(object, attrs);
+        Ok(())
     }
 
     pub fn posix_mkdir_all(&mut self, path: &str) -> Result<()> {
@@ -915,6 +930,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     object.link_target_object_id = None;
                     object.current_locations = vec![self.node_id.clone()];
                     set_object_create_timestamps(&mut object);
+                    let attrs = inherit_posix_create_attrs(
+                        DfsPosixCreateAttrs::directory_default(),
+                        true,
+                        parent_for_child.mode,
+                        parent_for_child.gid,
+                    );
+                    self.apply_posix_new_directory_metadata(&mut object, attrs)?;
                     object.version = next_version(&object.version);
                     if let Some(planned_parent) = planned.get_mut(&parent_for_child.path) {
                         touch_directory_for_batched_child(planned_parent, false);
@@ -950,14 +972,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         &current,
                         DfsObjectKind::Directory,
                     );
-                    self.apply_managed_policy_to_new_object(&mut object, 2)?;
                     let attrs = inherit_posix_create_attrs(
                         DfsPosixCreateAttrs::directory_default(),
                         true,
                         parent_for_child.mode,
                         parent_for_child.gid,
                     );
-                    apply_posix_create_attrs(&mut object, attrs);
+                    self.apply_posix_new_directory_metadata(&mut object, attrs)?;
                     if let Some(planned_parent) = planned.get_mut(&parent_for_child.path) {
                         touch_directory_for_batched_child(planned_parent, false);
                     } else {

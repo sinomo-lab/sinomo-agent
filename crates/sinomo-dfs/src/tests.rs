@@ -5728,6 +5728,110 @@ fn mkdir_all_commits_a_missing_chain_in_one_namespace_transaction() {
 }
 
 #[test]
+fn mkdir_all_over_tombstone_uses_new_directory_attributes_and_policy() {
+    let root = temp_root("mkdir-all-tombstone-create-metadata");
+    let node =
+        NodeId::from_legacy_named("node_mkdir_all_tombstone_create_metadata").expect("node id");
+    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let path = "/unmanaged/deleted-file";
+    dfs.posix_mkdir_all("/unmanaged").expect("create parent");
+    let deleted = dfs
+        .posix_write_file_with_create_attrs(
+            path,
+            b"deleted",
+            DfsWriteOptions::replicated_eventual(vec![node]),
+            DfsPosixCreateAttrs::new(0o640, 1001, 1002),
+        )
+        .expect("create file");
+    let mut deleted_metadata = dfs
+        .metadata()
+        .object(&deleted.object_id)
+        .expect("deleted file metadata")
+        .clone();
+    deleted_metadata.policy = DfsObjectPolicy::LocalOwned;
+    dfs.add_object_metadata(deleted_metadata)
+        .expect("install distinct deleted policy");
+    dfs.posix_unlink(path).expect("tombstone file");
+
+    let tombstone = dfs
+        .metadata()
+        .object(&deleted.object_id)
+        .expect("tombstone metadata");
+    assert_eq!(tombstone.kind, DfsObjectKind::Tombstone);
+    assert_eq!(
+        (tombstone.mode, tombstone.uid, tombstone.gid),
+        (0o640, 1001, 1002),
+        "the test must exercise a tombstone retaining the deleted file attributes"
+    );
+    assert_eq!(tombstone.policy, DfsObjectPolicy::LocalOwned);
+
+    dfs.posix_mkdir_all(path)
+        .expect("recreate tombstone as directory");
+    let recreated = dfs.posix_stat(path).expect("recreated directory");
+    assert_eq!(recreated.kind, DfsObjectKind::Directory);
+    assert_eq!(
+        (recreated.mode, recreated.uid, recreated.gid),
+        (0o755, 0, 0),
+        "mkdir-all must apply new-directory attributes instead of the deleted file attributes"
+    );
+    assert_eq!(
+        recreated.policy,
+        DfsObjectPolicy::ReplicatedEventual,
+        "an unmanaged mkdir-all must use the fresh-directory policy fallback"
+    );
+}
+
+#[test]
+fn mkdir_over_tombstone_applies_current_managed_directory_policy() {
+    let root = temp_root("mkdir-tombstone-managed-policy");
+    let node = NodeId::from_legacy_named("node_mkdir_tombstone_managed_policy").expect("node id");
+    let mut dfs = networked_sifs_with_backend(&root, node.clone());
+    let path = "/services/deleted-file";
+    let deleted = dfs
+        .posix_write_file_with_create_attrs(
+            path,
+            b"deleted",
+            DfsWriteOptions::replicated_eventual(vec![node]),
+            DfsPosixCreateAttrs::new(0o600, 2001, 2002),
+        )
+        .expect("create file");
+    let mut deleted_metadata = dfs
+        .metadata()
+        .object(&deleted.object_id)
+        .expect("deleted file metadata")
+        .clone();
+    deleted_metadata.policy = DfsObjectPolicy::LocalOwned;
+    dfs.add_object_metadata(deleted_metadata)
+        .expect("install distinct deleted policy");
+    dfs.posix_unlink(path).expect("tombstone file");
+
+    let mut file_system = dfs
+        .metadata()
+        .filesystems
+        .get(&sifs_file_system_id())
+        .expect("SIFS metadata")
+        .clone();
+    file_system.subtree_policies.push(DfsSubtreePolicy::legacy(
+        path,
+        DfsObjectPolicy::ReplicatedConfirmed,
+    ));
+    dfs.add_file_system(file_system)
+        .expect("install current managed policy");
+
+    let recreated = dfs.posix_mkdir(path).expect("recreate managed directory");
+    assert_eq!(recreated.kind, DfsObjectKind::Directory);
+    assert_eq!(
+        (recreated.mode, recreated.uid, recreated.gid),
+        (0o755, 0, 0)
+    );
+    assert_eq!(
+        recreated.policy,
+        DfsObjectPolicy::ReplicatedConfirmed,
+        "mkdir must resolve the current managed policy instead of retaining the dead object policy"
+    );
+}
+
+#[test]
 fn mkdir_all_existing_deep_chain_uses_linear_metadata_lookups() {
     let root = temp_root("mkdir-all-linear-lookups");
     let node = NodeId::from_legacy_named("node_mkdir_all_linear_lookups").expect("node id");
