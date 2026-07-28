@@ -5484,6 +5484,24 @@ fn served_foreground_write_returns_committed_response_before_replica_repair_comp
             )),
         "foreground served message should return the committed outcome with pending repair jobs"
     );
+    assert!(
+        !result
+            .response
+            .outbound_messages
+            .iter()
+            .any(|message| matches!(
+                &message.message,
+                DfsNetworkMessage::DistributedWriteResponse(DfsDistributedWriteResponse {
+                    request_id: response_request_id,
+                    result:
+                        DfsDistributedWriteResult::Outcome {
+                            outcome: NetworkedDfsWriteOutcome::Pending { .. },
+                        },
+                    ..
+                }) if response_request_id == &request_id
+            )),
+        "a served transport that may return a durable commit before replica repair must not emit a pending response first"
+    );
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -39573,6 +39591,229 @@ fn sifs_cluster_posix_cross_shard_rename_retry_resumes_existing_job() {
             .users_primary
             .posix_read_file("/services/retry-moved.txt")
             .expect("read moved"),
+        bytes
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    cluster.services_primary = services_thread.join().expect("services thread");
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_cross_shard_rename_pending_replay_reconciles_completed_job() {
+    let mut cluster = sifs_two_primary_cluster("sifs-xshard-pending-replay");
+    let ghost =
+        NodeId::from_legacy_named("node_sifs_xshard_pending_replay_ghost").expect("ghost node");
+    let source = "/users/pending-replay.txt";
+    let destination = "/services/pending-replay-moved.txt";
+    let bytes = b"pending durable rename reconciles its completed saga".to_vec();
+    cluster
+        .users_primary
+        .posix_write_file(
+            source,
+            &bytes,
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+                replica_candidates: vec![cluster.users_primary_node.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            },
+        )
+        .expect("primary local create");
+
+    let to_ghost = sifs_two_primary_shard_configs(
+        &cluster.users_primary_node,
+        &ghost,
+        3,
+        vec![
+            cluster.services_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+        vec![
+            cluster.users_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+    );
+    cluster.shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        for shard in &to_ghost {
+            control.put_metadata_shard(shard).expect("ghost shard");
+        }
+    });
+
+    let request_id = "dfs_net_req_xshard_pending_replay".to_string();
+    let command = DfsNamespaceCommand {
+        request_id: request_id.clone(),
+        file_system_id: sifs_file_system_id(),
+        requesting_node_id: cluster.replica_node.clone(),
+        include_metadata_journal_batches: false,
+        metadata_journal_after_sequences: Vec::new(),
+        authority_shards: Vec::new(),
+        operation: DfsNamespaceOperation::Rename {
+            from: source.to_string(),
+            to: destination.to_string(),
+        },
+    };
+    let first = cluster
+        .users_primary
+        .handle_namespace_request(cluster.replica_node.clone(), command.clone())
+        .expect("serve rename while destination primary is unavailable");
+    assert!(matches!(
+        first,
+        NetworkedDfsServiceEvent::RemoteNamespaceServed {
+            result: DfsNamespaceResult::Rejected {
+                posix_error: None,
+                ref reason,
+                ..
+            },
+            ..
+        } if reason.contains("network")
+    ));
+    let pending_request = cluster
+        .users_primary
+        .metadata_backend
+        .as_ref()
+        .expect("metadata backend")
+        .get_namespace_request(&cluster.replica_node, &request_id)
+        .expect("durable namespace request lookup")
+        .expect("pending durable namespace request");
+    assert_eq!(
+        pending_request.status,
+        DfsNamespaceRequestStatus::Pending,
+        "a retryable cross-shard transport failure must preserve the durable admission"
+    );
+    let parked_job = cluster
+        .users_primary
+        .metadata_backend
+        .as_ref()
+        .expect("metadata backend")
+        .list_namespace_jobs_page(None, 16)
+        .expect("namespace jobs")
+        .jobs
+        .into_iter()
+        .find(|job| {
+            job.kind == DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
+                && job.status == DfsNamespaceJobStatus::Running
+                && job.root_path == source
+                && job.target_path.as_deref() == Some(destination)
+        })
+        .expect("parked cross-shard rename job");
+    assert!(
+        parked_job.created_at >= pending_request.created_at,
+        "the saga must belong to this durable admission"
+    );
+    let (moved_object, old_path) = parked_job
+        .pending_frames
+        .iter()
+        .find_map(|frame| match frame {
+            DfsNamespaceJobFrame::CrossShardAdopt {
+                moved_object,
+                old_path,
+                ..
+            } => Some((moved_object.clone(), old_path.clone())),
+            _ => None,
+        })
+        .expect("cross-shard adoption frame");
+    let healed = sifs_two_primary_shard_configs(
+        &cluster.users_primary_node,
+        &cluster.services_primary_node,
+        4,
+        vec![
+            cluster.services_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+        vec![
+            cluster.users_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+    );
+    cluster.shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        for shard in &healed {
+            control.put_metadata_shard(shard).expect("healed shard");
+        }
+    });
+    let services_primary = std::mem::replace(
+        &mut cluster.services_primary,
+        NetworkedDfsService::new(
+            sinomo_core::network::InProcessNetwork::new().add_node(
+                NodeId::from_legacy_named("node_unused_pump_pending_replay").expect("node"),
+            ),
+            LocalContentStore::new(cluster.root.join("unused-content")).expect("content"),
+        ),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&stop);
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+
+    let report = cluster
+        .users_primary
+        .posix_resume_namespace_jobs_bounded(8, 512)
+        .expect("maintenance completes parked rename");
+    assert_eq!(
+        (report.resumed_job_count, report.completed_job_count),
+        (1, 1),
+        "the parked cross-shard rename must complete independently of the outer response: {report:?}"
+    );
+
+    // A second runner can retain the original frames after the first runner
+    // adopted and evicted the source object. It must refresh the destination
+    // authority and treat the adoption as the same idempotent saga.
+    let mut duplicate_runner = NetworkedDfsService::new(
+        cluster.users_primary.transport.clone(),
+        LocalContentStore::new(cluster.root.join("duplicate-runner-content")).expect("content"),
+    )
+    .with_control_plane(cluster.shared_kv.clone())
+    .with_metadata_backend(
+        open_local_sharded_metadata_backend(
+            cluster.root.join("duplicate-runner-metadata"),
+            healed.clone(),
+        )
+        .expect("duplicate runner metadata"),
+    )
+    .expect("attach duplicate runner metadata");
+    duplicate_runner
+        .run_cross_shard_adopt(&moved_object, &old_path)
+        .expect("stale saga runner reconciles adopted destination object");
+
+    // The outer request is still Pending because maintenance completed the
+    // saga without sending its namespace response. An exact replay must use
+    // the completed job as the success witness instead of attempting a fresh
+    // rename from the now-absent source path.
+    let replay = cluster
+        .users_primary
+        .handle_namespace_request(cluster.replica_node.clone(), command)
+        .expect("replay pending durable rename");
+    assert!(matches!(
+        replay,
+        NetworkedDfsServiceEvent::RemoteNamespaceServed {
+            result: DfsNamespaceResult::Applied,
+            ..
+        }
+    ));
+    let completed_request = cluster
+        .users_primary
+        .metadata_backend
+        .as_ref()
+        .expect("metadata backend")
+        .get_namespace_request(&cluster.replica_node, &request_id)
+        .expect("durable namespace request lookup")
+        .expect("completed durable namespace request");
+    assert_eq!(
+        completed_request.status,
+        DfsNamespaceRequestStatus::Completed
+    );
+    assert_eq!(completed_request.result, Some(DfsNamespaceResult::Applied));
+    assert!(matches!(
+        cluster.users_primary.posix_stat(source),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert_eq!(
+        cluster
+            .users_primary
+            .posix_read_file(destination)
+            .expect("read moved file after exact replay"),
         bytes
     );
 

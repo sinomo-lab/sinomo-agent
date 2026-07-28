@@ -507,7 +507,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             intent_id,
                             repair_jobs,
                             ..
-                        } if foreground_replica_repair && !repair_jobs.is_empty() => {
+                        } if foreground_replica_repair
+                            && !repair_jobs.is_empty()
+                            && !self
+                                .transport
+                                .can_return_committed_foreground_response_before_replica_repair() =>
+                        {
                             self.track_pending_remote_write_response(
                                 intent_id,
                                 &requester_node_id,

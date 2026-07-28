@@ -45,9 +45,14 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt as _;
 
+// Notifications make newly committed DFS work cheap to discover, but they are
+// advisory process-local edges. Keep a bounded read-only projection probe so a
+// mutation committed through another process, or racing a consumed edge, cannot
+// leave durable replica work parked indefinitely.
+const DAEMON_DFS_DURABLE_SAFETY_REPROBE_INTERVAL: Duration = Duration::from_secs(30);
 // Durable work that is known but currently cannot run (for example, a repair
-// whose target is offline) gets a bounded read-only re-probe. This is not a
-// periodic maintenance pass: a fully idle projection has no DFS timer at all.
+// whose target is offline) retains its longer retry cadence. The durable safety
+// probe below caps that cadence only for discovering newly committed work.
 const DAEMON_DFS_DEFERRED_WORK_REPROBE_INTERVAL: Duration = Duration::from_secs(300);
 const DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 pub const DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(30);
@@ -1899,14 +1904,20 @@ fn daemon_dfs_maintenance_probe_decision(
         // pass starts or completes.
         Some(DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL)
     } else {
-        work.next_maintenance_deadline_unix_nanos()
+        let projected_delay = work
+            .next_maintenance_deadline_unix_nanos()
             .map(|retry_at| Duration::from_nanos(retry_at.saturating_sub(observed_at_unix_nanos)))
             .into_iter()
             .chain(
                 work.has_deferred_work()
                     .then_some(DAEMON_DFS_DEFERRED_WORK_REPROBE_INTERVAL),
             )
-            .min()
+            .min();
+        Some(
+            projected_delay
+                .unwrap_or(DAEMON_DFS_DURABLE_SAFETY_REPROBE_INTERVAL)
+                .min(DAEMON_DFS_DURABLE_SAFETY_REPROBE_INTERVAL),
+        )
     };
     DaemonDfsMaintenanceProbeDecision {
         trigger_maintenance,
@@ -8921,7 +8932,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_dfs_idle_work_parks_without_a_timer_or_launch() {
+    fn daemon_dfs_idle_work_parks_with_read_only_safety_probe() {
         let observed_at = Instant::now();
         let decision = daemon_dfs_maintenance_probe_decision(
             observed_at,
@@ -8931,7 +8942,13 @@ mod tests {
 
         assert!(!decision.trigger_maintenance);
         assert!(!decision.immediate_continuation);
-        assert_eq!(decision.next_probe_at, None);
+        assert_eq!(
+            decision
+                .next_probe_at
+                .expect("durable safety probe")
+                .duration_since(observed_at),
+            DAEMON_DFS_DURABLE_SAFETY_REPROBE_INTERVAL
+        );
         assert!(
             !daemon_dfs_maintenance_should_launch(true, false),
             "an idle projection must never acquire the DFS lane or distributed lease"
@@ -8939,7 +8956,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_dfs_deferred_work_uses_bounded_read_only_reprobe() {
+    fn daemon_dfs_deferred_work_keeps_durable_safety_reprobe() {
         let observed_at = Instant::now();
         let decision = daemon_dfs_maintenance_probe_decision(
             observed_at,
@@ -8958,7 +8975,7 @@ mod tests {
                 .next_probe_at
                 .expect("deferred work deadline")
                 .duration_since(observed_at),
-            DAEMON_DFS_DEFERRED_WORK_REPROBE_INTERVAL
+            DAEMON_DFS_DURABLE_SAFETY_REPROBE_INTERVAL
         );
     }
 
@@ -8966,7 +8983,7 @@ mod tests {
     fn daemon_dfs_probe_uses_exact_future_repair_retry_deadline() {
         let observed_at = Instant::now();
         let observed_at_unix_nanos = 1_000_000_000;
-        let retry_delay = Duration::from_secs(47);
+        let retry_delay = Duration::from_secs(17);
         let decision = daemon_dfs_maintenance_probe_decision(
             observed_at,
             observed_at_unix_nanos,
@@ -8992,7 +9009,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_dfs_probe_preserves_far_exact_deadline_without_periodic_cap() {
+    fn daemon_dfs_probe_caps_far_deadline_for_new_durable_work() {
         let observed_at = Instant::now();
         let observed_at_unix_nanos = 1_000_000_000;
         let retry_delay = Duration::from_secs(900);
@@ -9016,7 +9033,7 @@ mod tests {
                 .next_probe_at
                 .expect("far repair deadline")
                 .duration_since(observed_at),
-            retry_delay
+            DAEMON_DFS_DURABLE_SAFETY_REPROBE_INTERVAL
         );
     }
 
@@ -9138,8 +9155,15 @@ mod tests {
 
         assert!(!decision.trigger_maintenance);
         assert!(!decision.immediate_continuation);
-        assert_eq!(decision.next_probe_at, None);
-        assert!(!daemon_dfs_maintenance_probe_is_due(observed_at, None));
+        let next_probe_at = decision.next_probe_at.expect("durable safety probe");
+        assert_eq!(
+            next_probe_at.duration_since(observed_at),
+            DAEMON_DFS_DURABLE_SAFETY_REPROBE_INTERVAL
+        );
+        assert!(!daemon_dfs_maintenance_probe_is_due(
+            observed_at,
+            Some(next_probe_at)
+        ));
     }
 
     #[test]
@@ -9157,7 +9181,13 @@ mod tests {
             "foreground preemption alone must not create triggered DFS work"
         );
         assert!(!decision.immediate_continuation);
-        assert_eq!(decision.next_probe_at, None);
+        assert_eq!(
+            decision
+                .next_probe_at
+                .expect("durable safety probe")
+                .duration_since(observed_at),
+            DAEMON_DFS_DURABLE_SAFETY_REPROBE_INTERVAL
+        );
     }
 
     #[test]
@@ -9382,7 +9412,13 @@ mod tests {
         );
         assert!(!cleared.trigger_maintenance);
         assert!(!cleared.immediate_continuation);
-        assert_eq!(cleared.next_probe_at, None);
+        assert_eq!(
+            cleared
+                .next_probe_at
+                .expect("durable safety probe")
+                .duration_since(observed_at),
+            DAEMON_DFS_DURABLE_SAFETY_REPROBE_INTERVAL
+        );
     }
 
     #[test]

@@ -172,6 +172,7 @@ enum DurableNamespaceRequestAdmission {
         shard_id: DfsMetadataShardId,
         record: DfsNamespaceRequestRecord,
         persisted: bool,
+        replaying_pending: bool,
     },
     Replay {
         result: DfsNamespaceResult,
@@ -618,6 +619,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         shard_id: existing.authority_shard_id.clone(),
                         record: existing,
                         persisted: true,
+                        replaying_pending: true,
                     })
                 }
             };
@@ -659,6 +661,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             shard_id,
             record,
             persisted,
+            replaying_pending: false,
         })
     }
 
@@ -1124,6 +1127,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                             shard_id,
                                             record,
                                             persisted: false,
+                                            ..
                                         } => Some((shard_id.clone(), record.clone())),
                                         DurableNamespaceRequestAdmission::Execute { .. }
                                         | DurableNamespaceRequestAdmission::Replay { .. }
@@ -1131,6 +1135,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     },
                                 );
                                 self.active_durable_namespace_prepare_recorded = false;
+                                let replaying_pending_since = durable_execute.as_ref().and_then(
+                                    |admission| match admission {
+                                        DurableNamespaceRequestAdmission::Execute {
+                                            record,
+                                            replaying_pending: true,
+                                            ..
+                                        } => Some(record.created_at),
+                                        DurableNamespaceRequestAdmission::Execute { .. }
+                                        | DurableNamespaceRequestAdmission::Replay { .. }
+                                        | DurableNamespaceRequestAdmission::Reject { .. } => None,
+                                    },
+                                );
                                 self.active_durable_namespace_request = durable_execute
                                     .as_ref()
                                     .and_then(|admission| match admission {
@@ -1194,10 +1210,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         &command.operation,
                                     ),
                                     (Some(_), DfsNamespaceOperation::Rename { from, to }) => self
-                                        .namespace_coordinator_dispatch_rename(
+                                        .namespace_coordinator_dispatch_rename_with_pending_replay(
                                             &command.file_system_id,
                                             from,
                                             to,
+                                            replaying_pending_since,
                                         )
                                         .map(|()| None),
                                     (

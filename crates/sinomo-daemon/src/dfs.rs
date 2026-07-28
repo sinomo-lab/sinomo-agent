@@ -2109,14 +2109,13 @@ fn daemon_dfs_pending_work_from_records(
     let due_repair_attempt_count = eligible_repair_attempt_records
         .iter()
         .filter(|record| {
-            !record.in_flight
-                && record.next_retry_unix_nanos != u64::MAX
+            record.next_retry_unix_nanos != u64::MAX
                 && record.next_retry_unix_nanos <= now_unix_nanos
         })
         .count();
     let next_repair_retry_unix_nanos = eligible_repair_attempt_records
         .iter()
-        .filter(|record| !record.in_flight && record.next_retry_unix_nanos != u64::MAX)
+        .filter(|record| record.next_retry_unix_nanos != u64::MAX)
         .filter_map(|record| {
             (record.next_retry_unix_nanos > now_unix_nanos).then_some(record.next_retry_unix_nanos)
         })
@@ -2142,8 +2141,7 @@ fn daemon_dfs_pending_work_from_records(
     let finite_future_repair_attempt_count = eligible_repair_attempt_records
         .iter()
         .filter(|record| {
-            !record.in_flight
-                && record.next_retry_unix_nanos != u64::MAX
+            record.next_retry_unix_nanos != u64::MAX
                 && record.next_retry_unix_nanos > now_unix_nanos
         })
         .count();
@@ -8654,6 +8652,70 @@ mod tests {
         assert_eq!(pending.unattempted_repair_count, 1);
         assert_eq!(pending.metadata_replica_lag_count, 1);
         assert!(pending.should_trigger_background_maintenance());
+    }
+
+    #[test]
+    fn daemon_dfs_inflight_repair_projects_retry_deadline() {
+        let local_node_id =
+            NodeId::from_legacy_named("node_inflight_repair_local").expect("local node");
+        let target_node_id =
+            NodeId::from_legacy_named("node_inflight_repair_target").expect("target node");
+        let repair = DfsOperatorRepairView {
+            intent_id: "intent-inflight-repair".to_string(),
+            file_system_id: sinomo_dfs::sifs_file_system_id(),
+            object_id: DfsObjectId::from_legacy_named("object_inflight_repair").expect("object id"),
+            version: DfsVersion::from_legacy_named("version_inflight_repair").expect("version"),
+            content_hash: Some("blake3:inflight-repair".to_string()),
+            missing_replica_node_id: target_node_id.clone(),
+        };
+        let attempt = DfsRepairAttemptRecord {
+            intent_id: repair.intent_id.clone(),
+            object_id: repair.object_id.clone(),
+            version: repair.version.clone(),
+            content_hash: repair.content_hash.clone().expect("content hash"),
+            missing_replica_node_id: target_node_id,
+            attempts: 1,
+            in_flight: true,
+            last_attempt_unix_nanos: 1,
+            next_retry_unix_nanos: 100,
+            transfer_request_id: Some("repair-inflight-request".to_string()),
+            last_error: None,
+        };
+        let project = |now_unix_nanos| {
+            daemon_dfs_pending_work_from_records(
+                0,
+                1,
+                0,
+                0,
+                0,
+                &[],
+                &[],
+                &[],
+                std::slice::from_ref(&repair),
+                std::slice::from_ref(&attempt),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &local_node_id,
+                0,
+                now_unix_nanos,
+            )
+        };
+
+        let waiting = project(99);
+        assert_eq!(waiting.due_repair_attempt_count, 0);
+        assert_eq!(waiting.unattempted_repair_count, 0);
+        assert_eq!(waiting.next_repair_retry_unix_nanos, Some(100));
+        assert!(!waiting.should_trigger_background_maintenance());
+        assert!(
+            !waiting.has_deferred_work(),
+            "an in-flight transfer timeout is scheduled work, not parked work"
+        );
+
+        let due = project(100);
+        assert_eq!(due.due_repair_attempt_count, 1);
+        assert_eq!(due.next_repair_retry_unix_nanos, None);
+        assert!(due.should_trigger_background_maintenance());
     }
 
     #[test]

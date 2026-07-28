@@ -294,6 +294,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         from: &str,
         to: &str,
     ) -> posix_model::Result<()> {
+        self.namespace_coordinator_dispatch_rename_with_pending_replay(
+            file_system_id,
+            from,
+            to,
+            None,
+        )
+    }
+
+    pub(crate) fn namespace_coordinator_dispatch_rename_with_pending_replay(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        from: &str,
+        to: &str,
+        pending_request_created_at: Option<time::OffsetDateTime>,
+    ) -> posix_model::Result<()> {
         if self.routed_namespace_settle_depth >= DFS_MAX_NESTED_NAMESPACE_COORDINATION_DEPTH {
             return Err(posix_model::DfsPosixError::Dfs(DfsError::Busy {
                 path: from.to_string(),
@@ -313,6 +328,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries,
             ],
         )? {
+            return Ok(());
+        }
+        if let Some(created_at) = pending_request_created_at
+            && self.completed_cross_shard_namespace_job_for_paths_since(
+                file_system_id,
+                from,
+                to,
+                &[
+                    DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries,
+                    DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries,
+                ],
+                created_at,
+            )?
+        {
+            // The source-side operation can finish its durable saga before a
+            // response retry observes and completes the outer durable request.
+            // A completed job created by this same pending admission is the
+            // canonical success witness; do not reinterpret the exact replay
+            // as a fresh rename after the source path has been evicted.
             return Ok(());
         }
         let destination_primary =

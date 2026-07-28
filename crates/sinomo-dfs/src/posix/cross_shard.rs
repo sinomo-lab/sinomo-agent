@@ -395,14 +395,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// state: a saga that parked (transport failure) may resume after
     /// pre-existing writes settled, so the snapshot recorded at job creation
     /// cannot be trusted. Idempotent against already-applied adoptions.
-    fn run_cross_shard_adopt(
+    pub(crate) fn run_cross_shard_adopt(
         &mut self,
         frame_object: &DfsObjectMetadata,
         old_path: &str,
     ) -> Result<()> {
         let old_path = normalize_posix_path(old_path)?;
         let target_path = normalize_posix_path(&frame_object.path)?;
-        let Some(current) = self.object_by_id(&frame_object.object_id)? else {
+        let mut current = self.object_by_id(&frame_object.object_id)?;
+        if current
+            .as_ref()
+            .is_none_or(|current| current.kind == DfsObjectKind::Tombstone)
+        {
+            // A duplicate saga runner can retain the adoption frame after
+            // another runner has already adopted and evicted the source-side
+            // object. Refresh the destination authority before classifying
+            // that exact replay as a missing source.
+            self.sync_remote_namespace_path(&target_path)?;
+            current = self.object_by_id(&frame_object.object_id)?;
+        }
+        let Some(current) = current else {
             return Err(DfsPosixError::NotFound { path: old_path });
         };
         if current.kind == DfsObjectKind::Tombstone {
@@ -1117,6 +1129,44 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target_path: &str,
         kinds: &[DfsNamespaceJobKind],
     ) -> Result<Option<DfsNamespaceJobRecord>> {
+        self.cross_shard_namespace_job_for_paths(
+            file_system_id,
+            root_path,
+            target_path,
+            kinds,
+            DfsNamespaceJobStatus::Running,
+            None,
+        )
+    }
+
+    pub(crate) fn completed_cross_shard_namespace_job_for_paths_since(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        root_path: &str,
+        target_path: &str,
+        kinds: &[DfsNamespaceJobKind],
+        created_at: time::OffsetDateTime,
+    ) -> Result<bool> {
+        self.cross_shard_namespace_job_for_paths(
+            file_system_id,
+            root_path,
+            target_path,
+            kinds,
+            DfsNamespaceJobStatus::Completed,
+            Some(created_at),
+        )
+        .map(|job| job.is_some())
+    }
+
+    fn cross_shard_namespace_job_for_paths(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        root_path: &str,
+        target_path: &str,
+        kinds: &[DfsNamespaceJobKind],
+        status: DfsNamespaceJobStatus,
+        created_at_not_before: Option<time::OffsetDateTime>,
+    ) -> Result<Option<DfsNamespaceJobRecord>> {
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok(None);
         };
@@ -1134,8 +1184,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .list_namespace_jobs_page(cursor, POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE)?;
             for job in page.jobs {
                 if job.file_system_id != *file_system_id
-                    || job.status != DfsNamespaceJobStatus::Running
+                    || job.status != status
                     || !kinds.contains(&job.kind)
+                    || created_at_not_before.is_some_and(|created_at| job.created_at < created_at)
                 {
                     continue;
                 }
