@@ -5,19 +5,22 @@
 //! metadata behavior; this layer only turns table batches and snapshots into a
 //! durable `DfsMetadataTables` image.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 
+use serde::ser::{SerializeSeq, SerializeStruct};
+use serde::{Serialize, Serializer};
 use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
 use sinomo_core::storage::durable_file;
 use time::OffsetDateTime;
 
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_io::{
-    create_dir_all, metadata_durable_file_error, read_dir, read_sobj, read_sobj_tree, sync_dir,
-    write_sobj_atomic,
+    create_dir_all, encode_sobj, metadata_durable_file_error, read_dir, read_sobj, read_sobj_tree,
+    remove_file_if_exists, sync_dir, write_file_atomic,
 };
 use crate::metadata_keys::path_record_for_object;
 use crate::metadata_records::{
@@ -32,7 +35,7 @@ use crate::metadata_tables::{
     DfsMetadataTableState, DfsMetadataTables, MetadataTableReplay,
     MetadataTableSnapshotFingerprint, max_optional_sequence,
 };
-use crate::{DfsFileSystem, DfsObjectKind, DfsObjectMetadata};
+use crate::{DfsFileSystem, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion};
 
 pub(crate) const LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 1;
 pub(crate) const METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 2;
@@ -49,6 +52,12 @@ pub(crate) fn metadata_table_path(root: &Path) -> PathBuf {
 
 pub(crate) fn metadata_table_snapshot_path(root: &Path) -> PathBuf {
     root.join("records").join("tables").join("snapshot.sobj")
+}
+
+pub(crate) fn metadata_table_checkpoint_log_path(root: &Path) -> PathBuf {
+    root.join("records")
+        .join("tables")
+        .join("materialized.checkpoint.slog")
 }
 
 pub(crate) fn load_or_migrate_metadata_tables(root: &Path) -> Result<DfsMetadataTableState> {
@@ -98,9 +107,33 @@ fn read_metadata_table_state_with_tail_policy(
     truncate_torn_tail: bool,
 ) -> Result<DfsMetadataTableState> {
     let mut state = read_metadata_table_snapshot(root)?;
+    let checkpoint_path = metadata_table_checkpoint_log_path(root);
+    if checkpoint_path.is_file() {
+        let replay = replay_metadata_table_batches_after_checkpoint_from(
+            &checkpoint_path,
+            0,
+            state.materialized_through_sequence,
+            &mut state.tables,
+        )?;
+        state.materialized_through_sequence = max_optional_sequence(
+            state.materialized_through_sequence,
+            replay.materialized_through_sequence,
+        );
+        if replay.prefix_proof.is_some() {
+            state.prefix_proof = replay.prefix_proof;
+        }
+        if truncate_torn_tail {
+            truncate_torn_metadata_table_log_tail(&checkpoint_path, replay.offset)?;
+        }
+    }
     let table_path = metadata_table_path(root);
     if table_path.is_file() {
-        let replay = replay_metadata_table_batches_from(&table_path, 0, &mut state.tables)?;
+        let replay = replay_metadata_table_batches_after_checkpoint_from(
+            &table_path,
+            0,
+            state.materialized_through_sequence,
+            &mut state.tables,
+        )?;
         state.table_log_offset = replay.offset;
         state.materialized_through_sequence = max_optional_sequence(
             state.materialized_through_sequence,
@@ -113,6 +146,31 @@ fn read_metadata_table_state_with_tail_policy(
             truncate_torn_metadata_table_log_tail(&table_path, state.table_log_offset)?;
         }
     }
+    Ok(state)
+}
+
+/// Read the immutable snapshot plus the table-log generation rotated for one
+/// background checkpoint, excluding the active log where newer writes land.
+pub(crate) fn read_metadata_table_checkpoint_state(root: &Path) -> Result<DfsMetadataTableState> {
+    let mut state = read_metadata_table_snapshot(root)?;
+    let checkpoint_path = metadata_table_checkpoint_log_path(root);
+    if !checkpoint_path.is_file() {
+        return Ok(state);
+    }
+    let replay = replay_metadata_table_batches_after_checkpoint_from(
+        &checkpoint_path,
+        0,
+        state.materialized_through_sequence,
+        &mut state.tables,
+    )?;
+    state.materialized_through_sequence = max_optional_sequence(
+        state.materialized_through_sequence,
+        replay.materialized_through_sequence,
+    );
+    if replay.prefix_proof.is_some() {
+        state.prefix_proof = replay.prefix_proof;
+    }
+    state.table_log_offset = 0;
     Ok(state)
 }
 
@@ -238,6 +296,15 @@ pub(crate) fn replay_metadata_table_batches_from(
     offset: u64,
     tables: &mut DfsMetadataTables,
 ) -> Result<MetadataTableReplay> {
+    replay_metadata_table_batches_after_checkpoint_from(path, offset, None, tables)
+}
+
+fn replay_metadata_table_batches_after_checkpoint_from(
+    path: &Path,
+    offset: u64,
+    checkpoint_sequence: Option<u64>,
+    tables: &mut DfsMetadataTables,
+) -> Result<MetadataTableReplay> {
     let mut file = fs::File::open(path).map_err(|source| MetadataBackendError::Io {
         path: path.to_owned(),
         source,
@@ -262,12 +329,13 @@ pub(crate) fn replay_metadata_table_batches_from(
             path: path.to_owned(),
             source,
         })?;
-    replay_metadata_table_batches(&mut file, path, tables)
+    replay_metadata_table_batches(&mut file, path, checkpoint_sequence, tables)
 }
 
 fn replay_metadata_table_batches(
     file: &mut fs::File,
     path: &Path,
+    checkpoint_sequence: Option<u64>,
     tables: &mut DfsMetadataTables,
 ) -> Result<MetadataTableReplay> {
     let mut offset = file
@@ -317,8 +385,10 @@ fn replay_metadata_table_batches(
             }
             prefix_proof = Some(proof.clone());
         }
-        for op in batch.ops {
-            tables.apply(op);
+        if checkpoint_sequence.is_none_or(|checkpoint| batch.sequence > checkpoint) {
+            for op in batch.ops {
+                tables.apply(op);
+            }
         }
         // Only advance past fully decoded records: a torn record at the tail
         // must leave the cursor at the last complete-record boundary.
@@ -386,6 +456,309 @@ pub(crate) fn append_metadata_table_batch(
     Ok(record_bytes)
 }
 
+/// Rotate the active materialized log into an immutable checkpoint generation.
+///
+/// The metadata writer lock must be held by the caller. Reopen always replays
+/// the checkpoint generation before the active log, so a crash after the
+/// rename and before a worker finishes loses no table state.
+pub(crate) fn rotate_metadata_table_log_for_checkpoint(
+    root: &Path,
+    max_log_bytes: u64,
+) -> Result<bool> {
+    let checkpoint_path = metadata_table_checkpoint_log_path(root);
+    if checkpoint_path.is_file() {
+        return Ok(true);
+    }
+    let active_path = metadata_table_path(root);
+    let len = match fs::metadata(&active_path) {
+        Ok(metadata) => metadata.len(),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(MetadataBackendError::Io {
+                path: active_path.clone(),
+                source,
+            });
+        }
+    };
+    if len <= max_log_bytes {
+        return Ok(false);
+    }
+    if let Some(parent) = active_path.parent() {
+        create_dir_all(parent.to_path_buf())?;
+    }
+    fs::rename(&active_path, &checkpoint_path).map_err(|source| MetadataBackendError::Io {
+        path: active_path.clone(),
+        source,
+    })?;
+    if let Some(parent) = active_path.parent() {
+        sync_dir(parent)?;
+    }
+    // New writes may resume immediately in a distinct generation while the
+    // worker decodes and serializes the immutable checkpoint log.
+    write_file_atomic(&active_path, &[])?;
+    Ok(true)
+}
+
+pub(crate) fn install_encoded_metadata_table_snapshot(
+    root: &Path,
+    snapshot_bytes: &[u8],
+) -> Result<()> {
+    write_file_atomic(&metadata_table_snapshot_path(root), snapshot_bytes)
+}
+
+pub(crate) fn remove_metadata_table_checkpoint_log(root: &Path) -> Result<()> {
+    remove_file_if_exists(&metadata_table_checkpoint_log_path(root))
+}
+
+struct BorrowedMapValues<'a, K, V>(&'a BTreeMap<K, V>);
+
+impl<K, V> Serialize for BorrowedMapValues<'_, K, V>
+where
+    K: Ord,
+    V: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for value in self.0.values() {
+            sequence.serialize_element(value)?;
+        }
+        sequence.end()
+    }
+}
+
+struct BorrowedHardlinkValues<'a>(&'a DfsMetadataTables);
+
+#[derive(Serialize)]
+struct BorrowedHardlinkSnapshotRecord<'a> {
+    target_object_id: &'a DfsObjectId,
+    hardlink_object_id: &'a DfsObjectId,
+    path_record: &'a DfsPathRecord,
+}
+
+impl Serialize for BorrowedHardlinkValues<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.hardlinks.len()))?;
+        for ((target_object_id, hardlink_object_id), path_record) in &self.0.hardlinks {
+            sequence.serialize_element(&BorrowedHardlinkSnapshotRecord {
+                target_object_id,
+                hardlink_object_id,
+                path_record,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+struct BorrowedVisibleCommitValues<'a>(&'a DfsMetadataTables);
+
+#[derive(Serialize)]
+struct BorrowedVisibleCommitSnapshotRecord<'a> {
+    object_id: &'a DfsObjectId,
+    version: &'a DfsVersion,
+    commit: &'a DfsVisibleVersionCommitRecord,
+}
+
+impl Serialize for BorrowedVisibleCommitValues<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.visible_commits.len()))?;
+        for ((object_id, version), commit) in &self.0.visible_commits {
+            sequence.serialize_element(&BorrowedVisibleCommitSnapshotRecord {
+                object_id,
+                version,
+                commit,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+struct BorrowedMetadataTableSnapshotTables<'a>(&'a DfsMetadataTables);
+
+impl Serialize for BorrowedMetadataTableSnapshotTables<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let tables = self.0;
+        let field_count = 1 + [
+            !tables.file_systems.is_empty(),
+            !tables.objects.is_empty(),
+            !tables.file_system_objects.is_empty(),
+            !tables.paths.is_empty(),
+            !tables.inodes.is_empty(),
+            !tables.dirfrags.is_empty(),
+            !tables.dentries.is_empty(),
+            !tables.hardlinks.is_empty(),
+            !tables.compacted_tombstones.is_empty(),
+            !tables.versions.is_empty(),
+            !tables.receipts.is_empty(),
+            !tables.intents.is_empty(),
+            !tables.conflicts.is_empty(),
+            !tables.advisory_lock_states.is_empty(),
+            !tables.visible_commits.is_empty(),
+            !tables.namespace_transactions.is_empty(),
+            !tables.namespace_transaction_receipts.is_empty(),
+            !tables.namespace_prepares.is_empty(),
+            !tables.namespace_prepare_receipts.is_empty(),
+            !tables.namespace_jobs.is_empty(),
+            !tables.namespace_request_receipts.is_empty(),
+            !tables.namespace_receipt_retention.is_empty(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+        let mut state =
+            serializer.serialize_struct("DfsMetadataTableSnapshotTables", field_count)?;
+        if !tables.file_systems.is_empty() {
+            state.serialize_field("file_systems", &BorrowedMapValues(&tables.file_systems))?;
+        }
+        if !tables.objects.is_empty() {
+            state.serialize_field("objects", &BorrowedMapValues(&tables.objects))?;
+        }
+        if !tables.file_system_objects.is_empty() {
+            state.serialize_field(
+                "file_system_objects",
+                &BorrowedMapValues(&tables.file_system_objects),
+            )?;
+        }
+        if !tables.paths.is_empty() {
+            state.serialize_field("paths", &BorrowedMapValues(&tables.paths))?;
+        }
+        if !tables.inodes.is_empty() {
+            state.serialize_field("inodes", &BorrowedMapValues(&tables.inodes))?;
+        }
+        if !tables.dirfrags.is_empty() {
+            state.serialize_field("dirfrags", &BorrowedMapValues(&tables.dirfrags))?;
+        }
+        if !tables.dentries.is_empty() {
+            state.serialize_field("dentries", &BorrowedMapValues(&tables.dentries))?;
+        }
+        if !tables.hardlinks.is_empty() {
+            state.serialize_field("hardlinks", &BorrowedHardlinkValues(tables))?;
+        }
+        if !tables.compacted_tombstones.is_empty() {
+            state.serialize_field(
+                "compacted_tombstones",
+                &BorrowedMapValues(&tables.compacted_tombstones),
+            )?;
+        }
+        if !tables.versions.is_empty() {
+            state.serialize_field("versions", &BorrowedMapValues(&tables.versions))?;
+        }
+        if !tables.receipts.is_empty() {
+            state.serialize_field("receipts", &BorrowedMapValues(&tables.receipts))?;
+        }
+        if !tables.intents.is_empty() {
+            state.serialize_field("intents", &BorrowedMapValues(&tables.intents))?;
+        }
+        if !tables.conflicts.is_empty() {
+            state.serialize_field("conflicts", &BorrowedMapValues(&tables.conflicts))?;
+        }
+        if !tables.advisory_lock_states.is_empty() {
+            state.serialize_field(
+                "advisory_lock_states",
+                &BorrowedMapValues(&tables.advisory_lock_states),
+            )?;
+        }
+        if !tables.visible_commits.is_empty() {
+            state.serialize_field("visible_commits", &BorrowedVisibleCommitValues(tables))?;
+        }
+        if !tables.namespace_transactions.is_empty() {
+            state.serialize_field(
+                "namespace_transactions",
+                &BorrowedMapValues(&tables.namespace_transactions),
+            )?;
+        }
+        if !tables.namespace_transaction_receipts.is_empty() {
+            state.serialize_field(
+                "namespace_transaction_receipts",
+                &BorrowedMapValues(&tables.namespace_transaction_receipts),
+            )?;
+        }
+        if !tables.namespace_prepares.is_empty() {
+            state.serialize_field(
+                "namespace_prepares",
+                &BorrowedMapValues(&tables.namespace_prepares),
+            )?;
+        }
+        if !tables.namespace_prepare_receipts.is_empty() {
+            state.serialize_field(
+                "namespace_prepare_receipts",
+                &BorrowedMapValues(&tables.namespace_prepare_receipts),
+            )?;
+        }
+        if !tables.namespace_jobs.is_empty() {
+            state.serialize_field("namespace_jobs", &BorrowedMapValues(&tables.namespace_jobs))?;
+        }
+        if !tables.namespace_request_receipts.is_empty() {
+            state.serialize_field(
+                "namespace_request_receipts",
+                &BorrowedMapValues(&tables.namespace_request_receipts),
+            )?;
+        }
+        if !tables.namespace_receipt_retention.is_empty() {
+            state.serialize_field(
+                "namespace_receipt_retention",
+                &tables.namespace_receipt_retention,
+            )?;
+        }
+        state.serialize_field(
+            "namespace_requests",
+            &BorrowedMapValues(&tables.namespace_requests),
+        )?;
+        state.end()
+    }
+}
+
+struct BorrowedMetadataTableSnapshot<'a> {
+    format_version: u16,
+    materialized_through_sequence: Option<u64>,
+    tables: &'a DfsMetadataTables,
+    semantic_state_fingerprint: Option<&'a str>,
+    prefix_proof: Option<&'a DfsMetadataPrefixProof>,
+}
+
+impl Serialize for BorrowedMetadataTableSnapshot<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let field_count = 2
+            + usize::from(self.materialized_through_sequence.is_some())
+            + usize::from(self.semantic_state_fingerprint.is_some())
+            + usize::from(self.prefix_proof.is_some());
+        let mut state = serializer.serialize_struct("DfsMetadataTableSnapshot", field_count)?;
+        state.serialize_field("format_version", &self.format_version)?;
+        if self.materialized_through_sequence.is_some() {
+            state.serialize_field(
+                "materialized_through_sequence",
+                &self.materialized_through_sequence,
+            )?;
+        }
+        let borrowed_tables = Some(BorrowedMetadataTableSnapshotTables(self.tables));
+        state.serialize_field("tables", &borrowed_tables)?;
+        if self.semantic_state_fingerprint.is_some() {
+            state.serialize_field(
+                "semantic_state_fingerprint",
+                &self.semantic_state_fingerprint,
+            )?;
+        }
+        if self.prefix_proof.is_some() {
+            state.serialize_field("prefix_proof", &self.prefix_proof)?;
+        }
+        state.end()
+    }
+}
+
 pub(crate) fn persist_metadata_table_snapshot(
     root: &Path,
     tables: &DfsMetadataTables,
@@ -401,21 +774,46 @@ pub(crate) fn persist_metadata_table_snapshot(
             proof.journal_sequence
         )));
     }
-    let mut snapshot = DfsMetadataTableSnapshot {
+    let snapshot_bytes =
+        encode_metadata_table_snapshot(tables, materialized_through_sequence, prefix_proof)?;
+    write_file_atomic(&metadata_table_snapshot_path(root), &snapshot_bytes)?;
+    truncate_metadata_table_log(root)?;
+    remove_metadata_table_checkpoint_log(root)?;
+    Ok(())
+}
+
+pub(crate) fn encode_metadata_table_snapshot(
+    tables: &DfsMetadataTables,
+    materialized_through_sequence: Option<u64>,
+    prefix_proof: Option<&DfsMetadataPrefixProof>,
+) -> Result<Vec<u8>> {
+    if let Some(proof) = prefix_proof
+        && (!proof.is_well_formed()
+            || Some(proof.journal_sequence) != materialized_through_sequence)
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "cannot encode metadata snapshot sequence {materialized_through_sequence:?} with prefix proof sequence {}",
+            proof.journal_sequence
+        )));
+    }
+    let semantic_snapshot = BorrowedMetadataTableSnapshot {
         format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
         materialized_through_sequence,
-        tables: Some(metadata_tables_snapshot(tables)),
-        ops: Vec::new(),
         semantic_state_fingerprint: None,
-        prefix_proof: prefix_proof.cloned(),
+        prefix_proof: None,
+        tables,
     };
-    snapshot.semantic_state_fingerprint = Some(
-        dfs_metadata_table_snapshot_state_fingerprint(&snapshot)
-            .map_err(|source| MetadataBackendError::Serde(source.to_string()))?,
-    );
-    write_sobj_atomic(&metadata_table_snapshot_path(root), &snapshot)?;
-    truncate_metadata_table_log(root)?;
-    Ok(())
+    let encoded = serde_json::to_vec(&semantic_snapshot)
+        .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
+    let semantic_state_fingerprint = format!("blake3:{}", blake3::hash(&encoded).to_hex());
+    let snapshot = BorrowedMetadataTableSnapshot {
+        format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+        materialized_through_sequence,
+        tables,
+        semantic_state_fingerprint: Some(&semantic_state_fingerprint),
+        prefix_proof,
+    };
+    encode_sobj(&snapshot)
 }
 
 pub(crate) fn metadata_tables_snapshot(
@@ -458,14 +856,31 @@ pub(crate) fn metadata_tables_snapshot(
             )
             .collect(),
         namespace_transactions: tables.namespace_transactions.values().cloned().collect(),
+        namespace_transaction_receipts: tables
+            .namespace_transaction_receipts
+            .values()
+            .cloned()
+            .collect(),
         namespace_prepares: tables.namespace_prepares.values().cloned().collect(),
+        namespace_prepare_receipts: tables
+            .namespace_prepare_receipts
+            .values()
+            .cloned()
+            .collect(),
         namespace_jobs: tables.namespace_jobs.values().cloned().collect(),
+        namespace_request_receipts: tables
+            .namespace_request_receipts
+            .values()
+            .cloned()
+            .collect(),
+        namespace_receipt_retention: tables.namespace_receipt_retention.clone(),
         namespace_requests: tables.namespace_requests.values().cloned().collect(),
     }
 }
 
 fn metadata_tables_from_snapshot(snapshot: DfsMetadataTableSnapshotTables) -> DfsMetadataTables {
     let mut tables = DfsMetadataTables::default();
+    tables.namespace_receipt_retention = snapshot.namespace_receipt_retention;
     for file_system in snapshot.file_systems {
         tables.apply(DfsMetadataTableOp::PutFileSystem { file_system });
     }
@@ -522,14 +937,23 @@ fn metadata_tables_from_snapshot(snapshot: DfsMetadataTableSnapshotTables) -> Df
     for transaction in snapshot.namespace_transactions {
         tables.apply(DfsMetadataTableOp::PutNamespaceTransaction { transaction });
     }
+    for receipt in snapshot.namespace_transaction_receipts {
+        tables.apply(DfsMetadataTableOp::PutNamespaceTransactionReceipt { receipt });
+    }
     for prepare in snapshot.namespace_prepares {
         tables.apply(DfsMetadataTableOp::PutNamespacePrepare { prepare });
+    }
+    for receipt in snapshot.namespace_prepare_receipts {
+        tables.apply(DfsMetadataTableOp::PutNamespacePrepareReceipt { receipt });
     }
     for job in snapshot.namespace_jobs {
         tables.apply(DfsMetadataTableOp::PutNamespaceJob { job });
     }
     for request in snapshot.namespace_requests {
         tables.apply(DfsMetadataTableOp::PutNamespaceRequest { request });
+    }
+    for receipt in snapshot.namespace_request_receipts {
+        tables.apply(DfsMetadataTableOp::PutNamespaceRequestReceipt { receipt });
     }
     tables
 }

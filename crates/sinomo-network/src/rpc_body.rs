@@ -166,6 +166,82 @@ pub(crate) trait ObjectRpcBodyReceiver: fmt::Debug + Send {
     fn recv_chunk(&mut self) -> ObjectRpcBodyReceiverFuture<'_>;
 }
 
+/// Bounded test-support producer for an application-visible incoming body.
+///
+/// Production bodies are created by the owned object-RPC record reader. This
+/// helper lets higher-layer integration tests prove streaming and backpressure
+/// contracts without exposing transport-private receiver traits.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct ObjectRpcTestBodySender {
+    sender: tokio::sync::mpsc::Sender<ObjectRpcBodyChunk>,
+}
+
+#[cfg(feature = "test-support")]
+impl ObjectRpcTestBodySender {
+    /// Returns the remaining bounded receiver capacity in whole chunks.
+    ///
+    /// This test-only observer lets higher-layer streaming tests assert that
+    /// backpressure reaches their public read boundary without exposing
+    /// production transport-ring internals.
+    pub fn available_chunk_capacity(&self) -> usize {
+        self.sender.capacity()
+    }
+
+    pub async fn send(&self, bytes: Vec<u8>) -> Result<(), NetworkError> {
+        self.send_chunk(ObjectRpcBodyChunk::bytes(Bytes::from(bytes)))
+            .await
+    }
+
+    /// Transfers one ownership-bearing chunk into the bounded test body.
+    pub async fn send_chunk(&self, chunk: ObjectRpcBodyChunk) -> Result<(), NetworkError> {
+        if chunk.len() > BODY_CHUNK_MAX {
+            return Err(NetworkError::FrameTooLarge {
+                actual_bytes: chunk.len(),
+                max_bytes: BODY_CHUNK_MAX,
+            });
+        }
+        self.sender.send(chunk).await.map_err(|_| NetworkError::Io {
+            operation: "send test object RPC body chunk".to_string(),
+            detail: "incoming test body was dropped".to_string(),
+        })
+    }
+
+    pub fn try_send(&self, bytes: Vec<u8>) -> Result<bool, NetworkError> {
+        if bytes.len() > BODY_CHUNK_MAX {
+            return Err(NetworkError::FrameTooLarge {
+                actual_bytes: bytes.len(),
+                max_bytes: BODY_CHUNK_MAX,
+            });
+        }
+        match self
+            .sender
+            .try_send(ObjectRpcBodyChunk::bytes(Bytes::from(bytes)))
+        {
+            Ok(()) => Ok(true),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(false),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(NetworkError::Io {
+                operation: "send test object RPC body chunk".to_string(),
+                detail: "incoming test body was dropped".to_string(),
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+struct TestChannelBodyReceiver {
+    receiver: tokio::sync::mpsc::Receiver<ObjectRpcBodyChunk>,
+}
+
+#[cfg(feature = "test-support")]
+impl ObjectRpcBodyReceiver for TestChannelBodyReceiver {
+    fn recv_chunk(&mut self) -> ObjectRpcBodyReceiverFuture<'_> {
+        Box::pin(async move { Ok(self.receiver.recv().await) })
+    }
+}
+
 #[derive(Debug)]
 struct BodyChunkCursor {
     chunk: Option<ObjectRpcBodyChunk>,
@@ -1724,6 +1800,21 @@ impl ObjectRpcIncomingBody {
             role: ObjectRpcBodyRole::Attachment,
             multiplexed_terminal: None,
         }
+    }
+
+    /// Creates a bounded, incrementally produced incoming body for cross-crate
+    /// streaming tests.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_channel(
+        total_bytes: Option<u64>,
+        buffered_chunks: usize,
+    ) -> (ObjectRpcTestBodySender, Self) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(buffered_chunks.max(1));
+        (
+            ObjectRpcTestBodySender { sender },
+            Self::receiver(total_bytes, Box::new(TestChannelBodyReceiver { receiver })),
+        )
     }
 
     pub(crate) fn multiplexed_chunk_ring_with_depth(

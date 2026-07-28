@@ -4346,6 +4346,220 @@ pub(crate) fn select_metadata_shard_config_for_path_strict_default_sifs_split(
     select_metadata_shard_config_for_path_with_options(file_system_id, shards, path, true)
 }
 
+/// Immutable path-routing index for one metadata topology generation.
+///
+/// Control-plane helpers above intentionally accept arbitrary slices and are
+/// convenient for one-off validation. Long-lived metadata backends should
+/// compile the catalog once: prefix routing then costs O(path depth), while
+/// hash-range routing is a binary search over disjoint winner intervals.
+#[derive(Clone, Debug)]
+pub(crate) struct DfsMetadataShardRoutingIndex {
+    file_system_id: DfsFileSystemId,
+    root_shard_id: Option<String>,
+    prefix_root: MetadataPathPrefixNode,
+    hash_intervals: Vec<MetadataHashRoutingInterval>,
+    saw_default_sifs_split_shard: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MetadataPathPrefixNode {
+    shard_id: Option<String>,
+    children: BTreeMap<String, MetadataPathPrefixNode>,
+}
+
+#[derive(Clone, Debug)]
+struct MetadataHashRoutingInterval {
+    start_inclusive: u128,
+    end_exclusive: u128,
+    shard_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct MetadataHashRoutingCandidate {
+    start_inclusive: u128,
+    end_exclusive: u128,
+    width: u128,
+    shard_id: String,
+}
+
+impl DfsMetadataShardRoutingIndex {
+    pub(crate) fn new(
+        file_system_id: DfsFileSystemId,
+        shards: &[DfsMetadataShardConfig],
+    ) -> Result<Self, KvError> {
+        let mut root_shard_id = None::<String>;
+        let mut prefix_root = MetadataPathPrefixNode::default();
+        let mut hash_candidates = Vec::new();
+        let mut saw_default_sifs_split_shard = false;
+        let hash_space_end = u128::from(u64::MAX) + 1;
+
+        for shard in shards
+            .iter()
+            .filter(|shard| shard.file_system_id == file_system_id)
+        {
+            match &shard.assignment {
+                DfsMetadataShardAssignment::Root => {
+                    if root_shard_id
+                        .as_ref()
+                        .is_none_or(|current| shard.shard_id.as_str() < current.as_str())
+                    {
+                        root_shard_id = Some(shard.shard_id.clone());
+                    }
+                }
+                DfsMetadataShardAssignment::PathPrefix { prefix } => {
+                    let prefix = normalize_metadata_selection_path(prefix)?;
+                    if matches!(prefix.as_str(), SIFS_SERVICES_PATH | SIFS_USERS_PATH) {
+                        saw_default_sifs_split_shard = true;
+                    }
+                    let mut node = &mut prefix_root;
+                    for component in prefix
+                        .trim_start_matches('/')
+                        .split('/')
+                        .filter(|component| !component.is_empty())
+                    {
+                        node = node.children.entry(component.to_string()).or_default();
+                    }
+                    if node
+                        .shard_id
+                        .as_ref()
+                        .is_none_or(|current| shard.shard_id.as_str() < current.as_str())
+                    {
+                        node.shard_id = Some(shard.shard_id.clone());
+                    }
+                }
+                DfsMetadataShardAssignment::NameHashRange {
+                    start_inclusive,
+                    end_exclusive,
+                } => {
+                    if start_inclusive == end_exclusive {
+                        continue;
+                    }
+                    let width = metadata_hash_range_width(*start_inclusive, *end_exclusive);
+                    let start = u128::from(*start_inclusive);
+                    let end = u128::from(*end_exclusive);
+                    let mut push_candidate = |start_inclusive: u128, end_exclusive: u128| {
+                        if start_inclusive < end_exclusive {
+                            hash_candidates.push(MetadataHashRoutingCandidate {
+                                start_inclusive,
+                                end_exclusive,
+                                width,
+                                shard_id: shard.shard_id.clone(),
+                            });
+                        }
+                    };
+                    if start_inclusive < end_exclusive {
+                        push_candidate(start, end);
+                    } else {
+                        push_candidate(start, hash_space_end);
+                        push_candidate(0, end);
+                    }
+                }
+            }
+        }
+
+        let mut endpoints = Vec::with_capacity(hash_candidates.len().saturating_mul(2) + 2);
+        endpoints.push(0);
+        endpoints.push(hash_space_end);
+        for candidate in &hash_candidates {
+            endpoints.push(candidate.start_inclusive);
+            endpoints.push(candidate.end_exclusive);
+        }
+        endpoints.sort_unstable();
+        endpoints.dedup();
+
+        let mut hash_intervals = Vec::<MetadataHashRoutingInterval>::new();
+        for endpoints in endpoints.windows(2) {
+            let start_inclusive = endpoints[0];
+            let end_exclusive = endpoints[1];
+            let winner = hash_candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.start_inclusive <= start_inclusive
+                        && start_inclusive < candidate.end_exclusive
+                })
+                .min_by(|left, right| {
+                    left.width
+                        .cmp(&right.width)
+                        .then_with(|| left.shard_id.cmp(&right.shard_id))
+                });
+            let Some(winner) = winner else {
+                continue;
+            };
+            if let Some(previous) = hash_intervals.last_mut()
+                && previous.end_exclusive == start_inclusive
+                && previous.shard_id == winner.shard_id
+            {
+                previous.end_exclusive = end_exclusive;
+            } else {
+                hash_intervals.push(MetadataHashRoutingInterval {
+                    start_inclusive,
+                    end_exclusive,
+                    shard_id: winner.shard_id.clone(),
+                });
+            }
+        }
+
+        Ok(Self {
+            file_system_id,
+            root_shard_id,
+            prefix_root,
+            hash_intervals,
+            saw_default_sifs_split_shard,
+        })
+    }
+
+    pub(crate) fn select_shard_id(
+        &self,
+        path: &str,
+        reject_incomplete_default_sifs_split: bool,
+    ) -> Result<Option<&str>, KvError> {
+        let path = normalize_metadata_selection_path(path)?;
+        let mut prefix_match = self.prefix_root.shard_id.as_deref();
+        let mut node = &self.prefix_root;
+        for component in path
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|component| !component.is_empty())
+        {
+            let Some(next) = node.children.get(component) else {
+                break;
+            };
+            node = next;
+            if node.shard_id.is_some() {
+                prefix_match = node.shard_id.as_deref();
+            }
+        }
+
+        let path_hash = u128::from(metadata_name_hash(&path));
+        let hash_match = self
+            .hash_intervals
+            .partition_point(|interval| interval.start_inclusive <= path_hash)
+            .checked_sub(1)
+            .and_then(|index| self.hash_intervals.get(index))
+            .filter(|interval| path_hash < interval.end_exclusive)
+            .map(|interval| interval.shard_id.as_str());
+
+        if reject_incomplete_default_sifs_split
+            && prefix_match.is_none()
+            && hash_match.is_none()
+            && self.root_shard_id.is_some()
+            && self.file_system_id == sifs_file_system_id()
+            && self.saw_default_sifs_split_shard
+            && let Some((shard_id, prefix)) = default_sifs_split_shard_for_path(&path)
+        {
+            return Err(KvError::Busy {
+                path: format!(
+                    "metadata shard config incomplete for {path}: missing default {shard_id} shard for {prefix}"
+                ),
+            });
+        }
+
+        Ok(prefix_match
+            .or(hash_match)
+            .or(self.root_shard_id.as_deref()))
+    }
+}
+
 fn select_metadata_shard_config_for_path_with_options(
     file_system_id: &DfsFileSystemId,
     shards: &[DfsMetadataShardConfig],
@@ -7398,6 +7612,93 @@ mod tests {
                 .map(|shard| shard.shard_id),
             Some("zzz-narrow".to_string())
         );
+    }
+
+    #[test]
+    fn compiled_metadata_shard_routing_matches_reference_selector() {
+        let file_system_id = file_system_id();
+        let owner = node("node_compiled_shard_router");
+        let selected_path = "/hashed/wrapped";
+        let selected_hash = metadata_name_hash(selected_path);
+        let shards = vec![
+            DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "root".to_string(),
+                primary_node_id: owner.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+            DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: owner.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+            DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "services-deep".to_string(),
+                primary_node_id: owner.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services/deep".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+            DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "hash-wide".to_string(),
+                primary_node_id: owner.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::NameHashRange {
+                    start_inclusive: selected_hash.wrapping_sub(100),
+                    end_exclusive: selected_hash.wrapping_add(101),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+            DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "hash-narrow".to_string(),
+                primary_node_id: owner,
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::NameHashRange {
+                    start_inclusive: selected_hash,
+                    end_exclusive: selected_hash.wrapping_add(1),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+        ];
+        let compiled = DfsMetadataShardRoutingIndex::new(file_system_id.clone(), &shards)
+            .expect("compile routing index");
+
+        for path in [
+            "/",
+            "/services",
+            "/services/api",
+            "/services/deep/task",
+            "/services2",
+            selected_path,
+            "/other/path",
+            "/a/../services/deep/normalized",
+        ] {
+            let reference = select_metadata_shard_config_for_path(&file_system_id, &shards, path)
+                .expect("reference selection")
+                .map(|shard| shard.shard_id);
+            let indexed = compiled
+                .select_shard_id(path, false)
+                .expect("indexed selection")
+                .map(str::to_string);
+            assert_eq!(indexed, reference, "routing mismatch for {path}");
+        }
     }
 
     #[test]

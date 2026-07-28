@@ -1290,13 +1290,38 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         request_id: &str,
     ) -> Result<Option<DfsNamespaceRequestRecord>>;
 
+    /// Fetch the compact canonical outcome retained after a completed request
+    /// has been folded into an authoritative metadata snapshot.
+    fn get_namespace_request_receipt(
+        &self,
+        requester_node_id: &NodeId,
+        request_id: &str,
+    ) -> Result<Option<DfsNamespaceRequestReceipt>> {
+        let _ = (requester_node_id, request_id);
+        Ok(None)
+    }
+
+    /// Return whether a missing request identity is at or below this shard's
+    /// durable idempotency-retention floor.
+    ///
+    /// Callers must reject such an identity as expired/unknown. Treating it as
+    /// new could reapply an operation after its exact terminal receipt was
+    /// evicted from the bounded checkpoint window.
+    fn namespace_request_history_expired_on_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        request_id: &str,
+    ) -> Result<bool> {
+        let _ = (shard_id, request_id);
+        Ok(false)
+    }
+
     /// Return durable routed namespace requests for bounded autonomous
     /// inspection. Recovery should use `list_pending_namespace_requests_page`
     /// so terminal idempotency records are never cloned or filtered.
     ///
-    /// Completed records remain the canonical exact-retry response. They
-    /// cannot be age-pruned until the namespace protocol defines a requester
-    /// retry watermark or equivalent retention fence.
+    /// Completed records remain complete until the next checkpoint folds them
+    /// into bounded canonical receipts. Pending records are never pruned.
     fn list_namespace_requests(&self) -> Result<Vec<DfsNamespaceRequestRecord>>;
 
     /// Return one bounded, oldest-attempt-first page of pending namespace

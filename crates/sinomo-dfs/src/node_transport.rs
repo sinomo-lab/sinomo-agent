@@ -24,12 +24,11 @@ use sinomo_core::node::NodeId;
 
 use crate::{
     AsyncDfsMessageTransport, ContentStoreQuarantinedBlob, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES,
-    DfsBlobTransferResult, DfsDirectReadClientResponse, DfsDirectReadClientResult,
-    DfsDirectReadRequest, DfsError, DfsMessageCommand, DfsMessageProcessReport,
-    DfsMessageProcessResult, DfsMessageResponse, DfsMessageTransport, DfsMessageTransportFuture,
-    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsNetworkMessage,
-    DfsOutboundAttachment, DfsReadData, DfsReadResponse, DfsReadResult, DfsRoutedCall,
-    DfsRoutedMessage, DfsRoutedSend, DfsRoutedSendOutcome, DfsTransportIdentity,
+    DfsBlobTransferResult, DfsDirectReadClientResponse, DfsDirectReadRequest, DfsError,
+    DfsMessageCommand, DfsMessageProcessReport, DfsMessageProcessResult, DfsMessageResponse,
+    DfsMessageTransport, DfsMessageTransportFuture, DfsMetadataJournalBatchCommand,
+    DfsMetadataJournalBatchResponse, DfsNetworkMessage, DfsOutboundAttachment, DfsReadResponse,
+    DfsRoutedCall, DfsRoutedMessage, DfsRoutedSend, DfsRoutedSendOutcome, DfsTransportIdentity,
     DistributedRepairJob, NetworkedDfsService, NetworkedDfsServiceEvent,
     decode_dfs_message_rpc_response, decode_dfs_metadata_journal_batch_rpc_response,
     dfs_direct_read_request_from_read_request, dfs_direct_read_response_from_rpc_result,
@@ -526,38 +525,29 @@ pub(crate) fn dfs_direct_read_sender_from_peer_transport(
 fn collect_dfs_direct_read_response_sync(
     response: DfsDirectReadClientResponse,
 ) -> Result<DfsReadResponse, DfsPeerTransportError> {
-    let result = match response.result {
-        DfsDirectReadClientResult::Found(data) => {
-            let bytes = collect_dfs_incoming_body_sync(data.attachment, data.content_size_bytes)?;
-            if bytes.len() != data.content_size_bytes {
-                return Err(DfsPeerTransportError::new(format!(
-                    "DFS direct read attachment has {} bytes, metadata expected {}",
-                    bytes.len(),
-                    data.content_size_bytes
-                )));
-            }
-            let actual_hash = crate::content_hash(&bytes);
-            if actual_hash != data.content_hash {
-                return Err(DfsPeerTransportError::new(format!(
-                    "DFS direct read attachment hash mismatch: expected {}, actual {actual_hash}",
-                    data.content_hash
-                )));
-            }
-            DfsReadResult::Found(DfsReadData {
-                object_id: data.object_id,
-                version: data.version,
-                content_hash: Some(data.content_hash),
-                bytes,
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            return tokio::task::block_in_place(|| {
+                handle.block_on(response.collect_to_read_response())
             })
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()));
         }
-        DfsDirectReadClientResult::NotFound => DfsReadResult::NotFound,
-        DfsDirectReadClientResult::Rejected { reason } => DfsReadResult::Rejected { reason },
-    };
-    Ok(DfsReadResponse {
-        request_id: response.request_id,
-        object_id: response.object_id,
-        result,
-    })
+        return Err(DfsPeerTransportError::new(
+            "sync DFS direct-read collector cannot run inside a current-thread Tokio runtime",
+        ));
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+    let result = runtime
+        .block_on(response.collect_to_read_response())
+        .map_err(|source| DfsPeerTransportError::new(source.to_string()));
+    runtime.shutdown_timeout(Duration::from_millis(250));
+    result
 }
 #[derive(Clone)]
 struct DeferredDfsPeerSend {
@@ -1433,6 +1423,30 @@ impl DfsNodeTransport {
         )
     }
 
+    /// Opens the canonical stream-native DFS read response from one selected
+    /// content location.
+    ///
+    /// The returned response retains the transport-owned body chunks. Callers
+    /// that still require a contiguous [`DfsReadResponse`] must explicitly use
+    /// [`DfsDirectReadClientResponse::collect_to_read_response`].
+    pub async fn read_object_stream(
+        &self,
+        target_node_id: &NodeId,
+        request: &DfsDirectReadRequest,
+    ) -> Result<DfsDirectReadClientResponse, NetworkError> {
+        let options =
+            self.current_send_options(format!("stream DFS read from {target_node_id}"))?;
+        let sender = self
+            .async_direct_read_sender
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| NetworkError::Io {
+                operation: format!("stream DFS read from {target_node_id}"),
+                detail: "transport has no asynchronous direct-read sender".to_string(),
+            })?;
+        send_dfs_direct_read_to_peer_async(sender, options, target_node_id.clone(), request).await
+    }
+
     fn clamp_send_options_to_operation_deadline(
         mut options: DfsObjectRpcSendOptions,
         operation_deadline: Option<Instant>,
@@ -1647,14 +1661,17 @@ impl DfsNodeTransport {
         let Some(request) = dfs_direct_read_request_from_read_request(read_request) else {
             return Ok(None);
         };
-        let options =
-            self.current_send_options(format!("direct DFS read from {target_node_id}"))?;
-        let Some(sender) = self.async_direct_read_sender.as_ref().cloned() else {
+        if self.async_direct_read_sender.is_none() {
             return Ok(None);
-        };
-        let response =
-            send_dfs_direct_read_to_peer_async(sender, options, target_node_id.clone(), &request)
-                .await?;
+        }
+        // Routed-message consumers retain their historical contiguous response
+        // contract. Keep that copy at this explicit compatibility boundary;
+        // direct stream callers return immediately after the response head.
+        let response = self
+            .read_object_stream(target_node_id, &request)
+            .await?
+            .collect_to_read_response()
+            .await?;
         Ok(Some(vec![dfs_direct_read_response_routed_message(
             target_node_id,
             routed_message,
@@ -2609,13 +2626,12 @@ async fn send_dfs_direct_read_to_peer_async(
     options: DfsObjectRpcSendOptions,
     target_node_id: NodeId,
     request: &DfsDirectReadRequest,
-) -> Result<DfsReadResponse, NetworkError> {
+) -> Result<DfsDirectReadClientResponse, NetworkError> {
     let send_started = Instant::now();
     match sender(&target_node_id, request, options).await {
         Ok(response) => {
-            let response = response.collect_to_read_response().await?;
             dfs_perf_trace(format_args!(
-                "direct-read-send-async local_request={} target={} request={} bytes={} elapsed_ms={}",
+                "direct-read-head-async local_request={} target={} request={} bytes={} elapsed_ms={}",
                 request.object_id,
                 target_node_id,
                 request.request_id,

@@ -256,6 +256,25 @@ beyond their maximum before admitting a mutation. A stale head at `N - 1`
 cannot cause sequence `N` to be reused when either durable source has already
 reached `N`.
 
+Materialized-table checkpointing is not part of the foreground mutation cost.
+Crossing the table-log threshold schedules one process-global-deduplicated
+worker per shard root. Under the metadata writer lock, the worker rotates the
+active table log through exact boundary `S` into an immutable checkpoint
+generation and creates a new active generation for later writes. It releases
+the lock while compacting and serializing the immutable generation, then
+reacquires the lock to atomically publish the snapshot and retire the rotated
+generation. Reopen ignores table-log records at or below the installed
+snapshot sequence. A crash after snapshot publication but before retiring the
+rotated generation therefore replays neither the superseded prefix nor a
+partial suffix; a crash before publication leaves the old snapshot, rotated
+generation, and active suffix authoritative.
+
+Only after the snapshot and newer table-log suffix are durable may checkpoint
+maintenance prune journal segments strictly older than `S`. It always retains
+the segment containing `S`. A replica behind the retained history consequently
+observes a non-contiguous first entry and enters authoritative snapshot repair;
+an empty retained suffix can never be mistaken for successful catch-up.
+
 Directory tombstone validation is defined against the terminal namespace after
 the complete shard-local transaction is replayed in planner order: tombstones
 first, then live objects, with matching compacted tombstones skipped. The
@@ -496,6 +515,20 @@ state rather than an operator reconciliation boundary. Exact retries either
 join that recovery or replay the durable terminal result without another
 namespace effect.
 
+At an authoritative table checkpoint, complete namespace transactions,
+terminal prepares, and completed routed requests are folded into compact
+identity/result receipts. Full `Pending` requests and `Prepared` transactions
+remain intact because autonomous recovery still needs their semantic payload.
+Each terminal receipt class retains at most 4,096 entries for seven days by
+default; checkpoints evict the oldest timestamp-and-identity prefix when
+either bound is exceeded. The snapshot persists monotonic eviction floors.
+An exact receipt still inside the window replays its canonical outcome and a
+changed-payload reuse still rejects. Once the receipt has crossed its floor, a
+retry returns explicit expired/unknown instead of being admitted as a new
+mutation. Generated request ids carry a sortable ULID suffix for this fence;
+after evicting an opaque legacy id, another missing opaque id is conservatively
+expired rather than risking duplicate application.
+
 Retained namespace-prepare history requires transaction identity to bind the
 immutable mutation generation, not only the operation kind and stable
 object/path. A directory recreated from a selected tombstone may deliberately
@@ -509,10 +542,10 @@ Hidden namespace prepares reserve their normalized object/path footprint in
 filesystem-qualified active-owner indexes. Admission performs only direct
 lookups for the candidate footprint; it does not scan retained prepare history.
 An exact same-operation retry ignores its own ownership. Only `Prepared` rows
-own keys: `Committed` and `Aborted` rows remain durable for recovery and audit
-but release the footprint atomically. Structured-snapshot hydration and table-
-log replay derive the indexes from the same prepare table, so restart preserves
-active reservations without resurrecting terminal ones.
+own keys: `Committed` and `Aborted` rows release the footprint atomically and
+become bounded terminal receipts at checkpoint. Structured-snapshot hydration
+and table-log replay derive the indexes from the same prepare table, so restart
+preserves active reservations without resurrecting terminal ones.
 
 A move or hardlink that crosses metadata primaries uses a durable handoff:
 

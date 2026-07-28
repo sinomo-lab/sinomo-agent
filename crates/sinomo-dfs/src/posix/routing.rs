@@ -354,12 +354,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         path: &str,
     ) -> Result<Option<DfsObjectMetadata>> {
-        let path = normalize_posix_path(path)?;
         let shard_snapshot = self.refresh_sifs_metadata_shards()?;
+        self.lookup_sifs_path_direct_distributed_synced_from_snapshot(
+            path,
+            shard_snapshot.as_deref(),
+        )
+    }
+
+    /// Exact-path variant that reuses a caller's request-scoped topology.
+    ///
+    /// No-link capability walks call this once per component. Keeping the
+    /// snapshot outside the component loop avoids repeated cluster-KV catalog
+    /// reads and ensures the whole walk uses one routing generation.
+    pub(super) fn lookup_sifs_path_direct_distributed_synced_from_snapshot(
+        &mut self,
+        path: &str,
+        shard_snapshot: Option<&[DfsMetadataShardConfig]>,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        let path = normalize_posix_path(path)?;
         for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
             let local_object = self.lookup_sifs_path(&path)?;
             let Some(shard) = shard_snapshot
-                .as_deref()
                 .map(|shards| self.routed_namespace_shard_for_path_from_snapshot(&path, shards))
                 .transpose()?
                 .flatten()
@@ -430,7 +445,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             let cursor_before = self.metadata_shard_cursor_for_path_from_snapshot(
                 &path,
-                shard_snapshot.as_deref().unwrap_or_default(),
+                shard_snapshot.unwrap_or_default(),
             )?;
             if self
                 .route_namespace_operation_to_metadata_primary_with_timeout(
@@ -445,7 +460,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             if self.metadata_shard_cursor_for_path_from_snapshot(
                 &path,
-                shard_snapshot.as_deref().unwrap_or_default(),
+                shard_snapshot.unwrap_or_default(),
             )? <= cursor_before
             {
                 break;

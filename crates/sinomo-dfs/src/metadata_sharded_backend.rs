@@ -7,13 +7,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
 
 use crate::advisory_lock::{
     DfsAdvisoryLockApplyResult, DfsAdvisoryLockCommand, DfsAdvisoryLockStateRecord,
     DfsAdvisoryLockTransitionContext, prepare_advisory_lock_state_for_migration,
 };
-use crate::control_plane::{DfsMetadataShardConfig, select_metadata_shard_config_for_path};
+use crate::control_plane::{
+    DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardRoutingIndex,
+};
 use crate::intent::write_intent_status_is_active;
 use crate::metadata_api::{
     DfsMetadataBackend, DfsMetadataReplicaIngestPermit, DfsMetadataShardWriteFreeze,
@@ -21,7 +24,7 @@ use crate::metadata_api::{
 use crate::metadata_backend::LocalSobjMetadataBackend;
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_hardlink::sort_hardlinks_by_path;
-use crate::metadata_io::create_dir_all;
+use crate::metadata_io::{create_dir_all, read_sobj_optional, write_sobj_atomic};
 use crate::metadata_keys::{
     conflict_scan_cursor, conflict_scan_key, directory_page_cursor_with_shard, key_segment,
     local_directory_page_cursor, local_object_page_cursor, local_object_version_page_cursor,
@@ -72,6 +75,86 @@ fn is_source_eviction_tombstone(object: &DfsObjectMetadata) -> bool {
         )
 }
 
+const ROUTING_TOPOLOGY_HISTORY_LIMIT: usize = 4;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+struct DfsMetadataRoutingTopologyHistory {
+    #[serde(default)]
+    active: Vec<DfsMetadataShardConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fallbacks: Vec<Vec<DfsMetadataShardConfig>>,
+}
+
+fn routing_topology_history_path(root: &std::path::Path) -> PathBuf {
+    root.join("shard-index").join("routing-topologies.sobj")
+}
+
+fn canonicalize_routing_topology(shards: &mut [DfsMetadataShardConfig]) {
+    shards.sort_by(|left, right| {
+        left.file_system_id
+            .cmp(&right.file_system_id)
+            .then_with(|| left.shard_id.cmp(&right.shard_id))
+    });
+}
+
+fn compile_routing_indexes(
+    shards: impl IntoIterator<Item = DfsMetadataShardConfig>,
+) -> Result<BTreeMap<DfsFileSystemId, DfsMetadataShardRoutingIndex>> {
+    let mut configs_by_file_system =
+        BTreeMap::<DfsFileSystemId, Vec<DfsMetadataShardConfig>>::new();
+    for shard in shards {
+        configs_by_file_system
+            .entry(shard.file_system_id.clone())
+            .or_default()
+            .push(shard);
+    }
+    configs_by_file_system
+        .into_iter()
+        .map(|(file_system_id, shards)| {
+            DfsMetadataShardRoutingIndex::new(file_system_id.clone(), &shards)
+                .map(|index| (file_system_id, index))
+                .map_err(|error| MetadataBackendError::Serde(error.to_string()))
+        })
+        .collect()
+}
+
+fn load_routing_topology_history(
+    root: &std::path::Path,
+    active: &[DfsMetadataShardConfig],
+    persist: bool,
+) -> Result<DfsMetadataRoutingTopologyHistory> {
+    let path = routing_topology_history_path(root);
+    let persisted = read_sobj_optional::<DfsMetadataRoutingTopologyHistory>(&path)?;
+    let mut history = persisted.clone().unwrap_or_default();
+    if history.active.is_empty() {
+        history.active = active.to_vec();
+        // Upgrade compatibility: old layouts have no routing history. A root
+        // assignment is the only unambiguous predecessor for a newly split
+        // catalog, so retain that bounded fallback rather than scanning every
+        // shard for every create miss.
+        let root_fallback = active
+            .iter()
+            .filter(|shard| matches!(&shard.assignment, DfsMetadataShardAssignment::Root))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !root_fallback.is_empty() && root_fallback.len() < active.len() {
+            history.fallbacks.push(root_fallback);
+        }
+    } else if history.active != active {
+        let previous = std::mem::replace(&mut history.active, active.to_vec());
+        history.fallbacks.insert(0, previous);
+    }
+    history
+        .fallbacks
+        .retain(|topology| !topology.is_empty() && topology != &history.active);
+    history.fallbacks.dedup();
+    history.fallbacks.truncate(ROUTING_TOPOLOGY_HISTORY_LIMIT);
+    if persist && persisted.as_ref() != Some(&history) {
+        write_sobj_atomic(&path, &history)?;
+    }
+    Ok(history)
+}
+
 /// Local sharded metadata router.
 ///
 /// This backend multiplexes multiple `LocalSobjMetadataBackend` shards using
@@ -82,6 +165,8 @@ fn is_source_eviction_tombstone(object: &DfsObjectMetadata) -> bool {
 pub struct LocalShardedMetadataBackend {
     root: PathBuf,
     shard_configs: BTreeMap<String, DfsMetadataShardConfig>,
+    routing_indexes: BTreeMap<DfsFileSystemId, DfsMetadataShardRoutingIndex>,
+    fallback_routing_indexes: Vec<BTreeMap<DfsFileSystemId, DfsMetadataShardRoutingIndex>>,
     shards: BTreeMap<DfsMetadataShardId, LocalSobjMetadataBackend>,
 }
 
@@ -123,7 +208,7 @@ impl LocalShardedMetadataBackend {
 
     fn open_with(
         root: PathBuf,
-        shards: Vec<DfsMetadataShardConfig>,
+        mut shards: Vec<DfsMetadataShardConfig>,
         initialize_layout: bool,
         replica_repair_local_node_id: Option<&NodeId>,
     ) -> Result<Self> {
@@ -135,6 +220,8 @@ impl LocalShardedMetadataBackend {
         if initialize_layout {
             create_dir_all(root.join("shard-index").join("objects"))?;
         }
+        canonicalize_routing_topology(&mut shards);
+        let routing_history = load_routing_topology_history(&root, &shards, initialize_layout)?;
         let mut shard_configs = BTreeMap::new();
         let mut backends = BTreeMap::new();
         for shard in shards {
@@ -174,9 +261,18 @@ impl LocalShardedMetadataBackend {
             };
             backends.insert(shard_id, backend);
         }
+        let routing_indexes = compile_routing_indexes(shard_configs.values().cloned())?;
+        let fallback_routing_indexes = routing_history
+            .fallbacks
+            .iter()
+            .map(|topology| compile_routing_indexes(topology.iter().cloned()))
+            .collect::<Result<Vec<_>>>()?;
+
         Ok(Self {
             root,
             shard_configs,
+            routing_indexes,
+            fallback_routing_indexes,
             shards: backends,
         })
     }
@@ -279,25 +375,15 @@ impl LocalShardedMetadataBackend {
         Ok(())
     }
 
-    fn shard_configs_for_file_system(
-        &self,
-        file_system_id: &DfsFileSystemId,
-    ) -> Vec<DfsMetadataShardConfig> {
-        self.shard_configs
-            .values()
-            .filter(|shard| shard.file_system_id == *file_system_id)
-            .cloned()
-            .collect()
-    }
-
     fn configured_shard_ids_for_file_system(
         &self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<Vec<DfsMetadataShardId>> {
         let shard_ids = self
-            .shard_configs_for_file_system(file_system_id)
-            .into_iter()
-            .map(|shard| DfsMetadataShardId::new(shard.shard_id))
+            .shard_configs
+            .values()
+            .filter(|shard| shard.file_system_id == *file_system_id)
+            .map(|shard| DfsMetadataShardId::new(shard.shard_id.clone()))
             .collect::<Vec<_>>();
         if shard_ids.is_empty() {
             return Err(MetadataBackendError::UnknownFileSystem {
@@ -312,17 +398,68 @@ impl LocalShardedMetadataBackend {
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) -> Result<DfsMetadataShardId> {
-        let selected = select_metadata_shard_config_for_path(
-            file_system_id,
-            &self.shard_configs_for_file_system(file_system_id),
-            path,
-        )
-        .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
-        selected
-            .map(|shard| DfsMetadataShardId::new(shard.shard_id))
+        let selected = self
+            .routing_indexes
+            .get(file_system_id)
             .ok_or_else(|| MetadataBackendError::UnknownFileSystem {
                 file_system_id: file_system_id.clone(),
-            })
+            })?
+            .select_shard_id(path, false)
+            .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+        selected.map(DfsMetadataShardId::new).ok_or_else(|| {
+            MetadataBackendError::UnknownFileSystem {
+                file_system_id: file_system_id.clone(),
+            }
+        })
+    }
+
+    fn fallback_shard_ids_for_path(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+        selected_shard_id: &DfsMetadataShardId,
+    ) -> Result<Vec<DfsMetadataShardId>> {
+        let mut shard_ids = Vec::new();
+        let mut seen = BTreeSet::new();
+        seen.insert(selected_shard_id.clone());
+        for routing_indexes in &self.fallback_routing_indexes {
+            let Some(index) = routing_indexes.get(file_system_id) else {
+                continue;
+            };
+            let Some(shard_id) = index
+                .select_shard_id(path, false)
+                .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
+            else {
+                continue;
+            };
+            let shard_id = DfsMetadataShardId::new(shard_id);
+            if self.shards.contains_key(&shard_id) && seen.insert(shard_id.clone()) {
+                shard_ids.push(shard_id);
+            }
+        }
+        Ok(shard_ids)
+    }
+
+    fn clear_routing_fallbacks_for_file_system(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<()> {
+        for indexes in &mut self.fallback_routing_indexes {
+            indexes.remove(file_system_id);
+        }
+        self.fallback_routing_indexes
+            .retain(|indexes| !indexes.is_empty());
+
+        let path = routing_topology_history_path(&self.root);
+        let Some(mut history) = read_sobj_optional::<DfsMetadataRoutingTopologyHistory>(&path)?
+        else {
+            return Ok(());
+        };
+        for topology in &mut history.fallbacks {
+            topology.retain(|shard| shard.file_system_id != *file_system_id);
+        }
+        history.fallbacks.retain(|topology| !topology.is_empty());
+        write_sobj_atomic(&path, &history)
     }
 
     fn shard_id_for_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsMetadataShardId>> {
@@ -861,6 +998,11 @@ impl LocalShardedMetadataBackend {
                 return Ok(report);
             }
         }
+        // A complete scan proves that every live object is now at the active
+        // route (or has durable source-eviction evidence). Retire historical
+        // routing generations so steady-state negative lookups touch exactly
+        // one shard.
+        self.clear_routing_fallbacks_for_file_system(file_system_id)?;
         Ok(report)
     }
 
@@ -1089,14 +1231,16 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             // source-eviction marker may become path-selected after a later
             // topology change, but it remains storage-only evidence.
         }
-        for (fallback_shard_id, backend) in &self.shards {
-            if fallback_shard_id == &shard_id {
-                continue;
-            }
-            let Some(candidate) = backend.get_object_by_path(file_system_id, path)? else {
+        for fallback_shard_id in
+            self.fallback_shard_ids_for_path(file_system_id, path, &shard_id)?
+        {
+            let Some(candidate) = self
+                .shard_backend(&fallback_shard_id)?
+                .get_object_by_path(file_system_id, path)?
+            else {
                 continue;
             };
-            if self.object_is_visible_from_shard(&candidate, fallback_shard_id)? {
+            if self.object_is_visible_from_shard(&candidate, &fallback_shard_id)? {
                 return Ok(Some(candidate));
             }
         }
@@ -2465,6 +2609,36 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(found)
     }
 
+    fn get_namespace_request_receipt(
+        &self,
+        requester_node_id: &NodeId,
+        request_id: &str,
+    ) -> Result<Option<DfsNamespaceRequestReceipt>> {
+        let mut found = None;
+        for backend in self.shards.values() {
+            if let Some(receipt) =
+                backend.get_namespace_request_receipt(requester_node_id, request_id)?
+            {
+                if found.is_some() {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "namespace request receipt {requester_node_id}/{request_id} exists on multiple local shards"
+                    )));
+                }
+                found = Some(receipt);
+            }
+        }
+        Ok(found)
+    }
+
+    fn namespace_request_history_expired_on_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        request_id: &str,
+    ) -> Result<bool> {
+        self.shard_backend(shard_id)?
+            .namespace_request_history_expired_on_shard(shard_id, request_id)
+    }
+
     fn list_namespace_requests(&self) -> Result<Vec<DfsNamespaceRequestRecord>> {
         let mut requests = BTreeMap::new();
         for backend in self.shards.values() {
@@ -2909,9 +3083,24 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                     .namespace_transactions
                     .extend(snapshot_tables.namespace_transactions);
                 tables
+                    .namespace_transaction_receipts
+                    .extend(snapshot_tables.namespace_transaction_receipts);
+                tables
                     .namespace_prepares
                     .extend(snapshot_tables.namespace_prepares);
+                tables
+                    .namespace_prepare_receipts
+                    .extend(snapshot_tables.namespace_prepare_receipts);
                 tables.namespace_jobs.extend(snapshot_tables.namespace_jobs);
+                tables
+                    .namespace_request_receipts
+                    .extend(snapshot_tables.namespace_request_receipts);
+                tables
+                    .namespace_requests
+                    .extend(snapshot_tables.namespace_requests);
+                tables
+                    .namespace_receipt_retention
+                    .merge_conservative(snapshot_tables.namespace_receipt_retention);
             }
         }
         Ok(DfsMetadataTableSnapshot {

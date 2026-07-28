@@ -617,46 +617,57 @@ fn validate_namespace_prepare_shape(
             completed_request.requester_node_id.clone(),
             completed_request.request_id.clone(),
         );
-        match tables.namespace_requests.get(&request_key) {
-            Some(existing)
-                if namespace_request_transition_is_valid(existing, completed_request) => {}
-            Some(existing)
-                if namespace_prepare_can_repair_terminal_request(
-                    tables,
-                    prepare,
-                    existing,
-                    completed_request,
-                ) =>
-            {
-                // Once the exact hidden request-owned prepare is durable, its
-                // attached outcome owns crash recovery. An outer ambiguous
-                // failure used to record a contradictory terminal rejection
-                // after this point. Permit only that already-durable prepare
-                // to repair the request when it commits; a newly introduced
-                // prepare still cannot rewrite a terminal request.
-            }
-            Some(_) => {
+        if let Some(receipt) = tables.namespace_request_receipts.get(&request_key) {
+            if !receipt.matches_completed_request(completed_request) {
                 return Err(MetadataBackendError::Serde(format!(
-                    "namespace prepare {} completed request conflicts with {}/{}",
+                    "namespace prepare {} completed request conflicts with compacted receipt {}/{}",
                     prepare.operation_id,
                     completed_request.requester_node_id,
                     completed_request.request_id
                 )));
             }
-            None if prepare.status == DfsNamespacePrepareStatus::Prepared => {
-                // A request-owned prepare is itself the first durable
-                // operation boundary for the fused admission path. The table
-                // planner below materializes a derived Pending admission in
-                // the same atomic batch as this hidden prepare. Other prepare
-                // states still require that admission to exist already.
-            }
-            None => {
-                return Err(MetadataBackendError::Serde(format!(
-                    "namespace prepare {} has no durable admission for completed request {}/{}",
-                    prepare.operation_id,
-                    completed_request.requester_node_id,
-                    completed_request.request_id
-                )));
+        } else {
+            match tables.namespace_requests.get(&request_key) {
+                Some(existing)
+                    if namespace_request_transition_is_valid(existing, completed_request) => {}
+                Some(existing)
+                    if namespace_prepare_can_repair_terminal_request(
+                        tables,
+                        prepare,
+                        existing,
+                        completed_request,
+                    ) =>
+                {
+                    // Once the exact hidden request-owned prepare is durable, its
+                    // attached outcome owns crash recovery. An outer ambiguous
+                    // failure used to record a contradictory terminal rejection
+                    // after this point. Permit only that already-durable prepare
+                    // to repair the request when it commits; a newly introduced
+                    // prepare still cannot rewrite a terminal request.
+                }
+                Some(_) => {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "namespace prepare {} completed request conflicts with {}/{}",
+                        prepare.operation_id,
+                        completed_request.requester_node_id,
+                        completed_request.request_id
+                    )));
+                }
+                None if prepare.status == DfsNamespacePrepareStatus::Prepared => {
+                    // A request-owned prepare is itself the first durable
+                    // operation boundary for the fused admission path. The table
+                    // planner below materializes a derived Pending admission in
+                    // the same atomic batch as this hidden prepare. Other prepare
+                    // states still require that admission to exist already.
+                }
+                None => {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "namespace prepare {} has no durable admission for completed request {}/{}",
+                        prepare.operation_id,
+                        completed_request.requester_node_id,
+                        completed_request.request_id
+                    )));
+                }
             }
         }
     }
@@ -668,15 +679,16 @@ fn namespace_prepare_request_completion_is_materialized(
     prepare: &DfsNamespacePrepareRecord,
 ) -> bool {
     prepare.completed_request.as_ref().is_none_or(|completion| {
-        tables
-            .namespace_requests
-            .get(&(
-                completion.requester_node_id.clone(),
-                completion.request_id.clone(),
-            ))
-            .is_some_and(|existing| {
-                completed_namespace_request_outcome_matches(existing, completion)
-            })
+        let key = (
+            completion.requester_node_id.clone(),
+            completion.request_id.clone(),
+        );
+        tables.namespace_requests.get(&key).is_some_and(|existing| {
+            completed_namespace_request_outcome_matches(existing, completion)
+        }) || tables
+            .namespace_request_receipts
+            .get(&key)
+            .is_some_and(|receipt| receipt.matches_completed_request(completion))
     })
 }
 
@@ -899,20 +911,22 @@ fn namespace_prepare_table_ops_for_record(
             ops.push(DfsMetadataTableOp::PutNamespacePrepare {
                 prepare: prepare.clone(),
             });
-            if let Some(request) = &prepare.completed_request
-                && !tables
-                    .namespace_requests
-                    .get(&(
-                        request.requester_node_id.clone(),
-                        request.request_id.clone(),
-                    ))
-                    .is_some_and(|existing| {
-                        completed_namespace_request_outcome_matches(existing, request)
-                    })
-            {
-                ops.push(DfsMetadataTableOp::PutNamespaceRequest {
-                    request: request.clone(),
-                });
+            if let Some(request) = &prepare.completed_request {
+                let key = (
+                    request.requester_node_id.clone(),
+                    request.request_id.clone(),
+                );
+                let materialized = tables.namespace_requests.get(&key).is_some_and(|existing| {
+                    completed_namespace_request_outcome_matches(existing, request)
+                }) || tables
+                    .namespace_request_receipts
+                    .get(&key)
+                    .is_some_and(|receipt| receipt.matches_completed_request(request));
+                if !materialized {
+                    ops.push(DfsMetadataTableOp::PutNamespaceRequest {
+                        request: request.clone(),
+                    });
+                }
             }
             Ok(ops)
         }
@@ -1137,6 +1151,13 @@ fn require_replica_snapshot_tables_file_system(
             expected,
         )?;
     }
+    for receipt in tables.namespace_transaction_receipts.values() {
+        require_replica_snapshot_record_file_system(
+            "namespace transaction receipt",
+            &receipt.file_system_id,
+            expected,
+        )?;
+    }
     for prepare in tables.namespace_prepares.values() {
         require_replica_snapshot_record_file_system(
             "namespace prepare",
@@ -1149,10 +1170,31 @@ fn require_replica_snapshot_tables_file_system(
             expected,
         )?;
     }
+    for receipt in tables.namespace_prepare_receipts.values() {
+        require_replica_snapshot_record_file_system(
+            "namespace prepare receipt",
+            &receipt.file_system_id,
+            expected,
+        )?;
+    }
     for job in tables.namespace_jobs.values() {
         require_replica_snapshot_record_file_system(
             "namespace job",
             &job.file_system_id,
+            expected,
+        )?;
+    }
+    for request in tables.namespace_requests.values() {
+        require_replica_snapshot_record_file_system(
+            "namespace request",
+            &request.file_system_id,
+            expected,
+        )?;
+    }
+    for receipt in tables.namespace_request_receipts.values() {
+        require_replica_snapshot_record_file_system(
+            "namespace request receipt",
+            &receipt.file_system_id,
             expected,
         )?;
     }
@@ -1306,6 +1348,10 @@ impl LocalSobjMetadataBackend {
             total_ms = trace_started.elapsed().as_millis(),
             "metadata-backend-open"
         );
+        metadata_table_apply::schedule_metadata_table_checkpoint_if_needed(
+            &backend.root,
+            DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES,
+        )?;
         Ok(backend)
     }
 
@@ -2310,10 +2356,54 @@ impl LocalSobjMetadataBackend {
                     transaction.as_ref(),
                 )?;
                 let normalized = normalized_namespace_transaction(transaction);
+                if let Some(receipt) = self
+                    .tables
+                    .namespace_transaction_receipts
+                    .get(transaction_id)
+                {
+                    if receipt
+                        .matches_transaction(&normalized)
+                        .map_err(|source| MetadataBackendError::Serde(source.to_string()))?
+                    {
+                        return Ok(false);
+                    }
+                    return Err(MetadataBackendError::Serde(format!(
+                        "journal namespace transaction {transaction_id} conflicts with its compacted receipt"
+                    )));
+                }
                 if self.tables.namespace_transactions.get(transaction_id) == Some(&normalized) {
                     return Ok(false);
                 }
                 self.plan_namespace_transaction_table_ops(&normalized, table_ops, rollback)?;
+                Ok(true)
+            }
+            DfsMetadataMutation::PutNamespaceTransactionReceipt {
+                file_system_id,
+                transaction_id,
+                receipt,
+            } => {
+                if receipt.file_system_id != *file_system_id
+                    || receipt.transaction_id != *transaction_id
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "journal namespace transaction receipt scope {file_system_id}/{transaction_id} does not match its payload"
+                    )));
+                }
+                if self
+                    .tables
+                    .namespace_transaction_receipts
+                    .get(transaction_id)
+                    == Some(receipt)
+                {
+                    return Ok(false);
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::PutNamespaceTransactionReceipt {
+                        receipt: receipt.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
                 Ok(true)
             }
             DfsMetadataMutation::PutNamespacePrepare {
@@ -2333,6 +2423,16 @@ impl LocalSobjMetadataBackend {
                     )));
                 }
                 let prepare = normalized_namespace_prepare(prepare);
+                if let Some(receipt) = self.tables.namespace_prepare_receipts.get(operation_id) {
+                    if receipt.status == prepare.status
+                        && receipt.matches_prepare_identity(&prepare)
+                    {
+                        return Ok(false);
+                    }
+                    return Err(MetadataBackendError::Serde(format!(
+                        "journal namespace prepare {operation_id} conflicts with its compacted receipt"
+                    )));
+                }
                 let ops =
                     namespace_prepare_table_ops_for_record(&self.tables, &self.shard_id, &prepare)?;
                 if ops.is_empty() {
@@ -2341,6 +2441,30 @@ impl LocalSobjMetadataBackend {
                 for op in ops {
                     self.plan_preapplied_table_op(op, table_ops, rollback);
                 }
+                Ok(true)
+            }
+            DfsMetadataMutation::PutNamespacePrepareReceipt {
+                file_system_id,
+                operation_id,
+                receipt,
+            } => {
+                if receipt.file_system_id != *file_system_id
+                    || receipt.operation_id != *operation_id
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "journal namespace prepare receipt scope {file_system_id}/{operation_id} does not match its payload"
+                    )));
+                }
+                if self.tables.namespace_prepare_receipts.get(operation_id) == Some(receipt) {
+                    return Ok(false);
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::PutNamespacePrepareReceipt {
+                        receipt: receipt.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
                 Ok(true)
             }
             DfsMetadataMutation::PutNamespaceJob { job_id, job, .. } => {
@@ -2375,12 +2499,47 @@ impl LocalSobjMetadataBackend {
                     )));
                 }
                 let key = (requester_node_id.clone(), request_id.clone());
+                if let Some(receipt) = self.tables.namespace_request_receipts.get(&key) {
+                    if receipt.matches_completed_request(request) {
+                        return Ok(false);
+                    }
+                    return Err(MetadataBackendError::Serde(format!(
+                        "journal namespace request {requester_node_id}/{request_id} conflicts with its compacted receipt"
+                    )));
+                }
                 if self.tables.namespace_requests.get(&key) == Some(request) {
                     return Ok(false);
                 }
                 self.plan_preapplied_table_op(
                     DfsMetadataTableOp::PutNamespaceRequest {
                         request: request.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
+            DfsMetadataMutation::PutNamespaceRequestReceipt {
+                file_system_id,
+                requester_node_id,
+                request_id,
+                receipt,
+            } => {
+                if receipt.file_system_id != *file_system_id
+                    || receipt.requester_node_id != *requester_node_id
+                    || receipt.request_id != *request_id
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "journal namespace request receipt scope {file_system_id}/{requester_node_id}/{request_id} does not match its payload"
+                    )));
+                }
+                let key = (requester_node_id.clone(), request_id.clone());
+                if self.tables.namespace_request_receipts.get(&key) == Some(receipt) {
+                    return Ok(false);
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::PutNamespaceRequestReceipt {
+                        receipt: receipt.clone(),
                     },
                     table_ops,
                     rollback,
@@ -2872,12 +3031,22 @@ impl LocalSobjMetadataBackend {
                 let transaction = normalized_namespace_transaction(transaction);
                 namespace_transaction_table_ops(&self.tables, &transaction)
             }
+            DfsMetadataMutation::PutNamespaceTransactionReceipt { receipt, .. } => {
+                vec![DfsMetadataTableOp::PutNamespaceTransactionReceipt {
+                    receipt: receipt.clone(),
+                }]
+            }
             DfsMetadataMutation::PutNamespacePrepare { prepare, .. } => {
                 let Some(prepare) = prepare.as_ref() else {
                     return Ok(());
                 };
                 let prepare = normalized_namespace_prepare(prepare);
                 namespace_prepare_table_ops_for_record(&self.tables, &self.shard_id, &prepare)?
+            }
+            DfsMetadataMutation::PutNamespacePrepareReceipt { receipt, .. } => {
+                vec![DfsMetadataTableOp::PutNamespacePrepareReceipt {
+                    receipt: receipt.clone(),
+                }]
             }
             DfsMetadataMutation::PutNamespaceJob { job, .. } => {
                 let Some(job) = job.as_ref() else {
@@ -2888,6 +3057,11 @@ impl LocalSobjMetadataBackend {
             DfsMetadataMutation::PutNamespaceRequest { request, .. } => {
                 vec![DfsMetadataTableOp::PutNamespaceRequest {
                     request: request.clone(),
+                }]
+            }
+            DfsMetadataMutation::PutNamespaceRequestReceipt { receipt, .. } => {
+                vec![DfsMetadataTableOp::PutNamespaceRequestReceipt {
+                    receipt: receipt.clone(),
                 }]
             }
         };
@@ -3261,6 +3435,23 @@ impl LocalSobjMetadataBackend {
             &root,
             self.table_materialization_state(),
             max_log_bytes,
+        )
+    }
+
+    #[cfg(test)]
+    fn compact_metadata_table_log_with_namespace_retention(
+        &mut self,
+        max_log_bytes: u64,
+        checkpoint_time: OffsetDateTime,
+        retention_limits: crate::metadata_tables::DfsNamespaceReceiptRetentionLimits,
+    ) -> Result<()> {
+        let root = self.root.clone();
+        metadata_table_apply::compact_metadata_table_log_if_needed_with_retention(
+            &root,
+            self.table_materialization_state(),
+            max_log_bytes,
+            checkpoint_time,
+            retention_limits,
         )
     }
 
@@ -4840,6 +5031,35 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         }
 
         let transaction = normalized_namespace_transaction(transaction);
+        if let Some(receipt) = self
+            .tables
+            .namespace_transaction_receipts
+            .get(&transaction.transaction_id)
+            .cloned()
+        {
+            if !receipt
+                .matches_transaction(&transaction)
+                .map_err(|source| MetadataBackendError::Serde(source.to_string()))?
+            {
+                return Err(MetadataBackendError::Serde(format!(
+                    "namespace transaction {} reuses a compacted transaction id with a different payload",
+                    transaction.transaction_id
+                )));
+            }
+            return self.write_journal_entry_and_apply_table_ops_unlocked(
+                DfsMetadataMutation::put_namespace_transaction_receipt(&receipt),
+                vec![DfsMetadataTableOp::PutNamespaceTransactionReceipt { receipt }],
+            );
+        }
+        if self
+            .tables
+            .namespace_transaction_history_expired(&transaction)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace transaction {} idempotency history expired or is unknown",
+                transaction.transaction_id
+            )));
+        }
         validate_namespace_transaction_preconditions(&self.tables, &transaction)?;
         let entry =
             self.write_journal_unlocked(DfsMetadataMutation::ApplyNamespaceTransaction {
@@ -4879,6 +5099,40 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             )));
         }
         let prepare = normalized_namespace_prepare(prepare);
+        if let Some(receipt) = self
+            .tables
+            .namespace_prepare_receipts
+            .get(&prepare.operation_id)
+            .cloned()
+        {
+            let canonical_digest =
+                crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+                    .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+            if prepare.operation_digest != canonical_digest
+                || !receipt.matches_prepare_identity(&prepare)
+            {
+                return Err(MetadataBackendError::Serde(format!(
+                    "namespace prepare {} reuses a compacted operation id with a different payload",
+                    prepare.operation_id
+                )));
+            }
+            if receipt.status == DfsNamespacePrepareStatus::Aborted {
+                return Err(MetadataBackendError::Serde(format!(
+                    "namespace prepare {} is aborted",
+                    prepare.operation_id
+                )));
+            }
+            return self.write_journal_entry_and_apply_table_ops_unlocked(
+                DfsMetadataMutation::put_namespace_prepare_receipt(&receipt),
+                vec![DfsMetadataTableOp::PutNamespacePrepareReceipt { receipt }],
+            );
+        }
+        if self.tables.namespace_prepare_history_expired(&prepare) {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {} idempotency history expired or is unknown",
+                prepare.operation_id
+            )));
+        }
         if let Some(existing) = self
             .tables
             .namespace_prepares
@@ -4990,15 +5244,44 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         expected_owner_epoch: u64,
     ) -> Result<DfsMetadataJournalEntry> {
         let _lock = self.begin_metadata_write()?;
+        if let Some(receipt) = self
+            .tables
+            .namespace_prepare_receipts
+            .get(operation_id)
+            .cloned()
+        {
+            if receipt.operation_digest != expected_operation_digest
+                || receipt.owner_epoch != expected_owner_epoch
+            {
+                return Err(MetadataBackendError::Serde(format!(
+                    "namespace prepare {operation_id} digest/epoch fence mismatch"
+                )));
+            }
+            if receipt.status == DfsNamespacePrepareStatus::Aborted {
+                return Err(MetadataBackendError::Serde(format!(
+                    "namespace prepare {operation_id} is aborted"
+                )));
+            }
+            return self.write_journal_entry_and_apply_table_ops_unlocked(
+                DfsMetadataMutation::put_namespace_prepare_receipt(&receipt),
+                vec![DfsMetadataTableOp::PutNamespacePrepareReceipt { receipt }],
+            );
+        }
         let mut prepare = self
             .tables
             .namespace_prepares
             .get(operation_id)
             .cloned()
             .ok_or_else(|| {
-                MetadataBackendError::Serde(format!(
-                    "namespace prepare {operation_id} does not exist"
-                ))
+                if self.tables.namespace_prepare_history_has_evictions() {
+                    MetadataBackendError::Serde(format!(
+                        "namespace prepare {operation_id} idempotency history expired or is unknown"
+                    ))
+                } else {
+                    MetadataBackendError::Serde(format!(
+                        "namespace prepare {operation_id} does not exist"
+                    ))
+                }
             })?;
         if prepare.operation_digest != expected_operation_digest
             || prepare.owner_epoch != expected_owner_epoch
@@ -5056,25 +5339,32 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 &mut table_ops,
                 &mut rollback,
             );
-            if let Some(request) = prepare.completed_request.as_ref()
-                && !self
-                    .tables
-                    .namespace_requests
-                    .get(&(
-                        request.requester_node_id.clone(),
-                        request.request_id.clone(),
-                    ))
-                    .is_some_and(|existing| {
-                        completed_namespace_request_outcome_matches(existing, request)
-                    })
-            {
-                self.plan_preapplied_table_op(
-                    DfsMetadataTableOp::PutNamespaceRequest {
-                        request: request.clone(),
-                    },
-                    &mut table_ops,
-                    &mut rollback,
+            if let Some(request) = prepare.completed_request.as_ref() {
+                let key = (
+                    request.requester_node_id.clone(),
+                    request.request_id.clone(),
                 );
+                let materialized =
+                    self.tables
+                        .namespace_requests
+                        .get(&key)
+                        .is_some_and(|existing| {
+                            completed_namespace_request_outcome_matches(existing, request)
+                        })
+                        || self
+                            .tables
+                            .namespace_request_receipts
+                            .get(&key)
+                            .is_some_and(|receipt| receipt.matches_completed_request(request));
+                if !materialized {
+                    self.plan_preapplied_table_op(
+                        DfsMetadataTableOp::PutNamespaceRequest {
+                            request: request.clone(),
+                        },
+                        &mut table_ops,
+                        &mut rollback,
+                    );
+                }
             }
             self.append_preapplied_table_ops_for_written_entries(
                 std::slice::from_ref(&entry),
@@ -5108,15 +5398,44 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         expected_owner_epoch: u64,
     ) -> Result<DfsMetadataJournalEntry> {
         let _lock = self.begin_metadata_write()?;
+        if let Some(receipt) = self
+            .tables
+            .namespace_prepare_receipts
+            .get(operation_id)
+            .cloned()
+        {
+            if receipt.operation_digest != expected_operation_digest
+                || receipt.owner_epoch != expected_owner_epoch
+            {
+                return Err(MetadataBackendError::Serde(format!(
+                    "namespace prepare {operation_id} digest/epoch fence mismatch"
+                )));
+            }
+            if receipt.status == DfsNamespacePrepareStatus::Committed {
+                return Err(MetadataBackendError::Serde(format!(
+                    "namespace prepare {operation_id} is already committed"
+                )));
+            }
+            return self.write_journal_entry_and_apply_table_ops_unlocked(
+                DfsMetadataMutation::put_namespace_prepare_receipt(&receipt),
+                vec![DfsMetadataTableOp::PutNamespacePrepareReceipt { receipt }],
+            );
+        }
         let mut prepare = self
             .tables
             .namespace_prepares
             .get(operation_id)
             .cloned()
             .ok_or_else(|| {
-                MetadataBackendError::Serde(format!(
-                    "namespace prepare {operation_id} does not exist"
-                ))
+                if self.tables.namespace_prepare_history_has_evictions() {
+                    MetadataBackendError::Serde(format!(
+                        "namespace prepare {operation_id} idempotency history expired or is unknown"
+                    ))
+                } else {
+                    MetadataBackendError::Serde(format!(
+                        "namespace prepare {operation_id} does not exist"
+                    ))
+                }
             })?;
         if prepare.operation_digest != expected_operation_digest
             || prepare.owner_epoch != expected_owner_epoch
@@ -5197,11 +5516,33 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             request.requester_node_id.clone(),
             request.request_id.clone(),
         );
+        if let Some(receipt) = self.tables.namespace_request_receipts.get(&key).cloned() {
+            if !receipt.matches_completed_request(request) {
+                return Err(MetadataBackendError::Serde(format!(
+                    "namespace request id {}/{} was reused after compaction with a different payload",
+                    request.requester_node_id, request.request_id
+                )));
+            }
+            return self.write_journal_entry_and_apply_table_ops_unlocked(
+                DfsMetadataMutation::put_namespace_request_receipt(&receipt),
+                vec![DfsMetadataTableOp::PutNamespaceRequestReceipt { receipt }],
+            );
+        }
         if let Some(existing) = self.tables.namespace_requests.get(&key)
             && !namespace_request_transition_is_valid(existing, request)
         {
             return Err(MetadataBackendError::Serde(format!(
                 "namespace request id {}/{} was reused with a different payload or invalid status transition",
+                request.requester_node_id, request.request_id
+            )));
+        }
+        if !self.tables.namespace_requests.contains_key(&key)
+            && self
+                .tables
+                .namespace_request_history_expired(&request.request_id)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace request {}/{} idempotency history expired or is unknown",
                 request.requester_node_id, request.request_id
             )));
         }
@@ -5223,6 +5564,33 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             .namespace_requests
             .get(&(requester_node_id.clone(), request_id.to_string()))
             .cloned())
+    }
+
+    fn get_namespace_request_receipt(
+        &self,
+        requester_node_id: &NodeId,
+        request_id: &str,
+    ) -> Result<Option<DfsNamespaceRequestReceipt>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables
+            .namespace_request_receipts
+            .get(&(requester_node_id.clone(), request_id.to_string()))
+            .cloned())
+    }
+
+    fn namespace_request_history_expired_on_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        request_id: &str,
+    ) -> Result<bool> {
+        if shard_id != &self.shard_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace request retention shard {} does not match backend shard {}",
+                shard_id.0, self.shard_id.0
+            )));
+        }
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables.namespace_request_history_expired(request_id))
     }
 
     fn list_namespace_requests(&self) -> Result<Vec<DfsNamespaceRequestRecord>> {
@@ -10102,7 +10470,7 @@ mod tests {
             root_only.put_object(&object).expect("root object");
         }
 
-        let backend = LocalShardedMetadataBackend::new(
+        let mut backend = LocalShardedMetadataBackend::new(
             &root,
             vec![
                 shard_config("root", DfsMetadataShardAssignment::Root),
@@ -10110,6 +10478,18 @@ mod tests {
                     "services",
                     DfsMetadataShardAssignment::PathPrefix {
                         prefix: "/services".to_string(),
+                    },
+                ),
+                shard_config(
+                    "users",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/users".to_string(),
+                    },
+                ),
+                shard_config(
+                    "agents",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/agents".to_string(),
                     },
                 ),
             ],
@@ -10122,6 +10502,42 @@ mod tests {
                 .expect("activation fallback path"),
             Some(object),
             "publishing a new path-prefix shard before migration must not make existing root-shard paths disappear"
+        );
+
+        reset_metadata_current_tables_snapshot_calls();
+        assert_eq!(
+            backend
+                .get_object_by_path(
+                    &file_system.file_system_id,
+                    "/services/not-created-during-migration.txt",
+                )
+                .expect("bounded migration miss"),
+            None
+        );
+        assert_eq!(
+            metadata_current_tables_snapshot_calls(),
+            2,
+            "a create miss should inspect the selected shard plus the one previous-topology source, not every configured shard"
+        );
+
+        let migration = backend
+            .migrate_objects_to_configured_shards(&file_system.file_system_id, 8)
+            .expect("finish bounded migration");
+        assert!(!migration.reached_limit);
+        reset_metadata_current_tables_snapshot_calls();
+        assert_eq!(
+            backend
+                .get_object_by_path(
+                    &file_system.file_system_id,
+                    "/services/not-created-after-migration.txt",
+                )
+                .expect("steady-state miss"),
+            None
+        );
+        assert_eq!(
+            metadata_current_tables_snapshot_calls(),
+            1,
+            "a completed migration should retire its fallback topology"
         );
 
         cleanup(&root);
@@ -16753,6 +17169,550 @@ mod tests {
         assert_eq!(next.retiring_epoch, 12);
 
         cleanup(&root);
+    }
+
+    #[test]
+    fn table_checkpoint_compacts_terminal_namespace_history_without_losing_exact_retries() {
+        let root = temp_root("terminal_namespace_receipt_checkpoint");
+        let shard_id = DfsMetadataShardId::new("root");
+        let file_system = file_system();
+        let current = object(version("version_namespace_receipt_1"));
+        let mut committed = current.clone();
+        committed.version = version("version_namespace_receipt_2");
+        committed.mode = 0o600;
+
+        let now = OffsetDateTime::now_utc();
+        let mut pending_request = namespace_request(91, DfsNamespaceRequestStatus::Pending);
+        pending_request.created_at = now;
+        pending_request.updated_at = now;
+        let mut completed_request = pending_request.clone();
+        completed_request.status = DfsNamespaceRequestStatus::Completed;
+        completed_request.result = Some(DfsNamespaceResult::Applied);
+        let mut prepare = namespace_prepare(
+            &format!("namespace-request:{}:commit", pending_request.operation_id),
+            "root",
+            &current,
+            committed,
+        );
+        prepare.transaction.created_at = now;
+        prepare.completed_request = Some(completed_request.clone());
+        prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+                .expect("canonical request-owned prepare digest");
+        let transaction = prepare.transaction.clone();
+
+        let mut backend =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("metadata backend");
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        backend
+            .put_namespace_request_on_shard(&shard_id, &pending_request)
+            .expect("pending request");
+        backend
+            .prepare_namespace_transaction(&prepare)
+            .expect("hidden prepare");
+        backend
+            .commit_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect("commit prepare");
+
+        let full_request_bytes = serde_json::to_vec(&completed_request)
+            .expect("encode full request")
+            .len();
+        backend
+            .compact_metadata_table_log_if_needed(0)
+            .expect("force exact table checkpoint");
+
+        assert!(
+            backend
+                .get_namespace_transaction(&transaction.transaction_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .get_namespace_prepare(&prepare.operation_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .get_namespace_request(
+                    &completed_request.requester_node_id,
+                    &completed_request.request_id,
+                )
+                .unwrap()
+                .is_none()
+        );
+        let request_receipt = backend
+            .get_namespace_request_receipt(
+                &completed_request.requester_node_id,
+                &completed_request.request_id,
+            )
+            .expect("request receipt")
+            .expect("compacted request receipt");
+        assert_eq!(request_receipt.result, DfsNamespaceResult::Applied);
+        assert!(
+            serde_json::to_vec(&request_receipt)
+                .expect("encode compact request receipt")
+                .len()
+                < full_request_bytes,
+            "terminal receipt must discard the semantic operation and recovery diagnostics"
+        );
+        assert_eq!(backend.tables.namespace_transaction_receipts.len(), 1);
+        assert_eq!(backend.tables.namespace_prepare_receipts.len(), 1);
+        assert_eq!(backend.tables.namespace_request_receipts.len(), 1);
+
+        drop(backend);
+        let mut reopened =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("reopen checkpoint");
+        assert_eq!(
+            reopened
+                .get_namespace_request_receipt(
+                    &completed_request.requester_node_id,
+                    &completed_request.request_id,
+                )
+                .expect("reopened request receipt"),
+            Some(request_receipt)
+        );
+
+        let commit_retry = reopened
+            .commit_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect("exact committed prepare retry");
+        assert!(matches!(
+            commit_retry.mutation,
+            DfsMetadataMutation::PutNamespacePrepareReceipt { .. }
+        ));
+        let request_retry = reopened
+            .put_namespace_request_on_shard(&shard_id, &completed_request)
+            .expect("exact completed request retry");
+        assert!(matches!(
+            request_retry.mutation,
+            DfsMetadataMutation::PutNamespaceRequestReceipt { .. }
+        ));
+        let transaction_retry = reopened
+            .apply_namespace_transaction(&transaction)
+            .expect("exact materialized transaction retry");
+        assert!(matches!(
+            transaction_retry.mutation,
+            DfsMetadataMutation::PutNamespaceTransactionReceipt { .. }
+        ));
+
+        let mut conflicting_transaction = transaction.clone();
+        conflicting_transaction.objects[0].mode ^= 0o111;
+        assert!(
+            reopened
+                .apply_namespace_transaction(&conflicting_transaction)
+                .expect_err("transaction id reuse must remain fenced")
+                .to_string()
+                .contains("different payload")
+        );
+        assert!(
+            reopened
+                .commit_prepared_namespace_transaction(
+                    &prepare.operation_id,
+                    "blake3:different-prepare",
+                    prepare.owner_epoch,
+                )
+                .expect_err("prepare digest reuse must remain fenced")
+                .to_string()
+                .contains("fence mismatch")
+        );
+        let mut conflicting_request = completed_request;
+        conflicting_request.command_digest = "blake3:different-request".to_string();
+        assert!(
+            reopened
+                .put_namespace_request_on_shard(&shard_id, &conflicting_request)
+                .expect_err("request id reuse must remain fenced")
+                .to_string()
+                .contains("different payload")
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn bounded_namespace_receipt_retention_preserves_live_recovery_and_expires_evicted_retries() {
+        let root = temp_root("bounded_namespace_receipt_retention");
+        let shard_id = DfsMetadataShardId::new("root");
+        let file_system = file_system();
+        let current = object(version("version_namespace_retention_1"));
+        let mut committed = current.clone();
+        committed.version = version("version_namespace_retention_2");
+        committed.mode = 0o600;
+
+        let mut pending_current = object(version("version_namespace_pending_1"));
+        pending_current.object_id =
+            DfsObjectId::from_legacy_named("object_namespace_pending_retention")
+                .expect("pending object");
+        pending_current.path = "/pending-retention".to_string();
+        let mut pending_committed = pending_current.clone();
+        pending_committed.version = version("version_namespace_pending_2");
+
+        let terminal_request = namespace_request(92, DfsNamespaceRequestStatus::Pending);
+        let mut completed_request = terminal_request.clone();
+        completed_request.status = DfsNamespaceRequestStatus::Completed;
+        completed_request.result = Some(DfsNamespaceResult::Applied);
+        let mut terminal_prepare = namespace_prepare(
+            &format!("namespace-request:{}:commit", terminal_request.operation_id),
+            "root",
+            &current,
+            committed,
+        );
+        terminal_prepare.completed_request = Some(completed_request.clone());
+        terminal_prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&terminal_prepare)
+                .expect("canonical terminal prepare digest");
+        let terminal_transaction = terminal_prepare.transaction.clone();
+
+        let pending_request = namespace_request(93, DfsNamespaceRequestStatus::Pending);
+        let pending_prepare = namespace_prepare(
+            "namespace-retention-still-prepared",
+            "root",
+            &pending_current,
+            pending_committed,
+        );
+
+        let mut backend =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("metadata backend");
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&current).expect("terminal current");
+        backend
+            .put_object(&pending_current)
+            .expect("pending current");
+        backend
+            .put_namespace_request_on_shard(&shard_id, &terminal_request)
+            .expect("terminal request admission");
+        backend
+            .prepare_namespace_transaction(&terminal_prepare)
+            .expect("terminal prepare");
+        backend
+            .commit_prepared_namespace_transaction(
+                &terminal_prepare.operation_id,
+                &terminal_prepare.operation_digest,
+                terminal_prepare.owner_epoch,
+            )
+            .expect("terminal commit");
+        backend
+            .put_namespace_request_on_shard(&shard_id, &pending_request)
+            .expect("pending request");
+        backend
+            .prepare_namespace_transaction(&pending_prepare)
+            .expect("pending prepare");
+
+        backend
+            .compact_metadata_table_log_with_namespace_retention(
+                0,
+                OffsetDateTime::now_utc(),
+                crate::metadata_tables::DfsNamespaceReceiptRetentionLimits {
+                    max_transaction_receipts: 0,
+                    max_prepare_receipts: 0,
+                    max_request_receipts: 0,
+                    max_age: time::Duration::days(365_000),
+                },
+            )
+            .expect("checkpoint with zero terminal receipt capacity");
+
+        assert!(backend.tables.namespace_transaction_receipts.is_empty());
+        assert!(backend.tables.namespace_prepare_receipts.is_empty());
+        assert!(backend.tables.namespace_request_receipts.is_empty());
+        assert!(
+            backend
+                .tables
+                .namespace_receipt_retention
+                .transaction_floor
+                .is_some()
+        );
+        assert!(
+            backend
+                .tables
+                .namespace_receipt_retention
+                .prepare_floor
+                .is_some()
+        );
+        assert!(
+            backend
+                .tables
+                .namespace_receipt_retention
+                .opaque_request_history_evicted
+        );
+        assert_eq!(
+            backend
+                .get_namespace_request(
+                    &pending_request.requester_node_id,
+                    &pending_request.request_id,
+                )
+                .expect("pending request lookup"),
+            Some(pending_request.clone())
+        );
+        assert_eq!(
+            backend
+                .get_namespace_prepare(&pending_prepare.operation_id)
+                .expect("pending prepare lookup"),
+            Some(normalized_namespace_prepare(&pending_prepare))
+        );
+
+        drop(backend);
+        let mut reopened =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("reopen checkpoint");
+        assert!(
+            reopened
+                .tables
+                .namespace_receipt_retention
+                .opaque_request_history_evicted,
+            "the expiry fence must survive reopen"
+        );
+        assert!(
+            reopened
+                .apply_namespace_transaction(&terminal_transaction)
+                .expect_err("evicted transaction retry must not reapply")
+                .to_string()
+                .contains("idempotency history expired or is unknown")
+        );
+        assert!(
+            reopened
+                .commit_prepared_namespace_transaction(
+                    &terminal_prepare.operation_id,
+                    &terminal_prepare.operation_digest,
+                    terminal_prepare.owner_epoch,
+                )
+                .expect_err("evicted prepare retry must not reapply")
+                .to_string()
+                .contains("idempotency history expired or is unknown")
+        );
+        assert!(
+            reopened
+                .put_namespace_request_on_shard(&shard_id, &completed_request)
+                .expect_err("evicted request retry must not reapply")
+                .to_string()
+                .contains("idempotency history expired or is unknown")
+        );
+        reopened
+            .put_namespace_request_on_shard(&shard_id, &pending_request)
+            .expect("pending request remains exactly retryable");
+        reopened
+            .prepare_namespace_transaction(&pending_prepare)
+            .expect("prepared transaction remains exactly retryable");
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn namespace_receipt_retention_evicts_oldest_by_age_then_count() {
+        let mut tables = DfsMetadataTables::default();
+        let fs_id = file_system_id();
+        let shard_id = DfsMetadataShardId::new("root");
+        for (index, day) in [(0, 0), (1, 5), (2, 9), (3, 10)] {
+            if index == 3 {
+                continue;
+            }
+            let created_at =
+                OffsetDateTime::from_unix_timestamp(day * 86_400).expect("receipt timestamp");
+            tables.namespace_transaction_receipts.insert(
+                format!("transaction-{index}"),
+                DfsNamespaceTransactionReceipt {
+                    transaction_id: format!("transaction-{index}"),
+                    file_system_id: fs_id.clone(),
+                    transaction_digest: format!("blake3:transaction-{index}"),
+                    created_at,
+                    retained_at: created_at,
+                },
+            );
+            tables.namespace_prepare_receipts.insert(
+                format!("prepare-{index}"),
+                DfsNamespacePrepareReceipt {
+                    operation_id: format!("prepare-{index}"),
+                    file_system_id: fs_id.clone(),
+                    shard_id: shard_id.clone(),
+                    owner_epoch: 1,
+                    operation_digest: format!("blake3:prepare-{index}"),
+                    transaction_id: format!("transaction-{index}"),
+                    status: DfsNamespacePrepareStatus::Committed,
+                    created_at,
+                    retained_at: created_at,
+                },
+            );
+            let requester_node_id = node(&format!("node_namespace_retention_{index}"));
+            let request_id = format!("opaque-request-{index}");
+            tables.namespace_request_receipts.insert(
+                (requester_node_id.clone(), request_id.clone()),
+                DfsNamespaceRequestReceipt {
+                    file_system_id: fs_id.clone(),
+                    requester_node_id,
+                    request_id,
+                    operation_id: format!("operation-{index}"),
+                    authority_shard_id: shard_id.clone(),
+                    command_digest: format!("blake3:request-{index}"),
+                    result: DfsNamespaceResult::Applied,
+                    posix_coordination_result: None,
+                    created_at,
+                    retained_at: created_at,
+                },
+            );
+        }
+
+        tables
+            .compact_terminal_namespace_history(
+                OffsetDateTime::from_unix_timestamp(10 * 86_400).expect("checkpoint timestamp"),
+                crate::metadata_tables::DfsNamespaceReceiptRetentionLimits {
+                    max_transaction_receipts: 2,
+                    max_prepare_receipts: 2,
+                    max_request_receipts: 2,
+                    max_age: time::Duration::days(7),
+                },
+            )
+            .expect("age checkpoint");
+        assert_eq!(
+            tables
+                .namespace_transaction_receipts
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["transaction-1".to_string(), "transaction-2".to_string()]
+        );
+        assert_eq!(tables.namespace_prepare_receipts.len(), 2);
+        assert_eq!(tables.namespace_request_receipts.len(), 2);
+
+        let created_at =
+            OffsetDateTime::from_unix_timestamp(10 * 86_400).expect("new receipt timestamp");
+        tables.namespace_transaction_receipts.insert(
+            "transaction-3".to_string(),
+            DfsNamespaceTransactionReceipt {
+                transaction_id: "transaction-3".to_string(),
+                file_system_id: fs_id.clone(),
+                transaction_digest: "blake3:transaction-3".to_string(),
+                created_at,
+                retained_at: created_at,
+            },
+        );
+        tables.namespace_prepare_receipts.insert(
+            "prepare-3".to_string(),
+            DfsNamespacePrepareReceipt {
+                operation_id: "prepare-3".to_string(),
+                file_system_id: fs_id.clone(),
+                shard_id: shard_id.clone(),
+                owner_epoch: 1,
+                operation_digest: "blake3:prepare-3".to_string(),
+                transaction_id: "transaction-3".to_string(),
+                status: DfsNamespacePrepareStatus::Committed,
+                created_at,
+                retained_at: created_at,
+            },
+        );
+        let requester_node_id = node("node_namespace_retention_3");
+        tables.namespace_request_receipts.insert(
+            (requester_node_id.clone(), "opaque-request-3".to_string()),
+            DfsNamespaceRequestReceipt {
+                file_system_id: fs_id,
+                requester_node_id,
+                request_id: "opaque-request-3".to_string(),
+                operation_id: "operation-3".to_string(),
+                authority_shard_id: shard_id,
+                command_digest: "blake3:request-3".to_string(),
+                result: DfsNamespaceResult::Applied,
+                posix_coordination_result: None,
+                created_at,
+                retained_at: created_at,
+            },
+        );
+        tables
+            .compact_terminal_namespace_history(
+                created_at,
+                crate::metadata_tables::DfsNamespaceReceiptRetentionLimits {
+                    max_transaction_receipts: 2,
+                    max_prepare_receipts: 2,
+                    max_request_receipts: 2,
+                    max_age: time::Duration::days(365_000),
+                },
+            )
+            .expect("count checkpoint");
+
+        assert_eq!(
+            tables
+                .namespace_transaction_receipts
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["transaction-2".to_string(), "transaction-3".to_string()],
+            "count pressure must retain the newest terminal identities"
+        );
+        assert_eq!(
+            tables
+                .namespace_receipt_retention
+                .transaction_floor
+                .as_ref()
+                .map(|key| key.identity.as_str()),
+            Some("transaction-1")
+        );
+        assert_eq!(
+            tables
+                .namespace_prepare_receipts
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["prepare-2".to_string(), "prepare-3".to_string()]
+        );
+        assert_eq!(tables.namespace_request_receipts.len(), 2);
+        assert!(
+            tables
+                .namespace_receipt_retention
+                .opaque_request_history_evicted
+        );
+
+        let mut sortable_tables = DfsMetadataTables::default();
+        let requester_node_id = node("node_sortable_namespace_retention");
+        let old_request_id = "dfs_net_req_1_00000000000000000000000000".to_string();
+        let retained_request_id = "dfs_net_req_2_00000000000000000000000001".to_string();
+        for (request_id, second) in [
+            (old_request_id.clone(), 0),
+            (retained_request_id.clone(), 1),
+        ] {
+            sortable_tables.namespace_request_receipts.insert(
+                (requester_node_id.clone(), request_id.clone()),
+                DfsNamespaceRequestReceipt {
+                    file_system_id: file_system_id(),
+                    requester_node_id: requester_node_id.clone(),
+                    request_id,
+                    operation_id: format!("sortable-operation-{second}"),
+                    authority_shard_id: DfsMetadataShardId::new("root"),
+                    command_digest: format!("blake3:sortable-{second}"),
+                    result: DfsNamespaceResult::Applied,
+                    posix_coordination_result: None,
+                    created_at: OffsetDateTime::from_unix_timestamp(second)
+                        .expect("sortable timestamp"),
+                    retained_at: OffsetDateTime::from_unix_timestamp(second)
+                        .expect("sortable retention timestamp"),
+                },
+            );
+        }
+        sortable_tables
+            .compact_terminal_namespace_history(
+                OffsetDateTime::from_unix_timestamp(2).expect("sortable checkpoint"),
+                crate::metadata_tables::DfsNamespaceReceiptRetentionLimits {
+                    max_transaction_receipts: 1,
+                    max_prepare_receipts: 1,
+                    max_request_receipts: 1,
+                    max_age: time::Duration::days(365_000),
+                },
+            )
+            .expect("sortable checkpoint");
+        assert!(sortable_tables.namespace_request_history_expired(&old_request_id));
+        assert!(
+            !sortable_tables.namespace_request_history_expired(&retained_request_id),
+            "a retained or newer generated request identity must remain admissible"
+        );
+        assert!(
+            !sortable_tables
+                .namespace_request_history_expired("dfs_net_req_3_00000000000000000000000002"),
+            "the durable floor must not reject identities newer than the evicted prefix"
+        );
     }
 
     fn temp_root(name: &str) -> sinomo_testdir::TestDir {
