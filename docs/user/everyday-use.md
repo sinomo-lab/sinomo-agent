@@ -121,21 +121,25 @@ policy are appropriate for those secrets.
 
 ## Skills
 
-Skills are portable instruction packages based on a `SKILL.md` file:
+Sinomo uses the open
+[Agent Skills format](https://agentskills.io/home). A skill is a directory with
+a required `SKILL.md` and optional `scripts/`, `references/`, `assets/`, or
+other resources:
 
 ```sh
 SKILL_ID=your-skill-id
 SCOPE=your-scope
 sinomo skill list
-sinomo skill import /path/to/skill-directory
+sinomo skill import /path/to/skill-name
 sinomo skill show "$SKILL_ID" --text
 sinomo skill activate "$SKILL_ID" --scope "$SCOPE"
-sinomo skill export "$SKILL_ID" --output exported-skill.md
+sinomo skill export "$SKILL_ID" --output /path/to/exports
 ```
 
 Inspect imported instructions and resources before activation. A skill can
 guide an agent but cannot grant host, network, filesystem, device, secret, or
-rollout permissions.
+rollout permissions. In particular, the experimental `allowed-tools`
+frontmatter field does not override Sinomo authority checks.
 
 ## Shared Files and SIFS
 

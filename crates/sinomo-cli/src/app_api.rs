@@ -38,8 +38,8 @@ use sinomo_agent::{
     InteractionSurface, InteractionSurfaceKind, SkillActivationScope, SkillCatalogEntry,
     SkillCatalogSifsStore, SkillCatalogSource, SkillCatalogStore, SkillCatalogWrite, TaskId,
     WorkspaceRef, channel_message_agent_item_id, mark_participant_message_observed,
-    render_common_skill_markdown, safe_agent_channel_attachment_file_name,
-    sync_participant_session,
+    read_agent_skill_package, render_common_skill_markdown,
+    safe_agent_channel_attachment_file_name, sync_participant_session, write_agent_skill_package,
 };
 use sinomo_lm::{
     AnthropicConfig, CLAUDE_DEFAULT_MODEL, ClaudeCodeConfig, CodexCliConfig, GeminiConfig,
@@ -782,6 +782,11 @@ pub struct SkillDetail {
     pub summary: SkillSummary,
     pub manifest_path: String,
     pub base_hash: Option<String>,
+    pub license: Option<String>,
+    pub compatibility: Option<String>,
+    pub allowed_tools: Option<String>,
+    pub metadata: BTreeMap<String, String>,
+    pub resources: Vec<String>,
     pub target_agents: Vec<String>,
     pub model_families: Vec<String>,
     pub activation_tags: Vec<String>,
@@ -795,6 +800,15 @@ impl SkillDetail {
             summary: SkillSummary::from_entry(entry, active),
             manifest_path: entry.manifest_path.clone(),
             base_hash: entry.base_hash.clone(),
+            license: entry.license.clone(),
+            compatibility: entry.compatibility.clone(),
+            allowed_tools: entry.allowed_tools.clone(),
+            metadata: entry.metadata.clone(),
+            resources: entry
+                .resources
+                .iter()
+                .map(|resource| resource.relative_path.clone())
+                .collect(),
             target_agents: entry.target_agents.clone(),
             model_families: entry.model_families.clone(),
             activation_tags: entry.activation_tags.clone(),
@@ -6650,7 +6664,7 @@ pub fn skill_detail(
     ))
 }
 
-/// Import a community-style skill file or directory containing `SKILL.md`.
+/// Validate and import an Agent Skills package directory (or its `SKILL.md`).
 pub fn import_skill(
     data_dir: &SinomoDataDir,
     path: &Path,
@@ -6659,19 +6673,14 @@ pub fn import_skill(
     activate: bool,
 ) -> Result<SkillMutationResult, String> {
     let version = version.unwrap_or_else(|| "1.0.0".to_string());
-    let path = if path.is_dir() {
-        path.join(sinomo_agent::SKILL_FILE_NAME)
-    } else {
-        path.to_path_buf()
-    };
-    let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let package = read_agent_skill_package(path).map_err(|error| error.to_string())?;
     let store =
         SkillCatalogSifsStore::open(Some(data_dir.root())).map_err(|error| error.to_string())?;
-    let mut write = SkillCatalogWrite::from_markdown_skill(
+    let mut write = SkillCatalogWrite::from_agent_skill_package(
         skill_id,
         version,
         SkillCatalogSource::user("app-user"),
-        text,
+        package,
     )
     .map_err(|error| error.to_string())?;
     if activate {
@@ -6693,7 +6702,7 @@ pub fn import_skill(
     })
 }
 
-/// Export a catalog skill as portable Markdown, optionally writing it to disk.
+/// Export a catalog skill as a portable Agent Skills package.
 pub fn export_skill(
     data_dir: &SinomoDataDir,
     skill_id: &str,
@@ -6704,23 +6713,31 @@ pub fn export_skill(
         SkillCatalogSifsStore::open(Some(data_dir.root())).map_err(|error| error.to_string())?;
     let catalog = store.load_catalog().map_err(|error| error.to_string())?;
     let entry = select_skill_entry_for_app(&catalog, skill_id, version)?;
-    let text = store
-        .read_skill_text(&entry)
+    let package = store
+        .read_skill_package(&entry)
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("skill `{}` has no readable SKILL.md body", entry.skill_id))?;
-    let rendered = render_common_skill_markdown(&entry, &text);
+        .ok_or_else(|| format!("skill `{}` has no readable package", entry.skill_id))?;
+    let rendered = render_common_skill_markdown(&entry, &package.markdown)
+        .map_err(|error| error.to_string())?;
+    if output.is_some_and(|path| path.is_file()) {
+        return Err("Agent Skills exports require a directory path".to_string());
+    }
     let output_path = output.map(|path| {
-        if path.is_dir() {
-            path.join(sinomo_agent::SKILL_FILE_NAME)
-        } else {
+        if path.file_name().and_then(|name| name.to_str()) == Some(entry.skill_id.as_str()) {
             path.to_path_buf()
+        } else {
+            path.join(&entry.skill_id)
         }
     });
     if let Some(path) = output_path.as_deref() {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
-        fs::write(path, rendered.as_bytes()).map_err(|error| error.to_string())?;
+        write_agent_skill_package(
+            path,
+            &sinomo_agent::AgentSkillPackage {
+                markdown: rendered,
+                files: package.files,
+            },
+        )
+        .map_err(|error| error.to_string())?;
     }
     Ok(SkillMutationResult {
         status: "exported".to_string(),

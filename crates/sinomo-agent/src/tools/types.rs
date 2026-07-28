@@ -463,7 +463,7 @@ pub fn tool_disclosure_descriptors() -> Vec<AgentToolDescriptor> {
         AgentToolDescriptor::new(AgentToolSpec::new(
             AgentToolKind::SkillSearch,
             "skill_search",
-            "Search skills declared by the active agent package or installed module resources without loading full skill text into the prompt.",
+            "Search the available Agent Skills catalog by name or description without loading instructions.",
             false,
         ))
         .with_capabilities([AgentToolCapability::ObserveEnvironment])
@@ -484,7 +484,7 @@ pub fn tool_disclosure_descriptors() -> Vec<AgentToolDescriptor> {
         AgentToolDescriptor::new(AgentToolSpec::new(
             AgentToolKind::SkillDescribe,
             "skill_describe",
-            "Return a full skill descriptor, including embedded skill text when the package/module declared it inline.",
+            "Inspect Agent Skills metadata and provenance without activating its instructions.",
             false,
         ))
         .with_capabilities([AgentToolCapability::ObserveEnvironment])
@@ -501,8 +501,8 @@ pub fn tool_disclosure_descriptors() -> Vec<AgentToolDescriptor> {
         AgentToolDescriptor::new(AgentToolSpec::new(
             AgentToolKind::SkillActivate,
             "skill_activate",
-            "Request activation of a disclosed skill through a host-provided runtime executor. The generic agent bridge reports blocked until such an executor is attached.",
-            true,
+            "Load the selected Agent Skills SKILL.md instructions and list bundled resources. Call this when the task matches an available skill description.",
+            false,
         ))
         .with_capabilities([AgentToolCapability::ObserveEnvironment])
         .with_input_schema(serde_json::json!({
@@ -512,6 +512,15 @@ pub fn tool_disclosure_descriptors() -> Vec<AgentToolDescriptor> {
                 "skill": {
                     "type": "string",
                     "description": "Skill id to activate."
+                },
+                "resource": {
+                    "type": "string",
+                    "description": "Optional relative resource path from a prior activation result. When set, returns only that bundled resource."
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum resource bytes to return. Defaults to 256 KiB and is capped at 1 MiB."
                 },
                 "reason": {
                     "type": "string",
@@ -539,6 +548,18 @@ pub struct AgentSkillDescriptor {
     pub id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resource_paths: Vec<String>,
+    #[serde(skip)]
+    pub resource_contents: BTreeMap<String, Vec<u8>>,
     pub source: AgentSkillSource,
     #[serde(default)]
     pub package_declared: bool,
@@ -575,6 +596,12 @@ impl AgentSkillDescriptor {
         Self {
             id: id.into(),
             description: String::new(),
+            license: None,
+            compatibility: None,
+            allowed_tools: None,
+            metadata: BTreeMap::new(),
+            resource_paths: Vec::new(),
+            resource_contents: BTreeMap::new(),
             source: AgentSkillSource::Package,
             package_declared: true,
             module_id: None,
@@ -601,6 +628,12 @@ impl AgentSkillDescriptor {
         Self {
             id: resource.id.clone(),
             description: resource.description.clone(),
+            license: None,
+            compatibility: None,
+            allowed_tools: None,
+            metadata: BTreeMap::new(),
+            resource_paths: Vec::new(),
+            resource_contents: BTreeMap::new(),
             source: AgentSkillSource::Module,
             package_declared,
             module_id: Some(registration.module_id().as_str().to_string()),

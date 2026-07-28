@@ -104,11 +104,24 @@ the 80-percent compaction threshold is calculated.
 ## Skill Catalog
 
 The managed skill catalog is cluster state stored in SIFS under
-`/services/sinomo/skills`. Skill bodies are human-readable `SKILL.md` files.
-Catalog metadata, active pointers, and conflict records are SOBJ files. Sinomo
-built-ins and module-declared skills are provider-managed sources and can be
-reconciled automatically into SIFS. User, agent, and evolution skills are
+`/services/sinomo/skills`. Its portable package boundary is the open
+[Agent Skills specification](https://agentskills.io/specification): every skill
+is a directory whose required `SKILL.md` starts with YAML frontmatter containing
+`name` and `description`. Optional `license`, `compatibility`, `metadata`, and
+experimental `allowed-tools` fields are preserved. `scripts/`, `references/`,
+`assets/`, and other regular files remain relative resources in the same
+package. Catalog metadata, active pointers, and conflict records are SOBJ files.
+Sinomo built-ins and module-declared skills are provider-managed sources and can
+be reconciled automatically into SIFS. User, agent, and evolution skills are
 override sources and must not be overwritten silently by provider updates.
+
+Imports validate the standard naming, length, frontmatter, and directory-name
+contracts before publishing anything. Symlinks are rejected, resource paths
+must remain inside the package, and bounded file-count and byte limits prevent
+uncontrolled traversal. The catalog content hash covers `SKILL.md` plus every
+bundled resource, while each resource also has an independently verified hash.
+Exports recreate a standard skill directory rather than flattening the package
+to one Markdown file.
 
 Module skills use existing `ModuleDeclarativeResourceKind::Skill` declarations.
 Embedded module skill text can be materialized directly; path-backed module
@@ -116,8 +129,8 @@ resources resolve their bytes through the module payload before publishing the
 same catalog write. `AgentSkillPlan` merges package-declared skills,
 module-projected skills, and active catalog entries. Catalog descriptors carry
 SIFS path, version, content hash, base hash, status, and manifest path so
-`skill_search` and `skill_describe` can disclose provenance without loading
-every skill body into prompt context.
+`skill_search` and `skill_describe` can disclose metadata and provenance without
+loading skill instructions into prompt context.
 
 Upstream updates for Sinomo or module skills auto-replace only clean
 provider-managed versions from the same source. When a user, agent, or
@@ -136,19 +149,23 @@ The CLI can inspect, validate, import, and export agent packages, and can list,
 inspect, import, export, and activate skills. Use `sinomo agent help` and
 `sinomo skill help` for the current command surface.
 
-Community skill import treats the Markdown `SKILL.md` as the ground-truth body.
-Common frontmatter keys such as `name`, `description`, and
-`metadata.short-description` are used to seed Sinomo descriptors when present,
-but Sinomo-specific SOBJ metadata remains optional. Export preserves existing
-portable frontmatter or synthesizes `name` and `description` for plain
-Markdown bodies.
+Agent runtimes follow Agent Skills progressive disclosure. The stable turn
+context contains only the name and description of each valid, readable active
+skill. When a task matches, `skill_activate` returns the Markdown instruction
+body and the package's relative resource list. A later `skill_activate` call
+with one listed resource reads that file with a bounded model-visible payload;
+resources are never eagerly injected. Skill activation output remains in the
+ordinary traced tool transcript.
 
-Agent runtimes expose skill lookup through `skill_search` and `skill_describe`.
+The experimental `allowed-tools` field is descriptive metadata. It does not
+grant a capability, change the current tool surface, or bypass Sinomo policy,
+workspace, sandbox, device, network, or host authority checks.
+
 When the host registry is configured with a local data directory, `skill_update`
 persists a prompt-based improvement as a new `evolution` source version, records
 the previous active content hash as `base_hash`, and activates the new version by
-default. This is the lightweight Hermes-style skill evolution path; broader
-mutation campaigns remain owned by `sinomo-evolution`.
+default. Updates must provide a complete standard `SKILL.md`. Broader mutation
+campaigns remain owned by `sinomo-evolution`.
 
 ## Prompts and Provider Rendering
 

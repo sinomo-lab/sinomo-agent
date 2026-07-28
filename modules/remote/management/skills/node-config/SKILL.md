@@ -1,3 +1,8 @@
+---
+name: node-config
+description: Typed node configuration guidance using the existing config service.
+---
+
 # Remote Node Configuration
 
 Use Sinomo's existing typed configuration service after remote management has

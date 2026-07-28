@@ -11268,7 +11268,7 @@ fn skills_summary_section(shared: &Shared, reader: &ThemeReader) -> FormSection 
             "skill-import-path",
             "Import path",
             import_path,
-            "/path/to/SKILL.md",
+            "/path/to/skill-name",
             {
                 let s = shared.clone();
                 move |value| s.settings_mut().set_skill_import_path(value)
@@ -11287,7 +11287,7 @@ fn skills_summary_section(shared: &Shared, reader: &ThemeReader) -> FormSection 
                 let path = s.settings().skill_import_path.trim().to_string();
                 if path.is_empty() {
                     s.settings_mut().skill_action_error =
-                        Some("enter a skill file or directory path".to_string());
+                        Some("enter an Agent Skills package directory".to_string());
                     return;
                 }
                 queue_settings_operation(
@@ -11346,7 +11346,7 @@ fn skills_summary_section(shared: &Shared, reader: &ThemeReader) -> FormSection 
     ));
 
     FormSection::new("Skills", summary_body)
-        .description("Manage imported and generated SKILL.md files used by agents.")
+        .description("Manage standard Agent Skills packages used by agents.")
         .theme_when(clone_reader(reader))
 }
 
@@ -11395,7 +11395,7 @@ fn skills_catalog_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange
                     &s,
                     &r,
                     "Import",
-                    "Add a SKILL.md file to make it available to agents.",
+                    "Add a directory containing SKILL.md to make it available to agents.",
                 ));
             WidgetPod::new(FormSection::new("Catalog", body).theme_when(clone_reader(&r)))
         } else {
@@ -11573,6 +11573,25 @@ fn skill_detail_section(
     if let Some(base_hash) = detail.base_hash.as_ref() {
         body = body.with_child(value_row(shared, reader, "Base hash", short(base_hash, 48)));
     }
+    if let Some(license) = detail.license.as_ref() {
+        body = body.with_child(value_row(shared, reader, "License", license.clone()));
+    }
+    if let Some(compatibility) = detail.compatibility.as_ref() {
+        body = body.with_child(value_row(
+            shared,
+            reader,
+            "Compatibility",
+            compatibility.clone(),
+        ));
+    }
+    if !detail.resources.is_empty() {
+        body = body.with_child(value_row(
+            shared,
+            reader,
+            "Resources",
+            detail.resources.join(", "),
+        ));
+    }
     if !detail.activation_tags.is_empty() {
         body = body.with_child(value_row(
             shared,
@@ -11595,7 +11614,7 @@ fn skill_detail_section(
         "skill-export-path",
         "Export path",
         export_path,
-        "/path/to/SKILL.md",
+        "/path/to/skill-name",
         {
             let s = shared.clone();
             move |value| s.settings_mut().set_skill_export_path(value)
@@ -14752,8 +14771,8 @@ mod tests {
         let skills_key = skills_section_key(&shared);
         {
             let mut settings = shared.settings_mut();
-            settings.set_skill_import_path("SKILL.md".to_string());
-            settings.set_skill_export_path("exported-SKILL.md".to_string());
+            settings.set_skill_import_path("skill-name".to_string());
+            settings.set_skill_export_path("exported-skill".to_string());
         }
         assert_eq!(
             skills_section_key(&shared),
@@ -15684,8 +15703,6 @@ mod tests {
     fn skills_state_imports_exports_and_activates_versions() {
         let (backend, root) = temp_skill_backend("skills-state");
         let first_path = write_skill_file(&root, "shortcut-skill", "The shortcut is alpha-lane.");
-        let second_path =
-            write_skill_file(&root, "shortcut-skill-v2", "The shortcut is beta-lane.");
 
         let mut state = SettingsState::new(&backend);
         assert!(state.skills.is_empty());
@@ -15714,10 +15731,19 @@ mod tests {
                 .contains("alpha-lane")
         );
 
+        let second_path = write_skill_file(&root, "shortcut-skill", "The shortcut is beta-lane.");
+        let second_reference = second_path
+            .parent()
+            .expect("second skill directory")
+            .join("references")
+            .join("details.md");
+        std::fs::create_dir_all(second_reference.parent().expect("reference parent"))
+            .expect("reference directory");
+        std::fs::write(&second_reference, "Beta lane reference.").expect("reference");
         sinomo_cli::app_api::import_skill(
             backend.data_dir.as_ref(),
             &second_path,
-            Some("shortcut-skill".to_string()),
+            None,
             Some("2.0.0".to_string()),
             false,
         )
@@ -15778,7 +15804,7 @@ mod tests {
                 .active
         );
 
-        let export_path = root.join("exports").join("shortcut-skill.md");
+        let export_path = root.join("exports").join("shortcut-skill");
         state.set_skill_export_path(export_path.display().to_string());
         apply_test_operation(
             &mut state,
@@ -15792,9 +15818,15 @@ mod tests {
             },
         );
         assert!(state.skill_action_error.is_none());
-        let exported = std::fs::read_to_string(&export_path).expect("exported skill");
+        let exported =
+            std::fs::read_to_string(export_path.join("SKILL.md")).expect("exported skill");
         assert!(exported.contains("name: shortcut-skill"));
         assert!(exported.contains("beta-lane"));
+        assert_eq!(
+            std::fs::read_to_string(export_path.join("references/details.md"))
+                .expect("exported reference"),
+            "Beta lane reference."
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

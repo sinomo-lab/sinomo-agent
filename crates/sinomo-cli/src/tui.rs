@@ -7769,6 +7769,8 @@ where
     agent_definition: AgentDefinition,
     skill_catalog: sinomo_agent::SkillCatalog,
     skill_catalog_texts: std::collections::BTreeMap<String, String>,
+    skill_catalog_resources:
+        std::collections::BTreeMap<String, Vec<sinomo_agent::AgentSkillPackageFile>>,
     tool_registry: sinomo_agent::AgentToolRegistry,
     thinking: ThinkingControl,
     provider: String,
@@ -7884,6 +7886,7 @@ where
             agent_definition: AgentDefinition::main(),
             skill_catalog: sinomo_agent::SkillCatalog::default(),
             skill_catalog_texts: std::collections::BTreeMap::new(),
+            skill_catalog_resources: std::collections::BTreeMap::new(),
             tool_registry: sinomo_agent::AgentToolRegistry::new(),
             thinking,
             provider: provider.into(),
@@ -7910,6 +7913,14 @@ where
         texts: std::collections::BTreeMap<String, String>,
     ) -> Self {
         self.skill_catalog_texts = texts;
+        self
+    }
+
+    pub fn with_skill_catalog_resources(
+        mut self,
+        resources: std::collections::BTreeMap<String, Vec<sinomo_agent::AgentSkillPackageFile>>,
+    ) -> Self {
+        self.skill_catalog_resources = resources;
         self
     }
 
@@ -7955,7 +7966,8 @@ where
             sinomo_agent::AgentConfig::new(self.provider.clone(), self.model_name.clone())
                 .with_agent_definition(self.agent_definition.clone())
                 .with_skill_catalog(self.skill_catalog.clone())
-                .with_skill_catalog_texts(self.skill_catalog_texts.clone());
+                .with_skill_catalog_texts(self.skill_catalog_texts.clone())
+                .with_skill_catalog_resources(self.skill_catalog_resources.clone());
         if let Some(workspace_root) = self.workspace_root.as_ref() {
             config = config.with_workspace_root(workspace_root.clone());
         }
@@ -8468,11 +8480,13 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         );
         let skill_catalog = best_effort_reconciled_skill_catalog(data_dir);
         let skill_catalog_texts = best_effort_skill_catalog_texts(data_dir, &skill_catalog);
+        let skill_catalog_resources = best_effort_skill_catalog_resources(data_dir, &skill_catalog);
         Ok(
             Self::with_thinking(model, runtime_info.provider, runtime_info.model, thinking)
                 .with_runtime_storage(AgentRuntimeStorage::from_data_dir(data_dir))
                 .with_skill_catalog(skill_catalog)
                 .with_skill_catalog_texts(skill_catalog_texts)
+                .with_skill_catalog_resources(skill_catalog_resources)
                 .with_tool_registry(main_agent_config_tool_registry(data_dir)?),
         )
     }
@@ -8498,6 +8512,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         let options = provider_options_for_model(account.as_ref(), &resolved.model);
         let skill_catalog = best_effort_reconciled_skill_catalog(data_dir);
         let skill_catalog_texts = best_effort_skill_catalog_texts(data_dir, &skill_catalog);
+        let skill_catalog_resources = best_effort_skill_catalog_resources(data_dir, &skill_catalog);
         Ok(Self::with_thinking(
             DefaultMainAgentChatModel::configured(
                 data_dir,
@@ -8513,6 +8528,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         .with_runtime_storage(AgentRuntimeStorage::from_data_dir(data_dir))
         .with_skill_catalog(skill_catalog)
         .with_skill_catalog_texts(skill_catalog_texts)
+        .with_skill_catalog_resources(skill_catalog_resources)
         .with_tool_registry(tool_registry)
         .with_account_and_options(Some(resolved.account), options))
     }
