@@ -482,6 +482,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
     ) -> Result<()> {
+        self.route_namespace_operation_with_result(primary_node_id, operation)
+            .map(drop)
+    }
+
+    pub(crate) fn route_namespace_operation_with_result(
+        &mut self,
+        primary_node_id: NodeId,
+        operation: DfsNamespaceOperation,
+    ) -> Result<Option<DfsPosixCoordinationResult>> {
         let file_system_id = sifs_file_system_id();
         let mut primary = primary_node_id;
         for _ in 0..POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT {
@@ -500,7 +509,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         &operation,
                         &mut primary,
                     )? {
-                        RoutedNamespaceNetworkRecovery::Completed => return Ok(()),
+                        RoutedNamespaceNetworkRecovery::Completed => {
+                            validate_cross_shard_adoption_receipt(&operation, None)?;
+                            validate_cross_shard_adoption_source_pin_set(
+                                &operation,
+                                self.metadata_backend.as_deref(),
+                            )?;
+                            return Ok(None);
+                        }
                         RoutedNamespaceNetworkRecovery::Retry => continue,
                         RoutedNamespaceNetworkRecovery::Unchanged => {
                             return Err(DfsPosixError::Dfs(error));
@@ -511,12 +527,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             match routed.result.clone() {
                 DfsNamespaceResult::Applied => {
-                    validate_advisory_lock_migration_receipt(
+                    validate_cross_shard_adoption_receipt(
                         &operation,
                         routed.posix_coordination_result.as_ref(),
                     )?;
+                    validate_cross_shard_adoption_source_pin_set(
+                        &operation,
+                        self.metadata_backend.as_deref(),
+                    )?;
                     self.finish_routed_namespace_catch_up_if_needed(&operation, &routed)?;
-                    return Ok(());
+                    return Ok(routed.posix_coordination_result);
                 }
                 DfsNamespaceResult::Rejected {
                     reason,
@@ -525,9 +545,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 } => match current_primary_node_id {
                     Some(current) if current == self.node_id => {
                         // Authority moved to this node; execute locally.
-                        return self
-                            .execute_posix_coordination_operation_local(&operation)
-                            .map(drop);
+                        return self.execute_posix_coordination_operation_local(&operation);
                     }
                     Some(current) if current != primary => {
                         primary = self
@@ -539,9 +557,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             )
                             .map_err(DfsPosixError::Dfs)?;
                         if primary == self.node_id {
-                            return self
-                                .execute_posix_coordination_operation_local(&operation)
-                                .map(drop);
+                            return self.execute_posix_coordination_operation_local(&operation);
                         }
                     }
                     _ => return Err(posix_error_for_namespace_rejection(reason, posix_error)),
@@ -853,27 +869,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             | DfsNamespaceOperation::DirectorySync { .. }
             | DfsNamespaceOperation::RenameDirectoryBounded { .. }
             | DfsNamespaceOperation::ResumeNamespaceJobBounded { .. }
-            | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. } => {
+            | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. }
+            | DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. }
+            | DfsNamespaceOperation::VerifyObjectFamilyAdoption { .. } => {
                 Err(DfsPosixError::Dfs(DfsError::Distributed {
                     message: "POSIX coordination operation bypassed its typed executor".to_string(),
                 }))
             }
             DfsNamespaceOperation::AdoptObjectAtPath {
                 object,
+                source_path,
+                pin_transfer_id,
                 versions,
+                version_pins,
+                version_pin_set_fingerprint,
                 receipts,
                 intents,
+                intent_receipts,
+                intent_receipt_retention,
                 conflicts,
                 advisory_lock_state,
-                source_path: _,
-            } => self.adopt_object_at_path_local(
-                object,
-                versions,
-                receipts,
-                intents,
-                conflicts,
-                advisory_lock_state.as_ref(),
-            ),
+            } => self
+                .adopt_object_at_path_local(
+                    object,
+                    source_path,
+                    pin_transfer_id.as_deref(),
+                    versions,
+                    version_pins,
+                    version_pin_set_fingerprint.as_deref(),
+                    receipts,
+                    intents,
+                    intent_receipts,
+                    intent_receipt_retention,
+                    conflicts,
+                    advisory_lock_state.as_ref(),
+                )
+                .map(drop),
             DfsNamespaceOperation::AdoptHardlinkAlias {
                 alias,
                 source_path: _,
@@ -1061,7 +1092,7 @@ fn namespace_lookup_error_is_uncorroborated_redirect(error: &DfsError) -> bool {
     )
 }
 
-fn validate_advisory_lock_migration_receipt(
+fn validate_cross_shard_adoption_receipt(
     operation: &DfsNamespaceOperation,
     result: Option<&DfsPosixCoordinationResult>,
 ) -> Result<()> {
@@ -1085,6 +1116,112 @@ fn validate_advisory_lock_migration_receipt(
                 "destination does not support exact advisory-lock migration preparation for {object_id}"
             ),
         }));
+    }
+    if let DfsNamespaceOperation::FinalizeObjectFamilyAdoption {
+        object_id,
+        pin_transfer_id,
+        ..
+    } = operation
+    {
+        if matches!(
+            result,
+            Some(DfsPosixCoordinationResult::ObjectFamilyAdoptionFinalized {
+                object_id: finalized_object_id,
+                pin_transfer_id: finalized_transfer_id,
+                durable_through_sequence,
+            }) if finalized_object_id == object_id
+                && finalized_transfer_id == pin_transfer_id
+                && *durable_through_sequence > 0
+        ) {
+            return Ok(());
+        }
+        return Err(DfsPosixError::Dfs(DfsError::Distributed {
+            message: format!(
+                "destination did not return a quorum-durable pin-transfer finalization receipt for {object_id}"
+            ),
+        }));
+    }
+    if let DfsNamespaceOperation::AdoptObjectAtPath {
+        object,
+        version_pins,
+        version_pin_set_fingerprint: Some(expected_pin_fingerprint),
+        pin_transfer_id,
+        advisory_lock_state,
+        ..
+    } = operation
+    {
+        let canonical_pin_fingerprint =
+            crate::protocol::cross_shard_version_pin_set_fingerprint(object, version_pins)
+                .map_err(DfsPosixError::from)?;
+        if &canonical_pin_fingerprint != expected_pin_fingerprint {
+            return Err(DfsPosixError::Dfs(DfsError::Distributed {
+                message: format!(
+                    "cross-shard adoption of {} carried a non-canonical durable version-pin fingerprint",
+                    object.object_id
+                ),
+            }));
+        }
+        let expected_lock_fingerprint = advisory_lock_state
+            .as_ref()
+            .map(|source_state| {
+                crate::advisory_lock::prepare_advisory_lock_state_for_migration(source_state)
+                    .map(|(_, fingerprint)| fingerprint)
+                    .map_err(|source| {
+                        DfsPosixError::Dfs(DfsError::Serialization {
+                            message: format!(
+                                "encode advisory-lock migration receipt for {}: {source}",
+                                object.object_id
+                            ),
+                        })
+                    })
+            })
+            .transpose()?;
+        if let Some(DfsPosixCoordinationResult::ObjectFamilyAdoption {
+            object_id,
+            target_version,
+            pin_transfer_id: acknowledged_transfer_id,
+            version_pin_set_fingerprint,
+            advisory_lock_state_fingerprint,
+            durable_through_sequence,
+            ..
+        }) = result
+        {
+            if object_id == &object.object_id
+                && target_version == &object.version
+                && pin_transfer_id.as_ref() == Some(acknowledged_transfer_id)
+                && version_pin_set_fingerprint == &canonical_pin_fingerprint
+                && advisory_lock_state_fingerprint == &expected_lock_fingerprint
+                && *durable_through_sequence > 0
+            {
+                return Ok(());
+            }
+            return Err(DfsPosixError::Dfs(DfsError::Distributed {
+                message: format!(
+                    "destination returned a mismatched object-family adoption receipt for {}",
+                    object.object_id
+                ),
+            }));
+        }
+        if pin_transfer_id.as_deref().is_none_or(str::is_empty) {
+            return Err(DfsPosixError::Dfs(DfsError::Distributed {
+                message: format!(
+                    "pin-aware cross-shard adoption of {} omitted its stable transfer identity",
+                    object.object_id
+                ),
+            }));
+        }
+        if !version_pins.is_empty() {
+            return Err(DfsPosixError::Dfs(DfsError::Distributed {
+                message: format!(
+                    "destination did not return an exact quorum-durable version-pin receipt for {}; retry after every involved metadata authority supports durable pin adoption",
+                    object.object_id
+                ),
+            }));
+        }
+        // Empty pin sets retain rolling compatibility. A legacy destination
+        // may ignore the optional fingerprint and return no typed receipt;
+        // lock-bearing operations still fall through to their older exact
+        // lock receipt below.
     }
     let DfsNamespaceOperation::AdoptObjectAtPath {
         object,
@@ -1125,10 +1262,107 @@ fn validate_advisory_lock_migration_receipt(
     }))
 }
 
+fn validate_cross_shard_adoption_source_pin_set(
+    operation: &DfsNamespaceOperation,
+    metadata_backend: Option<&dyn crate::DfsMetadataBackend>,
+) -> Result<()> {
+    let DfsNamespaceOperation::AdoptObjectAtPath {
+        object,
+        version_pin_set_fingerprint: Some(_),
+        ..
+    } = operation
+    else {
+        return Ok(());
+    };
+    let current_pins = metadata_backend
+        .map(|backend| backend.version_pins_for_object(&object.object_id))
+        .transpose()?
+        .unwrap_or_default();
+    validate_cross_shard_adoption_source_pin_records(operation, &current_pins)
+}
+
+fn validate_cross_shard_adoption_source_pin_records(
+    operation: &DfsNamespaceOperation,
+    current_pins: &[crate::DfsMetadataVersionPinRecord],
+) -> Result<()> {
+    let DfsNamespaceOperation::AdoptObjectAtPath {
+        object,
+        version_pins,
+        version_pin_set_fingerprint: Some(expected_fingerprint),
+        ..
+    } = operation
+    else {
+        return Ok(());
+    };
+    let captured_fingerprint =
+        crate::protocol::cross_shard_version_pin_set_fingerprint(object, version_pins)
+            .map_err(DfsPosixError::from)?;
+    if &captured_fingerprint != expected_fingerprint {
+        return Err(DfsPosixError::Dfs(DfsError::Distributed {
+            message: format!(
+                "source cross-shard adoption payload for {} has a non-canonical durable version-pin fingerprint",
+                object.object_id
+            ),
+        }));
+    }
+    let current_fingerprint =
+        crate::protocol::cross_shard_version_pin_set_fingerprint(object, current_pins)
+            .map_err(DfsPosixError::from)?;
+    if &current_fingerprint == expected_fingerprint {
+        return Ok(());
+    }
+    Err(DfsPosixError::Dfs(DfsError::Distributed {
+        message: format!(
+            "source durable version-pin set changed while adopting {}; retry the object-family copy before source eviction",
+            object.object_id
+        ),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DfsAdvisoryLockStateRecord, directory_object};
+    use crate::{
+        DfsAdvisoryLockStateRecord, DfsMetadataVersionPinRecord, DfsObjectMetadata, DfsVersion,
+        directory_object,
+    };
+    use time::OffsetDateTime;
+
+    fn pin(object: &DfsObjectMetadata, version: &str, pin_id: &str) -> DfsMetadataVersionPinRecord {
+        DfsMetadataVersionPinRecord {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            version: DfsVersion::from_legacy_named(version).expect("version"),
+            pin_id: pin_id.to_string(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    fn adoption_operation(
+        object: DfsObjectMetadata,
+        version_pins: Vec<DfsMetadataVersionPinRecord>,
+        advisory_lock_state: Option<DfsAdvisoryLockStateRecord>,
+    ) -> DfsNamespaceOperation {
+        let version_pin_set_fingerprint =
+            crate::protocol::cross_shard_version_pin_set_fingerprint(&object, &version_pins)
+                .expect("pin fingerprint");
+        let pin_transfer_id = crate::protocol::cross_shard_pin_transfer_id(&object, "/source")
+            .expect("pin transfer id");
+        DfsNamespaceOperation::AdoptObjectAtPath {
+            object,
+            source_path: "/source".to_string(),
+            pin_transfer_id: Some(pin_transfer_id),
+            versions: Vec::new(),
+            version_pins,
+            version_pin_set_fingerprint: Some(version_pin_set_fingerprint),
+            receipts: Vec::new(),
+            intents: Vec::new(),
+            intent_receipts: Vec::new(),
+            intent_receipt_retention: crate::DfsWriteIntentReceiptRetentionState::default(),
+            conflicts: Vec::new(),
+            advisory_lock_state,
+        }
+    }
 
     #[test]
     fn lock_bearing_adoption_requires_an_exact_typed_receipt() {
@@ -1142,19 +1376,24 @@ mod tests {
         let operation = DfsNamespaceOperation::AdoptObjectAtPath {
             object: object.clone(),
             source_path: "/source".to_string(),
+            pin_transfer_id: None,
             versions: Vec::new(),
+            version_pins: Vec::new(),
+            version_pin_set_fingerprint: None,
             receipts: Vec::new(),
             intents: Vec::new(),
+            intent_receipts: Vec::new(),
+            intent_receipt_retention: crate::DfsWriteIntentReceiptRetentionState::default(),
             conflicts: Vec::new(),
             advisory_lock_state: Some(state.clone()),
         };
-        assert!(validate_advisory_lock_migration_receipt(&operation, None).is_err());
+        assert!(validate_cross_shard_adoption_receipt(&operation, None).is_err());
 
         let mut rebound = state;
         rebound.authority_rebind_required = true;
         let fingerprint = crate::advisory_lock::advisory_lock_state_fingerprint(&rebound)
             .expect("state fingerprint");
-        validate_advisory_lock_migration_receipt(
+        validate_cross_shard_adoption_receipt(
             &operation,
             Some(&DfsPosixCoordinationResult::AdvisoryLockMigration {
                 object_id: object.object_id,
@@ -1163,5 +1402,108 @@ mod tests {
             }),
         )
         .expect("exact receipt");
+    }
+
+    #[test]
+    fn nonempty_pin_adoption_rejects_old_or_mismatched_destination_receipts() {
+        let owner = NodeId::from_legacy_named("node_pin_receipt").expect("node");
+        let object = directory_object("/moved", owner);
+        let version_pin = pin(&object, "version_pinned", "checkpoint");
+        let operation = adoption_operation(object.clone(), vec![version_pin], None);
+        let DfsNamespaceOperation::AdoptObjectAtPath {
+            version_pin_set_fingerprint: Some(expected_fingerprint),
+            pin_transfer_id: Some(expected_transfer_id),
+            ..
+        } = &operation
+        else {
+            panic!("adoption operation");
+        };
+
+        assert!(
+            validate_cross_shard_adoption_receipt(&operation, None).is_err(),
+            "an old destination that only returns Applied must not release pinned source state"
+        );
+        assert!(
+            validate_cross_shard_adoption_receipt(
+                &operation,
+                Some(&DfsPosixCoordinationResult::ObjectFamilyAdoption {
+                    object_id: object.object_id.clone(),
+                    target_version: object.version.clone(),
+                    pin_transfer_id: expected_transfer_id.clone(),
+                    pin_transfer_active: true,
+                    version_pin_set_fingerprint: "blake3:wrong".to_string(),
+                    advisory_lock_state_fingerprint: None,
+                    durable_through_sequence: 1,
+                }),
+            )
+            .is_err(),
+            "a mismatched pin family must not release source state"
+        );
+        assert!(
+            validate_cross_shard_adoption_receipt(
+                &operation,
+                Some(&DfsPosixCoordinationResult::ObjectFamilyAdoption {
+                    object_id: object.object_id.clone(),
+                    target_version: DfsVersion::from_legacy_named("version_wrong_receipt")
+                        .expect("version"),
+                    pin_transfer_id: expected_transfer_id.clone(),
+                    pin_transfer_active: true,
+                    version_pin_set_fingerprint: expected_fingerprint.clone(),
+                    advisory_lock_state_fingerprint: None,
+                    durable_through_sequence: 1,
+                }),
+            )
+            .is_err(),
+            "a receipt for a different target generation must not release source state"
+        );
+        validate_cross_shard_adoption_receipt(
+            &operation,
+            Some(&DfsPosixCoordinationResult::ObjectFamilyAdoption {
+                object_id: object.object_id.clone(),
+                target_version: object.version.clone(),
+                pin_transfer_id: expected_transfer_id.clone(),
+                pin_transfer_active: true,
+                version_pin_set_fingerprint: expected_fingerprint.clone(),
+                advisory_lock_state_fingerprint: None,
+                durable_through_sequence: 1,
+            }),
+        )
+        .expect("exact quorum-durable receipt");
+    }
+
+    #[test]
+    fn empty_pin_adoption_remains_compatible_with_an_old_destination() {
+        let owner = NodeId::from_legacy_named("node_empty_pin_receipt").expect("node");
+        let operation = adoption_operation(directory_object("/moved", owner), Vec::new(), None);
+        validate_cross_shard_adoption_receipt(&operation, None)
+            .expect("legacy Applied response for empty pin family");
+    }
+
+    #[test]
+    fn source_pin_revalidation_detects_late_put_and_late_unpin() {
+        let owner = NodeId::from_legacy_named("node_pin_revalidation").expect("node");
+        let object = directory_object("/moved", owner);
+        let captured = pin(&object, "version_pinned", "checkpoint");
+        let operation = adoption_operation(object.clone(), vec![captured.clone()], None);
+
+        validate_cross_shard_adoption_source_pin_records(
+            &operation,
+            std::slice::from_ref(&captured),
+        )
+        .expect("unchanged source pin set");
+
+        let late = pin(&object, "version_late", "late-checkpoint");
+        assert!(
+            validate_cross_shard_adoption_source_pin_records(
+                &operation,
+                &[captured.clone(), late],
+            )
+            .is_err(),
+            "a pin created during the first copy must force a recopy before source eviction"
+        );
+        assert!(
+            validate_cross_shard_adoption_source_pin_records(&operation, &[]).is_err(),
+            "an unpin after the first copy must force an exact empty-set retry"
+        );
     }
 }

@@ -1,11 +1,12 @@
 use crate::{
     DfsAdvisoryLockCommand, DfsAdvisoryLockOutcome, DfsAdvisoryLockStateRecord, DfsConflictRecord,
     DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataPrefixProof, DfsMetadataShardConfig,
-    DfsMetadataShardId, DfsMetadataTableSnapshot, DfsNamespaceJobRecord, DfsNamespaceTransaction,
-    DfsObjectId, DfsObjectMetadata, DfsObjectVersionRecord, DfsPosixCreateAttrs,
-    DfsPosixDirectorySyncCertificate, DfsPosixDirectorySyncTarget, DfsPosixFileSyncCertificate,
-    DfsPosixFileSyncTarget, DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsVersion,
-    DfsWriteIntentRecord, NetworkedDfsWriteOutcome,
+    DfsMetadataShardId, DfsMetadataTableSnapshot, DfsMetadataVersionPinRecord,
+    DfsNamespaceJobRecord, DfsNamespaceTransaction, DfsObjectId, DfsObjectMetadata,
+    DfsObjectVersionRecord, DfsPosixCreateAttrs, DfsPosixDirectorySyncCertificate,
+    DfsPosixDirectorySyncTarget, DfsPosixFileSyncCertificate, DfsPosixFileSyncTarget,
+    DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsVersion, DfsWriteIntentReceipt,
+    DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord, NetworkedDfsWriteOutcome,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
@@ -429,12 +430,31 @@ pub enum DfsNamespaceOperation {
     AdoptObjectAtPath {
         object: DfsObjectMetadata,
         source_path: String,
+        /// Stable identity for the pin-family handoff. It remains unchanged
+        /// when only the source pin set changes, allowing the destination to
+        /// reconcile stale copied pins without deleting target-authored pins.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pin_transfer_id: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         versions: Vec<DfsObjectVersionRecord>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        version_pins: Vec<DfsMetadataVersionPinRecord>,
+        /// Capability-bearing digest of the exact source-authority pin set.
+        /// New sources always send this, including for an empty set. A missing
+        /// digest identifies a legacy sender and retains add-only behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version_pin_set_fingerprint: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         receipts: Vec<DfsReplicaReceiptRecord>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         intents: Vec<DfsWriteIntentRecord>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        intent_receipts: Vec<DfsWriteIntentReceipt>,
+        #[serde(
+            default,
+            skip_serializing_if = "DfsWriteIntentReceiptRetentionState::is_empty"
+        )]
+        intent_receipt_retention: DfsWriteIntentReceiptRetentionState,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         conflicts: Vec<DfsConflictRecord>,
         /// Object-scoped lock state copied atomically with the destination
@@ -442,6 +462,26 @@ pub enum DfsNamespaceOperation {
         /// new grant can be issued.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         advisory_lock_state: Option<DfsAdvisoryLockStateRecord>,
+    },
+    /// Finalize one pin-aware object-family handoff after the source shard
+    /// durably removed its copied pin records and source object generation.
+    /// The destination then releases its temporary pin-mutation fence.
+    FinalizeObjectFamilyAdoption {
+        path: String,
+        source_path: String,
+        object_id: DfsObjectId,
+        target_version: DfsVersion,
+        pin_transfer_id: String,
+    },
+    /// Read-only proof used by a stale saga runner whose local source shard no
+    /// longer contains the physical object family. The destination authority
+    /// accepts this only when the exact adopted object generation is live and
+    /// no pin-transfer fence remains for the object. Unlike finalization, this
+    /// operation can never remove transfer provenance.
+    VerifyObjectFamilyAdoption {
+        object: DfsObjectMetadata,
+        source_path: String,
+        pin_transfer_id: String,
     },
     /// Cross-shard-primary hardlink, sent by the link-target's shard primary
     /// (coordinator) to the link-path's shard primary: atomically validate
@@ -492,6 +532,10 @@ impl DfsNamespaceOperation {
                 .first()
                 .map(|object| object.path.as_str()),
             DfsNamespaceOperation::AdoptObjectAtPath { object, .. } => Some(object.path.as_str()),
+            DfsNamespaceOperation::FinalizeObjectFamilyAdoption { path, .. } => Some(path.as_str()),
+            DfsNamespaceOperation::VerifyObjectFamilyAdoption { object, .. } => {
+                Some(object.path.as_str())
+            }
             DfsNamespaceOperation::AdoptHardlinkAlias { alias, .. } => Some(alias.path.as_str()),
         }
     }
@@ -540,9 +584,105 @@ impl DfsNamespaceOperation {
             | DfsNamespaceOperation::DirectorySync { path, .. }
             | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { path, .. } => vec![path],
             DfsNamespaceOperation::AdoptObjectAtPath { object, .. } => vec![object.path.as_str()],
+            DfsNamespaceOperation::FinalizeObjectFamilyAdoption { path, .. } => {
+                // `source_path` authenticates the sending source authority
+                // and binds the transfer identity, but finalization mutates
+                // only the destination shard's provenance record.
+                vec![path.as_str()]
+            }
+            DfsNamespaceOperation::VerifyObjectFamilyAdoption { object, .. } => {
+                vec![object.path.as_str()]
+            }
             DfsNamespaceOperation::AdoptHardlinkAlias { alias, .. } => vec![alias.path.as_str()],
         }
     }
+}
+
+pub(crate) fn cross_shard_pin_transfer_id(
+    object: &DfsObjectMetadata,
+    source_path: &str,
+) -> Result<String, crate::DfsError> {
+    if source_path.is_empty() || object.path.is_empty() || source_path == object.path {
+        return Err(crate::DfsError::Serialization {
+            message: format!(
+                "cross-shard pin transfer for {} requires distinct non-empty source and target paths",
+                object.object_id
+            ),
+        });
+    }
+    let encoded = serde_json::to_vec(&(
+        "sinomo-dfs-cross-shard-pin-transfer-v1",
+        &object.file_system_id,
+        &object.object_id,
+        source_path,
+        &object.path,
+        &object.version,
+    ))
+    .map_err(|source| crate::DfsError::Serialization {
+        message: format!(
+            "encode durable pin-transfer identity for cross-shard adoption of {}: {source}",
+            object.object_id
+        ),
+    })?;
+    Ok(format!("blake3:{}", blake3::hash(&encoded).to_hex()))
+}
+
+pub(crate) fn cross_shard_version_pin_set_fingerprint(
+    object: &DfsObjectMetadata,
+    version_pins: &[DfsMetadataVersionPinRecord],
+) -> Result<String, crate::DfsError> {
+    let mut canonical_pins = version_pins.to_vec();
+    canonical_pins.sort_by(|left, right| {
+        (&left.version, &left.pin_id, left.created_at).cmp(&(
+            &right.version,
+            &right.pin_id,
+            right.created_at,
+        ))
+    });
+    for pin in &canonical_pins {
+        if pin.file_system_id != object.file_system_id || pin.object_id != object.object_id {
+            return Err(crate::DfsError::Serialization {
+                message: format!(
+                    "durable version pin {}/{}/{} does not belong to adopted object {} in filesystem {}",
+                    pin.object_id, pin.version, pin.pin_id, object.object_id, object.file_system_id
+                ),
+            });
+        }
+        if pin.pin_id.is_empty() {
+            return Err(crate::DfsError::Serialization {
+                message: format!(
+                    "durable version pin for object {} version {} has an empty consumer identity",
+                    object.object_id, pin.version
+                ),
+            });
+        }
+    }
+    if canonical_pins
+        .windows(2)
+        .any(|pins| pins[0].version == pins[1].version && pins[0].pin_id == pins[1].pin_id)
+    {
+        return Err(crate::DfsError::Serialization {
+            message: format!(
+                "adopted object {} contains duplicate durable version-pin identities",
+                object.object_id
+            ),
+        });
+    }
+    let encoded = serde_json::to_vec(&(
+        "sinomo-dfs-cross-shard-version-pin-set-v1",
+        &object.file_system_id,
+        &object.object_id,
+        &object.version,
+        &object.path,
+        &canonical_pins,
+    ))
+    .map_err(|source| crate::DfsError::Serialization {
+        message: format!(
+            "encode durable version-pin set for cross-shard adoption of {}: {source}",
+            object.object_id
+        ),
+    })?;
+    Ok(format!("blake3:{}", blake3::hash(&encoded).to_hex()))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -589,6 +729,35 @@ pub enum DfsPosixCoordinationResult {
     AdvisoryLockMigrationPrepared {
         object_id: DfsObjectId,
         state_fingerprint: String,
+    },
+    /// Exact, quorum-durable acknowledgement for a pin-aware object-family
+    /// adoption. Older destinations cannot fabricate this enum variant, while
+    /// the fingerprints prevent a partial or mismatched family from releasing
+    /// the source authority's copy.
+    ObjectFamilyAdoption {
+        object_id: DfsObjectId,
+        target_version: DfsVersion,
+        pin_transfer_id: String,
+        /// Whether target-side transfer provenance owns at least one copied
+        /// pin and therefore requires an explicit post-eviction finalize.
+        pin_transfer_active: bool,
+        version_pin_set_fingerprint: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        advisory_lock_state_fingerprint: Option<String>,
+        durable_through_sequence: u64,
+    },
+    ObjectFamilyAdoptionFinalized {
+        object_id: DfsObjectId,
+        pin_transfer_id: String,
+        durable_through_sequence: u64,
+    },
+    /// Read-only acknowledgement that the exact destination generation is
+    /// authoritative and its temporary pin-transfer fence is already absent.
+    ObjectFamilyAdoptionVerified {
+        object_id: DfsObjectId,
+        target_version: DfsVersion,
+        pin_transfer_id: String,
+        durable_through_sequence: u64,
     },
     FileSync(DfsPosixFileSyncCertificate),
     DirectorySync(DfsPosixDirectorySyncCertificate),

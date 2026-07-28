@@ -113,6 +113,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let source_path = match operation {
             DfsNamespaceOperation::AdvisoryLockMigrationPrepare { source_path, .. }
             | DfsNamespaceOperation::AdoptObjectAtPath { source_path, .. }
+            | DfsNamespaceOperation::FinalizeObjectFamilyAdoption { source_path, .. }
+            | DfsNamespaceOperation::VerifyObjectFamilyAdoption { source_path, .. }
             | DfsNamespaceOperation::AdoptHardlinkAlias { source_path, .. } => source_path,
             _ => return Ok(None),
         };
@@ -181,6 +183,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             | DfsNamespaceOperation::FileSync { path, .. }
             | DfsNamespaceOperation::DirectorySync { path, .. } => {
                 Self::normalized_namespace_paths([path.as_str()], false, "operation")?
+            }
+            DfsNamespaceOperation::VerifyObjectFamilyAdoption { object, .. } => {
+                Self::normalized_namespace_paths([object.path.as_str()], false, "operation")?
             }
             DfsNamespaceOperation::LookupPaths { paths } => Self::normalized_namespace_paths(
                 paths.iter().map(String::as_str),
@@ -307,7 +312,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         from: &str,
         to: &str,
-        pending_request_created_at: Option<time::OffsetDateTime>,
+        pending_request: Option<&DfsNamespaceRequestRecord>,
     ) -> posix_model::Result<()> {
         if self.routed_namespace_settle_depth >= DFS_MAX_NESTED_NAMESPACE_COORDINATION_DEPTH {
             return Err(posix_model::DfsPosixError::Dfs(DfsError::Busy {
@@ -330,7 +335,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )? {
             return Ok(());
         }
-        if let Some(created_at) = pending_request_created_at
+        if let Some(request) = pending_request
             && self.completed_cross_shard_namespace_job_for_paths_since(
                 file_system_id,
                 from,
@@ -339,7 +344,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries,
                     DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries,
                 ],
-                created_at,
+                request.created_at,
+                &DfsNamespaceJobOrigin::from_request(request),
             )?
         {
             // The source-side operation can finish its durable saga before a

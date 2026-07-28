@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sinomo_core::DfsWriteReceipt;
 use sinomo_core::events::EventId;
 use sinomo_core::node::NodeId;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use time::OffsetDateTime;
 
@@ -197,6 +197,83 @@ pub struct DfsObjectVersionRecord {
     pub visible: bool,
 }
 
+/// Durable ownership of one immutable metadata version by an independent
+/// checkpoint or retention consumer.
+///
+/// `pin_id` is the consumer-scoped identity: different consumers may pin the
+/// same version without one consumer's removal releasing another's root.
+/// DFS path pins and content-placement pins are separate contracts and never
+/// create this record implicitly.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+pub struct DfsMetadataVersionPinRecord {
+    pub file_system_id: DfsFileSystemId,
+    pub object_id: DfsObjectId,
+    pub version: DfsVersion,
+    pub pin_id: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Durable target-shard provenance for pins copied during one deterministic
+/// cross-shard object handoff.
+///
+/// A retry may observe a newer source pin set after destination publication.
+/// Retaining the exact previously copied records lets it remove only stale
+/// transfer copies while preserving pins created independently on the target.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsCrossShardPinTransferRecord {
+    pub transfer_id: String,
+    pub file_system_id: DfsFileSystemId,
+    pub object_id: DfsObjectId,
+    pub source_path: String,
+    pub target_path: String,
+    pub target_version: DfsVersion,
+    /// Complete source pin set acknowledged by the destination. Every key is
+    /// fenced against generic mutation until finalization.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_pins: Vec<DfsMetadataVersionPinRecord>,
+    /// Subset of `source_pins` inserted by this transfer and therefore safe to
+    /// remove when a retry observes that the source released the pin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copied_pins: Vec<DfsMetadataVersionPinRecord>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+/// Exact source-shard generation and pin snapshot used to fence a
+/// cross-primary handoff.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsCrossShardVersionPinFence {
+    pub source_object: DfsObjectMetadata,
+    pub source_journal_sequence: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub version_pins: Vec<DfsMetadataVersionPinRecord>,
+}
+
+/// Complete physical metadata family captured from the shard selected by a
+/// cross-shard move's old path.
+///
+/// This deliberately does not follow the object-to-shard authority index:
+/// after destination publication that index names the target, while crash
+/// recovery still needs the exact source family to reconcile the target and
+/// finish the fenced source eviction.
+#[derive(Clone, Debug)]
+pub struct DfsCrossShardSourceFamily {
+    pub source_object: DfsObjectMetadata,
+    pub source_journal_sequence: u64,
+    pub versions: Vec<DfsObjectVersionRecord>,
+    pub version_pins: Vec<DfsMetadataVersionPinRecord>,
+    pub pin_transfers: Vec<DfsCrossShardPinTransferRecord>,
+    pub receipts: Vec<DfsReplicaReceiptRecord>,
+    pub intents: Vec<DfsWriteIntentRecord>,
+    pub intent_receipts: Vec<DfsWriteIntentReceipt>,
+    pub intent_receipt_retention: DfsWriteIntentReceiptRetentionState,
+    pub conflicts: Vec<DfsConflictRecord>,
+    pub advisory_lock_state: Option<DfsAdvisoryLockStateRecord>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsReplicaReceiptRecord {
     pub receipt: DfsWriteReceipt,
@@ -242,6 +319,213 @@ pub struct DfsWriteIntentRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(with = "time::serde::rfc3339::option")]
     pub updated_at: Option<OffsetDateTime>,
+}
+
+/// Compact terminal write identity retained after recovery no longer needs the
+/// full object body or mutable diagnostics from a write intent.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsWriteIntentReceipt {
+    pub intent_id: String,
+    pub file_system_id: DfsFileSystemId,
+    pub object_id: DfsObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<DfsVersion>,
+    pub target_version: DfsVersion,
+    pub coordinator_node_id: NodeId,
+    #[serde(default)]
+    pub owner_epoch: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub desired_replica_node_ids: Vec<NodeId>,
+    pub policy: DfsReplicationPolicy,
+    pub status: DfsWriteIntentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(default)]
+    pub touch_parent_on_create: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_predecessor_object_id: Option<DfsObjectId>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub terminal_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub retained_at: OffsetDateTime,
+}
+
+impl DfsWriteIntentReceipt {
+    pub(crate) fn from_intent(
+        intent: &DfsWriteIntentRecord,
+        retained_at: OffsetDateTime,
+    ) -> Option<Self> {
+        if matches!(
+            intent.status,
+            DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+        ) {
+            return None;
+        }
+        Some(Self {
+            intent_id: intent.intent_id.clone(),
+            file_system_id: intent.file_system_id.clone(),
+            object_id: intent.object_id.clone(),
+            base_version: intent.base_version.clone(),
+            target_version: intent.target_version.clone(),
+            coordinator_node_id: intent.coordinator_node_id.clone(),
+            owner_epoch: intent.owner_epoch,
+            desired_replica_node_ids: intent.desired_replica_node_ids.clone(),
+            policy: intent.policy.clone(),
+            status: intent.status.clone(),
+            content_hash: intent.content_hash.clone(),
+            touch_parent_on_create: intent.touch_parent_on_create,
+            create_predecessor_object_id: intent.create_predecessor_object_id.clone(),
+            created_at: intent.created_at,
+            terminal_at: intent.updated_at.unwrap_or(intent.created_at),
+            retained_at,
+        })
+    }
+
+    pub(crate) fn to_intent_record(&self) -> DfsWriteIntentRecord {
+        DfsWriteIntentRecord {
+            intent_id: self.intent_id.clone(),
+            file_system_id: self.file_system_id.clone(),
+            object_id: self.object_id.clone(),
+            base_version: self.base_version.clone(),
+            target_version: self.target_version.clone(),
+            coordinator_node_id: self.coordinator_node_id.clone(),
+            owner_epoch: self.owner_epoch,
+            desired_replica_node_ids: self.desired_replica_node_ids.clone(),
+            policy: self.policy.clone(),
+            status: self.status.clone(),
+            content_hash: self.content_hash.clone(),
+            object_metadata: None,
+            touch_parent_on_create: self.touch_parent_on_create,
+            create_predecessor_object_id: self.create_predecessor_object_id.clone(),
+            created_at: self.created_at,
+            updated_at: Some(self.terminal_at),
+        }
+    }
+
+    pub(crate) fn matches_intent(&self, intent: &DfsWriteIntentRecord) -> bool {
+        Self::from_intent(intent, self.retained_at).as_ref() == Some(self)
+    }
+}
+
+/// Durable high-water marks for compact intent receipts evicted by metadata
+/// history GC. Generated intent IDs end in a monotonically increasing counter;
+/// a retry at or below the object/coordinator-specific floor is expired rather
+/// than admitted as a fresh write after its exact receipt has been collected.
+///
+/// The object scope is essential during shard migration: a floor learned for
+/// one moved object must not reject an unrelated lower-counter intent which was
+/// legitimately owned by the destination shard.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsWriteIntentReceiptRetentionState {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub max_evicted_counter_by_object_and_coordinator: BTreeMap<DfsObjectId, BTreeMap<NodeId, u64>>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub opaque_intent_history_evicted_object_ids: BTreeSet<DfsObjectId>,
+}
+
+impl DfsWriteIntentReceiptRetentionState {
+    pub(crate) fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub(crate) fn eviction_delta(receipt: &DfsWriteIntentReceipt) -> Self {
+        let mut state = Self::default();
+        if let Some(counter) = write_intent_id_counter(&receipt.intent_id) {
+            state
+                .max_evicted_counter_by_object_and_coordinator
+                .entry(receipt.object_id.clone())
+                .or_default()
+                .insert(receipt.coordinator_node_id.clone(), counter);
+        } else {
+            state
+                .opaque_intent_history_evicted_object_ids
+                .insert(receipt.object_id.clone());
+        }
+        state
+    }
+
+    pub(crate) fn merge_conservative(&mut self, other: Self) {
+        for (object_id, floors) in other.max_evicted_counter_by_object_and_coordinator {
+            let current_floors = self
+                .max_evicted_counter_by_object_and_coordinator
+                .entry(object_id)
+                .or_default();
+            for (node_id, floor) in floors {
+                let current = current_floors.entry(node_id).or_insert(0);
+                *current = (*current).max(floor);
+            }
+        }
+        self.opaque_intent_history_evicted_object_ids
+            .extend(other.opaque_intent_history_evicted_object_ids);
+    }
+
+    pub(crate) fn history_expired(&self, intent: &DfsWriteIntentRecord) -> bool {
+        match write_intent_id_counter(&intent.intent_id) {
+            Some(counter) => self
+                .max_evicted_counter_by_object_and_coordinator
+                .get(&intent.object_id)
+                .and_then(|floors| floors.get(&intent.coordinator_node_id))
+                .is_some_and(|floor| counter <= *floor),
+            None => self
+                .opaque_intent_history_evicted_object_ids
+                .contains(&intent.object_id),
+        }
+    }
+
+    pub(crate) fn for_object(&self, object_id: &DfsObjectId) -> Self {
+        let mut state = Self::default();
+        if let Some(floors) = self
+            .max_evicted_counter_by_object_and_coordinator
+            .get(object_id)
+        {
+            state
+                .max_evicted_counter_by_object_and_coordinator
+                .insert(object_id.clone(), floors.clone());
+        }
+        if self
+            .opaque_intent_history_evicted_object_ids
+            .contains(object_id)
+        {
+            state
+                .opaque_intent_history_evicted_object_ids
+                .insert(object_id.clone());
+        }
+        state
+    }
+
+    pub(crate) fn max_evicted_counter(&self) -> u64 {
+        self.max_evicted_counter_by_object_and_coordinator
+            .values()
+            .flat_map(|floors| floors.values().copied())
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// Exact write-intent history attached to one object during an authoritative
+/// shard move.
+///
+/// Compact receipts remain distinct from full recovery records so migration
+/// cannot accidentally expand a bounded receipt back into a full intent body.
+/// The retention state is filtered to this object so a destination inherits
+/// the source's exact high-water marks without fencing unrelated histories.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsObjectWriteIntentHistory {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intents: Vec<DfsWriteIntentRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipts: Vec<DfsWriteIntentReceipt>,
+    #[serde(
+        default,
+        skip_serializing_if = "DfsWriteIntentReceiptRetentionState::is_empty"
+    )]
+    pub retention: DfsWriteIntentReceiptRetentionState,
+}
+
+fn write_intent_id_counter(intent_id: &str) -> Option<u64> {
+    intent_id.rsplit('_').next()?.parse().ok()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -382,6 +666,10 @@ pub(crate) fn dfs_metadata_prefix_proof_after(
 }
 
 /// Mutation payload stored in the metadata journal.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum DfsMetadataMutation {
@@ -404,6 +692,45 @@ pub enum DfsMetadataMutation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         version_record: Option<DfsObjectVersionRecord>,
     },
+    RemoveVersion {
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        version: DfsVersion,
+    },
+    PutVersionPin {
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        pin_id: String,
+        pin: DfsMetadataVersionPinRecord,
+    },
+    RemoveVersionPin {
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        pin_id: String,
+    },
+    ReconcileCrossShardPinTransfer {
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        transfer_id: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        authoritative_migration: bool,
+        versions: Vec<DfsObjectVersionRecord>,
+        transfer: DfsCrossShardPinTransferRecord,
+    },
+    RemoveCrossShardPinTransfer {
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        transfer_id: String,
+    },
+    FinalizeCrossShardSourceEviction {
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        tombstone: DfsObjectMetadata,
+        removed_pins: Vec<DfsMetadataVersionPinRecord>,
+        removed_pin_transfers: Vec<DfsCrossShardPinTransferRecord>,
+    },
     PutReceipt {
         file_system_id: DfsFileSystemId,
         object_id: DfsObjectId,
@@ -423,8 +750,33 @@ pub enum DfsMetadataMutation {
         object_id: DfsObjectId,
         intent_id: String,
         status: DfsWriteIntentStatus,
+        /// Authoritative shard migration may install a durable source record
+        /// below a destination's conservative eviction floor. Ordinary retries
+        /// must leave this false and remain fenced by that floor.
+        #[serde(default, skip_serializing_if = "is_false")]
+        authoritative_migration: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         intent: Option<DfsWriteIntentRecord>,
+    },
+    /// Atomic full-body to terminal-receipt transition.
+    PutIntentReceipt {
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        intent_id: String,
+        receipt: DfsWriteIntentReceipt,
+    },
+    RemoveIntentReceipt {
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        intent_id: String,
+        retention: DfsWriteIntentReceiptRetentionState,
+    },
+    /// Merge a source shard's conservative intent-receipt eviction floors into
+    /// the destination while moving an object's authoritative metadata family.
+    MergeIntentReceiptRetention {
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        retention: DfsWriteIntentReceiptRetentionState,
     },
     CommitVisibleVersion {
         file_system_id: DfsFileSystemId,
@@ -437,6 +789,11 @@ pub enum DfsMetadataMutation {
         visible_version: Option<DfsObjectVersionRecord>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         required_replica_node_ids: Vec<NodeId>,
+    },
+    RemoveVisibleCommit {
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        version: DfsVersion,
     },
     PutConflict {
         file_system_id: DfsFileSystemId,
@@ -466,6 +823,11 @@ pub enum DfsMetadataMutation {
         transaction_id: String,
         receipt: DfsNamespaceTransactionReceipt,
     },
+    RemoveNamespaceTransactionReceipt {
+        file_system_id: DfsFileSystemId,
+        transaction_id: String,
+        retention: DfsNamespaceReceiptRetentionState,
+    },
     PutNamespacePrepare {
         file_system_id: DfsFileSystemId,
         operation_id: String,
@@ -480,11 +842,28 @@ pub enum DfsMetadataMutation {
         operation_id: String,
         receipt: DfsNamespacePrepareReceipt,
     },
+    RemoveNamespacePrepareReceipt {
+        file_system_id: DfsFileSystemId,
+        operation_id: String,
+        retention: DfsNamespaceReceiptRetentionState,
+    },
     PutNamespaceJob {
         file_system_id: DfsFileSystemId,
         job_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         job: Option<DfsNamespaceJobRecord>,
+    },
+    /// Compact terminal evidence retained after a namespace job's resumable
+    /// frames and progress bookkeeping have been collected.
+    PutNamespaceJobReceipt {
+        file_system_id: DfsFileSystemId,
+        job_id: String,
+        receipt: DfsNamespaceJobReceipt,
+    },
+    RemoveNamespaceJobReceipt {
+        file_system_id: DfsFileSystemId,
+        job_id: String,
+        retention: DfsNamespaceReceiptRetentionState,
     },
     PutNamespaceRequest {
         file_system_id: DfsFileSystemId,
@@ -500,6 +879,12 @@ pub enum DfsMetadataMutation {
         request_id: String,
         receipt: DfsNamespaceRequestReceipt,
     },
+    RemoveNamespaceRequestReceipt {
+        file_system_id: DfsFileSystemId,
+        requester_node_id: NodeId,
+        request_id: String,
+        retention: DfsNamespaceReceiptRetentionState,
+    },
 }
 
 impl DfsMetadataMutation {
@@ -507,16 +892,31 @@ impl DfsMetadataMutation {
         match self {
             Self::PutFileSystem { .. }
             | Self::PutNamespaceJob { .. }
+            | Self::PutNamespaceJobReceipt { .. }
+            | Self::RemoveNamespaceJobReceipt { .. }
             | Self::PutNamespaceRequest { .. }
             | Self::PutNamespaceRequestReceipt { .. }
             | Self::PutNamespaceTransactionReceipt { .. }
-            | Self::PutNamespacePrepareReceipt { .. } => {}
+            | Self::RemoveNamespaceTransactionReceipt { .. }
+            | Self::PutNamespacePrepareReceipt { .. }
+            | Self::RemoveNamespacePrepareReceipt { .. }
+            | Self::RemoveNamespaceRequestReceipt { .. } => {}
             Self::PutObject { object_id, .. }
             | Self::PutVersion { object_id, .. }
+            | Self::RemoveVersion { object_id, .. }
+            | Self::PutVersionPin { object_id, .. }
+            | Self::RemoveVersionPin { object_id, .. }
+            | Self::ReconcileCrossShardPinTransfer { object_id, .. }
+            | Self::RemoveCrossShardPinTransfer { object_id, .. }
+            | Self::FinalizeCrossShardSourceEviction { object_id, .. }
             | Self::PutReceipt { object_id, .. }
             | Self::RemoveReceipt { object_id, .. }
             | Self::PutIntent { object_id, .. }
+            | Self::PutIntentReceipt { object_id, .. }
+            | Self::RemoveIntentReceipt { object_id, .. }
+            | Self::MergeIntentReceiptRetention { object_id, .. }
             | Self::CommitVisibleVersion { object_id, .. }
+            | Self::RemoveVisibleCommit { object_id, .. }
             | Self::PutConflict { object_id, .. }
             | Self::PutAdvisoryLockState { object_id, .. } => {
                 visit(object_id);
@@ -628,6 +1028,83 @@ impl DfsMetadataMutation {
         }
     }
 
+    pub(crate) fn remove_version(
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        version: DfsVersion,
+    ) -> Self {
+        Self::RemoveVersion {
+            file_system_id,
+            object_id,
+            version,
+        }
+    }
+
+    pub(crate) fn put_version_pin(pin: &DfsMetadataVersionPinRecord) -> Self {
+        Self::PutVersionPin {
+            file_system_id: pin.file_system_id.clone(),
+            object_id: pin.object_id.clone(),
+            version: pin.version.clone(),
+            pin_id: pin.pin_id.clone(),
+            pin: pin.clone(),
+        }
+    }
+
+    pub(crate) fn remove_version_pin(
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        pin_id: String,
+    ) -> Self {
+        Self::RemoveVersionPin {
+            file_system_id,
+            object_id,
+            version,
+            pin_id,
+        }
+    }
+
+    pub(crate) fn reconcile_cross_shard_pin_transfer(
+        transfer: &DfsCrossShardPinTransferRecord,
+        versions: Vec<DfsObjectVersionRecord>,
+        authoritative_migration: bool,
+    ) -> Self {
+        Self::ReconcileCrossShardPinTransfer {
+            file_system_id: transfer.file_system_id.clone(),
+            object_id: transfer.object_id.clone(),
+            transfer_id: transfer.transfer_id.clone(),
+            authoritative_migration,
+            versions,
+            transfer: transfer.clone(),
+        }
+    }
+
+    pub(crate) fn remove_cross_shard_pin_transfer(
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        transfer_id: String,
+    ) -> Self {
+        Self::RemoveCrossShardPinTransfer {
+            file_system_id,
+            object_id,
+            transfer_id,
+        }
+    }
+
+    pub(crate) fn finalize_cross_shard_source_eviction(
+        tombstone: &DfsObjectMetadata,
+        removed_pins: Vec<DfsMetadataVersionPinRecord>,
+        removed_pin_transfers: Vec<DfsCrossShardPinTransferRecord>,
+    ) -> Self {
+        Self::FinalizeCrossShardSourceEviction {
+            file_system_id: tombstone.file_system_id.clone(),
+            object_id: tombstone.object_id.clone(),
+            tombstone: tombstone.clone(),
+            removed_pins,
+            removed_pin_transfers,
+        }
+    }
+
     pub(crate) fn put_receipt(receipt: &DfsReplicaReceiptRecord) -> Self {
         Self::PutReceipt {
             file_system_id: receipt.receipt.file_system_id.clone(),
@@ -644,7 +1121,54 @@ impl DfsMetadataMutation {
             object_id: intent.object_id.clone(),
             intent_id: intent.intent_id.clone(),
             status: intent.status.clone(),
+            authoritative_migration: false,
             intent: Some(intent.clone()),
+        }
+    }
+
+    pub(crate) fn put_migrated_intent(intent: &DfsWriteIntentRecord) -> Self {
+        Self::PutIntent {
+            file_system_id: intent.file_system_id.clone(),
+            object_id: intent.object_id.clone(),
+            intent_id: intent.intent_id.clone(),
+            status: intent.status.clone(),
+            authoritative_migration: true,
+            intent: Some(intent.clone()),
+        }
+    }
+
+    pub(crate) fn put_intent_receipt(receipt: &DfsWriteIntentReceipt) -> Self {
+        Self::PutIntentReceipt {
+            file_system_id: receipt.file_system_id.clone(),
+            object_id: receipt.object_id.clone(),
+            intent_id: receipt.intent_id.clone(),
+            receipt: receipt.clone(),
+        }
+    }
+
+    pub(crate) fn remove_intent_receipt(
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        intent_id: String,
+        retention: DfsWriteIntentReceiptRetentionState,
+    ) -> Self {
+        Self::RemoveIntentReceipt {
+            file_system_id,
+            object_id,
+            intent_id,
+            retention,
+        }
+    }
+
+    pub(crate) fn merge_intent_receipt_retention(
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        retention: DfsWriteIntentReceiptRetentionState,
+    ) -> Self {
+        Self::MergeIntentReceiptRetention {
+            file_system_id,
+            object_id,
+            retention,
         }
     }
 
@@ -661,6 +1185,14 @@ impl DfsMetadataMutation {
             file_system_id: job.file_system_id.clone(),
             job_id: job.job_id.clone(),
             job: Some(job.clone()),
+        }
+    }
+
+    pub(crate) fn put_namespace_job_receipt(receipt: &DfsNamespaceJobReceipt) -> Self {
+        Self::PutNamespaceJobReceipt {
+            file_system_id: receipt.file_system_id.clone(),
+            job_id: receipt.job_id.clone(),
+            receipt: receipt.clone(),
         }
     }
 
@@ -1004,9 +1536,11 @@ pub struct DfsNamespaceReceiptRetentionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepare_floor: Option<DfsNamespaceReceiptOrderKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_evicted_request_order_token: Option<String>,
-    #[serde(default)]
-    pub opaque_request_history_evicted: bool,
+    pub job_floor: Option<DfsNamespaceReceiptOrderKey>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub max_evicted_request_order_token_by_requester: BTreeMap<NodeId, String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub opaque_request_history_evicted_requester_node_ids: BTreeSet<NodeId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
@@ -1032,15 +1566,20 @@ impl DfsNamespaceReceiptRetentionState {
             (Some(key), None) | (None, Some(key)) => Some(key),
             (None, None) => None,
         };
-        self.max_evicted_request_order_token = match (
-            self.max_evicted_request_order_token.take(),
-            other.max_evicted_request_order_token,
-        ) {
+        self.job_floor = match (self.job_floor.take(), other.job_floor) {
             (Some(left), Some(right)) => Some(left.max(right)),
-            (Some(token), None) | (None, Some(token)) => Some(token),
+            (Some(key), None) | (None, Some(key)) => Some(key),
             (None, None) => None,
         };
-        self.opaque_request_history_evicted |= other.opaque_request_history_evicted;
+        for (requester_node_id, floor) in other.max_evicted_request_order_token_by_requester {
+            let current = self
+                .max_evicted_request_order_token_by_requester
+                .entry(requester_node_id)
+                .or_default();
+            *current = std::mem::take(current).max(floor);
+        }
+        self.opaque_request_history_evicted_requester_node_ids
+            .extend(other.opaque_request_history_evicted_requester_node_ids);
     }
 }
 
@@ -1123,6 +1662,28 @@ pub struct DfsObjectVersionPage {
     /// Cursor to pass to the next page request, if more versions remain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<DfsObjectVersionPageCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Cursor for durable version pins belonging to one object.
+pub struct DfsMetadataVersionPinPageCursor {
+    /// Version id at the end of the current page.
+    pub version: DfsVersion,
+    /// Independent consumer identity at the end of the current page.
+    pub pin_id: String,
+    /// Metadata shard to resume from when the page came from a sharded backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_id: Option<DfsMetadataShardId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+/// Page of durable version pins belonging to one object.
+pub struct DfsMetadataVersionPinPage {
+    /// Pins returned by this page in `(version, pin_id)` order.
+    pub pins: Vec<DfsMetadataVersionPinRecord>,
+    /// Cursor to pass to the next page request, if more pins remain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsMetadataVersionPinPageCursor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1381,10 +1942,38 @@ pub struct DfsMetadataSummary {
     pub failed_namespace_job_count: usize,
 }
 
+/// Exact durable routed-request identity which originated a namespace job.
+///
+/// Jobs created outside routed request execution, and jobs persisted by older
+/// versions, omit this identity. Recovery may use the legacy path/time match
+/// for those rows, but new routed jobs can be tied to one exact admission.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
+pub struct DfsNamespaceJobOrigin {
+    pub requester_node_id: NodeId,
+    pub request_id: String,
+    pub operation_id: String,
+}
+
+impl DfsNamespaceJobOrigin {
+    pub(crate) fn from_request(request: &DfsNamespaceRequestRecord) -> Self {
+        Self {
+            requester_node_id: request.requester_node_id.clone(),
+            request_id: request.request_id.clone(),
+            operation_id: request.operation_id.clone(),
+        }
+    }
+
+    pub(crate) fn matches_request(&self, request: &DfsNamespaceRequestRecord) -> bool {
+        self == &Self::from_request(request)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsNamespaceJobRecord {
     pub job_id: String,
     pub file_system_id: DfsFileSystemId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<DfsNamespaceJobOrigin>,
     pub kind: DfsNamespaceJobKind,
     pub status: DfsNamespaceJobStatus,
     pub root_path: String,
@@ -1402,6 +1991,57 @@ pub struct DfsNamespaceJobRecord {
     pub completed_at: Option<OffsetDateTime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+}
+
+/// Compact terminal evidence for a collected namespace job.
+///
+/// Pending frames and progress counters intentionally remain only on the full
+/// job record while it can still run. This receipt preserves enough identity
+/// for exact routed-request recovery and conservative legacy path matching.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceJobReceipt {
+    pub job_id: String,
+    pub file_system_id: DfsFileSystemId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<DfsNamespaceJobOrigin>,
+    pub kind: DfsNamespaceJobKind,
+    pub status: DfsNamespaceJobStatus,
+    pub root_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub terminal_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub retained_at: OffsetDateTime,
+}
+
+impl DfsNamespaceJobReceipt {
+    pub(crate) fn from_job(
+        job: &DfsNamespaceJobRecord,
+        retained_at: OffsetDateTime,
+    ) -> Option<Self> {
+        if job.status == DfsNamespaceJobStatus::Running {
+            return None;
+        }
+        Some(Self {
+            job_id: job.job_id.clone(),
+            file_system_id: job.file_system_id.clone(),
+            origin: job.origin.clone(),
+            kind: job.kind.clone(),
+            status: job.status.clone(),
+            root_path: job.root_path.clone(),
+            target_path: job.target_path.clone(),
+            created_at: job.created_at,
+            terminal_at: job.completed_at.unwrap_or(job.updated_at),
+            retained_at,
+        })
+    }
+
+    pub(crate) fn matches_terminal_job(&self, job: &DfsNamespaceJobRecord) -> bool {
+        Self::from_job(job, self.retained_at).as_ref() == Some(self)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1601,9 +2241,20 @@ pub(crate) struct DfsMetadataTableSnapshotTables {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) versions: Vec<DfsObjectVersionRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) version_pins: Vec<DfsMetadataVersionPinRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) cross_shard_pin_transfers: Vec<DfsCrossShardPinTransferRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) receipts: Vec<DfsReplicaReceiptRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) intents: Vec<DfsWriteIntentRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) intent_receipts: Vec<DfsWriteIntentReceipt>,
+    #[serde(
+        default,
+        skip_serializing_if = "DfsWriteIntentReceiptRetentionState::is_empty"
+    )]
+    pub(crate) intent_receipt_retention: DfsWriteIntentReceiptRetentionState,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) conflicts: Vec<DfsConflictRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1620,6 +2271,8 @@ pub(crate) struct DfsMetadataTableSnapshotTables {
     pub(crate) namespace_prepare_receipts: Vec<DfsNamespacePrepareReceipt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) namespace_jobs: Vec<DfsNamespaceJobRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) namespace_job_receipts: Vec<DfsNamespaceJobReceipt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) namespace_request_receipts: Vec<DfsNamespaceRequestReceipt>,
     #[serde(
@@ -1717,6 +2370,31 @@ pub(crate) enum DfsMetadataTableOp {
     PutVersion {
         version: DfsObjectVersionRecord,
     },
+    RemoveVersion {
+        object_id: DfsObjectId,
+        version: DfsVersion,
+    },
+    PutVersionPin {
+        pin: DfsMetadataVersionPinRecord,
+    },
+    RemoveVersionPin {
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        pin_id: String,
+    },
+    ReconcileCrossShardPinTransfer {
+        versions: Vec<DfsObjectVersionRecord>,
+        transfer: DfsCrossShardPinTransferRecord,
+    },
+    RemoveCrossShardPinTransfer {
+        object_id: DfsObjectId,
+        transfer_id: String,
+    },
+    FinalizeCrossShardSourceEviction {
+        tombstone: DfsObjectMetadata,
+        removed_pins: Vec<DfsMetadataVersionPinRecord>,
+        removed_pin_transfers: Vec<DfsCrossShardPinTransferRecord>,
+    },
     PutReceipt {
         receipt: DfsReplicaReceiptRecord,
     },
@@ -1727,6 +2405,17 @@ pub(crate) enum DfsMetadataTableOp {
     },
     PutIntent {
         intent: DfsWriteIntentRecord,
+    },
+    PutIntentReceipt {
+        receipt: DfsWriteIntentReceipt,
+    },
+    RemoveIntentReceipt {
+        object_id: DfsObjectId,
+        intent_id: String,
+        retention: DfsWriteIntentReceiptRetentionState,
+    },
+    MergeIntentReceiptRetention {
+        retention: DfsWriteIntentReceiptRetentionState,
     },
     PutConflict {
         conflict: DfsConflictRecord,
@@ -1743,11 +2432,19 @@ pub(crate) enum DfsMetadataTableOp {
         version: DfsVersion,
         commit: DfsVisibleVersionCommitRecord,
     },
+    RemoveVisibleCommit {
+        object_id: DfsObjectId,
+        version: DfsVersion,
+    },
     PutNamespaceTransaction {
         transaction: DfsNamespaceTransaction,
     },
     PutNamespaceTransactionReceipt {
         receipt: DfsNamespaceTransactionReceipt,
+    },
+    RemoveNamespaceTransactionReceipt {
+        transaction_id: String,
+        retention: DfsNamespaceReceiptRetentionState,
     },
     PutNamespacePrepare {
         prepare: DfsNamespacePrepareRecord,
@@ -1755,14 +2452,30 @@ pub(crate) enum DfsMetadataTableOp {
     PutNamespacePrepareReceipt {
         receipt: DfsNamespacePrepareReceipt,
     },
+    RemoveNamespacePrepareReceipt {
+        operation_id: String,
+        retention: DfsNamespaceReceiptRetentionState,
+    },
     PutNamespaceJob {
         job: DfsNamespaceJobRecord,
+    },
+    PutNamespaceJobReceipt {
+        receipt: DfsNamespaceJobReceipt,
+    },
+    RemoveNamespaceJobReceipt {
+        job_id: String,
+        retention: DfsNamespaceReceiptRetentionState,
     },
     PutNamespaceRequest {
         request: DfsNamespaceRequestRecord,
     },
     PutNamespaceRequestReceipt {
         receipt: DfsNamespaceRequestReceipt,
+    },
+    RemoveNamespaceRequestReceipt {
+        requester_node_id: NodeId,
+        request_id: String,
+        retention: DfsNamespaceReceiptRetentionState,
     },
 }
 
@@ -1833,19 +2546,34 @@ pub(crate) fn metadata_journal_batch_file_system_id(
             DfsMetadataMutation::PutFileSystem { file_system_id, .. }
             | DfsMetadataMutation::PutObject { file_system_id, .. }
             | DfsMetadataMutation::PutVersion { file_system_id, .. }
+            | DfsMetadataMutation::RemoveVersion { file_system_id, .. }
+            | DfsMetadataMutation::PutVersionPin { file_system_id, .. }
+            | DfsMetadataMutation::RemoveVersionPin { file_system_id, .. }
+            | DfsMetadataMutation::ReconcileCrossShardPinTransfer { file_system_id, .. }
+            | DfsMetadataMutation::RemoveCrossShardPinTransfer { file_system_id, .. }
+            | DfsMetadataMutation::FinalizeCrossShardSourceEviction { file_system_id, .. }
             | DfsMetadataMutation::PutReceipt { file_system_id, .. }
             | DfsMetadataMutation::RemoveReceipt { file_system_id, .. }
             | DfsMetadataMutation::PutIntent { file_system_id, .. }
+            | DfsMetadataMutation::PutIntentReceipt { file_system_id, .. }
+            | DfsMetadataMutation::RemoveIntentReceipt { file_system_id, .. }
+            | DfsMetadataMutation::MergeIntentReceiptRetention { file_system_id, .. }
             | DfsMetadataMutation::CommitVisibleVersion { file_system_id, .. }
+            | DfsMetadataMutation::RemoveVisibleCommit { file_system_id, .. }
             | DfsMetadataMutation::PutConflict { file_system_id, .. }
             | DfsMetadataMutation::PutAdvisoryLockState { file_system_id, .. }
             | DfsMetadataMutation::ApplyNamespaceTransaction { file_system_id, .. }
             | DfsMetadataMutation::PutNamespaceTransactionReceipt { file_system_id, .. }
+            | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { file_system_id, .. }
             | DfsMetadataMutation::PutNamespacePrepare { file_system_id, .. }
             | DfsMetadataMutation::PutNamespacePrepareReceipt { file_system_id, .. }
+            | DfsMetadataMutation::RemoveNamespacePrepareReceipt { file_system_id, .. }
             | DfsMetadataMutation::PutNamespaceJob { file_system_id, .. }
+            | DfsMetadataMutation::PutNamespaceJobReceipt { file_system_id, .. }
+            | DfsMetadataMutation::RemoveNamespaceJobReceipt { file_system_id, .. }
             | DfsMetadataMutation::PutNamespaceRequest { file_system_id, .. }
-            | DfsMetadataMutation::PutNamespaceRequestReceipt { file_system_id, .. } => {
+            | DfsMetadataMutation::PutNamespaceRequestReceipt { file_system_id, .. }
+            | DfsMetadataMutation::RemoveNamespaceRequestReceipt { file_system_id, .. } => {
                 Some(file_system_id.clone())
             }
         })
@@ -2094,6 +2822,7 @@ mod tests {
                 object_id: intent.object_id.clone(),
                 intent_id: intent.intent_id.clone(),
                 status: intent.status.clone(),
+                authoritative_migration: false,
                 intent: Some(intent),
             }
         );
@@ -2216,12 +2945,70 @@ mod tests {
         let decoded: DfsMetadataTableSnapshotTables = serde_json::from_value(serde_json::json!({}))
             .expect("deserialize legacy metadata table snapshot");
         assert!(decoded.namespace_requests.is_empty());
+        assert!(decoded.namespace_job_receipts.is_empty());
         assert_eq!(
             serde_json::to_value(decoded)
                 .expect("serialize metadata table snapshot")
                 .get("namespace_requests"),
             Some(&serde_json::json!([]))
         );
+    }
+
+    #[test]
+    fn namespace_job_origin_is_backward_compatible_and_terminal_receipt_is_compact() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let request = DfsNamespaceRequestRecord {
+            file_system_id: file_system_id(),
+            requester_node_id: node("node_namespace_job_requester"),
+            request_id: "dfs_net_req_namespace_job_origin".to_string(),
+            operation_id: "req-namespace-job-origin".to_string(),
+            authority_shard_id: DfsMetadataShardId::new("users"),
+            operation: DfsNamespaceOperation::Rename {
+                from: "/users/source".to_string(),
+                to: "/services/target".to_string(),
+            },
+            command_digest: "blake3:namespace-job-origin".to_string(),
+            status: DfsNamespaceRequestStatus::Pending,
+            result: None,
+            posix_coordination_result: None,
+            recovery_attempts: 0,
+            last_recovery_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let origin = DfsNamespaceJobOrigin::from_request(&request);
+        assert!(origin.matches_request(&request));
+        let job = DfsNamespaceJobRecord {
+            job_id: "job-namespace-origin".to_string(),
+            file_system_id: file_system_id(),
+            origin: Some(origin.clone()),
+            kind: DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries,
+            status: DfsNamespaceJobStatus::Completed,
+            root_path: "/users/source".to_string(),
+            target_path: Some("/services/target".to_string()),
+            pending_frames: vec![DfsNamespaceJobFrame::ScanDirectory {
+                path: "/users/source".to_string(),
+                cursor: None,
+            }],
+            processed_object_count: 7,
+            created_at: now,
+            updated_at: now,
+            completed_at: Some(now),
+            failure_reason: None,
+        };
+        let receipt =
+            DfsNamespaceJobReceipt::from_job(&job, now).expect("terminal namespace job receipt");
+        assert_eq!(receipt.origin, Some(origin));
+        assert!(receipt.matches_terminal_job(&job));
+        let encoded_receipt = serde_json::to_value(&receipt).expect("encode job receipt");
+        assert!(encoded_receipt.get("pending_frames").is_none());
+        assert!(encoded_receipt.get("processed_object_count").is_none());
+
+        let mut legacy = serde_json::to_value(job).expect("encode namespace job");
+        legacy.as_object_mut().expect("job object").remove("origin");
+        let decoded: DfsNamespaceJobRecord =
+            serde_json::from_value(legacy).expect("decode pre-origin namespace job");
+        assert!(decoded.origin.is_none());
     }
 
     #[test]

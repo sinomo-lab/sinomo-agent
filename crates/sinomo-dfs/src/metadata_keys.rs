@@ -4,7 +4,8 @@ use time::OffsetDateTime;
 
 use crate::metadata_records::{
     DfsConflictPageCursor, DfsConflictRecord, DfsConflictScanCursor, DfsDentryPageCursor,
-    DfsDirFragmentId, DfsDirectoryPageCursor, DfsInodeId, DfsMetadataShardId, DfsObjectPageCursor,
+    DfsDirFragmentId, DfsDirectoryPageCursor, DfsInodeId, DfsMetadataShardId,
+    DfsMetadataVersionPinPageCursor, DfsMetadataVersionPinRecord, DfsObjectPageCursor,
     DfsObjectVersionPageCursor, DfsObjectVersionRecord, DfsObjectVersionScanCursor, DfsPathRecord,
     DfsReplicaReceiptPageCursor, DfsReplicaReceiptRecord, DfsReplicaReceiptScanCursor,
     DfsWriteIntentPageCursor, DfsWriteIntentRecord, DfsWriteIntentScanCursor,
@@ -125,6 +126,26 @@ pub(crate) fn local_object_version_page_cursor(
 ) -> DfsObjectVersionPageCursor {
     DfsObjectVersionPageCursor {
         version: cursor.version.clone(),
+        shard_id: None,
+    }
+}
+
+pub(crate) fn version_pin_page_cursor(
+    pin: &DfsMetadataVersionPinRecord,
+) -> DfsMetadataVersionPinPageCursor {
+    DfsMetadataVersionPinPageCursor {
+        version: pin.version.clone(),
+        pin_id: pin.pin_id.clone(),
+        shard_id: None,
+    }
+}
+
+pub(crate) fn local_version_pin_page_cursor(
+    cursor: &DfsMetadataVersionPinPageCursor,
+) -> DfsMetadataVersionPinPageCursor {
+    DfsMetadataVersionPinPageCursor {
+        version: cursor.version.clone(),
+        pin_id: cursor.pin_id.clone(),
         shard_id: None,
     }
 }

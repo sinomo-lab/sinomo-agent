@@ -25,15 +25,15 @@ use sinomo_dfs::{
     DfsFileSystemId, DfsInboundAttachment, DfsMaintenanceExecutionExclusions,
     DfsMaintenanceRunOptions, DfsMaintenanceTickOptions, DfsMaintenanceTickReport,
     DfsMessageCommand, DfsMessageCommittedWork, DfsMessageExecutionScope, DfsMessageProcessResult,
-    DfsMessageResponse, DfsMetadataBackend, DfsMetadataJournalReplicationOptions,
-    DfsMetadataJournalReplicationReport, DfsMetadataPublishScheduleOptions,
-    DfsMetadataPublishScheduleStart, DfsMetadataShardId, DfsMetadataShardMembershipHandoff,
-    DfsMetadataShardStatus, DfsNodeDetachedSendState, DfsNodeDetachedSendWorker,
-    DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectMetadata, DfsObjectRpcSendOptions,
-    DfsOperatorInspector, DfsOperatorRepairView, DfsPeerTransport, DfsPeerTransportError,
-    DfsPlacementReconciliationJob, DfsPlacementReconciliationState, DfsRepairAttemptRecord,
-    DfsReplicaReceiptRecord, DfsTombstoneCompactionOptions, DfsWriteIntentRecord,
-    DfsWriteIntentStatus, LocalContentStore, NetworkedDfsService,
+    DfsMessageResponse, DfsMetadataBackend, DfsMetadataHistoryGcOptions,
+    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
+    DfsMetadataPublishScheduleOptions, DfsMetadataPublishScheduleStart, DfsMetadataShardId,
+    DfsMetadataShardMembershipHandoff, DfsMetadataShardStatus, DfsNodeDetachedSendState,
+    DfsNodeDetachedSendWorker, DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectMetadata,
+    DfsObjectRpcSendOptions, DfsOperatorInspector, DfsOperatorRepairView, DfsPeerTransport,
+    DfsPeerTransportError, DfsPlacementReconciliationJob, DfsPlacementReconciliationState,
+    DfsRepairAttemptRecord, DfsReplicaReceiptRecord, DfsTombstoneCompactionOptions,
+    DfsWriteIntentRecord, DfsWriteIntentStatus, LocalContentStore, NetworkedDfsService,
     default_dfs_repair_attempt_snapshot_path, dfs_message_execution_scope,
     read_dfs_repair_attempt_snapshot,
 };
@@ -68,6 +68,12 @@ const DAEMON_DFS_PROMOTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK: usize = 8;
 const DAEMON_DFS_TOMBSTONE_COMPACTION_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const DAEMON_DFS_TOMBSTONE_COMPACTION_MAX_RECORDS: u64 = 256;
+const DAEMON_DFS_METADATA_HISTORY_GC_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const DAEMON_DFS_METADATA_HISTORY_GC_MAX_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+const DAEMON_DFS_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS: u64 = 2;
+const DAEMON_DFS_METADATA_HISTORY_GC_MAX_RECORDS: u64 = 256;
+const DAEMON_DFS_METADATA_HISTORY_GC_RECORD_TRIGGER: u64 = 10_000;
+const DAEMON_DFS_METADATA_HISTORY_GC_BYTES_TRIGGER: u64 = 64 * 1024 * 1024;
 const DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
 // A replica journal apply is durable WAN work. Give daemon maintenance a larger
 // response budget than the library default while keeping foreground publication
@@ -802,6 +808,65 @@ pub(crate) fn daemon_dfs_now_unix_nanos() -> u64 {
 
 fn daemon_dfs_duration_nanos(duration: Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DaemonDfsMetadataHistoryGcSchedule {
+    due_record_count: usize,
+    next_deadline_unix_nanos: Option<u64>,
+}
+
+fn daemon_dfs_metadata_history_gc_schedule(
+    projection: &sinomo_dfs::DfsMetadataHistoryGcReport,
+    now_unix_nanos: u64,
+    record_trigger: u64,
+    bytes_trigger: u64,
+    max_history_age: Duration,
+) -> DaemonDfsMetadataHistoryGcSchedule {
+    let eligible_record_count = projection.eligible_record_count();
+    let retained_pressure = projection
+        .shards
+        .iter()
+        .filter(|shard| shard.collection_authorized)
+        .any(|shard| {
+            let largest_retained_representation = shard
+                .estimated_serialized_bytes
+                .max(shard.snapshot_size_bytes.unwrap_or(0))
+                .max(shard.journal_size_bytes);
+            shard.total_record_count >= record_trigger
+                || largest_retained_representation >= bytes_trigger
+        });
+    // Clamp the lifecycle age trigger to the planner's configured recovery
+    // window. Count and byte pressure are likewise gated on an age-eligible
+    // candidate, so neither path can shorten the retention contract.
+    let trigger_age_nanos =
+        daemon_dfs_duration_nanos(max_history_age).max(projection.min_history_age_nanos);
+    let oldest_age_deadline = projection
+        .oldest_eligible_record_unix_nanos
+        .map(|retained_at| retained_at.saturating_add(trigger_age_nanos));
+    let age_due = eligible_record_count > 0
+        && oldest_age_deadline.is_none_or(|deadline| deadline <= now_unix_nanos);
+    let pressure_due = eligible_record_count > 0 && retained_pressure;
+    if age_due || pressure_due {
+        return DaemonDfsMetadataHistoryGcSchedule {
+            due_record_count: usize::try_from(eligible_record_count).unwrap_or(usize::MAX),
+            next_deadline_unix_nanos: None,
+        };
+    }
+
+    // A footprint made only of young or recovery-rooted records cannot advance
+    // GC. Keep its first eligibility deadline observable without advertising
+    // immediately actionable work; otherwise a static high-water condition
+    // would launch a no-op lifecycle pass every short maintenance interval.
+    let next_deadline_unix_nanos = if eligible_record_count == 0 {
+        projection.next_eligible_at_unix_nanos
+    } else {
+        oldest_age_deadline.filter(|deadline| *deadline > now_unix_nanos)
+    };
+    DaemonDfsMetadataHistoryGcSchedule {
+        due_record_count: 0,
+        next_deadline_unix_nanos,
+    }
 }
 
 #[derive(Debug)]
@@ -2198,6 +2263,21 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         DfsTombstoneCompactionOptions::dry_run(DAEMON_DFS_TOMBSTONE_COMPACTION_MIN_AGE)
             .with_now_unix_nanos(now_unix_nanos),
     )?;
+    let metadata_history_projection = metadata.metadata_history_gc_projection(
+        DfsMetadataHistoryGcOptions::dry_run(
+            DAEMON_DFS_METADATA_HISTORY_GC_MIN_AGE,
+            DAEMON_DFS_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS,
+        )
+        .with_max_removals(DAEMON_DFS_METADATA_HISTORY_GC_MAX_RECORDS)
+        .with_now_unix_nanos(now_unix_nanos),
+    )?;
+    let metadata_history_schedule = daemon_dfs_metadata_history_gc_schedule(
+        &metadata_history_projection,
+        now_unix_nanos,
+        DAEMON_DFS_METADATA_HISTORY_GC_RECORD_TRIGGER,
+        DAEMON_DFS_METADATA_HISTORY_GC_BYTES_TRIGGER,
+        DAEMON_DFS_METADATA_HISTORY_GC_MAX_AGE,
+    );
     let lifecycle_options = DfsMaintenanceRunOptions::default();
     let content = LocalContentStore::open_for_inspection(data_dir.dfs_dir().join("content"));
     let staging_projection = content.collect_stale_staging(
@@ -2307,6 +2387,7 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         .saturating_add(
             usize::try_from(tombstone_projection.eligible_tombstone_count).unwrap_or(usize::MAX),
         )
+        .saturating_add(metadata_history_schedule.due_record_count)
         .saturating_add(
             usize::try_from(staging_projection.eligible_staging_count).unwrap_or(usize::MAX),
         );
@@ -2314,6 +2395,7 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         .next_time_based_maintenance_unix_nanos
         .into_iter()
         .chain(tombstone_projection.next_eligible_at_unix_nanos)
+        .chain(metadata_history_schedule.next_deadline_unix_nanos)
         .chain(staging_projection.next_eligible_at_unix_nanos)
         .min();
     Ok(work)
@@ -5513,10 +5595,19 @@ fn daemon_dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport
                 .version_gc
                 .as_ref()
                 .is_some_and(|gc| gc.max_deletions_reached && gc.deleted_version_count > 0)
+            || lifecycle.orphan_gc.as_ref().is_some_and(|gc| {
+                gc.max_deletions_reached
+                    && gc
+                        .deleted_orphan_count
+                        .saturating_add(gc.deleted_stale_orphan_observation_count)
+                        .saturating_add(gc.persisted_orphan_observation_count)
+                        .saturating_add(gc.compacted_packed_segment_count)
+                        > 0
+            })
             || lifecycle
-                .orphan_gc
+                .metadata_history_gc
                 .as_ref()
-                .is_some_and(|gc| gc.max_deletions_reached && gc.deleted_orphan_count > 0)
+                .is_some_and(|gc| gc.max_removals_reached && gc.applied_record_count() > 0)
             || lifecycle
                 .tombstone_compaction
                 .as_ref()
@@ -5561,6 +5652,18 @@ fn daemon_dfs_maintenance_tick_options() -> DfsMaintenanceTickOptions {
     options.lifecycle.tombstone_compaction_min_age = DAEMON_DFS_TOMBSTONE_COMPACTION_MIN_AGE;
     options.lifecycle.tombstone_compaction_max_records =
         DAEMON_DFS_TOMBSTONE_COMPACTION_MAX_RECORDS;
+    options.lifecycle.collect_metadata_history = true;
+    options.lifecycle.metadata_history_gc_min_age = DAEMON_DFS_METADATA_HISTORY_GC_MIN_AGE;
+    options.lifecycle.metadata_history_gc_keep_latest_versions =
+        DAEMON_DFS_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS;
+    options.lifecycle.metadata_history_gc_max_records = DAEMON_DFS_METADATA_HISTORY_GC_MAX_RECORDS;
+    // Configured local shard directories do not prove that every table image
+    // is fresh enough to be the reachability authority for node-local content.
+    // Keep automatic manifest/blob collection disabled until a durable,
+    // authoritative content-root catalog (or equivalent coverage proof) is
+    // available. Manual/acceptance lifecycle calls remain explicit opt-ins.
+    options.lifecycle.collect_content_versions = false;
+    options.lifecycle.collect_orphan_content = false;
     // Metadata cursor ownership belongs exclusively to retained exact-shard
     // publisher lanes. A broad maintenance pass must not race those lanes or
     // duplicate their outbound RPCs.
@@ -7481,6 +7584,31 @@ mod tests {
                 .tombstone_compaction_max_records,
             DAEMON_DFS_TOMBSTONE_COMPACTION_MAX_RECORDS
         );
+        let lifecycle = daemon_dfs_maintenance_tick_options().lifecycle;
+        assert!(lifecycle.collect_metadata_history);
+        assert_eq!(
+            lifecycle.metadata_history_gc_min_age,
+            DAEMON_DFS_METADATA_HISTORY_GC_MIN_AGE
+        );
+        assert_eq!(
+            lifecycle.metadata_history_gc_keep_latest_versions,
+            DAEMON_DFS_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS
+        );
+        assert_eq!(
+            lifecycle.metadata_history_gc_max_records,
+            DAEMON_DFS_METADATA_HISTORY_GC_MAX_RECORDS
+        );
+        assert!(DAEMON_DFS_METADATA_HISTORY_GC_MAX_AGE >= DAEMON_DFS_METADATA_HISTORY_GC_MIN_AGE);
+        assert!(DAEMON_DFS_METADATA_HISTORY_GC_RECORD_TRIGGER > 0);
+        assert!(DAEMON_DFS_METADATA_HISTORY_GC_BYTES_TRIGGER > 0);
+        assert!(
+            !lifecycle.collect_content_versions,
+            "daemon maintenance must not delete manifests without authoritative content-root coverage"
+        );
+        assert!(
+            !lifecycle.collect_orphan_content,
+            "daemon maintenance must not delete blobs without authoritative content-root coverage"
+        );
         assert!(
             !daemon_dfs_maintenance_tick_options().publish_metadata,
             "broad maintenance must not race retained exact-shard publishers"
@@ -7505,6 +7633,209 @@ mod tests {
         assert_eq!(
             daemon_dfs_metadata_publish_schedule_options().max_retry_delay,
             DAEMON_DFS_METADATA_PUBLISH_RETRY_MAX_DELAY
+        );
+    }
+
+    #[test]
+    fn daemon_dfs_pending_probe_does_not_schedule_unprotected_content_gc() {
+        let root = temp_root("pending-unprotected-content-gc");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let node_id = NodeId::from_legacy_named("node_pending_unprotected_content").expect("node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_pending_unprotected_content").expect("cluster"),
+            "pending unprotected content",
+            node_id,
+            "local",
+            "pk-local",
+            OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("write state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("sync raft");
+        drop(
+            open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)
+                .expect("initialize metadata backend"),
+        );
+        let content =
+            LocalContentStore::new(data_dir.dfs_dir().join("content")).expect("content store");
+        let orphan = content
+            .put_object_version_blob_only(
+                "content-only-object",
+                "content-only-version",
+                b"content without an authoritative metadata root",
+            )
+            .expect("store content-only blob");
+        assert!(
+            content
+                .has_blob(&orphan.content_hash)
+                .expect("content-only blob exists")
+        );
+
+        let pending = daemon_dfs_pending_maintenance_work(&paths).expect("pending maintenance");
+        assert_eq!(pending.due_time_based_maintenance_count, 0);
+        assert!(
+            !pending.should_trigger_background_maintenance(),
+            "unprotected content candidates must not create a daemon maintenance loop"
+        );
+        assert!(
+            content
+                .has_blob(&orphan.content_hash)
+                .expect("content-only blob remains"),
+            "the scheduling probe must remain read-only"
+        );
+    }
+
+    #[test]
+    fn daemon_dfs_metadata_history_gc_schedule_combines_pressure_and_safe_age() {
+        fn projection(
+            eligible_record_count: u64,
+            oldest_eligible_record_unix_nanos: Option<u64>,
+            next_eligible_at_unix_nanos: Option<u64>,
+            total_record_count: u64,
+            estimated_serialized_bytes: u64,
+            snapshot_size_bytes: u64,
+            journal_size_bytes: u64,
+        ) -> sinomo_dfs::DfsMetadataHistoryGcReport {
+            sinomo_dfs::DfsMetadataHistoryGcReport {
+                min_history_age_nanos: 100,
+                eligible_version_count: eligible_record_count,
+                oldest_eligible_record_unix_nanos,
+                next_eligible_at_unix_nanos,
+                shards: vec![sinomo_dfs::DfsMetadataHistoryShardStats {
+                    shard_id: DfsMetadataShardId::new("root"),
+                    collection_authorized: true,
+                    snapshot_size_bytes: Some(snapshot_size_bytes),
+                    journal_size_bytes,
+                    journal_segment_count: 1,
+                    journal_head_sequence: 1,
+                    total_record_count,
+                    estimated_serialized_bytes,
+                    tables: Vec::new(),
+                }],
+                ..Default::default()
+            }
+        }
+
+        let young_pressure = projection(0, None, Some(1_100), 10, 10, 10, 10);
+        assert_eq!(
+            daemon_dfs_metadata_history_gc_schedule(
+                &young_pressure,
+                1_000,
+                10,
+                10,
+                Duration::from_nanos(200),
+            ),
+            DaemonDfsMetadataHistoryGcSchedule {
+                due_record_count: 0,
+                next_deadline_unix_nanos: Some(1_100),
+            },
+            "young-only high-water pressure must not launch a no-op GC pass"
+        );
+
+        let below_pressure = projection(1, Some(850), None, 9, 9, 9, 9);
+        assert_eq!(
+            daemon_dfs_metadata_history_gc_schedule(
+                &below_pressure,
+                1_000,
+                10,
+                10,
+                Duration::from_nanos(200),
+            ),
+            DaemonDfsMetadataHistoryGcSchedule {
+                due_record_count: 0,
+                next_deadline_unix_nanos: Some(1_050),
+            },
+            "low-volume eligible history should park until its maximum-age deadline"
+        );
+
+        let record_pressure = projection(1, Some(850), None, 10, 9, 9, 9);
+        assert_eq!(
+            daemon_dfs_metadata_history_gc_schedule(
+                &record_pressure,
+                1_000,
+                10,
+                10,
+                Duration::from_nanos(200),
+            )
+            .due_record_count,
+            1
+        );
+
+        let mut replica_pressure = projection(1, Some(850), None, 9, 9, 9, 9);
+        replica_pressure
+            .shards
+            .push(sinomo_dfs::DfsMetadataHistoryShardStats {
+                shard_id: DfsMetadataShardId::new("replica"),
+                collection_authorized: false,
+                snapshot_size_bytes: Some(100),
+                journal_size_bytes: 100,
+                journal_segment_count: 1,
+                journal_head_sequence: 1,
+                total_record_count: 100,
+                estimated_serialized_bytes: 100,
+                tables: Vec::new(),
+            });
+        assert_eq!(
+            daemon_dfs_metadata_history_gc_schedule(
+                &replica_pressure,
+                1_000,
+                10,
+                10,
+                Duration::from_nanos(200),
+            ),
+            DaemonDfsMetadataHistoryGcSchedule {
+                due_record_count: 0,
+                next_deadline_unix_nanos: Some(1_050),
+            },
+            "replica and frozen-shard pressure must not schedule authoritative GC"
+        );
+
+        let byte_pressure = projection(1, Some(850), None, 9, 9, 9, 10);
+        assert_eq!(
+            daemon_dfs_metadata_history_gc_schedule(
+                &byte_pressure,
+                1_000,
+                10,
+                10,
+                Duration::from_nanos(200),
+            )
+            .due_record_count,
+            1
+        );
+
+        let age_pressure = projection(1, Some(800), None, 9, 9, 9, 9);
+        assert_eq!(
+            daemon_dfs_metadata_history_gc_schedule(
+                &age_pressure,
+                1_000,
+                10,
+                10,
+                Duration::from_nanos(200),
+            )
+            .due_record_count,
+            1
+        );
+
+        let configured_minimum_wins = projection(1, Some(850), None, 9, 9, 9, 9);
+        let mut configured_minimum_wins = configured_minimum_wins;
+        configured_minimum_wins.min_history_age_nanos = 200;
+        assert_eq!(
+            daemon_dfs_metadata_history_gc_schedule(
+                &configured_minimum_wins,
+                1_000,
+                10,
+                10,
+                Duration::from_nanos(50),
+            ),
+            DaemonDfsMetadataHistoryGcSchedule {
+                due_record_count: 0,
+                next_deadline_unix_nanos: Some(1_050),
+            },
+            "the age trigger must never shorten the configured recovery window"
         );
     }
 
@@ -7567,6 +7898,29 @@ mod tests {
             .compacted_tombstone_count = 1;
         assert!(daemon_dfs_maintenance_report_reached_limit(
             &no_progress_compaction
+        ));
+
+        let mut no_progress_history_gc = empty_report();
+        no_progress_history_gc
+            .lifecycle_reports
+            .push(sinomo_dfs::DfsLifecycleMaintenanceReport {
+                metadata_history_gc: Some(sinomo_dfs::DfsMetadataHistoryGcReport {
+                    max_removals_reached: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        assert!(
+            !daemon_dfs_maintenance_report_reached_limit(&no_progress_history_gc),
+            "a zero-progress metadata-history limit must keep ordinary backoff"
+        );
+        no_progress_history_gc.lifecycle_reports[0]
+            .metadata_history_gc
+            .as_mut()
+            .expect("metadata history GC report")
+            .removed_version_count = 1;
+        assert!(daemon_dfs_maintenance_report_reached_limit(
+            &no_progress_history_gc
         ));
     }
 

@@ -109,11 +109,6 @@ pub(super) fn remove_file_if_exists_and_sync_parent(path: &Path) -> Result<bool>
     durable_file::remove_file_if_exists_and_sync_parent(path).map_err(content_durable_file_error)
 }
 
-pub(super) fn remove_empty_dir_if_exists_and_sync_parent(path: &Path) -> Result<bool> {
-    durable_file::remove_empty_dir_if_exists_and_sync_parent(path)
-        .map_err(content_durable_file_error)
-}
-
 pub(super) fn file_age_nanos(path: &Path, now: SystemTime) -> Result<u64> {
     let modified = path
         .metadata()

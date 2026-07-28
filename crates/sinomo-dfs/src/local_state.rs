@@ -166,6 +166,14 @@ pub fn open_local_sharded_metadata_backend_for_inspection(
     LocalShardedMetadataBackend::open_for_inspection(root, shards)
 }
 
+pub fn open_local_sharded_metadata_backend_for_inspection_at_node(
+    root: impl Into<PathBuf>,
+    shards: Vec<DfsMetadataShardConfig>,
+    local_node_id: &NodeId,
+) -> Result<LocalShardedMetadataBackend, MetadataBackendError> {
+    LocalShardedMetadataBackend::open_for_inspection_at_node(root, shards, local_node_id)
+}
+
 pub fn inspect_dfs_status(
     root: impl Into<PathBuf>,
 ) -> Result<DfsOperatorStatus, MetadataBackendError> {
@@ -274,9 +282,12 @@ pub fn open_cluster_sharded_dfs_metadata_backend_for_inspection(
     if shards.is_empty() {
         return Ok(None);
     }
-    open_local_sharded_metadata_backend_for_inspection(
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
+        .map_err(DfsError::from_network)?;
+    open_local_sharded_metadata_backend_for_inspection_at_node(
         default_dfs_metadata_shards_root(data_dir),
         shards,
+        &state.local_node_id,
     )
     .map(Some)
     .map_err(Into::into)

@@ -8,6 +8,8 @@
 
 mod attrs;
 mod cross_shard;
+#[cfg(test)]
+pub(crate) use cross_shard::cross_shard_object_version_record;
 mod jobs;
 mod links;
 pub(crate) mod locks;
@@ -79,9 +81,6 @@ pub(crate) const POSIX_RENAME_MOVE_TRANSACTION_MAX_PATH_BYTES: usize =
 const POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE: usize = 1024;
 const POSIX_REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const POSIX_REMOTE_READ_IDLE_WAIT_INITIAL: Duration = Duration::from_millis(2);
-/// Version-history records shipped with a cross-shard adoption; older
-/// history stays in the source shard until lifecycle GC collects it.
-const CROSS_SHARD_MOVE_VERSION_HISTORY_LIMIT: usize = 32;
 /// Follow-up sync rounds a routed-operation wrapper performs when bounded
 /// response replay has not yet surfaced the mutation locally.
 const POSIX_ROUTED_SYNC_RETRY_ROUNDS: usize = 4;

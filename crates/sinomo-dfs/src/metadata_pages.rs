@@ -14,16 +14,18 @@ use crate::metadata_keys::{
     directory_page_cursor_with_dentry, directory_page_key, id_lower_bound, normalize_path,
     normalize_posix_path, object_page_cursor, object_page_key, object_version_page_cursor,
     object_version_scan_cursor, replica_receipt_page_cursor, replica_receipt_scan_cursor,
-    write_intent_page_cursor, write_intent_scan_cursor, write_intent_scan_cursor_key,
+    version_pin_page_cursor, write_intent_page_cursor, write_intent_scan_cursor,
+    write_intent_scan_cursor_key,
 };
 use crate::metadata_records::{
     DfsConflictPage, DfsConflictPageCursor, DfsConflictRecord, DfsConflictScanCursor,
-    DfsConflictScanPage, DfsDirFragmentId, DfsDirectoryPageCursor, DfsNamespaceJobPage,
-    DfsNamespaceJobPageCursor, DfsObjectPage, DfsObjectPageCursor, DfsObjectVersionPage,
-    DfsObjectVersionPageCursor, DfsObjectVersionScanCursor, DfsObjectVersionScanPage,
-    DfsPendingNamespaceRequestPage, DfsPendingNamespaceRequestPageCursor, DfsReplicaReceiptPage,
-    DfsReplicaReceiptPageCursor, DfsReplicaReceiptScanCursor, DfsReplicaReceiptScanPage,
-    DfsWriteIntentPage, DfsWriteIntentPageCursor, DfsWriteIntentScanCursor, DfsWriteIntentScanPage,
+    DfsConflictScanPage, DfsDirFragmentId, DfsDirectoryPageCursor, DfsMetadataVersionPinPage,
+    DfsMetadataVersionPinPageCursor, DfsNamespaceJobPage, DfsNamespaceJobPageCursor, DfsObjectPage,
+    DfsObjectPageCursor, DfsObjectVersionPage, DfsObjectVersionPageCursor,
+    DfsObjectVersionScanCursor, DfsObjectVersionScanPage, DfsPendingNamespaceRequestPage,
+    DfsPendingNamespaceRequestPageCursor, DfsReplicaReceiptPage, DfsReplicaReceiptPageCursor,
+    DfsReplicaReceiptScanCursor, DfsReplicaReceiptScanPage, DfsWriteIntentPage,
+    DfsWriteIntentPageCursor, DfsWriteIntentScanCursor, DfsWriteIntentScanPage,
 };
 use crate::metadata_tables::DfsMetadataTables;
 use crate::metadata_visible_commit::object_by_path_from_tables;
@@ -631,6 +633,45 @@ pub(crate) fn versions_for_object_page_from_tables(
     }
 }
 
+pub(crate) fn version_pins_for_object_page_from_tables(
+    tables: &DfsMetadataTables,
+    object_id: &DfsObjectId,
+    after: Option<&DfsMetadataVersionPinPageCursor>,
+    max_entries: usize,
+) -> DfsMetadataVersionPinPage {
+    if max_entries == 0 {
+        return DfsMetadataVersionPinPage {
+            pins: Vec::new(),
+            next_cursor: None,
+        };
+    }
+    let start = match after {
+        Some(after) => Excluded((
+            object_id.clone(),
+            after.version.clone(),
+            after.pin_id.clone(),
+        )),
+        None => Included((object_id.clone(), id_lower_bound(), String::new())),
+    };
+    let mut entries = Vec::new();
+    for ((record_object_id, _, _), pin) in tables
+        .version_pins
+        .range((start, Unbounded))
+        .take_while(|((record_object_id, _, _), _)| record_object_id == object_id)
+    {
+        if record_object_id != object_id || pin.object_id != *object_id {
+            continue;
+        }
+        let cursor = version_pin_page_cursor(pin);
+        entries.push((pin.clone(), cursor));
+        if entries.len() > max_entries {
+            break;
+        }
+    }
+    let (pins, next_cursor) = finish_cursor_page(entries, max_entries);
+    DfsMetadataVersionPinPage { pins, next_cursor }
+}
+
 pub(crate) fn version_records_page_from_tables(
     tables: &DfsMetadataTables,
     after: Option<&DfsObjectVersionScanCursor>,
@@ -767,25 +808,36 @@ pub(crate) fn intents_for_object_page_from_tables(
             next_cursor: None,
         };
     }
-    let start = match after {
-        Some(after) => Excluded((object_id.clone(), after.intent_id.clone())),
-        None => Included((object_id.clone(), String::new())),
-    };
     let mut entries = Vec::new();
-    for ((record_object_id, _), intent) in tables
+    for ((record_object_id, intent_id), intent) in tables
         .intents
-        .range((start, Unbounded))
+        .range((Included((object_id.clone(), String::new())), Unbounded))
         .take_while(|((record_object_id, _), _)| record_object_id == object_id)
     {
-        if record_object_id != object_id || intent.object_id != *object_id {
+        if record_object_id != object_id
+            || intent.object_id != *object_id
+            || after.is_some_and(|after| intent_id <= &after.intent_id)
+        {
             continue;
         }
         let cursor = write_intent_page_cursor(intent);
         entries.push((intent.clone(), cursor));
-        if entries.len() > max_entries {
-            break;
-        }
     }
+    for ((record_object_id, intent_id), receipt) in tables
+        .intent_receipts
+        .range((Included((object_id.clone(), String::new())), Unbounded))
+        .take_while(|((record_object_id, _), _)| record_object_id == object_id)
+    {
+        if record_object_id != object_id || after.is_some_and(|after| intent_id <= &after.intent_id)
+        {
+            continue;
+        }
+        let intent = receipt.to_intent_record();
+        let cursor = write_intent_page_cursor(&intent);
+        entries.push((intent, cursor));
+    }
+    entries.sort_by(|left, right| left.1.intent_id.cmp(&right.1.intent_id));
+    entries.truncate(max_entries.saturating_add(1));
     let (intents, next_cursor) = finish_cursor_page(entries, max_entries);
     DfsWriteIntentPage {
         intents,
@@ -806,18 +858,13 @@ pub(crate) fn intents_for_object_version_page_from_tables(
             next_cursor: None,
         };
     }
-    let start = match after {
-        Some(after) => Excluded((
-            object_id.clone(),
-            target_version.clone(),
-            after.intent_id.clone(),
-        )),
-        None => Included((object_id.clone(), target_version.clone(), String::new())),
-    };
     let mut entries = Vec::new();
     for ((record_object_id, record_version, _), intent_key) in tables
         .intent_targets
-        .range((start, Unbounded))
+        .range((
+            Included((object_id.clone(), target_version.clone(), String::new())),
+            Unbounded,
+        ))
         .take_while(|((record_object_id, record_version, _), _)| {
             record_object_id == object_id && record_version == target_version
         })
@@ -831,12 +878,29 @@ pub(crate) fn intents_for_object_version_page_from_tables(
         if intent.object_id != *object_id || intent.target_version != *target_version {
             continue;
         }
+        if after.is_some_and(|after| intent.intent_id <= after.intent_id) {
+            continue;
+        }
         let cursor = write_intent_page_cursor(intent);
         entries.push((intent.clone(), cursor));
-        if entries.len() > max_entries {
-            break;
-        }
     }
+    for ((record_object_id, intent_id), receipt) in tables
+        .intent_receipts
+        .range((Included((object_id.clone(), String::new())), Unbounded))
+        .take_while(|((record_object_id, _), _)| record_object_id == object_id)
+    {
+        if record_object_id != object_id
+            || receipt.target_version != *target_version
+            || after.is_some_and(|after| intent_id <= &after.intent_id)
+        {
+            continue;
+        }
+        let intent = receipt.to_intent_record();
+        let cursor = write_intent_page_cursor(&intent);
+        entries.push((intent, cursor));
+    }
+    entries.sort_by(|left, right| left.1.intent_id.cmp(&right.1.intent_id));
+    entries.truncate(max_entries.saturating_add(1));
     let (intents, next_cursor) = finish_cursor_page(entries, max_entries);
     DfsWriteIntentPage {
         intents,
@@ -967,7 +1031,8 @@ pub(crate) fn conflict_records_page_from_tables(
 mod tests {
     use super::*;
     use crate::metadata_records::{
-        DfsMetadataTableOp, DfsObjectVersionRecord, DfsWriteIntentRecord, DfsWriteIntentStatus,
+        DfsMetadataTableOp, DfsMetadataVersionPinRecord, DfsObjectVersionRecord,
+        DfsWriteIntentRecord, DfsWriteIntentStatus,
     };
     use crate::{DfsFileSystemId, DfsReplicationPolicy};
     use sinomo_core::node::NodeId;
@@ -1119,6 +1184,62 @@ mod tests {
         );
         assert_eq!(second.versions.len(), 1);
         assert!(second.next_cursor.is_none());
+    }
+
+    #[test]
+    fn version_pins_for_object_page_is_bounded_and_uses_composite_cursor() {
+        let object_id = oid("obj_page_version_pins");
+        let other_id = oid("obj_page_version_pins_other");
+        let mut tables = DfsMetadataTables::default();
+        for (version_name, pin_id) in [
+            ("version_pin_page_1", "consumer-a"),
+            ("version_pin_page_1", "consumer-b"),
+            ("version_pin_page_2", "consumer-a"),
+        ] {
+            tables.apply(DfsMetadataTableOp::PutVersionPin {
+                pin: DfsMetadataVersionPinRecord {
+                    file_system_id: file_system_id(),
+                    object_id: object_id.clone(),
+                    version: ver(version_name),
+                    pin_id: pin_id.to_string(),
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                },
+            });
+        }
+        tables.apply(DfsMetadataTableOp::PutVersionPin {
+            pin: DfsMetadataVersionPinRecord {
+                file_system_id: file_system_id(),
+                object_id: other_id,
+                version: ver("version_pin_page_1"),
+                pin_id: "consumer-a".to_string(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            },
+        });
+
+        let first = version_pins_for_object_page_from_tables(&tables, &object_id, None, 2);
+        assert_eq!(first.pins.len(), 2);
+        assert!(first.next_cursor.is_some());
+        let second = version_pins_for_object_page_from_tables(
+            &tables,
+            &object_id,
+            first.next_cursor.as_ref(),
+            2,
+        );
+        assert_eq!(second.pins.len(), 1);
+        assert!(second.next_cursor.is_none());
+        let observed = first
+            .pins
+            .into_iter()
+            .chain(second.pins)
+            .map(|pin| (pin.version, pin.pin_id))
+            .collect::<Vec<_>>();
+        let mut expected = vec![
+            (ver("version_pin_page_1"), "consumer-a".to_string()),
+            (ver("version_pin_page_1"), "consumer-b".to_string()),
+            (ver("version_pin_page_2"), "consumer-a".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(observed, expected);
     }
 
     #[test]

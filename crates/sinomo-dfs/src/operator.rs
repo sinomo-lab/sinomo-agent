@@ -2704,6 +2704,7 @@ mod tests {
             .put_namespace_job(&DfsNamespaceJobRecord {
                 job_id: "namespace-job-running".to_string(),
                 file_system_id: file_system_id(),
+                origin: None,
                 kind: DfsNamespaceJobKind::ClearDirectoryRecursive,
                 status: DfsNamespaceJobStatus::Running,
                 root_path: "/alpha".to_string(),
@@ -2723,6 +2724,7 @@ mod tests {
             .put_namespace_job(&DfsNamespaceJobRecord {
                 job_id: "namespace-job-failed".to_string(),
                 file_system_id: file_system_id(),
+                origin: None,
                 kind: DfsNamespaceJobKind::RenameDirectory,
                 status: DfsNamespaceJobStatus::Failed,
                 root_path: "/beta".to_string(),

@@ -199,6 +199,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.transient_metadata_object_ids.clear();
         self.transient_metadata_predecessor_object_ids.clear();
         self.coordinator = DistributedEventualCoordinator::new();
+        let intent_counter_floor = self
+            .metadata_backend
+            .as_ref()
+            .expect("metadata backend checked above")
+            .write_intent_counter_floor()?;
+        self.coordinator
+            .observe_restored_intent_counter_floor(intent_counter_floor);
         self.pending_writes.clear();
         self.pending_reads.clear();
         if !self.rebuild_cross_shard_namespace_locks_until_cancelled(should_cancel)? {
@@ -934,6 +941,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 };
                 self.apply_metadata_version_to_service_state(version_record);
             }
+            DfsMetadataMutation::RemoveVersion { .. } => {}
             DfsMetadataMutation::PutReceipt {
                 object_id,
                 version,
@@ -968,6 +976,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 };
                 self.apply_metadata_intent_to_service_state(intent)?;
             }
+            DfsMetadataMutation::PutIntentReceipt { receipt, .. } => {
+                self.apply_metadata_intent_to_service_state(&receipt.to_intent_record())?;
+            }
+            DfsMetadataMutation::RemoveIntentReceipt { .. }
+            | DfsMetadataMutation::MergeIntentReceiptRetention { .. } => {}
             DfsMetadataMutation::CommitVisibleVersion {
                 committed_object,
                 visible_version,
@@ -987,6 +1000,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.apply_metadata_version_to_service_state(visible_version);
                 self.restore_backend_receipts_for_visible_version(object_id, committed_version)?;
             }
+            DfsMetadataMutation::RemoveVisibleCommit { .. } => {}
+            DfsMetadataMutation::PutVersionPin { .. }
+            | DfsMetadataMutation::RemoveVersionPin { .. }
+            | DfsMetadataMutation::ReconcileCrossShardPinTransfer { .. }
+            | DfsMetadataMutation::RemoveCrossShardPinTransfer { .. }
+            | DfsMetadataMutation::FinalizeCrossShardSourceEviction { .. } => {}
             DfsMetadataMutation::PutConflict { conflict, .. } => {
                 let Some(conflict) = conflict.as_ref() else {
                     self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
@@ -1002,8 +1021,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             | DfsMetadataMutation::PutNamespacePrepare { .. }
             | DfsMetadataMutation::PutNamespaceRequest { .. }
             | DfsMetadataMutation::PutNamespaceTransactionReceipt { .. }
+            | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { .. }
             | DfsMetadataMutation::PutNamespacePrepareReceipt { .. }
+            | DfsMetadataMutation::RemoveNamespacePrepareReceipt { .. }
+            | DfsMetadataMutation::PutNamespaceJobReceipt { .. }
+            | DfsMetadataMutation::RemoveNamespaceJobReceipt { .. }
             | DfsMetadataMutation::PutNamespaceRequestReceipt { .. } => {}
+            DfsMetadataMutation::RemoveNamespaceRequestReceipt { .. } => {}
             DfsMetadataMutation::PutNamespaceJob { job, .. } => {
                 let Some(job) = job.as_ref() else {
                     self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
@@ -1054,6 +1078,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     self.apply_metadata_version_to_service_state(&version_record);
                 }
             }
+            DfsMetadataMutation::RemoveVersion { .. } => {}
             DfsMetadataMutation::PutReceipt {
                 object_id,
                 version,
@@ -1100,6 +1125,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     self.apply_metadata_intent_to_service_state(&intent)?;
                 }
             }
+            DfsMetadataMutation::PutIntentReceipt { receipt, .. } => {
+                self.apply_metadata_intent_to_service_state(&receipt.to_intent_record())?;
+            }
+            DfsMetadataMutation::RemoveIntentReceipt { .. }
+            | DfsMetadataMutation::MergeIntentReceiptRetention { .. } => {}
             DfsMetadataMutation::CommitVisibleVersion {
                 object_id,
                 committed_version,
@@ -1117,6 +1147,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 self.restore_backend_receipts_for_visible_version(object_id, committed_version)?;
             }
+            DfsMetadataMutation::RemoveVisibleCommit { .. } => {}
+            DfsMetadataMutation::PutVersionPin { .. }
+            | DfsMetadataMutation::RemoveVersionPin { .. }
+            | DfsMetadataMutation::ReconcileCrossShardPinTransfer { .. }
+            | DfsMetadataMutation::RemoveCrossShardPinTransfer { .. }
+            | DfsMetadataMutation::FinalizeCrossShardSourceEviction { .. } => {}
             DfsMetadataMutation::PutConflict {
                 object_id,
                 conflict_id,
@@ -1138,8 +1174,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             | DfsMetadataMutation::PutNamespacePrepare { .. }
             | DfsMetadataMutation::PutNamespaceRequest { .. }
             | DfsMetadataMutation::PutNamespaceTransactionReceipt { .. }
+            | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { .. }
             | DfsMetadataMutation::PutNamespacePrepareReceipt { .. }
+            | DfsMetadataMutation::RemoveNamespacePrepareReceipt { .. }
+            | DfsMetadataMutation::PutNamespaceJobReceipt { .. }
+            | DfsMetadataMutation::RemoveNamespaceJobReceipt { .. }
             | DfsMetadataMutation::PutNamespaceRequestReceipt { .. } => {}
+            DfsMetadataMutation::RemoveNamespaceRequestReceipt { .. } => {}
             DfsMetadataMutation::PutNamespaceJob { job_id, .. } => {
                 let job = self
                     .metadata_backend

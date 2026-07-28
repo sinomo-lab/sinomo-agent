@@ -93,6 +93,7 @@ fn namespace_operation_should_replay_journal_batches(operation: &DfsNamespaceOpe
             | DfsNamespaceOperation::FileSync { .. }
             | DfsNamespaceOperation::DirectorySync { .. }
             | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. }
+            | DfsNamespaceOperation::VerifyObjectFamilyAdoption { .. }
     )
 }
 
@@ -103,6 +104,12 @@ fn namespace_operation_requires_fresh_authority(operation: &DfsNamespaceOperatio
             | DfsNamespaceOperation::FileSync { .. }
             | DfsNamespaceOperation::DirectorySync { .. }
             | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. }
+            | DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. }
+            | DfsNamespaceOperation::VerifyObjectFamilyAdoption { .. }
+            | DfsNamespaceOperation::AdoptObjectAtPath {
+                pin_transfer_id: Some(_),
+                ..
+            }
             | DfsNamespaceOperation::AdoptObjectAtPath {
                 advisory_lock_state: Some(_),
                 ..
@@ -144,6 +151,12 @@ pub(crate) fn namespace_operation_response_retry_safe(operation: &DfsNamespaceOp
                 | DfsNamespaceOperation::FileSync { .. }
                 | DfsNamespaceOperation::DirectorySync { .. }
                 | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. }
+                | DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. }
+                | DfsNamespaceOperation::VerifyObjectFamilyAdoption { .. }
+                | DfsNamespaceOperation::AdoptObjectAtPath {
+                    pin_transfer_id: Some(_),
+                    ..
+                }
         )
 }
 
@@ -272,7 +285,9 @@ fn namespace_transaction_proves_operation_completed(
         | DfsNamespaceOperation::AdvisoryLock { .. }
         | DfsNamespaceOperation::FileSync { .. }
         | DfsNamespaceOperation::DirectorySync { .. }
-        | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. } => false,
+        | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. }
+        | DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. }
+        | DfsNamespaceOperation::VerifyObjectFamilyAdoption { .. } => false,
     }
 }
 
@@ -624,7 +639,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             };
         }
-        if backend.namespace_request_history_expired_on_shard(&shard_id, &command.request_id)? {
+        if backend.namespace_request_history_expired_on_shard(
+            &shard_id,
+            requester_node_id,
+            &command.request_id,
+        )? {
             return Ok(DurableNamespaceRequestAdmission::Reject {
                 reason: format!(
                     "namespace request {}/{} idempotency history expired or is unknown",
@@ -1135,13 +1154,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     },
                                 );
                                 self.active_durable_namespace_prepare_recorded = false;
-                                let replaying_pending_since = durable_execute.as_ref().and_then(
+                                let replaying_pending_request = durable_execute.as_ref().and_then(
                                     |admission| match admission {
                                         DurableNamespaceRequestAdmission::Execute {
                                             record,
                                             replaying_pending: true,
                                             ..
-                                        } => Some(record.created_at),
+                                        } => Some(record.clone()),
                                         DurableNamespaceRequestAdmission::Execute { .. }
                                         | DurableNamespaceRequestAdmission::Replay { .. }
                                         | DurableNamespaceRequestAdmission::Reject { .. } => None,
@@ -1214,7 +1233,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                             &command.file_system_id,
                                             from,
                                             to,
-                                            replaying_pending_since,
+                                            replaying_pending_request.as_ref(),
                                         )
                                         .map(|()| None),
                                     (
@@ -2204,5 +2223,80 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .map_err(DfsError::from_network)?;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use sinomo_core::DfsObjectPolicy;
+
+    fn adoption_object() -> DfsObjectMetadata {
+        DfsObjectMetadata {
+            file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
+            object_id: DfsObjectId::from_legacy_named("object_pin_adoption").expect("object"),
+            path: "/services/pinned.txt".to_string(),
+            kind: DfsObjectKind::File,
+            tombstone_provenance: None,
+            owner_node_id: NodeId::from_legacy_named("node_target").expect("node"),
+            current_locations: Vec::new(),
+            content_hash: Some("blake3:test".to_string()),
+            content_size_bytes: Some(4),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 1,
+            modified_at_unix_nanos: 1,
+            created_at_unix_nanos: 1,
+            changed_at_unix_nanos: 1,
+            version: DfsVersion::from_legacy_named("version_pin_adoption").expect("version"),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        }
+    }
+
+    #[test]
+    fn pin_aware_adoption_bypasses_durable_admission_that_cannot_preserve_typed_receipts() {
+        let operation = DfsNamespaceOperation::AdoptObjectAtPath {
+            object: adoption_object(),
+            source_path: "/users/pinned.txt".to_string(),
+            pin_transfer_id: Some("pin-transfer".to_string()),
+            versions: Vec::new(),
+            version_pins: Vec::new(),
+            version_pin_set_fingerprint: Some("blake3:pins".to_string()),
+            receipts: Vec::new(),
+            intents: Vec::new(),
+            intent_receipts: Vec::new(),
+            intent_receipt_retention: DfsWriteIntentReceiptRetentionState::default(),
+            conflicts: Vec::new(),
+            advisory_lock_state: None,
+        };
+
+        assert!(namespace_operation_requires_fresh_authority(&operation));
+        assert!(!namespace_operation_uses_durable_request_admission(
+            &operation
+        ));
+        assert!(!namespace_operation_can_fuse_durable_request_admission(
+            &operation
+        ));
+        assert!(namespace_operation_response_retry_safe(&operation));
+    }
+
+    #[test]
+    fn pin_transfer_finalization_stamps_only_the_destination_authority() {
+        let operation = DfsNamespaceOperation::FinalizeObjectFamilyAdoption {
+            path: "/services/pinned.txt".to_string(),
+            source_path: "/users/pinned.txt".to_string(),
+            object_id: DfsObjectId::from_legacy_named("object_pin_finalize").expect("object"),
+            target_version: DfsVersion::from_legacy_named("version_pin_finalize").expect("version"),
+            pin_transfer_id: "pin-transfer".to_string(),
+        };
+
+        assert_eq!(operation.routing_path(), Some("/services/pinned.txt"));
+        assert_eq!(operation.involved_paths(), vec!["/services/pinned.txt"]);
+        assert!(namespace_operation_requires_fresh_authority(&operation));
+        assert!(namespace_operation_response_retry_safe(&operation));
     }
 }

@@ -75,7 +75,7 @@ fn metadata_backend_open_error_allows_snapshot_repair(error: &crate::MetadataBac
 /// generation without rescanning a settled prefix.
 const DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_MUTATION_LIMIT: usize = 256;
 const DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_PAGE_SIZE: usize = 32;
-const DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION: u16 = 3;
+const DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION: u16 = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 struct DfsDefaultSifsMigrationGeneration {
@@ -160,6 +160,22 @@ enum DfsDefaultSifsPendingMigrationStage {
         active_version: Option<DfsVersion>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         after_receipt: Option<crate::DfsReplicaReceiptPageCursor>,
+    },
+    ClearPinTransfers {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_transfer_id: Option<String>,
+    },
+    ClearVersionPins {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<crate::DfsMetadataVersionPinPageCursor>,
+    },
+    PinTransfers {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_transfer_id: Option<String>,
+    },
+    VersionPins {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<crate::DfsMetadataVersionPinPageCursor>,
     },
     Intents {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -340,13 +356,24 @@ fn read_default_sifs_migration_cursor(
     file_system_id: &DfsFileSystemId,
     generation: &DfsDefaultSifsMigrationGeneration,
 ) -> Result<Option<DfsDefaultSifsMigrationCursor>, DfsError> {
-    let cursor = crate::metadata_io::read_sobj_optional::<DfsDefaultSifsMigrationCursor>(
-        &default_sifs_migration_cursor_path(metadata_root, file_system_id),
-    )?;
-    Ok(cursor.filter(|cursor| {
-        cursor.format_version == DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION
-            && cursor.generation == *generation
-    }))
+    let path = default_sifs_migration_cursor_path(metadata_root, file_system_id);
+    let cursor = crate::metadata_io::read_sobj_optional::<DfsDefaultSifsMigrationCursor>(&path)?;
+    match cursor {
+        Some(cursor)
+            if cursor.format_version
+                == DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION
+                && cursor.generation == *generation =>
+        {
+            Ok(Some(cursor))
+        }
+        Some(_) => {
+            // An obsolete generation must not leave a permanent journal-prune
+            // fence after membership or shard configuration changes.
+            crate::metadata_io::remove_file_if_exists(&path)?;
+            Ok(None)
+        }
+        None => Ok(None),
+    }
 }
 
 fn write_default_sifs_migration_cursor(
@@ -6524,6 +6551,71 @@ fn replay_default_sifs_object_family_entry(
             }
             Ok(DfsDefaultSifsPendingProgress::Complete)
         }
+        crate::DfsMetadataMutation::ReconcileCrossShardPinTransfer {
+            versions, transfer, ..
+        } => {
+            if !budget.can_mutate() {
+                return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+            }
+            target
+                .install_cross_shard_pin_transfer_for_authoritative_migration(transfer, versions)?;
+            budget.charge_mutation();
+            Ok(DfsDefaultSifsPendingProgress::Complete)
+        }
+        crate::DfsMetadataMutation::RemoveCrossShardPinTransfer {
+            file_system_id,
+            object_id,
+            transfer_id,
+        } => {
+            if !budget.can_mutate() {
+                return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+            }
+            target.remove_cross_shard_pin_transfer_for_authoritative_migration(
+                file_system_id,
+                object_id,
+                transfer_id,
+            )?;
+            budget.charge_mutation();
+            Ok(DfsDefaultSifsPendingProgress::Complete)
+        }
+        crate::DfsMetadataMutation::PutVersionPin { pin, .. } => {
+            if !budget.can_mutate() {
+                return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+            }
+            if target.put_version_pin(pin)?.is_some() {
+                budget.charge_mutation();
+            }
+            Ok(DfsDefaultSifsPendingProgress::Complete)
+        }
+        crate::DfsMetadataMutation::RemoveVersionPin {
+            file_system_id,
+            object_id,
+            version,
+            pin_id,
+        } => {
+            if !budget.can_mutate() {
+                return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+            }
+            if target
+                .remove_version_pin(file_system_id, object_id, version, pin_id)?
+                .is_some()
+            {
+                budget.charge_mutation();
+            }
+            Ok(DfsDefaultSifsPendingProgress::Complete)
+        }
+        crate::DfsMetadataMutation::RemoveVersion { .. }
+        | crate::DfsMetadataMutation::PutIntentReceipt { .. }
+        | crate::DfsMetadataMutation::RemoveIntentReceipt { .. }
+        | crate::DfsMetadataMutation::MergeIntentReceiptRetention { .. }
+        | crate::DfsMetadataMutation::RemoveVisibleCommit { .. } => {
+            if !budget.can_mutate() {
+                return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+            }
+            target.apply_migrated_object_family_gc_mutation(&entry.mutation)?;
+            budget.charge_mutation();
+            Ok(DfsDefaultSifsPendingProgress::Complete)
+        }
         crate::DfsMetadataMutation::PutReceipt {
             receipt: Some(receipt),
             ..
@@ -6568,7 +6660,7 @@ fn replay_default_sifs_object_family_entry(
                 if !budget.can_mutate() {
                     return Ok(DfsDefaultSifsPendingProgress::Incomplete);
                 }
-                target.put_intent(intent)?;
+                target.put_migrated_intent_for_object(Some(object), intent)?;
                 budget.charge_mutation();
             }
             Ok(DfsDefaultSifsPendingProgress::Complete)
@@ -6689,8 +6781,21 @@ fn replay_default_sifs_object_family_entry(
             }
             Ok(DfsDefaultSifsPendingProgress::Complete)
         }
+        // A source-eviction record describes the source shard's physical
+        // cleanup and must never be replayed onto the authoritative target.
         // Payload-less legacy mutations and namespace prepare/job records do
-        // not change the migrated metadata family.
+        // not change the migrated metadata family either.
+        crate::DfsMetadataMutation::FinalizeCrossShardSourceEviction { .. }
+        | crate::DfsMetadataMutation::PutVersion {
+            version_record: None,
+            ..
+        }
+        | crate::DfsMetadataMutation::PutReceipt { receipt: None, .. }
+        | crate::DfsMetadataMutation::PutIntent { intent: None, .. }
+        | crate::DfsMetadataMutation::PutAdvisoryLockState { state: None, .. }
+        | crate::DfsMetadataMutation::ApplyNamespaceTransaction {
+            transaction: None, ..
+        } => Ok(DfsDefaultSifsPendingProgress::Complete),
         _ => Ok(DfsDefaultSifsPendingProgress::Complete),
     }
 }
@@ -6843,7 +6948,9 @@ fn advance_default_sifs_pending_migration(
                         1,
                     )?;
                 let Some(version) = version_page.versions.into_iter().next() else {
-                    pending.stage = DfsDefaultSifsPendingMigrationStage::Intents { after: None };
+                    pending.stage = DfsDefaultSifsPendingMigrationStage::ClearPinTransfers {
+                        after_transfer_id: None,
+                    };
                     continue;
                 };
                 budget.charge_family_record();
@@ -6871,6 +6978,205 @@ fn advance_default_sifs_pending_migration(
                 *active_version = Some(version.version);
                 *after_receipt = None;
             }
+            DfsDefaultSifsPendingMigrationStage::ClearPinTransfers { after_transfer_id } => {
+                if !budget.can_read_family_record() {
+                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+                }
+                let mut transfers = shard_backends
+                    .get(&pending.target_shard_id)
+                    .expect("pending target exists")
+                    .cross_shard_pin_transfers_for_object(&pending.object.object_id)?;
+                transfers.sort_by(|left, right| left.transfer_id.cmp(&right.transfer_id));
+                let next = transfers.into_iter().find(|transfer| {
+                    after_transfer_id
+                        .as_ref()
+                        .is_none_or(|after| transfer.transfer_id > *after)
+                });
+                let Some(transfer) = next else {
+                    pending.stage =
+                        DfsDefaultSifsPendingMigrationStage::ClearVersionPins { after: None };
+                    continue;
+                };
+                budget.charge_family_record();
+                if !budget.can_mutate() {
+                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+                }
+                shard_backends
+                    .get_mut(&pending.target_shard_id)
+                    .expect("pending target exists")
+                    .remove_cross_shard_pin_transfer_for_authoritative_migration(
+                        &transfer.file_system_id,
+                        &transfer.object_id,
+                        &transfer.transfer_id,
+                    )?;
+                budget.charge_mutation();
+                *after_transfer_id = Some(transfer.transfer_id);
+            }
+            DfsDefaultSifsPendingMigrationStage::ClearVersionPins { after } => {
+                if !budget.can_read_family_record() {
+                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+                }
+                let page_size = DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_PAGE_SIZE
+                    .min(budget.remaining_family_records)
+                    .max(1);
+                let page = shard_backends
+                    .get(&pending.target_shard_id)
+                    .expect("pending target exists")
+                    .version_pins_for_object_page(
+                        &pending.object.object_id,
+                        after.as_ref(),
+                        page_size,
+                    )?;
+                for pin in page.pins {
+                    budget.charge_family_record();
+                    if !budget.can_mutate() {
+                        return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+                    }
+                    if shard_backends
+                        .get_mut(&pending.target_shard_id)
+                        .expect("pending target exists")
+                        .remove_version_pin(
+                            &pin.file_system_id,
+                            &pin.object_id,
+                            &pin.version,
+                            &pin.pin_id,
+                        )?
+                        .is_some()
+                    {
+                        budget.charge_mutation();
+                    }
+                    *after = Some(crate::DfsMetadataVersionPinPageCursor {
+                        version: pin.version,
+                        pin_id: pin.pin_id,
+                        shard_id: None,
+                    });
+                }
+                if page.next_cursor.is_some() {
+                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+                }
+                pending.stage = DfsDefaultSifsPendingMigrationStage::PinTransfers {
+                    after_transfer_id: None,
+                };
+            }
+            DfsDefaultSifsPendingMigrationStage::PinTransfers { after_transfer_id } => {
+                if !budget.can_read_family_record() {
+                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+                }
+                let mut transfers = shard_backends
+                    .get(&pending.source_shard_id)
+                    .expect("pending source exists")
+                    .cross_shard_pin_transfers_for_object(&pending.object.object_id)?;
+                transfers.sort_by(|left, right| left.transfer_id.cmp(&right.transfer_id));
+                let next = transfers.into_iter().find(|transfer| {
+                    after_transfer_id
+                        .as_ref()
+                        .is_none_or(|after| transfer.transfer_id > *after)
+                });
+                let Some(transfer) = next else {
+                    pending.stage =
+                        DfsDefaultSifsPendingMigrationStage::VersionPins { after: None };
+                    continue;
+                };
+                budget.charge_family_record();
+                if !budget.can_mutate() {
+                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+                }
+
+                // Versions were copied in the preceding stage. Include the
+                // exact source records again in the provenance mutation so a
+                // transfer appended concurrently with that scan can still
+                // install newly pinned versions atomically.
+                let mut transfer_version_ids = transfer
+                    .source_pins
+                    .iter()
+                    .chain(&transfer.copied_pins)
+                    .map(|pin| pin.version.clone())
+                    .collect::<BTreeSet<_>>();
+                transfer_version_ids.insert(transfer.target_version.clone());
+                let source = shard_backends
+                    .get(&pending.source_shard_id)
+                    .expect("pending source exists");
+                let mut versions = Vec::with_capacity(transfer_version_ids.len());
+                for version_id in transfer_version_ids {
+                    let version = source
+                        .get_version(&pending.object.object_id, &version_id)?
+                        .ok_or_else(|| DfsError::Metadata {
+                            message: format!(
+                                "default SIFS migration source shard {} pin transfer {} references missing version {}/{}",
+                                pending.source_shard_id.0,
+                                transfer.transfer_id,
+                                pending.object.object_id,
+                                version_id
+                            ),
+                        })?;
+                    versions.push(version);
+                }
+                shard_backends
+                    .get_mut(&pending.target_shard_id)
+                    .expect("pending target exists")
+                    .install_cross_shard_pin_transfer_for_authoritative_migration(
+                        &transfer, &versions,
+                    )?;
+                budget.charge_mutation();
+                *after_transfer_id = Some(transfer.transfer_id);
+            }
+            DfsDefaultSifsPendingMigrationStage::VersionPins { after } => {
+                if !budget.can_read_family_record() {
+                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+                }
+                let page_size = DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_PAGE_SIZE
+                    .min(budget.remaining_family_records)
+                    .max(1);
+                let page = shard_backends
+                    .get(&pending.source_shard_id)
+                    .expect("pending source exists")
+                    .version_pins_for_object_page(
+                        &pending.object.object_id,
+                        after.as_ref(),
+                        page_size,
+                    )?;
+                // The preceding stage installed the source's captured
+                // provenance exactly. Skip every acknowledged key here,
+                // including pre-existing target pins that the transfer fences
+                // without owning. Replay of a later transfer mutation will
+                // atomically reconcile any ownership change that raced the
+                // base scan.
+                let target_transfer_acknowledged_pins = shard_backends
+                    .get(&pending.target_shard_id)
+                    .expect("pending target exists")
+                    .cross_shard_pin_transfers_for_object(&pending.object.object_id)?
+                    .into_iter()
+                    .flat_map(|transfer| transfer.source_pins)
+                    .map(|pin| (pin.version, pin.pin_id))
+                    .collect::<BTreeSet<_>>();
+                for pin in page.pins {
+                    budget.charge_family_record();
+                    if !target_transfer_acknowledged_pins
+                        .contains(&(pin.version.clone(), pin.pin_id.clone()))
+                    {
+                        if !budget.can_mutate() {
+                            return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+                        }
+                        if shard_backends
+                            .get_mut(&pending.target_shard_id)
+                            .expect("pending target exists")
+                            .put_version_pin(&pin)?
+                            .is_some()
+                        {
+                            budget.charge_mutation();
+                        }
+                    }
+                    *after = Some(crate::DfsMetadataVersionPinPageCursor {
+                        version: pin.version,
+                        pin_id: pin.pin_id,
+                        shard_id: None,
+                    });
+                }
+                if page.next_cursor.is_some() {
+                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+                }
+                pending.stage = DfsDefaultSifsPendingMigrationStage::Intents { after: None };
+            }
             DfsDefaultSifsPendingMigrationStage::Intents { after } => {
                 if !budget.can_read_family_record() {
                     return Ok(DfsDefaultSifsPendingProgress::Incomplete);
@@ -6888,25 +7194,88 @@ fn advance_default_sifs_pending_migration(
                     )?;
                 for intent in page.intents {
                     budget.charge_family_record();
+                    let source_receipt = shard_backends
+                        .get(&pending.source_shard_id)
+                        .expect("pending source exists")
+                        .get_intent_receipt(&intent.object_id, &intent.intent_id)?;
                     let target = shard_backends
                         .get_mut(&pending.target_shard_id)
                         .expect("pending target exists");
-                    match target.get_intent(&intent.object_id, &intent.intent_id)? {
-                        Some(existing) if existing != intent => {
-                            return Err(DfsError::Metadata {
-                                message: format!(
-                                    "target metadata shard {} has conflicting intent {} for object {} during bounded migration",
-                                    pending.target_shard_id.0, intent.intent_id, intent.object_id
-                                ),
-                            });
-                        }
-                        Some(_) => {}
-                        None => {
-                            if !budget.can_mutate() {
-                                return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+                    if let Some(receipt) = source_receipt {
+                        match target.get_intent_receipt(&receipt.object_id, &receipt.intent_id)? {
+                            Some(existing) if existing != receipt => {
+                                return Err(DfsError::Metadata {
+                                    message: format!(
+                                        "target metadata shard {} has conflicting compact intent receipt {} for object {} during bounded migration",
+                                        pending.target_shard_id.0,
+                                        receipt.intent_id,
+                                        receipt.object_id
+                                    ),
+                                });
                             }
-                            target.put_intent(&intent)?;
-                            budget.charge_mutation();
+                            Some(_) => {}
+                            None => {
+                                if let Some(existing) =
+                                    target.get_intent(&receipt.object_id, &receipt.intent_id)?
+                                    && !receipt.matches_intent(&existing)
+                                {
+                                    return Err(DfsError::Metadata {
+                                        message: format!(
+                                            "target metadata shard {} has conflicting intent {} for object {} during bounded migration",
+                                            pending.target_shard_id.0,
+                                            receipt.intent_id,
+                                            receipt.object_id
+                                        ),
+                                    });
+                                }
+                                if !budget.can_mutate() {
+                                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+                                }
+                                target.put_intent_receipt_for_object(
+                                    Some(&pending.object),
+                                    &receipt,
+                                )?;
+                                budget.charge_mutation();
+                            }
+                        }
+                    } else {
+                        match target.get_intent_receipt(&intent.object_id, &intent.intent_id)? {
+                            Some(receipt) if !receipt.matches_intent(&intent) => {
+                                return Err(DfsError::Metadata {
+                                    message: format!(
+                                        "target metadata shard {} has conflicting compact intent receipt {} for object {} during bounded migration",
+                                        pending.target_shard_id.0,
+                                        intent.intent_id,
+                                        intent.object_id
+                                    ),
+                                });
+                            }
+                            Some(_) => {}
+                            None => {
+                                match target.get_intent(&intent.object_id, &intent.intent_id)? {
+                                    Some(existing) if existing != intent => {
+                                        return Err(DfsError::Metadata {
+                                            message: format!(
+                                                "target metadata shard {} has conflicting intent {} for object {} during bounded migration",
+                                                pending.target_shard_id.0,
+                                                intent.intent_id,
+                                                intent.object_id
+                                            ),
+                                        });
+                                    }
+                                    Some(_) => {}
+                                    None => {
+                                        if !budget.can_mutate() {
+                                            return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+                                        }
+                                        target.put_migrated_intent_for_object(
+                                            Some(&pending.object),
+                                            &intent,
+                                        )?;
+                                        budget.charge_mutation();
+                                    }
+                                }
+                            }
                         }
                     }
                     *after = Some(crate::DfsWriteIntentPageCursor {
@@ -6916,6 +7285,29 @@ fn advance_default_sifs_pending_migration(
                 }
                 if page.next_cursor.is_some() {
                     return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+                }
+                if !budget.can_read_family_record() {
+                    return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+                }
+                let retention = shard_backends
+                    .get(&pending.source_shard_id)
+                    .expect("pending source exists")
+                    .intent_receipt_retention_for_object(&pending.object.object_id)?;
+                budget.charge_family_record();
+                if !retention.is_empty() {
+                    if !budget.can_mutate() {
+                        return Ok(DfsDefaultSifsPendingProgress::Incomplete);
+                    }
+                    shard_backends
+                        .get_mut(&pending.target_shard_id)
+                        .expect("pending target exists")
+                        .merge_intent_receipt_retention_for_object(
+                            Some(&pending.object),
+                            &pending.object.file_system_id,
+                            &pending.object.object_id,
+                            &retention,
+                        )?;
+                    budget.charge_mutation();
                 }
                 pending.stage = DfsDefaultSifsPendingMigrationStage::Conflicts { after: None };
             }
@@ -7052,6 +7444,7 @@ fn advance_default_sifs_pending_migration(
                             Some(crate::DfsTombstoneProvenance::SourceEviction {
                                 source_shard_id: recorded_source,
                                 target_shard_id: recorded_target,
+                                ..
                             }) if recorded_source == &source_shard_id
                                 && recorded_target == &pending.target_shard_id
                         )
@@ -7075,6 +7468,25 @@ fn advance_default_sifs_pending_migration(
                             source_generation.replayed_through_sequence,
                             journal_page_size,
                         )?;
+                    let source_journal_head = shard_backends
+                        .get(&source_shard_id)
+                        .expect("pending writable source exists")
+                        .journal_last_sequence();
+                    let expected_sequence = source_generation
+                        .replayed_through_sequence
+                        .saturating_add(1);
+                    if source_journal_head > source_generation.replayed_through_sequence
+                        && entries.first().is_none_or(|entry| {
+                            entry.shard_id != source_shard_id || entry.sequence != expected_sequence
+                        })
+                    {
+                        return Err(DfsError::Metadata {
+                            message: format!(
+                                "default SIFS migration source shard {} lost journal sequence {} while object {} still references that prefix",
+                                source_shard_id.0, expected_sequence, pending.object.object_id
+                            ),
+                        });
+                    }
                     if !entries.is_empty() {
                         for entry in entries {
                             budget.charge_family_record();
@@ -7130,6 +7542,7 @@ fn advance_default_sifs_pending_migration(
                             &source_shard_id,
                             &pending.target_shard_id,
                             pending.writable_sources[source_index].replayed_through_sequence,
+                            None,
                         )?;
                     match eviction {
                         crate::metadata_backend::DfsConditionalSourceEviction::Applied {
@@ -7225,6 +7638,7 @@ fn plan_default_sifs_pending_migration(
         if let Some(crate::DfsTombstoneProvenance::SourceEviction {
             source_shard_id,
             target_shard_id,
+            ..
         }) = candidate.tombstone_provenance.as_ref()
             && (source_shard_id != candidate_shard_id || target_shard_id == source_shard_id)
         {
@@ -7493,6 +7907,34 @@ fn stage_default_sifs_journal_entry_object_ids(
     }
 }
 
+fn default_sifs_migration_cursor_has_journal_gap(
+    cursor: &DfsDefaultSifsMigrationCursor,
+    shard_backends: &BTreeMap<DfsMetadataShardId, LocalSobjMetadataBackend>,
+) -> Result<bool, DfsError> {
+    for (shard_id, backend) in shard_backends {
+        let after_sequence = cursor
+            .observed_journal_sequences
+            .get(&shard_id.0)
+            .copied()
+            .unwrap_or_default();
+        if backend.journal_last_sequence() <= after_sequence {
+            continue;
+        }
+        let expected_sequence = after_sequence.saturating_add(1);
+        let first = backend
+            .durable_journal_since_limited(after_sequence, 1)?
+            .into_iter()
+            .next();
+        if first
+            .as_ref()
+            .is_none_or(|entry| entry.shard_id != *shard_id || entry.sequence != expected_sequence)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn resume_default_sifs_pending_journal_replay(
     cursor: &mut DfsDefaultSifsMigrationCursor,
     shard_backends: &BTreeMap<DfsMetadataShardId, LocalSobjMetadataBackend>,
@@ -7708,6 +8150,11 @@ fn migrate_default_sifs_metadata_on_active_primary_shards(
             .observed_journal_sequences
             .entry(shard_id.0.clone())
             .or_insert_with(|| backend.journal_last_sequence());
+    }
+    if default_sifs_migration_cursor_has_journal_gap(&cursor, &shard_backends)? {
+        return Err(DfsError::Metadata {
+            message: "default SIFS migration cursor references pruned journal history".to_string(),
+        });
     }
 
     // Convert a bounded durable journal suffix into dirty object IDs before
@@ -9549,6 +9996,7 @@ mod cursor_update_tests {
             Some(crate::DfsTombstoneProvenance::SourceEviction {
                 source_shard_id: DfsMetadataShardId::new("root"),
                 target_shard_id: DfsMetadataShardId::new("services"),
+                pin_transfer_id: None,
             })
         );
         drop(source);
@@ -10457,6 +10905,216 @@ mod cursor_update_tests {
     }
 
     #[test]
+    fn default_migration_pages_large_version_pin_sets_within_the_pass_budget() {
+        const PIN_COUNT: usize = 40;
+        const PASS_LIMIT: usize = 5;
+        let root = sinomo_testdir::TestDir::new("dfs-default-migration-version-pin-pages");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let local = NodeId::from_legacy_named("node_dfs_version_pin_pages").expect("node");
+        let file_system = distributed_sifs(local.clone());
+        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
+        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
+        let cursor_path =
+            default_sifs_migration_cursor_path(&metadata_root, &file_system.file_system_id);
+        let mut source =
+            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
+                .expect("root source");
+        source.put_file_system(&file_system).expect("filesystem");
+        let mut object = crate::distributed_sifs_bootstrap_objects(local.clone())
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        object.object_id =
+            crate::DfsObjectId::from_legacy_named("obj_version_pin_pages").expect("object id");
+        object.path = "/services/version-pin-pages.bin".to_string();
+        source.put_object(&object).expect("legacy object");
+        let version = crate::object_version_record(&object, object.content_size_bytes);
+        source.put_version(&version).expect("pinned version");
+        for index in 0..PIN_COUNT {
+            source
+                .put_version_pin(&crate::DfsMetadataVersionPinRecord {
+                    file_system_id: object.file_system_id.clone(),
+                    object_id: object.object_id.clone(),
+                    version: version.version.clone(),
+                    pin_id: format!("checkpoint-{index:03}"),
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                })
+                .expect("put pin")
+                .expect("new pin");
+        }
+        drop(source);
+
+        let mut observed_partial_pin_page = false;
+        for pass in 0..32 {
+            let (report, _, buffered, index_writes, journal_writes) =
+                run_test_default_migration_pass(
+                    &data_dir,
+                    &file_system,
+                    &shards,
+                    &local,
+                    PASS_LIMIT,
+                );
+            assert!(
+                index_writes.saturating_add(journal_writes) <= PASS_LIMIT,
+                "pass {pass} exceeded the physical mutation cap"
+            );
+            assert!(
+                buffered <= (PASS_LIMIT + 1).saturating_mul(shards.len()),
+                "pass {pass} buffered an unbounded pin page"
+            );
+            let target =
+                open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
+                    .expect("target");
+            let copied = target
+                .version_pins_for_object(&object.object_id)
+                .expect("target pins")
+                .len();
+            if copied > 0 && copied < PIN_COUNT {
+                let cursor =
+                    crate::metadata_io::read_sobj::<DfsDefaultSifsMigrationCursor>(&cursor_path)
+                        .expect("durable migration cursor");
+                assert!(matches!(
+                    cursor.pending_migration.map(|pending| pending.stage),
+                    Some(DfsDefaultSifsPendingMigrationStage::VersionPins { after: Some(_) })
+                ));
+                observed_partial_pin_page = true;
+                break;
+            }
+            assert!(report.migration.reached_limit);
+        }
+        assert!(
+            observed_partial_pin_page,
+            "a large pin set must yield with a durable composite cursor before full materialization"
+        );
+    }
+
+    #[test]
+    fn default_migration_preserves_active_pin_transfer_provenance_exactly() {
+        const PASS_LIMIT: usize = 4;
+        let root = sinomo_testdir::TestDir::new("dfs-default-migration-pin-transfer");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let local = NodeId::from_legacy_named("node_dfs_pin_transfer_migration").expect("node");
+        let file_system = distributed_sifs(local.clone());
+        let shards = local_default_migration_shards(&file_system.file_system_id, &local);
+        let mut source =
+            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
+                .expect("root source");
+        source.put_file_system(&file_system).expect("filesystem");
+        let mut object = crate::distributed_sifs_bootstrap_objects(local)
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        object.object_id =
+            crate::DfsObjectId::from_legacy_named("obj_pin_transfer_migration").expect("object id");
+        object.path = "/services/pin-transfer-migration.bin".to_string();
+        source.put_object(&object).expect("legacy object");
+        let version = crate::object_version_record(&object, object.content_size_bytes);
+        source.put_version(&version).expect("version");
+        let preexisting_pin = crate::DfsMetadataVersionPinRecord {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            version: version.version.clone(),
+            pin_id: "checkpoint-preexisting-before-transfer".to_string(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        source
+            .put_version_pin(&preexisting_pin)
+            .expect("preexisting pin")
+            .expect("new preexisting pin");
+        let copied_pin = crate::DfsMetadataVersionPinRecord {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            version: version.version.clone(),
+            pin_id: "checkpoint-copied-by-transfer".to_string(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let source_pins = vec![preexisting_pin.clone(), copied_pin.clone()];
+        assert!(
+            source
+                .reconcile_cross_shard_pin_transfer(
+                    "active-transfer-before-topology-change",
+                    &object,
+                    "/legacy/pin-transfer-migration.bin",
+                    std::slice::from_ref(&version),
+                    &source_pins,
+                )
+                .expect("install source transfer")
+        );
+        let expected_transfer = source
+            .cross_shard_pin_transfers_for_object(&object.object_id)
+            .expect("source transfer")
+            .into_iter()
+            .next()
+            .expect("active source transfer");
+        assert_eq!(expected_transfer.source_pins.len(), 2);
+        assert_eq!(
+            expected_transfer.copied_pins,
+            vec![copied_pin.clone()],
+            "the source transfer must distinguish its copied pin from an acknowledged pre-existing pin"
+        );
+        drop(source);
+
+        let mut settled = false;
+        for _ in 0..64 {
+            let (report, _, _, _, _) = run_test_default_migration_pass(
+                &data_dir,
+                &file_system,
+                &shards,
+                &NodeId::from_legacy_named("node_dfs_pin_transfer_migration").expect("node"),
+                PASS_LIMIT,
+            );
+            if !report.migration.reached_limit {
+                settled = true;
+                break;
+            }
+        }
+        assert!(
+            settled,
+            "bounded migration with active transfer must converge"
+        );
+
+        let target =
+            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
+                .expect("target");
+        assert_eq!(
+            target
+                .cross_shard_pin_transfers_for_object(&object.object_id)
+                .expect("target transfer"),
+            vec![expected_transfer],
+            "authoritative migration must preserve transfer identity, timestamps, and ownership"
+        );
+        let mut expected_pins = source_pins;
+        expected_pins.sort();
+        let mut target_pins = target
+            .version_pins_for_object(&object.object_id)
+            .expect("target pins");
+        target_pins.sort();
+        assert_eq!(
+            target_pins, expected_pins,
+            "both copied and independently owned acknowledged pins remain durable on the target"
+        );
+
+        let source = open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
+            .expect("source after eviction");
+        assert!(
+            source
+                .cross_shard_pin_transfers_for_object(&object.object_id)
+                .expect("source transfers after eviction")
+                .is_empty(),
+            "source provenance is removed atomically with source eviction"
+        );
+        assert!(
+            source
+                .version_pins_for_object(&object.object_id)
+                .expect("source pins after eviction")
+                .is_empty(),
+            "source-owned pins are removed atomically with source eviction"
+        );
+    }
+
+    #[test]
     fn index_only_catalog_mutations_share_the_cursor_budget() {
         const OBJECTS: usize = 65;
         const PASS_LIMIT: usize = 7;
@@ -11142,6 +11800,329 @@ mod cursor_update_tests {
             receiver
                 .metadata_shard_authoritative_writes_frozen(&shard_id)
                 .expect("promoted replica remains fenced until activation")
+        );
+    }
+
+    #[test]
+    fn exact_primary_handoff_snapshot_preserves_authoritative_gc_after_promotion() {
+        let target = sinomo_testdir::TestDir::new("sinomo-dfs-primary-handoff-snapshot-gc");
+        let shard_id = DfsMetadataShardId::new("root");
+        let source_node_id = NodeId::from_legacy_named("handoff-gc-source").unwrap();
+        let promoted_node_id = NodeId::from_legacy_named("handoff-gc-promoted").unwrap();
+        let other_node_id = NodeId::from_legacy_named("handoff-gc-other").unwrap();
+        let mut file_system = DfsFileSystem::sifs(source_node_id.clone());
+        file_system.display_name = "primary handoff snapshot GC".to_string();
+        let object_id =
+            crate::DfsObjectId::from_legacy_named("object_handoff_gc").expect("object id");
+        let old_version =
+            DfsVersion::from_legacy_named("version_handoff_gc_old").expect("old version");
+        let live_version =
+            DfsVersion::from_legacy_named("version_handoff_gc_live").expect("live version");
+        let live = crate::DfsObjectMetadata {
+            object_id: object_id.clone(),
+            file_system_id: file_system.file_system_id.clone(),
+            path: "/handoff-gc.txt".to_string(),
+            kind: DfsObjectKind::File,
+            tombstone_provenance: None,
+            owner_node_id: source_node_id.clone(),
+            current_locations: vec![source_node_id.clone(), promoted_node_id.clone()],
+            content_hash: None,
+            content_size_bytes: None,
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 1,
+            modified_at_unix_nanos: 2,
+            created_at_unix_nanos: 1,
+            changed_at_unix_nanos: 2,
+            version: live_version.clone(),
+            policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        let old_version_record = DfsObjectVersionRecord {
+            file_system_id: file_system.file_system_id.clone(),
+            object_id: object_id.clone(),
+            version: old_version.clone(),
+            content_hash: None,
+            size_bytes: None,
+            locations: vec![source_node_id.clone()],
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        };
+        let live_version_record = DfsObjectVersionRecord {
+            file_system_id: file_system.file_system_id.clone(),
+            object_id: object_id.clone(),
+            version: live_version.clone(),
+            content_hash: None,
+            size_bytes: None,
+            locations: live.current_locations.clone(),
+            created_by_event_id: None,
+            created_at: OffsetDateTime::from_unix_timestamp(1).expect("live version timestamp"),
+            visible: true,
+        };
+        let terminal_intent = crate::DfsWriteIntentRecord {
+            intent_id: "dfs_intent_handoff_gc_1".to_string(),
+            file_system_id: file_system.file_system_id.clone(),
+            object_id: object_id.clone(),
+            base_version: Some(old_version.clone()),
+            target_version: live_version.clone(),
+            coordinator_node_id: source_node_id.clone(),
+            owner_epoch: 7,
+            desired_replica_node_ids: vec![source_node_id.clone(), promoted_node_id.clone()],
+            policy: crate::DfsReplicationPolicy::confirmed(2).expect("replication policy"),
+            status: crate::DfsWriteIntentStatus::Aborted,
+            content_hash: None,
+            object_metadata: Some(live.clone()),
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+        };
+
+        let source_root = target.path().join("source");
+        let mut source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &source_root).expect("source backend");
+        source
+            .put_file_system(&file_system)
+            .expect("source filesystem");
+        source
+            .put_version(&old_version_record)
+            .expect("old source version");
+        source
+            .put_version(&live_version_record)
+            .expect("live source version");
+        source.put_object(&live).expect("live source object");
+        source
+            .put_intent(&terminal_intent)
+            .expect("terminal source intent");
+
+        let pre_gc_sequence = source.journal_last_sequence();
+        let pre_gc_snapshot = source.export_table_snapshot();
+        let receiver_root = target.path().join("receiver");
+        let mut receiver = LocalSobjMetadataBackend::new(shard_id.clone(), &receiver_root)
+            .expect("receiver backend");
+        receiver
+            .replace_with_replicated_snapshot(shard_id.clone(), pre_gc_sequence, pre_gc_snapshot)
+            .expect("seed promoted replica with pre-GC history");
+        assert!(
+            receiver
+                .get_version(&object_id, &old_version)
+                .expect("seeded old version")
+                .is_some()
+        );
+        assert!(
+            receiver
+                .export_table_snapshot()
+                .tables
+                .expect("seeded snapshot tables")
+                .intents
+                .iter()
+                .any(|intent| intent.object_id == object_id
+                    && intent.intent_id == terminal_intent.intent_id)
+        );
+
+        let gc = source
+            .gc_metadata_history_authoritative(crate::DfsMetadataHistoryGcOptions::delete_eligible(
+                Duration::ZERO,
+                1,
+            ))
+            .expect("durable authoritative metadata GC");
+        assert_eq!(gc.removed_version_count, 1);
+        assert_eq!(gc.compacted_intent_count, 1);
+        drop(source);
+
+        let source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &source_root).expect("reopen source");
+        assert_eq!(
+            source
+                .get_version(&object_id, &old_version)
+                .expect("reopened old version"),
+            None,
+            "durable GC must remove the old version before handoff"
+        );
+        assert!(
+            source
+                .export_table_snapshot()
+                .tables
+                .expect("reopened source tables")
+                .intents
+                .iter()
+                .all(|intent| intent.object_id != object_id
+                    || intent.intent_id != terminal_intent.intent_id),
+            "durable GC must replace the full terminal body"
+        );
+        let expected_receipt = source
+            .get_intent_receipt(&object_id, &terminal_intent.intent_id)
+            .expect("reopened intent receipt")
+            .expect("compact terminal receipt");
+        assert_eq!(
+            source.get_object(&object_id).expect("reopened live object"),
+            Some(live.clone())
+        );
+        assert_eq!(
+            source
+                .get_version(&object_id, &live_version)
+                .expect("reopened live version"),
+            Some(live_version_record.clone())
+        );
+
+        let sequence = source.journal_last_sequence();
+        let snapshot = source.export_table_snapshot();
+        let state_fingerprint =
+            crate::service_sync::metadata_shard_state_fingerprint_at(&source, &shard_id, sequence)
+                .expect("source post-GC checkpoint");
+        let retiring = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: shard_id.0.clone(),
+            primary_node_id: source_node_id.clone(),
+            replica_node_ids: vec![promoted_node_id.clone(), other_node_id.clone()],
+            epoch: 7,
+            assignment: crate::DfsMetadataShardAssignment::Root,
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        let desired = DfsMetadataShardConfig {
+            file_system_id: retiring.file_system_id.clone(),
+            shard_id: retiring.shard_id.clone(),
+            primary_node_id: promoted_node_id.clone(),
+            replica_node_ids: vec![other_node_id, source_node_id.clone()],
+            epoch: 8,
+            assignment: retiring.assignment.clone(),
+            default_policy: retiring.default_policy.clone(),
+        };
+        let handoff_id = "handoff-snapshot-gc".to_string();
+        receiver
+            .freeze_metadata_shard_for_membership_handoff(&shard_id, &handoff_id, retiring.epoch)
+            .expect("freeze promoted replica")
+            .expect("local shard");
+        let context = DfsMetadataReplicaShardContext {
+            local_node_id: promoted_node_id,
+            shard: retiring.clone(),
+            pending_membership_handoff: Some(DfsMetadataShardMembershipHandoff {
+                handoff_id: handoff_id.clone(),
+                retiring_shard: retiring.clone(),
+                desired_shard: desired.clone(),
+                required_prepared_sequence: 0,
+                required_head_watermark: None,
+                retiring_primary_fence: Some(crate::DfsMetadataShardMembershipHandoffFence {
+                    handoff_id: handoff_id.clone(),
+                    primary_node_id: source_node_id.clone(),
+                    journal_sequence: sequence,
+                    state_fingerprint,
+                }),
+            }),
+        };
+        let command = DfsMetadataSnapshotInstallCommand {
+            request_id: "primary-handoff-snapshot-gc".to_string(),
+            source_node_id,
+            file_system_id: Some(retiring.file_system_id),
+            authority_epoch: Some(retiring.epoch),
+            primary_handoff_id: Some(handoff_id.clone()),
+            shard_id: shard_id.clone(),
+            next_after_sequence: sequence,
+            snapshot,
+            reason: "install exact post-GC state before promoting replica".to_string(),
+        };
+
+        assert!(matches!(
+            process_dfs_metadata_snapshot_install(&mut receiver, Some(&context), command).result,
+            DfsMetadataSnapshotInstallResult::Installed { .. }
+        ));
+        assert!(
+            receiver
+                .metadata_shard_authoritative_writes_frozen(&shard_id)
+                .expect("receiver remains frozen before activation")
+        );
+        assert_eq!(
+            receiver
+                .get_version(&object_id, &old_version)
+                .expect("post-install old version"),
+            None,
+            "the exact post-GC snapshot must not resurrect pruned history"
+        );
+        assert!(
+            receiver
+                .export_table_snapshot()
+                .tables
+                .expect("post-install receiver tables")
+                .intents
+                .iter()
+                .all(|intent| intent.object_id != object_id
+                    || intent.intent_id != terminal_intent.intent_id)
+        );
+        assert_eq!(
+            receiver
+                .get_intent_receipt(&object_id, &terminal_intent.intent_id)
+                .expect("post-install terminal receipt"),
+            Some(expected_receipt.clone())
+        );
+        assert_eq!(
+            receiver
+                .get_object(&object_id)
+                .expect("post-install live object"),
+            Some(live.clone())
+        );
+        assert_eq!(
+            receiver
+                .get_version(&object_id, &live_version)
+                .expect("post-install live version"),
+            Some(live_version_record.clone())
+        );
+
+        assert!(
+            receiver
+                .clear_metadata_shard_membership_handoff_freeze(
+                    &shard_id,
+                    &handoff_id,
+                    desired.epoch,
+                )
+                .expect("activate promoted metadata authority")
+        );
+        assert!(
+            !receiver
+                .metadata_shard_authoritative_writes_frozen(&shard_id)
+                .expect("promoted metadata authority is writable")
+        );
+        receiver
+            .put_intent(&terminal_intent)
+            .expect("exact retry uses promoted compact receipt");
+        assert!(
+            receiver
+                .export_table_snapshot()
+                .tables
+                .expect("promoted receiver tables")
+                .intents
+                .iter()
+                .all(|intent| intent.object_id != object_id
+                    || intent.intent_id != terminal_intent.intent_id),
+            "an exact retry must not expand the compact terminal body"
+        );
+        assert_eq!(
+            receiver
+                .get_intent_receipt(&object_id, &terminal_intent.intent_id)
+                .expect("promoted terminal receipt"),
+            Some(expected_receipt)
+        );
+        assert_eq!(
+            receiver
+                .get_version(&object_id, &old_version)
+                .expect("promoted old version"),
+            None,
+            "promotion and exact retry must not resurrect pruned history"
+        );
+        assert_eq!(
+            receiver
+                .get_object(&object_id)
+                .expect("promoted live object"),
+            Some(live)
+        );
+        assert_eq!(
+            receiver
+                .get_version(&object_id, &live_version)
+                .expect("promoted live version"),
+            Some(live_version_record)
         );
     }
 }

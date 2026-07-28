@@ -7,3 +7,6 @@ pub const DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT: usize = 4 * 1024 * 1024;
 
 pub(crate) const OBJECT_LOCAL_METADATA_PAGE_SIZE: usize = 4096;
 pub(crate) const SHARD_MIGRATION_PAGE_SIZE: usize = 1024;
+/// Bounds one object's independently named durable checkpoints so a fenced
+/// shard-move finalization fits in one bounded journal mutation.
+pub(crate) const MAX_DURABLE_VERSION_PINS_PER_OBJECT: usize = 255;

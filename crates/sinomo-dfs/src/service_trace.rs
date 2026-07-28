@@ -129,6 +129,10 @@ pub(crate) fn dfs_namespace_operation_trace_label(
             "advisory-lock-migration-prepare"
         }
         DfsNamespaceOperation::AdoptObjectAtPath { .. } => "adopt-object-at-path",
+        DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. } => {
+            "finalize-object-family-adoption"
+        }
+        DfsNamespaceOperation::VerifyObjectFamilyAdoption { .. } => "verify-object-family-adoption",
         DfsNamespaceOperation::AdoptHardlinkAlias { .. } => "adopt-hardlink-alias",
     }
 }

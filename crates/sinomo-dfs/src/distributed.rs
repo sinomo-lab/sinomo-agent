@@ -495,6 +495,10 @@ impl DistributedEventualCoordinator {
         }
     }
 
+    pub(crate) fn observe_restored_intent_counter_floor(&mut self, floor: u64) {
+        self.next_intent_id = self.next_intent_id.max(floor.saturating_add(1));
+    }
+
     pub fn set_committed_version(
         &mut self,
         file_system_id: DfsFileSystemId,

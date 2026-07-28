@@ -169,14 +169,59 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .anti_entropy
             .map(|options| self.run_local_content_anti_entropy(options))
             .transpose()?;
-        let version_gc = options
-            .version_gc
-            .map(|options| self.content.collect_versions(options))
-            .transpose()?;
-        let orphan_gc = options
-            .orphan_gc
-            .map(|options| self.content.collect_garbage(options))
-            .transpose()?;
+        // Metadata is the reachability authority. Journal and materialize its
+        // bounded removals before deleting local manifests or blobs, then
+        // derive content roots from the post-GC table image.
+        let metadata_history_gc =
+            match (options.metadata_history_gc, self.metadata_backend.as_mut()) {
+                (Some(options), Some(backend)) => Some(backend.gc_metadata_history(options)?),
+                (Some(_), None) | (None, _) => None,
+            };
+        let content_gc_requested = options.version_gc.is_some() || options.orphan_gc.is_some();
+        // A content-only service can hold valid manifests and blobs without a
+        // local metadata catalog. Absence of that catalog is not evidence that
+        // the authoritative root set is empty.
+        let content_protection = if content_gc_requested {
+            self.metadata_backend
+                .as_ref()
+                .map(|backend| backend.metadata_content_protection())
+                .transpose()?
+        } else {
+            None
+        };
+        let content_gc_metadata_protection_unavailable =
+            content_gc_requested && content_protection.is_none();
+        let version_gc =
+            match (options.version_gc, content_protection.as_ref()) {
+                (Some(options), Some(content_protection)) => {
+                    let options =
+                        options.with_protected_versions(content_protection.versions.iter().map(
+                            |identity| (identity.object_id.as_str(), identity.version.as_str()),
+                        ));
+                    Some(self.content.collect_versions(options)?)
+                }
+                // Dry runs do not mutate manifests or their storage indexes. Keep
+                // their candidate projection observable, with the report-level
+                // unavailable flag making the missing roots explicit.
+                (Some(options), None) if options.dry_run => {
+                    Some(self.content.collect_versions(options)?)
+                }
+                (Some(_), None) | (None, _) => None,
+            };
+        let orphan_gc = match (options.orphan_gc, content_protection.as_ref()) {
+            (Some(options), Some(content_protection)) => {
+                let options = options.with_protected_content_hashes(
+                    content_protection.content_hashes.iter().map(String::as_str),
+                );
+                Some(self.content.collect_garbage(options)?)
+            }
+            // Orphan-GC dry runs neither persist first-observation markers nor
+            // delete blobs, so an explicitly unprotected projection is safe.
+            (Some(options), None) if options.dry_run => {
+                Some(self.content.collect_garbage(options)?)
+            }
+            (Some(_), None) | (None, _) => None,
+        };
         let tombstone_compaction_requested = options.tombstone_compaction.is_some();
         let metadata_backend_configured = self.metadata_backend.is_some();
         let tombstone_compaction =
@@ -191,6 +236,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             anti_entropy,
             version_gc,
             orphan_gc,
+            metadata_history_gc,
+            content_gc_metadata_protection_unavailable,
             metadata_backend_configured,
             tombstone_compaction_requested,
             tombstone_compaction,
