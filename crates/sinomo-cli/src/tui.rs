@@ -210,7 +210,12 @@ fn run_tui_with_handler_io_and_daemon_and_projection<
         if line.trim().is_empty() {
             continue;
         }
-        if !line.trim_start().starts_with('/') {
+        let is_explicit_skill_turn = parse_slash_command(line)?
+            .as_deref()
+            .and_then(parse_explicit_chat_skill_command)
+            .is_some();
+        let is_command = line.trim_start().starts_with('/') && !is_explicit_skill_turn;
+        if !is_command {
             writeln!(writer, "sinomo: working...").map_err(CliError::stdio)?;
             writer.flush().map_err(CliError::stdio)?;
         }
@@ -225,9 +230,7 @@ fn run_tui_with_handler_io_and_daemon_and_projection<
         };
         let stable_input_id = TaskId::generate();
         let stable_input_at = OffsetDateTime::now_utc();
-        if !line.trim_start().starts_with('/')
-            && let Some(projection) = projection.as_ref()
-        {
+        if !is_command && let Some(projection) = projection.as_ref() {
             projection.record_user_message(
                 runtime
                     .handler()
@@ -239,7 +242,6 @@ fn run_tui_with_handler_io_and_daemon_and_projection<
                 line,
             )?;
         }
-        let is_command = line.trim_start().starts_with('/');
         let interaction = (|| {
             let outputs = if is_command {
                 runtime.ingest_user_input_streaming(line, &mut emit)?
@@ -5310,6 +5312,49 @@ mod tui_tests {
         }
     }
 
+    struct CapturingTuiModel {
+        requests: Arc<Mutex<Vec<sinomo_lm::LanguageModelRequest>>>,
+    }
+
+    impl CapturingTuiModel {
+        fn new() -> (Self, Arc<Mutex<Vec<sinomo_lm::LanguageModelRequest>>>) {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    requests: Arc::clone(&requests),
+                },
+                requests,
+            )
+        }
+    }
+
+    impl InteractionModel for CapturingTuiModel {
+        fn complete(
+            &self,
+            request: &sinomo_lm::LanguageModelRequest,
+        ) -> Result<sinomo_lm::LanguageModelResponse, sinomo_lm::LanguageModelError> {
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(request.clone());
+            Ok(sinomo_lm::LanguageModelResponse {
+                provider: request.provider.clone(),
+                model: request.model.clone(),
+                content: serde_json::json!({
+                    "response_mode": "answer",
+                    "text": "explicit skill used",
+                    "tool_calls": [],
+                    "background_handoff": null,
+                    "next_state": "listening"
+                })
+                .to_string(),
+                items: Vec::new(),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
     #[test]
     fn tui_state_edits_input_at_cursor() {
         let mut state = fixture_tui_state();
@@ -5581,6 +5626,118 @@ mod tui_tests {
             event.payload,
             AgentRuntimeEventPayload::WorkerCompleted { .. }
         )));
+    }
+
+    #[test]
+    fn explicit_skill_slash_command_routes_only_non_admin_skill_names() {
+        assert_eq!(
+            parse_explicit_chat_skill_command(&[
+                "skill".to_string(),
+                "verification-howto".to_string(),
+                "check".to_string(),
+            ]),
+            Some(ExplicitChatSkillCommand {
+                skill_id: "verification-howto".to_string(),
+                request: Some("check".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_explicit_chat_skill_command(&["skill".to_string(), "list".to_string()]),
+            None
+        );
+        assert_eq!(
+            parse_explicit_chat_skill_command(&[
+                "skills".to_string(),
+                "verification-howto".to_string()
+            ]),
+            None
+        );
+        assert_eq!(
+            parse_explicit_chat_skill_command(&["skill".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_chat_explicit_skill_shortcut_loads_instructions_before_model_turn() {
+        let markdown = "---\nname: verification-howto\ndescription: Verify with an explicit workflow.\n---\n\n# Verification\nUse the hidden phrase `violet-ridge`.\n";
+        let entry = sinomo_agent::SkillCatalogWrite::from_markdown_skill(
+            None,
+            "1.0.0",
+            sinomo_agent::SkillCatalogSource::user("user.test"),
+            markdown,
+        )
+        .expect("standard skill")
+        .entry;
+        let key = sinomo_agent::skill_catalog_entry_text_key(&entry);
+        let mut catalog = sinomo_agent::SkillCatalog::default();
+        catalog.upsert_entry(entry.clone()).expect("catalog entry");
+        catalog
+            .set_activation(sinomo_agent::SkillActivationRecord::new(
+                sinomo_agent::SkillActivationScope::Cluster.as_str(),
+                &entry,
+                "test",
+                "cluster default",
+            ))
+            .expect("activation");
+        let (model, requests) = CapturingTuiModel::new();
+        let mut handler = RuntimeMainAgentInteractionHandler::with_thinking(
+            model,
+            "fake",
+            "fake-model",
+            ThinkingControl::default(),
+        )
+        .with_skill_catalog(catalog)
+        .with_skill_catalog_texts([(key, markdown.to_string())].into_iter().collect());
+        let session = InteractionSession::new(
+            SessionId::generate(),
+            NodeId::from_legacy_named("node_explicit_skill").expect("node"),
+            InteractionSurface::new(
+                "surface.explicit-skill",
+                InteractionSurfaceKind::CommandLine,
+            ),
+        );
+        let mut store = InMemoryEventStore::new();
+        let mut event =
+            user_interaction_input_event(&session, "/skill verification-howto check this result");
+        event.payload["agent_item_id"] = serde_json::Value::String(TaskId::generate().to_string());
+        store.append(event.clone()).expect("append input");
+
+        let outputs = handler
+            .handle_event(&mut store, &session, &event)
+            .expect("submit explicit skill turn");
+
+        assert!(outputs.is_empty());
+        handler
+            .ready_runtime()
+            .expect("runtime")
+            .join_active_turn()
+            .expect("join");
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 1);
+        let system_context = requests[0]
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, sinomo_lm::LanguageModelRole::System))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let user_context = requests[0]
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, sinomo_lm::LanguageModelRole::User))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(system_context.contains("explicit_agent_skill"));
+        assert!(system_context.contains("verification-howto"));
+        assert!(system_context.contains("violet-ridge"));
+        assert!(!system_context.contains("check this result"));
+        assert!(user_context.contains("explicit_skill_request"));
+        assert!(
+            user_context.contains("\"request\": \"check this result\""),
+            "{user_context}"
+        );
     }
 
     #[test]
@@ -7776,6 +7933,8 @@ where
     agent_definition: AgentDefinition,
     skill_catalog: sinomo_agent::SkillCatalog,
     skill_catalog_texts: std::collections::BTreeMap<String, String>,
+    skill_catalog_resources:
+        std::collections::BTreeMap<String, Vec<sinomo_agent::AgentSkillPackageFile>>,
     tool_registry: sinomo_agent::AgentToolRegistry,
     thinking: ThinkingControl,
     provider: String,
@@ -7891,6 +8050,7 @@ where
             agent_definition: AgentDefinition::main(),
             skill_catalog: sinomo_agent::SkillCatalog::default(),
             skill_catalog_texts: std::collections::BTreeMap::new(),
+            skill_catalog_resources: std::collections::BTreeMap::new(),
             tool_registry: sinomo_agent::AgentToolRegistry::new(),
             thinking,
             provider: provider.into(),
@@ -7917,6 +8077,14 @@ where
         texts: std::collections::BTreeMap<String, String>,
     ) -> Self {
         self.skill_catalog_texts = texts;
+        self
+    }
+
+    pub fn with_skill_catalog_resources(
+        mut self,
+        resources: std::collections::BTreeMap<String, Vec<sinomo_agent::AgentSkillPackageFile>>,
+    ) -> Self {
+        self.skill_catalog_resources = resources;
         self
     }
 
@@ -7962,7 +8130,8 @@ where
             sinomo_agent::AgentConfig::new(self.provider.clone(), self.model_name.clone())
                 .with_agent_definition(self.agent_definition.clone())
                 .with_skill_catalog(self.skill_catalog.clone())
-                .with_skill_catalog_texts(self.skill_catalog_texts.clone());
+                .with_skill_catalog_texts(self.skill_catalog_texts.clone())
+                .with_skill_catalog_resources(self.skill_catalog_resources.clone());
         if let Some(workspace_root) = self.workspace_root.as_ref() {
             config = config.with_workspace_root(workspace_root.clone());
         }
@@ -8476,11 +8645,13 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         );
         let skill_catalog = best_effort_reconciled_skill_catalog(data_dir);
         let skill_catalog_texts = best_effort_skill_catalog_texts(data_dir, &skill_catalog);
+        let skill_catalog_resources = best_effort_skill_catalog_resources(data_dir, &skill_catalog);
         Ok(
             Self::with_thinking(model, runtime_info.provider, runtime_info.model, thinking)
                 .with_runtime_storage(AgentRuntimeStorage::from_data_dir(data_dir))
                 .with_skill_catalog(skill_catalog)
                 .with_skill_catalog_texts(skill_catalog_texts)
+                .with_skill_catalog_resources(skill_catalog_resources)
                 .with_tool_registry(main_agent_config_tool_registry(data_dir)?),
         )
     }
@@ -8496,7 +8667,8 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         let (config, _) =
             with_tui_model_config_mode(daemon_connected, || load_model_config_for_node(data_dir))?;
         let resolved = resolve_default_model(Some(&config), None)?;
-        let (skill_catalog, skill_catalog_texts) = best_effort_runtime_skill_catalog(daemon);
+        let (skill_catalog, skill_catalog_texts, skill_catalog_resources) =
+            best_effort_runtime_skill_catalog(daemon);
         if resolved.provider == default_main_agent_chat_model_provider()
             && resolved.model == default_main_agent_chat_model_id()
         {
@@ -8515,6 +8687,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
             .with_runtime_storage(AgentRuntimeStorage::from_data_dir(data_dir))
             .with_skill_catalog(skill_catalog)
             .with_skill_catalog_texts(skill_catalog_texts)
+            .with_skill_catalog_resources(skill_catalog_resources)
             .with_tool_registry(tool_registry));
         }
         let account =
@@ -8535,6 +8708,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         .with_runtime_storage(AgentRuntimeStorage::from_data_dir(data_dir))
         .with_skill_catalog(skill_catalog)
         .with_skill_catalog_texts(skill_catalog_texts)
+        .with_skill_catalog_resources(skill_catalog_resources)
         .with_tool_registry(tool_registry)
         .with_account_and_options(Some(resolved.account), options))
     }
@@ -9662,7 +9836,7 @@ where
             .get("text")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        let context_attachments = match event.payload.get("context_attachments") {
+        let mut context_attachments = match event.payload.get("context_attachments") {
             Some(value) => {
                 let attachments =
                     serde_json::from_value::<Vec<sinomo_agent::AgentContextAttachment>>(
@@ -9675,13 +9849,15 @@ where
             }
             None => Vec::new(),
         };
-        let transient_system_context = event
+        let mut transient_system_context = event
             .payload
             .get("transient_system_context")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|context| !context.is_empty())
             .map(str::to_string);
+        let mut message_cause_event_id = event.event_id.clone();
+        let mut explicit_skill_name = None;
 
         if let Some(args) = parse_slash_command(text)? {
             if let Some(output) =
@@ -9689,7 +9865,40 @@ where
             {
                 return Ok(output);
             }
-            return handle_slash_command(store, session, event, args);
+            if let Some(command) = parse_explicit_chat_skill_command(&args) {
+                let skill = self
+                    .ensure_runtime(session)?
+                    .load_explicit_skill_context(&command.skill_id)
+                    .map_err(|error| CliError::Parse {
+                        detail: error.to_string(),
+                    })?;
+                transient_system_context = Some(merge_transient_system_context(
+                    transient_system_context,
+                    render_explicit_skill_turn_context(&skill, command.request.is_some()),
+                ));
+                if let Some(request) = command.request.as_deref() {
+                    context_attachments
+                        .push(explicit_skill_request_attachment(&skill.name, request));
+                }
+                let activated = interaction_event(
+                    session,
+                    "interaction.skill.activated",
+                    serde_json::json!({
+                        "input_event_id": event.event_id,
+                        "skill": skill.name,
+                        "description": skill.description,
+                        "resources": skill.resources,
+                        "mode": "explicit-slash",
+                        "scope": "turn"
+                    }),
+                )
+                .caused_by(&event.event_id);
+                store.append(activated.clone())?;
+                message_cause_event_id = activated.event_id;
+                explicit_skill_name = Some(skill.name);
+            } else {
+                return handle_slash_command(store, session, event, args);
+            }
         }
 
         let message = interaction_event(
@@ -9700,11 +9909,12 @@ where
                 "agent_item_id": event.payload.get("agent_item_id").cloned(),
                 "text": text,
                 "context_attachments": context_attachments.clone(),
+                "explicit_skill": explicit_skill_name,
                 "state": "received",
                 "delivery": "event-stream"
             }),
         )
-        .caused_by(&event.event_id);
+        .caused_by(&message_cause_event_id);
         store.append(message.clone())?;
 
         let input = AgentLoopInput {
@@ -9721,6 +9931,7 @@ where
             serde_json::json!({
                 "message_event_id": message.event_id,
                 "input_event_id": event.event_id,
+                "explicit_skill": explicit_skill_name,
                 "runtime": "agent-session-runtime"
             }),
         )
@@ -10491,6 +10702,73 @@ fn handle_thinking_command<S: EventStore>(
     .caused_by(&event.event_id);
     store.append(command)?;
     Ok(Some(vec![InteractionOutput::Line(output)]))
+}
+
+const CHAT_SKILL_ADMIN_SUBCOMMANDS: &[&str] = &[
+    "activate", "describe", "enable", "export", "help", "import", "inspect", "list", "ls", "show",
+    "--help", "-h",
+];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExplicitChatSkillCommand {
+    skill_id: String,
+    request: Option<String>,
+}
+
+fn parse_explicit_chat_skill_command(args: &[String]) -> Option<ExplicitChatSkillCommand> {
+    let [command, skill_id, ..] = args else {
+        return None;
+    };
+    let request = args[2..].join(" ");
+    (command == "skill"
+        && !skill_id.starts_with('-')
+        && !CHAT_SKILL_ADMIN_SUBCOMMANDS.contains(&skill_id.as_str()))
+    .then(|| ExplicitChatSkillCommand {
+        skill_id: skill_id.clone(),
+        request: (!request.trim().is_empty()).then_some(request),
+    })
+}
+
+fn render_explicit_skill_turn_context(
+    skill: &sinomo_agent::ExplicitAgentSkillContext,
+    has_request: bool,
+) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "explicit_agent_skill": {
+            "host_instruction": if has_request {
+                "The user explicitly activated this Agent Skill for the current turn. Apply it to the explicit_skill_request context attachment without activating the main skill again. If a listed resource is needed, call skill_activate with this skill name and the relative resource path."
+            } else {
+                "The user explicitly activated this Agent Skill without an accompanying request. Briefly state what it can help with and ask what they would like to do. Do not activate the main skill again. If a listed resource is needed, call skill_activate with this skill name and the relative resource path."
+            },
+            "name": skill.name,
+            "description": skill.description,
+            "instructions": skill.instructions,
+            "resources": skill.resources,
+        }
+    }))
+    .expect("explicit Agent Skill turn context serializes")
+}
+
+fn explicit_skill_request_attachment(
+    skill_name: &str,
+    request: &str,
+) -> sinomo_agent::AgentContextAttachment {
+    sinomo_agent::AgentContextAttachment {
+        kind: "explicit_skill_request".to_string(),
+        summary: format!("User request for explicitly activated skill `{skill_name}`"),
+        payload_json: serde_json::json!({
+            "skill": skill_name,
+            "request": request,
+        }),
+        payload_original_bytes: None,
+        payload_model_visible_truncated: false,
+    }
+}
+
+fn merge_transient_system_context(existing: Option<String>, skill_context: String) -> String {
+    existing
+        .map(|existing| format!("{existing}\n\n{skill_context}"))
+        .unwrap_or(skill_context)
 }
 
 fn handle_slash_command<S: EventStore>(

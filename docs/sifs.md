@@ -30,8 +30,9 @@ The baseline SIFS layout is:
 
 `/services` is reserved for service-owned state. For example, a web service can publish and update files under `/services/web/...`.
 Sinomo-managed agent skills live under `/services/sinomo/skills`: skill bodies
-are `SKILL.md` files, while catalog indexes, active pointers, and conflict
-records are stored as SOBJ metadata.
+and bundled Agent Skills resources retain their portable directory layout,
+while catalog indexes, active pointers, and conflict records are stored as SOBJ
+metadata.
 Cluster-wide custom and imported agent definitions live under
 `/services/sinomo/agents` as JSON package artifacts. Nodes consume those
 definitions as execution endpoints rather than owning local agent config files.

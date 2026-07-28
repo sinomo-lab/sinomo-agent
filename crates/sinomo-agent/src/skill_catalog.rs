@@ -18,7 +18,14 @@ pub const SKILL_CATALOG_SIFS_ROOT: &str = "/services/sinomo/skills";
 pub const SKILL_CATALOG_FILE_NAME: &str = "catalog.sobj";
 pub const SKILL_FILE_NAME: &str = "SKILL.md";
 pub const SKILL_MANIFEST_FILE_NAME: &str = "skill.sobj";
+pub const AGENT_SKILLS_SPEC_URL: &str = "https://agentskills.io/specification";
 const SKILL_MARKDOWN_FRONTMATTER_DELIMITER: &str = "---";
+const AGENT_SKILL_NAME_MAX_CHARS: usize = 64;
+const AGENT_SKILL_DESCRIPTION_MAX_CHARS: usize = 1024;
+const AGENT_SKILL_COMPATIBILITY_MAX_CHARS: usize = 500;
+const AGENT_SKILL_PACKAGE_MAX_FILES: usize = 2_000;
+const AGENT_SKILL_PACKAGE_MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
+const AGENT_SKILL_PACKAGE_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SkillCatalog {
@@ -263,71 +270,95 @@ pub enum SkillUpstreamUpdateDecision {
     Conflict { conflict: SkillConflictRecord },
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSkillFrontmatter {
+    pub name: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<String>,
+    #[serde(
+        default,
+        rename = "allowed-tools",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub allowed_tools: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SkillMarkdownDocument {
-    pub has_frontmatter: bool,
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub metadata_short_description: Option<String>,
+    pub frontmatter: AgentSkillFrontmatter,
     pub body: String,
 }
 
 impl SkillMarkdownDocument {
-    pub fn summary_description(&self) -> Option<&str> {
-        self.description
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                self.metadata_short_description
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-            })
+    pub fn name(&self) -> &str {
+        &self.frontmatter.name
+    }
+
+    pub fn description(&self) -> &str {
+        &self.frontmatter.description
     }
 }
 
-pub fn parse_skill_markdown(text: &str) -> SkillMarkdownDocument {
-    let Some((frontmatter, body)) = split_skill_markdown_frontmatter(text) else {
-        return SkillMarkdownDocument {
-            body: text.to_string(),
-            ..SkillMarkdownDocument::default()
-        };
-    };
-    let (name, description, metadata_short_description) =
-        parse_skill_markdown_frontmatter(frontmatter);
-    SkillMarkdownDocument {
-        has_frontmatter: true,
-        name,
-        description,
-        metadata_short_description,
-        body: body.to_string(),
-    }
+pub fn parse_skill_markdown(text: &str) -> Result<SkillMarkdownDocument, SkillCatalogError> {
+    let (frontmatter, body) = split_skill_markdown_frontmatter(text).ok_or_else(|| {
+        SkillCatalogError::InvalidAgentSkill {
+            detail: "SKILL.md must start with YAML frontmatter delimited by `---`".to_string(),
+        }
+    })?;
+    let frontmatter =
+        serde_yaml::from_str::<AgentSkillFrontmatter>(frontmatter).map_err(|source| {
+            SkillCatalogError::InvalidAgentSkill {
+                detail: format!("invalid SKILL.md YAML frontmatter: {source}"),
+            }
+        })?;
+    validate_agent_skill_frontmatter(&frontmatter)?;
+    Ok(SkillMarkdownDocument {
+        frontmatter,
+        body: body.trim().to_string(),
+    })
 }
 
-pub fn render_common_skill_markdown(entry: &SkillCatalogEntry, text: &str) -> String {
-    let document = parse_skill_markdown(text);
-    if document.has_frontmatter
-        && document
-            .name
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-        && document.summary_description().is_some()
-    {
-        return text.to_string();
+pub fn render_common_skill_markdown(
+    entry: &SkillCatalogEntry,
+    text: &str,
+) -> Result<String, SkillCatalogError> {
+    let document = parse_skill_markdown(text)?;
+    if document.name() != entry.skill_id {
+        return Err(SkillCatalogError::InvalidAgentSkill {
+            detail: format!(
+                "SKILL.md name `{}` does not match catalog skill id `{}`",
+                document.name(),
+                entry.skill_id
+            ),
+        });
     }
-    let body = if document.has_frontmatter {
-        document.body.as_str()
-    } else {
-        text
-    };
-    let description = document
-        .summary_description()
-        .unwrap_or(entry.description.as_str());
-    format!(
-        "---\nname: {}\ndescription: {}\n---\n\n{}",
-        yaml_string(&entry.skill_id),
-        yaml_string(description),
-        body.trim_start_matches(['\r', '\n'])
-    )
+    Ok(text.to_string())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSkillPackageFile {
+    pub relative_path: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSkillPackage {
+    pub markdown: String,
+    pub files: Vec<AgentSkillPackageFile>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SkillResourceDescriptor {
+    pub relative_path: String,
+    pub sifs_path: String,
+    pub content_hash: String,
+    pub byte_len: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -342,6 +373,16 @@ pub struct SkillCatalogEntry {
     pub base_hash: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<SkillResourceDescriptor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_agents: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -374,6 +415,11 @@ impl SkillCatalogEntry {
             content_hash: skill_content_hash(text.as_ref()),
             base_hash: None,
             description: String::new(),
+            license: None,
+            compatibility: None,
+            allowed_tools: None,
+            metadata: BTreeMap::new(),
+            resources: Vec::new(),
             target_agents: Vec::new(),
             model_families: Vec::new(),
             activation_tags: Vec::new(),
@@ -384,6 +430,15 @@ impl SkillCatalogEntry {
 
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = description.into();
+        self
+    }
+
+    pub fn with_agent_skill_frontmatter(mut self, frontmatter: &AgentSkillFrontmatter) -> Self {
+        self.description = frontmatter.description.clone();
+        self.license = frontmatter.license.clone();
+        self.compatibility = frontmatter.compatibility.clone();
+        self.allowed_tools = frontmatter.allowed_tools.clone();
+        self.metadata = frontmatter.metadata.clone();
         self
     }
 
@@ -423,6 +478,14 @@ impl SkillCatalogEntry {
             validate_content_hash(base_hash)?;
         }
         validate_free_text(&self.description, "skill description")?;
+        validate_optional_free_text(&self.license, "skill license")?;
+        validate_optional_free_text(&self.compatibility, "skill compatibility")?;
+        validate_optional_free_text(&self.allowed_tools, "skill allowed tools")?;
+        for (key, value) in &self.metadata {
+            validate_free_text(key, "skill metadata key")?;
+            validate_free_text(value, "skill metadata value")?;
+        }
+        validate_skill_resources(&self.sifs_path, &self.resources)?;
         validate_token_list(&self.target_agents, "target agent")?;
         validate_token_list(&self.model_families, "model family")?;
         validate_token_list(&self.activation_tags, "activation tag")?;
@@ -434,6 +497,16 @@ impl SkillCatalogEntry {
         AgentSkillDescriptor {
             id: self.skill_id.clone(),
             description: self.description.clone(),
+            license: self.license.clone(),
+            compatibility: self.compatibility.clone(),
+            allowed_tools: self.allowed_tools.clone(),
+            metadata: self.metadata.clone(),
+            resource_paths: self
+                .resources
+                .iter()
+                .map(|resource| resource.relative_path.clone())
+                .collect(),
+            resource_contents: BTreeMap::new(),
             source: AgentSkillSource::Catalog,
             package_declared: false,
             module_id: match self.source.kind {
@@ -711,6 +784,7 @@ pub enum SkillConflictStatus {
 pub struct SkillCatalogWrite {
     pub entry: SkillCatalogEntry,
     pub text: String,
+    pub resources: Vec<AgentSkillPackageFile>,
     pub activate_scope: Option<String>,
     pub activated_by: String,
     pub reason: String,
@@ -721,6 +795,7 @@ impl SkillCatalogWrite {
         Self {
             entry,
             text: text.into(),
+            resources: Vec::new(),
             activate_scope: None,
             activated_by: String::new(),
             reason: String::new(),
@@ -734,18 +809,52 @@ impl SkillCatalogWrite {
         text: impl Into<String>,
     ) -> Result<Self, SkillCatalogError> {
         let text = text.into();
-        let document = parse_skill_markdown(&text);
-        let skill_id = skill_id.or_else(|| document.name.clone()).ok_or_else(|| {
+        let document = parse_skill_markdown(&text)?;
+        if let Some(requested_id) = skill_id.as_deref()
+            && requested_id != document.name()
+        {
+            return Err(SkillCatalogError::InvalidAgentSkill {
+                detail: format!(
+                    "requested skill id `{requested_id}` does not match SKILL.md name `{}`",
+                    document.name()
+                ),
+            });
+        }
+        let entry = SkillCatalogEntry::new(document.name(), version, source, &text)
+            .with_agent_skill_frontmatter(&document.frontmatter);
+        Ok(Self::new(entry, text))
+    }
+
+    pub fn from_agent_skill_package(
+        skill_id: Option<String>,
+        version: impl Into<String>,
+        source: SkillCatalogSource,
+        package: AgentSkillPackage,
+    ) -> Result<Self, SkillCatalogError> {
+        let mut write = Self::from_markdown_skill(skill_id, version, source, package.markdown)?;
+        let package_root = parent_sifs_path(&write.entry.sifs_path).ok_or_else(|| {
             SkillCatalogError::InvalidCatalog {
-                detail: "markdown skill import requires --id or SKILL.md frontmatter name"
-                    .to_string(),
+                detail: format!(
+                    "skill path `{}` does not have a package directory",
+                    write.entry.sifs_path
+                ),
             }
         })?;
-        let mut entry = SkillCatalogEntry::new(skill_id, version, source, &text);
-        if let Some(description) = document.summary_description() {
-            entry = entry.with_description(description.to_string());
-        }
-        Ok(Self::new(entry, text))
+        validate_package_files(&package.files)?;
+        write.entry.resources = package
+            .files
+            .iter()
+            .map(|file| SkillResourceDescriptor {
+                relative_path: file.relative_path.clone(),
+                sifs_path: format!("{package_root}/{}", file.relative_path),
+                content_hash: skill_resource_content_hash(&file.bytes),
+                byte_len: u64::try_from(file.bytes.len()).unwrap_or(u64::MAX),
+            })
+            .collect();
+        write.entry.content_hash = skill_package_content_hash(&write.text, &package.files);
+        write.resources = package.files;
+        write.entry.validate()?;
+        Ok(write)
     }
 
     pub fn from_module_resource(
@@ -759,6 +868,40 @@ impl SkillCatalogWrite {
             });
         }
         let text = text.into();
+        let document = parse_skill_markdown(&text)?;
+        if document.name() != resource.id {
+            return Err(SkillCatalogError::InvalidAgentSkill {
+                detail: format!(
+                    "module skill resource id `{}` does not match SKILL.md name `{}`",
+                    resource.id,
+                    document.name()
+                ),
+            });
+        }
+        let resource_path = Path::new(&resource.path);
+        if resource_path.file_name().and_then(|name| name.to_str()) != Some(SKILL_FILE_NAME)
+            || resource_path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                != Some(document.name())
+        {
+            return Err(SkillCatalogError::InvalidAgentSkill {
+                detail: format!(
+                    "module Agent Skills resource `{}` must end in `{}/SKILL.md`",
+                    resource.path,
+                    document.name()
+                ),
+            });
+        }
+        if !resource.description.is_empty() && resource.description != document.description() {
+            return Err(SkillCatalogError::InvalidAgentSkill {
+                detail: format!(
+                    "module skill resource `{}` description must match SKILL.md frontmatter",
+                    resource.id
+                ),
+            });
+        }
         let entry = SkillCatalogEntry::new(
             resource.id.clone(),
             registration.manifest.version.clone(),
@@ -768,17 +911,8 @@ impl SkillCatalogWrite {
             ),
             &text,
         )
-        .with_description(resource.description.clone())
-        .with_target_agents(resource.target_agents.clone())
-        .with_model_families(resource.model_families.clone())
-        .with_activation_tags(resource.activation_tags.clone())
-        .with_required_capabilities(
-            resource
-                .required_capabilities
-                .iter()
-                .map(|capability| capability.as_str().to_string())
-                .collect(),
-        );
+        .with_agent_skill_frontmatter(&document.frontmatter);
+        let entry = apply_module_resource_metadata(entry, resource);
         Ok(Self::new(entry, text))
     }
 
@@ -807,6 +941,23 @@ impl SkillCatalogWrite {
         self.reason = reason.into();
         self
     }
+}
+
+fn apply_module_resource_metadata(
+    entry: SkillCatalogEntry,
+    resource: &ModuleDeclarativeResourceExport,
+) -> SkillCatalogEntry {
+    entry
+        .with_target_agents(resource.target_agents.clone())
+        .with_model_families(resource.model_families.clone())
+        .with_activation_tags(resource.activation_tags.clone())
+        .with_required_capabilities(
+            resource
+                .required_capabilities
+                .iter()
+                .map(|capability| capability.as_str().to_string())
+                .collect(),
+        )
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -900,19 +1051,28 @@ impl BuiltInSkillDefinition {
         self
     }
 
-    pub fn to_catalog_write(&self) -> SkillCatalogWrite {
-        let entry = SkillCatalogEntry::new(
-            self.skill_id.clone(),
+    pub fn to_catalog_write(&self) -> Result<SkillCatalogWrite, SkillCatalogError> {
+        let mut write = SkillCatalogWrite::from_markdown_skill(
+            Some(self.skill_id.clone()),
             self.version.clone(),
             SkillCatalogSource::sinomo(self.version.clone()),
-            &self.text,
-        )
-        .with_description(self.description.clone())
-        .with_target_agents(self.target_agents.clone())
-        .with_model_families(self.model_families.clone())
-        .with_activation_tags(self.activation_tags.clone())
-        .with_required_capabilities(self.required_capabilities.clone());
-        SkillCatalogWrite::new(entry, self.text.clone())
+            self.text.clone(),
+        )?;
+        if !self.description.is_empty() && self.description != write.entry.description {
+            return Err(SkillCatalogError::InvalidAgentSkill {
+                detail: format!(
+                    "built-in skill `{}` description must match SKILL.md frontmatter",
+                    self.skill_id
+                ),
+            });
+        }
+        write.entry = write
+            .entry
+            .with_target_agents(self.target_agents.clone())
+            .with_model_families(self.model_families.clone())
+            .with_activation_tags(self.activation_tags.clone())
+            .with_required_capabilities(self.required_capabilities.clone());
+        Ok(write)
     }
 }
 
@@ -928,7 +1088,7 @@ pub fn reconcile_builtin_skills_to_catalog<S: SkillCatalogStore>(
         report.scanned = report.scanned.saturating_add(1);
         let outcome = reconcile_skill_catalog_write(
             store,
-            definition.to_catalog_write(),
+            definition.to_catalog_write()?,
             activate_scope,
             activated_by,
             reason,
@@ -1099,6 +1259,23 @@ pub fn load_skill_catalog_texts_from_sifs(
     Ok(texts)
 }
 
+pub fn load_skill_catalog_resources_from_sifs(
+    data_dir: &sinomo_runtime::local::SinomoDataDir,
+    catalog: &SkillCatalog,
+) -> Result<BTreeMap<String, Vec<AgentSkillPackageFile>>, SkillCatalogError> {
+    let store = SkillCatalogSifsStore::open(Some(data_dir.root()))?;
+    let mut resources = BTreeMap::new();
+    for entry in &catalog.entries {
+        let Some(package) = store.read_skill_package(entry)? else {
+            continue;
+        };
+        if !package.files.is_empty() {
+            resources.insert(skill_catalog_entry_text_key(entry), package.files);
+        }
+    }
+    Ok(resources)
+}
+
 pub fn skill_catalog_entry_text_key(entry: &SkillCatalogEntry) -> String {
     skill_catalog_text_key(&entry.skill_id, &entry.version, &entry.content_hash)
 }
@@ -1186,15 +1363,27 @@ fn module_resource_catalog_write(
         return Ok(None);
     };
     let path = module_payload_resource_path(payload_root, &resource.path)?;
-    let bytes = std::fs::read(&path).map_err(|source| SkillCatalogError::Store {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let text = String::from_utf8(bytes).map_err(|source| SkillCatalogError::InvalidSkillText {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    SkillCatalogWrite::from_module_resource(registration, resource, text).map(Some)
+    let package = read_agent_skill_package(&path)?;
+    let source = SkillCatalogSource::module(
+        registration.module_id().as_str().to_string(),
+        registration.manifest.version.clone(),
+    );
+    let mut write = SkillCatalogWrite::from_agent_skill_package(
+        Some(resource.id.clone()),
+        registration.manifest.version.clone(),
+        source,
+        package,
+    )?;
+    if !resource.description.is_empty() && resource.description != write.entry.description {
+        return Err(SkillCatalogError::InvalidAgentSkill {
+            detail: format!(
+                "module skill resource `{}` description must match SKILL.md frontmatter",
+                resource.id
+            ),
+        });
+    }
+    write.entry = apply_module_resource_metadata(write.entry, resource);
+    Ok(Some(write))
 }
 
 fn module_payload_resource_path(
@@ -1235,6 +1424,228 @@ fn declarative_registration_matches_loader_state(
         ModuleBackendRegistration::Declarative { payload_ref } => payload_ref == &state.payload_ref,
         _ => false,
     }
+}
+
+pub fn read_agent_skill_package(path: &Path) -> Result<AgentSkillPackage, SkillCatalogError> {
+    let import_metadata =
+        std::fs::symlink_metadata(path).map_err(|source| SkillCatalogError::Store {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    if import_metadata.file_type().is_symlink() {
+        return Err(SkillCatalogError::InvalidAgentSkill {
+            detail: format!(
+                "skill package import path `{}` must not be a symbolic link",
+                path.display()
+            ),
+        });
+    }
+    let (skill_dir, skill_file) = if path.is_dir() {
+        (path, path.join(SKILL_FILE_NAME))
+    } else {
+        let file_name = path.file_name().and_then(|name| name.to_str());
+        if file_name != Some(SKILL_FILE_NAME) {
+            return Err(SkillCatalogError::InvalidAgentSkill {
+                detail: format!(
+                    "Agent Skills packages must be directories containing exactly `{SKILL_FILE_NAME}`"
+                ),
+            });
+        }
+        let skill_dir = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| SkillCatalogError::InvalidAgentSkill {
+                detail: format!("`{}` has no skill package directory", path.display()),
+            })?;
+        (skill_dir, path.to_path_buf())
+    };
+    let skill_metadata =
+        std::fs::symlink_metadata(&skill_file).map_err(|source| SkillCatalogError::Store {
+            path: skill_file.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    if !skill_metadata.file_type().is_file() || skill_metadata.file_type().is_symlink() {
+        return Err(SkillCatalogError::InvalidAgentSkill {
+            detail: format!("`{}` must be a regular file", skill_file.display()),
+        });
+    }
+    let markdown =
+        std::fs::read_to_string(&skill_file).map_err(|source| SkillCatalogError::Store {
+            path: skill_file.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let document = parse_skill_markdown(&markdown)?;
+    let directory_name = skill_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| SkillCatalogError::InvalidAgentSkill {
+            detail: format!(
+                "skill package directory `{}` is not valid UTF-8",
+                skill_dir.display()
+            ),
+        })?;
+    if directory_name != document.name() {
+        return Err(SkillCatalogError::InvalidAgentSkill {
+            detail: format!(
+                "skill directory name `{directory_name}` must match SKILL.md name `{}`",
+                document.name()
+            ),
+        });
+    }
+
+    let mut files = Vec::new();
+    let mut total_bytes = markdown.len();
+    collect_agent_skill_package_files(skill_dir, skill_dir, &mut files, &mut total_bytes)?;
+    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    validate_package_files(&files)?;
+    Ok(AgentSkillPackage { markdown, files })
+}
+
+pub fn write_agent_skill_package(
+    package_dir: &Path,
+    package: &AgentSkillPackage,
+) -> Result<(), SkillCatalogError> {
+    let document = parse_skill_markdown(&package.markdown)?;
+    let directory_name = package_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| SkillCatalogError::InvalidAgentSkill {
+            detail: format!(
+                "skill package directory `{}` is not valid UTF-8",
+                package_dir.display()
+            ),
+        })?;
+    if directory_name != document.name() {
+        return Err(SkillCatalogError::InvalidAgentSkill {
+            detail: format!(
+                "export directory name `{directory_name}` must match SKILL.md name `{}`",
+                document.name()
+            ),
+        });
+    }
+    validate_package_files(&package.files)?;
+    std::fs::create_dir_all(package_dir).map_err(|source| SkillCatalogError::Store {
+        path: package_dir.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let skill_file = package_dir.join(SKILL_FILE_NAME);
+    std::fs::write(&skill_file, package.markdown.as_bytes()).map_err(|source| {
+        SkillCatalogError::Store {
+            path: skill_file.display().to_string(),
+            detail: source.to_string(),
+        }
+    })?;
+    for file in &package.files {
+        let path = package_dir.join(&file.relative_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| SkillCatalogError::Store {
+                path: parent.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        }
+        std::fs::write(&path, &file.bytes).map_err(|source| SkillCatalogError::Store {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
+fn collect_agent_skill_package_files(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<AgentSkillPackageFile>,
+    total_bytes: &mut usize,
+) -> Result<(), SkillCatalogError> {
+    let entries = std::fs::read_dir(current).map_err(|source| SkillCatalogError::Store {
+        path: current.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| SkillCatalogError::Store {
+            path: current.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|source| SkillCatalogError::Store {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        if file_type.is_symlink() {
+            return Err(SkillCatalogError::InvalidAgentSkill {
+                detail: format!(
+                    "skill package resource `{}` must not be a symbolic link",
+                    path.display()
+                ),
+            });
+        }
+        if file_type.is_dir() {
+            collect_agent_skill_package_files(root, &path, files, total_bytes)?;
+            continue;
+        }
+        if !file_type.is_file() || path == root.join(SKILL_FILE_NAME) {
+            continue;
+        }
+        if files.len() >= AGENT_SKILL_PACKAGE_MAX_FILES {
+            return Err(SkillCatalogError::InvalidAgentSkill {
+                detail: format!(
+                    "skill package exceeds the {AGENT_SKILL_PACKAGE_MAX_FILES} resource file limit"
+                ),
+            });
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|source| SkillCatalogError::Store {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        let byte_len =
+            usize::try_from(metadata.len()).map_err(|_| SkillCatalogError::InvalidAgentSkill {
+                detail: format!("skill package resource `{}` is too large", path.display()),
+            })?;
+        if byte_len > AGENT_SKILL_PACKAGE_MAX_FILE_BYTES {
+            return Err(SkillCatalogError::InvalidAgentSkill {
+                detail: format!(
+                    "skill package resource `{}` exceeds the {} byte file limit",
+                    path.display(),
+                    AGENT_SKILL_PACKAGE_MAX_FILE_BYTES
+                ),
+            });
+        }
+        *total_bytes = total_bytes.checked_add(byte_len).ok_or_else(|| {
+            SkillCatalogError::InvalidAgentSkill {
+                detail: "skill package size overflow".to_string(),
+            }
+        })?;
+        if *total_bytes > AGENT_SKILL_PACKAGE_MAX_TOTAL_BYTES {
+            return Err(SkillCatalogError::InvalidAgentSkill {
+                detail: format!(
+                    "skill package exceeds the {} byte total limit",
+                    AGENT_SKILL_PACKAGE_MAX_TOTAL_BYTES
+                ),
+            });
+        }
+        let relative_path =
+            path.strip_prefix(root)
+                .map_err(|source| SkillCatalogError::InvalidAgentSkill {
+                    detail: format!(
+                        "skill resource `{}` escaped package root: {source}",
+                        path.display()
+                    ),
+                })?;
+        let relative_path = portable_skill_relative_path(relative_path)?;
+        let bytes = std::fs::read(&path).map_err(|source| SkillCatalogError::Store {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        files.push(AgentSkillPackageFile {
+            relative_path,
+            bytes,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1345,20 +1756,94 @@ pub trait SkillCatalogStore {
         Ok(Some(text))
     }
 
+    fn read_skill_package(
+        &self,
+        entry: &SkillCatalogEntry,
+    ) -> Result<Option<AgentSkillPackage>, SkillCatalogError> {
+        let Some(markdown) = self.read_skill_text(entry)? else {
+            return Ok(None);
+        };
+        let mut files = Vec::with_capacity(entry.resources.len());
+        for resource in &entry.resources {
+            let bytes =
+                self.read_file(&resource.sifs_path)?
+                    .ok_or_else(|| SkillCatalogError::Store {
+                        path: resource.sifs_path.clone(),
+                        detail: "catalog resource is missing".to_string(),
+                    })?;
+            let actual_hash = skill_resource_content_hash(&bytes);
+            if actual_hash != resource.content_hash || bytes.len() as u64 != resource.byte_len {
+                return Err(SkillCatalogError::ResourceHashMismatch {
+                    path: resource.sifs_path.clone(),
+                    expected: resource.content_hash.clone(),
+                    actual: actual_hash,
+                });
+            }
+            files.push(AgentSkillPackageFile {
+                relative_path: resource.relative_path.clone(),
+                bytes,
+            });
+        }
+        let actual_hash = skill_package_content_hash(&markdown, &files);
+        if actual_hash != entry.content_hash {
+            return Err(SkillCatalogError::ContentHashMismatch {
+                skill_id: entry.skill_id.clone(),
+                expected: entry.content_hash.clone(),
+                actual: actual_hash,
+            });
+        }
+        Ok(Some(AgentSkillPackage { markdown, files }))
+    }
+
     fn write_skill_version(
         &self,
         write: SkillCatalogWrite,
     ) -> Result<SkillCatalog, SkillCatalogError> {
         write.entry.validate()?;
-        if write.entry.content_hash != skill_content_hash(&write.text) {
+        validate_package_files(&write.resources)?;
+        let actual_hash = skill_package_content_hash(&write.text, &write.resources);
+        if write.entry.content_hash != actual_hash {
             return Err(SkillCatalogError::ContentHashMismatch {
                 skill_id: write.entry.skill_id,
                 expected: write.entry.content_hash,
-                actual: skill_content_hash(&write.text),
+                actual: actual_hash,
             });
+        }
+        if write.resources.len() != write.entry.resources.len() {
+            return Err(SkillCatalogError::InvalidCatalog {
+                detail: format!(
+                    "skill {} has {} resource descriptors for {} resource files",
+                    write.entry.skill_id,
+                    write.entry.resources.len(),
+                    write.resources.len()
+                ),
+            });
+        }
+        for (resource, descriptor) in write.resources.iter().zip(&write.entry.resources) {
+            if resource.relative_path != descriptor.relative_path {
+                return Err(SkillCatalogError::InvalidCatalog {
+                    detail: format!(
+                        "skill resource order mismatch for `{}`",
+                        resource.relative_path
+                    ),
+                });
+            }
+            let actual_resource_hash = skill_resource_content_hash(&resource.bytes);
+            if descriptor.content_hash != actual_resource_hash
+                || descriptor.byte_len != resource.bytes.len() as u64
+            {
+                return Err(SkillCatalogError::ResourceHashMismatch {
+                    path: descriptor.sifs_path.clone(),
+                    expected: descriptor.content_hash.clone(),
+                    actual: actual_resource_hash,
+                });
+            }
         }
         let mut catalog = self.load_catalog()?;
         self.write_file(&write.entry.sifs_path, write.text.as_bytes())?;
+        for (resource, descriptor) in write.resources.iter().zip(&write.entry.resources) {
+            self.write_file(&descriptor.sifs_path, &resource.bytes)?;
+        }
         self.write_file(
             &write.entry.manifest_path,
             &encode_catalog_sobj(&write.entry.manifest_path, &write.entry)?,
@@ -1460,6 +1945,31 @@ pub fn skill_content_hash(text: &str) -> String {
     format!("blake3:{}", blake3::hash(text.as_bytes()).to_hex())
 }
 
+pub fn skill_resource_content_hash(bytes: &[u8]) -> String {
+    format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+
+pub fn skill_package_content_hash(text: &str, files: &[AgentSkillPackageFile]) -> String {
+    if files.is_empty() {
+        return skill_content_hash(text);
+    }
+    let mut files = files.iter().collect::<Vec<_>>();
+    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo.agent-skill-package.v1\0");
+    hasher.update(SKILL_FILE_NAME.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(&(text.len() as u64).to_le_bytes());
+    hasher.update(text.as_bytes());
+    for file in files {
+        hasher.update(file.relative_path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(&(file.bytes.len() as u64).to_le_bytes());
+        hasher.update(&file.bytes);
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
 pub fn skill_sifs_path(source: &SkillCatalogSource, skill_id: &str, version: &str) -> String {
     let source_id = source.source_id.as_deref().unwrap_or("unknown");
     let source_version = source.source_version.as_deref().unwrap_or(version);
@@ -1548,89 +2058,228 @@ fn split_skill_markdown_frontmatter(text: &str) -> Option<(&str, &str)> {
     None
 }
 
-fn parse_skill_markdown_frontmatter(
-    frontmatter: &str,
-) -> (Option<String>, Option<String>, Option<String>) {
-    let mut name = None;
-    let mut description = None;
-    let mut metadata_short_description = None;
-    let mut in_metadata = false;
-    for raw_line in frontmatter.lines() {
-        let line = raw_line.trim_end();
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let indented = raw_line.starts_with(' ') || raw_line.starts_with('\t');
-        if !indented {
-            in_metadata = false;
-            let Some((key, value)) = yaml_key_value(trimmed) else {
-                continue;
-            };
-            match key {
-                "name" => name = non_empty_yaml_value(value),
-                "description" => description = non_empty_yaml_value(value),
-                "metadata" if value.trim().is_empty() => in_metadata = true,
-                _ => {}
-            }
-            continue;
-        }
-        if in_metadata {
-            let Some((key, value)) = yaml_key_value(trimmed) else {
-                continue;
-            };
-            if key == "short-description" {
-                metadata_short_description = non_empty_yaml_value(value);
-            }
+fn validate_agent_skill_frontmatter(
+    frontmatter: &AgentSkillFrontmatter,
+) -> Result<(), SkillCatalogError> {
+    validate_agent_skill_name(&frontmatter.name)?;
+    let description_chars = frontmatter.description.chars().count();
+    if frontmatter.description.trim().is_empty() {
+        return Err(SkillCatalogError::InvalidAgentSkill {
+            detail: "frontmatter `description` must be a non-empty string".to_string(),
+        });
+    }
+    if description_chars > AGENT_SKILL_DESCRIPTION_MAX_CHARS {
+        return Err(SkillCatalogError::InvalidAgentSkill {
+            detail: format!(
+                "frontmatter `description` exceeds the {AGENT_SKILL_DESCRIPTION_MAX_CHARS} character limit"
+            ),
+        });
+    }
+    if let Some(compatibility) = &frontmatter.compatibility {
+        let compatibility_chars = compatibility.chars().count();
+        if compatibility.trim().is_empty()
+            || compatibility_chars > AGENT_SKILL_COMPATIBILITY_MAX_CHARS
+        {
+            return Err(SkillCatalogError::InvalidAgentSkill {
+                detail: format!(
+                    "frontmatter `compatibility` must contain 1-{AGENT_SKILL_COMPATIBILITY_MAX_CHARS} characters"
+                ),
+            });
         }
     }
-    (name, description, metadata_short_description)
+    if let Some(license) = &frontmatter.license
+        && license.trim().is_empty()
+    {
+        return Err(SkillCatalogError::InvalidAgentSkill {
+            detail: "frontmatter `license` must be non-empty when provided".to_string(),
+        });
+    }
+    for (key, value) in &frontmatter.metadata {
+        if key.trim().is_empty() {
+            return Err(SkillCatalogError::InvalidAgentSkill {
+                detail: "frontmatter `metadata` keys must be non-empty strings".to_string(),
+            });
+        }
+        validate_free_text(value, "Agent Skills metadata value")?;
+    }
+    Ok(())
 }
 
-fn yaml_key_value(line: &str) -> Option<(&str, &str)> {
-    let (key, value) = line.split_once(':')?;
-    Some((key.trim(), value.trim()))
+fn validate_agent_skill_name(name: &str) -> Result<(), SkillCatalogError> {
+    let char_count = name.chars().count();
+    if !(1..=AGENT_SKILL_NAME_MAX_CHARS).contains(&char_count) {
+        return Err(SkillCatalogError::InvalidAgentSkill {
+            detail: format!(
+                "frontmatter `name` must contain 1-{AGENT_SKILL_NAME_MAX_CHARS} characters"
+            ),
+        });
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        return Err(SkillCatalogError::InvalidAgentSkill {
+            detail: "frontmatter `name` must not start or end with a hyphen".to_string(),
+        });
+    }
+    if name.contains("--") {
+        return Err(SkillCatalogError::InvalidAgentSkill {
+            detail: "frontmatter `name` must not contain consecutive hyphens".to_string(),
+        });
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(SkillCatalogError::InvalidAgentSkill {
+            detail:
+                "frontmatter `name` may contain only lowercase ASCII letters, numbers, and hyphens"
+                    .to_string(),
+        });
+    }
+    Ok(())
 }
 
-fn non_empty_yaml_value(value: &str) -> Option<String> {
-    let value = unquote_yaml_scalar(value).trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
-}
-
-fn unquote_yaml_scalar(value: &str) -> String {
-    let value = value.trim();
-    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
-        let inner = &value[1..value.len() - 1];
-        let mut output = String::new();
-        let mut chars = inner.chars();
-        while let Some(ch) = chars.next() {
-            if ch == '\\' {
-                match chars.next() {
-                    Some('"') => output.push('"'),
-                    Some('\\') => output.push('\\'),
-                    Some('n') => output.push('\n'),
-                    Some('r') => output.push('\r'),
-                    Some('t') => output.push('\t'),
-                    Some(other) => {
-                        output.push('\\');
-                        output.push(other);
-                    }
-                    None => output.push('\\'),
+fn portable_skill_relative_path(path: &Path) -> Result<String, SkillCatalogError> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => {
+                let part = part
+                    .to_str()
+                    .ok_or_else(|| SkillCatalogError::InvalidAgentSkill {
+                        detail: format!(
+                            "skill resource path `{}` is not valid UTF-8",
+                            path.display()
+                        ),
+                    })?;
+                if part.is_empty() || part.contains(['/', '\\', '\0']) {
+                    return Err(SkillCatalogError::InvalidAgentSkill {
+                        detail: format!(
+                            "skill resource path `{}` has an invalid component",
+                            path.display()
+                        ),
+                    });
                 }
-            } else {
-                output.push(ch);
+                parts.push(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(SkillCatalogError::InvalidAgentSkill {
+                    detail: format!(
+                        "skill resource path `{}` must stay inside the skill directory",
+                        path.display()
+                    ),
+                });
             }
         }
-        return output;
     }
-    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
-        return value[1..value.len() - 1].replace("''", "'");
+    if parts.is_empty() {
+        return Err(SkillCatalogError::InvalidAgentSkill {
+            detail: "skill resource path must be non-empty".to_string(),
+        });
     }
-    value.to_string()
+    let relative_path = parts.join("/");
+    if relative_path == SKILL_FILE_NAME {
+        return Err(SkillCatalogError::InvalidAgentSkill {
+            detail: format!("`{SKILL_FILE_NAME}` cannot also be a package resource"),
+        });
+    }
+    Ok(relative_path)
 }
 
-fn yaml_string(value: &str) -> String {
-    serde_json::to_string(value).expect("string scalar serializes")
+fn validate_package_files(files: &[AgentSkillPackageFile]) -> Result<(), SkillCatalogError> {
+    if files.len() > AGENT_SKILL_PACKAGE_MAX_FILES {
+        return Err(SkillCatalogError::InvalidAgentSkill {
+            detail: format!(
+                "skill package exceeds the {AGENT_SKILL_PACKAGE_MAX_FILES} resource file limit"
+            ),
+        });
+    }
+    let mut seen = BTreeSet::new();
+    let mut total_bytes = 0usize;
+    for file in files {
+        let normalized = portable_skill_relative_path(Path::new(&file.relative_path))?;
+        if normalized != file.relative_path {
+            return Err(SkillCatalogError::InvalidAgentSkill {
+                detail: format!(
+                    "skill resource path `{}` is not portable",
+                    file.relative_path
+                ),
+            });
+        }
+        if !seen.insert(&file.relative_path) {
+            return Err(SkillCatalogError::InvalidAgentSkill {
+                detail: format!("duplicate skill resource `{}`", file.relative_path),
+            });
+        }
+        if file.bytes.len() > AGENT_SKILL_PACKAGE_MAX_FILE_BYTES {
+            return Err(SkillCatalogError::InvalidAgentSkill {
+                detail: format!(
+                    "skill resource `{}` exceeds the {} byte file limit",
+                    file.relative_path, AGENT_SKILL_PACKAGE_MAX_FILE_BYTES
+                ),
+            });
+        }
+        total_bytes = total_bytes.checked_add(file.bytes.len()).ok_or_else(|| {
+            SkillCatalogError::InvalidAgentSkill {
+                detail: "skill package size overflow".to_string(),
+            }
+        })?;
+        if total_bytes > AGENT_SKILL_PACKAGE_MAX_TOTAL_BYTES {
+            return Err(SkillCatalogError::InvalidAgentSkill {
+                detail: format!(
+                    "skill package exceeds the {} byte total limit",
+                    AGENT_SKILL_PACKAGE_MAX_TOTAL_BYTES
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_skill_resources(
+    skill_path: &str,
+    resources: &[SkillResourceDescriptor],
+) -> Result<(), SkillCatalogError> {
+    let package_root =
+        parent_sifs_path(skill_path).ok_or_else(|| SkillCatalogError::InvalidCatalog {
+            detail: format!("skill path `{skill_path}` has no package directory"),
+        })?;
+    let mut seen = BTreeSet::new();
+    for resource in resources {
+        let normalized = portable_skill_relative_path(Path::new(&resource.relative_path))?;
+        if normalized != resource.relative_path {
+            return Err(SkillCatalogError::InvalidCatalog {
+                detail: format!(
+                    "skill resource path `{}` is not portable",
+                    resource.relative_path
+                ),
+            });
+        }
+        if !seen.insert(&resource.relative_path) {
+            return Err(SkillCatalogError::InvalidCatalog {
+                detail: format!("duplicate skill resource `{}`", resource.relative_path),
+            });
+        }
+        let expected_path = format!("{package_root}/{}", resource.relative_path);
+        if resource.sifs_path != expected_path {
+            return Err(SkillCatalogError::InvalidCatalog {
+                detail: format!(
+                    "skill resource `{}` must be stored at `{expected_path}`",
+                    resource.relative_path
+                ),
+            });
+        }
+        validate_sifs_path(&resource.sifs_path, "skill resource SIFS path")?;
+        validate_content_hash(&resource.content_hash)?;
+        if resource.byte_len > AGENT_SKILL_PACKAGE_MAX_FILE_BYTES as u64 {
+            return Err(SkillCatalogError::InvalidCatalog {
+                detail: format!(
+                    "skill resource `{}` exceeds the file size limit",
+                    resource.relative_path
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn default_skill_catalog_schema_version() -> u32 {
@@ -1726,6 +2375,16 @@ fn validate_free_text(value: &str, context: &str) -> Result<(), SkillCatalogErro
     Ok(())
 }
 
+fn validate_optional_free_text(
+    value: &Option<String>,
+    context: &str,
+) -> Result<(), SkillCatalogError> {
+    if let Some(value) = value {
+        validate_free_text(value, context)?;
+    }
+    Ok(())
+}
+
 fn validate_sifs_path(value: &str, context: &str) -> Result<(), SkillCatalogError> {
     if !value.starts_with('/') {
         return Err(SkillCatalogError::InvalidCatalog {
@@ -1758,6 +2417,8 @@ fn validate_content_hash(value: &str) -> Result<(), SkillCatalogError> {
 pub enum SkillCatalogError {
     #[error("invalid skill catalog: {detail}")]
     InvalidCatalog { detail: String },
+    #[error("invalid Agent Skills package: {detail}")]
+    InvalidAgentSkill { detail: String },
     #[error("invalid {context} `{value}`: {detail}")]
     InvalidToken {
         context: String,
@@ -1769,6 +2430,12 @@ pub enum SkillCatalogError {
     #[error("skill {skill_id} content hash mismatch: expected {expected}, got {actual}")]
     ContentHashMismatch {
         skill_id: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("skill resource {path} content hash mismatch: expected {expected}, got {actual}")]
+    ResourceHashMismatch {
+        path: String,
         expected: String,
         actual: String,
     },
@@ -1786,7 +2453,7 @@ mod tests {
 
     #[test]
     fn markdown_skill_frontmatter_drives_import_metadata_without_rewriting_text() {
-        let text = "---\nname: rust-debug\ndescription: \"Debug Rust failures.\"\nmetadata:\n  short-description: Rust debug\n---\n\n# Rust Debug\nRead the assertion first.\n";
+        let text = "---\nname: rust-debug\ndescription: \"Debug Rust failures. Use for failing Rust tests.\"\nlicense: Apache-2.0\ncompatibility: Requires cargo.\nallowed-tools: Bash(cargo:*) Read\nmetadata:\n  example.org/owner: compiler-team\n---\n\n# Rust Debug\nRead the assertion first.\n";
         let write = SkillCatalogWrite::from_markdown_skill(
             None,
             "1.0.0",
@@ -1796,44 +2463,135 @@ mod tests {
         .expect("markdown write");
 
         assert_eq!(write.entry.skill_id, "rust-debug");
-        assert_eq!(write.entry.description, "Debug Rust failures.");
+        assert_eq!(
+            write.entry.description,
+            "Debug Rust failures. Use for failing Rust tests."
+        );
+        assert_eq!(write.entry.license.as_deref(), Some("Apache-2.0"));
+        assert_eq!(
+            write.entry.compatibility.as_deref(),
+            Some("Requires cargo.")
+        );
+        assert_eq!(
+            write.entry.allowed_tools.as_deref(),
+            Some("Bash(cargo:*) Read")
+        );
+        assert_eq!(
+            write
+                .entry
+                .metadata
+                .get("example.org/owner")
+                .map(String::as_str),
+            Some("compiler-team")
+        );
         assert_eq!(write.text, text);
         assert_eq!(write.entry.content_hash, skill_content_hash(text));
-        let document = parse_skill_markdown(text);
-        assert!(document.has_frontmatter);
-        assert_eq!(document.name.as_deref(), Some("rust-debug"));
-        assert_eq!(document.body, "\n# Rust Debug\nRead the assertion first.\n");
+        let document = parse_skill_markdown(text).expect("standard skill");
+        assert_eq!(document.name(), "rust-debug");
+        assert_eq!(document.body, "# Rust Debug\nRead the assertion first.");
     }
 
     #[test]
-    fn markdown_skill_import_accepts_plain_markdown_when_id_is_explicit() {
+    fn markdown_skill_import_rejects_plain_markdown_and_name_mismatches() {
         let text = "# Plain Skill\nFollow plain markdown.";
-        let write = SkillCatalogWrite::from_markdown_skill(
-            Some("skill.plain".to_string()),
+        let error = SkillCatalogWrite::from_markdown_skill(
+            Some("plain-skill".to_string()),
             "1.0.0",
             SkillCatalogSource::agent("agent.test"),
             text,
         )
-        .expect("plain markdown write");
+        .expect_err("plain markdown must fail");
+        assert!(matches!(error, SkillCatalogError::InvalidAgentSkill { .. }));
 
-        assert_eq!(write.entry.skill_id, "skill.plain");
-        assert!(write.entry.description.is_empty());
-        assert_eq!(write.text, text);
+        let error = SkillCatalogWrite::from_markdown_skill(
+            Some("other-skill".to_string()),
+            "1.0.0",
+            SkillCatalogSource::agent("agent.test"),
+            "---\nname: plain-skill\ndescription: Follow plain markdown. Use for plain tasks.\n---\n\n# Plain Skill",
+        )
+        .expect_err("mismatched id must fail");
+        assert!(error.to_string().contains("does not match"));
     }
 
     #[test]
-    fn export_markdown_synthesizes_common_frontmatter_when_missing() {
-        let text = "# Plain Skill\nFollow plain markdown.";
+    fn export_markdown_preserves_valid_agent_skills_document() {
+        let text = "---\nname: plain-skill\ndescription: Follow plain markdown. Use for plain tasks.\n---\n\n# Plain Skill\nFollow plain markdown.";
         let entry = SkillCatalogEntry::new(
-            "skill.plain",
+            "plain-skill",
             "1.0.0",
             SkillCatalogSource::agent("agent.test"),
             text,
         )
         .with_description("Plain portable skill.");
-        let rendered = render_common_skill_markdown(&entry, text);
+        let rendered = render_common_skill_markdown(&entry, text).expect("render");
 
-        assert!(rendered.starts_with("---\nname: \"skill.plain\"\ndescription: \"Plain portable skill.\"\n---\n\n# Plain Skill"));
+        assert_eq!(rendered, text);
+    }
+
+    #[test]
+    fn agent_skill_directory_resources_round_trip_through_catalog_and_export() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-skill-package-round-trip");
+        let source = root.path().join("source").join("pdf-processing");
+        std::fs::create_dir_all(source.join("scripts")).expect("scripts");
+        std::fs::create_dir_all(source.join("references")).expect("references");
+        let markdown = "---\nname: pdf-processing\ndescription: Extract PDF text. Use when handling PDF documents.\nmetadata:\n  example.org/version: \"1.0\"\n---\n\n# PDF Processing\nRun `scripts/extract.py`.\n";
+        std::fs::write(source.join(SKILL_FILE_NAME), markdown).expect("skill");
+        std::fs::write(source.join("scripts").join("extract.py"), b"print('pdf')\n")
+            .expect("script");
+        std::fs::write(
+            source.join("references").join("formats.md"),
+            b"# Formats\nPDF.\n",
+        )
+        .expect("reference");
+
+        let package = read_agent_skill_package(&source).expect("read package");
+        assert_eq!(
+            package
+                .files
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["references/formats.md", "scripts/extract.py"]
+        );
+
+        let store = LocalSkillCatalogStore::new(root.path().join("catalog"));
+        let write = SkillCatalogWrite::from_agent_skill_package(
+            None,
+            "1.0.0",
+            SkillCatalogSource::user("user.test"),
+            package.clone(),
+        )
+        .expect("package write");
+        assert_ne!(write.entry.content_hash, skill_content_hash(markdown));
+        let entry = write.entry.clone();
+        store.write_skill_version(write).expect("store package");
+        let stored = store
+            .read_skill_package(&entry)
+            .expect("read stored package")
+            .expect("stored package");
+        assert_eq!(stored, package);
+
+        let export_dir = root.path().join("export").join("pdf-processing");
+        write_agent_skill_package(&export_dir, &stored).expect("export package");
+        assert_eq!(
+            std::fs::read(export_dir.join("scripts").join("extract.py")).expect("exported script"),
+            b"print('pdf')\n"
+        );
+    }
+
+    #[test]
+    fn agent_skill_directory_name_must_match_frontmatter_name() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-skill-directory-name");
+        let source = root.path().join("wrong-name");
+        std::fs::create_dir_all(&source).expect("source");
+        std::fs::write(
+            source.join(SKILL_FILE_NAME),
+            "---\nname: right-name\ndescription: Check names. Use for name validation.\n---\n",
+        )
+        .expect("skill");
+
+        let error = read_agent_skill_package(&source).expect_err("directory mismatch");
+        assert!(error.to_string().contains("must match"));
     }
 
     #[test]
@@ -1932,6 +2690,7 @@ mod tests {
 
     #[test]
     fn module_embedded_skill_resource_materializes_catalog_write() {
+        let skill_text = "---\nname: module-debug\ndescription: Debug with module guidance.\n---\n\n# Module skill\nUse module-specific steps.";
         let module_id =
             sinomo_runtime::core::Id::from_legacy_named("module.skill.test").expect("module id");
         let registration = ModuleRegistration::native_rust(
@@ -1944,16 +2703,16 @@ mod tests {
             "module.skill.test",
         );
         let resource =
-            ModuleDeclarativeResourceExport::skill("skill.module.debug", "skills/debug.md")
+            ModuleDeclarativeResourceExport::skill("module-debug", "skills/module-debug/SKILL.md")
                 .with_description("Debug with module guidance.")
                 .with_target_agent("coding-agent")
                 .with_activation_tag("debug")
-                .with_embedded_text("# Module skill\nUse module-specific steps.");
+                .with_embedded_text(skill_text);
         let write = SkillCatalogWrite::from_embedded_module_resource(&registration, &resource)
             .expect("embedded resource")
             .expect("catalog write");
 
-        assert_eq!(write.entry.skill_id, "skill.module.debug");
+        assert_eq!(write.entry.skill_id, "module-debug");
         assert_eq!(write.entry.version, "2.0.0");
         assert_eq!(write.entry.source.kind, SkillCatalogSourceKind::Module);
         assert_eq!(
@@ -1971,11 +2730,14 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-skill-catalog-module-reconcile");
         let store = LocalSkillCatalogStore::new(root.path().join("catalog"));
         let payload_root = root.path().join("payload");
-        let skill_path = payload_root.join("skills").join("debug.md");
+        let skill_text = "---\nname: module-debug\ndescription: Debug with module guidance.\n---\n\n# Module skill\nUse module-specific steps.";
+        let skill_path = payload_root
+            .join("skills")
+            .join("module-debug")
+            .join("SKILL.md");
         std::fs::create_dir_all(skill_path.parent().expect("skill parent"))
             .expect("create payload");
-        std::fs::write(&skill_path, "# Module skill\nUse module-specific steps.")
-            .expect("write payload skill");
+        std::fs::write(&skill_path, skill_text).expect("write payload skill");
         let module_id =
             sinomo_runtime::core::Id::from_legacy_named("module.skill.test").expect("module id");
         let registration = ModuleRegistration::native_rust(
@@ -1989,10 +2751,13 @@ mod tests {
         )
         .with_surfaces(
             sinomo_runtime::module::ModuleSurfaces::default().with_declarative_resource(
-                ModuleDeclarativeResourceExport::skill("skill.module.debug", "skills/debug.md")
-                    .with_description("Debug with module guidance.")
-                    .with_target_agent("coding-agent")
-                    .with_activation_tag("debug"),
+                ModuleDeclarativeResourceExport::skill(
+                    "module-debug",
+                    "skills/module-debug/SKILL.md",
+                )
+                .with_description("Debug with module guidance.")
+                .with_target_agent("coding-agent")
+                .with_activation_tag("debug"),
             ),
         );
 
@@ -2012,7 +2777,7 @@ mod tests {
         assert_eq!(report.conflicts, 0);
         let catalog = store.load_catalog().expect("catalog");
         let active = catalog
-            .active_entry_for_scope(SkillActivationScope::Cluster.as_str(), "skill.module.debug")
+            .active_entry_for_scope(SkillActivationScope::Cluster.as_str(), "module-debug")
             .expect("active module skill");
         assert_eq!(active.version, "2.0.0");
         assert_eq!(active.source.source_id.as_deref(), Some(module_id.as_str()));
@@ -2021,7 +2786,7 @@ mod tests {
             .read_skill_text(active)
             .expect("read skill")
             .expect("skill text");
-        assert_eq!(text, "# Module skill\nUse module-specific steps.");
+        assert_eq!(text, skill_text);
     }
 
     #[test]
@@ -2048,7 +2813,10 @@ mod tests {
             target_ring: sinomo_runtime::core::TrustRing::R3SandboxedModule,
             capabilities: sinomo_runtime::core::ModuleCapabilities::default(),
             surfaces: sinomo_runtime::module::ModuleSurfaces::default().with_declarative_resource(
-                ModuleDeclarativeResourceExport::skill("skill.module.scan", "skills/scan.md"),
+                ModuleDeclarativeResourceExport::skill(
+                    "module-scan",
+                    "skills/module-scan/SKILL.md",
+                ),
             ),
             resources: Vec::new(),
         }
@@ -2060,12 +2828,15 @@ mod tests {
             version,
             content_hash,
         );
-        let skill_path = payload_path.join("skills").join("scan.md");
+        let skill_path = payload_path
+            .join("skills")
+            .join("module-scan")
+            .join("SKILL.md");
         std::fs::create_dir_all(skill_path.parent().expect("skill parent"))
             .expect("create payload");
         std::fs::write(
             &skill_path,
-            "# Declarative module skill\nFollow scan steps.",
+            "---\nname: module-scan\ndescription: Follow scan steps.\n---\n\n# Declarative module skill\nFollow scan steps.",
         )
         .expect("write payload skill");
         sinomo_runtime::module::write_declarative_module_registration(
@@ -2096,7 +2867,7 @@ mod tests {
         assert_eq!(report.conflicts, 0);
         let catalog = store.load_catalog().expect("catalog");
         let active = catalog
-            .active_entry_for_scope(SkillActivationScope::Cluster.as_str(), "skill.module.scan")
+            .active_entry_for_scope(SkillActivationScope::Cluster.as_str(), "module-scan")
             .expect("active module skill");
         assert_eq!(active.version, version);
     }
@@ -2105,10 +2876,10 @@ mod tests {
     fn reconciliation_records_conflict_without_replacing_evolved_skill() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-skill-catalog-module-conflict");
         let store = LocalSkillCatalogStore::new(root.path().join("catalog"));
-        let base_text = "# Module skill\nBase guidance.";
-        let evolved_text = "# Module skill\nEvolved guidance.";
+        let base_text = "---\nname: module-debug\ndescription: Debug with module guidance.\n---\n\n# Module skill\nBase guidance.";
+        let evolved_text = "---\nname: module-debug\ndescription: Debug with module guidance.\n---\n\n# Module skill\nEvolved guidance.";
         let evolved = SkillCatalogEntry::new(
-            "skill.module.debug",
+            "module-debug",
             "1.0.0-evolved",
             SkillCatalogSource::evolution("evojob_1"),
             evolved_text,
@@ -2136,8 +2907,13 @@ mod tests {
         )
         .with_surfaces(
             sinomo_runtime::module::ModuleSurfaces::default().with_declarative_resource(
-                ModuleDeclarativeResourceExport::skill("skill.module.debug", "skills/debug.md")
-                    .with_embedded_text("# Module skill\nUpstream changed."),
+                ModuleDeclarativeResourceExport::skill(
+                    "module-debug",
+                    "skills/module-debug/SKILL.md",
+                )
+                .with_embedded_text(
+                    "---\nname: module-debug\ndescription: Debug with module guidance.\n---\n\n# Module skill\nUpstream changed.",
+                ),
             ),
         );
 
@@ -2157,13 +2933,13 @@ mod tests {
         assert_eq!(report.conflicts, 1);
         let catalog = store.load_catalog().expect("catalog");
         let active = catalog
-            .active_entry_for_scope(SkillActivationScope::Cluster.as_str(), "skill.module.debug")
+            .active_entry_for_scope(SkillActivationScope::Cluster.as_str(), "module-debug")
             .expect("active skill");
         assert_eq!(active.source.kind, SkillCatalogSourceKind::Evolution);
         assert_eq!(active.version, "1.0.0-evolved");
         assert!(
             catalog
-                .entry("skill.module.debug", "1.1.0")
+                .entry("module-debug", "1.1.0")
                 .is_some_and(|entry| entry.source.kind == SkillCatalogSourceKind::Module)
         );
         assert_eq!(catalog.conflicts.len(), 1);

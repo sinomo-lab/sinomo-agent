@@ -5899,7 +5899,7 @@ mod tests {
                 )
                 .with_event_kind_name("dfs.metadata.updated")
                 .with_storage_owner("sinomo-dfs")
-                .with_skill_resource("skill.dfs.operator", "skills/dfs/SKILL.md")
+                .with_skill_resource("dfs-operator", "skills/dfs-operator/SKILL.md")
                 .with_prompt_resource("prompt.dfs.repair", "prompts/repair.md")
                 .with_capability_export(CapabilityName::new("dfs.status.read").expect("capability"))
                 .with_capability_export(
@@ -6199,11 +6199,11 @@ mod tests {
     fn declarative_module_package_install_imports_payload_catalog_and_state() {
         let data_root = unique_temp("declarative-module-data");
         let package_root = unique_temp("declarative-module-package");
-        std::fs::create_dir_all(package_root.join("skills/rust")).expect("skills dir");
+        std::fs::create_dir_all(package_root.join("skills/rust-debugging")).expect("skills dir");
         std::fs::create_dir_all(package_root.join("prompts")).expect("prompts dir");
         std::fs::write(
-            package_root.join("skills/rust/SKILL.md"),
-            "# Rust Debugging\n\nUse cargo diagnostics before editing.",
+            package_root.join("skills/rust-debugging/SKILL.md"),
+            "---\nname: rust-debugging\ndescription: Rust compiler and test failure workflow\n---\n\n# Rust Debugging\n\nUse cargo diagnostics before editing.",
         )
         .expect("skill");
         std::fs::write(
@@ -6221,8 +6221,8 @@ mod tests {
             surfaces: ModuleSurfaces::default(),
             resources: vec![
                 ModuleDeclarativeResourceExport::skill(
-                    "skill.rust-debugging",
-                    "skills/rust/SKILL.md",
+                    "rust-debugging",
+                    "skills/rust-debugging/SKILL.md",
                 )
                 .with_description("Rust compiler and test failure workflow")
                 .with_model_family("gpt")
@@ -6249,7 +6249,12 @@ mod tests {
         assert_eq!(result.registration.surfaces.declarative_resources.len(), 2);
         assert!(result.state.active);
         assert!(result.state.content_hash.starts_with("blake3:"));
-        assert!(result.payload_path.join("skills/rust/SKILL.md").exists());
+        assert!(
+            result
+                .payload_path
+                .join("skills/rust-debugging/SKILL.md")
+                .exists()
+        );
         assert!(result.payload_path.join("prompts/triage.md").exists());
         assert!(result.catalog_path.exists());
         assert!(result.state_path.as_ref().expect("state path").exists());

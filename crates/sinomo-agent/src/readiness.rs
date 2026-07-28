@@ -3461,7 +3461,7 @@ fn check_remote_object_rpc_active_cancellation_smoke() -> AgentReadinessCheck {
 }
 
 fn check_skill_disclosure_smoke() -> AgentReadinessCheck {
-    let package_skill = "rust.coding";
+    let package_skill = "rust-coding";
     let skill_plan = AgentSkillPlan::from_package_and_modules(
         [package_skill],
         &AgentModuleToolProjection::new(),
@@ -3526,46 +3526,34 @@ fn check_skill_disclosure_smoke() -> AgentReadinessCheck {
     );
     let search_found =
         output_matches_string_field(&skill_search.output, "/matches", "id", package_skill);
-    let describe_ok = skill_describe
-        .output
-        .pointer("/descriptor/id")
-        .and_then(serde_json::Value::as_str)
-        == Some(package_skill)
+    let describe_rejected = skill_describe.status == AgentToolStatus::Failed
         && skill_describe
             .output
-            .pointer("/descriptor/source")
+            .get("error")
             .and_then(serde_json::Value::as_str)
-            == Some("package")
+            == Some("invalid_agent_skill")
         && skill_describe
             .output
-            .pointer("/descriptor/package_declared")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-        && skill_describe
-            .output
-            .pointer("/descriptor/embedded_text")
-            .is_none()
-        && skill_describe
-            .output
-            .pointer("/activation/mode")
+            .get("skill")
             .and_then(serde_json::Value::as_str)
-            == Some("host_runtime")
-        && skill_describe
+            == Some(package_skill);
+    let search_hides_unreadable_reference = !search_found
+        && skill_search
             .output
-            .pointer("/activation/available")
-            .and_then(serde_json::Value::as_bool)
-            == Some(false);
+            .get("count")
+            .and_then(serde_json::Value::as_u64)
+            == Some(0);
     let activate_blocked = skill_activate.status == AgentToolStatus::Blocked
         && skill_activate
             .output
             .get("error")
             .and_then(serde_json::Value::as_str)
-            == Some("skill_activation_unavailable")
+            == Some("skill_content_unavailable")
         && skill_activate
             .output
             .pointer("/activation/mode")
             .and_then(serde_json::Value::as_str)
-            == Some("host_runtime")
+            == Some("dedicated_tool")
         && skill_activate
             .output
             .pointer("/activation/available")
@@ -3577,32 +3565,28 @@ fn check_skill_disclosure_smoke() -> AgentReadinessCheck {
             .is_some();
 
     if skill_search.status == AgentToolStatus::Succeeded
-        && skill_describe.status == AgentToolStatus::Succeeded
-        && search_found
-        && describe_ok
+        && search_hides_unreadable_reference
+        && describe_rejected
         && activate_blocked
-        && skill_describe
-            .evidence
-            .record_value("skill_disclosure")
-            .is_some()
     {
         passed(
             "skill_disclosure_smoke",
-            "package-declared skills are searchable, describable, and activation requests return the host-runtime contract",
+            "package-declared names without a valid SKILL.md stay out of standard discovery and fail closed",
             serde_json::json!({
                 "skill": package_skill,
                 "skill_search_count": skill_search.output.get("count"),
                 "source": "package",
-                "embedded_text": false,
-                "activation_mode": "host_runtime",
+                "standard_skill_available": false,
+                "activation_mode": "dedicated_tool",
                 "activation_available": false,
+                "skill_describe_status": skill_describe.status,
                 "skill_activate_status": skill_activate.status,
             }),
         )
     } else {
         failed(
             "skill_disclosure_smoke",
-            "package-declared skill search, describe, or activation contract failed",
+            "unreadable package skill references did not fail closed",
             serde_json::json!({
                 "skill": package_skill,
                 "skill_search_status": skill_search.status,
@@ -3612,7 +3596,8 @@ fn check_skill_disclosure_smoke() -> AgentReadinessCheck {
                 "skill_activate_status": skill_activate.status,
                 "skill_activate_output": skill_activate.output,
                 "search_found": search_found,
-                "describe_ok": describe_ok,
+                "search_hides_unreadable_reference": search_hides_unreadable_reference,
+                "describe_rejected": describe_rejected,
                 "activate_blocked": activate_blocked,
             }),
         )
@@ -3622,7 +3607,7 @@ fn check_skill_disclosure_smoke() -> AgentReadinessCheck {
 fn check_module_projection_disclosure_smoke() -> AgentReadinessCheck {
     let module_id = TaskId::generate();
     let projected_tool = "module_rpc_agent_readiness_status";
-    let projected_skill = "skill.agent.readiness";
+    let projected_skill = "agent-readiness";
     let registration = sinomo_runtime::module::ModuleRegistration::native_rust(
         module_id.clone(),
         "0.1.0",
@@ -3645,10 +3630,14 @@ fn check_module_projection_disclosure_smoke() -> AgentReadinessCheck {
                     projected_skill,
                     "skills/agent-readiness/SKILL.md",
                 )
-                .with_description("Exercise agent module skill disclosure from readiness.")
+                .with_description(
+                    "Exercise agent module skill disclosure. Use for readiness verification.",
+                )
                 .with_target_agent("coding-agent")
                 .with_activation_tag("readiness")
-                .with_embedded_text("# Agent readiness\nCheck module-projected skill disclosure."),
+                .with_embedded_text(
+                    "---\nname: agent-readiness\ndescription: Exercise agent module skill disclosure. Use for readiness verification.\n---\n\n# Agent readiness\nCheck module-projected skill disclosure.",
+                ),
             ),
     );
     let projection = AgentModuleToolProjection::new()
@@ -3750,19 +3739,19 @@ fn check_module_projection_disclosure_smoke() -> AgentReadinessCheck {
             == Some("skills/agent-readiness/SKILL.md")
         && skill_describe
             .output
-            .pointer("/descriptor/embedded_text")
-            .and_then(serde_json::Value::as_str)
-            == Some("# Agent readiness\nCheck module-projected skill disclosure.")
+            .pointer("/descriptor/has_skill_content")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
         && skill_describe
             .output
             .pointer("/activation/mode")
             .and_then(serde_json::Value::as_str)
-            == Some("host_runtime")
+            == Some("dedicated_tool")
         && skill_describe
             .output
             .pointer("/activation/available")
             .and_then(serde_json::Value::as_bool)
-            == Some(false)
+            == Some(true)
         && skill_describe
             .evidence
             .record_value("skill_disclosure")
@@ -3785,9 +3774,9 @@ fn check_module_projection_disclosure_smoke() -> AgentReadinessCheck {
                 "tool_search_count": tool_search.output.get("count"),
                 "skill_search_count": skill_search.output.get("count"),
                 "skill_describe_source": "module",
-                "skill_describe_embedded_text": true,
-                "skill_activation_mode": "host_runtime",
-                "skill_activation_available": false,
+                "skill_describe_has_content": true,
+                "skill_activation_mode": "dedicated_tool",
+                "skill_activation_available": true,
             }),
         )
     } else {

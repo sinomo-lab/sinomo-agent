@@ -46,8 +46,9 @@ use sinomo_agent::{
     InteractionSession, InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
     SkillActivationScope, SkillCatalogEntry, SkillCatalogSifsStore, SkillCatalogSource,
     SkillCatalogSourceKind, SkillCatalogStore, SkillCatalogWrite, TaskId, WorkspaceRef,
-    interaction_event, register_hosted_model_tools, render_common_skill_markdown,
-    run_local_agent_readiness_gate, user_interaction_input_event,
+    interaction_event, read_agent_skill_package, register_hosted_model_tools,
+    render_common_skill_markdown, run_local_agent_readiness_gate, user_interaction_input_event,
+    write_agent_skill_package,
 };
 use sinomo_lm::{
     AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, ClaudeProvider, CurrentDefaultModel,
@@ -2058,7 +2059,7 @@ fn skill_cli_spec() -> CliCommandSpec {
         .with_aliases(["--id"])
     };
     let optional_skill = || CliPositionalSpec::optional(CliValueSpec::new("skill-id", "skill id"));
-    CliCommandSpec::new("skill", "manage the SIFS-backed skill catalog")
+    CliCommandSpec::new("skill", "manage standard Agent Skills packages in SIFS")
         .with_aliases(["skills"])
         .help_on_empty()
         .with_children([
@@ -2078,60 +2079,66 @@ fn skill_cli_spec() -> CliCommandSpec {
                     json(),
                 ])
                 .with_positionals([optional_skill()]),
-            CliCommandSpec::new("import", "import a SKILL.md file or directory")
-                .with_options([
-                    CliOptionSpec::value(
-                        "--file",
-                        "SKILL.md path or skill directory",
-                        CliValueSpec::new("path", "skill path"),
-                    )
-                    .with_aliases(["--path"]),
-                    skill(),
-                    version(),
-                    CliOptionSpec::value(
-                        "--source",
-                        "catalog source kind",
-                        CliValueSpec::new("kind", "source kind")
-                            .with_choices([
-                                CliAutocompleteChoice::new("sinomo", "built-in Sinomo skill"),
-                                CliAutocompleteChoice::new("module", "module-provided skill"),
-                                CliAutocompleteChoice::new("user", "user-provided skill"),
-                                CliAutocompleteChoice::new("agent", "agent-provided skill"),
-                                CliAutocompleteChoice::new("evolution", "evolution-provided skill"),
-                            ])
-                            .restricted(),
-                    ),
-                    CliOptionSpec::value(
-                        "--source-id",
-                        "source identity",
-                        CliValueSpec::new("id", "source identity"),
-                    ),
-                    CliOptionSpec::flag("--activate", "activate the imported skill"),
-                    CliOptionSpec::flag("--no-activate", "leave the imported skill inactive"),
-                    CliOptionSpec::value(
-                        "--scope",
-                        "activation scope",
-                        CliValueSpec::new("scope", "activation scope"),
-                    ),
-                    json(),
-                ])
-                .with_positionals([CliPositionalSpec::optional(CliValueSpec::new(
-                    "path",
-                    "skill path",
-                ))]),
-            CliCommandSpec::new("export", "export a catalog skill as SKILL.md")
-                .with_options([
-                    skill(),
-                    version(),
-                    CliOptionSpec::value(
-                        "--output",
-                        "output path",
-                        CliValueSpec::new("path", "output path"),
-                    )
-                    .with_aliases(["-o"]),
-                    json(),
-                ])
-                .with_positionals([optional_skill()]),
+            CliCommandSpec::new(
+                "import",
+                "validate and import an Agent Skills package directory",
+            )
+            .with_options([
+                CliOptionSpec::value(
+                    "--file",
+                    "skill directory or its SKILL.md file",
+                    CliValueSpec::new("path", "skill path"),
+                )
+                .with_aliases(["--path"]),
+                skill(),
+                version(),
+                CliOptionSpec::value(
+                    "--source",
+                    "catalog source kind",
+                    CliValueSpec::new("kind", "source kind")
+                        .with_choices([
+                            CliAutocompleteChoice::new("sinomo", "built-in Sinomo skill"),
+                            CliAutocompleteChoice::new("module", "module-provided skill"),
+                            CliAutocompleteChoice::new("user", "user-provided skill"),
+                            CliAutocompleteChoice::new("agent", "agent-provided skill"),
+                            CliAutocompleteChoice::new("evolution", "evolution-provided skill"),
+                        ])
+                        .restricted(),
+                ),
+                CliOptionSpec::value(
+                    "--source-id",
+                    "source identity",
+                    CliValueSpec::new("id", "source identity"),
+                ),
+                CliOptionSpec::flag("--activate", "activate the imported skill"),
+                CliOptionSpec::flag("--no-activate", "leave the imported skill inactive"),
+                CliOptionSpec::value(
+                    "--scope",
+                    "activation scope",
+                    CliValueSpec::new("scope", "activation scope"),
+                ),
+                json(),
+            ])
+            .with_positionals([CliPositionalSpec::optional(CliValueSpec::new(
+                "path",
+                "skill path",
+            ))]),
+            CliCommandSpec::new(
+                "export",
+                "export a catalog skill as an Agent Skills directory",
+            )
+            .with_options([
+                skill(),
+                version(),
+                CliOptionSpec::value(
+                    "--output",
+                    "output directory",
+                    CliValueSpec::new("path", "output directory"),
+                )
+                .with_aliases(["-o"]),
+                json(),
+            ])
+            .with_positionals([optional_skill()]),
             CliCommandSpec::new("activate", "activate a catalog skill")
                 .with_aliases(["enable"])
                 .with_options([
@@ -2389,7 +2396,7 @@ fn parse_skill_matches(matches: &CliCommandMatches) -> Result<SkillCliCommand, C
                 .value("--file")
                 .or_else(|| matches.positionals().first().map(String::as_str))
                 .ok_or_else(|| CliParseError::Parse {
-                    detail: "skill import requires a SKILL.md path or skill directory".to_string(),
+                    detail: "skill import requires an Agent Skills package directory".to_string(),
                 })?;
             let source = matches
                 .value("--source")
@@ -3083,14 +3090,14 @@ fn show_skill(options: SkillShowOptions) -> Result<(), CliError> {
 
 fn import_skill(options: SkillImportOptions) -> Result<(), CliError> {
     let store = skill_store_for_cli()?;
-    let text = read_skill_markdown_import(&options.path)?;
+    let package = read_agent_skill_package(&options.path).map_err(skill_catalog_cli_error)?;
     let source =
         skill_source_from_import_options(&options.source, &options.source_id, &options.version);
-    let mut write = SkillCatalogWrite::from_markdown_skill(
+    let mut write = SkillCatalogWrite::from_agent_skill_package(
         options.skill_id.clone(),
         options.version.clone(),
         source,
-        text,
+        package,
     )
     .map_err(skill_catalog_cli_error)?;
     if options.activate {
@@ -3133,25 +3140,21 @@ fn export_skill(options: SkillExportOptions) -> Result<(), CliError> {
     let store = skill_store_for_cli()?;
     let catalog = store.load_catalog().map_err(skill_catalog_cli_error)?;
     let entry = select_skill_entry(&catalog, &options.skill_id, options.version.as_deref())?;
-    let text = store
-        .read_skill_text(&entry)
+    let package = store
+        .read_skill_package(&entry)
         .map_err(skill_catalog_cli_error)?
         .ok_or_else(|| CliError::Parse {
-            detail: format!("skill `{}` has no readable SKILL.md body", entry.skill_id),
+            detail: format!("skill `{}` has no readable package", entry.skill_id),
         })?;
-    let rendered = render_common_skill_markdown(&entry, &text);
+    let rendered =
+        render_common_skill_markdown(&entry, &package.markdown).map_err(skill_catalog_cli_error)?;
     if let Some(output) = options.output.as_deref() {
-        let path = skill_export_output_path(output);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|source| CliError::Io {
-                path: parent.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        }
-        fs::write(&path, rendered.as_bytes()).map_err(|source| CliError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
+        let path = skill_export_output_directory(output, &entry.skill_id)?;
+        let package = sinomo_agent::AgentSkillPackage {
+            markdown: rendered,
+            files: package.files,
+        };
+        write_agent_skill_package(&path, &package).map_err(skill_catalog_cli_error)?;
         if options.json {
             println!(
                 "{}",
@@ -3221,23 +3224,16 @@ fn skill_store_for_cli() -> Result<SkillCatalogSifsStore, CliError> {
     SkillCatalogSifsStore::open(Some(data_dir.root())).map_err(skill_catalog_cli_error)
 }
 
-fn read_skill_markdown_import(path: &Path) -> Result<String, CliError> {
-    let path = if path.is_dir() {
-        path.join(sinomo_agent::SKILL_FILE_NAME)
+fn skill_export_output_directory(path: &Path, skill_id: &str) -> Result<PathBuf, CliError> {
+    if path.is_file() {
+        return Err(CliError::Parse {
+            detail: "Agent Skills exports require a directory path".to_string(),
+        });
+    }
+    if path.file_name().and_then(|name| name.to_str()) == Some(skill_id) {
+        Ok(path.to_path_buf())
     } else {
-        path.to_path_buf()
-    };
-    fs::read_to_string(&path).map_err(|source| CliError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
-}
-
-fn skill_export_output_path(path: &Path) -> PathBuf {
-    if path.is_dir() {
-        path.join(sinomo_agent::SKILL_FILE_NAME)
-    } else {
-        path.to_path_buf()
+        Ok(path.join(skill_id))
     }
 }
 
@@ -3302,6 +3298,11 @@ fn skill_entry_json(entry: &SkillCatalogEntry, active: bool) -> serde_json::Valu
         "id": &entry.skill_id,
         "version": &entry.version,
         "description": &entry.description,
+        "license": &entry.license,
+        "compatibility": &entry.compatibility,
+        "allowed_tools": &entry.allowed_tools,
+        "metadata": &entry.metadata,
+        "resources": &entry.resources,
         "source": {
             "kind": entry.source.kind.as_str(),
             "id": &entry.source.source_id,
@@ -4190,13 +4191,24 @@ pub(crate) fn best_effort_skill_catalog_texts(
     sinomo_agent::load_skill_catalog_texts_from_sifs(data_dir, catalog).unwrap_or_default()
 }
 
+pub(crate) fn best_effort_skill_catalog_resources(
+    data_dir: &SinomoDataDir,
+    catalog: &sinomo_agent::SkillCatalog,
+) -> BTreeMap<String, Vec<sinomo_agent::AgentSkillPackageFile>> {
+    sinomo_agent::load_skill_catalog_resources_from_sifs(data_dir, catalog).unwrap_or_default()
+}
+
 /// Keep the TUI's first frame independent of DFS recovery and cluster routing.
 /// The daemon remains the authoritative SIFS path, while the outer deadline
 /// also bounds daemon handlers whose internal DFS timeout exceeds the client
 /// idle timeout.
 pub(crate) fn best_effort_runtime_skill_catalog(
     daemon: Option<&DaemonStatus>,
-) -> (sinomo_agent::SkillCatalog, BTreeMap<String, String>) {
+) -> (
+    sinomo_agent::SkillCatalog,
+    BTreeMap<String, String>,
+    BTreeMap<String, Vec<sinomo_agent::AgentSkillPackageFile>>,
+) {
     let Some(daemon) = daemon else {
         return Default::default();
     };
@@ -4214,13 +4226,18 @@ pub(crate) fn best_effort_runtime_skill_catalog(
                 .map(SkillCatalogSifsStore::from_vfs)?;
                 let catalog = store.load_catalog().ok()?;
                 let mut texts = BTreeMap::new();
+                let mut resources = BTreeMap::new();
                 for entry in &catalog.entries {
-                    let text = store.read_skill_text(entry).ok()?;
-                    if let Some(text) = text {
-                        texts.insert(sinomo_agent::skill_catalog_entry_text_key(entry), text);
+                    let package = store.read_skill_package(entry).ok()?;
+                    if let Some(package) = package {
+                        let key = sinomo_agent::skill_catalog_entry_text_key(entry);
+                        texts.insert(key.clone(), package.markdown);
+                        if !package.files.is_empty() {
+                            resources.insert(key, package.files);
+                        }
                     }
                 }
-                Some((catalog, texts))
+                Some((catalog, texts, resources))
             })();
             let _ = sender.send(loaded);
         })
@@ -4384,6 +4401,7 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     )?;
     let skill_catalog = best_effort_reconciled_skill_catalog(&data_dir);
     let skill_catalog_texts = best_effort_skill_catalog_texts(&data_dir, &skill_catalog);
+    let skill_catalog_resources = best_effort_skill_catalog_resources(&data_dir, &skill_catalog);
     let loop_model = ConfiguredInteractionModel {
         data_dir: data_dir.clone(),
         provider: provider.clone(),
@@ -4396,7 +4414,8 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         .with_agent_definition(definition.clone())
         .with_workspace_root(&workspace_root)
         .with_skill_catalog(skill_catalog)
-        .with_skill_catalog_texts(skill_catalog_texts);
+        .with_skill_catalog_texts(skill_catalog_texts)
+        .with_skill_catalog_resources(skill_catalog_resources);
     let agent = Agent::new(loop_model, provider, model)
         .with_config(agent_config)
         .with_tool_registry(tool_registry)
