@@ -2040,6 +2040,18 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         })
     }
 
+    fn write_intents_on_shard_page(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after: Option<&DfsWriteIntentScanCursor>,
+        max_entries: usize,
+    ) -> Result<Option<DfsWriteIntentScanPage>> {
+        let Some(backend) = self.shards.get(shard_id) else {
+            return Ok(None);
+        };
+        backend.write_intents_on_shard_page(shard_id, after, max_entries)
+    }
+
     fn version_records_page(
         &self,
         after: Option<&DfsObjectVersionScanCursor>,
@@ -2782,6 +2794,24 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             }
         }
         Ok(found)
+    }
+
+    fn list_prepared_namespace_prepares(&self) -> Result<Vec<DfsNamespacePrepareRecord>> {
+        let mut prepares = BTreeMap::new();
+        for backend in self.shards.values() {
+            for prepare in backend.list_prepared_namespace_prepares()? {
+                if prepares
+                    .insert(prepare.operation_id.clone(), prepare.clone())
+                    .is_some()
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "namespace prepare {} exists on multiple local shards",
+                        prepare.operation_id
+                    )));
+                }
+            }
+        }
+        Ok(prepares.into_values().collect())
     }
 
     fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {

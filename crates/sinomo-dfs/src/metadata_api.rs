@@ -885,6 +885,19 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         max_entries: usize,
     ) -> Result<DfsWriteIntentScanPage>;
 
+    /// Return one cursor-bounded page of durable write intents from one exact
+    /// local metadata shard.
+    ///
+    /// Recovery uses this shard-scoped view to retain intent provenance across
+    /// authority movement. It must include historical duplicates which the
+    /// merged global scan deliberately filters from ordinary callers.
+    fn write_intents_on_shard_page(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after: Option<&DfsWriteIntentScanCursor>,
+        max_entries: usize,
+    ) -> Result<Option<DfsWriteIntentScanPage>>;
+
     /// Return one cursor-bounded global page of object-version records.
     fn version_records_page(
         &self,
@@ -1218,6 +1231,13 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         let _ = operation_id;
         Ok(None)
     }
+
+    /// Return only hidden namespace prepares which still require recovery.
+    ///
+    /// Replica snapshot export is intentionally not the inspection API here:
+    /// it clones and fingerprints every metadata table even though recovery
+    /// needs only this bounded active subset.
+    fn list_prepared_namespace_prepares(&self) -> Result<Vec<DfsNamespacePrepareRecord>>;
 
     /// Move an exact non-terminal write intent to a newer shard-owner epoch.
     ///

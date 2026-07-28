@@ -10,6 +10,9 @@ use sinomo_agent::{
 use sinomo_runtime::local::SinomoDataDir;
 use time::OffsetDateTime;
 
+type StableChatProjectionAction =
+    Box<dyn FnOnce(StableChatProjection) -> Result<(), CliError> + Send + 'static>;
+
 /// Stable, model-independent projection of one CLI-visible conversation.
 ///
 /// `InteractionSession::session_id` is the stable surface activity id and is
@@ -18,9 +21,14 @@ use time::OffsetDateTime;
 /// format without changing this projection. This writer records only the
 /// human-visible chat contract in the same SIFS AgentChannel representation
 /// used by the app, so historical recall has one format across UI surfaces.
+#[derive(Clone)]
 pub(crate) struct StableChatProjection {
-    store: SifsAgentChannelStore,
+    /// Stable history is best-effort for an interactive terminal. Local JSONL
+    /// remains the durable TUI transcript when the daemon/cluster SIFS route
+    /// cannot pass the bounded startup probe.
+    store: Option<std::sync::Arc<SifsAgentChannelStore>>,
     session: InteractionSession,
+    background_sender: Option<std::sync::mpsc::Sender<StableChatProjectionAction>>,
 }
 
 impl StableChatProjection {
@@ -32,9 +40,99 @@ impl StableChatProjection {
             detail: format!("open stable CLI chat projection: {detail}"),
         })?;
         Ok(Self {
-            store,
+            store: Some(std::sync::Arc::new(store)),
             session: session.clone(),
+            background_sender: None,
         })
+    }
+
+    pub(crate) fn open_daemon_bounded(
+        address: impl Into<String>,
+        timeout: std::time::Duration,
+        session: &InteractionSession,
+    ) -> Result<Self, CliError> {
+        let address = address.into();
+        let session = session.clone();
+        let thread_session = session.clone();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("sinomo-tui-chat-projection".to_string())
+            .spawn(move || {
+                let opened = SifsAgentChannelStore::open_daemon_with_timeout(address, timeout)
+                    .and_then(|store| {
+                        store
+                            .load_channel(&thread_session.session_id)
+                            .map(|_| store)
+                            .map_err(|source| source.to_string())
+                    });
+                let _ = sender.send(opened);
+            })
+            .map_err(|source| CliError::Parse {
+                detail: format!("start stable CLI chat projection probe: {source}"),
+            })?;
+        match receiver.recv_timeout(timeout) {
+            Ok(Ok(store)) => Self {
+                store: Some(std::sync::Arc::new(store)),
+                session,
+                background_sender: None,
+            }
+            .with_background_writes(),
+            Ok(Err(detail)) => Err(CliError::Parse {
+                detail: format!("open stable CLI chat projection through daemon: {detail}"),
+            }),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(CliError::Parse {
+                detail: format!(
+                    "open stable CLI chat projection through daemon timed out after {}ms",
+                    timeout.as_millis()
+                ),
+            }),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(CliError::Parse {
+                detail: "stable CLI chat projection probe stopped unexpectedly".to_string(),
+            }),
+        }
+    }
+
+    pub(crate) fn unavailable(session: &InteractionSession) -> Self {
+        Self {
+            store: None,
+            session: session.clone(),
+            background_sender: None,
+        }
+    }
+
+    fn with_background_writes(self) -> Result<Self, CliError> {
+        let (sender, receiver) = std::sync::mpsc::channel::<StableChatProjectionAction>();
+        let writer = Self {
+            store: self.store.clone(),
+            session: self.session.clone(),
+            background_sender: None,
+        };
+        std::thread::Builder::new()
+            .name("sinomo-tui-chat-writer".to_string())
+            .spawn(move || {
+                for action in receiver {
+                    let _ = action(writer.clone());
+                }
+            })
+            .map_err(|source| CliError::Parse {
+                detail: format!("start stable CLI chat projection writer: {source}"),
+            })?;
+        Ok(Self {
+            background_sender: Some(sender),
+            ..self
+        })
+    }
+
+    fn enqueue_background(
+        &self,
+        action: impl FnOnce(Self) -> Result<(), CliError> + Send + 'static,
+    ) -> Option<Result<(), CliError>> {
+        let sender = self.background_sender.as_ref()?;
+        // The local JSONL transcript is authoritative for the TUI itself.
+        // A failed, slow, or disconnected cluster projection must never fail
+        // or delay the command.
+        let _ = sender.send(Box::new(action));
+        Some(Ok(()))
     }
 
     pub(crate) fn record_user_message(
@@ -44,6 +142,15 @@ impl StableChatProjection {
         created_at: OffsetDateTime,
         text: &str,
     ) -> Result<(), CliError> {
+        if self.background_sender.is_some() {
+            let agent_key = agent_key.to_string();
+            let text = text.to_string();
+            return self
+                .enqueue_background(move |projection| {
+                    projection.record_user_message(&agent_key, message_id, created_at, &text)
+                })
+                .unwrap_or(Ok(()));
+        }
         self.record_message(
             agent_key,
             message_id,
@@ -64,6 +171,18 @@ impl StableChatProjection {
         created_at: OffsetDateTime,
         text: &str,
     ) -> Result<(), CliError> {
+        if self.background_sender.is_some() {
+            let agent_key = agent_key.to_string();
+            let text = text.to_string();
+            return self
+                .enqueue_background(move |projection| {
+                    projection.record_agent_message(&agent_key, message_id, created_at, &text)
+                })
+                .unwrap_or(Ok(()));
+        }
+        if self.store.is_none() {
+            return Ok(());
+        }
         let (mut channel, participant_id) = self.load_channel_for_agent(agent_key, false)?;
         let participant = channel
             .participant(&participant_id)
@@ -95,6 +214,16 @@ impl StableChatProjection {
         text: &str,
         is_error: bool,
     ) -> Result<(), CliError> {
+        if self.background_sender.is_some() {
+            let agent_key = agent_key.to_string();
+            let text = text.to_string();
+            return self
+                .enqueue_background(move |projection| {
+                    projection
+                        .record_system_message(&agent_key, message_id, created_at, &text, is_error)
+                })
+                .unwrap_or(Ok(()));
+        }
         self.record_message(
             agent_key,
             message_id,
@@ -117,6 +246,15 @@ impl StableChatProjection {
         agent_key: &str,
         event: &AgentRuntimeEvent,
     ) -> Result<(), CliError> {
+        if self.background_sender.is_some() {
+            let agent_key = agent_key.to_string();
+            let event = event.clone();
+            return self
+                .enqueue_background(move |projection| {
+                    projection.record_runtime_event(&agent_key, &event)
+                })
+                .unwrap_or(Ok(()));
+        }
         match &event.payload {
             AgentRuntimeEventPayload::TurnFinalDecision {
                 decision,
@@ -191,6 +329,21 @@ impl StableChatProjection {
         created_at: OffsetDateTime,
         handoff: &BackgroundHandoffRequest,
     ) -> Result<(), CliError> {
+        if self.background_sender.is_some() {
+            let agent_key = agent_key.to_string();
+            let parent_message_id = parent_message_id.clone();
+            let handoff = handoff.clone();
+            return self
+                .enqueue_background(move |projection| {
+                    projection.record_background_handoff_request(
+                        &agent_key,
+                        &parent_message_id,
+                        created_at,
+                        &handoff,
+                    )
+                })
+                .unwrap_or(Ok(()));
+        }
         self.record_system_message(
             agent_key,
             stable_related_message_id(parent_message_id, "background-handoff")?,
@@ -213,6 +366,9 @@ impl StableChatProjection {
         message_kind: AgentChannelMessageKind,
         text: &str,
     ) -> Result<(), CliError> {
+        if self.store.is_none() {
+            return Ok(());
+        }
         let allow_membership_setup = matches!(&author, AgentChannelAuthor::User { .. });
         let (mut channel, _) = self.load_channel_for_agent(agent_key, allow_membership_setup)?;
         if matches!(&author, AgentChannelAuthor::User { .. })
@@ -248,6 +404,8 @@ impl StableChatProjection {
         let source = self.source(&message_id);
         if let Some(existing) = self
             .store
+            .as_ref()
+            .expect("stable chat projection store checked by record entrypoint")
             .load_immutable_message_record(&channel.channel_id, &message_id)
             .map_err(|source| projection_store_error("load stable chat message", source))?
         {
@@ -272,6 +430,8 @@ impl StableChatProjection {
                 .max(existing.sequence.saturating_add(1));
             channel.updated_at = channel.updated_at.max(existing.created_at);
             self.store
+                .as_ref()
+                .expect("stable chat projection store checked by record entrypoint")
                 .save_channel(channel)
                 .map_err(|source| projection_store_error("repair stable chat metadata", source))?;
             return Ok(());
@@ -292,9 +452,13 @@ impl StableChatProjection {
         channel.transcript.push(message.clone());
         trim_recent_transcript(channel);
         self.store
+            .as_ref()
+            .expect("stable chat projection store checked by record entrypoint")
             .append_message(&channel.channel_id, &message)
             .map_err(|source| projection_store_error("append stable chat message", source))?;
         self.store
+            .as_ref()
+            .expect("stable chat projection store checked by record entrypoint")
             .save_channel(channel)
             .map_err(|source| projection_store_error("save stable chat metadata", source))
     }
@@ -306,6 +470,8 @@ impl StableChatProjection {
     ) -> Result<(AgentChannel, TaskId), CliError> {
         let loaded = self
             .store
+            .as_ref()
+            .expect("stable chat projection store checked by record entrypoint")
             .load_channel(&self.session.session_id)
             .map_err(|source| projection_store_error("load stable CLI chat", source))?;
         let mut channel = match loaded {
@@ -491,6 +657,51 @@ mod tests {
             NodeId::from_legacy_named("node_cli_projection").expect("node id"),
             InteractionSurface::new("surface.cli.test", InteractionSurfaceKind::CommandLine),
         )
+    }
+
+    #[test]
+    fn unavailable_projection_never_blocks_or_fails_the_tui() {
+        let session = session();
+        let projection = StableChatProjection::unavailable(&session);
+        projection
+            .record_user_message(
+                "main-agent",
+                TaskId::generate(),
+                OffsetDateTime::from_unix_timestamp(10).expect("time"),
+                "hello",
+            )
+            .expect("unavailable projection is best effort");
+        projection
+            .record_system_message(
+                "main-agent",
+                TaskId::generate(),
+                OffsetDateTime::from_unix_timestamp(20).expect("time"),
+                "done",
+                false,
+            )
+            .expect("unavailable projection is best effort");
+        assert!(projection.is_for_session(&session));
+    }
+
+    #[test]
+    fn background_projection_does_not_wait_for_slow_cluster_work() {
+        let projection = StableChatProjection::unavailable(&session())
+            .with_background_writes()
+            .expect("background writer");
+        let started = std::time::Instant::now();
+        projection
+            .enqueue_background(|_| {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                Err(CliError::Parse {
+                    detail: "simulated stalled SIFS projection".to_string(),
+                })
+            })
+            .expect("bounded mode")
+            .expect("slow stable projection is best effort");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "foreground projection exceeded its hard TUI budget"
+        );
     }
 
     #[test]

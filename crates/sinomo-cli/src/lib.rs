@@ -4190,6 +4190,51 @@ pub(crate) fn best_effort_skill_catalog_texts(
     sinomo_agent::load_skill_catalog_texts_from_sifs(data_dir, catalog).unwrap_or_default()
 }
 
+/// Keep the TUI's first frame independent of DFS recovery and cluster routing.
+/// The daemon remains the authoritative SIFS path, while the outer deadline
+/// also bounds daemon handlers whose internal DFS timeout exceeds the client
+/// idle timeout.
+pub(crate) fn best_effort_runtime_skill_catalog(
+    daemon: Option<&DaemonStatus>,
+) -> (sinomo_agent::SkillCatalog, BTreeMap<String, String>) {
+    let Some(daemon) = daemon else {
+        return Default::default();
+    };
+    let address = daemon.address.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    if std::thread::Builder::new()
+        .name("sinomo-tui-skills".to_string())
+        .spawn(move || {
+            let loaded = (|| {
+                let store = sinomo_runtime::vfs::daemon_sifs_with_timeout(
+                    address,
+                    Duration::from_millis(250),
+                )
+                .ok()
+                .map(SkillCatalogSifsStore::from_vfs)?;
+                let catalog = store.load_catalog().ok()?;
+                let mut texts = BTreeMap::new();
+                for entry in &catalog.entries {
+                    let text = store.read_skill_text(entry).ok()?;
+                    if let Some(text) = text {
+                        texts.insert(sinomo_agent::skill_catalog_entry_text_key(entry), text);
+                    }
+                }
+                Some((catalog, texts))
+            })();
+            let _ = sender.send(loaded);
+        })
+        .is_err()
+    {
+        return Default::default();
+    }
+    receiver
+        .recv_timeout(Duration::from_millis(250))
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
 pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     let session_id = options
@@ -5161,18 +5206,27 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
         .with_additional_workspace_roots(resolved_workspace_roots.iter().skip(1).cloned());
     let requested_sandbox_node_id = sandbox_node_id.clone();
     let coding_authority = agent_definition_has_coding_authority(definition);
-    let live_sifs_mount = match ensure_simple_sandbox_sifs_mount(data_dir) {
-        Ok(mount) => mount,
-        Err(error) if !workspace_root_uses_simple_sandbox_sifs_mount(data_dir, workspace_root)? => {
-            // The workspace can remain usable without a live SIFS projection,
-            // but this runtime cannot claim that the agent's canonical home is
-            // available in that case.
-            eprintln!(
-                "warning: live SIFS integration for the agent runtime is unavailable; using the local workspace without the agent home: {error}"
-            );
-            None
+    let workspace_uses_live_mount =
+        workspace_root_uses_simple_sandbox_sifs_mount(data_dir, workspace_root)?;
+    let needs_live_sifs_mount = session_id.is_some()
+        || workspace_uses_live_mount
+        || (allow_coding_mutation && coding_authority);
+    let live_sifs_mount = if needs_live_sifs_mount {
+        match ensure_simple_sandbox_sifs_mount(data_dir) {
+            Ok(mount) => mount,
+            Err(error) if !workspace_uses_live_mount => {
+                // The workspace can remain usable without a live SIFS projection,
+                // but this runtime cannot claim that the agent's canonical home is
+                // available in that case.
+                eprintln!(
+                    "warning: live SIFS integration for the agent runtime is unavailable; using the local workspace without the agent home: {error}"
+                );
+                None
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
+    } else {
+        None
     };
     if allow_coding_mutation && coding_authority {
         for root in resolved_workspace_roots {

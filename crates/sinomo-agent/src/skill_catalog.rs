@@ -1244,6 +1244,13 @@ pub struct SkillCatalogSifsStore {
 }
 
 impl SkillCatalogSifsStore {
+    pub fn from_vfs(vfs: VfsHandle) -> Self {
+        Self {
+            root: SKILL_CATALOG_SIFS_ROOT.to_string(),
+            vfs,
+        }
+    }
+
     pub fn open(data_dir: Option<PathBuf>) -> Result<Self, SkillCatalogError> {
         // Skill catalog reads serve this node's local SIFS mirror: catalog and
         // activation state are node-local config converged by background
@@ -1256,10 +1263,7 @@ impl SkillCatalogSifsStore {
                 detail: source.to_string(),
             }
         })?;
-        Ok(Self {
-            root: SKILL_CATALOG_SIFS_ROOT.to_string(),
-            vfs,
-        })
+        Ok(Self::from_vfs(vfs))
     }
 }
 

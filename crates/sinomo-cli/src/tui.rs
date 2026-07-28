@@ -124,7 +124,7 @@ pub(crate) fn runtime_main_agent_handler_for_tui_with_data_dir(
     let handler = RuntimeMainAgentInteractionHandler::from_default_model_config(
         data_dir,
         runtime_config,
-        daemon_connected,
+        daemon.as_ref(),
     )?;
     Ok((handler, daemon))
 }
@@ -406,7 +406,15 @@ fn run_tui_with_handler_and_daemon<H: TuiAgentRuntimeControl>(
         daemon.as_ref(),
         runtime.handler.tui_agent_runtime_info(),
     );
-    let mut chat_projection = StableChatProjection::open(&data_dir, runtime.session())?;
+    let mut chat_projection = match daemon.as_ref() {
+        Some(daemon) => StableChatProjection::open_daemon_bounded(
+            &daemon.address,
+            Duration::from_millis(250),
+            runtime.session(),
+        )
+        .unwrap_or_else(|_| StableChatProjection::unavailable(runtime.session())),
+        None => StableChatProjection::unavailable(runtime.session()),
+    };
     session_store.save_state(runtime.session(), &state)?;
     let mut terminal = TuiTerminalSession::enter()?;
 
@@ -419,7 +427,7 @@ fn run_tui_with_handler_and_daemon<H: TuiAgentRuntimeControl>(
             &mut runtime,
             &mut state,
             &session_store,
-            &data_dir,
+            daemon.as_ref(),
             &mut chat_projection,
         )? {
             terminal.draw(&state)?;
@@ -481,16 +489,8 @@ fn handle_tui_input_action<H: TuiAgentRuntimeControl>(
     match action {
         TuiInputAction::None => {}
         TuiInputAction::Exit => {
-            submit_tui_input(
-                runtime,
-                state,
-                terminal,
-                data_dir,
-                session_store,
-                daemon,
-                "/quit".to_string(),
-                chat_projection,
-            )?;
+            state.exit_requested = true;
+            session_store.save_state(runtime.session(), state)?;
         }
         TuiInputAction::Submit(line) => {
             submit_tui_input(
@@ -541,7 +541,7 @@ fn handle_tui_input_action<H: TuiAgentRuntimeControl>(
             session_store.save_state(runtime.session(), state)?;
         }
     }
-    sync_stable_chat_projection(chat_projection, data_dir, runtime.session())?;
+    sync_stable_chat_projection(chat_projection, daemon, runtime.session());
     Ok(())
 }
 
@@ -588,7 +588,7 @@ fn submit_tui_input<H: TuiAgentRuntimeControl>(
 
     state.begin_submission(&line);
     terminal.draw(state)?;
-    sync_stable_chat_projection(chat_projection, data_dir, runtime.session())?;
+    sync_stable_chat_projection(chat_projection, daemon, runtime.session());
     let stable_input_id = TaskId::generate();
     let stable_input_at = OffsetDateTime::now_utc();
     chat_projection.record_user_message(
@@ -669,10 +669,10 @@ fn refresh_tui_runtime_events<H: TuiAgentRuntimeControl>(
     runtime: &mut InteractionRuntime<JsonlEventStore, H>,
     state: &mut TuiState,
     session_store: &TuiSessionStore,
-    data_dir: &SinomoDataDir,
+    daemon: Option<&DaemonStatus>,
     chat_projection: &mut StableChatProjection,
 ) -> Result<bool, CliError> {
-    sync_stable_chat_projection(chat_projection, data_dir, runtime.session())?;
+    sync_stable_chat_projection(chat_projection, daemon, runtime.session());
     let events = runtime.handler.drain_tui_runtime_events()?;
     if events.is_empty() {
         return Ok(false);
@@ -690,13 +690,20 @@ fn refresh_tui_runtime_events<H: TuiAgentRuntimeControl>(
 
 fn sync_stable_chat_projection(
     projection: &mut StableChatProjection,
-    data_dir: &SinomoDataDir,
+    daemon: Option<&DaemonStatus>,
     session: &InteractionSession,
-) -> Result<(), CliError> {
+) {
     if !projection.is_for_session(session) {
-        *projection = StableChatProjection::open(data_dir, session)?;
+        *projection = match daemon {
+            Some(daemon) => StableChatProjection::open_daemon_bounded(
+                &daemon.address,
+                Duration::from_millis(250),
+                session,
+            )
+            .unwrap_or_else(|_| StableChatProjection::unavailable(session)),
+            None => StableChatProjection::unavailable(session),
+        };
     }
-    Ok(())
 }
 
 fn stable_tui_result_id(input_id: &TaskId, kind: &str) -> Result<TaskId, CliError> {
@@ -8455,6 +8462,7 @@ impl AgentRecallToolTransition {
 }
 
 impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
+    #[cfg(test)]
     pub fn from_runtime_config(
         data_dir: &SinomoDataDir,
         runtime_config: ModelRuntimeConfig,
@@ -8480,24 +8488,38 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
     fn from_default_model_config(
         data_dir: &SinomoDataDir,
         runtime_config: ModelRuntimeConfig,
-        daemon_connected: bool,
+        daemon: Option<&DaemonStatus>,
     ) -> Result<Self, CliError> {
+        let daemon_connected = daemon.is_some();
         let thinking = ThinkingControl::default();
         let tool_registry = main_agent_config_tool_registry(data_dir)?;
         let (config, _) =
             with_tui_model_config_mode(daemon_connected, || load_model_config_for_node(data_dir))?;
         let resolved = resolve_default_model(Some(&config), None)?;
+        let (skill_catalog, skill_catalog_texts) = best_effort_runtime_skill_catalog(daemon);
         if resolved.provider == default_main_agent_chat_model_provider()
             && resolved.model == default_main_agent_chat_model_id()
         {
-            return Ok(Self::from_runtime_config(data_dir, runtime_config)?
-                .with_tool_registry(tool_registry));
+            let runtime_info = DefaultMainAgentChatModel::runtime_info_for_config(&runtime_config);
+            let model = DefaultMainAgentChatModel::from_runtime_config(
+                data_dir,
+                runtime_config,
+                thinking.clone(),
+            );
+            return Ok(Self::with_thinking(
+                model,
+                runtime_info.provider,
+                runtime_info.model,
+                thinking,
+            )
+            .with_runtime_storage(AgentRuntimeStorage::from_data_dir(data_dir))
+            .with_skill_catalog(skill_catalog)
+            .with_skill_catalog_texts(skill_catalog_texts)
+            .with_tool_registry(tool_registry));
         }
         let account =
             provider_account_config(&config, &resolved.provider, Some(&resolved.account)).cloned();
         let options = provider_options_for_model(account.as_ref(), &resolved.model);
-        let skill_catalog = best_effort_reconciled_skill_catalog(data_dir);
-        let skill_catalog_texts = best_effort_skill_catalog_texts(data_dir, &skill_catalog);
         Ok(Self::with_thinking(
             DefaultMainAgentChatModel::configured(
                 data_dir,

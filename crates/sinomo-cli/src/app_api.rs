@@ -875,6 +875,13 @@ impl SifsAgentChannelStore {
         SifsBrowser::open(data_dir).map(Self::from_browser)
     }
 
+    pub fn open_daemon_with_timeout(
+        address: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        SifsBrowser::open_daemon_with_timeout(address, timeout).map(Self::from_browser)
+    }
+
     pub fn open_daemon_on_runtime(
         address: impl Into<String>,
         runtime: &tokio::runtime::Handle,
@@ -7288,9 +7295,16 @@ impl SifsBrowser {
     }
 
     pub fn open_daemon(address: impl Into<String>) -> Result<Self, String> {
+        Self::open_daemon_with_timeout(address, sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT)
+    }
+
+    pub fn open_daemon_with_timeout(
+        address: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
         let backend = RemoteSifsBrowser {
             address: address.into(),
-            timeout: sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
+            timeout,
             runtime: None,
         };
         Self::open_remote_backend(backend)

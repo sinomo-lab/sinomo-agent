@@ -143,6 +143,7 @@ thread_local! {
     static METADATA_BEGIN_WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METADATA_CURRENT_TABLES_SNAPSHOT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METADATA_BACKEND_OPEN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static METADATA_EXPORT_TABLE_SNAPSHOT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METADATA_JOURNAL_WRITE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static NAMESPACE_RECOVERY_PLANNER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static NAMESPACE_PREPARED_COMMIT_REFERENCE_PLANNER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -177,6 +178,16 @@ pub(crate) fn reset_metadata_backend_open_calls() {
 #[cfg(test)]
 pub(crate) fn metadata_backend_open_calls() -> usize {
     METADATA_BACKEND_OPEN_CALLS.get()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_metadata_export_table_snapshot_calls() {
+    METADATA_EXPORT_TABLE_SNAPSHOT_CALLS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn metadata_export_table_snapshot_calls() -> usize {
+    METADATA_EXPORT_TABLE_SNAPSHOT_CALLS.get()
 }
 
 #[cfg(test)]
@@ -1666,6 +1677,9 @@ impl LocalSobjMetadataBackend {
 
     /// Export the current materialized table state for replica snapshot repair.
     pub fn export_table_snapshot(&self) -> DfsMetadataTableSnapshot {
+        #[cfg(test)]
+        METADATA_EXPORT_TABLE_SNAPSHOT_CALLS
+            .set(METADATA_EXPORT_TABLE_SNAPSHOT_CALLS.get().saturating_add(1));
         let mut snapshot = DfsMetadataTableSnapshot {
             format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
             materialized_through_sequence: Some(self.materialized_through_sequence),
@@ -4961,6 +4975,18 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         Ok(write_intents_page_from_tables(&tables, after, max_entries))
     }
 
+    fn write_intents_on_shard_page(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after: Option<&DfsWriteIntentScanCursor>,
+        max_entries: usize,
+    ) -> Result<Option<DfsWriteIntentScanPage>> {
+        if shard_id != &self.shard_id {
+            return Ok(None);
+        }
+        self.write_intents_page(after, max_entries).map(Some)
+    }
+
     fn commit_visible_version(
         &mut self,
         expected_version: &DfsVersion,
@@ -5469,6 +5495,16 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     ) -> Result<Option<DfsNamespacePrepareRecord>> {
         let tables = self.current_tables_snapshot()?;
         Ok(tables.namespace_prepares.get(operation_id).cloned())
+    }
+
+    fn list_prepared_namespace_prepares(&self) -> Result<Vec<DfsNamespacePrepareRecord>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables
+            .namespace_prepares
+            .values()
+            .filter(|prepare| prepare.status == DfsNamespacePrepareStatus::Prepared)
+            .cloned()
+            .collect())
     }
 
     fn tombstone_compaction_projection(
