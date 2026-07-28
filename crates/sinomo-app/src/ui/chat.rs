@@ -17502,6 +17502,7 @@ fn composer_input_row(
             bottom: 4.0,
         })
         .selection_scope(selection.clone())
+        .copy_to_clipboard(true)
         .appearance(FieldAppearance::Bare)
         .theme_when(clone_reader(reader));
     if provider_ready {

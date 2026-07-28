@@ -5353,7 +5353,8 @@ where
         }
     })
     .semantic_name("Settings error")
-    .selectable(error_selection.clone());
+    .selectable(error_selection.clone())
+    .copy_to_clipboard(true);
     let error_text =
         read_only_text_menu(reader, "settings-error", error_text, error_selection, true);
     let status_label = Label::dynamic("Settings status", {
@@ -5684,6 +5685,7 @@ fn selectable_read_only_input(reader: &ThemeReader, name: &str, value: String) -
         .value(value)
         .read_only()
         .selection_scope(selection.clone())
+        .copy_to_clipboard(true)
         .theme_when(clone_reader(reader));
     read_only_text_menu(reader, name, field, selection, has_text)
 }
@@ -5696,6 +5698,7 @@ fn selectable_read_only_area(reader: &ThemeReader, name: &str, value: String) ->
         .value(value)
         .read_only()
         .selection_scope(selection.clone())
+        .copy_to_clipboard(true)
         .theme_when(clone_reader(reader));
     read_only_text_menu(reader, name, field, selection, has_text)
 }
