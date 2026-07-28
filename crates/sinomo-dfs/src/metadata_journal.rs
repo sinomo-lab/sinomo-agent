@@ -58,6 +58,10 @@ struct JournalSegmentFileIdentity {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(windows)]
+    volume_serial_number: Option<u32>,
+    #[cfg(windows)]
+    file_index: Option<u64>,
 }
 
 impl JournalSegmentFileIdentity {
@@ -72,7 +76,17 @@ impl JournalSegmentFileIdentity {
                 inode: metadata.ino(),
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+
+            Self {
+                created: metadata.created().ok(),
+                volume_serial_number: metadata.volume_serial_number(),
+                file_index: metadata.file_index(),
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             Self {
                 created: metadata.created().ok(),
@@ -801,8 +815,12 @@ pub(crate) fn read_segmented_journal_file_since_limited(
             && cached.modified == modified
     });
     let can_extend = cached.as_ref().is_some_and(|cached| {
+        // Unix inode/device and Windows volume/file-index pairs survive an
+        // append while distinguishing replacement files. Other platforms only
+        // expose the weaker creation timestamp, so retain the mtime fence
+        // there instead of extending a possibly stale offset index.
         cached.identity == identity
-            && (cfg!(unix) || cached.modified == modified)
+            && (cfg!(any(unix, windows)) || cached.modified == modified)
             && cached.indexed_bytes == cached.observed_file_len
             && file_bytes > cached.observed_file_len
     });
