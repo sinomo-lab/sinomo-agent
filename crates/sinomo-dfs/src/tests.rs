@@ -13652,6 +13652,23 @@ fn routed_exclusive_create_replays_only_the_exact_request_and_rolls_back_rejecti
         }
     };
 
+    let fresh_replay_probe = command_for(
+        "exclusive-create-fresh-replay-probe",
+        "/users/exclusive-routed-probe",
+    );
+    crate::metadata_sharded_backend::reset_sharded_metadata_object_id_lookup_count();
+    assert!(
+        service
+            .replayed_routed_write_outcome_if_known(&requester, &fresh_replay_probe)
+            .expect("fresh exclusive-create replay lookup")
+            .is_none()
+    );
+    assert_eq!(
+        crate::metadata_sharded_backend::sharded_metadata_object_id_lookup_count(),
+        0,
+        "fresh exclusive-create replay detection must stay on the path-selected shard"
+    );
+
     let command = command_for("exclusive-create-original", "/users/exclusive-routed");
     let first = service
         .handle_distributed_write_request(requester.clone(), command.clone())

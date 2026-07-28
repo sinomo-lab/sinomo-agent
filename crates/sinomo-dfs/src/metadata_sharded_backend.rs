@@ -77,6 +77,22 @@ fn is_source_eviction_tombstone(object: &DfsObjectMetadata) -> bool {
 
 const ROUTING_TOPOLOGY_HISTORY_LIMIT: usize = 4;
 
+#[cfg(test)]
+thread_local! {
+    static SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_sharded_metadata_object_id_lookup_count() {
+    SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn sharded_metadata_object_id_lookup_count() -> usize {
+    SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT.get()
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 struct DfsMetadataRoutingTopologyHistory {
     #[serde(default)]
@@ -1166,6 +1182,12 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn get_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsObjectMetadata>> {
+        #[cfg(test)]
+        SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT.set(
+            SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT
+                .get()
+                .saturating_add(1),
+        );
         if let Some(shard_id) = self.shard_id_for_object(object_id)? {
             return self.shard_backend(&shard_id)?.get_object(object_id);
         }
