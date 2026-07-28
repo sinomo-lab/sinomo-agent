@@ -62,7 +62,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         if manifest.content_hash == content_hash
                             && self
                                 .content
-                                .manifest_content_available(&manifest)
+                                .manifest_storage_candidate_available(&manifest)
                                 .unwrap_or(false) =>
                     {
                         Some(manifest.size_bytes)
@@ -234,7 +234,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 manifest.size_bytes
             ));
         }
-        match self.content.manifest_content_available(&manifest) {
+        match self.content.manifest_storage_candidate_available(&manifest) {
             Ok(true) => None,
             Ok(false) => Some(
                 "local object-version manifest references missing or corrupt content".to_string(),
