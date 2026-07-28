@@ -65,11 +65,12 @@ struct JournalSegmentFileIdentity {
 }
 
 impl JournalSegmentFileIdentity {
-    fn from_metadata(metadata: &fs::Metadata) -> Self {
+    fn from_file_metadata(file: &fs::File, metadata: &fs::Metadata) -> Self {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
 
+            let _ = file;
             Self {
                 created: metadata.created().ok(),
                 device: metadata.dev(),
@@ -78,19 +79,54 @@ impl JournalSegmentFileIdentity {
         }
         #[cfg(windows)]
         {
-            use std::os::windows::fs::MetadataExt;
+            use std::mem::MaybeUninit;
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::HANDLE;
+            use windows_sys::Win32::Storage::FileSystem::{
+                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+            };
+
+            let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+            // SAFETY: `file` owns a live OS handle and `information` points to
+            // writable storage for the exact structure required by Win32.
+            let has_information = unsafe {
+                GetFileInformationByHandle(file.as_raw_handle() as HANDLE, information.as_mut_ptr())
+                    != 0
+            };
+            let information = has_information.then(|| unsafe { information.assume_init() });
 
             Self {
                 created: metadata.created().ok(),
-                volume_serial_number: metadata.volume_serial_number(),
-                file_index: metadata.file_index(),
+                volume_serial_number: information
+                    .as_ref()
+                    .map(|information| information.dwVolumeSerialNumber),
+                file_index: information.as_ref().map(|information| {
+                    (u64::from(information.nFileIndexHigh) << 32)
+                        | u64::from(information.nFileIndexLow)
+                }),
             }
         }
         #[cfg(not(any(unix, windows)))]
         {
+            let _ = file;
             Self {
                 created: metadata.created().ok(),
             }
+        }
+    }
+
+    fn supports_append_extension(&self) -> bool {
+        #[cfg(unix)]
+        {
+            true
+        }
+        #[cfg(windows)]
+        {
+            self.volume_serial_number.is_some() && self.file_index.is_some()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            false
         }
     }
 }
@@ -806,7 +842,7 @@ pub(crate) fn read_segmented_journal_file_since_limited(
         source,
     })?;
     let file_bytes = metadata.len();
-    let identity = JournalSegmentFileIdentity::from_metadata(&metadata);
+    let identity = JournalSegmentFileIdentity::from_file_metadata(&file, &metadata);
     let modified = metadata.modified().ok();
     let cached = cached_journal_segment_index(path);
     let cache_hit = cached.as_ref().is_some_and(|cached| {
@@ -820,7 +856,7 @@ pub(crate) fn read_segmented_journal_file_since_limited(
         // expose the weaker creation timestamp, so retain the mtime fence
         // there instead of extending a possibly stale offset index.
         cached.identity == identity
-            && (cfg!(any(unix, windows)) || cached.modified == modified)
+            && (cached.identity.supports_append_extension() || cached.modified == modified)
             && cached.indexed_bytes == cached.observed_file_len
             && file_bytes > cached.observed_file_len
     });

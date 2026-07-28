@@ -30,6 +30,9 @@ sinomo-core = { path = "../sinomo-core" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-module = { path = "../sinomo-module" }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [dev-dependencies]
 sinomo-core = { path = "../sinomo-core", features = ["network-test-support"] }
 sinomo-testdir = { path = "../sinomo-testdir" }
