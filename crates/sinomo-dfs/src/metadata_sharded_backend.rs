@@ -257,7 +257,7 @@ impl LocalShardedMetadataBackend {
         canonicalize_routing_topology(&mut shards);
         let routing_history = load_routing_topology_history(&root, &shards, initialize_layout)?;
         let mut shard_configs = BTreeMap::new();
-        let mut backends = BTreeMap::new();
+        let mut shard_opens = Vec::with_capacity(shards.len());
         for shard in shards {
             let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
             if shard_configs
@@ -270,31 +270,63 @@ impl LocalShardedMetadataBackend {
                 )));
             }
             let shard_root = root.join(key_segment(&shard_id.0));
-            let backend = if initialize_layout {
-                match LocalSobjMetadataBackend::new(shard_id.clone(), shard_root.clone()) {
-                    Ok(backend) => backend,
-                    Err(open_error)
-                        if replica_repair_local_node_id
-                            .is_some_and(|local_node_id| shard.primary_node_id != *local_node_id) =>
-                    {
-                        LocalSobjMetadataBackend::open_for_replica_repair(
-                            shard_id.clone(),
-                            shard_root,
-                        )
-                        .map_err(|repair_error| {
-                            MetadataBackendError::Serde(format!(
-                                "cannot open replica metadata shard {}: {open_error}; repair-only open failed: {repair_error}",
-                                shard.shard_id
-                            ))
-                        })?
-                    }
-                    Err(error) => return Err(error),
-                }
-            } else {
-                LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), shard_root)?
-            };
-            backends.insert(shard_id, backend);
+            shard_opens.push((shard, shard_id, shard_root));
         }
+        let replica_repair_local_node_id = replica_repair_local_node_id.cloned();
+        let opened = std::thread::scope(|scope| {
+            let handles = shard_opens
+                .into_iter()
+                .map(|(shard, shard_id, shard_root)| {
+                    let replica_repair_local_node_id = replica_repair_local_node_id.as_ref();
+                    scope.spawn(move || {
+                        let backend = if initialize_layout {
+                            match LocalSobjMetadataBackend::new(
+                                shard_id.clone(),
+                                shard_root.clone(),
+                            ) {
+                                Ok(backend) => backend,
+                                Err(open_error)
+                                    if replica_repair_local_node_id.is_some_and(|local_node_id| {
+                                        shard.primary_node_id != *local_node_id
+                                    }) =>
+                                {
+                                    LocalSobjMetadataBackend::open_for_replica_repair(
+                                        shard_id.clone(),
+                                        shard_root,
+                                    )
+                                    .map_err(|repair_error| {
+                                        MetadataBackendError::Serde(format!(
+                                            "cannot open replica metadata shard {}: {open_error}; repair-only open failed: {repair_error}",
+                                            shard.shard_id
+                                        ))
+                                    })?
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        } else {
+                            LocalSobjMetadataBackend::open_for_inspection(
+                                shard_id.clone(),
+                                shard_root,
+                            )?
+                        };
+                        Ok((shard_id, backend))
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().map_err(|_| {
+                        MetadataBackendError::Serde(
+                            "local DFS metadata shard open worker panicked".to_string(),
+                        )
+                    })?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        #[cfg(test)]
+        crate::metadata_backend::record_metadata_backend_open_calls_from_workers(opened.len());
+        let backends = opened.into_iter().collect::<BTreeMap<_, _>>();
         let routing_indexes = compile_routing_indexes(shard_configs.values().cloned())?;
         let fallback_routing_indexes = routing_history
             .fallbacks
@@ -304,7 +336,7 @@ impl LocalShardedMetadataBackend {
 
         Ok(Self {
             root,
-            local_node_id: replica_repair_local_node_id.cloned(),
+            local_node_id: replica_repair_local_node_id,
             shard_configs,
             routing_indexes,
             fallback_routing_indexes,

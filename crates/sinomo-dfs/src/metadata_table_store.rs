@@ -12,15 +12,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 
 use serde::ser::{SerializeSeq, SerializeStruct};
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
 use sinomo_core::storage::durable_file;
 use time::OffsetDateTime;
 
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_io::{
-    create_dir_all, encode_sobj, metadata_durable_file_error, read_dir, read_sobj, read_sobj_tree,
-    remove_file_if_exists, sync_dir, write_file_atomic,
+    create_dir_all, encode_sobj, metadata_durable_file_error, read_dir, read_sobj,
+    read_sobj_optional, read_sobj_tree, remove_file_if_exists, sync_dir, write_file_atomic,
+    write_sobj_atomic,
 };
 use crate::metadata_keys::path_record_for_object;
 use crate::metadata_records::{
@@ -52,6 +53,12 @@ pub(crate) fn metadata_table_path(root: &Path) -> PathBuf {
 
 pub(crate) fn metadata_table_snapshot_path(root: &Path) -> PathBuf {
     root.join("records").join("tables").join("snapshot.sobj")
+}
+
+fn metadata_table_snapshot_verification_path(root: &Path) -> PathBuf {
+    root.join("records")
+        .join("tables")
+        .join("snapshot.verified.sobj")
 }
 
 pub(crate) fn metadata_table_checkpoint_log_path(root: &Path) -> PathBuf {
@@ -106,7 +113,7 @@ fn read_metadata_table_state_with_tail_policy(
     root: &Path,
     truncate_torn_tail: bool,
 ) -> Result<DfsMetadataTableState> {
-    let mut state = read_metadata_table_snapshot(root)?;
+    let mut state = read_metadata_table_snapshot(root, truncate_torn_tail)?;
     let checkpoint_path = metadata_table_checkpoint_log_path(root);
     if checkpoint_path.is_file() {
         let replay = replay_metadata_table_batches_after_checkpoint_from(
@@ -152,7 +159,7 @@ fn read_metadata_table_state_with_tail_policy(
 /// Read the immutable snapshot plus the table-log generation rotated for one
 /// background checkpoint, excluding the active log where newer writes land.
 pub(crate) fn read_metadata_table_checkpoint_state(root: &Path) -> Result<DfsMetadataTableState> {
-    let mut state = read_metadata_table_snapshot(root)?;
+    let mut state = read_metadata_table_snapshot(root, false)?;
     let checkpoint_path = metadata_table_checkpoint_log_path(root);
     if !checkpoint_path.is_file() {
         return Ok(state);
@@ -197,7 +204,33 @@ fn truncate_torn_metadata_table_log_tail(path: &Path, offset: u64) -> Result<()>
     Ok(())
 }
 
-fn read_metadata_table_snapshot(root: &Path) -> Result<DfsMetadataTableState> {
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct DfsMetadataTableSnapshotVerification {
+    snapshot_len: u64,
+    snapshot_blake3: String,
+}
+
+fn snapshot_verification_from_bytes(snapshot_bytes: &[u8]) -> DfsMetadataTableSnapshotVerification {
+    DfsMetadataTableSnapshotVerification {
+        snapshot_len: snapshot_bytes.len() as u64,
+        snapshot_blake3: blake3::hash(snapshot_bytes).to_hex().to_string(),
+    }
+}
+
+fn persist_snapshot_verification(
+    root: &Path,
+    verification: &DfsMetadataTableSnapshotVerification,
+) -> Result<()> {
+    write_sobj_atomic(
+        &metadata_table_snapshot_verification_path(root),
+        verification,
+    )
+}
+
+fn read_metadata_table_snapshot(
+    root: &Path,
+    persist_verification: bool,
+) -> Result<DfsMetadataTableState> {
     let path = metadata_table_snapshot_path(root);
     if !path.is_file() {
         return Ok(DfsMetadataTableState::default());
@@ -206,7 +239,27 @@ fn read_metadata_table_snapshot(root: &Path) -> Result<DfsMetadataTableState> {
     let format_version = snapshot.format_version;
     let materialized_through_sequence = snapshot.materialized_through_sequence;
     let prefix_proof = snapshot.prefix_proof.clone();
-    if let Some(expected) = snapshot.semantic_state_fingerprint.as_ref() {
+    let persisted_verification = read_sobj_optional::<DfsMetadataTableSnapshotVerification>(
+        &metadata_table_snapshot_verification_path(root),
+    )
+    .unwrap_or(None);
+    let mut current_verification = None;
+    let snapshot_previously_verified = if let Some(expected) = persisted_verification.as_ref() {
+        let (hash, snapshot_len) =
+            durable_file::file_blake3_hash_and_size(&path).map_err(metadata_durable_file_error)?;
+        let verification = DfsMetadataTableSnapshotVerification {
+            snapshot_len,
+            snapshot_blake3: hash.to_hex().to_string(),
+        };
+        let matches = &verification == expected;
+        current_verification = Some(verification);
+        matches
+    } else {
+        false
+    };
+    if !snapshot_previously_verified
+        && let Some(expected) = snapshot.semantic_state_fingerprint.as_ref()
+    {
         let actual =
             dfs_metadata_table_snapshot_state_fingerprint(&snapshot).map_err(|source| {
                 MetadataBackendError::Serde(format!(
@@ -219,6 +272,20 @@ fn read_metadata_table_snapshot(root: &Path) -> Result<DfsMetadataTableState> {
                 "DFS metadata table snapshot semantic checksum mismatch at {}",
                 path.display()
             )));
+        }
+        if persist_verification {
+            let verification = match current_verification {
+                Some(verification) => verification,
+                None => {
+                    let (hash, snapshot_len) = durable_file::file_blake3_hash_and_size(&path)
+                        .map_err(metadata_durable_file_error)?;
+                    DfsMetadataTableSnapshotVerification {
+                        snapshot_len,
+                        snapshot_blake3: hash.to_hex().to_string(),
+                    }
+                }
+            };
+            let _ = persist_snapshot_verification(root, &verification);
         }
     }
     if let Some(proof) = prefix_proof.as_ref()
@@ -503,6 +570,9 @@ pub(crate) fn install_encoded_metadata_table_snapshot(
     root: &Path,
     snapshot_bytes: &[u8],
 ) -> Result<()> {
+    // Callers may install bytes received from another authority. Only the
+    // normal read path may issue a verification receipt after checking the
+    // embedded semantic fingerprint.
     write_file_atomic(&metadata_table_snapshot_path(root), snapshot_bytes)
 }
 
@@ -806,6 +876,7 @@ pub(crate) fn persist_metadata_table_snapshot(
     let snapshot_bytes =
         encode_metadata_table_snapshot(tables, materialized_through_sequence, prefix_proof)?;
     write_file_atomic(&metadata_table_snapshot_path(root), &snapshot_bytes)?;
+    let _ = persist_snapshot_verification(root, &snapshot_verification_from_bytes(&snapshot_bytes));
     truncate_metadata_table_log(root)?;
     remove_metadata_table_checkpoint_log(root)?;
     Ok(())
@@ -1311,4 +1382,47 @@ fn load_legacy_metadata_tables(root: &Path) -> Result<DfsMetadataTables> {
         tables.apply(DfsMetadataTableOp::PutNamespaceTransaction { transaction });
     }
     Ok(tables)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verified_snapshot_receipt_skips_reencoding_unchanged_semantic_state() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-table-snapshot-verification");
+        let tables = DfsMetadataTables::default();
+        persist_metadata_table_snapshot(root.path(), &tables, None, None)
+            .expect("persist verified snapshot");
+
+        crate::metadata_records::reset_dfs_metadata_full_snapshot_fingerprint_calls();
+        read_metadata_table_state(root.path()).expect("read verified snapshot");
+        assert_eq!(
+            crate::metadata_records::dfs_metadata_full_snapshot_fingerprint_calls(),
+            0,
+            "a raw-content-matched receipt must avoid rebuilding the semantic snapshot"
+        );
+
+        let replacement = encode_metadata_table_snapshot(&tables, Some(1), None)
+            .expect("encode replacement snapshot");
+        write_file_atomic(&metadata_table_snapshot_path(root.path()), &replacement)
+            .expect("replace snapshot without its verification receipt");
+        crate::metadata_records::reset_dfs_metadata_full_snapshot_fingerprint_calls();
+        let replaced =
+            read_metadata_table_state(root.path()).expect("validate replacement snapshot");
+        assert_eq!(replaced.materialized_through_sequence, Some(1));
+        assert_eq!(
+            crate::metadata_records::dfs_metadata_full_snapshot_fingerprint_calls(),
+            1,
+            "changed snapshot bytes must invalidate the old verification receipt"
+        );
+
+        crate::metadata_records::reset_dfs_metadata_full_snapshot_fingerprint_calls();
+        read_metadata_table_state(root.path()).expect("read repaired verification receipt");
+        assert_eq!(
+            crate::metadata_records::dfs_metadata_full_snapshot_fingerprint_calls(),
+            0,
+            "successful validation must repair the derived receipt for later opens"
+        );
+    }
 }

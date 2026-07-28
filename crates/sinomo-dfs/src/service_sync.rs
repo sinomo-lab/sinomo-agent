@@ -319,7 +319,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(0);
         };
         let mut rebound = 0usize;
+        let mut hydration_required = false;
         for (active, pending, proof) in observed {
+            let shard_id = DfsMetadataShardId::new(active.shard_id.clone());
+            let prefix_before = backend.metadata_prefix_proof(&shard_id)?;
             if rebind_completed_metadata_shard_membership_handoff(
                 backend,
                 &self.node_id,
@@ -328,9 +331,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 proof.as_ref(),
             )? {
                 rebound = rebound.saturating_add(1);
+                // A freshly opened marker-bearing backend may already have
+                // supplied the exact durable state used by the service's
+                // initial hydration. Rebinding still grants this backend
+                // instance authority, but repeating the full object/receipt/
+                // intent scan is necessary only when refresh or deferred
+                // recovery advanced the exact durable prefix.
+                hydration_required |= backend.metadata_prefix_proof(&shard_id)? != prefix_before;
             }
         }
-        if rebound > 0 {
+        if hydration_required {
             // `clear_*` runs the append-producing recovery deliberately
             // deferred by backend open while a marker is present. Reflect any
             // recovered objects, transactions, and coordinator state before
@@ -4220,9 +4230,15 @@ mod tests {
         .with_control_plane(control_plane.clone())
         .with_metadata_backend(fresh_after_append_backend)
         .expect("fresh service after active append");
+        crate::service_hydration::reset_full_metadata_hydration_calls();
         fresh_after_append
             .bootstrap_distributed_sifs()
             .expect("contiguous post-activation prefix rebinds");
+        assert_eq!(
+            crate::service_hydration::full_metadata_hydration_calls(),
+            0,
+            "binding an already-current durable prefix must not repeat full hydration"
+        );
         assert_eq!(
             fresh_after_append
                 .metadata()
@@ -4230,9 +4246,15 @@ mod tests {
             Some(&recovered_after_mount_open)
         );
 
+        crate::service_hydration::reset_full_metadata_hydration_calls();
         mounted
             .bootstrap_distributed_sifs()
             .expect("bootstrap rebinds the exact completed generation");
+        assert_eq!(
+            crate::service_hydration::full_metadata_hydration_calls(),
+            1,
+            "a durable prefix advanced after initial hydration must be rehydrated"
+        );
         assert_eq!(
             mounted
                 .metadata()

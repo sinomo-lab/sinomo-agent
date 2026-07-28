@@ -123,7 +123,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use time::OffsetDateTime;
 
-const DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES: u64 = 64 * 1024 * 1024;
+// Table-log replay is paid by every full SIFS service open. Keep the active
+// append generation bounded enough that cold hydration does not spend seconds
+// rebuilding a shard, while the checkpoint worker still rotates it in the
+// background so foreground writes are not blocked on snapshot encoding.
+const DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES: u64 = 8 * 1024 * 1024;
 
 struct PlannedWrittenJournalTableOps {
     applied: usize,
@@ -185,6 +189,11 @@ pub(crate) fn reset_metadata_backend_open_calls() {
 #[cfg(test)]
 pub(crate) fn metadata_backend_open_calls() -> usize {
     METADATA_BACKEND_OPEN_CALLS.get()
+}
+
+#[cfg(test)]
+pub(crate) fn record_metadata_backend_open_calls_from_workers(count: usize) {
+    METADATA_BACKEND_OPEN_CALLS.set(METADATA_BACKEND_OPEN_CALLS.get().saturating_add(count));
 }
 
 #[cfg(test)]

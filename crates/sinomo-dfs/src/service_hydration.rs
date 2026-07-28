@@ -15,6 +15,22 @@ use crate::*;
 
 type HydrationReceiptsByVersion = BTreeMap<(DfsObjectId, DfsVersion), Vec<DfsReplicaReceiptRecord>>;
 
+#[cfg(test)]
+thread_local! {
+    static FULL_METADATA_HYDRATION_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_full_metadata_hydration_calls() {
+    FULL_METADATA_HYDRATION_CALLS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn full_metadata_hydration_calls() -> usize {
+    FULL_METADATA_HYDRATION_CALLS.get()
+}
+
 fn hydration_never_cancelled() -> bool {
     false
 }
@@ -184,6 +200,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if should_cancel() {
             return Ok(false);
         }
+        #[cfg(test)]
+        FULL_METADATA_HYDRATION_CALLS.set(FULL_METADATA_HYDRATION_CALLS.get().saturating_add(1));
 
         let file_systems = self
             .metadata_backend
@@ -211,7 +229,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if !self.rebuild_cross_shard_namespace_locks_until_cancelled(should_cancel)? {
             return Ok(false);
         }
-
         for file_system in &file_systems {
             if should_cancel() {
                 return Ok(false);
@@ -234,7 +251,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if !self.recover_durable_namespace_prepares_until_cancelled(should_cancel)? {
             return Ok(false);
         }
-
         for file_system in &file_systems {
             if !try_walk_metadata_pages_until_cancelled(should_cancel, |cursor| {
                 let page = self
@@ -260,7 +276,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Ok(false);
             }
         }
-
         // Conflicts already have a global cursor-backed index. Scanning that
         // index once avoids one empty per-object lookup (and its table refresh
         // checks) for every hydrated object. On a mount with thousands of
@@ -278,7 +293,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })? {
             return Ok(false);
         }
-
         // Receipts already have a global cursor-backed index. Materialize it
         // once for restart hydration instead of doing two object/version scans
         // for every restorable intent (coordinator receipt restore followed by
@@ -304,7 +318,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })? {
             return Ok(false);
         }
-
         let Some(durable_write_intent_shards) =
             self.durable_write_intent_shards_until_cancelled(should_cancel)?
         else {
@@ -558,7 +571,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.apply_recovered_commit_ready_intent(&intent_id)?;
             self.cleanup_committed_pending_write_if_repaired(&intent_id);
         }
-
         // Request-owned namespace prepares were completed before the object
         // scan above. Any admission which crashed before it could persist a
         // prepare is now safe to resume from its exact durable operation. The
