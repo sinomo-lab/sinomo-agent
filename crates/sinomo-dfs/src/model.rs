@@ -175,6 +175,8 @@ pub enum DfsTombstoneProvenance {
     SourceEviction {
         source_shard_id: crate::DfsMetadataShardId,
         target_shard_id: crate::DfsMetadataShardId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pin_transfer_id: Option<String>,
     },
 }
 

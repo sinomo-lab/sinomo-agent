@@ -31,14 +31,24 @@ pub(crate) fn journal_entry_has_replay_payloads(entry: &DfsMetadataJournalEntry)
         DfsMetadataMutation::PutFileSystem { file_system, .. } => file_system.is_some(),
         DfsMetadataMutation::PutObject { object, .. } => object.is_some(),
         DfsMetadataMutation::PutVersion { version_record, .. } => version_record.is_some(),
+        DfsMetadataMutation::RemoveVersion { .. } => true,
+        DfsMetadataMutation::PutVersionPin { .. }
+        | DfsMetadataMutation::RemoveVersionPin { .. }
+        | DfsMetadataMutation::ReconcileCrossShardPinTransfer { .. }
+        | DfsMetadataMutation::RemoveCrossShardPinTransfer { .. }
+        | DfsMetadataMutation::FinalizeCrossShardSourceEviction { .. } => true,
         DfsMetadataMutation::PutReceipt { receipt, .. } => receipt.is_some(),
         DfsMetadataMutation::RemoveReceipt { .. } => true,
         DfsMetadataMutation::PutIntent { intent, .. } => intent.is_some(),
+        DfsMetadataMutation::PutIntentReceipt { .. }
+        | DfsMetadataMutation::RemoveIntentReceipt { .. }
+        | DfsMetadataMutation::MergeIntentReceiptRetention { .. } => true,
         DfsMetadataMutation::CommitVisibleVersion {
             committed_object,
             visible_version,
             ..
         } => committed_object.is_some() && visible_version.is_some(),
+        DfsMetadataMutation::RemoveVisibleCommit { .. } => true,
         DfsMetadataMutation::PutConflict { conflict, .. } => conflict.is_some(),
         DfsMetadataMutation::PutAdvisoryLockState { state, .. } => state.is_some(),
         DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => transaction.is_some(),
@@ -46,8 +56,13 @@ pub(crate) fn journal_entry_has_replay_payloads(entry: &DfsMetadataJournalEntry)
         DfsMetadataMutation::PutNamespaceJob { job, .. } => job.is_some(),
         DfsMetadataMutation::PutNamespaceRequest { .. }
         | DfsMetadataMutation::PutNamespaceTransactionReceipt { .. }
+        | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { .. }
         | DfsMetadataMutation::PutNamespacePrepareReceipt { .. }
+        | DfsMetadataMutation::RemoveNamespacePrepareReceipt { .. }
+        | DfsMetadataMutation::PutNamespaceJobReceipt { .. }
+        | DfsMetadataMutation::RemoveNamespaceJobReceipt { .. }
         | DfsMetadataMutation::PutNamespaceRequestReceipt { .. } => true,
+        DfsMetadataMutation::RemoveNamespaceRequestReceipt { .. } => true,
     }
 }
 
@@ -69,7 +84,22 @@ pub(crate) fn require_journal_entry_replay_payloads(entry: &DfsMetadataJournalEn
         DfsMetadataMutation::PutReceipt { receipt, .. } => {
             required_replay_payload(entry, "put-receipt", receipt.as_ref())?;
         }
-        DfsMetadataMutation::RemoveReceipt { .. } | DfsMetadataMutation::PutConflict { .. } => {}
+        DfsMetadataMutation::RemoveVersion { .. }
+        | DfsMetadataMutation::PutVersionPin { .. }
+        | DfsMetadataMutation::RemoveVersionPin { .. }
+        | DfsMetadataMutation::ReconcileCrossShardPinTransfer { .. }
+        | DfsMetadataMutation::RemoveCrossShardPinTransfer { .. }
+        | DfsMetadataMutation::FinalizeCrossShardSourceEviction { .. }
+        | DfsMetadataMutation::RemoveReceipt { .. }
+        | DfsMetadataMutation::PutIntentReceipt { .. }
+        | DfsMetadataMutation::RemoveIntentReceipt { .. }
+        | DfsMetadataMutation::MergeIntentReceiptRetention { .. }
+        | DfsMetadataMutation::RemoveVisibleCommit { .. }
+        | DfsMetadataMutation::RemoveNamespaceJobReceipt { .. }
+        | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { .. }
+        | DfsMetadataMutation::RemoveNamespacePrepareReceipt { .. }
+        | DfsMetadataMutation::RemoveNamespaceRequestReceipt { .. }
+        | DfsMetadataMutation::PutConflict { .. } => {}
         DfsMetadataMutation::PutIntent { intent, .. } => {
             required_replay_payload(entry, "put-intent", intent.as_ref())?;
         }
@@ -104,6 +134,7 @@ pub(crate) fn require_journal_entry_replay_payloads(entry: &DfsMetadataJournalEn
         DfsMetadataMutation::PutNamespaceRequest { .. }
         | DfsMetadataMutation::PutNamespaceTransactionReceipt { .. }
         | DfsMetadataMutation::PutNamespacePrepareReceipt { .. }
+        | DfsMetadataMutation::PutNamespaceJobReceipt { .. }
         | DfsMetadataMutation::PutNamespaceRequestReceipt { .. } => {}
     }
     Ok(())
@@ -172,19 +203,36 @@ pub(crate) fn require_replica_journal_entry_file_system(
         DfsMetadataMutation::PutFileSystem { file_system_id, .. }
         | DfsMetadataMutation::PutObject { file_system_id, .. }
         | DfsMetadataMutation::PutVersion { file_system_id, .. }
+        | DfsMetadataMutation::RemoveVersion { file_system_id, .. }
+        | DfsMetadataMutation::PutVersionPin { file_system_id, .. }
+        | DfsMetadataMutation::RemoveVersionPin { file_system_id, .. }
+        | DfsMetadataMutation::ReconcileCrossShardPinTransfer { file_system_id, .. }
+        | DfsMetadataMutation::RemoveCrossShardPinTransfer { file_system_id, .. }
+        | DfsMetadataMutation::FinalizeCrossShardSourceEviction { file_system_id, .. }
         | DfsMetadataMutation::PutReceipt { file_system_id, .. }
         | DfsMetadataMutation::RemoveReceipt { file_system_id, .. }
         | DfsMetadataMutation::PutIntent { file_system_id, .. }
+        | DfsMetadataMutation::PutIntentReceipt { file_system_id, .. }
+        | DfsMetadataMutation::RemoveIntentReceipt { file_system_id, .. }
+        | DfsMetadataMutation::MergeIntentReceiptRetention { file_system_id, .. }
         | DfsMetadataMutation::CommitVisibleVersion { file_system_id, .. }
+        | DfsMetadataMutation::RemoveVisibleCommit { file_system_id, .. }
         | DfsMetadataMutation::PutConflict { file_system_id, .. }
         | DfsMetadataMutation::PutAdvisoryLockState { file_system_id, .. }
         | DfsMetadataMutation::ApplyNamespaceTransaction { file_system_id, .. }
         | DfsMetadataMutation::PutNamespaceTransactionReceipt { file_system_id, .. }
+        | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { file_system_id, .. }
         | DfsMetadataMutation::PutNamespacePrepare { file_system_id, .. }
         | DfsMetadataMutation::PutNamespacePrepareReceipt { file_system_id, .. }
+        | DfsMetadataMutation::RemoveNamespacePrepareReceipt { file_system_id, .. }
         | DfsMetadataMutation::PutNamespaceJob { file_system_id, .. }
+        | DfsMetadataMutation::PutNamespaceJobReceipt { file_system_id, .. }
+        | DfsMetadataMutation::RemoveNamespaceJobReceipt { file_system_id, .. }
         | DfsMetadataMutation::PutNamespaceRequest { file_system_id, .. }
-        | DfsMetadataMutation::PutNamespaceRequestReceipt { file_system_id, .. } => file_system_id,
+        | DfsMetadataMutation::PutNamespaceRequestReceipt { file_system_id, .. }
+        | DfsMetadataMutation::RemoveNamespaceRequestReceipt { file_system_id, .. } => {
+            file_system_id
+        }
     };
     require_replica_record_file_system(entry, "outer mutation", outer_file_system_id, expected)?;
 
@@ -216,6 +264,69 @@ pub(crate) fn require_replica_journal_entry_file_system(
             &version.file_system_id,
             expected,
         ),
+        DfsMetadataMutation::PutVersionPin { pin, .. } => require_replica_record_file_system(
+            entry,
+            "metadata version pin",
+            &pin.file_system_id,
+            expected,
+        ),
+        DfsMetadataMutation::ReconcileCrossShardPinTransfer {
+            versions, transfer, ..
+        } => {
+            require_replica_record_file_system(
+                entry,
+                "cross-shard pin transfer",
+                &transfer.file_system_id,
+                expected,
+            )?;
+            for pin in &transfer.source_pins {
+                require_replica_record_file_system(
+                    entry,
+                    "cross-shard copied version pin",
+                    &pin.file_system_id,
+                    expected,
+                )?;
+            }
+            for version in versions {
+                require_replica_record_file_system(
+                    entry,
+                    "cross-shard pin-transfer version",
+                    &version.file_system_id,
+                    expected,
+                )?;
+            }
+            Ok(())
+        }
+        DfsMetadataMutation::FinalizeCrossShardSourceEviction {
+            tombstone,
+            removed_pins,
+            removed_pin_transfers,
+            ..
+        } => {
+            require_replica_record_file_system(
+                entry,
+                "cross-shard source-eviction tombstone",
+                &tombstone.file_system_id,
+                expected,
+            )?;
+            for pin in removed_pins {
+                require_replica_record_file_system(
+                    entry,
+                    "cross-shard source-eviction pin",
+                    &pin.file_system_id,
+                    expected,
+                )?;
+            }
+            for transfer in removed_pin_transfers {
+                require_replica_record_file_system(
+                    entry,
+                    "cross-shard source-eviction pin transfer",
+                    &transfer.file_system_id,
+                    expected,
+                )?;
+            }
+            Ok(())
+        }
         DfsMetadataMutation::PutReceipt {
             receipt: Some(receipt),
             ..
@@ -244,6 +355,14 @@ pub(crate) fn require_replica_journal_entry_file_system(
                 )?;
             }
             Ok(())
+        }
+        DfsMetadataMutation::PutIntentReceipt { receipt, .. } => {
+            require_replica_record_file_system(
+                entry,
+                "intent receipt",
+                &receipt.file_system_id,
+                expected,
+            )
         }
         DfsMetadataMutation::CommitVisibleVersion {
             committed_object: Some(object),
@@ -330,6 +449,14 @@ pub(crate) fn require_replica_journal_entry_file_system(
                 expected,
             )
         }
+        DfsMetadataMutation::PutNamespaceJobReceipt { receipt, .. } => {
+            require_replica_record_file_system(
+                entry,
+                "namespace job receipt",
+                &receipt.file_system_id,
+                expected,
+            )
+        }
         DfsMetadataMutation::PutNamespaceRequest { request, .. } => {
             require_replica_record_file_system(
                 entry,
@@ -346,7 +473,17 @@ pub(crate) fn require_replica_journal_entry_file_system(
                 expected,
             )
         }
-        DfsMetadataMutation::RemoveReceipt { .. }
+        DfsMetadataMutation::RemoveVersion { .. }
+        | DfsMetadataMutation::RemoveVersionPin { .. }
+        | DfsMetadataMutation::RemoveCrossShardPinTransfer { .. }
+        | DfsMetadataMutation::RemoveReceipt { .. }
+        | DfsMetadataMutation::RemoveIntentReceipt { .. }
+        | DfsMetadataMutation::MergeIntentReceiptRetention { .. }
+        | DfsMetadataMutation::RemoveVisibleCommit { .. }
+        | DfsMetadataMutation::RemoveNamespaceJobReceipt { .. }
+        | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { .. }
+        | DfsMetadataMutation::RemoveNamespacePrepareReceipt { .. }
+        | DfsMetadataMutation::RemoveNamespaceRequestReceipt { .. }
         | DfsMetadataMutation::PutConflict { conflict: None, .. } => Ok(()),
         // Payload completeness was checked above. These arms only keep this
         // match exhaustive without re-unwrapping every option.

@@ -1010,6 +1010,24 @@ pub(crate) fn prune_segmented_journal_before_checkpoint(
     if checkpoint_sequence == 0 {
         return Ok(0);
     }
+    // Default-SIFS rebalancing persists journal cursors beside the shard
+    // directories. Its object-family transfer is incremental rather than an
+    // exact shard snapshot install, so a suffix named by one of those cursors
+    // must remain available. The migration clears its cursor after its final
+    // journal fence; the next checkpoint can reclaim the accumulated segments.
+    let active_migration_cursor_dir = root
+        .parent()
+        .map(|metadata_root| metadata_root.join("shard-index").join("migration-cursors"));
+    if let Some(cursor_dir) = active_migration_cursor_dir
+        && cursor_dir.exists()
+        && read_dir(&cursor_dir)?.into_iter().any(|entry| {
+            let path = entry.path();
+            path.is_file()
+                && path.extension().and_then(|extension| extension.to_str()) == Some("sobj")
+        })
+    {
+        return Ok(0);
+    }
     let retain_segment_id = journal_segment_id(checkpoint_sequence);
     if retain_segment_id <= 1 {
         return Ok(0);
@@ -1132,6 +1150,42 @@ mod tests {
             vec![first_in_segment_three],
             "a lagging replica must observe a non-contiguous retained entry and request a snapshot"
         );
+    }
+
+    #[test]
+    fn checkpoint_pruning_waits_for_durable_default_sifs_migration_cursor() {
+        let metadata_root = sinomo_testdir::TestDir::new("dfs-journal-migration-prune-fence");
+        let shard_root = metadata_root.join("services");
+        let first_in_segment_two = JOURNAL_SEGMENT_ENTRY_LIMIT + 1;
+        let first_in_segment_three = JOURNAL_SEGMENT_ENTRY_LIMIT * 2 + 1;
+        for sequence in [1, first_in_segment_two, first_in_segment_three] {
+            append_segmented_journal_entry(&shard_root, &test_journal_entry(sequence))
+                .expect("append migration-fenced segment");
+        }
+
+        let cursor_dir = metadata_root.join("shard-index").join("migration-cursors");
+        create_dir_all(cursor_dir.clone()).expect("migration cursor directory");
+        let cursor_path = cursor_dir.join("default-sifs-test.sobj");
+        fs::write(&cursor_path, b"durable migration cursor").expect("migration cursor");
+
+        assert_eq!(
+            prune_segmented_journal_before_checkpoint(&shard_root, first_in_segment_three)
+                .expect("fenced prune"),
+            0
+        );
+        let segments = shard_root.join("journal").join("segments");
+        assert!(segments.join(format!("{:020}.slog", 1)).is_file());
+        assert!(segments.join(format!("{:020}.slog", 2)).is_file());
+
+        remove_file_if_exists(&cursor_path).expect("clear migration cursor");
+        assert_eq!(
+            prune_segmented_journal_before_checkpoint(&shard_root, first_in_segment_three)
+                .expect("post-migration prune"),
+            2
+        );
+        assert!(!segments.join(format!("{:020}.slog", 1)).exists());
+        assert!(!segments.join(format!("{:020}.slog", 2)).exists());
+        assert!(segments.join(format!("{:020}.slog", 3)).is_file());
     }
 
     fn linear_bounded_metadata_journal_batch(

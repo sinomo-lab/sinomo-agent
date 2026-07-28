@@ -21,8 +21,8 @@ use crate::posix_path::{
 };
 use crate::{
     DfsMessageCommittedWork, DfsMessageTransport, DfsNamespaceJobFrame, DfsNamespaceJobKind,
-    DfsNamespaceJobRecord, DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNamespaceTransaction,
-    DfsObjectId, DfsObjectKind, DfsObjectMetadata, NetworkedDfsService,
+    DfsNamespaceJobOrigin, DfsNamespaceJobRecord, DfsNamespaceJobStatus, DfsNamespaceOperation,
+    DfsNamespaceTransaction, DfsObjectId, DfsObjectKind, DfsObjectMetadata, NetworkedDfsService,
 };
 
 pub(super) fn namespace_job_kind_is_cross_shard(kind: &DfsNamespaceJobKind) -> bool {
@@ -325,6 +325,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(DfsNamespaceJobRecord {
             job_id,
             file_system_id: directory.file_system_id,
+            origin: self
+                .active_durable_namespace_request
+                .as_ref()
+                .map(DfsNamespaceJobOrigin::from_request),
             kind: DfsNamespaceJobKind::ClearDirectoryRecursive,
             status: DfsNamespaceJobStatus::Running,
             root_path: path.to_string(),
@@ -665,6 +669,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(DfsNamespaceJobRecord {
             job_id,
             file_system_id: source.file_system_id.clone(),
+            origin: self
+                .active_durable_namespace_request
+                .as_ref()
+                .map(DfsNamespaceJobOrigin::from_request),
             kind: DfsNamespaceJobKind::RenameDirectory,
             status: DfsNamespaceJobStatus::Running,
             root_path: from.to_string(),

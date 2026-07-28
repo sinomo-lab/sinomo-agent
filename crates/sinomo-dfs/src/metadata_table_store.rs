@@ -600,8 +600,12 @@ impl Serialize for BorrowedMetadataTableSnapshotTables<'_> {
             !tables.hardlinks.is_empty(),
             !tables.compacted_tombstones.is_empty(),
             !tables.versions.is_empty(),
+            !tables.version_pins.is_empty(),
+            !tables.cross_shard_pin_transfers.is_empty(),
             !tables.receipts.is_empty(),
             !tables.intents.is_empty(),
+            !tables.intent_receipts.is_empty(),
+            !tables.intent_receipt_retention.is_empty(),
             !tables.conflicts.is_empty(),
             !tables.advisory_lock_states.is_empty(),
             !tables.visible_commits.is_empty(),
@@ -610,6 +614,7 @@ impl Serialize for BorrowedMetadataTableSnapshotTables<'_> {
             !tables.namespace_prepares.is_empty(),
             !tables.namespace_prepare_receipts.is_empty(),
             !tables.namespace_jobs.is_empty(),
+            !tables.namespace_job_receipts.is_empty(),
             !tables.namespace_request_receipts.is_empty(),
             !tables.namespace_receipt_retention.is_empty(),
         ]
@@ -654,11 +659,29 @@ impl Serialize for BorrowedMetadataTableSnapshotTables<'_> {
         if !tables.versions.is_empty() {
             state.serialize_field("versions", &BorrowedMapValues(&tables.versions))?;
         }
+        if !tables.version_pins.is_empty() {
+            state.serialize_field("version_pins", &BorrowedMapValues(&tables.version_pins))?;
+        }
+        if !tables.cross_shard_pin_transfers.is_empty() {
+            state.serialize_field(
+                "cross_shard_pin_transfers",
+                &BorrowedMapValues(&tables.cross_shard_pin_transfers),
+            )?;
+        }
         if !tables.receipts.is_empty() {
             state.serialize_field("receipts", &BorrowedMapValues(&tables.receipts))?;
         }
         if !tables.intents.is_empty() {
             state.serialize_field("intents", &BorrowedMapValues(&tables.intents))?;
+        }
+        if !tables.intent_receipts.is_empty() {
+            state.serialize_field(
+                "intent_receipts",
+                &BorrowedMapValues(&tables.intent_receipts),
+            )?;
+        }
+        if !tables.intent_receipt_retention.is_empty() {
+            state.serialize_field("intent_receipt_retention", &tables.intent_receipt_retention)?;
         }
         if !tables.conflicts.is_empty() {
             state.serialize_field("conflicts", &BorrowedMapValues(&tables.conflicts))?;
@@ -698,6 +721,12 @@ impl Serialize for BorrowedMetadataTableSnapshotTables<'_> {
         }
         if !tables.namespace_jobs.is_empty() {
             state.serialize_field("namespace_jobs", &BorrowedMapValues(&tables.namespace_jobs))?;
+        }
+        if !tables.namespace_job_receipts.is_empty() {
+            state.serialize_field(
+                "namespace_job_receipts",
+                &BorrowedMapValues(&tables.namespace_job_receipts),
+            )?;
         }
         if !tables.namespace_request_receipts.is_empty() {
             state.serialize_field(
@@ -840,8 +869,12 @@ pub(crate) fn metadata_tables_snapshot(
             .collect(),
         compacted_tombstones: tables.compacted_tombstones.values().cloned().collect(),
         versions: tables.versions.values().cloned().collect(),
+        version_pins: tables.version_pins.values().cloned().collect(),
+        cross_shard_pin_transfers: tables.cross_shard_pin_transfers.values().cloned().collect(),
         receipts: tables.receipts.values().cloned().collect(),
         intents: tables.intents.values().cloned().collect(),
+        intent_receipts: tables.intent_receipts.values().cloned().collect(),
+        intent_receipt_retention: tables.intent_receipt_retention.clone(),
         conflicts: tables.conflicts.values().cloned().collect(),
         advisory_lock_states: tables.advisory_lock_states.values().cloned().collect(),
         visible_commits: tables
@@ -868,6 +901,7 @@ pub(crate) fn metadata_tables_snapshot(
             .cloned()
             .collect(),
         namespace_jobs: tables.namespace_jobs.values().cloned().collect(),
+        namespace_job_receipts: tables.namespace_job_receipts.values().cloned().collect(),
         namespace_request_receipts: tables
             .namespace_request_receipts
             .values()
@@ -881,6 +915,7 @@ pub(crate) fn metadata_tables_snapshot(
 fn metadata_tables_from_snapshot(snapshot: DfsMetadataTableSnapshotTables) -> DfsMetadataTables {
     let mut tables = DfsMetadataTables::default();
     tables.namespace_receipt_retention = snapshot.namespace_receipt_retention;
+    tables.intent_receipt_retention = snapshot.intent_receipt_retention;
     for file_system in snapshot.file_systems {
         tables.apply(DfsMetadataTableOp::PutFileSystem { file_system });
     }
@@ -915,11 +950,23 @@ fn metadata_tables_from_snapshot(snapshot: DfsMetadataTableSnapshotTables) -> Df
     for version in snapshot.versions {
         tables.apply(DfsMetadataTableOp::PutVersion { version });
     }
+    for pin in snapshot.version_pins {
+        tables.apply(DfsMetadataTableOp::PutVersionPin { pin });
+    }
+    for transfer in snapshot.cross_shard_pin_transfers {
+        tables.cross_shard_pin_transfers.insert(
+            (transfer.object_id.clone(), transfer.transfer_id.clone()),
+            transfer,
+        );
+    }
     for receipt in snapshot.receipts {
         tables.apply(DfsMetadataTableOp::PutReceipt { receipt });
     }
     for intent in snapshot.intents {
         tables.apply(DfsMetadataTableOp::PutIntent { intent });
+    }
+    for receipt in snapshot.intent_receipts {
+        tables.apply(DfsMetadataTableOp::PutIntentReceipt { receipt });
     }
     for conflict in snapshot.conflicts {
         tables.apply(DfsMetadataTableOp::PutConflict { conflict });
@@ -948,6 +995,9 @@ fn metadata_tables_from_snapshot(snapshot: DfsMetadataTableSnapshotTables) -> Df
     }
     for job in snapshot.namespace_jobs {
         tables.apply(DfsMetadataTableOp::PutNamespaceJob { job });
+    }
+    for receipt in snapshot.namespace_job_receipts {
+        tables.apply(DfsMetadataTableOp::PutNamespaceJobReceipt { receipt });
     }
     for request in snapshot.namespace_requests {
         tables.apply(DfsMetadataTableOp::PutNamespaceRequest { request });
@@ -1139,6 +1189,13 @@ pub(crate) fn metadata_table_snapshot_ops(tables: &DfsMetadataTables) -> Vec<Dfs
             .values()
             .cloned()
             .map(|job| DfsMetadataTableOp::PutNamespaceJob { job }),
+    );
+    ops.extend(
+        tables
+            .namespace_job_receipts
+            .values()
+            .cloned()
+            .map(|receipt| DfsMetadataTableOp::PutNamespaceJobReceipt { receipt }),
     );
     ops.extend(
         tables

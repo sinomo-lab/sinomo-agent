@@ -10,8 +10,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use time::OffsetDateTime;
-
 use crate::metadata_cursor::journal_write_lock_path;
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_journal::prune_segmented_journal_before_checkpoint;
@@ -25,8 +23,7 @@ use crate::metadata_table_store::{
     rotate_metadata_table_log_for_checkpoint,
 };
 use crate::metadata_tables::{
-    DfsMetadataTableRollback, DfsMetadataTables, DfsNamespaceReceiptRetentionLimits,
-    MetadataTableSnapshotFingerprint,
+    DfsMetadataTableRollback, DfsMetadataTables, MetadataTableSnapshotFingerprint,
 };
 
 static METADATA_TABLE_CHECKPOINT_WORKERS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
@@ -65,22 +62,6 @@ pub(crate) fn compact_metadata_table_log_if_needed(
     state: TableMaterializationState<'_>,
     max_log_bytes: u64,
 ) -> Result<()> {
-    compact_metadata_table_log_if_needed_with_retention(
-        root,
-        state,
-        max_log_bytes,
-        OffsetDateTime::now_utc(),
-        DfsNamespaceReceiptRetentionLimits::default(),
-    )
-}
-
-pub(crate) fn compact_metadata_table_log_if_needed_with_retention(
-    root: &Path,
-    state: TableMaterializationState<'_>,
-    max_log_bytes: u64,
-    checkpoint_time: OffsetDateTime,
-    retention_limits: DfsNamespaceReceiptRetentionLimits,
-) -> Result<()> {
     let path = metadata_table_path(root);
     let has_rotated_checkpoint = metadata_table_checkpoint_log_path(root).is_file();
     let len = match fs::metadata(&path) {
@@ -99,14 +80,9 @@ pub(crate) fn compact_metadata_table_log_if_needed_with_retention(
     if len <= max_log_bytes && !has_rotated_checkpoint {
         return Ok(());
     }
-    state
-        .tables
-        .compact_terminal_namespace_history(checkpoint_time, retention_limits)
-        .map_err(|source| {
-            MetadataBackendError::Serde(format!(
-                "compact terminal namespace metadata into receipts: {source}"
-            ))
-        })?;
+    // Observable history transitions are authoritative journal mutations.
+    // Snapshot-only body folding would leave an incremental replica with old
+    // recovery records capable of resurrecting metadata after promotion.
     persist_metadata_table_snapshot(
         root,
         state.tables,
@@ -217,8 +193,9 @@ fn run_metadata_table_checkpoint_worker(root: &Path, max_log_bytes: u64) -> Resu
         metadata_table_snapshot_fingerprint(root)?
     };
 
-    // The rotated generation is immutable. Decode, compact, hash, and encode
-    // it without holding the shard writer lock.
+    // The rotated generation is immutable. Decode, hash, and encode it without
+    // holding the shard writer lock. Checkpointing must preserve the exact
+    // journal-materialized tables; history compaction is a journal mutation.
     let state = read_metadata_table_checkpoint_state(root)?;
     let checkpoint_sequence = state.materialized_through_sequence.unwrap_or(0);
     let Some(prefix_proof) = state.prefix_proof else {
@@ -235,17 +212,7 @@ fn run_metadata_table_checkpoint_worker(root: &Path, max_log_bytes: u64) -> Resu
             prefix_proof.journal_sequence
         )));
     }
-    let mut tables = state.tables;
-    tables
-        .compact_terminal_namespace_history(
-            OffsetDateTime::now_utc(),
-            DfsNamespaceReceiptRetentionLimits::default(),
-        )
-        .map_err(|source| {
-            MetadataBackendError::Serde(format!(
-                "compact terminal namespace metadata into receipts: {source}"
-            ))
-        })?;
+    let tables = state.tables;
     let snapshot_bytes =
         encode_metadata_table_snapshot(&tables, Some(checkpoint_sequence), Some(&prefix_proof))?;
 
@@ -271,8 +238,14 @@ fn append_table_batch(
     sequence: u64,
     ops: Vec<DfsMetadataTableOp>,
     max_log_bytes: u64,
-    rollback: Option<DfsMetadataTableRollback>,
+    mut rollback: Option<DfsMetadataTableRollback>,
 ) -> Result<()> {
+    if let Err(error) = validate_version_pin_removal_order(state.tables, &ops, rollback.is_some()) {
+        if let Some(rollback) = rollback.take() {
+            rollback.rollback(state.tables);
+        }
+        return Err(error);
+    }
     let Some(prefix_proof) = state.prefix_proof.as_ref() else {
         if let Some(rollback) = rollback {
             rollback.rollback(state.tables);
@@ -313,6 +286,89 @@ fn append_table_batch(
     }
     *state.materialized_through_sequence = (*state.materialized_through_sequence).max(sequence);
     schedule_metadata_table_checkpoint_if_needed(root, max_log_bytes)
+}
+
+fn validate_version_pin_removal_order(
+    tables: &DfsMetadataTables,
+    ops: &[DfsMetadataTableOp],
+    preapplied: bool,
+) -> Result<()> {
+    let mut pins = tables.version_pins.keys().cloned().collect::<BTreeSet<_>>();
+    if !preapplied {
+        for op in ops {
+            match op {
+                DfsMetadataTableOp::PutVersionPin { pin } => {
+                    pins.insert((
+                        pin.object_id.clone(),
+                        pin.version.clone(),
+                        pin.pin_id.clone(),
+                    ));
+                }
+                DfsMetadataTableOp::RemoveVersionPin {
+                    object_id,
+                    version,
+                    pin_id,
+                } => {
+                    pins.remove(&(object_id.clone(), version.clone(), pin_id.clone()));
+                }
+                DfsMetadataTableOp::ReconcileCrossShardPinTransfer { transfer, .. } => {
+                    if let Some(previous) = tables
+                        .cross_shard_pin_transfers
+                        .get(&(transfer.object_id.clone(), transfer.transfer_id.clone()))
+                    {
+                        for pin in &previous.copied_pins {
+                            if !transfer.copied_pins.iter().any(|current| current == pin) {
+                                pins.remove(&(
+                                    pin.object_id.clone(),
+                                    pin.version.clone(),
+                                    pin.pin_id.clone(),
+                                ));
+                            }
+                        }
+                    }
+                    for pin in &transfer.source_pins {
+                        pins.insert((
+                            pin.object_id.clone(),
+                            pin.version.clone(),
+                            pin.pin_id.clone(),
+                        ));
+                    }
+                }
+                DfsMetadataTableOp::FinalizeCrossShardSourceEviction { removed_pins, .. } => {
+                    for pin in removed_pins {
+                        pins.remove(&(
+                            pin.object_id.clone(),
+                            pin.version.clone(),
+                            pin.pin_id.clone(),
+                        ));
+                    }
+                }
+                DfsMetadataTableOp::RemoveVersion { object_id, version }
+                    if pins.iter().any(|(pin_object_id, pin_version, _)| {
+                        pin_object_id == object_id && pin_version == version
+                    }) =>
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata table batch cannot remove pinned version {object_id}/{version}"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
+    for op in ops {
+        if let DfsMetadataTableOp::RemoveVersion { object_id, version } = op
+            && pins.iter().any(|(pin_object_id, pin_version, _)| {
+                pin_object_id == object_id && pin_version == version
+            })
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "preapplied metadata table batch cannot remove pinned version {object_id}/{version}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -421,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn reopen_skips_pre_checkpoint_log_prefix_after_snapshot_install_crash_window() {
+    fn reopen_preserves_unjournaled_history_across_snapshot_install_crash_window() {
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-table-snapshot-prefix-crash-window");
         let mut tables = DfsMetadataTables::default();
         let mut table_log_offset = 0;
@@ -447,18 +503,7 @@ mod tests {
         )
         .expect("append table prefix");
 
-        let mut checkpoint_tables = tables.clone();
-        checkpoint_tables
-            .compact_terminal_namespace_history(
-                OffsetDateTime::UNIX_EPOCH,
-                DfsNamespaceReceiptRetentionLimits {
-                    max_transaction_receipts: 8,
-                    max_prepare_receipts: 8,
-                    max_request_receipts: 8,
-                    max_age: time::Duration::days(365_000),
-                },
-            )
-            .expect("compact checkpoint image");
+        let checkpoint_tables = tables.clone();
         let snapshot_bytes =
             encode_metadata_table_snapshot(&checkpoint_tables, Some(1), prefix_proof.as_ref())
                 .expect("encode checkpoint");
@@ -469,14 +514,15 @@ mod tests {
 
         let reopened = read_metadata_table_state(root.path()).expect("reopen crash window");
         assert!(
-            reopened.tables.namespace_transactions.is_empty(),
-            "the pre-checkpoint log prefix must not resurrect full terminal history"
-        );
-        assert!(
             reopened
                 .tables
-                .namespace_transaction_receipts
-                .contains_key("txn_snapshot_crash")
+                .namespace_transactions
+                .contains_key("txn_snapshot_crash"),
+            "checkpoint publication must preserve full history that was not removed by a journal mutation"
+        );
+        assert!(
+            reopened.tables.namespace_transaction_receipts.is_empty(),
+            "a checkpoint must not invent an unjournaled compact receipt"
         );
         assert_eq!(reopened.materialized_through_sequence, Some(1));
     }
@@ -541,14 +587,15 @@ mod tests {
 
         let reopened = read_metadata_table_state(root.path()).expect("read checkpoint");
         assert!(
-            reopened.tables.namespace_transactions.is_empty(),
-            "terminal payload should be folded only in the worker-owned image"
-        );
-        assert!(
             reopened
                 .tables
-                .namespace_transaction_receipts
-                .contains_key("txn_background_checkpoint")
+                .namespace_transactions
+                .contains_key("txn_background_checkpoint"),
+            "background checkpointing must preserve full history absent journaled GC"
+        );
+        assert!(
+            reopened.tables.namespace_transaction_receipts.is_empty(),
+            "background checkpointing must not invent compact receipts"
         );
         assert_eq!(reopened.materialized_through_sequence, Some(1));
         assert_eq!(
@@ -596,13 +643,7 @@ mod tests {
             .expect("rotate captured table generation");
         let capture =
             read_metadata_table_checkpoint_state(root.path()).expect("capture table boundary");
-        let mut checkpoint_tables = capture.tables;
-        checkpoint_tables
-            .compact_terminal_namespace_history(
-                OffsetDateTime::now_utc(),
-                DfsNamespaceReceiptRetentionLimits::default(),
-            )
-            .expect("compact captured tables");
+        let checkpoint_tables = capture.tables;
         let snapshot_bytes =
             encode_metadata_table_snapshot(&checkpoint_tables, Some(1), prefix_proof.as_ref())
                 .expect("encode captured snapshot");
@@ -658,9 +699,10 @@ mod tests {
         assert!(
             reopened
                 .tables
-                .namespace_transaction_receipts
+                .namespace_transactions
                 .contains_key("txn_checkpoint_prefix")
         );
+        assert!(reopened.tables.namespace_transaction_receipts.is_empty());
         assert!(
             reopened
                 .tables

@@ -17,10 +17,9 @@ use fs_ops::write_file_atomic;
 use fs_ops::{
     content_durable_file_error, create_dir_all, duration_nanos_saturating, file_age_nanos,
     file_len_if_exists, projected_file_growth, read_dir, read_file, recursive_file_count_and_bytes,
-    remove_empty_dir_if_exists_and_sync_parent, remove_file_if_exists,
-    remove_file_if_exists_and_sync_parent, sync_dir, system_time_nanos_since_epoch_saturating,
-    temporary_path_for, write_file_create_new_atomic, write_files_create_new_relaxed,
-    write_reader_to_file,
+    remove_file_if_exists, remove_file_if_exists_and_sync_parent, sync_dir,
+    system_time_nanos_since_epoch_saturating, temporary_path_for, write_file_create_new_atomic,
+    write_files_create_new_relaxed, write_reader_to_file,
 };
 #[cfg(test)]
 use packed::PACKED_BLOB_LOCK_FILE;
@@ -54,6 +53,10 @@ const STREAMED_BLOB_ONLY_MIN_BYTES: usize = 1024 * 1024;
 const CONTENT_HASH_TREE_VERSION: u32 = 1;
 const CONTENT_HASH_TREE_LEAF_BYTES: u64 = 1024 * 1024;
 const STREAM_MANIFEST_CACHE_MAX_ENTRIES: usize = 1024;
+const ORPHAN_OBSERVATION_FORMAT_VERSION: u32 = 1;
+const ORPHAN_OBSERVATION_DIR: &str = "orphan-observations";
+const VERSION_GC_DELETE_BATCH_SIZE: usize = 1024;
+const ORPHAN_GC_PACKED_TOMBSTONE_BATCH_SIZE: usize = 1024;
 
 fn content_store_perf_trace(args: std::fmt::Arguments<'_>) {
     tracing::trace!(target: "sinomo.dfs.perf", detail = %args, "dfs content store perf");
@@ -370,6 +373,10 @@ pub struct ContentStoreGcOptions {
     pub min_orphan_age_nanos: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_deletions: Option<u64>,
+    /// Content identities that remain reachable through metadata or another
+    /// durable recovery root even when no local manifest references them.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub protected_content_hashes: BTreeSet<String>,
 }
 
 impl ContentStoreGcOptions {
@@ -378,6 +385,7 @@ impl ContentStoreGcOptions {
             dry_run: true,
             min_orphan_age_nanos: duration_nanos_saturating(min_orphan_age),
             max_deletions: None,
+            protected_content_hashes: BTreeSet::new(),
         }
     }
 
@@ -386,11 +394,27 @@ impl ContentStoreGcOptions {
             dry_run: false,
             min_orphan_age_nanos: duration_nanos_saturating(min_orphan_age),
             max_deletions: None,
+            protected_content_hashes: BTreeSet::new(),
         }
     }
 
     pub fn with_max_deletions(mut self, max_deletions: u64) -> Self {
         self.max_deletions = Some(max_deletions);
+        self
+    }
+
+    pub fn with_protected_content_hash(mut self, content_hash: impl Into<String>) -> Self {
+        self.protected_content_hashes.insert(content_hash.into());
+        self
+    }
+
+    pub fn with_protected_content_hashes<I, H>(mut self, content_hashes: I) -> Self
+    where
+        I: IntoIterator<Item = H>,
+        H: Into<String>,
+    {
+        self.protected_content_hashes
+            .extend(content_hashes.into_iter().map(Into::into));
         self
     }
 }
@@ -409,6 +433,73 @@ pub struct ContentStoreGcReport {
     pub deleted_orphan_bytes: u64,
     pub retained_young_orphan_count: u64,
     pub retained_young_orphan_bytes: u64,
+    /// Orphans that had no durable first-observation marker at the start of
+    /// this pass. A non-zero dry-run value tells reactive scheduling to run a
+    /// write pass now instead of sleeping until `next_eligible_at_unix_nanos`.
+    #[serde(default)]
+    pub newly_observed_orphan_count: u64,
+    #[serde(default)]
+    pub newly_observed_orphan_bytes: u64,
+    /// Earliest wall-clock instant at which an observed orphan reaches the
+    /// configured grace period. Newly observed orphans always survive the
+    /// observation pass, including when the configured duration is zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_eligible_at_unix_nanos: Option<u64>,
+    #[serde(default)]
+    pub retained_protected_orphan_count: u64,
+    #[serde(default)]
+    pub retained_protected_orphan_bytes: u64,
+    /// Durable first-observation markers whose hash is no longer orphaned.
+    /// Dry-run reports these so reactive scheduling can request a bounded write
+    /// pass that resets the grace epoch before the hash can become orphaned
+    /// again.
+    #[serde(default)]
+    pub stale_orphan_observation_count: u64,
+    #[serde(default)]
+    pub stale_orphan_observation_bytes: u64,
+    #[serde(default)]
+    pub deleted_stale_orphan_observation_count: u64,
+    #[serde(default)]
+    pub deleted_stale_orphan_observation_bytes: u64,
+    #[serde(default)]
+    pub persisted_orphan_observation_count: u64,
+    #[serde(default)]
+    pub persisted_orphan_observation_bytes: u64,
+    #[serde(default)]
+    pub retained_limit_orphan_observation_count: u64,
+    #[serde(default)]
+    pub retained_limit_orphan_observation_bytes: u64,
+    /// Physical packed-segment reclamation derived from the durable index after
+    /// logical orphan tombstones have been applied.
+    #[serde(default)]
+    pub scanned_packed_segment_count: u64,
+    #[serde(default)]
+    pub eligible_packed_segment_count: u64,
+    #[serde(default)]
+    pub eligible_packed_reclaimable_bytes: u64,
+    #[serde(default)]
+    pub compacted_packed_segment_count: u64,
+    #[serde(default)]
+    pub reclaimed_packed_segment_bytes: u64,
+    #[serde(default)]
+    pub checkpointed_packed_index_lane_count: u64,
+    #[serde(default)]
+    pub truncated_packed_index_log_bytes: u64,
+    #[serde(default)]
+    pub retained_limit_packed_segment_count: u64,
+    /// Lane-grouped packed-index tombstone appends made durable by this pass.
+    #[serde(default)]
+    pub packed_tombstone_batch_count: u64,
+    /// Directory fsyncs used to make relaxed orphan-marker changes durable.
+    #[serde(default)]
+    pub orphan_observation_directory_sync_count: u64,
+    /// Blob-shard directory fsyncs used to make loose orphan unlinks durable.
+    #[serde(default)]
+    pub loose_blob_directory_sync_count: u64,
+    /// Aggregated post-delete quota-stat snapshot writes. This is at most one
+    /// for a successful collection pass.
+    #[serde(default)]
+    pub stats_delta_persist_count: u64,
     pub retained_limit_orphan_count: u64,
     pub retained_limit_orphan_bytes: u64,
     pub max_deletions_reached: bool,
@@ -475,6 +566,10 @@ pub struct ContentStoreVersionGcOptions {
     pub keep_latest_versions_per_object: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_deletions: Option<u64>,
+    /// Exact object/version identities that remain reachable through metadata
+    /// or another durable recovery root.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub protected_versions: BTreeSet<(String, String)>,
 }
 
 impl ContentStoreVersionGcOptions {
@@ -484,6 +579,7 @@ impl ContentStoreVersionGcOptions {
             min_version_age_nanos: duration_nanos_saturating(min_version_age),
             keep_latest_versions_per_object: keep_latest_versions_per_object.max(1),
             max_deletions: None,
+            protected_versions: BTreeSet::new(),
         }
     }
 
@@ -496,11 +592,36 @@ impl ContentStoreVersionGcOptions {
             min_version_age_nanos: duration_nanos_saturating(min_version_age),
             keep_latest_versions_per_object: keep_latest_versions_per_object.max(1),
             max_deletions: None,
+            protected_versions: BTreeSet::new(),
         }
     }
 
     pub fn with_max_deletions(mut self, max_deletions: u64) -> Self {
         self.max_deletions = Some(max_deletions);
+        self
+    }
+
+    pub fn with_protected_version(
+        mut self,
+        object_id: impl Into<String>,
+        version: impl Into<String>,
+    ) -> Self {
+        self.protected_versions
+            .insert((object_id.into(), version.into()));
+        self
+    }
+
+    pub fn with_protected_versions<I, O, V>(mut self, versions: I) -> Self
+    where
+        I: IntoIterator<Item = (O, V)>,
+        O: Into<String>,
+        V: Into<String>,
+    {
+        self.protected_versions.extend(
+            versions
+                .into_iter()
+                .map(|(object_id, version)| (object_id.into(), version.into())),
+        );
         self
     }
 }
@@ -520,6 +641,14 @@ pub struct ContentStoreVersionGcReport {
     pub retained_latest_logical_bytes: u64,
     pub retained_young_version_count: u64,
     pub retained_young_logical_bytes: u64,
+    /// Earliest wall-clock instant at which an unprotected, non-latest
+    /// manifest reaches the configured recovery age.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_eligible_at_unix_nanos: Option<u64>,
+    #[serde(default)]
+    pub retained_protected_version_count: u64,
+    #[serde(default)]
+    pub retained_protected_logical_bytes: u64,
     pub retained_limit_version_count: u64,
     pub retained_limit_logical_bytes: u64,
     pub eligible_version_count: u64,
@@ -528,6 +657,22 @@ pub struct ContentStoreVersionGcReport {
     pub deleted_version_count: u64,
     pub deleted_logical_bytes: u64,
     pub deleted_manifest_bytes: u64,
+    /// Number of bounded manifest unlink groups made durable by this pass.
+    ///
+    /// A pass can cover several groups with one final directory barrier. The
+    /// grouping keeps unlink work bounded without repeatedly syncing the same
+    /// high-cardinality object directory.
+    #[serde(default)]
+    pub durable_delete_batch_count: u64,
+    /// Directory fsyncs used to make manifest/index unlinks and directory
+    /// removals durable. This is intentionally bounded by touched directories,
+    /// rather than one fsync per deleted manifest.
+    #[serde(default)]
+    pub durable_directory_sync_count: u64,
+    /// Aggregated post-delete quota-stat snapshot writes. This is at most one
+    /// for a successful collection pass.
+    #[serde(default)]
+    pub stats_delta_persist_count: u64,
     pub max_deletions_reached: bool,
 }
 
@@ -597,29 +742,42 @@ struct ScrubbedBlob {
     size_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OrphanObservation {
+    format_version: u32,
+    content_hash: String,
+    first_observed_at_unix_nanos: u64,
+}
+
+#[derive(Debug, Clone)]
+struct OrphanObservationGcCandidate {
+    path: PathBuf,
+    size_bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 enum OrphanBlobGcCandidate {
     Loose {
+        content_hash: String,
         path: PathBuf,
         size_bytes: u64,
     },
     Packed {
         content_hash: String,
-        path: PathBuf,
         size_bytes: u64,
     },
 }
 
 impl OrphanBlobGcCandidate {
-    fn path(&self) -> PathBuf {
-        match self {
-            Self::Loose { path, .. } | Self::Packed { path, .. } => path.clone(),
-        }
-    }
-
     fn size_bytes(&self) -> u64 {
         match self {
             Self::Loose { size_bytes, .. } | Self::Packed { size_bytes, .. } => *size_bytes,
+        }
+    }
+
+    fn content_hash(&self) -> &str {
+        match self {
+            Self::Loose { content_hash, .. } | Self::Packed { content_hash, .. } => content_hash,
         }
     }
 }
@@ -643,6 +801,36 @@ struct VersionManifestEntry {
     manifest_bytes: u64,
     logical_bytes: u64,
     extent_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct VersionManifestDeletionBatchResult {
+    deleted_version_count: u64,
+    deleted_logical_bytes: u64,
+    deleted_manifest_bytes: u64,
+    stats_delta: ContentStoreStatsDelta,
+}
+
+#[derive(Debug)]
+struct PendingPackedOrphanDeletion {
+    content_hash: String,
+    size_bytes: u64,
+}
+
+#[derive(Debug)]
+struct RelaxedOrphanObservationWrite {
+    first_observed_at_unix_nanos: u64,
+    created: bool,
+    size_bytes: u64,
+    parent: PathBuf,
+    root_created: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RelaxedDirectoryRemoval {
+    Removed,
+    Retained,
+    Missing,
 }
 
 struct PreparedSmallObjectVersion<'a> {
@@ -925,6 +1113,9 @@ impl LocalContentStore {
                             new_hash: hash.clone(),
                         });
                     }
+                    self.clear_orphan_observations_before_manifest_publish(std::iter::once(
+                        &existing,
+                    ))?;
                     self.ensure_content_manifest_index_best_effort(&existing);
                     manifests.push(existing);
                     continue;
@@ -1120,13 +1311,13 @@ impl LocalContentStore {
                 fs::File::open(&path).map_err(|source| ContentStoreError::Io { path, source })?;
             return Ok(BlobReader::new(file, size_bytes));
         }
-        let Some(location) = self.packed_blob_location(hash)? else {
+        let Some((location, mut reader)) = self.open_packed_blob_reader(hash, 0, usize::MAX)?
+        else {
             return Err(ContentStoreError::Io {
                 path,
                 source: io::Error::new(io::ErrorKind::NotFound, "blob not found"),
             });
         };
-        let mut reader = self.open_packed_blob_reader(&location, 0, usize::MAX)?;
         let mut bytes =
             Vec::with_capacity(usize::try_from(reader.size_bytes()).unwrap_or(usize::MAX));
         reader
@@ -1136,7 +1327,15 @@ impl LocalContentStore {
                 source,
             })?;
         ensure_bytes_match_hash(hash, &bytes)?;
-        self.open_packed_blob_reader(&location, 0, usize::MAX)
+        self.open_packed_blob_reader(hash, 0, usize::MAX)?
+            .map(|(_, reader)| reader)
+            .ok_or_else(|| ContentStoreError::Io {
+                path: self.packed_blob_location_path(&location),
+                source: io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "packed blob disappeared after verification",
+                ),
+            })
     }
 
     /// Opens a blob for streaming using a single read pass.
@@ -1162,13 +1361,13 @@ impl LocalContentStore {
                 .len();
             return Ok(BlobReader::new(file, size_bytes));
         }
-        let Some(location) = self.packed_blob_location(hash)? else {
+        let Some((_, reader)) = self.open_packed_blob_reader(hash, 0, usize::MAX)? else {
             return Err(ContentStoreError::Io {
                 path,
                 source: io::Error::new(io::ErrorKind::NotFound, "blob not found"),
             });
         };
-        self.open_packed_blob_reader(&location, 0, usize::MAX)
+        Ok(reader)
     }
 
     /// Opens a bounded range of a content-addressed blob for streaming.
@@ -1188,13 +1387,14 @@ impl LocalContentStore {
         self.blob_stream_open_count.fetch_add(1, Ordering::Relaxed);
         let path = self.blob_path(hash)?;
         if !path.is_file() {
-            let Some(location) = self.packed_blob_location(hash)? else {
+            let Some((_, reader)) = self.open_packed_blob_range_reader(hash, offset, max_bytes)?
+            else {
                 return Err(ContentStoreError::Io {
                     path,
                     source: io::Error::new(io::ErrorKind::NotFound, "blob not found"),
                 });
             };
-            return self.open_packed_blob_range_reader(&location, offset, max_bytes);
+            return Ok(reader);
         }
         let mut file = fs::File::open(&path).map_err(|source| ContentStoreError::Io {
             path: path.clone(),
@@ -1551,6 +1751,21 @@ impl LocalContentStore {
     }
 
     pub fn scrub(&self) -> Result<ContentStoreScrubReport> {
+        self.scrub_with_stats_snapshot(true)
+    }
+
+    fn scrub_with_stats_snapshot(
+        &self,
+        persist_stats_snapshot: bool,
+    ) -> Result<ContentStoreScrubReport> {
+        self.scrub_with_stats_snapshot_and_version_entries(persist_stats_snapshot, None)
+    }
+
+    fn scrub_with_stats_snapshot_and_version_entries(
+        &self,
+        persist_stats_snapshot: bool,
+        version_entries: Option<&mut BTreeMap<String, Vec<VersionManifestEntry>>>,
+    ) -> Result<ContentStoreScrubReport> {
         let (blob_count, blob_bytes) = self.scan_blob_stats()?;
         let (staging_file_count, staging_bytes) =
             recursive_file_count_and_bytes(&self.root.join("staging"))?;
@@ -1571,6 +1786,7 @@ impl LocalContentStore {
             &mut report,
             &mut referenced_blobs,
             &mut checked_blobs,
+            version_entries,
         )?;
         self.collect_orphan_blob_issues(&self.root.join("blobs"), &referenced_blobs, &mut report)?;
         self.collect_orphan_packed_blob_issues(&referenced_blobs, &mut report)?;
@@ -1580,12 +1796,14 @@ impl LocalContentStore {
             .filter_map(|hash| checked_blobs.get(hash))
             .map(|blob| blob.size_bytes)
             .fold(0_u64, |total, size| total.saturating_add(size));
-        self.replace_stats_snapshot(&report.stats)?;
+        if persist_stats_snapshot {
+            self.replace_stats_snapshot(&report.stats)?;
+        }
         Ok(report)
     }
 
     pub fn collect_garbage(&self, options: ContentStoreGcOptions) -> Result<ContentStoreGcReport> {
-        let scrub = self.scrub()?;
+        let scrub = self.scrub_with_stats_snapshot(!options.dry_run)?;
         let blocked_by_scrub_issue_count = scrub
             .issues
             .iter()
@@ -1609,49 +1827,162 @@ impl LocalContentStore {
             return Ok(report);
         }
 
-        let now = SystemTime::now();
+        let observed_at_unix_nanos = system_time_nanos_since_epoch_saturating(SystemTime::now());
         let orphan_blobs = report
             .scrub
             .issues
             .iter()
             .filter_map(|issue| match issue {
                 ContentStoreScrubIssue::OrphanBlob {
-                    path, size_bytes, ..
+                    content_hash,
+                    path,
+                    size_bytes,
+                    ..
                 } => Some(OrphanBlobGcCandidate::Loose {
+                    content_hash: content_hash.clone(),
                     path: path.clone(),
                     size_bytes: *size_bytes,
                 }),
                 ContentStoreScrubIssue::OrphanPackedBlob {
                     content_hash,
-                    path,
                     size_bytes,
                     ..
                 } => Some(OrphanBlobGcCandidate::Packed {
                     content_hash: content_hash.clone(),
-                    path: path.clone(),
                     size_bytes: *size_bytes,
                 }),
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let observed_orphan_hashes = orphan_blobs
+            .iter()
+            .filter(|orphan| {
+                !options
+                    .protected_content_hashes
+                    .contains(orphan.content_hash())
+            })
+            .map(|orphan| orphan.content_hash().to_owned())
+            .collect::<BTreeSet<_>>();
+        let max_durable_work = options.max_deletions.unwrap_or(u64::MAX);
+        let mut durable_work_count = 0_u64;
+        let mut pending_packed_deletions =
+            Vec::with_capacity(ORPHAN_GC_PACKED_TOMBSTONE_BATCH_SIZE);
+        let mut stats_delta = ContentStoreStatsDelta::default();
+        let mut dirty_orphan_observation_directories = BTreeSet::<PathBuf>::new();
+        let mut orphan_observation_root_created = false;
+        let mut dirty_loose_blob_directories = BTreeSet::<PathBuf>::new();
+        let mut dirty_packed_index_lanes = BTreeSet::<u8>::new();
+        for stale in self.orphan_observation_gc_candidates(&observed_orphan_hashes)? {
+            report.stale_orphan_observation_count =
+                report.stale_orphan_observation_count.saturating_add(1);
+            report.stale_orphan_observation_bytes = report
+                .stale_orphan_observation_bytes
+                .saturating_add(stale.size_bytes);
+            if durable_work_count.saturating_add(pending_packed_deletions.len() as u64)
+                >= max_durable_work
+            {
+                report.max_deletions_reached = true;
+                report.retained_limit_orphan_observation_count = report
+                    .retained_limit_orphan_observation_count
+                    .saturating_add(1);
+                report.retained_limit_orphan_observation_bytes = report
+                    .retained_limit_orphan_observation_bytes
+                    .saturating_add(stale.size_bytes);
+                continue;
+            }
+            if options.dry_run {
+                durable_work_count = durable_work_count.saturating_add(1);
+                continue;
+            }
+            if remove_file_if_exists_without_sync(&stale.path)? {
+                if let Some(parent) = stale.path.parent() {
+                    dirty_orphan_observation_directories.insert(parent.to_owned());
+                }
+                durable_work_count = durable_work_count.saturating_add(1);
+                report.deleted_stale_orphan_observation_count = report
+                    .deleted_stale_orphan_observation_count
+                    .saturating_add(1);
+                report.deleted_stale_orphan_observation_bytes = report
+                    .deleted_stale_orphan_observation_bytes
+                    .saturating_add(stale.size_bytes);
+            }
+        }
         for orphan in orphan_blobs {
-            let path = orphan.path();
             let size_bytes = orphan.size_bytes();
-            let age_nanos = file_age_nanos(&path, now)?;
-            if age_nanos < options.min_orphan_age_nanos {
+            if options
+                .protected_content_hashes
+                .contains(orphan.content_hash())
+            {
+                report.retained_protected_orphan_count =
+                    report.retained_protected_orphan_count.saturating_add(1);
+                report.retained_protected_orphan_bytes = report
+                    .retained_protected_orphan_bytes
+                    .saturating_add(size_bytes);
+                continue;
+            }
+            let (mut first_observed_at_unix_nanos, newly_observed) = self
+                .read_orphan_observation_or_fresh(orphan.content_hash(), observed_at_unix_nanos)?;
+            if newly_observed {
+                let observation_size_bytes = self.encoded_orphan_observation_size(
+                    orphan.content_hash(),
+                    observed_at_unix_nanos,
+                )?;
+                report.newly_observed_orphan_count =
+                    report.newly_observed_orphan_count.saturating_add(1);
+                report.newly_observed_orphan_bytes = report
+                    .newly_observed_orphan_bytes
+                    .saturating_add(size_bytes);
+                if durable_work_count.saturating_add(pending_packed_deletions.len() as u64)
+                    >= max_durable_work
+                {
+                    report.max_deletions_reached = true;
+                    report.retained_limit_orphan_observation_count = report
+                        .retained_limit_orphan_observation_count
+                        .saturating_add(1);
+                    report.retained_limit_orphan_observation_bytes = report
+                        .retained_limit_orphan_observation_bytes
+                        .saturating_add(observation_size_bytes);
+                } else if options.dry_run {
+                    durable_work_count = durable_work_count.saturating_add(1);
+                } else {
+                    let persisted = self.persist_orphan_observation_without_sync(
+                        orphan.content_hash(),
+                        observed_at_unix_nanos,
+                    )?;
+                    first_observed_at_unix_nanos = persisted.first_observed_at_unix_nanos;
+                    if persisted.created {
+                        dirty_orphan_observation_directories.insert(persisted.parent);
+                        orphan_observation_root_created |= persisted.root_created;
+                        durable_work_count = durable_work_count.saturating_add(1);
+                        report.persisted_orphan_observation_count =
+                            report.persisted_orphan_observation_count.saturating_add(1);
+                        report.persisted_orphan_observation_bytes = report
+                            .persisted_orphan_observation_bytes
+                            .saturating_add(persisted.size_bytes);
+                    }
+                }
+            }
+            let eligible_at_unix_nanos =
+                first_observed_at_unix_nanos.saturating_add(options.min_orphan_age_nanos);
+            if newly_observed || observed_at_unix_nanos < eligible_at_unix_nanos {
                 report.retained_young_orphan_count =
                     report.retained_young_orphan_count.saturating_add(1);
                 report.retained_young_orphan_bytes = report
                     .retained_young_orphan_bytes
                     .saturating_add(size_bytes);
+                report.next_eligible_at_unix_nanos = Some(
+                    report
+                        .next_eligible_at_unix_nanos
+                        .map(|current| current.min(eligible_at_unix_nanos))
+                        .unwrap_or(eligible_at_unix_nanos),
+                );
                 continue;
             }
 
             report.eligible_orphan_count = report.eligible_orphan_count.saturating_add(1);
             report.eligible_orphan_bytes = report.eligible_orphan_bytes.saturating_add(size_bytes);
-            if report
-                .max_deletions
-                .is_some_and(|max_deletions| report.deleted_orphan_count >= max_deletions)
+            if durable_work_count.saturating_add(pending_packed_deletions.len() as u64)
+                >= max_durable_work
             {
                 report.max_deletions_reached = true;
                 report.retained_limit_orphan_count =
@@ -1662,33 +1993,94 @@ impl LocalContentStore {
                 continue;
             }
             if options.dry_run {
+                durable_work_count = durable_work_count.saturating_add(1);
                 continue;
             }
             match orphan {
-                OrphanBlobGcCandidate::Loose { path, .. } => {
+                OrphanBlobGcCandidate::Loose {
+                    content_hash, path, ..
+                } => {
                     let before_len = file_len_if_exists(&path)?;
-                    if remove_file_if_exists_and_sync_parent(&path)? {
+                    if remove_file_if_exists_without_sync(&path)? {
+                        if let Some(parent) = path.parent() {
+                            dirty_loose_blob_directories.insert(parent.to_owned());
+                        }
                         report.deleted_orphan_count = report.deleted_orphan_count.saturating_add(1);
                         report.deleted_orphan_bytes =
                             report.deleted_orphan_bytes.saturating_add(size_bytes);
-                        self.apply_stats_delta(ContentStoreStatsDelta::blob_file_change(
-                            before_len, None,
-                        ))?;
+                        durable_work_count = durable_work_count.saturating_add(1);
+                        stats_delta.add(ContentStoreStatsDelta::blob_file_change(before_len, None));
+                        if let Some(parent) =
+                            self.remove_orphan_observation_without_sync(&content_hash)?
+                        {
+                            dirty_orphan_observation_directories.insert(parent);
+                        }
                     }
                 }
                 OrphanBlobGcCandidate::Packed { content_hash, .. } => {
-                    if self.remove_packed_blob_index_entry(&content_hash)? {
-                        report.deleted_orphan_count = report.deleted_orphan_count.saturating_add(1);
-                        report.deleted_orphan_bytes =
-                            report.deleted_orphan_bytes.saturating_add(size_bytes);
-                        self.apply_stats_delta(ContentStoreStatsDelta {
-                            blob_count: -1,
-                            blob_bytes: -i128::from(size_bytes),
-                            ..ContentStoreStatsDelta::default()
-                        })?;
+                    pending_packed_deletions.push(PendingPackedOrphanDeletion {
+                        content_hash,
+                        size_bytes,
+                    });
+                    if pending_packed_deletions.len() >= ORPHAN_GC_PACKED_TOMBSTONE_BATCH_SIZE {
+                        durable_work_count = durable_work_count.saturating_add(
+                            self.flush_pending_packed_orphan_deletions(
+                                &mut pending_packed_deletions,
+                                &mut dirty_orphan_observation_directories,
+                                &mut dirty_packed_index_lanes,
+                                &mut stats_delta,
+                                &mut report,
+                            )?,
+                        );
                     }
                 }
             }
+        }
+        durable_work_count =
+            durable_work_count.saturating_add(self.flush_pending_packed_orphan_deletions(
+                &mut pending_packed_deletions,
+                &mut dirty_orphan_observation_directories,
+                &mut dirty_packed_index_lanes,
+                &mut stats_delta,
+                &mut report,
+            )?);
+        for directory in dirty_loose_blob_directories {
+            sync_dir(&directory)?;
+            report.loose_blob_directory_sync_count =
+                report.loose_blob_directory_sync_count.saturating_add(1);
+        }
+        report.orphan_observation_directory_sync_count = self.sync_orphan_observation_directories(
+            &dirty_orphan_observation_directories,
+            orphan_observation_root_created,
+        )?;
+        let (checkpointed_lane_count, truncated_log_bytes) =
+            self.checkpoint_packed_blob_index_lanes_after_gc(&dirty_packed_index_lanes)?;
+        report.checkpointed_packed_index_lane_count = checkpointed_lane_count;
+        report.truncated_packed_index_log_bytes = truncated_log_bytes;
+        if !stats_delta.is_zero() && self.tracks_stats_deltas() {
+            self.apply_stats_delta(stats_delta)?;
+            report.stats_delta_persist_count = 1;
+        }
+        // Repack at most one bounded segment after logical orphan work. If the
+        // process crashes after an index tombstone, the next projection derives
+        // the same physical garbage from the durable index and schedules retry.
+        let max_compactions =
+            u64::from(durable_work_count < max_durable_work && !report.max_deletions_reached);
+        let packed = self.collect_packed_blob_segment_garbage(options.dry_run, max_compactions)?;
+        report.scanned_packed_segment_count = packed.scanned_segment_count;
+        report.eligible_packed_segment_count = packed.eligible_segment_count;
+        report.eligible_packed_reclaimable_bytes = packed.eligible_reclaimable_bytes;
+        report.compacted_packed_segment_count = packed.compacted_segment_count;
+        report.reclaimed_packed_segment_bytes = packed.reclaimed_segment_bytes;
+        report.checkpointed_packed_index_lane_count = report
+            .checkpointed_packed_index_lane_count
+            .saturating_add(packed.checkpointed_index_lane_count);
+        report.truncated_packed_index_log_bytes = report
+            .truncated_packed_index_log_bytes
+            .saturating_add(packed.truncated_index_log_bytes);
+        report.retained_limit_packed_segment_count = packed.retained_limit_segment_count;
+        if packed.retained_limit_segment_count > 0 {
+            report.max_deletions_reached = true;
         }
         Ok(report)
     }
@@ -1764,7 +2156,11 @@ impl LocalContentStore {
         &self,
         options: ContentStoreVersionGcOptions,
     ) -> Result<ContentStoreVersionGcReport> {
-        let scrub = self.scrub()?;
+        let mut versions_by_object = BTreeMap::<String, Vec<VersionManifestEntry>>::new();
+        let scrub = self.scrub_with_stats_snapshot_and_version_entries(
+            !options.dry_run,
+            Some(&mut versions_by_object),
+        )?;
         let blocked_by_scrub_issue_count = scrub
             .issues
             .iter()
@@ -1790,17 +2186,25 @@ impl LocalContentStore {
             return Ok(report);
         }
 
-        let mut versions_by_object = BTreeMap::<String, Vec<VersionManifestEntry>>::new();
-        self.collect_version_manifest_entries(&self.root.join("objects"), &mut versions_by_object)?;
         report.scanned_object_count = versions_by_object.len() as u64;
         report.scanned_version_count = versions_by_object
             .values()
             .map(|entries| entries.len() as u64)
             .fold(0_u64, |total, len| total.saturating_add(len));
 
+        let mut protected_versions_by_object = BTreeMap::<&str, BTreeSet<&str>>::new();
+        for (object_id, version) in &options.protected_versions {
+            protected_versions_by_object
+                .entry(object_id.as_str())
+                .or_default()
+                .insert(version.as_str());
+        }
         let now = SystemTime::now();
         let keep_latest_limit =
             usize::try_from(keep_latest_versions_per_object).unwrap_or(usize::MAX);
+        let mut deletion_batch = Vec::with_capacity(VERSION_GC_DELETE_BATCH_SIZE);
+        let mut dirty_deletion_directories = BTreeSet::new();
+        let mut stats_delta = ContentStoreStatsDelta::default();
         for entries in versions_by_object.values_mut() {
             entries.sort_by(|left, right| {
                 right
@@ -1810,6 +2214,17 @@ impl LocalContentStore {
                     .then_with(|| right.path.cmp(&left.path))
             });
             for (index, entry) in entries.iter().enumerate() {
+                if protected_versions_by_object
+                    .get(entry.object_id.as_str())
+                    .is_some_and(|versions| versions.contains(entry.version.as_str()))
+                {
+                    report.retained_protected_version_count =
+                        report.retained_protected_version_count.saturating_add(1);
+                    report.retained_protected_logical_bytes = report
+                        .retained_protected_logical_bytes
+                        .saturating_add(entry.logical_bytes);
+                    continue;
+                }
                 if index < keep_latest_limit {
                     report.retained_latest_version_count =
                         report.retained_latest_version_count.saturating_add(1);
@@ -1826,6 +2241,15 @@ impl LocalContentStore {
                     report.retained_young_logical_bytes = report
                         .retained_young_logical_bytes
                         .saturating_add(entry.logical_bytes);
+                    let eligible_at_unix_nanos = entry
+                        .modified_nanos
+                        .saturating_add(options.min_version_age_nanos);
+                    report.next_eligible_at_unix_nanos = Some(
+                        report
+                            .next_eligible_at_unix_nanos
+                            .map(|current| current.min(eligible_at_unix_nanos))
+                            .unwrap_or(eligible_at_unix_nanos),
+                    );
                     continue;
                 }
 
@@ -1836,6 +2260,42 @@ impl LocalContentStore {
                 report.eligible_manifest_bytes = report
                     .eligible_manifest_bytes
                     .saturating_add(entry.manifest_bytes);
+                if options.dry_run {
+                    if report
+                        .max_deletions
+                        .is_some_and(|max_deletions| report.deleted_version_count >= max_deletions)
+                    {
+                        report.max_deletions_reached = true;
+                        report.retained_limit_version_count =
+                            report.retained_limit_version_count.saturating_add(1);
+                        report.retained_limit_logical_bytes = report
+                            .retained_limit_logical_bytes
+                            .saturating_add(entry.logical_bytes);
+                    }
+                    continue;
+                }
+
+                if deletion_batch.len() >= VERSION_GC_DELETE_BATCH_SIZE {
+                    self.flush_version_manifest_deletion_batch(
+                        &mut deletion_batch,
+                        &mut dirty_deletion_directories,
+                        &mut report,
+                        &mut stats_delta,
+                    )?;
+                }
+                if report.max_deletions.is_some_and(|max_deletions| {
+                    report
+                        .deleted_version_count
+                        .saturating_add(deletion_batch.len() as u64)
+                        >= max_deletions
+                }) {
+                    self.flush_version_manifest_deletion_batch(
+                        &mut deletion_batch,
+                        &mut dirty_deletion_directories,
+                        &mut report,
+                        &mut stats_delta,
+                    )?;
+                }
                 if report
                     .max_deletions
                     .is_some_and(|max_deletions| report.deleted_version_count >= max_deletions)
@@ -1848,24 +2308,23 @@ impl LocalContentStore {
                         .saturating_add(entry.logical_bytes);
                     continue;
                 }
-                if options.dry_run {
-                    continue;
-                }
-                self.remove_content_manifest_index_for_version_if_current(entry)?;
-                if remove_file_if_exists_and_sync_parent(&entry.path)? {
-                    self.evict_stream_manifest(&entry.path);
-                    report.deleted_version_count = report.deleted_version_count.saturating_add(1);
-                    report.deleted_logical_bytes = report
-                        .deleted_logical_bytes
-                        .saturating_add(entry.logical_bytes);
-                    report.deleted_manifest_bytes = report
-                        .deleted_manifest_bytes
-                        .saturating_add(entry.manifest_bytes);
-                    self.apply_stats_delta(ContentStoreStatsDelta::manifest_deleted(entry))?;
-                    remove_empty_dir_if_exists_and_sync_parent(&entry.version_dir)?;
-                    remove_empty_dir_if_exists_and_sync_parent(&entry.object_dir)?;
-                }
+                deletion_batch.push(entry.clone());
             }
+        }
+        self.flush_version_manifest_deletion_batch(
+            &mut deletion_batch,
+            &mut dirty_deletion_directories,
+            &mut report,
+            &mut stats_delta,
+        )?;
+        for directory in dirty_deletion_directories {
+            sync_dir(&directory)?;
+            report.durable_directory_sync_count =
+                report.durable_directory_sync_count.saturating_add(1);
+        }
+        if !stats_delta.is_zero() && self.tracks_stats_deltas() {
+            self.apply_stats_delta(stats_delta)?;
+            report.stats_delta_persist_count = 1;
         }
         Ok(report)
     }
@@ -1875,10 +2334,10 @@ impl LocalContentStore {
         if path.is_file() {
             return Ok(file_content_hash(&path).is_ok_and(|actual| actual == hash));
         }
-        let Some(location) = self.packed_blob_location(hash)? else {
+        let Some((location, mut reader)) = self.open_packed_blob_reader(hash, 0, usize::MAX)?
+        else {
             return Ok(false);
         };
-        let mut reader = self.open_packed_blob_reader(&location, 0, usize::MAX)?;
         let mut bytes =
             Vec::with_capacity(usize::try_from(reader.size_bytes()).unwrap_or(usize::MAX));
         reader
@@ -1904,10 +2363,7 @@ impl LocalContentStore {
             Err(source) if source.kind() == io::ErrorKind::NotFound => {}
             Err(source) => return Err(ContentStoreError::Io { path, source }),
         }
-        let Some(location) = self.packed_blob_location(hash)? else {
-            return Ok(false);
-        };
-        self.packed_blob_location_readable(&location)
+        Ok(self.packed_blob_readable_size(hash)?.is_some())
     }
 
     /// Read-only form of [`Self::blob_storage_candidate_exists`] that does not
@@ -1972,7 +2428,7 @@ impl LocalContentStore {
             }
             return Ok(());
         }
-        if self.packed_blob_location(hash)?.is_some() {
+        if self.packed_blob_readable_size(hash)?.is_some() {
             return Err(ContentStoreError::PackedBlob {
                 hash: hash.to_owned(),
             });
@@ -2512,6 +2968,7 @@ impl LocalContentStore {
                 })?;
                 self.write_tracked_blob_bytes(&hash, &blob_path, bytes)?;
             }
+            self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
             self.ensure_content_manifest_index_best_effort(&existing);
             return Ok(existing);
         }
@@ -2540,6 +2997,7 @@ impl LocalContentStore {
             self.write_tracked_blob_bytes(&manifest.content_hash, &blob_path, bytes)?;
         }
 
+        self.clear_orphan_observations_before_manifest_publish(std::iter::once(&manifest))?;
         if let Err(error) = write_file_create_new_atomic(&manifest_path, &manifest_bytes) {
             if let ContentStoreError::Io { source, .. } = &error
                 && source.kind() == io::ErrorKind::AlreadyExists
@@ -2553,6 +3011,7 @@ impl LocalContentStore {
                         new_hash: manifest.content_hash,
                     });
                 }
+                self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
                 self.ensure_content_manifest_index_best_effort(&existing);
                 return Ok(existing);
             }
@@ -2603,6 +3062,7 @@ impl LocalContentStore {
             } else {
                 remove_file_if_exists(temporary_path)?;
             }
+            self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
             self.ensure_content_manifest_index_best_effort(&existing);
             return Ok(existing);
         }
@@ -2633,6 +3093,7 @@ impl LocalContentStore {
             remove_file_if_exists(temporary_path)?;
         }
 
+        self.clear_orphan_observations_before_manifest_publish(std::iter::once(&manifest))?;
         if let Err(error) = write_file_create_new_atomic(&manifest_path, &manifest_bytes) {
             if let ContentStoreError::Io { source, .. } = &error
                 && source.kind() == io::ErrorKind::AlreadyExists
@@ -2646,6 +3107,7 @@ impl LocalContentStore {
                         new_hash: manifest.content_hash,
                     });
                 }
+                self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
                 self.ensure_content_manifest_index_best_effort(&existing);
                 return Ok(existing);
             }
@@ -2722,6 +3184,7 @@ impl LocalContentStore {
                 manifest_check_started.elapsed().as_millis(),
                 trace_started.elapsed().as_millis()
             ));
+            self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
             self.ensure_content_manifest_index_best_effort(&existing);
             return Ok(existing);
         }
@@ -2979,6 +3442,9 @@ impl LocalContentStore {
         }
 
         let mut manifest_delta = ContentStoreStatsDelta::default();
+        self.clear_orphan_observations_before_manifest_publish(
+            prepared.iter().map(|prepared| &prepared.manifest),
+        )?;
         write_files_create_new_relaxed(prepared.iter().map(|prepared| {
             (
                 prepared.manifest_path.clone(),
@@ -3116,6 +3582,7 @@ impl LocalContentStore {
                 })?;
                 self.publish_tracked_file_as_blob(&hash, source_path, &blob_path, &hash)?;
             }
+            self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
             self.ensure_content_manifest_index_best_effort(&existing);
             return Ok(existing);
         }
@@ -3150,6 +3617,7 @@ impl LocalContentStore {
                 &manifest.content_hash,
             )?;
         }
+        self.clear_orphan_observations_before_manifest_publish(std::iter::once(&manifest))?;
         if let Err(error) = write_file_create_new_atomic(&manifest_path, &manifest_bytes) {
             if let ContentStoreError::Io { source, .. } = &error
                 && source.kind() == io::ErrorKind::AlreadyExists
@@ -3163,6 +3631,7 @@ impl LocalContentStore {
                         new_hash: manifest.content_hash,
                     });
                 }
+                self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
                 self.ensure_content_manifest_index_best_effort(&existing);
                 return Ok(existing);
             }
@@ -3176,65 +3645,13 @@ impl LocalContentStore {
         Ok(manifest)
     }
 
-    fn collect_version_manifest_entries(
-        &self,
-        path: &Path,
-        versions_by_object: &mut BTreeMap<String, Vec<VersionManifestEntry>>,
-    ) -> Result<()> {
-        if !path.exists() {
-            return Ok(());
-        }
-        for entry in read_dir(path)? {
-            let entry_path = entry.path();
-            if entry_path.is_dir() {
-                self.collect_version_manifest_entries(&entry_path, versions_by_object)?;
-                continue;
-            }
-            if entry_path.file_name().and_then(|name| name.to_str()) != Some("manifest.sobj") {
-                continue;
-            }
-            let manifest_bytes = read_file(&entry_path)?;
-            let manifest = decode_manifest(&manifest_bytes)?;
-            let modified = entry_path
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .map_err(|source| ContentStoreError::Io {
-                    path: entry_path.clone(),
-                    source,
-                })?;
-            let version_dir = entry_path
-                .parent()
-                .map(Path::to_owned)
-                .unwrap_or_else(|| entry_path.clone());
-            let object_dir = version_dir
-                .parent()
-                .map(Path::to_owned)
-                .unwrap_or_else(|| version_dir.clone());
-            versions_by_object
-                .entry(manifest.object_id.clone())
-                .or_default()
-                .push(VersionManifestEntry {
-                    object_id: manifest.object_id,
-                    version: manifest.version,
-                    content_hash: manifest.content_hash,
-                    path: entry_path,
-                    version_dir,
-                    object_dir,
-                    modified_nanos: system_time_nanos_since_epoch_saturating(modified),
-                    manifest_bytes: manifest_bytes.len() as u64,
-                    logical_bytes: manifest.size_bytes,
-                    extent_count: manifest.extents.len() as u64,
-                });
-        }
-        Ok(())
-    }
-
     fn scrub_manifest_tree(
         &self,
         path: &Path,
         report: &mut ContentStoreScrubReport,
         referenced_blobs: &mut BTreeSet<String>,
         checked_blobs: &mut BTreeMap<String, ScrubbedBlob>,
+        mut version_entries: Option<&mut BTreeMap<String, Vec<VersionManifestEntry>>>,
     ) -> Result<()> {
         if !path.exists() {
             return Ok(());
@@ -3242,13 +3659,33 @@ impl LocalContentStore {
         for entry in read_dir(path)? {
             let entry_path = entry.path();
             if entry_path.is_dir() {
-                self.scrub_manifest_tree(&entry_path, report, referenced_blobs, checked_blobs)?;
+                self.scrub_manifest_tree(
+                    &entry_path,
+                    report,
+                    referenced_blobs,
+                    checked_blobs,
+                    version_entries.as_deref_mut(),
+                )?;
                 continue;
             }
             if entry_path.file_name().and_then(|name| name.to_str()) != Some("manifest.sobj") {
                 continue;
             }
-            self.scrub_manifest(&entry_path, report, referenced_blobs, checked_blobs)?;
+            let version_entry = self.scrub_manifest(
+                &entry_path,
+                report,
+                referenced_blobs,
+                checked_blobs,
+                version_entries.is_some(),
+            )?;
+            if let Some(version_entry) = version_entry
+                && let Some(version_entries) = version_entries.as_deref_mut()
+            {
+                version_entries
+                    .entry(version_entry.object_id.clone())
+                    .or_default()
+                    .push(version_entry);
+            }
         }
         Ok(())
     }
@@ -3259,7 +3696,8 @@ impl LocalContentStore {
         report: &mut ContentStoreScrubReport,
         referenced_blobs: &mut BTreeSet<String>,
         checked_blobs: &mut BTreeMap<String, ScrubbedBlob>,
-    ) -> Result<()> {
+        collect_version_entry: bool,
+    ) -> Result<Option<VersionManifestEntry>> {
         let manifest_bytes = match read_file(path) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -3267,7 +3705,7 @@ impl LocalContentStore {
                     path: path.to_owned(),
                     message: error.to_string(),
                 });
-                return Ok(());
+                return Ok(None);
             }
         };
         report.stats.manifest_count = report.stats.manifest_count.saturating_add(1);
@@ -3282,8 +3720,39 @@ impl LocalContentStore {
                     path: path.to_owned(),
                     message: error.to_string(),
                 });
-                return Ok(());
+                return Ok(None);
             }
+        };
+        let version_entry = if collect_version_entry {
+            let modified = path
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .map_err(|source| ContentStoreError::Io {
+                    path: path.to_owned(),
+                    source,
+                })?;
+            let version_dir = path
+                .parent()
+                .map(Path::to_owned)
+                .unwrap_or_else(|| path.to_owned());
+            let object_dir = version_dir
+                .parent()
+                .map(Path::to_owned)
+                .unwrap_or_else(|| version_dir.clone());
+            Some(VersionManifestEntry {
+                object_id: manifest.object_id.clone(),
+                version: manifest.version.clone(),
+                content_hash: manifest.content_hash.clone(),
+                path: path.to_owned(),
+                version_dir,
+                object_dir,
+                modified_nanos: system_time_nanos_since_epoch_saturating(modified),
+                manifest_bytes: manifest_bytes.len() as u64,
+                logical_bytes: manifest.size_bytes,
+                extent_count: manifest.extents.len() as u64,
+            })
+        } else {
+            None
         };
         report.stats.logical_object_bytes = report
             .stats
@@ -3302,7 +3771,7 @@ impl LocalContentStore {
                 referenced_blobs,
                 checked_blobs,
             )?;
-            return Ok(());
+            return Ok(version_entry);
         }
 
         report.stats.extent_manifest_count = report.stats.extent_manifest_count.saturating_add(1);
@@ -3335,7 +3804,7 @@ impl LocalContentStore {
                 checked_blobs,
             )?;
         }
-        Ok(())
+        Ok(version_entry)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3362,33 +3831,34 @@ impl LocalContentStore {
         referenced_blobs.insert(content_hash.to_owned());
         let blob_path = self.blob_path(content_hash)?;
         if !blob_path.is_file() {
-            let Some(location) = self.packed_blob_location(content_hash)? else {
-                report.issues.push(ContentStoreScrubIssue::MissingBlob {
-                    object_id: object_id.to_owned(),
-                    version: version.to_owned(),
-                    content_hash: content_hash.to_owned(),
-                    path: blob_path,
-                });
-                return Ok(());
+            let packed = match self.open_packed_blob_reader(content_hash, 0, usize::MAX) {
+                Ok(Some(packed)) => packed,
+                Ok(None) => {
+                    report.issues.push(ContentStoreScrubIssue::MissingBlob {
+                        object_id: object_id.to_owned(),
+                        version: version.to_owned(),
+                        content_hash: content_hash.to_owned(),
+                        path: blob_path,
+                    });
+                    return Ok(());
+                }
+                Err(error) => {
+                    report.issues.push(ContentStoreScrubIssue::MissingBlob {
+                        object_id: object_id.to_owned(),
+                        version: version.to_owned(),
+                        content_hash: content_hash.to_owned(),
+                        path: blob_path,
+                    });
+                    report.issues.push(ContentStoreScrubIssue::InvalidManifest {
+                        path: manifest_path.to_owned(),
+                        message: error.to_string(),
+                    });
+                    return Ok(());
+                }
             };
+            let (location, mut reader) = packed;
             if !checked_blobs.contains_key(content_hash) {
                 let segment_path = self.packed_blob_location_path(&location);
-                let mut reader = match self.open_packed_blob_reader(&location, 0, usize::MAX) {
-                    Ok(reader) => reader,
-                    Err(error) => {
-                        report.issues.push(ContentStoreScrubIssue::MissingBlob {
-                            object_id: object_id.to_owned(),
-                            version: version.to_owned(),
-                            content_hash: content_hash.to_owned(),
-                            path: segment_path,
-                        });
-                        report.issues.push(ContentStoreScrubIssue::InvalidManifest {
-                            path: manifest_path.to_owned(),
-                            message: error.to_string(),
-                        });
-                        return Ok(());
-                    }
-                };
                 let mut bytes =
                     Vec::with_capacity(usize::try_from(location.size_bytes).unwrap_or(usize::MAX));
                 if let Err(source) = reader.read_to_end(&mut bytes) {
@@ -3756,13 +4226,7 @@ impl LocalContentStore {
         if let Some(size_bytes) = file_len_if_exists(&path)? {
             return Ok(Some(size_bytes));
         }
-        let Some(location) = self.packed_blob_location(hash)? else {
-            return Ok(None);
-        };
-        if !self.packed_blob_location_readable(&location)? {
-            return Ok(None);
-        }
-        Ok(Some(location.size_bytes))
+        self.packed_blob_readable_size(hash)
     }
 
     fn read_hash_tree_optional(
@@ -4102,6 +4566,7 @@ impl LocalContentStore {
                     new_hash: manifest.content_hash,
                 });
             }
+            self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
             self.ensure_content_manifest_index_best_effort(&existing);
             return Ok(existing);
         }
@@ -4111,6 +4576,7 @@ impl LocalContentStore {
             manifest_bytes: manifest_bytes.len() as u64,
             ..ContentStoreQuotaDelta::default()
         })?;
+        self.clear_orphan_observations_before_manifest_publish(std::iter::once(&manifest))?;
         if let Err(error) = write_file_create_new_atomic(&manifest_path, &manifest_bytes) {
             if let ContentStoreError::Io { source, .. } = &error
                 && source.kind() == io::ErrorKind::AlreadyExists
@@ -4126,6 +4592,7 @@ impl LocalContentStore {
                         new_hash: manifest.content_hash,
                     });
                 }
+                self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
                 self.ensure_content_manifest_index_best_effort(&existing);
                 return Ok(existing);
             }
@@ -4167,26 +4634,422 @@ impl LocalContentStore {
         }
     }
 
-    fn remove_content_manifest_index_for_version_if_current(
+    fn flush_version_manifest_deletion_batch(
+        &self,
+        batch: &mut Vec<VersionManifestEntry>,
+        dirty_directories: &mut BTreeSet<PathBuf>,
+        report: &mut ContentStoreVersionGcReport,
+        total_stats_delta: &mut ContentStoreStatsDelta,
+    ) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let result = self.delete_version_manifest_batch(batch, dirty_directories)?;
+        batch.clear();
+        if result.deleted_version_count > 0 {
+            report.durable_delete_batch_count = report.durable_delete_batch_count.saturating_add(1);
+        }
+        report.deleted_version_count = report
+            .deleted_version_count
+            .saturating_add(result.deleted_version_count);
+        report.deleted_logical_bytes = report
+            .deleted_logical_bytes
+            .saturating_add(result.deleted_logical_bytes);
+        report.deleted_manifest_bytes = report
+            .deleted_manifest_bytes
+            .saturating_add(result.deleted_manifest_bytes);
+        total_stats_delta.add(result.stats_delta);
+        Ok(())
+    }
+
+    fn delete_version_manifest_batch(
+        &self,
+        entries: &[VersionManifestEntry],
+        dirty_directories: &mut BTreeSet<PathBuf>,
+    ) -> Result<VersionManifestDeletionBatchResult> {
+        let mut result = VersionManifestDeletionBatchResult::default();
+        let mut removed_manifest_directories = BTreeMap::<PathBuf, PathBuf>::new();
+        let mut touched_object_directories = BTreeSet::<PathBuf>::new();
+
+        for entry in entries {
+            if let Some(parent) =
+                self.remove_content_manifest_index_for_version_if_current_without_sync(entry)?
+            {
+                dirty_directories.insert(parent);
+            }
+            if !remove_file_if_exists_without_sync(&entry.path)? {
+                continue;
+            }
+
+            self.evict_stream_manifest(&entry.path);
+            dirty_directories.insert(entry.version_dir.clone());
+            removed_manifest_directories
+                .insert(entry.version_dir.clone(), entry.object_dir.clone());
+            touched_object_directories.insert(entry.object_dir.clone());
+            result.deleted_version_count = result.deleted_version_count.saturating_add(1);
+            result.deleted_logical_bytes = result
+                .deleted_logical_bytes
+                .saturating_add(entry.logical_bytes);
+            result.deleted_manifest_bytes = result
+                .deleted_manifest_bytes
+                .saturating_add(entry.manifest_bytes);
+            result
+                .stats_delta
+                .add(ContentStoreStatsDelta::manifest_deleted(entry));
+        }
+
+        // If the now-empty version directory can be removed, syncing its
+        // object directory makes both the manifest unlink and directory
+        // removal durable. A retained version directory contains sidecars, so
+        // it must itself be synced once for the manifest unlink.
+        for (version_dir, object_dir) in removed_manifest_directories {
+            match remove_empty_dir_if_exists_without_sync(&version_dir)? {
+                RelaxedDirectoryRemoval::Removed => {
+                    dirty_directories.remove(&version_dir);
+                    dirty_directories.insert(object_dir);
+                }
+                RelaxedDirectoryRemoval::Retained => {}
+                RelaxedDirectoryRemoval::Missing => {
+                    dirty_directories.remove(&version_dir);
+                }
+            }
+        }
+
+        // Most churn is many versions of one retained object. This collapses
+        // all of those per-version parent fsyncs into one object-directory
+        // fsync at the final durability barrier for this collection pass.
+        for object_dir in touched_object_directories {
+            match remove_empty_dir_if_exists_without_sync(&object_dir)? {
+                RelaxedDirectoryRemoval::Removed => {
+                    dirty_directories.remove(&object_dir);
+                    if let Some(parent) = object_dir.parent() {
+                        dirty_directories.insert(parent.to_owned());
+                    }
+                }
+                RelaxedDirectoryRemoval::Retained => {}
+                RelaxedDirectoryRemoval::Missing => {
+                    dirty_directories.remove(&object_dir);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn remove_content_manifest_index_for_version_if_current_without_sync(
         &self,
         entry: &VersionManifestEntry,
-    ) -> Result<()> {
+    ) -> Result<Option<PathBuf>> {
         let index_path = self.content_manifest_index_path(&entry.object_id, &entry.content_hash)?;
         if !index_path.is_file() {
-            return Ok(());
+            return Ok(None);
         }
         let Ok(indexed_manifest) = decode_manifest(&read_file(&index_path)?) else {
             // A derived index that does not decode cannot be proven to point
             // at the version being collected. Leave it for scrub/lookup repair.
-            return Ok(());
+            return Ok(None);
         };
         if indexed_manifest.object_id == entry.object_id
             && indexed_manifest.version == entry.version
             && indexed_manifest.content_hash == entry.content_hash
+            && remove_file_if_exists_without_sync(&index_path)?
         {
-            remove_file_if_exists_and_sync_parent(&index_path)?;
+            return Ok(index_path.parent().map(Path::to_owned));
         }
+        Ok(None)
+    }
+
+    fn flush_pending_packed_orphan_deletions(
+        &self,
+        pending: &mut Vec<PendingPackedOrphanDeletion>,
+        dirty_orphan_observation_directories: &mut BTreeSet<PathBuf>,
+        dirty_packed_index_lanes: &mut BTreeSet<u8>,
+        stats_delta: &mut ContentStoreStatsDelta,
+        report: &mut ContentStoreGcReport,
+    ) -> Result<u64> {
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let hashes = pending
+            .iter()
+            .map(|deletion| deletion.content_hash.clone())
+            .collect::<Vec<_>>();
+        let removal = self.remove_packed_blob_index_entries_deferred_checkpoint(&hashes)?;
+        if !removal.removed_hashes.is_empty() {
+            report.packed_tombstone_batch_count =
+                report.packed_tombstone_batch_count.saturating_add(1);
+        }
+        dirty_packed_index_lanes.extend(removal.modified_lanes);
+
+        let mut removed_count = 0_u64;
+        for deletion in pending.drain(..) {
+            if !removal.removed_hashes.contains(&deletion.content_hash) {
+                continue;
+            }
+            removed_count = removed_count.saturating_add(1);
+            report.deleted_orphan_count = report.deleted_orphan_count.saturating_add(1);
+            report.deleted_orphan_bytes = report
+                .deleted_orphan_bytes
+                .saturating_add(deletion.size_bytes);
+            stats_delta.add(ContentStoreStatsDelta {
+                blob_count: -1,
+                blob_bytes: -i128::from(deletion.size_bytes),
+                ..ContentStoreStatsDelta::default()
+            });
+            if let Some(parent) =
+                self.remove_orphan_observation_without_sync(&deletion.content_hash)?
+            {
+                dirty_orphan_observation_directories.insert(parent);
+            }
+        }
+        Ok(removed_count)
+    }
+
+    fn read_orphan_observation_or_fresh(
+        &self,
+        content_hash: &str,
+        observed_at_unix_nanos: u64,
+    ) -> Result<(u64, bool)> {
+        let path = self.orphan_observation_path(content_hash)?;
+        let bytes = match read_file(&path) {
+            Ok(bytes) => bytes,
+            Err(ContentStoreError::Io { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                return Ok((observed_at_unix_nanos, true));
+            }
+            Err(error) => return Err(error),
+        };
+        match decode_orphan_observation(&bytes).and_then(|observation| {
+            validate_orphan_observation(&observation, content_hash)?;
+            Ok(observation)
+        }) {
+            Ok(observation) => Ok((observation.first_observed_at_unix_nanos, false)),
+            Err(error) => {
+                // Observation state only delays deletion. Treating a torn or
+                // corrupt marker as a fresh observation resets the grace
+                // period, which is conservative and lets the next write pass
+                // repair relaxed batched marker writes after a crash.
+                content_store_perf_trace(format_args!(
+                    "reset invalid orphan observation hash={content_hash} path={} error={error}",
+                    path.display()
+                ));
+                Ok((observed_at_unix_nanos, true))
+            }
+        }
+    }
+
+    fn persist_orphan_observation_without_sync(
+        &self,
+        content_hash: &str,
+        observed_at_unix_nanos: u64,
+    ) -> Result<RelaxedOrphanObservationWrite> {
+        let path = self.orphan_observation_path(content_hash)?;
+        let parent = path
+            .parent()
+            .expect("orphan observation paths always have a shard parent")
+            .to_owned();
+        let root = self.root.join(ORPHAN_OBSERVATION_DIR);
+        let root_created = !root.is_dir();
+        let (existing_at, existing_is_fresh) =
+            self.read_orphan_observation_or_fresh(content_hash, observed_at_unix_nanos)?;
+        if !existing_is_fresh {
+            return Ok(RelaxedOrphanObservationWrite {
+                first_observed_at_unix_nanos: existing_at,
+                created: false,
+                size_bytes: file_len_if_exists(&path)?.unwrap_or(0),
+                parent,
+                root_created: false,
+            });
+        }
+
+        let observation = OrphanObservation {
+            format_version: ORPHAN_OBSERVATION_FORMAT_VERSION,
+            content_hash: content_hash.to_owned(),
+            first_observed_at_unix_nanos: observed_at_unix_nanos,
+        };
+        let bytes = encode_orphan_observation(&observation)?;
+        if path.is_file() {
+            // A corrupt marker is not useful recovery evidence. Removing it
+            // and installing a fresh timestamp can only extend retention.
+            remove_file_if_exists_without_sync(&path)?;
+        }
+        create_dir_all(parent.clone())?;
+        write_files_create_new_relaxed([(path, bytes.as_slice())])?;
+        Ok(RelaxedOrphanObservationWrite {
+            first_observed_at_unix_nanos: observed_at_unix_nanos,
+            created: true,
+            size_bytes: bytes.len() as u64,
+            parent,
+            root_created,
+        })
+    }
+
+    fn encoded_orphan_observation_size(
+        &self,
+        content_hash: &str,
+        observed_at_unix_nanos: u64,
+    ) -> Result<u64> {
+        let observation = OrphanObservation {
+            format_version: ORPHAN_OBSERVATION_FORMAT_VERSION,
+            content_hash: content_hash.to_owned(),
+            first_observed_at_unix_nanos: observed_at_unix_nanos,
+        };
+        Ok(u64::try_from(encode_orphan_observation(&observation)?.len()).unwrap_or(u64::MAX))
+    }
+
+    fn orphan_observation_gc_candidates(
+        &self,
+        observed_orphan_hashes: &BTreeSet<String>,
+    ) -> Result<Vec<OrphanObservationGcCandidate>> {
+        let root = self.root.join(ORPHAN_OBSERVATION_DIR);
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut candidates = Vec::new();
+        let mut shard_entries = read_dir(&root)?;
+        shard_entries.sort_by_key(|entry| entry.path());
+        for shard_entry in shard_entries {
+            let shard_path = shard_entry.path();
+            if !shard_path.is_dir() {
+                continue;
+            }
+            let mut marker_entries = read_dir(&shard_path)?;
+            marker_entries.sort_by_key(|entry| entry.path());
+            for marker_entry in marker_entries {
+                let marker_path = marker_entry.path();
+                if !marker_path.is_file() {
+                    continue;
+                }
+                let Some(file_name) = marker_path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let Some(hex) = file_name.strip_suffix(".sobj") else {
+                    continue;
+                };
+                let content_hash = format!("{HASH_PREFIX}{hex}");
+                if hash_hex(&content_hash).is_err()
+                    || observed_orphan_hashes.contains(&content_hash)
+                {
+                    continue;
+                }
+                let size_bytes = marker_entry
+                    .metadata()
+                    .map_err(|source| ContentStoreError::Io {
+                        path: marker_path.clone(),
+                        source,
+                    })?
+                    .len();
+                candidates.push(OrphanObservationGcCandidate {
+                    path: marker_path,
+                    size_bytes,
+                });
+            }
+        }
+        Ok(candidates)
+    }
+
+    fn remove_orphan_observation_without_sync(
+        &self,
+        content_hash: &str,
+    ) -> Result<Option<PathBuf>> {
+        let path = self.orphan_observation_path(content_hash)?;
+        if remove_file_if_exists_without_sync(&path)? {
+            return Ok(path.parent().map(Path::to_owned));
+        }
+        Ok(None)
+    }
+
+    /// Durably forgets every orphan-grace epoch covered by manifests that are
+    /// about to become authoritative references.
+    ///
+    /// The removal is ordered before manifest publication. A crash between
+    /// these two steps can only make the next orphan scan start a fresh grace
+    /// period; publishing first would leave a window where a later manifest
+    /// deletion could expose content to an observation epoch from before the
+    /// reference existed.
+    fn clear_orphan_observations_before_manifest_publish<'a, I>(&self, manifests: I) -> Result<()>
+    where
+        I: IntoIterator<Item = &'a ContentManifest>,
+    {
+        let root = self.root.join(ORPHAN_OBSERVATION_DIR);
+        match fs::metadata(&root) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(ContentStoreError::InvalidContentLayout {
+                    message: format!(
+                        "orphan observation root is not a directory: {}",
+                        root.display()
+                    ),
+                });
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(ContentStoreError::Io { path: root, source });
+            }
+        }
+
+        let mut referenced_hashes = BTreeSet::<&str>::new();
+        for manifest in manifests {
+            if manifest.extents.is_empty() {
+                referenced_hashes.insert(manifest.content_hash.as_str());
+            } else {
+                referenced_hashes.extend(
+                    manifest
+                        .extents
+                        .iter()
+                        .map(|extent| extent.content_hash.as_str()),
+                );
+            }
+        }
+
+        let mut dirty_directories = BTreeSet::new();
+        for content_hash in referenced_hashes {
+            if let Some(parent) = self.remove_orphan_observation_without_sync(content_hash)? {
+                dirty_directories.insert(parent);
+            }
+        }
+        self.sync_orphan_observation_directories(&dirty_directories, false)?;
         Ok(())
+    }
+
+    fn sync_orphan_observation_directories(
+        &self,
+        dirty_directories: &BTreeSet<PathBuf>,
+        root_created: bool,
+    ) -> Result<u64> {
+        if dirty_directories.is_empty() && !root_created {
+            return Ok(0);
+        }
+        let root = self.root.join(ORPHAN_OBSERVATION_DIR);
+        let mut sync_count = 0_u64;
+        for directory in dirty_directories {
+            match remove_empty_dir_if_exists_without_sync(directory)? {
+                RelaxedDirectoryRemoval::Removed | RelaxedDirectoryRemoval::Missing => {}
+                RelaxedDirectoryRemoval::Retained => {
+                    sync_dir(directory)?;
+                    sync_count = sync_count.saturating_add(1);
+                }
+            }
+        }
+        if root.is_dir() {
+            sync_dir(&root)?;
+            sync_count = sync_count.saturating_add(1);
+        }
+        if root_created {
+            sync_dir(&self.root)?;
+            sync_count = sync_count.saturating_add(1);
+        }
+        Ok(sync_count)
+    }
+
+    fn orphan_observation_path(&self, content_hash: &str) -> Result<PathBuf> {
+        let hex = hash_hex(content_hash)?;
+        Ok(self
+            .root
+            .join(ORPHAN_OBSERVATION_DIR)
+            .join(&hex[..2])
+            .join(format!("{hex}.sobj")))
     }
 
     fn blob_path(&self, hash: &str) -> Result<PathBuf> {
@@ -4224,6 +5087,33 @@ impl LocalContentStore {
     }
 }
 
+fn remove_file_if_exists_without_sync(path: &Path) -> Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(ContentStoreError::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
+}
+
+fn remove_empty_dir_if_exists_without_sync(path: &Path) -> Result<RelaxedDirectoryRemoval> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(RelaxedDirectoryRemoval::Removed),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            Ok(RelaxedDirectoryRemoval::Missing)
+        }
+        Err(source) if source.kind() == io::ErrorKind::DirectoryNotEmpty => {
+            Ok(RelaxedDirectoryRemoval::Retained)
+        }
+        Err(source) => Err(ContentStoreError::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
+}
+
 fn encode_manifest(manifest: &ContentManifest) -> Result<Vec<u8>> {
     sinomo_object_serde::to_bytes(manifest, 1, LengthMode::U32)
         .map_err(|source| ContentStoreError::Serde(source.to_string()))
@@ -4232,6 +5122,39 @@ fn encode_manifest(manifest: &ContentManifest) -> Result<Vec<u8>> {
 fn decode_manifest(bytes: &[u8]) -> Result<ContentManifest> {
     sinomo_object_serde::from_bytes(bytes)
         .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn encode_orphan_observation(observation: &OrphanObservation) -> Result<Vec<u8>> {
+    sinomo_object_serde::to_bytes(observation, 1, LengthMode::U32)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn decode_orphan_observation(bytes: &[u8]) -> Result<OrphanObservation> {
+    sinomo_object_serde::from_bytes(bytes)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn validate_orphan_observation(
+    observation: &OrphanObservation,
+    expected_content_hash: &str,
+) -> Result<()> {
+    if observation.format_version != ORPHAN_OBSERVATION_FORMAT_VERSION {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: format!(
+                "unsupported orphan observation format version {}",
+                observation.format_version
+            ),
+        });
+    }
+    if observation.content_hash != expected_content_hash {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: format!(
+                "orphan observation hash mismatch: expected={expected_content_hash}, actual={}",
+                observation.content_hash
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn validate_and_order_stream_manifest(mut manifest: ContentManifest) -> Result<ContentManifest> {
@@ -6115,6 +7038,222 @@ mod tests {
     }
 
     #[test]
+    fn gc_options_default_missing_protected_roots_for_backward_compatibility() {
+        let gc_options: ContentStoreGcOptions = serde_json::from_value(serde_json::json!({
+            "dry_run": false,
+            "min_orphan_age_nanos": 17
+        }))
+        .expect("deserialize legacy content gc options");
+        assert!(gc_options.protected_content_hashes.is_empty());
+
+        let version_options: ContentStoreVersionGcOptions =
+            serde_json::from_value(serde_json::json!({
+                "dry_run": true,
+                "min_version_age_nanos": 23,
+                "keep_latest_versions_per_object": 2
+            }))
+            .expect("deserialize legacy version gc options");
+        assert!(version_options.protected_versions.is_empty());
+
+        let serialized_gc =
+            serde_json::to_value(ContentStoreGcOptions::dry_run(Duration::from_nanos(17)))
+                .expect("serialize default content gc options");
+        assert!(serialized_gc.get("protected_content_hashes").is_none());
+        let serialized_versions = serde_json::to_value(ContentStoreVersionGcOptions::dry_run(
+            Duration::from_nanos(23),
+            2,
+        ))
+        .expect("serialize default version gc options");
+        assert!(serialized_versions.get("protected_versions").is_none());
+    }
+
+    #[test]
+    fn high_count_gc_batches_directory_syncs_and_packed_tombstones() {
+        const VERSION_COUNT: usize = VERSION_GC_DELETE_BATCH_SIZE + 2;
+        const HASH_SHARD: &str = "2a";
+        let root = temp_root("high_count_gc_batches_durability");
+        let store = LocalContentStore::new(&root)
+            .expect("create store")
+            .with_quota(ContentStoreQuota::no_limits());
+
+        let mut payloads = Vec::with_capacity(VERSION_COUNT);
+        for nonce in 0_u64.. {
+            let mut bytes = vec![0_u8; 128];
+            bytes[..8].copy_from_slice(&nonce.to_le_bytes());
+            let hash = content_hash(&bytes);
+            if &hash[HASH_PREFIX.len()..HASH_PREFIX.len() + 2] == HASH_SHARD {
+                payloads.push(bytes);
+                if payloads.len() == VERSION_COUNT {
+                    break;
+                }
+            }
+        }
+        let versions = (0..VERSION_COUNT)
+            .map(|index| format!("version_{index:04}"))
+            .collect::<Vec<_>>();
+        store
+            .put_object_versions(
+                versions.iter().zip(&payloads).map(|(version, bytes)| {
+                    ("batched-gc-object", version.as_str(), bytes.as_slice())
+                }),
+            )
+            .expect("write packed version churn fixture");
+
+        let version_gc = store
+            .collect_versions(ContentStoreVersionGcOptions::delete_eligible(
+                Duration::ZERO,
+                1,
+            ))
+            .expect("batch version GC");
+        assert_eq!(version_gc.deleted_version_count, (VERSION_COUNT - 1) as u64);
+        assert_eq!(version_gc.durable_delete_batch_count, 2);
+        assert_eq!(
+            version_gc.durable_directory_sync_count, 1,
+            "one final object-directory barrier must cover every bounded unlink group"
+        );
+        assert_eq!(version_gc.stats_delta_persist_count, 1);
+
+        let observed = store
+            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::ZERO))
+            .expect("batch orphan observations");
+        assert_eq!(
+            observed.persisted_orphan_observation_count,
+            (VERSION_COUNT - 1) as u64
+        );
+        assert_eq!(
+            observed.orphan_observation_directory_sync_count, 3,
+            "one shard, its new root, and the store root should be synced once each"
+        );
+
+        let collected = store
+            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::ZERO))
+            .expect("batch packed orphan collection");
+        assert_eq!(collected.deleted_orphan_count, (VERSION_COUNT - 1) as u64);
+        assert_eq!(collected.packed_tombstone_batch_count, 2);
+        assert_eq!(
+            collected.orphan_observation_directory_sync_count, 1,
+            "removing the now-empty marker shard only dirties its parent"
+        );
+        assert_eq!(collected.stats_delta_persist_count, 1);
+        let usage = store.quota_usage().expect("post-GC quota usage");
+        assert_eq!(usage.stats.manifest_count, 1);
+        assert_eq!(usage.stats.blob_count, 1);
+
+        drop(store);
+        let reopened = LocalContentStore::new(&root).expect("reopen batched GC store");
+        assert_eq!(
+            reopened
+                .manifests_for_object("batched-gc-object")
+                .expect("read retained manifests")
+                .len(),
+            1
+        );
+        assert!(
+            reopened
+                .scrub()
+                .expect("scrub reopened batched GC store")
+                .is_healthy()
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    #[ignore = "manual 10k version-manifest GC throughput probe"]
+    fn content_version_gc_10k_throughput_probe() {
+        const VERSION_COUNT: usize = 10_000;
+        const WRITE_BATCH_SIZE: usize = 4_096;
+
+        let root = temp_root("content-version-gc-10k-throughput");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let write_started = Instant::now();
+        for batch_start in (0..VERSION_COUNT).step_by(WRITE_BATCH_SIZE) {
+            let batch_end = batch_start
+                .saturating_add(WRITE_BATCH_SIZE)
+                .min(VERSION_COUNT);
+            let versions = (batch_start..batch_end)
+                .map(|index| format!("version_{index:06}"))
+                .collect::<Vec<_>>();
+            let payloads = (batch_start..batch_end)
+                .map(|index| {
+                    let mut payload = [0_u8; 128];
+                    payload[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                    for (offset, byte) in payload[8..].iter_mut().enumerate() {
+                        *byte = (index.wrapping_mul(131).wrapping_add(offset).wrapping_add(1)
+                            as u8)
+                            .rotate_left((offset % 8) as u32);
+                    }
+                    payload
+                })
+                .collect::<Vec<_>>();
+            store
+                .put_object_versions(versions.iter().zip(&payloads).map(|(version, payload)| {
+                    (
+                        "content-version-gc-throughput-object",
+                        version.as_str(),
+                        payload.as_slice(),
+                    )
+                }))
+                .expect("write throughput fixture");
+        }
+        let write_elapsed = write_started.elapsed();
+
+        let projection_started = Instant::now();
+        let projection = store
+            .collect_versions(ContentStoreVersionGcOptions::dry_run(Duration::ZERO, 1))
+            .expect("project throughput fixture");
+        let projection_elapsed = projection_started.elapsed();
+        assert_eq!(
+            projection.eligible_version_count,
+            (VERSION_COUNT - 1) as u64
+        );
+
+        let gc_started = Instant::now();
+        let report = store
+            .collect_versions(ContentStoreVersionGcOptions::delete_eligible(
+                Duration::ZERO,
+                1,
+            ))
+            .expect("collect throughput fixture");
+        let gc_elapsed = gc_started.elapsed();
+        eprintln!(
+            "content-version-gc-throughput versions={} write_ms={} projection_ms={} gc_ms={} deleted={} delete_groups={} directory_syncs={}",
+            VERSION_COUNT,
+            write_elapsed.as_millis(),
+            projection_elapsed.as_millis(),
+            gc_elapsed.as_millis(),
+            report.deleted_version_count,
+            report.durable_delete_batch_count,
+            report.durable_directory_sync_count,
+        );
+
+        assert_eq!(report.deleted_version_count, (VERSION_COUNT - 1) as u64);
+        assert_eq!(
+            report.durable_delete_batch_count,
+            (VERSION_COUNT - 1).div_ceil(VERSION_GC_DELETE_BATCH_SIZE) as u64
+        );
+        assert_eq!(report.durable_directory_sync_count, 1);
+        assert_eq!(
+            store
+                .manifests_for_object("content-version-gc-throughput-object")
+                .expect("read retained manifests")
+                .len(),
+            1
+        );
+
+        drop(store);
+        let reopened = LocalContentStore::new(&root).expect("reopen store");
+        assert_eq!(
+            reopened
+                .manifests_for_object("content-version-gc-throughput-object")
+                .expect("read retained manifests after restart")
+                .len(),
+            1
+        );
+        cleanup(&root);
+    }
+
+    #[test]
     fn collect_garbage_deletes_only_retention_eligible_orphans() {
         let root = temp_root("collect_garbage_deletes_eligible_orphans");
         let store = LocalContentStore::new(&root).expect("create store");
@@ -6144,10 +7283,16 @@ mod tests {
         assert_eq!(retained.deleted_orphan_count, 0);
         assert_eq!(retained.eligible_orphan_count, 0);
         assert_eq!(retained.retained_young_orphan_count, 2);
+        assert_eq!(retained.newly_observed_orphan_count, 2);
         assert_eq!(
             retained.retained_young_orphan_bytes,
             orphan_a_bytes.len() as u64 + orphan_b_bytes.len() as u64
         );
+        assert_eq!(
+            retained.newly_observed_orphan_bytes,
+            orphan_a_bytes.len() as u64 + orphan_b_bytes.len() as u64
+        );
+        assert!(retained.next_eligible_at_unix_nanos.is_some());
         assert!(store.has_blob(&orphan_a_hash).expect("orphan a retained"));
         assert!(store.has_blob(&orphan_b_hash).expect("orphan b retained"));
 
@@ -6158,6 +7303,7 @@ mod tests {
             )
             .expect("limited gc");
         assert_eq!(limited.blocked_by_scrub_issue_count, 0);
+        assert_eq!(limited.newly_observed_orphan_count, 0);
         assert_eq!(limited.eligible_orphan_count, 2);
         assert_eq!(limited.deleted_orphan_count, 1);
         assert!(limited.max_deletions_reached);
@@ -6189,6 +7335,545 @@ mod tests {
     }
 
     #[test]
+    fn collect_garbage_retains_protected_loose_and_packed_orphans() {
+        let root = temp_root("collect_garbage_retains_protected_orphans");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let protected_packed = store
+            .put_object_version("object-protected-packed", "version_1", b"protected packed")
+            .expect("put protected packed version");
+        assert!(
+            store
+                .packed_blob_location(&protected_packed.content_hash)
+                .expect("protected packed lookup")
+                .is_some(),
+            "fixture must exercise packed-orphan protection"
+        );
+        store
+            .put_object_version("object-protected-packed", "version_2", b"live packed")
+            .expect("put live packed version");
+        let version_gc = store
+            .collect_versions(ContentStoreVersionGcOptions::delete_eligible(
+                Duration::from_nanos(0),
+                1,
+            ))
+            .expect("make old packed blob orphaned");
+        assert_eq!(version_gc.deleted_version_count, 1);
+
+        let protected_loose_bytes = b"protected loose orphan";
+        let protected_loose_hash = content_hash(protected_loose_bytes);
+        write_file_atomic(
+            &store
+                .blob_path(&protected_loose_hash)
+                .expect("protected loose path"),
+            protected_loose_bytes,
+        )
+        .expect("write protected loose orphan");
+        let unprotected_bytes = b"unprotected loose orphan";
+        let unprotected_hash = content_hash(unprotected_bytes);
+        write_file_atomic(
+            &store
+                .blob_path(&unprotected_hash)
+                .expect("unprotected loose path"),
+            unprotected_bytes,
+        )
+        .expect("write unprotected loose orphan");
+
+        let options = ContentStoreGcOptions::delete_eligible(Duration::from_nanos(0))
+            .with_protected_content_hash(protected_packed.content_hash.clone())
+            .with_protected_content_hashes([protected_loose_hash.clone()]);
+        let observed = store
+            .collect_garbage(options.clone())
+            .expect("observe unprotected orphan");
+
+        assert_eq!(observed.retained_protected_orphan_count, 2);
+        assert_eq!(
+            observed.retained_protected_orphan_bytes,
+            protected_packed.size_bytes + protected_loose_bytes.len() as u64
+        );
+        assert_eq!(observed.retained_young_orphan_count, 1);
+        assert_eq!(observed.newly_observed_orphan_count, 1);
+        assert_eq!(
+            observed.newly_observed_orphan_bytes,
+            unprotected_bytes.len() as u64
+        );
+        assert_eq!(observed.eligible_orphan_count, 0);
+        assert_eq!(observed.deleted_orphan_count, 0);
+        assert!(observed.next_eligible_at_unix_nanos.is_some());
+        assert!(
+            store
+                .orphan_observation_path(&unprotected_hash)
+                .expect("unprotected observation path")
+                .is_file()
+        );
+        assert!(
+            !store
+                .orphan_observation_path(&protected_packed.content_hash)
+                .expect("protected packed observation path")
+                .exists()
+        );
+        assert!(
+            !store
+                .orphan_observation_path(&protected_loose_hash)
+                .expect("protected loose observation path")
+                .exists()
+        );
+
+        let report = store
+            .collect_garbage(options)
+            .expect("collect observed unprotected orphan");
+        assert_eq!(report.retained_protected_orphan_count, 2);
+        assert_eq!(report.newly_observed_orphan_count, 0);
+        assert_eq!(report.eligible_orphan_count, 1);
+        assert_eq!(report.deleted_orphan_count, 1);
+        assert!(
+            store
+                .has_blob(&protected_packed.content_hash)
+                .expect("protected packed retained")
+        );
+        assert!(
+            store
+                .has_blob(&protected_loose_hash)
+                .expect("protected loose retained")
+        );
+        assert!(
+            !store
+                .has_blob(&unprotected_hash)
+                .expect("unprotected loose collected")
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn orphan_projection_distinguishes_unobserved_from_clocked_grace() {
+        let root = temp_root("orphan_projection_distinguishes_observation");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let orphan_bytes = b"reactive observation orphan";
+        let orphan_hash = content_hash(orphan_bytes);
+        write_file_atomic(
+            &store.blob_path(&orphan_hash).expect("orphan path"),
+            orphan_bytes,
+        )
+        .expect("write orphan");
+        let min_age = Duration::from_secs(60 * 60);
+
+        let projection = store
+            .collect_garbage(ContentStoreGcOptions::dry_run(min_age))
+            .expect("project missing observation");
+        assert_eq!(projection.newly_observed_orphan_count, 1);
+        assert_eq!(
+            projection.newly_observed_orphan_bytes,
+            orphan_bytes.len() as u64
+        );
+        assert!(
+            !store
+                .orphan_observation_path(&orphan_hash)
+                .expect("observation path")
+                .exists()
+        );
+
+        let observation = store
+            .collect_garbage(ContentStoreGcOptions::delete_eligible(min_age))
+            .expect("persist observation");
+        assert_eq!(observation.newly_observed_orphan_count, 1);
+        assert_eq!(observation.retained_young_orphan_count, 1);
+        assert!(
+            store
+                .orphan_observation_path(&orphan_hash)
+                .expect("persisted observation path")
+                .is_file()
+        );
+
+        let clocked = store
+            .collect_garbage(ContentStoreGcOptions::dry_run(min_age))
+            .expect("project persisted grace clock");
+        assert_eq!(clocked.newly_observed_orphan_count, 0);
+        assert_eq!(clocked.retained_young_orphan_count, 1);
+        assert_eq!(
+            clocked.next_eligible_at_unix_nanos,
+            observation.next_eligible_at_unix_nanos
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn orphan_observation_writes_respect_the_gc_work_limit() {
+        let root = temp_root("orphan_observation_writes_respect_limit");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let blobs = [
+            b"bounded orphan observation a".as_slice(),
+            b"bounded orphan observation b".as_slice(),
+            b"bounded orphan observation c".as_slice(),
+        ];
+        let hashes = blobs
+            .iter()
+            .map(|bytes| {
+                let hash = content_hash(bytes);
+                write_file_atomic(&store.blob_path(&hash).expect("orphan blob path"), bytes)
+                    .expect("write orphan blob");
+                hash
+            })
+            .collect::<Vec<_>>();
+        let options = ContentStoreGcOptions::delete_eligible(Duration::from_secs(60 * 60))
+            .with_max_deletions(1);
+
+        let first = store
+            .collect_garbage(options.clone())
+            .expect("bounded first observation pass");
+        assert_eq!(first.newly_observed_orphan_count, 3);
+        assert_eq!(first.persisted_orphan_observation_count, 1);
+        assert_eq!(first.retained_limit_orphan_observation_count, 2);
+        assert!(first.max_deletions_reached);
+        assert_eq!(
+            hashes
+                .iter()
+                .filter(|hash| {
+                    store
+                        .orphan_observation_path(hash)
+                        .expect("orphan observation path")
+                        .is_file()
+                })
+                .count(),
+            1,
+            "one pass must persist at most max_deletions observation markers"
+        );
+
+        let second = store
+            .collect_garbage(options)
+            .expect("bounded second observation pass");
+        assert_eq!(second.newly_observed_orphan_count, 2);
+        assert_eq!(second.persisted_orphan_observation_count, 1);
+        assert_eq!(second.retained_limit_orphan_observation_count, 1);
+        assert_eq!(
+            hashes
+                .iter()
+                .filter(|hash| {
+                    store
+                        .orphan_observation_path(hash)
+                        .expect("orphan observation path")
+                        .is_file()
+                })
+                .count(),
+            2
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn orphan_observation_survives_restart_before_packed_blob_collection() {
+        let root = temp_root("orphan_observation_survives_restart");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let old = store
+            .put_object_version("object-observed-packed", "version_1", b"old packed bytes")
+            .expect("put old packed version");
+        store
+            .put_object_version("object-observed-packed", "version_2", b"new packed bytes")
+            .expect("put new packed version");
+        assert!(
+            store
+                .packed_blob_location(&old.content_hash)
+                .expect("old packed lookup")
+                .is_some(),
+            "fixture must exercise packed-orphan observations"
+        );
+        store
+            .collect_versions(ContentStoreVersionGcOptions::delete_eligible(
+                Duration::from_nanos(0),
+                1,
+            ))
+            .expect("orphan old packed version");
+
+        let first_pass = store
+            .collect_garbage(ContentStoreGcOptions::delete_eligible(
+                Duration::from_nanos(0),
+            ))
+            .expect("persist first observation");
+        assert_eq!(first_pass.retained_young_orphan_count, 1);
+        assert_eq!(first_pass.newly_observed_orphan_count, 1);
+        assert_eq!(first_pass.newly_observed_orphan_bytes, old.size_bytes);
+        assert_eq!(first_pass.eligible_orphan_count, 0);
+        assert_eq!(first_pass.deleted_orphan_count, 0);
+        let marker_path = store
+            .orphan_observation_path(&old.content_hash)
+            .expect("orphan observation path");
+        assert!(marker_path.is_file());
+        drop(store);
+
+        let reopened = LocalContentStore::new(&root).expect("reopen store");
+        let second_pass = reopened
+            .collect_garbage(ContentStoreGcOptions::delete_eligible(
+                Duration::from_nanos(0),
+            ))
+            .expect("collect after restart");
+        assert_eq!(second_pass.retained_young_orphan_count, 0);
+        assert_eq!(second_pass.newly_observed_orphan_count, 0);
+        assert_eq!(second_pass.eligible_orphan_count, 1);
+        assert_eq!(second_pass.deleted_orphan_count, 1);
+        assert_eq!(second_pass.eligible_packed_segment_count, 1);
+        assert_eq!(second_pass.compacted_packed_segment_count, 1);
+        assert_eq!(second_pass.reclaimed_packed_segment_bytes, old.size_bytes);
+        assert_eq!(
+            second_pass.checkpointed_packed_index_lane_count, 2,
+            "the tombstone batch and the subsequent physical repack each checkpoint the lane"
+        );
+        assert!(second_pass.truncated_packed_index_log_bytes > 0);
+        assert!(
+            !reopened
+                .has_blob(&old.content_hash)
+                .expect("packed orphan removed")
+        );
+        assert!(
+            !marker_path.exists(),
+            "successful deletion must remove its first-observed marker"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn torn_orphan_observation_resets_grace_before_collection() {
+        let root = temp_root("torn_orphan_observation_resets_grace");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let bytes = b"orphan with torn observation";
+        let hash = content_hash(bytes);
+        write_file_atomic(&store.blob_path(&hash).expect("orphan path"), bytes)
+            .expect("write orphan");
+
+        let first = store
+            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::ZERO))
+            .expect("persist first observation");
+        assert_eq!(first.persisted_orphan_observation_count, 1);
+        let marker = store
+            .orphan_observation_path(&hash)
+            .expect("observation path");
+        fs::write(&marker, b"torn").expect("corrupt observation");
+
+        let repaired = store
+            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::ZERO))
+            .expect("repair torn observation conservatively");
+        assert_eq!(repaired.newly_observed_orphan_count, 1);
+        assert_eq!(repaired.persisted_orphan_observation_count, 1);
+        assert_eq!(repaired.deleted_orphan_count, 0);
+        assert!(
+            store
+                .has_blob(&hash)
+                .expect("orphan retained for fresh grace")
+        );
+        drop(store);
+
+        let reopened = LocalContentStore::new(&root).expect("reopen repaired store");
+        let collected = reopened
+            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::ZERO))
+            .expect("collect after repaired observation restart");
+        assert_eq!(collected.deleted_orphan_count, 1);
+        assert!(!reopened.has_blob(&hash).expect("orphan collected"));
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn orphan_observation_is_pruned_after_content_becomes_referenced() {
+        let root = temp_root("orphan_observation_pruned_when_referenced");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let bytes = vec![b'r'; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 1];
+        let hash = content_hash(&bytes);
+        write_file_atomic(&store.blob_path(&hash).expect("orphan blob path"), &bytes)
+            .expect("write loose orphan");
+
+        let observed = store
+            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::from_secs(
+                60,
+            )))
+            .expect("observe loose orphan");
+        assert_eq!(observed.retained_young_orphan_count, 1);
+        let marker_path = store
+            .orphan_observation_path(&hash)
+            .expect("orphan observation path");
+        assert!(marker_path.is_file());
+
+        let manifest = store
+            .put_object_version("object-now-referenced", "version_1", &bytes)
+            .expect("reference observed content");
+        assert_eq!(manifest.content_hash, hash);
+        assert!(
+            !marker_path.exists(),
+            "manifest publication must durably reset any older orphan grace epoch"
+        );
+        let projection = store
+            .collect_garbage(ContentStoreGcOptions::dry_run(Duration::from_nanos(0)))
+            .expect("project resolved orphan observation");
+        assert_eq!(projection.stale_orphan_observation_count, 0);
+        assert_eq!(projection.deleted_stale_orphan_observation_count, 0);
+        let report = store
+            .collect_garbage(ContentStoreGcOptions::delete_eligible(
+                Duration::from_nanos(0),
+            ))
+            .expect("prune resolved orphan observation");
+        assert_eq!(report.deleted_orphan_count, 0);
+        assert_eq!(report.stale_orphan_observation_count, 0);
+        assert_eq!(report.deleted_stale_orphan_observation_count, 0);
+        assert!(store.has_blob(&hash).expect("referenced blob retained"));
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn rereferenced_content_gets_fresh_grace_after_last_manifest_is_removed() {
+        let root = temp_root("rereferenced_content_gets_fresh_grace");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let bytes = vec![b'g'; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 1];
+        let hash = content_hash(&bytes);
+        write_file_atomic(&store.blob_path(&hash).expect("orphan blob path"), &bytes)
+            .expect("write loose orphan");
+
+        let first_observation = store
+            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::ZERO))
+            .expect("persist old orphan observation");
+        assert_eq!(first_observation.newly_observed_orphan_count, 1);
+        assert_eq!(first_observation.deleted_orphan_count, 0);
+        let marker_path = store
+            .orphan_observation_path(&hash)
+            .expect("orphan observation path");
+        assert!(marker_path.is_file());
+
+        store
+            .put_object_version("object-rereferenced", "version_1", &bytes)
+            .expect("publish reference to observed content");
+        assert!(
+            !marker_path.exists(),
+            "the pre-reference orphan epoch must be cleared at publication"
+        );
+        store
+            .put_object_version("object-rereferenced", "version_2", b"replacement")
+            .expect("publish replacement version");
+        let version_gc = store
+            .collect_versions(ContentStoreVersionGcOptions::delete_eligible(
+                Duration::ZERO,
+                1,
+            ))
+            .expect("remove the last manifest referencing old content");
+        assert_eq!(version_gc.deleted_version_count, 1);
+
+        let fresh_observation = store
+            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::ZERO))
+            .expect("observe content after reference removal");
+        assert_eq!(fresh_observation.newly_observed_orphan_count, 1);
+        assert_eq!(fresh_observation.persisted_orphan_observation_count, 1);
+        assert_eq!(fresh_observation.deleted_orphan_count, 0);
+        assert!(
+            store
+                .has_blob(&hash)
+                .expect("freshly observed content retained"),
+            "an observation from before the manifest existed must not authorize deletion"
+        );
+
+        let collected = store
+            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::ZERO))
+            .expect("collect after fresh grace pass");
+        assert_eq!(collected.deleted_orphan_count, 1);
+        assert!(!store.has_blob(&hash).expect("orphan collected"));
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn stale_orphan_observation_cleanup_is_projected_and_bounded() {
+        let root = temp_root("stale_orphan_observation_cleanup_is_bounded");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let bytes = [
+            b"stale orphan marker a".as_slice(),
+            b"stale orphan marker b".as_slice(),
+            b"stale orphan marker c".as_slice(),
+        ];
+        let hashes = bytes
+            .iter()
+            .map(|blob| {
+                let hash = content_hash(blob);
+                write_file_atomic(&store.blob_path(&hash).expect("orphan blob path"), blob)
+                    .expect("write orphan blob");
+                hash
+            })
+            .collect::<Vec<_>>();
+        for (index, blob) in bytes.iter().enumerate() {
+            let manifest = store
+                .put_object_version(&format!("object-referenced-{index}"), "version_1", blob)
+                .expect("reference observed blob");
+            assert_eq!(manifest.content_hash, hashes[index]);
+        }
+        // Simulate stale legacy/crash-recovery markers. Normal manifest
+        // publication clears an earlier observation before it returns.
+        let observed_at_unix_nanos = system_time_nanos_since_epoch_saturating(SystemTime::now());
+        let mut dirty_directories = BTreeSet::new();
+        let mut root_created = false;
+        for hash in &hashes {
+            let persisted = store
+                .persist_orphan_observation_without_sync(hash, observed_at_unix_nanos)
+                .expect("persist stale observation fixture");
+            assert!(persisted.created);
+            dirty_directories.insert(persisted.parent);
+            root_created |= persisted.root_created;
+        }
+        store
+            .sync_orphan_observation_directories(&dirty_directories, root_created)
+            .expect("sync stale observation fixture");
+
+        let projection = store
+            .collect_garbage(
+                ContentStoreGcOptions::dry_run(Duration::from_nanos(0)).with_max_deletions(1),
+            )
+            .expect("project bounded stale-marker cleanup");
+        assert_eq!(projection.stale_orphan_observation_count, 3);
+        assert_eq!(projection.deleted_stale_orphan_observation_count, 0);
+        assert_eq!(projection.retained_limit_orphan_observation_count, 2);
+        assert!(projection.max_deletions_reached);
+        assert!(hashes.iter().all(|hash| {
+            store
+                .orphan_observation_path(hash)
+                .expect("orphan observation path")
+                .is_file()
+        }));
+
+        let limited = store
+            .collect_garbage(
+                ContentStoreGcOptions::delete_eligible(Duration::from_nanos(0))
+                    .with_max_deletions(1),
+            )
+            .expect("bounded stale-marker cleanup");
+        assert_eq!(limited.stale_orphan_observation_count, 3);
+        assert_eq!(limited.deleted_stale_orphan_observation_count, 1);
+        assert_eq!(limited.retained_limit_orphan_observation_count, 2);
+        assert_eq!(
+            hashes
+                .iter()
+                .filter(|hash| {
+                    store
+                        .orphan_observation_path(hash)
+                        .expect("orphan observation path")
+                        .is_file()
+                })
+                .count(),
+            2
+        );
+
+        let final_pass = store
+            .collect_garbage(ContentStoreGcOptions::delete_eligible(
+                Duration::from_nanos(0),
+            ))
+            .expect("finish stale-marker cleanup");
+        assert_eq!(final_pass.deleted_stale_orphan_observation_count, 2);
+        assert!(hashes.iter().all(|hash| {
+            !store
+                .orphan_observation_path(hash)
+                .expect("orphan observation path")
+                .exists()
+        }));
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn collect_garbage_dry_run_and_blocks_on_non_orphan_scrub_issues() {
         let root = temp_root("collect_garbage_dry_run_blocks_on_corrupt");
         let store = LocalContentStore::new(&root).expect("create store");
@@ -6208,8 +7893,26 @@ mod tests {
             .expect("dry-run gc");
         assert_eq!(dry_run.blocked_by_scrub_issue_count, 0);
         assert!(dry_run.dry_run);
-        assert_eq!(dry_run.eligible_orphan_count, 1);
+        assert_eq!(dry_run.retained_young_orphan_count, 1);
+        assert_eq!(dry_run.newly_observed_orphan_count, 1);
+        assert_eq!(
+            dry_run.newly_observed_orphan_bytes,
+            orphan_bytes.len() as u64
+        );
+        assert_eq!(dry_run.eligible_orphan_count, 0);
         assert_eq!(dry_run.deleted_orphan_count, 0);
+        assert!(dry_run.next_eligible_at_unix_nanos.is_some());
+        assert!(
+            !store
+                .orphan_observation_path(&orphan_hash)
+                .expect("dry-run observation path")
+                .exists(),
+            "dry-run must not persist first-observed state"
+        );
+        assert!(
+            !store.stats_snapshot_path().exists(),
+            "dry-run must not persist derived stats state"
+        );
         assert!(store.has_blob(&orphan_hash).expect("dry-run retained"));
 
         write_file_atomic(
@@ -6235,6 +7938,111 @@ mod tests {
     }
 
     #[test]
+    fn collect_versions_retains_protected_old_manifest() {
+        let root = temp_root("collect_versions_retains_protected_old_manifest");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let version_1 = store
+            .put_object_version(
+                "object-protected-history",
+                "version_1",
+                b"protected history",
+            )
+            .expect("put protected version");
+        store
+            .put_object_version(
+                "object-protected-history",
+                "version_2",
+                b"collectible history",
+            )
+            .expect("put collectible version");
+        let version_3 = store
+            .put_object_version("object-protected-history", "version_3", b"latest history")
+            .expect("put latest version");
+
+        let options = ContentStoreVersionGcOptions::delete_eligible(Duration::from_nanos(0), 1)
+            .with_protected_version("object-protected-history", "version_1")
+            .with_protected_versions([("object-protected-history", "version_1")]);
+        assert_eq!(options.protected_versions.len(), 1);
+        let report = store
+            .collect_versions(options)
+            .expect("collect unprotected old version");
+
+        assert_eq!(report.scanned_version_count, 3);
+        assert_eq!(report.retained_protected_version_count, 1);
+        assert_eq!(
+            report.retained_protected_logical_bytes,
+            version_1.size_bytes
+        );
+        assert_eq!(report.retained_latest_version_count, 1);
+        assert_eq!(report.eligible_version_count, 1);
+        assert_eq!(report.deleted_version_count, 1);
+        let remaining_versions = store
+            .manifests_for_object("object-protected-history")
+            .expect("remaining protected manifests")
+            .into_iter()
+            .map(|manifest| manifest.version)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            remaining_versions,
+            BTreeSet::from([version_1.version.clone(), version_3.version.clone()])
+        );
+        assert_eq!(
+            store
+                .read_object_version("object-protected-history", &version_1.version)
+                .expect("protected old version remains")
+                .1,
+            b"protected history"
+        );
+        assert!(
+            store
+                .read_object_version("object-protected-history", "version_2")
+                .is_err(),
+            "unprotected old version should be collected"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn version_gc_deadline_excludes_latest_and_protected_manifests() {
+        let root = temp_root("version_gc_deadline_excludes_roots");
+        let store = LocalContentStore::new(&root).expect("create store");
+        store
+            .put_object_version("object-deadline", "version_1", b"protected history")
+            .expect("put protected version");
+        store
+            .put_object_version("object-deadline", "version_2", b"young history")
+            .expect("put young version");
+        store
+            .put_object_version("object-deadline", "version_3", b"latest history")
+            .expect("put latest version");
+
+        let min_age = Duration::from_secs(60 * 60);
+        let young_modified = store
+            .manifest_path("object-deadline", "version_2")
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .expect("young manifest modified time");
+        let expected_deadline = system_time_nanos_since_epoch_saturating(young_modified)
+            .saturating_add(duration_nanos_saturating(min_age));
+        let report = store
+            .collect_versions(
+                ContentStoreVersionGcOptions::dry_run(min_age, 1)
+                    .with_protected_version("object-deadline", "version_1"),
+            )
+            .expect("project version deadline");
+
+        assert_eq!(report.scanned_version_count, 3);
+        assert_eq!(report.retained_protected_version_count, 1);
+        assert_eq!(report.retained_latest_version_count, 1);
+        assert_eq!(report.retained_young_version_count, 1);
+        assert_eq!(report.eligible_version_count, 0);
+        assert_eq!(report.next_eligible_at_unix_nanos, Some(expected_deadline));
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn collect_versions_prunes_old_manifests_then_blob_gc_reclaims_orphans() {
         let root = temp_root("collect_versions_prunes_old_manifests");
         let store = LocalContentStore::new(&root).expect("create store");
@@ -6247,6 +8055,7 @@ mod tests {
         let version_3 = store
             .put_object_version("object-history", "version_3", b"history bytes v3")
             .expect("put version 3");
+        let stats_before_dry_run = fs::read(store.stats_snapshot_path()).ok();
 
         let dry_run = store
             .collect_versions(ContentStoreVersionGcOptions::dry_run(
@@ -6260,6 +8069,11 @@ mod tests {
         assert_eq!(dry_run.retained_latest_version_count, 1);
         assert_eq!(dry_run.eligible_version_count, 2);
         assert_eq!(dry_run.deleted_version_count, 0);
+        assert_eq!(
+            fs::read(store.stats_snapshot_path()).ok(),
+            stats_before_dry_run,
+            "version GC dry-run must not persist a derived stats snapshot"
+        );
         assert_eq!(
             store
                 .manifests_for_object("object-history")
@@ -6278,6 +8092,7 @@ mod tests {
         assert_eq!(retained.deleted_version_count, 0);
         assert_eq!(retained.retained_latest_version_count, 1);
         assert_eq!(retained.retained_young_version_count, 2);
+        assert!(retained.next_eligible_at_unix_nanos.is_some());
 
         let limited = store
             .collect_versions(
@@ -6324,11 +8139,20 @@ mod tests {
         assert!(store.has_blob(&version_2.content_hash).expect("v2 orphan"));
         assert!(store.has_blob(&version_3.content_hash).expect("v3 live"));
 
+        let observation = store
+            .collect_garbage(ContentStoreGcOptions::delete_eligible(
+                Duration::from_nanos(0),
+            ))
+            .expect("observe orphans after version gc");
+        assert_eq!(observation.retained_young_orphan_count, 2);
+        assert_eq!(observation.newly_observed_orphan_count, 2);
+        assert_eq!(observation.deleted_orphan_count, 0);
+        assert!(observation.next_eligible_at_unix_nanos.is_some());
         let blob_gc = store
             .collect_garbage(ContentStoreGcOptions::delete_eligible(
                 Duration::from_nanos(0),
             ))
-            .expect("blob gc after version gc");
+            .expect("blob gc after observation");
         assert_eq!(blob_gc.deleted_orphan_count, 2);
         assert!(
             !store

@@ -27,6 +27,7 @@ mod metadata_backend;
 mod metadata_cursor;
 mod metadata_error;
 mod metadata_hardlink;
+mod metadata_history_gc;
 mod metadata_io;
 mod metadata_journal;
 mod metadata_keys;
@@ -263,30 +264,38 @@ pub use metadata_api::{
 };
 pub use metadata_backend::LocalSobjMetadataBackend;
 pub use metadata_error::MetadataBackendError;
+pub use metadata_history_gc::{
+    DfsMetadataContentProtection, DfsMetadataHistoryGcOptions, DfsMetadataHistoryGcReport,
+    DfsMetadataHistoryShardStats, DfsMetadataRetainedTableStats, DfsMetadataVersionIdentity,
+};
 pub use metadata_limits::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
 };
 pub use metadata_records::{
     DfsConflictPage, DfsConflictPageCursor, DfsConflictRecord, DfsConflictScanCursor,
-    DfsConflictScanPage, DfsConflictStatus, DfsDentryPageCursor, DfsDirFragmentId,
+    DfsConflictScanPage, DfsConflictStatus, DfsCrossShardPinTransferRecord,
+    DfsCrossShardSourceFamily, DfsCrossShardVersionPinFence, DfsDentryPageCursor, DfsDirFragmentId,
     DfsDirFragmentRecord, DfsDirectoryPage, DfsDirectoryPageCursor, DfsInodeId, DfsInodeRecord,
     DfsMetadataAuthorityAckFloor, DfsMetadataJournalBatch, DfsMetadataJournalEntry,
     DfsMetadataMutation, DfsMetadataPrefixAckFloor, DfsMetadataPrefixProof,
     DfsMetadataReplayCursorStatus, DfsMetadataReplicaLagStatus, DfsMetadataShardId,
     DfsMetadataShardMigrationReport, DfsMetadataShardStatus, DfsMetadataSubscription,
-    DfsMetadataSummary, DfsMetadataTableSnapshot, DfsNamespaceJobFrame, DfsNamespaceJobKind,
-    DfsNamespaceJobPage, DfsNamespaceJobPageCursor, DfsNamespaceJobRecord, DfsNamespaceJobStatus,
+    DfsMetadataSummary, DfsMetadataTableSnapshot, DfsMetadataVersionPinPage,
+    DfsMetadataVersionPinPageCursor, DfsMetadataVersionPinRecord, DfsNamespaceJobFrame,
+    DfsNamespaceJobKind, DfsNamespaceJobOrigin, DfsNamespaceJobPage, DfsNamespaceJobPageCursor,
+    DfsNamespaceJobReceipt, DfsNamespaceJobRecord, DfsNamespaceJobStatus,
     DfsNamespaceObjectVersionExpectation, DfsNamespacePathOccupantExpectation,
     DfsNamespacePrepareReceipt, DfsNamespacePrepareRecord, DfsNamespacePrepareStatus,
     DfsNamespaceRequestReceipt, DfsNamespaceRequestRecord, DfsNamespaceRequestStatus,
     DfsNamespaceTransaction, DfsNamespaceTransactionReceipt, DfsObjectPage, DfsObjectPageCursor,
     DfsObjectVersionPage, DfsObjectVersionPageCursor, DfsObjectVersionRecord,
-    DfsObjectVersionScanCursor, DfsObjectVersionScanPage, DfsPathRecord,
-    DfsPendingNamespaceRequestPage, DfsPendingNamespaceRequestPageCursor, DfsReplicaReceiptPage,
-    DfsReplicaReceiptPageCursor, DfsReplicaReceiptRecord, DfsReplicaReceiptScanCursor,
-    DfsReplicaReceiptScanPage, DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport,
-    DfsWriteIntentPage, DfsWriteIntentPageCursor, DfsWriteIntentRecord, DfsWriteIntentScanCursor,
-    DfsWriteIntentScanPage, DfsWriteIntentStatus,
+    DfsObjectVersionScanCursor, DfsObjectVersionScanPage, DfsObjectWriteIntentHistory,
+    DfsPathRecord, DfsPendingNamespaceRequestPage, DfsPendingNamespaceRequestPageCursor,
+    DfsReplicaReceiptPage, DfsReplicaReceiptPageCursor, DfsReplicaReceiptRecord,
+    DfsReplicaReceiptScanCursor, DfsReplicaReceiptScanPage, DfsTombstoneCompactionOptions,
+    DfsTombstoneCompactionReport, DfsWriteIntentPage, DfsWriteIntentPageCursor,
+    DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord,
+    DfsWriteIntentScanCursor, DfsWriteIntentScanPage, DfsWriteIntentStatus,
 };
 pub(crate) use metadata_records::{
     dfs_now_unix_nanos, metadata_journal_batch_file_system_id, object_version_record,

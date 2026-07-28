@@ -20,6 +20,10 @@ use crate::metadata_api::{
 };
 use crate::metadata_cursor;
 use crate::metadata_error::{MetadataBackendError, Result};
+use crate::metadata_history_gc::{
+    DfsMetadataContentProtection, DfsMetadataHistoryGcOptions, DfsMetadataHistoryGcReport,
+    DfsMetadataHistoryRemoval, metadata_content_protection_from_tables, plan_metadata_history_gc,
+};
 use crate::metadata_io::{create_dir_all, read_sobj_optional, write_sobj_atomic};
 #[cfg(test)]
 use crate::metadata_io::{read_dir, read_sobj, remove_file_if_exists, sync_dir};
@@ -35,7 +39,8 @@ use crate::metadata_journal::{
 };
 use crate::metadata_keys::normalize_path;
 use crate::metadata_limits::{
-    DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, OBJECT_LOCAL_METADATA_PAGE_SIZE,
+    DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, MAX_DURABLE_VERSION_PINS_PER_OBJECT,
+    OBJECT_LOCAL_METADATA_PAGE_SIZE,
 };
 use crate::metadata_lock::{MetadataWriteLock, metadata_write_lock};
 use crate::metadata_namespace_transaction::{
@@ -54,8 +59,8 @@ use crate::metadata_pages::{
     intents_for_object_version_page_from_tables, namespace_jobs_page_from_tables,
     objects_for_file_system_page_from_tables, pending_namespace_requests_page_from_tables,
     receipt_records_page_from_tables, receipts_for_version_page_from_tables,
-    version_records_page_from_tables, versions_for_object_page_from_tables,
-    write_intents_page_from_tables,
+    version_pins_for_object_page_from_tables, version_records_page_from_tables,
+    versions_for_object_page_from_tables, write_intents_page_from_tables,
 };
 use crate::metadata_read_snapshot;
 use crate::metadata_receipt::{receipt_for_replica_from_backend, replay_receipt_matches_existing};
@@ -72,17 +77,20 @@ use crate::metadata_table_apply::{self, TableMaterializationState};
 #[cfg(test)]
 use crate::metadata_table_store::{
     LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION, metadata_table_path,
-    metadata_table_snapshot_ops, metadata_table_snapshot_path, truncate_metadata_table_log,
+    metadata_table_snapshot_ops, truncate_metadata_table_log,
 };
 use crate::metadata_table_store::{
     METADATA_TABLE_SNAPSHOT_FORMAT_VERSION, archive_metadata_backend_state,
     load_or_migrate_metadata_tables, metadata_table_snapshot_fingerprint,
-    metadata_tables_from_table_snapshot, metadata_tables_snapshot, persist_metadata_table_snapshot,
-    read_metadata_table_state_lenient,
+    metadata_table_snapshot_path, metadata_tables_from_table_snapshot, metadata_tables_snapshot,
+    persist_metadata_table_snapshot, read_metadata_table_state_lenient,
 };
 use crate::metadata_tables::{
     DfsMetadataTableRollback, DfsMetadataTables, DfsMetadataTablesSnapshot,
-    MetadataTableReadSnapshotCache, MetadataTableSnapshotFingerprint, namespace_prepare_footprint,
+    MetadataTableReadSnapshotCache, MetadataTableSnapshotFingerprint,
+    namespace_job_receipt_eviction_delta, namespace_prepare_footprint,
+    namespace_prepare_receipt_eviction_delta, namespace_request_receipt_eviction_delta,
+    namespace_transaction_receipt_eviction_delta,
 };
 use crate::metadata_tombstone::{metadata_now_unix_nanos, plan_tombstone_compaction};
 use crate::metadata_visible_commit::{
@@ -100,7 +108,6 @@ use sinomo_core::node::NodeId;
 #[cfg(test)]
 use sinomo_core::object::serde_ext as sinomo_object_serde;
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(test)]
 use std::fs;
 #[cfg(test)]
 use std::io;
@@ -274,6 +281,409 @@ fn completed_namespace_request_outcome_matches(
         && right.status == DfsNamespaceRequestStatus::Completed
         && left.result == right.result
         && left.posix_coordination_result == right.posix_coordination_result
+}
+
+fn validate_version_pin_payload(
+    file_system_id: &DfsFileSystemId,
+    object_id: &DfsObjectId,
+    version: &DfsVersion,
+    pin_id: &str,
+    pin: &DfsMetadataVersionPinRecord,
+) -> Result<()> {
+    if pin_id.trim().is_empty() || pin_id.len() > 256 {
+        return Err(MetadataBackendError::Serde(
+            "metadata version pin id must contain 1..=256 bytes".to_string(),
+        ));
+    }
+    if &pin.file_system_id != file_system_id
+        || &pin.object_id != object_id
+        || &pin.version != version
+        || pin.pin_id != pin_id
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "metadata version pin payload does not match outer identity {file_system_id}/{object_id}/{version}/{pin_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_version_pin_capacity_for_new(
+    tables: &DfsMetadataTables,
+    object_id: &DfsObjectId,
+) -> Result<()> {
+    let count = tables
+        .version_pins
+        .keys()
+        .filter(|(pin_object_id, _, _)| pin_object_id == object_id)
+        .count();
+    if count >= MAX_DURABLE_VERSION_PINS_PER_OBJECT {
+        return Err(MetadataBackendError::Serde(format!(
+            "object {object_id} already has the maximum {} durable version pins",
+            MAX_DURABLE_VERSION_PINS_PER_OBJECT
+        )));
+    }
+    Ok(())
+}
+
+fn cross_shard_pin_transfer_identity_matches(
+    left: &DfsCrossShardPinTransferRecord,
+    right: &DfsCrossShardPinTransferRecord,
+) -> bool {
+    left.transfer_id == right.transfer_id
+        && left.file_system_id == right.file_system_id
+        && left.object_id == right.object_id
+        && normalize_path(&left.source_path) == normalize_path(&right.source_path)
+        && normalize_path(&left.target_path) == normalize_path(&right.target_path)
+        && left.target_version == right.target_version
+        && left.created_at == right.created_at
+}
+
+fn validate_cross_shard_pin_transfer_table_transition(
+    tables: &DfsMetadataTables,
+    outer_file_system_id: &DfsFileSystemId,
+    outer_object_id: &DfsObjectId,
+    outer_transfer_id: &str,
+    authoritative_migration: bool,
+    incoming_versions: &[DfsObjectVersionRecord],
+    transfer: &DfsCrossShardPinTransferRecord,
+) -> Result<bool> {
+    if outer_transfer_id.trim().is_empty() || outer_transfer_id.len() > 256 {
+        return Err(MetadataBackendError::Serde(
+            "cross-shard pin transfer id must contain 1..=256 bytes".to_string(),
+        ));
+    }
+    if &transfer.file_system_id != outer_file_system_id
+        || &transfer.object_id != outer_object_id
+        || transfer.transfer_id != outer_transfer_id
+        || transfer.source_path != normalize_path(&transfer.source_path)
+        || transfer.target_path != normalize_path(&transfer.target_path)
+        || transfer.source_path == transfer.target_path
+        || transfer.updated_at < transfer.created_at
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "cross-shard pin transfer payload does not match canonical outer identity {outer_file_system_id}/{outer_object_id}/{outer_transfer_id}"
+        )));
+    }
+    if transfer.source_pins.len() > MAX_DURABLE_VERSION_PINS_PER_OBJECT
+        || transfer.copied_pins.len() > transfer.source_pins.len()
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "cross-shard pin transfer {} exceeds the maximum {} acknowledged pins",
+            transfer.transfer_id, MAX_DURABLE_VERSION_PINS_PER_OBJECT
+        )));
+    }
+    let mut incoming_version_ids = BTreeSet::new();
+    for version in incoming_versions {
+        if version.file_system_id != transfer.file_system_id
+            || version.object_id != transfer.object_id
+            || !incoming_version_ids.insert(version.version.clone())
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "cross-shard pin transfer {} received an unrelated or duplicate version {}/{}",
+                transfer.transfer_id, version.object_id, version.version
+            )));
+        }
+        if let Some(existing) = tables
+            .versions
+            .get(&(version.object_id.clone(), version.version.clone()))
+            && existing != version
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "cross-shard pin transfer {} conflicts with destination version {}/{}",
+                transfer.transfer_id, version.object_id, version.version
+            )));
+        }
+    }
+    if !tables
+        .versions
+        .contains_key(&(transfer.object_id.clone(), transfer.target_version.clone()))
+        && !incoming_versions
+            .iter()
+            .any(|version| version.version == transfer.target_version)
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "cross-shard pin transfer {} is missing target version {}/{}",
+            transfer.transfer_id, transfer.object_id, transfer.target_version
+        )));
+    }
+    let key = (transfer.object_id.clone(), transfer.transfer_id.clone());
+    let previous = tables.cross_shard_pin_transfers.get(&key);
+    if let Some(previous) = previous
+        && !cross_shard_pin_transfer_identity_matches(previous, transfer)
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "cross-shard pin transfer {} immutable identity changed",
+            transfer.transfer_id
+        )));
+    }
+    if tables.cross_shard_pin_transfers.values().any(|other| {
+        other.object_id == transfer.object_id && other.transfer_id != transfer.transfer_id
+    }) {
+        return Err(MetadataBackendError::Serde(format!(
+            "object {} already has another active cross-shard pin transfer",
+            transfer.object_id
+        )));
+    }
+
+    let previous_owned = previous
+        .map(|previous| previous.copied_pins.iter().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    let copied_pins = transfer.copied_pins.iter().collect::<BTreeSet<_>>();
+    if copied_pins.len() != transfer.copied_pins.len() {
+        return Err(MetadataBackendError::Serde(format!(
+            "cross-shard pin transfer {} repeats an owned pin",
+            transfer.transfer_id
+        )));
+    }
+    let mut source_keys = BTreeSet::new();
+    for pin in &transfer.source_pins {
+        validate_version_pin_payload(
+            &pin.file_system_id,
+            &pin.object_id,
+            &pin.version,
+            &pin.pin_id,
+            pin,
+        )?;
+        if pin.file_system_id != transfer.file_system_id || pin.object_id != transfer.object_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "cross-shard pin transfer {} acknowledges unrelated pin {} for {}/{}",
+                transfer.transfer_id, pin.pin_id, pin.object_id, pin.version
+            )));
+        }
+        let pin_key = (
+            pin.object_id.clone(),
+            pin.version.clone(),
+            pin.pin_id.clone(),
+        );
+        if !source_keys.insert(pin_key.clone()) {
+            return Err(MetadataBackendError::Serde(format!(
+                "cross-shard pin transfer {} repeats acknowledged pin {} for {}/{}",
+                transfer.transfer_id, pin.pin_id, pin.object_id, pin.version
+            )));
+        }
+        let version = tables
+            .versions
+            .get(&(pin.object_id.clone(), pin.version.clone()))
+            .or_else(|| {
+                incoming_versions
+                    .iter()
+                    .find(|version| version.version == pin.version)
+            })
+            .ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "cross-shard pin transfer {} references missing version {}/{}",
+                    transfer.transfer_id, pin.object_id, pin.version
+                ))
+            })?;
+        if version.file_system_id != transfer.file_system_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "cross-shard pin transfer {} pin version filesystem mismatch",
+                transfer.transfer_id
+            )));
+        }
+        if let Some(other) =
+            tables.cross_shard_pin_transfer_fence(&pin.object_id, &pin.version, &pin.pin_id)
+            && other.transfer_id != transfer.transfer_id
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "cross-shard pin {} for {}/{} is already fenced by transfer {}",
+                pin.pin_id, pin.object_id, pin.version, other.transfer_id
+            )));
+        }
+        let desired_owned = copied_pins.contains(pin);
+        let previously_owned = previous_owned.contains(pin);
+        match tables.version_pins.get(&pin_key) {
+            Some(existing) if existing == pin && desired_owned == previously_owned => {}
+            Some(existing) if existing == pin && !desired_owned => {}
+            Some(existing) if existing == pin => {
+                return Err(MetadataBackendError::Serde(format!(
+                    "cross-shard pin transfer {} cannot claim pre-existing target pin {} for {}/{}",
+                    transfer.transfer_id, pin.pin_id, pin.object_id, pin.version
+                )));
+            }
+            Some(_) if previously_owned => {
+                return Err(MetadataBackendError::Serde(format!(
+                    "cross-shard pin transfer {} lost ownership of pin {} for {}/{} to a conflicting record",
+                    transfer.transfer_id, pin.pin_id, pin.object_id, pin.version
+                )));
+            }
+            Some(_) => {
+                return Err(MetadataBackendError::Serde(format!(
+                    "cross-shard pin transfer {} cannot claim a pre-existing target pin {} for {}/{}",
+                    transfer.transfer_id, pin.pin_id, pin.object_id, pin.version
+                )));
+            }
+            None if previously_owned => {
+                return Err(MetadataBackendError::Serde(format!(
+                    "cross-shard pin transfer {} is missing its owned pin {} for {}/{}",
+                    transfer.transfer_id, pin.pin_id, pin.object_id, pin.version
+                )));
+            }
+            None if desired_owned => {}
+            None if authoritative_migration => {}
+            None => {
+                return Err(MetadataBackendError::Serde(format!(
+                    "cross-shard pin transfer {} is missing acknowledged independent pin {} for {}/{}",
+                    transfer.transfer_id, pin.pin_id, pin.object_id, pin.version
+                )));
+            }
+        }
+    }
+    for pin in &transfer.copied_pins {
+        if !transfer.source_pins.iter().any(|source| source == pin) {
+            return Err(MetadataBackendError::Serde(format!(
+                "cross-shard pin transfer {} owns pin {} for {}/{} outside its acknowledged source set",
+                transfer.transfer_id, pin.pin_id, pin.object_id, pin.version
+            )));
+        }
+    }
+
+    let current_pin_count = tables
+        .version_pins
+        .keys()
+        .filter(|(object_id, _, _)| object_id == outer_object_id)
+        .count();
+    let stale_owned_count = previous
+        .map(|previous| {
+            previous
+                .copied_pins
+                .iter()
+                .filter(|pin| !transfer.copied_pins.iter().any(|desired| desired == *pin))
+                .count()
+        })
+        .unwrap_or(0);
+    let newly_inserted_count = transfer
+        .source_pins
+        .iter()
+        .filter(|pin| {
+            !tables.version_pins.contains_key(&(
+                pin.object_id.clone(),
+                pin.version.clone(),
+                pin.pin_id.clone(),
+            ))
+        })
+        .count();
+    if current_pin_count
+        .saturating_sub(stale_owned_count)
+        .saturating_add(newly_inserted_count)
+        > MAX_DURABLE_VERSION_PINS_PER_OBJECT
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "cross-shard pin transfer {} would exceed the maximum {} durable pins for object {}",
+            transfer.transfer_id, MAX_DURABLE_VERSION_PINS_PER_OBJECT, transfer.object_id
+        )));
+    }
+    Ok(previous == Some(transfer))
+}
+
+fn validate_cross_shard_source_eviction_table_transition(
+    tables: &DfsMetadataTables,
+    outer_file_system_id: &DfsFileSystemId,
+    outer_object_id: &DfsObjectId,
+    tombstone: &DfsObjectMetadata,
+    removed_pins: &[DfsMetadataVersionPinRecord],
+    removed_pin_transfers: &[DfsCrossShardPinTransferRecord],
+) -> Result<bool> {
+    if &tombstone.file_system_id != outer_file_system_id
+        || &tombstone.object_id != outer_object_id
+        || tombstone.kind != DfsObjectKind::Tombstone
+        || !matches!(
+            tombstone.tombstone_provenance,
+            Some(crate::DfsTombstoneProvenance::SourceEviction { .. })
+        )
+        || removed_pins.len() > MAX_DURABLE_VERSION_PINS_PER_OBJECT
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "invalid atomic cross-shard source eviction for {outer_file_system_id}/{outer_object_id}"
+        )));
+    }
+    let mut removed_pin_keys = BTreeSet::new();
+    for pin in removed_pins {
+        if pin.file_system_id != *outer_file_system_id
+            || pin.object_id != *outer_object_id
+            || !removed_pin_keys.insert((
+                pin.object_id.clone(),
+                pin.version.clone(),
+                pin.pin_id.clone(),
+            ))
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "atomic cross-shard source eviction for {outer_object_id} contains an unrelated or duplicate pin"
+            )));
+        }
+    }
+    let mut removed_transfer_keys = BTreeSet::new();
+    for transfer in removed_pin_transfers {
+        if transfer.file_system_id != *outer_file_system_id
+            || transfer.object_id != *outer_object_id
+            || !removed_transfer_keys
+                .insert((transfer.object_id.clone(), transfer.transfer_id.clone()))
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "atomic cross-shard source eviction for {outer_object_id} contains an unrelated or duplicate pin transfer"
+            )));
+        }
+    }
+
+    let current = tables
+        .objects
+        .get(outer_object_id)
+        .or_else(|| tables.compacted_tombstones.get(outer_object_id));
+    let already_applied = current == Some(tombstone)
+        && removed_pins.iter().all(|pin| {
+            tables.version_pins.get(&(
+                pin.object_id.clone(),
+                pin.version.clone(),
+                pin.pin_id.clone(),
+            )) != Some(pin)
+        })
+        && removed_pin_transfers.iter().all(|transfer| {
+            tables
+                .cross_shard_pin_transfers
+                .get(&(transfer.object_id.clone(), transfer.transfer_id.clone()))
+                != Some(transfer)
+        });
+    if already_applied {
+        return Ok(true);
+    }
+
+    let current_pins = tables
+        .version_pins
+        .values()
+        .filter(|pin| &pin.object_id == outer_object_id)
+        .collect::<BTreeSet<_>>();
+    let removed_pins_set = removed_pins.iter().collect::<BTreeSet<_>>();
+    if current_pins != removed_pins_set {
+        return Err(MetadataBackendError::Serde(format!(
+            "atomic cross-shard source eviction for {outer_object_id} does not remove the exact current pin set"
+        )));
+    }
+    let current_transfers = tables
+        .cross_shard_pin_transfers
+        .values()
+        .filter(|transfer| &transfer.object_id == outer_object_id)
+        .map(|transfer| {
+            (
+                (transfer.object_id.clone(), transfer.transfer_id.clone()),
+                transfer,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let removed_transfers = removed_pin_transfers
+        .iter()
+        .map(|transfer| {
+            (
+                (transfer.object_id.clone(), transfer.transfer_id.clone()),
+                transfer,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if current_transfers != removed_transfers {
+        return Err(MetadataBackendError::Serde(format!(
+            "atomic cross-shard source eviction for {outer_object_id} does not remove the exact current pin-transfer set"
+        )));
+    }
+    Ok(false)
 }
 
 fn validate_namespace_request_shape(request: &DfsNamespaceRequestRecord) -> Result<()> {
@@ -1097,6 +1507,27 @@ fn require_replica_snapshot_tables_file_system(
             expected,
         )?;
     }
+    for pin in tables.version_pins.values() {
+        require_replica_snapshot_record_file_system(
+            "durable version pin",
+            &pin.file_system_id,
+            expected,
+        )?;
+    }
+    for transfer in tables.cross_shard_pin_transfers.values() {
+        require_replica_snapshot_record_file_system(
+            "cross-shard pin transfer",
+            &transfer.file_system_id,
+            expected,
+        )?;
+        for pin in &transfer.source_pins {
+            require_replica_snapshot_record_file_system(
+                "cross-shard transfer-owned pin",
+                &pin.file_system_id,
+                expected,
+            )?;
+        }
+    }
     for receipt in tables.receipts.values() {
         require_replica_snapshot_record_file_system(
             "receipt record",
@@ -1184,6 +1615,13 @@ fn require_replica_snapshot_tables_file_system(
             expected,
         )?;
     }
+    for receipt in tables.namespace_job_receipts.values() {
+        require_replica_snapshot_record_file_system(
+            "namespace job receipt",
+            &receipt.file_system_id,
+            expected,
+        )?;
+    }
     for request in tables.namespace_requests.values() {
         require_replica_snapshot_record_file_system(
             "namespace request",
@@ -1197,6 +1635,60 @@ fn require_replica_snapshot_tables_file_system(
             &receipt.file_system_id,
             expected,
         )?;
+    }
+    Ok(())
+}
+
+fn require_version_pin_table_invariants(tables: &DfsMetadataTables) -> Result<()> {
+    let mut pin_counts = BTreeMap::<DfsObjectId, usize>::new();
+    for pin in tables.version_pins.values() {
+        let count = pin_counts.entry(pin.object_id.clone()).or_default();
+        *count = count.saturating_add(1);
+        if *count > MAX_DURABLE_VERSION_PINS_PER_OBJECT {
+            return Err(MetadataBackendError::Serde(format!(
+                "durable snapshot object {} exceeds the maximum {} version pins",
+                pin.object_id, MAX_DURABLE_VERSION_PINS_PER_OBJECT
+            )));
+        }
+        let version = tables
+            .versions
+            .get(&(pin.object_id.clone(), pin.version.clone()))
+            .ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "durable version pin {} for {}/{} references a missing metadata version",
+                    pin.pin_id, pin.object_id, pin.version
+                ))
+            })?;
+        if version.file_system_id != pin.file_system_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "durable version pin {} for {}/{} has filesystem {}, but its metadata version has filesystem {}",
+                pin.pin_id, pin.object_id, pin.version, pin.file_system_id, version.file_system_id
+            )));
+        }
+    }
+    for transfer in tables.cross_shard_pin_transfers.values() {
+        validate_cross_shard_pin_transfer_table_transition(
+            tables,
+            &transfer.file_system_id,
+            &transfer.object_id,
+            &transfer.transfer_id,
+            false,
+            &[],
+            transfer,
+        )?;
+        for pin in &transfer.copied_pins {
+            let key = (
+                pin.object_id.clone(),
+                pin.version.clone(),
+                pin.pin_id.clone(),
+            );
+            if tables.version_pins.get(&key) != Some(pin) {
+                return Err(MetadataBackendError::Serde(format!(
+                    "cross-shard pin transfer {} does not own its exact pin {} for {}/{}",
+                    transfer.transfer_id, pin.pin_id, pin.object_id, pin.version
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1300,6 +1792,7 @@ impl LocalSobjMetadataBackend {
             let bootstrapped_prefix = backend.ensure_metadata_prefix_proof_checkpoint_unlocked()?;
             backend.rewind_local_materialization_cursor_to_table_head_if_ahead()?;
             backend.recover_unmaterialized_local_journal_entries()?;
+            require_version_pin_table_invariants(&backend.tables)?;
             if bootstrapped_prefix
                 && (backend.materialized_through_sequence > 0
                     || backend.tables.has_materialized_state())
@@ -1368,6 +1861,7 @@ impl LocalSobjMetadataBackend {
         METADATA_BACKEND_OPEN_CALLS.set(METADATA_BACKEND_OPEN_CALLS.get().saturating_add(1));
         let root = root.into();
         let state = read_metadata_table_state_lenient(&root)?;
+        require_version_pin_table_invariants(&state.tables)?;
         let materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
         let next_sequence = read_next_journal_sequence_lenient(&root)?
             .max(materialized_through_sequence.saturating_add(1))
@@ -1394,6 +1888,7 @@ impl LocalSobjMetadataBackend {
     /// a 256-record page does not rehydrate every shard catalog.
     pub(crate) fn refresh_for_inspection(&mut self) -> Result<()> {
         self.refresh_metadata_tables()?;
+        require_version_pin_table_invariants(&self.tables)?;
         self.next_sequence = self
             .next_sequence
             .max(self.materialized_through_sequence.saturating_add(1))
@@ -1866,6 +2361,7 @@ impl LocalSobjMetadataBackend {
             }
         }
         let tables = metadata_tables_from_table_snapshot(snapshot, "replicated metadata snapshot")?;
+        require_version_pin_table_invariants(&tables)?;
         let archived_existing = archive_metadata_backend_state(&self.root)?;
         create_dir_all(self.root.join("records"))?;
         if let Some(floor) = acknowledged_floor.as_ref() {
@@ -2132,6 +2628,206 @@ impl LocalSobjMetadataBackend {
                 );
                 Ok(true)
             }
+            DfsMetadataMutation::RemoveVersion {
+                object_id, version, ..
+            } => {
+                if self.get_version(object_id, version)?.is_none() {
+                    return Ok(false);
+                }
+                if self
+                    .tables
+                    .version_pins
+                    .keys()
+                    .any(|(pin_object_id, pin_version, _)| {
+                        pin_object_id == object_id && pin_version == version
+                    })
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} cannot remove pinned version {object_id}/{version}",
+                        entry.shard_id.0, entry.sequence
+                    )));
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::RemoveVersion {
+                        object_id: object_id.clone(),
+                        version: version.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
+            DfsMetadataMutation::PutVersionPin {
+                file_system_id,
+                object_id,
+                version,
+                pin_id,
+                pin,
+            } => {
+                validate_version_pin_payload(file_system_id, object_id, version, pin_id, pin)?;
+                let pinned_version = self.get_version(object_id, version)?.ok_or_else(|| {
+                    MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} pins missing version {object_id}/{version}",
+                        entry.shard_id.0, entry.sequence
+                    ))
+                })?;
+                if pinned_version.file_system_id != *file_system_id {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} pin filesystem {file_system_id} does not match version filesystem {}",
+                        entry.shard_id.0, entry.sequence, pinned_version.file_system_id
+                    )));
+                }
+                if let Some(owner) = self
+                    .tables
+                    .cross_shard_pin_transfer_fence(object_id, version, pin_id)
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} cannot put pin {pin_id} for {object_id}/{version} while transfer {} owns it",
+                        entry.shard_id.0, entry.sequence, owner.transfer_id
+                    )));
+                }
+                let key = (object_id.clone(), version.clone(), pin_id.clone());
+                if let Some(existing) = self.tables.version_pins.get(&key) {
+                    if existing == pin {
+                        return Ok(false);
+                    }
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} conflicts with durable version pin {pin_id} for {object_id}/{version}",
+                        entry.shard_id.0, entry.sequence
+                    )));
+                }
+                require_version_pin_capacity_for_new(&self.tables, object_id)?;
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::PutVersionPin { pin: pin.clone() },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
+            DfsMetadataMutation::RemoveVersionPin {
+                file_system_id,
+                object_id,
+                version,
+                pin_id,
+            } => {
+                if let Some(owner) = self
+                    .tables
+                    .cross_shard_pin_transfer_fence(object_id, version, pin_id)
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} cannot remove pin {pin_id} for {object_id}/{version} while transfer {} owns it",
+                        entry.shard_id.0, entry.sequence, owner.transfer_id
+                    )));
+                }
+                let Some(existing) = self.tables.version_pins.get(&(
+                    object_id.clone(),
+                    version.clone(),
+                    pin_id.clone(),
+                )) else {
+                    return Ok(false);
+                };
+                if existing.file_system_id != *file_system_id {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} removes pin {pin_id} for {object_id}/{version} with filesystem {file_system_id}, but the stored pin has filesystem {}",
+                        entry.shard_id.0, entry.sequence, existing.file_system_id
+                    )));
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::RemoveVersionPin {
+                        object_id: object_id.clone(),
+                        version: version.clone(),
+                        pin_id: pin_id.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
+            DfsMetadataMutation::ReconcileCrossShardPinTransfer {
+                file_system_id,
+                object_id,
+                transfer_id,
+                authoritative_migration,
+                versions,
+                transfer,
+            } => {
+                if validate_cross_shard_pin_transfer_table_transition(
+                    &self.tables,
+                    file_system_id,
+                    object_id,
+                    transfer_id,
+                    *authoritative_migration,
+                    versions,
+                    transfer,
+                )? {
+                    return Ok(false);
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::ReconcileCrossShardPinTransfer {
+                        versions: versions.clone(),
+                        transfer: transfer.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
+            DfsMetadataMutation::RemoveCrossShardPinTransfer {
+                file_system_id,
+                object_id,
+                transfer_id,
+            } => {
+                let Some(existing) = self
+                    .tables
+                    .cross_shard_pin_transfers
+                    .get(&(object_id.clone(), transfer_id.clone()))
+                else {
+                    return Ok(false);
+                };
+                if existing.file_system_id != *file_system_id {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} removes cross-shard pin transfer {} with the wrong filesystem",
+                        entry.shard_id.0, entry.sequence, transfer_id
+                    )));
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::RemoveCrossShardPinTransfer {
+                        object_id: object_id.clone(),
+                        transfer_id: transfer_id.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
+            DfsMetadataMutation::FinalizeCrossShardSourceEviction {
+                file_system_id,
+                object_id,
+                tombstone,
+                removed_pins,
+                removed_pin_transfers,
+            } => {
+                if validate_cross_shard_source_eviction_table_transition(
+                    &self.tables,
+                    file_system_id,
+                    object_id,
+                    tombstone,
+                    removed_pins,
+                    removed_pin_transfers,
+                )? {
+                    return Ok(false);
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::FinalizeCrossShardSourceEviction {
+                        tombstone: tombstone.clone(),
+                        removed_pins: removed_pins.clone(),
+                        removed_pin_transfers: removed_pin_transfers.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
             DfsMetadataMutation::PutReceipt {
                 object_id,
                 version,
@@ -2195,16 +2891,109 @@ impl LocalSobjMetadataBackend {
             DfsMetadataMutation::PutIntent {
                 object_id,
                 intent_id,
+                authoritative_migration,
                 intent,
                 ..
             } => {
                 let intent = required_replay_payload(entry, "put-intent", intent.as_ref())?;
+                if let Some(receipt) = self
+                    .tables
+                    .intent_receipts
+                    .get(&(object_id.clone(), intent_id.clone()))
+                {
+                    if receipt.matches_intent(intent) {
+                        return Ok(false);
+                    }
+                    return Err(MetadataBackendError::Serde(format!(
+                        "journal write intent {object_id}/{intent_id} conflicts with its compacted receipt"
+                    )));
+                }
+                if !self
+                    .tables
+                    .intents
+                    .contains_key(&(object_id.clone(), intent_id.clone()))
+                    && !*authoritative_migration
+                    && self.tables.intent_receipt_retention.history_expired(intent)
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "journal write intent {object_id}/{intent_id} idempotency history expired"
+                    )));
+                }
                 if self.get_intent(object_id, intent_id)?.as_ref() == Some(intent) {
                     return Ok(false);
                 }
                 self.plan_preapplied_table_op(
                     DfsMetadataTableOp::PutIntent {
                         intent: intent.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
+            DfsMetadataMutation::PutIntentReceipt {
+                object_id,
+                intent_id,
+                receipt,
+                ..
+            } => {
+                if receipt.object_id != *object_id || receipt.intent_id != *intent_id {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "journal intent receipt scope {object_id}/{intent_id} does not match its payload"
+                    )));
+                }
+                if let Some(intent) = self
+                    .tables
+                    .intents
+                    .get(&(object_id.clone(), intent_id.clone()))
+                    && !receipt.matches_intent(intent)
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "journal intent receipt {object_id}/{intent_id} conflicts with its full intent"
+                    )));
+                }
+                if self
+                    .tables
+                    .intent_receipts
+                    .get(&(object_id.clone(), intent_id.clone()))
+                    == Some(receipt)
+                {
+                    return Ok(false);
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::PutIntentReceipt {
+                        receipt: receipt.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
+            DfsMetadataMutation::RemoveIntentReceipt {
+                object_id,
+                intent_id,
+                retention,
+                ..
+            } => {
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::RemoveIntentReceipt {
+                        object_id: object_id.clone(),
+                        intent_id: intent_id.clone(),
+                        retention: retention.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
+            DfsMetadataMutation::MergeIntentReceiptRetention {
+                object_id,
+                retention,
+                ..
+            } => {
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::MergeIntentReceiptRetention {
+                        retention: retention.for_object(object_id),
                     },
                     table_ops,
                     rollback,
@@ -2270,6 +3059,26 @@ impl LocalSobjMetadataBackend {
                 // read-your-write replay windows can arrive without every receipt entry; the
                 // commit payload is still enough to make the object/version visible locally.
                 self.plan_visible_version_commit_table_ops(&commit_record, table_ops, rollback)?;
+                Ok(true)
+            }
+            DfsMetadataMutation::RemoveVisibleCommit {
+                object_id, version, ..
+            } => {
+                if !self
+                    .tables
+                    .visible_commits
+                    .contains_key(&(object_id.clone(), version.clone()))
+                {
+                    return Ok(false);
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::RemoveVisibleCommit {
+                        object_id: object_id.clone(),
+                        version: version.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
                 Ok(true)
             }
             DfsMetadataMutation::PutConflict {
@@ -2406,6 +3215,21 @@ impl LocalSobjMetadataBackend {
                 );
                 Ok(true)
             }
+            DfsMetadataMutation::RemoveNamespaceTransactionReceipt {
+                transaction_id,
+                retention,
+                ..
+            } => {
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::RemoveNamespaceTransactionReceipt {
+                        transaction_id: transaction_id.clone(),
+                        retention: retention.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
             DfsMetadataMutation::PutNamespacePrepare {
                 file_system_id,
                 operation_id,
@@ -2467,6 +3291,21 @@ impl LocalSobjMetadataBackend {
                 );
                 Ok(true)
             }
+            DfsMetadataMutation::RemoveNamespacePrepareReceipt {
+                operation_id,
+                retention,
+                ..
+            } => {
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::RemoveNamespacePrepareReceipt {
+                        operation_id: operation_id.clone(),
+                        retention: retention.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
             DfsMetadataMutation::PutNamespaceJob { job_id, job, .. } => {
                 let job = required_replay_payload(entry, "put-namespace-job", job.as_ref())?;
                 if job.job_id != *job_id {
@@ -2475,11 +3314,66 @@ impl LocalSobjMetadataBackend {
                         job.job_id
                     )));
                 }
+                if let Some(receipt) = self.tables.namespace_job_receipts.get(job_id) {
+                    if receipt.matches_terminal_job(job) {
+                        return Ok(false);
+                    }
+                    return Err(MetadataBackendError::Serde(format!(
+                        "journal namespace job {job_id} conflicts with its compacted receipt"
+                    )));
+                }
                 if self.tables.namespace_jobs.get(job_id) == Some(job) {
                     return Ok(false);
                 }
                 self.plan_preapplied_table_op(
                     DfsMetadataTableOp::PutNamespaceJob { job: job.clone() },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
+            DfsMetadataMutation::PutNamespaceJobReceipt {
+                file_system_id,
+                job_id,
+                receipt,
+            } => {
+                if receipt.file_system_id != *file_system_id || receipt.job_id != *job_id {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "journal namespace job receipt scope {file_system_id}/{job_id} does not match its payload"
+                    )));
+                }
+                if receipt.status == DfsNamespaceJobStatus::Running {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "journal namespace job receipt {job_id} is not terminal"
+                    )));
+                }
+                if let Some(job) = self.tables.namespace_jobs.get(job_id)
+                    && !receipt.matches_terminal_job(job)
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "journal namespace job receipt {job_id} conflicts with its full job"
+                    )));
+                }
+                if self.tables.namespace_job_receipts.get(job_id) == Some(receipt) {
+                    return Ok(false);
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::PutNamespaceJobReceipt {
+                        receipt: receipt.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
+            DfsMetadataMutation::RemoveNamespaceJobReceipt {
+                job_id, retention, ..
+            } => {
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::RemoveNamespaceJobReceipt {
+                        job_id: job_id.clone(),
+                        retention: retention.clone(),
+                    },
                     table_ops,
                     rollback,
                 );
@@ -2540,6 +3434,23 @@ impl LocalSobjMetadataBackend {
                 self.plan_preapplied_table_op(
                     DfsMetadataTableOp::PutNamespaceRequestReceipt {
                         receipt: receipt.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
+            DfsMetadataMutation::RemoveNamespaceRequestReceipt {
+                requester_node_id,
+                request_id,
+                retention,
+                ..
+            } => {
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::RemoveNamespaceRequestReceipt {
+                        requester_node_id: requester_node_id.clone(),
+                        request_id: request_id.clone(),
+                        retention: retention.clone(),
                     },
                     table_ops,
                     rollback,
@@ -2949,6 +3860,172 @@ impl LocalSobjMetadataBackend {
                     version: normalized_version_record(version_record),
                 }]
             }
+            DfsMetadataMutation::RemoveVersion {
+                object_id, version, ..
+            } => {
+                if self
+                    .tables
+                    .version_pins
+                    .keys()
+                    .any(|(pin_object_id, pin_version, _)| {
+                        pin_object_id == object_id && pin_version == version
+                    })
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} cannot remove pinned version {object_id}/{version}",
+                        entry.shard_id.0, entry.sequence
+                    )));
+                }
+                vec![DfsMetadataTableOp::RemoveVersion {
+                    object_id: object_id.clone(),
+                    version: version.clone(),
+                }]
+            }
+            DfsMetadataMutation::PutVersionPin {
+                file_system_id,
+                object_id,
+                version,
+                pin_id,
+                pin,
+            } => {
+                validate_version_pin_payload(file_system_id, object_id, version, pin_id, pin)?;
+                let pinned_version = self.get_version(object_id, version)?.ok_or_else(|| {
+                    MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} pins missing version {object_id}/{version}",
+                        entry.shard_id.0, entry.sequence
+                    ))
+                })?;
+                if pinned_version.file_system_id != *file_system_id {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} pin filesystem {file_system_id} does not match version filesystem {}",
+                        entry.shard_id.0, entry.sequence, pinned_version.file_system_id
+                    )));
+                }
+                if let Some(owner) = self
+                    .tables
+                    .cross_shard_pin_transfer_fence(object_id, version, pin_id)
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} cannot put pin {pin_id} for {object_id}/{version} while transfer {} owns it",
+                        entry.shard_id.0, entry.sequence, owner.transfer_id
+                    )));
+                }
+                let key = (object_id.clone(), version.clone(), pin_id.clone());
+                if let Some(existing) = self.tables.version_pins.get(&key)
+                    && existing != pin
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} conflicts with durable version pin {pin_id} for {object_id}/{version}",
+                        entry.shard_id.0, entry.sequence
+                    )));
+                }
+                if !self.tables.version_pins.contains_key(&key) {
+                    require_version_pin_capacity_for_new(&self.tables, object_id)?;
+                }
+                vec![DfsMetadataTableOp::PutVersionPin { pin: pin.clone() }]
+            }
+            DfsMetadataMutation::RemoveVersionPin {
+                file_system_id,
+                object_id,
+                version,
+                pin_id,
+            } => {
+                if let Some(owner) = self
+                    .tables
+                    .cross_shard_pin_transfer_fence(object_id, version, pin_id)
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} cannot remove pin {pin_id} for {object_id}/{version} while transfer {} owns it",
+                        entry.shard_id.0, entry.sequence, owner.transfer_id
+                    )));
+                }
+                if let Some(existing) = self.tables.version_pins.get(&(
+                    object_id.clone(),
+                    version.clone(),
+                    pin_id.clone(),
+                )) && existing.file_system_id != *file_system_id
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} removes pin {pin_id} for {object_id}/{version} with filesystem {file_system_id}, but the stored pin has filesystem {}",
+                        entry.shard_id.0, entry.sequence, existing.file_system_id
+                    )));
+                }
+                vec![DfsMetadataTableOp::RemoveVersionPin {
+                    object_id: object_id.clone(),
+                    version: version.clone(),
+                    pin_id: pin_id.clone(),
+                }]
+            }
+            DfsMetadataMutation::ReconcileCrossShardPinTransfer {
+                file_system_id,
+                object_id,
+                transfer_id,
+                authoritative_migration,
+                versions,
+                transfer,
+            } => {
+                if validate_cross_shard_pin_transfer_table_transition(
+                    &self.tables,
+                    file_system_id,
+                    object_id,
+                    transfer_id,
+                    *authoritative_migration,
+                    versions,
+                    transfer,
+                )? {
+                    Vec::new()
+                } else {
+                    vec![DfsMetadataTableOp::ReconcileCrossShardPinTransfer {
+                        versions: versions.clone(),
+                        transfer: transfer.clone(),
+                    }]
+                }
+            }
+            DfsMetadataMutation::RemoveCrossShardPinTransfer {
+                file_system_id,
+                object_id,
+                transfer_id,
+            } => {
+                if let Some(existing) = self
+                    .tables
+                    .cross_shard_pin_transfers
+                    .get(&(object_id.clone(), transfer_id.clone()))
+                    && existing.file_system_id != *file_system_id
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} removes cross-shard pin transfer {} with the wrong filesystem",
+                        entry.shard_id.0, entry.sequence, transfer_id
+                    )));
+                }
+                vec![DfsMetadataTableOp::RemoveCrossShardPinTransfer {
+                    object_id: object_id.clone(),
+                    transfer_id: transfer_id.clone(),
+                }]
+            }
+            DfsMetadataMutation::FinalizeCrossShardSourceEviction {
+                file_system_id,
+                object_id,
+                tombstone,
+                removed_pins,
+                removed_pin_transfers,
+            } => {
+                if validate_cross_shard_source_eviction_table_transition(
+                    &self.tables,
+                    file_system_id,
+                    object_id,
+                    tombstone,
+                    removed_pins,
+                    removed_pin_transfers,
+                )? {
+                    Vec::new()
+                } else {
+                    vec![DfsMetadataTableOp::FinalizeCrossShardSourceEviction {
+                        tombstone: tombstone.clone(),
+                        removed_pins: removed_pins.clone(),
+                        removed_pin_transfers: removed_pin_transfers.clone(),
+                    }]
+                }
+            }
             DfsMetadataMutation::PutReceipt { receipt, .. } => {
                 let Some(receipt) = receipt.as_ref() else {
                     return Ok(());
@@ -2977,6 +4054,32 @@ impl LocalSobjMetadataBackend {
                     intent: intent.clone(),
                 }]
             }
+            DfsMetadataMutation::PutIntentReceipt { receipt, .. } => {
+                vec![DfsMetadataTableOp::PutIntentReceipt {
+                    receipt: receipt.clone(),
+                }]
+            }
+            DfsMetadataMutation::RemoveIntentReceipt {
+                object_id,
+                intent_id,
+                retention,
+                ..
+            } => {
+                vec![DfsMetadataTableOp::RemoveIntentReceipt {
+                    object_id: object_id.clone(),
+                    intent_id: intent_id.clone(),
+                    retention: retention.clone(),
+                }]
+            }
+            DfsMetadataMutation::MergeIntentReceiptRetention {
+                object_id,
+                retention,
+                ..
+            } => {
+                vec![DfsMetadataTableOp::MergeIntentReceiptRetention {
+                    retention: retention.for_object(object_id),
+                }]
+            }
             DfsMetadataMutation::CommitVisibleVersion {
                 previous_version,
                 committed_object,
@@ -2998,6 +4101,14 @@ impl LocalSobjMetadataBackend {
                     entry.created_at,
                 );
                 visible_commit_table_ops(&self.tables, &commit_record)
+            }
+            DfsMetadataMutation::RemoveVisibleCommit {
+                object_id, version, ..
+            } => {
+                vec![DfsMetadataTableOp::RemoveVisibleCommit {
+                    object_id: object_id.clone(),
+                    version: version.clone(),
+                }]
             }
             DfsMetadataMutation::PutConflict {
                 object_id,
@@ -3036,6 +4147,16 @@ impl LocalSobjMetadataBackend {
                     receipt: receipt.clone(),
                 }]
             }
+            DfsMetadataMutation::RemoveNamespaceTransactionReceipt {
+                transaction_id,
+                retention,
+                ..
+            } => {
+                vec![DfsMetadataTableOp::RemoveNamespaceTransactionReceipt {
+                    transaction_id: transaction_id.clone(),
+                    retention: retention.clone(),
+                }]
+            }
             DfsMetadataMutation::PutNamespacePrepare { prepare, .. } => {
                 let Some(prepare) = prepare.as_ref() else {
                     return Ok(());
@@ -3048,11 +4169,34 @@ impl LocalSobjMetadataBackend {
                     receipt: receipt.clone(),
                 }]
             }
+            DfsMetadataMutation::RemoveNamespacePrepareReceipt {
+                operation_id,
+                retention,
+                ..
+            } => {
+                vec![DfsMetadataTableOp::RemoveNamespacePrepareReceipt {
+                    operation_id: operation_id.clone(),
+                    retention: retention.clone(),
+                }]
+            }
             DfsMetadataMutation::PutNamespaceJob { job, .. } => {
                 let Some(job) = job.as_ref() else {
                     return Ok(());
                 };
                 vec![DfsMetadataTableOp::PutNamespaceJob { job: job.clone() }]
+            }
+            DfsMetadataMutation::PutNamespaceJobReceipt { receipt, .. } => {
+                vec![DfsMetadataTableOp::PutNamespaceJobReceipt {
+                    receipt: receipt.clone(),
+                }]
+            }
+            DfsMetadataMutation::RemoveNamespaceJobReceipt {
+                job_id, retention, ..
+            } => {
+                vec![DfsMetadataTableOp::RemoveNamespaceJobReceipt {
+                    job_id: job_id.clone(),
+                    retention: retention.clone(),
+                }]
             }
             DfsMetadataMutation::PutNamespaceRequest { request, .. } => {
                 vec![DfsMetadataTableOp::PutNamespaceRequest {
@@ -3062,6 +4206,18 @@ impl LocalSobjMetadataBackend {
             DfsMetadataMutation::PutNamespaceRequestReceipt { receipt, .. } => {
                 vec![DfsMetadataTableOp::PutNamespaceRequestReceipt {
                     receipt: receipt.clone(),
+                }]
+            }
+            DfsMetadataMutation::RemoveNamespaceRequestReceipt {
+                requester_node_id,
+                request_id,
+                retention,
+                ..
+            } => {
+                vec![DfsMetadataTableOp::RemoveNamespaceRequestReceipt {
+                    requester_node_id: requester_node_id.clone(),
+                    request_id: request_id.clone(),
+                    retention: retention.clone(),
                 }]
             }
         };
@@ -3438,23 +4594,6 @@ impl LocalSobjMetadataBackend {
         )
     }
 
-    #[cfg(test)]
-    fn compact_metadata_table_log_with_namespace_retention(
-        &mut self,
-        max_log_bytes: u64,
-        checkpoint_time: OffsetDateTime,
-        retention_limits: crate::metadata_tables::DfsNamespaceReceiptRetentionLimits,
-    ) -> Result<()> {
-        let root = self.root.clone();
-        metadata_table_apply::compact_metadata_table_log_if_needed_with_retention(
-            &root,
-            self.table_materialization_state(),
-            max_log_bytes,
-            checkpoint_time,
-            retention_limits,
-        )
-    }
-
     fn table_materialization_state(&mut self) -> TableMaterializationState<'_> {
         TableMaterializationState {
             tables: &mut self.tables,
@@ -3527,6 +4666,58 @@ impl LocalSobjMetadataBackend {
             .cloned())
     }
 
+    /// Hold the source shard writer fence while capturing one complete object
+    /// family. The returned lock must remain alive through target install,
+    /// authority-index publication, and conditional source eviction.
+    pub(crate) fn lock_and_capture_object_shard_migration_bundle(
+        &mut self,
+        object_id: &DfsObjectId,
+        page_size: usize,
+    ) -> Result<(
+        MetadataWriteLock,
+        crate::metadata_shard_migration::DfsObjectShardMigrationBundle,
+    )> {
+        let lock = self.begin_metadata_write()?;
+        let bundle = crate::metadata_shard_migration::collect_object_shard_migration_bundle(
+            self, object_id, page_size,
+        )?;
+        Ok((lock, bundle))
+    }
+
+    pub(crate) fn capture_cross_shard_source_pin_fence(
+        &mut self,
+        object_id: &DfsObjectId,
+    ) -> Result<DfsCrossShardVersionPinFence> {
+        let _lock = self.begin_metadata_write()?;
+        let source_object = self.tables.objects.get(object_id).cloned().ok_or_else(|| {
+            MetadataBackendError::UnknownObject {
+                object_id: object_id.clone(),
+            }
+        })?;
+        Ok(DfsCrossShardVersionPinFence {
+            source_object,
+            source_journal_sequence: self.journal_last_sequence(),
+            version_pins: self
+                .tables
+                .version_pins
+                .values()
+                .filter(|pin| &pin.object_id == object_id)
+                .cloned()
+                .collect(),
+        })
+    }
+
+    pub(crate) fn capture_cross_shard_source_family(
+        &mut self,
+        object_id: &DfsObjectId,
+    ) -> Result<DfsCrossShardSourceFamily> {
+        let (_lock, bundle) = self.lock_and_capture_object_shard_migration_bundle(
+            object_id,
+            OBJECT_LOCAL_METADATA_PAGE_SIZE,
+        )?;
+        Ok(bundle.into())
+    }
+
     /// Install a source-eviction marker only if both the complete source
     /// journal prefix and object generation still match the migration fence.
     ///
@@ -3541,8 +4732,30 @@ impl LocalSobjMetadataBackend {
         source_shard_id: &DfsMetadataShardId,
         target_shard_id: &DfsMetadataShardId,
         expected_journal_sequence: u64,
+        pin_transfer_id: Option<&str>,
     ) -> Result<DfsConditionalSourceEviction> {
-        let _lock = self.begin_metadata_write()?;
+        let lock = self.begin_metadata_write()?;
+        self.put_cross_shard_tombstone_if_unchanged_while_locked(
+            &lock,
+            expected_source,
+            target_object,
+            source_shard_id,
+            target_shard_id,
+            expected_journal_sequence,
+            pin_transfer_id,
+        )
+    }
+
+    pub(crate) fn put_cross_shard_tombstone_if_unchanged_while_locked(
+        &mut self,
+        _lock: &MetadataWriteLock,
+        expected_source: &DfsObjectMetadata,
+        target_object: &DfsObjectMetadata,
+        source_shard_id: &DfsMetadataShardId,
+        target_shard_id: &DfsMetadataShardId,
+        expected_journal_sequence: u64,
+        pin_transfer_id: Option<&str>,
+    ) -> Result<DfsConditionalSourceEviction> {
         let current = self
             .tables
             .objects
@@ -3553,36 +4766,64 @@ impl LocalSobjMetadataBackend {
                     .get(&expected_source.object_id)
             })
             .cloned();
-        if current.as_ref().is_some_and(|current| {
+        let already_evicted = current.as_ref().is_some_and(|current| {
             matches!(
                 current.tombstone_provenance.as_ref(),
                 Some(crate::DfsTombstoneProvenance::SourceEviction {
                     source_shard_id: recorded_source,
                     target_shard_id: recorded_target,
+                    ..
                 }) if recorded_source == source_shard_id && recorded_target == target_shard_id
             )
-        }) {
+        });
+        let current_pins = self
+            .tables
+            .version_pins
+            .values()
+            .filter(|pin| pin.object_id == expected_source.object_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let current_pin_transfers = self
+            .tables
+            .cross_shard_pin_transfers
+            .values()
+            .filter(|transfer| transfer.object_id == expected_source.object_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        if already_evicted && current_pins.is_empty() && current_pin_transfers.is_empty() {
             return Ok(DfsConditionalSourceEviction::AlreadyApplied);
         }
-        if self.journal_last_sequence() != expected_journal_sequence {
+        if !already_evicted && self.journal_last_sequence() != expected_journal_sequence {
             return Ok(DfsConditionalSourceEviction::JournalAdvanced);
         }
-        if current.as_ref() != Some(expected_source) {
+        if !already_evicted && current.as_ref() != Some(expected_source) {
             return Ok(DfsConditionalSourceEviction::SourceChanged);
         }
-        let Some(tombstone) = crate::metadata_shard_migration::cross_shard_eviction_tombstone(
-            expected_source,
-            target_object,
-            source_shard_id,
-            target_shard_id,
-        ) else {
-            return Ok(DfsConditionalSourceEviction::AlreadyApplied);
+        let tombstone = if already_evicted {
+            current.expect("already-evicted source has a tombstone")
+        } else {
+            let Some(tombstone) = crate::metadata_shard_migration::cross_shard_eviction_tombstone(
+                expected_source,
+                target_object,
+                source_shard_id,
+                target_shard_id,
+                pin_transfer_id,
+            ) else {
+                return Ok(DfsConditionalSourceEviction::AlreadyApplied);
+            };
+            normalized_object_metadata(&tombstone)
         };
-        let tombstone = normalized_object_metadata(&tombstone);
-        let table_ops = self.object_index_table_ops_with_previous(&tombstone, current.as_ref())?;
         let entry = self.write_journal_entry_and_apply_table_ops_unlocked(
-            DfsMetadataMutation::put_object(&tombstone),
-            table_ops,
+            DfsMetadataMutation::finalize_cross_shard_source_eviction(
+                &tombstone,
+                current_pins.clone(),
+                current_pin_transfers.clone(),
+            ),
+            vec![DfsMetadataTableOp::FinalizeCrossShardSourceEviction {
+                tombstone,
+                removed_pins: current_pins,
+                removed_pin_transfers: current_pin_transfers,
+            }],
         )?;
         Ok(DfsConditionalSourceEviction::Applied {
             sequence: entry.sequence,
@@ -3685,6 +4926,32 @@ impl LocalSobjMetadataBackend {
             after,
             max_entries,
         ))
+    }
+
+    /// Apply one object-family history mutation copied from a shard that is
+    /// still authoritative while the object is moving. The source journal
+    /// sequence is local to that shard, so the target records an equivalent
+    /// mutation in its own journal before changing its materialized tables.
+    pub(crate) fn apply_migrated_object_family_gc_mutation(
+        &mut self,
+        mutation: &DfsMetadataMutation,
+    ) -> Result<()> {
+        if !matches!(
+            mutation,
+            DfsMetadataMutation::RemoveVersion { .. }
+                | DfsMetadataMutation::PutIntentReceipt { .. }
+                | DfsMetadataMutation::RemoveIntentReceipt { .. }
+                | DfsMetadataMutation::MergeIntentReceiptRetention { .. }
+                | DfsMetadataMutation::RemoveVisibleCommit { .. }
+        ) {
+            return Err(MetadataBackendError::Serde(
+                "unsupported migrated object-family GC mutation".to_string(),
+            ));
+        }
+        let _lock = self.begin_metadata_write()?;
+        let entry = self.write_journal_unlocked(mutation.clone())?;
+        self.materialize_written_journal_entries_unlocked(std::slice::from_ref(&entry))?;
+        Ok(())
     }
 }
 
@@ -4158,6 +5425,572 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             DfsMetadataMutation::put_version(&version),
             vec![DfsMetadataTableOp::PutVersion { version }],
         )
+    }
+
+    fn put_version_pin(
+        &mut self,
+        pin: &DfsMetadataVersionPinRecord,
+    ) -> Result<Option<DfsMetadataJournalEntry>> {
+        validate_version_pin_payload(
+            &pin.file_system_id,
+            &pin.object_id,
+            &pin.version,
+            &pin.pin_id,
+            pin,
+        )?;
+        let _lock = self.begin_metadata_write()?;
+        let key = (
+            pin.object_id.clone(),
+            pin.version.clone(),
+            pin.pin_id.clone(),
+        );
+        if let Some(owner) =
+            self.tables
+                .cross_shard_pin_transfer_fence(&pin.object_id, &pin.version, &pin.pin_id)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata version pin {} for {}/{} is fenced by active cross-shard transfer {}",
+                pin.pin_id, pin.object_id, pin.version, owner.transfer_id
+            )));
+        }
+        let version = self
+            .tables
+            .versions
+            .get(&(pin.object_id.clone(), pin.version.clone()))
+            .ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "cannot pin missing metadata version {}/{}",
+                    pin.object_id, pin.version
+                ))
+            })?;
+        if version.file_system_id != pin.file_system_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata version pin {} filesystem {} does not match version filesystem {}",
+                pin.pin_id, pin.file_system_id, version.file_system_id
+            )));
+        }
+        if let Some(existing) = self.tables.version_pins.get(&key) {
+            if existing == pin {
+                return Ok(None);
+            }
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata version pin {} for {}/{} was reused with a different payload",
+                pin.pin_id, pin.object_id, pin.version
+            )));
+        }
+        require_version_pin_capacity_for_new(&self.tables, &pin.object_id)?;
+        self.write_journal_entry_and_apply_table_ops_unlocked(
+            DfsMetadataMutation::put_version_pin(pin),
+            vec![DfsMetadataTableOp::PutVersionPin { pin: pin.clone() }],
+        )
+        .map(Some)
+    }
+
+    fn remove_version_pin(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        pin_id: &str,
+    ) -> Result<Option<DfsMetadataJournalEntry>> {
+        let _lock = self.begin_metadata_write()?;
+        let key = (object_id.clone(), version.clone(), pin_id.to_string());
+        if let Some(owner) = self
+            .tables
+            .cross_shard_pin_transfer_fence(object_id, version, pin_id)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata version pin {pin_id} for {object_id}/{version} is fenced by active cross-shard transfer {}",
+                owner.transfer_id
+            )));
+        }
+        let Some(existing) = self.tables.version_pins.get(&key) else {
+            return Ok(None);
+        };
+        if &existing.file_system_id != file_system_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata version pin {pin_id} filesystem {} does not match removal filesystem {file_system_id}",
+                existing.file_system_id
+            )));
+        }
+        self.write_journal_entry_and_apply_table_ops_unlocked(
+            DfsMetadataMutation::remove_version_pin(
+                file_system_id.clone(),
+                object_id.clone(),
+                version.clone(),
+                pin_id.to_string(),
+            ),
+            vec![DfsMetadataTableOp::RemoveVersionPin {
+                object_id: object_id.clone(),
+                version: version.clone(),
+                pin_id: pin_id.to_string(),
+            }],
+        )
+        .map(Some)
+    }
+
+    fn version_pins_for_object(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> Result<Vec<DfsMetadataVersionPinRecord>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables
+            .version_pins
+            .values()
+            .filter(|pin| &pin.object_id == object_id)
+            .cloned()
+            .collect())
+    }
+
+    fn version_pins_for_object_page(
+        &self,
+        object_id: &DfsObjectId,
+        after: Option<&DfsMetadataVersionPinPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsMetadataVersionPinPage> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(version_pins_for_object_page_from_tables(
+            &tables,
+            object_id,
+            after,
+            max_entries,
+        ))
+    }
+
+    fn install_cross_shard_version_pin_family(
+        &mut self,
+        object: &DfsObjectMetadata,
+        versions: &[DfsObjectVersionRecord],
+        pins: &[DfsMetadataVersionPinRecord],
+    ) -> Result<()> {
+        let target_is_already_authoritative =
+            self.get_object(&object.object_id)?.is_some_and(|existing| {
+                existing.kind != crate::DfsObjectKind::Tombstone
+                    && existing.file_system_id == object.file_system_id
+                    && normalize_path(&existing.path) == normalize_path(&object.path)
+            });
+        for version in versions {
+            if version.object_id != object.object_id
+                || version.file_system_id != object.file_system_id
+            {
+                return Err(MetadataBackendError::Serde(format!(
+                    "cross-shard pin-family install for object {} received unrelated version {}/{}",
+                    object.object_id, version.object_id, version.version
+                )));
+            }
+            match self.get_version(&version.object_id, &version.version)? {
+                Some(existing) if existing != *version => {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "destination has conflicting version {} for pinned object {}",
+                        version.version, object.object_id
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    self.put_version(version)?;
+                }
+            }
+        }
+        let desired = pins
+            .iter()
+            .map(|pin| ((pin.version.clone(), pin.pin_id.clone()), pin.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let existing = self.version_pins_for_object(&object.object_id)?;
+        if !target_is_already_authoritative {
+            for pin in &existing {
+                if desired.get(&(pin.version.clone(), pin.pin_id.clone())) == Some(pin) {
+                    continue;
+                }
+                self.remove_version_pin(
+                    &pin.file_system_id,
+                    &pin.object_id,
+                    &pin.version,
+                    &pin.pin_id,
+                )?;
+            }
+        }
+        for pin in desired.values() {
+            self.put_version_pin(pin)?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_cross_shard_pin_transfer(
+        &mut self,
+        transfer_id: &str,
+        object: &DfsObjectMetadata,
+        source_path: &str,
+        versions: &[DfsObjectVersionRecord],
+        source_pins: &[DfsMetadataVersionPinRecord],
+    ) -> Result<bool> {
+        let source_path = normalize_path(source_path);
+        let target_path = normalize_path(&object.path);
+        if transfer_id.trim().is_empty()
+            || transfer_id.len() > 256
+            || source_path == target_path
+            || source_pins.len() > MAX_DURABLE_VERSION_PINS_PER_OBJECT
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "invalid bounded cross-shard pin transfer {} for {} -> {}",
+                transfer_id, source_path, target_path
+            )));
+        }
+        let versions = versions
+            .iter()
+            .map(normalized_version_record)
+            .collect::<Vec<_>>();
+        for version in &versions {
+            if version.object_id != object.object_id
+                || version.file_system_id != object.file_system_id
+            {
+                return Err(MetadataBackendError::Serde(format!(
+                    "cross-shard pin transfer {} received unrelated version {}/{}",
+                    transfer_id, version.object_id, version.version
+                )));
+            }
+        }
+
+        let _lock = self.begin_metadata_write()?;
+        let transfer_key = (object.object_id.clone(), transfer_id.to_string());
+        let previous = self
+            .tables
+            .cross_shard_pin_transfers
+            .get(&transfer_key)
+            .cloned();
+        if source_pins.is_empty() && previous.is_none() {
+            return Ok(false);
+        }
+        if self
+            .tables
+            .cross_shard_pin_transfers
+            .values()
+            .any(|other| other.object_id == object.object_id && other.transfer_id != transfer_id)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "object {} already has another active cross-shard pin transfer",
+                object.object_id
+            )));
+        }
+        if let Some(previous) = previous.as_ref()
+            && (previous.file_system_id != object.file_system_id
+                || previous.object_id != object.object_id
+                || normalize_path(&previous.source_path) != source_path
+                || normalize_path(&previous.target_path) != target_path
+                || previous.target_version != object.version)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "cross-shard pin transfer {} was reused with a different handoff identity",
+                transfer_id
+            )));
+        }
+
+        let previous_owned = previous
+            .as_ref()
+            .map(|record| record.copied_pins.iter().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
+        let mut source_keys = BTreeSet::new();
+        let mut owned_pins = Vec::new();
+        for pin in source_pins {
+            validate_version_pin_payload(
+                &pin.file_system_id,
+                &pin.object_id,
+                &pin.version,
+                &pin.pin_id,
+                pin,
+            )?;
+            if pin.file_system_id != object.file_system_id || pin.object_id != object.object_id {
+                return Err(MetadataBackendError::Serde(format!(
+                    "cross-shard pin transfer {} received unrelated source pin {} for {}/{}",
+                    transfer_id, pin.pin_id, pin.object_id, pin.version
+                )));
+            }
+            let key = (
+                pin.object_id.clone(),
+                pin.version.clone(),
+                pin.pin_id.clone(),
+            );
+            if !source_keys.insert(key.clone()) {
+                return Err(MetadataBackendError::Serde(format!(
+                    "cross-shard pin transfer {} repeats source pin {} for {}/{}",
+                    transfer_id, pin.pin_id, pin.object_id, pin.version
+                )));
+            }
+            let pinned_version = self
+                .tables
+                .versions
+                .get(&(pin.object_id.clone(), pin.version.clone()))
+                .or_else(|| {
+                    versions
+                        .iter()
+                        .find(|version| version.version == pin.version)
+                })
+                .ok_or_else(|| {
+                    MetadataBackendError::Serde(format!(
+                        "cross-shard pin transfer {} is missing destination version {}/{}",
+                        transfer_id, pin.object_id, pin.version
+                    ))
+                })?;
+            if pinned_version.file_system_id != pin.file_system_id {
+                return Err(MetadataBackendError::Serde(format!(
+                    "cross-shard pin transfer {} source pin filesystem mismatch",
+                    transfer_id
+                )));
+            }
+            if let Some(owner) = self.tables.cross_shard_pin_transfer_owner(
+                &pin.object_id,
+                &pin.version,
+                &pin.pin_id,
+            ) && owner.transfer_id != transfer_id
+            {
+                return Err(MetadataBackendError::Serde(format!(
+                    "cross-shard pin {} for {}/{} is already owned by transfer {}",
+                    pin.pin_id, pin.object_id, pin.version, owner.transfer_id
+                )));
+            }
+            match self.tables.version_pins.get(&key) {
+                Some(existing) if existing != pin => {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "cross-shard pin transfer {} conflicts with target pin {} for {}/{}",
+                        transfer_id, pin.pin_id, pin.object_id, pin.version
+                    )));
+                }
+                Some(_) if previous_owned.contains(pin) => owned_pins.push(pin.clone()),
+                Some(_) => {
+                    // An exact pre-existing target pin is independent state.
+                    // It satisfies the source consumer without becoming
+                    // transfer-owned or eligible for stale-copy removal.
+                }
+                None => owned_pins.push(pin.clone()),
+            }
+        }
+        owned_pins.sort();
+        let mut acknowledged_pins = source_pins.to_vec();
+        acknowledged_pins.sort();
+        let now = time::OffsetDateTime::now_utc();
+        let unchanged = previous.as_ref().is_some_and(|previous| {
+            previous.copied_pins == owned_pins && previous.source_pins == acknowledged_pins
+        });
+        let transfer = DfsCrossShardPinTransferRecord {
+            transfer_id: transfer_id.to_string(),
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            source_path,
+            target_path,
+            target_version: object.version.clone(),
+            source_pins: acknowledged_pins,
+            copied_pins: owned_pins,
+            created_at: previous
+                .as_ref()
+                .map(|previous| previous.created_at)
+                .unwrap_or(now),
+            updated_at: if unchanged {
+                previous
+                    .as_ref()
+                    .map(|previous| previous.updated_at)
+                    .unwrap_or(now)
+            } else {
+                now
+            },
+        };
+        if validate_cross_shard_pin_transfer_table_transition(
+            &self.tables,
+            &object.file_system_id,
+            &object.object_id,
+            transfer_id,
+            false,
+            &versions,
+            &transfer,
+        )? {
+            return Ok(true);
+        }
+        self.write_journal_entry_and_apply_table_ops_unlocked(
+            DfsMetadataMutation::reconcile_cross_shard_pin_transfer(
+                &transfer,
+                versions.clone(),
+                false,
+            ),
+            vec![DfsMetadataTableOp::ReconcileCrossShardPinTransfer { versions, transfer }],
+        )?;
+        Ok(true)
+    }
+
+    fn finalize_cross_shard_pin_transfer(
+        &mut self,
+        transfer_id: &str,
+        object: &DfsObjectMetadata,
+        source_path: &str,
+    ) -> Result<()> {
+        let _lock = self.begin_metadata_write()?;
+        let key = (object.object_id.clone(), transfer_id.to_string());
+        let Some(transfer) = self.tables.cross_shard_pin_transfers.get(&key) else {
+            return Ok(());
+        };
+        if transfer.file_system_id != object.file_system_id
+            || normalize_path(&transfer.source_path) != normalize_path(source_path)
+            || normalize_path(&transfer.target_path) != normalize_path(&object.path)
+            || transfer.target_version != object.version
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "cross-shard pin transfer {} finalization identity mismatch",
+                transfer_id
+            )));
+        }
+        self.write_journal_entry_and_apply_table_ops_unlocked(
+            DfsMetadataMutation::remove_cross_shard_pin_transfer(
+                object.file_system_id.clone(),
+                object.object_id.clone(),
+                transfer_id.to_string(),
+            ),
+            vec![DfsMetadataTableOp::RemoveCrossShardPinTransfer {
+                object_id: object.object_id.clone(),
+                transfer_id: transfer_id.to_string(),
+            }],
+        )?;
+        Ok(())
+    }
+
+    fn cross_shard_pin_transfers_for_object(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> Result<Vec<DfsCrossShardPinTransferRecord>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables
+            .cross_shard_pin_transfers
+            .values()
+            .filter(|transfer| &transfer.object_id == object_id)
+            .cloned()
+            .collect())
+    }
+
+    fn install_cross_shard_pin_transfer_for_authoritative_migration(
+        &mut self,
+        transfer: &DfsCrossShardPinTransferRecord,
+        versions: &[DfsObjectVersionRecord],
+    ) -> Result<()> {
+        let versions = versions
+            .iter()
+            .map(normalized_version_record)
+            .collect::<Vec<_>>();
+        let _lock = self.begin_metadata_write()?;
+        if validate_cross_shard_pin_transfer_table_transition(
+            &self.tables,
+            &transfer.file_system_id,
+            &transfer.object_id,
+            &transfer.transfer_id,
+            true,
+            &versions,
+            transfer,
+        )? {
+            return Ok(());
+        }
+        self.write_journal_entry_and_apply_table_ops_unlocked(
+            DfsMetadataMutation::reconcile_cross_shard_pin_transfer(
+                transfer,
+                versions.clone(),
+                true,
+            ),
+            vec![DfsMetadataTableOp::ReconcileCrossShardPinTransfer {
+                versions,
+                transfer: transfer.clone(),
+            }],
+        )?;
+        Ok(())
+    }
+
+    fn remove_cross_shard_pin_transfer_for_authoritative_migration(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        transfer_id: &str,
+    ) -> Result<()> {
+        let _lock = self.begin_metadata_write()?;
+        let Some(existing) = self
+            .tables
+            .cross_shard_pin_transfers
+            .get(&(object_id.clone(), transfer_id.to_string()))
+        else {
+            return Ok(());
+        };
+        if &existing.file_system_id != file_system_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "cross-shard pin transfer {} filesystem {} does not match authoritative migration filesystem {}",
+                transfer_id, existing.file_system_id, file_system_id
+            )));
+        }
+        self.write_journal_entry_and_apply_table_ops_unlocked(
+            DfsMetadataMutation::remove_cross_shard_pin_transfer(
+                file_system_id.clone(),
+                object_id.clone(),
+                transfer_id.to_string(),
+            ),
+            vec![DfsMetadataTableOp::RemoveCrossShardPinTransfer {
+                object_id: object_id.clone(),
+                transfer_id: transfer_id.to_string(),
+            }],
+        )?;
+        Ok(())
+    }
+
+    fn capture_cross_shard_source_pin_fence(
+        &mut self,
+        object_id: &DfsObjectId,
+    ) -> Result<DfsCrossShardVersionPinFence> {
+        LocalSobjMetadataBackend::capture_cross_shard_source_pin_fence(self, object_id)
+    }
+
+    fn capture_cross_shard_source_family(
+        &mut self,
+        object_id: &DfsObjectId,
+        source_path: &str,
+    ) -> Result<DfsCrossShardSourceFamily> {
+        let capture = LocalSobjMetadataBackend::capture_cross_shard_source_family(self, object_id)?;
+        if normalize_path(&capture.source_object.path) != normalize_path(source_path) {
+            return Err(MetadataBackendError::Serde(format!(
+                "object {} is at {}, not requested source path {}",
+                object_id, capture.source_object.path, source_path
+            )));
+        }
+        Ok(capture)
+    }
+
+    fn evict_object_record_for_foreign_shard_move_with_pin_fence(
+        &mut self,
+        moved_object: &DfsObjectMetadata,
+        source_path: &str,
+        expected_source_object: &DfsObjectMetadata,
+        expected_source_journal_sequence: u64,
+        expected_version_pins: &[DfsMetadataVersionPinRecord],
+        pin_transfer_id: Option<&str>,
+    ) -> Result<()> {
+        let _ = (
+            source_path,
+            expected_source_object,
+            expected_source_journal_sequence,
+            pin_transfer_id,
+        );
+        let current = self.get_object(&moved_object.object_id)?.ok_or_else(|| {
+            MetadataBackendError::UnknownObject {
+                object_id: moved_object.object_id.clone(),
+            }
+        })?;
+        if current.file_system_id != moved_object.file_system_id
+            || normalize_path(&current.path) != normalize_path(&moved_object.path)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "single-shard pinned adoption of object {} is not visible at {}",
+                moved_object.object_id, moved_object.path
+            )));
+        }
+        let current_pins = self.version_pins_for_object(&moved_object.object_id)?;
+        for expected in expected_version_pins {
+            if !current_pins.iter().any(|pin| pin == expected) {
+                return Err(MetadataBackendError::Serde(format!(
+                    "single-shard pinned adoption lost source pin {} for {}/{}",
+                    expected.pin_id, expected.object_id, expected.version
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn put_object_and_version(
@@ -4821,12 +6654,152 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
 
     fn put_intent(&mut self, intent: &DfsWriteIntentRecord) -> Result<DfsMetadataJournalEntry> {
         let _lock = self.begin_metadata_write()?;
+        let key = (intent.object_id.clone(), intent.intent_id.clone());
+        if let Some(receipt) = self.tables.intent_receipts.get(&key).cloned() {
+            if !receipt.matches_intent(intent) {
+                return Err(MetadataBackendError::Serde(format!(
+                    "write intent {}/{} was reused after compaction with a different payload",
+                    intent.object_id, intent.intent_id
+                )));
+            }
+            return self.write_journal_entry_and_apply_table_ops_unlocked(
+                DfsMetadataMutation::put_intent_receipt(&receipt),
+                vec![DfsMetadataTableOp::PutIntentReceipt { receipt }],
+            );
+        }
+        if !self.tables.intents.contains_key(&key)
+            && self.tables.intent_receipt_retention.history_expired(intent)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "write intent {}/{} idempotency history expired or is unknown",
+                intent.object_id, intent.intent_id
+            )));
+        }
         self.write_journal_entry_and_apply_table_ops_unlocked(
             DfsMetadataMutation::put_intent(intent),
             vec![DfsMetadataTableOp::PutIntent {
                 intent: intent.clone(),
             }],
         )
+    }
+
+    fn put_migrated_intent_for_object(
+        &mut self,
+        _object: Option<&DfsObjectMetadata>,
+        intent: &DfsWriteIntentRecord,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let _lock = self.begin_metadata_write()?;
+        let key = (intent.object_id.clone(), intent.intent_id.clone());
+        if let Some(receipt) = self.tables.intent_receipts.get(&key).cloned() {
+            if !receipt.matches_intent(intent) {
+                return Err(MetadataBackendError::Serde(format!(
+                    "migrated write intent {}/{} conflicts with a compacted target receipt",
+                    intent.object_id, intent.intent_id
+                )));
+            }
+            return self.write_journal_entry_and_apply_table_ops_unlocked(
+                DfsMetadataMutation::put_intent_receipt(&receipt),
+                vec![DfsMetadataTableOp::PutIntentReceipt { receipt }],
+            );
+        }
+        self.write_journal_entry_and_apply_table_ops_unlocked(
+            DfsMetadataMutation::put_migrated_intent(intent),
+            vec![DfsMetadataTableOp::PutIntent {
+                intent: intent.clone(),
+            }],
+        )
+    }
+
+    fn put_intent_receipt_for_object(
+        &mut self,
+        _object: Option<&DfsObjectMetadata>,
+        receipt: &DfsWriteIntentReceipt,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let _lock = self.begin_metadata_write()?;
+        let key = (receipt.object_id.clone(), receipt.intent_id.clone());
+        if let Some(intent) = self.tables.intents.get(&key)
+            && !receipt.matches_intent(intent)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "migrated intent receipt {}/{} conflicts with a full target intent",
+                receipt.object_id, receipt.intent_id
+            )));
+        }
+        if let Some(existing) = self.tables.intent_receipts.get(&key)
+            && existing != receipt
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "migrated intent receipt {}/{} conflicts with a compact target receipt",
+                receipt.object_id, receipt.intent_id
+            )));
+        }
+        self.write_journal_entry_and_apply_table_ops_unlocked(
+            DfsMetadataMutation::put_intent_receipt(receipt),
+            vec![DfsMetadataTableOp::PutIntentReceipt {
+                receipt: receipt.clone(),
+            }],
+        )
+    }
+
+    fn merge_intent_receipt_retention_for_object(
+        &mut self,
+        _object: Option<&DfsObjectMetadata>,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        retention: &DfsWriteIntentReceiptRetentionState,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let _lock = self.begin_metadata_write()?;
+        let retention = retention.for_object(object_id);
+        self.write_journal_entry_and_apply_table_ops_unlocked(
+            DfsMetadataMutation::merge_intent_receipt_retention(
+                file_system_id.clone(),
+                object_id.clone(),
+                retention.clone(),
+            ),
+            vec![DfsMetadataTableOp::MergeIntentReceiptRetention { retention }],
+        )
+    }
+
+    fn object_write_intent_history(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> Result<DfsObjectWriteIntentHistory> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(DfsObjectWriteIntentHistory {
+            intents: tables
+                .intents
+                .values()
+                .filter(|intent| intent.object_id == *object_id)
+                .cloned()
+                .collect(),
+            receipts: tables
+                .intent_receipts
+                .values()
+                .filter(|receipt| receipt.object_id == *object_id)
+                .cloned()
+                .collect(),
+            retention: tables.intent_receipt_retention.for_object(object_id),
+        })
+    }
+
+    fn get_intent_receipt(
+        &self,
+        object_id: &DfsObjectId,
+        intent_id: &str,
+    ) -> Result<Option<DfsWriteIntentReceipt>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables
+            .intent_receipts
+            .get(&(object_id.clone(), intent_id.to_string()))
+            .cloned())
+    }
+
+    fn intent_receipt_retention_for_object(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> Result<DfsWriteIntentReceiptRetentionState> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables.intent_receipt_retention.for_object(object_id))
     }
 
     fn rebind_prepared_write_intent(
@@ -4892,6 +6865,30 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     ) -> Result<Vec<DfsMetadataJournalEntry>> {
         let _ = object;
         let _lock = self.begin_metadata_write()?;
+        let key = (intent.object_id.clone(), intent.intent_id.clone());
+        if let Some(receipt) = self.tables.intent_receipts.get(&key).cloned() {
+            if !receipt.matches_intent(intent) {
+                return Err(MetadataBackendError::Serde(format!(
+                    "write intent {}/{} was reused after compaction with a different payload",
+                    intent.object_id, intent.intent_id
+                )));
+            }
+            let entries = self.write_journal_entries_unlocked(
+                std::iter::once(DfsMetadataMutation::put_intent_receipt(&receipt))
+                    .chain(receipts.iter().map(DfsMetadataMutation::put_receipt))
+                    .collect(),
+            )?;
+            self.materialize_written_journal_entries_unlocked(&entries)?;
+            return Ok(entries);
+        }
+        if !self.tables.intents.contains_key(&key)
+            && self.tables.intent_receipt_retention.history_expired(intent)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "write intent {}/{} idempotency history expired or is unknown",
+                intent.object_id, intent.intent_id
+            )));
+        }
         let mut mutations = Vec::with_capacity(1 + receipts.len());
         mutations.push(DfsMetadataMutation::put_intent(intent));
         mutations.extend(receipts.iter().map(DfsMetadataMutation::put_receipt));
@@ -4909,7 +6906,18 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         Ok(tables
             .intents
             .get(&(object_id.clone(), intent_id.to_string()))
-            .cloned())
+            .cloned()
+            .or_else(|| {
+                tables
+                    .intent_receipts
+                    .get(&(object_id.clone(), intent_id.to_string()))
+                    .map(DfsWriteIntentReceipt::to_intent_record)
+            }))
+    }
+
+    fn write_intent_counter_floor(&self) -> Result<u64> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables.intent_receipt_retention.max_evicted_counter())
     }
 
     fn intents_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsWriteIntentRecord>> {
@@ -5057,6 +7065,17 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         {
             return Err(MetadataBackendError::Serde(format!(
                 "namespace transaction {} idempotency history expired or is unknown",
+                transaction.transaction_id
+            )));
+        }
+        if let Some(existing) = self
+            .tables
+            .namespace_transactions
+            .get(&transaction.transaction_id)
+            && normalized_namespace_transaction(existing) != transaction
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace transaction {} reuses a transaction id with a different payload",
                 transaction.transaction_id
             )));
         }
@@ -5482,6 +7501,37 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         Ok(plan_tombstone_compaction(&tables, &options, now).report)
     }
 
+    fn metadata_history_gc_projection(
+        &self,
+        options: DfsMetadataHistoryGcOptions,
+    ) -> Result<DfsMetadataHistoryGcReport> {
+        let tables = self.current_tables_snapshot()?;
+        let snapshot_size_bytes = fs::metadata(metadata_table_snapshot_path(&self.root))
+            .ok()
+            .map(|metadata| metadata.len());
+        let mut report = plan_metadata_history_gc(
+            self.shard_id.clone(),
+            &tables,
+            &options,
+            snapshot_size_bytes,
+        )
+        .report;
+        self.populate_metadata_history_storage_stats(&mut report)?;
+        Ok(report)
+    }
+
+    fn gc_metadata_history(
+        &mut self,
+        options: DfsMetadataHistoryGcOptions,
+    ) -> Result<DfsMetadataHistoryGcReport> {
+        self.gc_metadata_history_authoritative(options)
+    }
+
+    fn metadata_content_protection(&self) -> Result<DfsMetadataContentProtection> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(metadata_content_protection_from_tables(&tables))
+    }
+
     fn compact_tombstones(
         &mut self,
         options: DfsTombstoneCompactionOptions,
@@ -5492,6 +7542,30 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
 
     fn put_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {
         let _lock = self.begin_metadata_write()?;
+        if let Some(receipt) = self.tables.namespace_job_receipts.get(&job.job_id).cloned() {
+            if !receipt.matches_terminal_job(job) {
+                return Err(MetadataBackendError::Serde(format!(
+                    "namespace job {} was reused after compaction with a different payload",
+                    job.job_id
+                )));
+            }
+            return self
+                .write_journal_entry_and_apply_table_ops_unlocked(
+                    DfsMetadataMutation::put_namespace_job_receipt(&receipt),
+                    vec![DfsMetadataTableOp::PutNamespaceJobReceipt { receipt }],
+                )
+                .map(drop);
+        }
+        if !self.tables.namespace_jobs.contains_key(&job.job_id)
+            && self
+                .tables
+                .namespace_job_history_expired(job.created_at, &job.job_id)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace job {} idempotency history expired or is unknown",
+                job.job_id
+            )));
+        }
         self.write_journal_entry_and_apply_table_ops_unlocked(
             DfsMetadataMutation::put_namespace_job(job),
             vec![DfsMetadataTableOp::PutNamespaceJob { job: job.clone() }],
@@ -5539,7 +7613,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         if !self.tables.namespace_requests.contains_key(&key)
             && self
                 .tables
-                .namespace_request_history_expired(&request.request_id)
+                .namespace_request_history_expired(&request.requester_node_id, &request.request_id)
         {
             return Err(MetadataBackendError::Serde(format!(
                 "namespace request {}/{} idempotency history expired or is unknown",
@@ -5581,6 +7655,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     fn namespace_request_history_expired_on_shard(
         &self,
         shard_id: &DfsMetadataShardId,
+        requester_node_id: &NodeId,
         request_id: &str,
     ) -> Result<bool> {
         if shard_id != &self.shard_id {
@@ -5590,7 +7665,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             )));
         }
         let tables = self.current_tables_snapshot()?;
-        Ok(tables.namespace_request_history_expired(request_id))
+        Ok(tables.namespace_request_history_expired(requester_node_id, request_id))
     }
 
     fn list_namespace_requests(&self) -> Result<Vec<DfsNamespaceRequestRecord>> {
@@ -5653,6 +7728,92 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {
         let tables = self.current_tables_snapshot()?;
         Ok(tables.namespace_jobs.get(job_id).cloned())
+    }
+
+    fn put_namespace_job_receipt(&mut self, receipt: &DfsNamespaceJobReceipt) -> Result<()> {
+        if receipt.status == DfsNamespaceJobStatus::Running {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace job receipt {} is not terminal",
+                receipt.job_id
+            )));
+        }
+        let _lock = self.begin_metadata_write()?;
+        if let Some(job) = self.tables.namespace_jobs.get(&receipt.job_id)
+            && !receipt.matches_terminal_job(job)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace job receipt {} conflicts with its full job",
+                receipt.job_id
+            )));
+        }
+        if let Some(existing) = self.tables.namespace_job_receipts.get(&receipt.job_id)
+            && existing != receipt
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace job receipt {} was reused with a different payload",
+                receipt.job_id
+            )));
+        }
+        if !self.tables.namespace_jobs.contains_key(&receipt.job_id)
+            && !self
+                .tables
+                .namespace_job_receipts
+                .contains_key(&receipt.job_id)
+            && self
+                .tables
+                .namespace_job_history_expired(receipt.created_at, &receipt.job_id)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace job {} idempotency history expired or is unknown",
+                receipt.job_id
+            )));
+        }
+        self.write_journal_entry_and_apply_table_ops_unlocked(
+            DfsMetadataMutation::put_namespace_job_receipt(receipt),
+            vec![DfsMetadataTableOp::PutNamespaceJobReceipt {
+                receipt: receipt.clone(),
+            }],
+        )
+        .map(drop)
+    }
+
+    fn get_namespace_job_receipt(&self, job_id: &str) -> Result<Option<DfsNamespaceJobReceipt>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables.namespace_job_receipts.get(job_id).cloned())
+    }
+
+    fn completed_namespace_job_receipt_for_paths_since(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        root_path: &str,
+        target_path: &str,
+        kinds: &[DfsNamespaceJobKind],
+        created_at: OffsetDateTime,
+        origin: &DfsNamespaceJobOrigin,
+    ) -> Result<Option<DfsNamespaceJobReceipt>> {
+        let tables = self.current_tables_snapshot()?;
+        let root_path = normalize_path(root_path);
+        let target_path = normalize_path(target_path);
+        Ok(tables
+            .namespace_job_receipts
+            .values()
+            .filter(|receipt| {
+                receipt.file_system_id == *file_system_id
+                    && receipt.status == DfsNamespaceJobStatus::Completed
+                    && kinds.contains(&receipt.kind)
+                    && receipt.created_at >= created_at
+                    && normalize_path(&receipt.root_path) == root_path
+                    && receipt
+                        .target_path
+                        .as_deref()
+                        .is_some_and(|path| normalize_path(path) == target_path)
+                    && receipt
+                        .origin
+                        .as_ref()
+                        .is_none_or(|actual| actual == origin)
+            })
+            .max_by_key(|receipt| receipt.created_at)
+            .cloned())
     }
 
     fn list_namespace_jobs(&self) -> Result<Vec<DfsNamespaceJobRecord>> {
@@ -6042,6 +8203,347 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
 }
 
 impl LocalSobjMetadataBackend {
+    fn populate_metadata_history_storage_stats(
+        &self,
+        report: &mut DfsMetadataHistoryGcReport,
+    ) -> Result<()> {
+        let Some(shard) = report
+            .shards
+            .iter_mut()
+            .find(|shard| shard.shard_id == self.shard_id)
+        else {
+            return Ok(());
+        };
+        shard.journal_head_sequence = self.journal_last_sequence();
+        let journal_root = self.root.join("journal");
+        if !journal_root.exists() {
+            return Ok(());
+        }
+        let root_entries =
+            fs::read_dir(&journal_root).map_err(|source| MetadataBackendError::Io {
+                path: journal_root.clone(),
+                source,
+            })?;
+        for entry in root_entries {
+            let entry = entry.map_err(|source| MetadataBackendError::Io {
+                path: journal_root.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let metadata = entry
+                .metadata()
+                .map_err(|source| MetadataBackendError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+            if metadata.is_file() {
+                shard.journal_size_bytes = shard.journal_size_bytes.saturating_add(metadata.len());
+            }
+        }
+        let segments_root = journal_root.join("segments");
+        if !segments_root.exists() {
+            return Ok(());
+        }
+        let segment_entries =
+            fs::read_dir(&segments_root).map_err(|source| MetadataBackendError::Io {
+                path: segments_root.clone(),
+                source,
+            })?;
+        for entry in segment_entries {
+            let entry = entry.map_err(|source| MetadataBackendError::Io {
+                path: segments_root.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("slog") {
+                continue;
+            }
+            let metadata = entry
+                .metadata()
+                .map_err(|source| MetadataBackendError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+            if metadata.is_file() {
+                shard.journal_segment_count = shard.journal_segment_count.saturating_add(1);
+                shard.journal_size_bytes = shard.journal_size_bytes.saturating_add(metadata.len());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn gc_metadata_history_authoritative(
+        &mut self,
+        options: DfsMetadataHistoryGcOptions,
+    ) -> Result<DfsMetadataHistoryGcReport> {
+        let _lock = self.begin_metadata_write()?;
+        let snapshot_size_bytes = fs::metadata(metadata_table_snapshot_path(&self.root))
+            .ok()
+            .map(|metadata| metadata.len());
+        let mut plan = plan_metadata_history_gc(
+            self.shard_id.clone(),
+            &self.tables,
+            &options,
+            snapshot_size_bytes,
+        );
+        self.populate_metadata_history_storage_stats(&mut plan.report)?;
+        if plan.removals.is_empty() {
+            return Ok(plan.report);
+        }
+
+        let retained_at = options
+            .now_unix_nanos
+            .and_then(|now| OffsetDateTime::from_unix_timestamp_nanos(i128::from(now)).ok())
+            .unwrap_or_else(OffsetDateTime::now_utc);
+        let mut mutations = Vec::with_capacity(plan.removals.len());
+        for removal in &plan.removals {
+            let mutation = match removal {
+                DfsMetadataHistoryRemoval::Receipt {
+                    file_system_id,
+                    object_id,
+                    version,
+                    replica_node_id,
+                } => DfsMetadataMutation::RemoveReceipt {
+                    file_system_id: file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    version: version.clone(),
+                    replica_node_id: replica_node_id.clone(),
+                },
+                DfsMetadataHistoryRemoval::Version {
+                    file_system_id,
+                    object_id,
+                    version,
+                } => DfsMetadataMutation::remove_version(
+                    file_system_id.clone(),
+                    object_id.clone(),
+                    version.clone(),
+                ),
+                DfsMetadataHistoryRemoval::Intent {
+                    object_id,
+                    intent_id,
+                    ..
+                } => {
+                    let intent = self
+                        .tables
+                        .intents
+                        .get(&(object_id.clone(), intent_id.clone()))
+                        .ok_or_else(|| {
+                            MetadataBackendError::Serde(format!(
+                                "metadata GC lost planned intent {object_id}/{intent_id} while holding the shard write lock"
+                            ))
+                        })?;
+                    let receipt = DfsWriteIntentReceipt::from_intent(intent, retained_at)
+                        .ok_or_else(|| {
+                            MetadataBackendError::Serde(format!(
+                                "metadata GC selected non-terminal intent {object_id}/{intent_id}"
+                            ))
+                        })?;
+                    DfsMetadataMutation::put_intent_receipt(&receipt)
+                }
+                DfsMetadataHistoryRemoval::IntentReceipt {
+                    file_system_id,
+                    object_id,
+                    intent_id,
+                } => {
+                    let receipt = self
+                        .tables
+                        .intent_receipts
+                        .get(&(object_id.clone(), intent_id.clone()))
+                        .ok_or_else(|| {
+                            MetadataBackendError::Serde(format!(
+                                "metadata GC lost planned intent receipt {object_id}/{intent_id} while holding the shard write lock"
+                            ))
+                        })?;
+                    DfsMetadataMutation::remove_intent_receipt(
+                        file_system_id.clone(),
+                        object_id.clone(),
+                        intent_id.clone(),
+                        DfsWriteIntentReceiptRetentionState::eviction_delta(receipt),
+                    )
+                }
+                DfsMetadataHistoryRemoval::Conflict {
+                    file_system_id,
+                    object_id,
+                    conflict_id,
+                } => DfsMetadataMutation::PutConflict {
+                    file_system_id: file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    conflict_id: conflict_id.clone(),
+                    conflict: None,
+                },
+                DfsMetadataHistoryRemoval::VisibleCommit {
+                    file_system_id,
+                    object_id,
+                    version,
+                } => DfsMetadataMutation::RemoveVisibleCommit {
+                    file_system_id: file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    version: version.clone(),
+                },
+                DfsMetadataHistoryRemoval::NamespaceJob { job_id, .. } => {
+                    let job = self.tables.namespace_jobs.get(job_id).ok_or_else(|| {
+                        MetadataBackendError::Serde(format!(
+                            "metadata GC lost planned namespace job {job_id} while holding the shard write lock"
+                        ))
+                    })?;
+                    let receipt =
+                        DfsNamespaceJobReceipt::from_job(job, retained_at).ok_or_else(|| {
+                            MetadataBackendError::Serde(format!(
+                                "metadata GC selected running namespace job {job_id}"
+                            ))
+                        })?;
+                    DfsMetadataMutation::put_namespace_job_receipt(&receipt)
+                }
+                DfsMetadataHistoryRemoval::NamespaceTransaction { transaction_id, .. } => {
+                    let transaction = self
+                        .tables
+                        .namespace_transactions
+                        .get(transaction_id)
+                        .ok_or_else(|| {
+                            MetadataBackendError::Serde(format!(
+                                "metadata GC lost planned namespace transaction {transaction_id} while holding the shard write lock"
+                            ))
+                        })?;
+                    let receipt =
+                        DfsNamespaceTransactionReceipt::from_transaction(transaction, retained_at)
+                            .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
+                    DfsMetadataMutation::put_namespace_transaction_receipt(&receipt)
+                }
+                DfsMetadataHistoryRemoval::NamespacePrepare { operation_id, .. } => {
+                    let prepare = self
+                        .tables
+                        .namespace_prepares
+                        .get(operation_id)
+                        .ok_or_else(|| {
+                            MetadataBackendError::Serde(format!(
+                                "metadata GC lost planned namespace prepare {operation_id} while holding the shard write lock"
+                            ))
+                        })?;
+                    let receipt = DfsNamespacePrepareReceipt::from_prepare(prepare, retained_at)
+                        .ok_or_else(|| {
+                            MetadataBackendError::Serde(format!(
+                                "metadata GC selected non-terminal namespace prepare {operation_id}"
+                            ))
+                        })?;
+                    DfsMetadataMutation::put_namespace_prepare_receipt(&receipt)
+                }
+                DfsMetadataHistoryRemoval::NamespaceRequest {
+                    requester_node_id,
+                    request_id,
+                    ..
+                } => {
+                    let key = (requester_node_id.clone(), request_id.clone());
+                    let request = self.tables.namespace_requests.get(&key).ok_or_else(|| {
+                        MetadataBackendError::Serde(format!(
+                            "metadata GC lost planned namespace request {requester_node_id}/{request_id} while holding the shard write lock"
+                        ))
+                    })?;
+                    let receipt = DfsNamespaceRequestReceipt::from_request(request, retained_at)
+                        .ok_or_else(|| {
+                            MetadataBackendError::Serde(format!(
+                                "metadata GC selected non-terminal namespace request {requester_node_id}/{request_id}"
+                            ))
+                        })?;
+                    DfsMetadataMutation::put_namespace_request_receipt(&receipt)
+                }
+                DfsMetadataHistoryRemoval::NamespaceJobReceipt {
+                    file_system_id,
+                    job_id,
+                } => {
+                    let receipt =
+                        self.tables
+                            .namespace_job_receipts
+                            .get(job_id)
+                            .ok_or_else(|| {
+                                MetadataBackendError::Serde(format!(
+                                    "metadata GC lost planned namespace job receipt {job_id} while holding the shard write lock"
+                                ))
+                            })?;
+                    DfsMetadataMutation::RemoveNamespaceJobReceipt {
+                        file_system_id: file_system_id.clone(),
+                        job_id: job_id.clone(),
+                        retention: namespace_job_receipt_eviction_delta(receipt),
+                    }
+                }
+                DfsMetadataHistoryRemoval::NamespaceTransactionReceipt {
+                    file_system_id,
+                    transaction_id,
+                } => {
+                    let receipt = self
+                        .tables
+                        .namespace_transaction_receipts
+                        .get(transaction_id)
+                        .ok_or_else(|| {
+                            MetadataBackendError::Serde(format!(
+                                "metadata GC lost planned namespace transaction receipt {transaction_id} while holding the shard write lock"
+                            ))
+                        })?;
+                    DfsMetadataMutation::RemoveNamespaceTransactionReceipt {
+                        file_system_id: file_system_id.clone(),
+                        transaction_id: transaction_id.clone(),
+                        retention: namespace_transaction_receipt_eviction_delta(receipt),
+                    }
+                }
+                DfsMetadataHistoryRemoval::NamespacePrepareReceipt {
+                    file_system_id,
+                    operation_id,
+                } => {
+                    let receipt = self
+                        .tables
+                        .namespace_prepare_receipts
+                        .get(operation_id)
+                        .ok_or_else(|| {
+                            MetadataBackendError::Serde(format!(
+                                "metadata GC lost planned namespace prepare receipt {operation_id} while holding the shard write lock"
+                            ))
+                        })?;
+                    DfsMetadataMutation::RemoveNamespacePrepareReceipt {
+                        file_system_id: file_system_id.clone(),
+                        operation_id: operation_id.clone(),
+                        retention: namespace_prepare_receipt_eviction_delta(receipt),
+                    }
+                }
+                DfsMetadataHistoryRemoval::NamespaceRequestReceipt {
+                    file_system_id,
+                    requester_node_id,
+                    request_id,
+                } => {
+                    let key = (requester_node_id.clone(), request_id.clone());
+                    let receipt = self
+                        .tables
+                        .namespace_request_receipts
+                        .get(&key)
+                        .ok_or_else(|| {
+                            MetadataBackendError::Serde(format!(
+                                "metadata GC lost planned namespace request receipt {requester_node_id}/{request_id} while holding the shard write lock"
+                            ))
+                        })?;
+                    DfsMetadataMutation::RemoveNamespaceRequestReceipt {
+                        file_system_id: file_system_id.clone(),
+                        requester_node_id: requester_node_id.clone(),
+                        request_id: request_id.clone(),
+                        retention: namespace_request_receipt_eviction_delta(receipt),
+                    }
+                }
+            };
+            mutations.push(mutation);
+        }
+        let entries = self.write_journal_entries_unlocked(mutations)?;
+        self.materialize_written_journal_entries_unlocked(&entries)?;
+        // A bounded lifecycle drain may need hundreds of journaled batches.
+        // Publishing a complete snapshot after every partial batch makes that
+        // drain quadratic in the retained table size. The journal and
+        // materialized table log are already durable at this point, so defer
+        // the forced checkpoint until this shard's current candidate set fits
+        // in the configured batch. The normal table-log byte threshold still
+        // schedules an earlier checkpoint when the incremental suffix grows
+        // large.
+        if !plan.report.max_removals_reached {
+            self.compact_metadata_table_log_if_needed(0)?;
+        }
+        Ok(plan.report)
+    }
+
     fn recover_namespace_transactions(&mut self) -> Result<()> {
         let trace_started = Instant::now();
         let _lock = self.begin_metadata_write()?;
@@ -6246,9 +8748,9 @@ mod tests {
         dentry_key, key_segment, normalize_path, path_hash, path_record_for_object,
     };
     use crate::{
-        DfsAdvisoryLockMode, DfsAdvisoryLockOutcome, DfsAdvisoryLockRequestId,
-        DfsAdvisoryLockSessionId, DfsMetadataShardAssignment, DfsNamespaceOperation,
-        DfsNamespaceResult, DfsObjectKind,
+        ContentStoreGcOptions, ContentStoreVersionGcOptions, DfsAdvisoryLockMode,
+        DfsAdvisoryLockOutcome, DfsAdvisoryLockRequestId, DfsAdvisoryLockSessionId,
+        DfsMetadataShardAssignment, DfsNamespaceOperation, DfsNamespaceResult, DfsObjectKind,
     };
     use sinomo_core::DfsObjectPolicy;
     use std::time::Duration;
@@ -6304,11 +8806,49 @@ mod tests {
         }
     }
 
+    fn object_version_record(
+        object: &DfsObjectMetadata,
+        version: DfsVersion,
+        created_at: OffsetDateTime,
+    ) -> DfsObjectVersionRecord {
+        DfsObjectVersionRecord {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            version,
+            content_hash: object.content_hash.clone(),
+            size_bytes: object.content_size_bytes,
+            locations: object.current_locations.clone(),
+            created_by_event_id: object.created_by_event_id.clone(),
+            created_at,
+            visible: true,
+        }
+    }
+
+    fn replica_receipt_record(
+        object: &DfsObjectMetadata,
+        version: DfsVersion,
+        received_at: OffsetDateTime,
+    ) -> DfsReplicaReceiptRecord {
+        DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                committed_version: version,
+                owner_node_id: object.owner_node_id.clone(),
+                event_id: EventId::generate(),
+            },
+            replica_node_id: object.owner_node_id.clone(),
+            content_hash: object.content_hash.clone(),
+            received_at,
+        }
+    }
+
     fn namespace_job(index: usize, root_path: &str) -> DfsNamespaceJobRecord {
         let timestamp = OffsetDateTime::from_unix_timestamp(index as i64).expect("valid timestamp");
         DfsNamespaceJobRecord {
             job_id: format!("job_namespace_page_{index:02}"),
             file_system_id: file_system_id(),
+            origin: None,
             kind: DfsNamespaceJobKind::ClearDirectoryRecursive,
             status: DfsNamespaceJobStatus::Running,
             root_path: root_path.to_string(),
@@ -8301,6 +10841,108 @@ mod tests {
     }
 
     #[test]
+    fn migrated_intent_records_route_to_the_destination_without_advancing_the_source_journal() {
+        let root = temp_root("migrated_intent_records_route_to_destination");
+        let root_shard_id = DfsMetadataShardId::new("root");
+        let services_shard_id = DfsMetadataShardId::new("services");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let file_system = file_system();
+        let mut source_object = object(version("version_1"));
+        source_object.object_id = DfsObjectId::from_legacy_named("obj_migrated_intent_routing")
+            .expect("migrated intent routing object id");
+        source_object.path = "/intent-source.txt".to_string();
+        let pending_intent = DfsWriteIntentRecord {
+            intent_id: "intent-migrated-pending".to_string(),
+            file_system_id: source_object.file_system_id.clone(),
+            object_id: source_object.object_id.clone(),
+            base_version: Some(source_object.version.clone()),
+            target_version: version("version_2"),
+            coordinator_node_id: node("node_owner"),
+            owner_epoch: 1,
+            desired_replica_node_ids: vec![node("node_owner")],
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            status: DfsWriteIntentStatus::ReceiptsPending,
+            content_hash: Some("blake3:migrated-pending".to_string()),
+            object_metadata: Some(source_object.clone()),
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: None,
+        };
+        let mut terminal_intent = pending_intent.clone();
+        terminal_intent.intent_id = "intent-migrated-terminal".to_string();
+        terminal_intent.target_version = version("version_3");
+        terminal_intent.status = DfsWriteIntentStatus::Committed;
+        terminal_intent.content_hash = Some("blake3:migrated-terminal".to_string());
+        terminal_intent.updated_at = Some(OffsetDateTime::now_utc());
+        let terminal_receipt =
+            DfsWriteIntentReceipt::from_intent(&terminal_intent, OffsetDateTime::now_utc())
+                .expect("terminal intent receipt");
+
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&source_object).expect("source object");
+        backend
+            .put_intent(&pending_intent)
+            .expect("source pending intent");
+        backend
+            .put_intent(&terminal_intent)
+            .expect("source terminal intent");
+        let source_head = backend
+            .shard_backend(&root_shard_id)
+            .expect("root shard")
+            .journal_last_sequence();
+
+        let mut destination_object = source_object.clone();
+        destination_object.path = "/services/intent-source.txt".to_string();
+        destination_object.version = version("version_4");
+
+        backend
+            .put_migrated_intent_for_object(Some(&destination_object), &pending_intent)
+            .expect("migrate pending intent");
+        backend
+            .put_intent_receipt_for_object(Some(&destination_object), &terminal_receipt)
+            .expect("migrate terminal receipt");
+
+        assert_eq!(
+            backend
+                .shard_backend(&root_shard_id)
+                .expect("root shard")
+                .journal_last_sequence(),
+            source_head,
+            "destination adoption must not advance the fenced source journal"
+        );
+        let destination = backend
+            .shard_backend(&services_shard_id)
+            .expect("services shard");
+        assert_eq!(
+            destination
+                .get_intent(&pending_intent.object_id, &pending_intent.intent_id)
+                .expect("destination pending intent"),
+            Some(pending_intent)
+        );
+        assert_eq!(
+            destination
+                .get_intent_receipt(&terminal_receipt.object_id, &terminal_receipt.intent_id)
+                .expect("destination terminal receipt"),
+            Some(terminal_receipt)
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn sharded_backend_moves_object_between_path_shards_without_scanning_on_read() {
         let root = temp_root("sharded_backend_moves_object_between_path_shards");
         let mut backend = LocalShardedMetadataBackend::new(
@@ -8464,6 +11106,7 @@ mod tests {
             Some(crate::DfsTombstoneProvenance::SourceEviction {
                 source_shard_id: DfsMetadataShardId::new("root"),
                 target_shard_id: DfsMetadataShardId::new("services"),
+                pin_transfer_id: None,
             });
         backend
             .shard_backend_mut(&DfsMetadataShardId::new("root"))
@@ -8554,6 +11197,7 @@ mod tests {
                     &source_shard_id,
                     &target_shard_id,
                     fenced_sequence,
+                    None,
                 )
                 .expect("conditional eviction"),
             DfsConditionalSourceEviction::JournalAdvanced,
@@ -8961,6 +11605,315 @@ mod tests {
                 .into_iter()
                 .map(|index| format!("namespace-request-{index:02}"))
                 .collect::<Vec<_>>()
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_namespace_request_floor_survives_authority_prefix_change() {
+        let root = temp_root("sharded_namespace_request_floor_authority_change");
+        let root_shard = DfsMetadataShardId::new("root");
+        let services_shard = DfsMetadataShardId::new("services");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config(&root_shard.0, DfsMetadataShardAssignment::Root),
+                shard_config(
+                    &services_shard.0,
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+
+        let mut completed = namespace_request(70, DfsNamespaceRequestStatus::Completed);
+        completed.authority_shard_id = root_shard.clone();
+        backend
+            .put_namespace_request_on_shard(&root_shard, &completed)
+            .expect("completed request on former authority");
+        let compacted = backend
+            .gc_metadata_history(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(u64::MAX),
+            )
+            .expect("compact request body");
+        assert_eq!(compacted.compacted_namespace_request_count, 1);
+        let evicted = backend
+            .gc_metadata_history(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(u64::MAX),
+            )
+            .expect("evict compact request receipt");
+        assert_eq!(evicted.removed_namespace_request_receipt_count, 1);
+
+        assert!(
+            backend
+                .namespace_request_history_expired_on_shard(
+                    &services_shard,
+                    &completed.requester_node_id,
+                    &completed.request_id,
+                )
+                .expect("new-authority history lookup"),
+            "the selected shard must consult an evicted receipt floor retained by the former authority"
+        );
+        let mut rerouted_retry = completed;
+        rerouted_retry.authority_shard_id = services_shard.clone();
+        assert!(
+            backend
+                .put_namespace_request_on_shard(&services_shard, &rerouted_retry)
+                .expect_err("old request cannot become fresh on a new prefix authority")
+                .to_string()
+                .contains("idempotency history expired")
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_metadata_history_projection_inventories_replica_without_scheduling_it() {
+        let root = temp_root("sharded_metadata_history_projection_replica_inventory");
+        let local_node_id = node("node_owner");
+        let root_shard = DfsMetadataShardId::new("root");
+        let services_shard = DfsMetadataShardId::new("services");
+        let root_config = shard_config(&root_shard.0, DfsMetadataShardAssignment::Root);
+        let mut services_config = shard_config(
+            &services_shard.0,
+            DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/services".to_string(),
+            },
+        );
+        services_config.primary_node_id = node("node_remote_primary");
+        services_config.replica_node_ids = vec![local_node_id.clone()];
+        let mut backend = LocalShardedMetadataBackend::new_with_replica_repair(
+            &root,
+            vec![root_config, services_config],
+            &local_node_id,
+        )
+        .expect("sharded backend with local replica");
+
+        let file_system = file_system();
+        let mut current = object(version("version_replica_projection_current"));
+        current.path = "/services/replica-history.txt".to_string();
+        let old_version = version("version_replica_projection_old");
+        let old_record =
+            object_version_record(&current, old_version.clone(), OffsetDateTime::UNIX_EPOCH);
+        let current_record = object_version_record(
+            &current,
+            current.version.clone(),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+        );
+        let replica = backend
+            .shard_backend_mut(&services_shard)
+            .expect("services replica backend");
+        replica
+            .put_file_system(&file_system)
+            .expect("replica filesystem");
+        replica
+            .put_object(&current)
+            .expect("replica current object");
+        replica
+            .put_version(&old_record)
+            .expect("replica old version");
+        replica
+            .put_version(&current_record)
+            .expect("replica current version");
+
+        let projection = backend
+            .metadata_history_gc_projection(
+                DfsMetadataHistoryGcOptions::dry_run(Duration::ZERO, 1)
+                    .with_now_unix_nanos(2_000_000_000),
+            )
+            .expect("sharded GC projection");
+        let replica_stats = projection
+            .shards
+            .iter()
+            .find(|stats| stats.shard_id == services_shard)
+            .expect("replica shard inventory");
+        assert!(
+            projection
+                .shards
+                .iter()
+                .find(|stats| stats.shard_id == root_shard)
+                .is_some_and(|stats| stats.collection_authorized),
+            "the local authoritative shard must remain eligible to contribute collection pressure"
+        );
+        assert!(
+            !replica_stats.collection_authorized,
+            "replica inventory must be explicitly excluded from collection pressure"
+        );
+        assert_eq!(
+            replica_stats
+                .tables
+                .iter()
+                .find(|table| table.table == "versions")
+                .map(|table| table.record_count),
+            Some(2)
+        );
+        assert_eq!(
+            projection.eligible_version_count, 0,
+            "replica history must remain observable without becoming authoritative scheduled work"
+        );
+        let gc = backend
+            .gc_metadata_history(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(2_000_000_000),
+            )
+            .expect("primary-only sharded GC");
+        assert_eq!(gc.applied_record_count(), 0);
+        assert_eq!(
+            backend
+                .shard_backend(&services_shard)
+                .expect("services replica")
+                .get_version(&current.object_id, &old_version)
+                .expect("replica old version"),
+            Some(old_record)
+        );
+
+        backend
+            .shard_backend_mut(&root_shard)
+            .expect("root primary")
+            .freeze_metadata_shard_for_membership_handoff(
+                &root_shard,
+                "projection-pressure-freeze",
+                1,
+            )
+            .expect("freeze root primary")
+            .expect("local root shard");
+        let frozen_projection = backend
+            .metadata_history_gc_projection(
+                DfsMetadataHistoryGcOptions::dry_run(Duration::ZERO, 1)
+                    .with_now_unix_nanos(2_000_000_000),
+            )
+            .expect("frozen sharded GC projection");
+        assert!(
+            frozen_projection
+                .shards
+                .iter()
+                .all(|stats| !stats.collection_authorized),
+            "handoff-frozen and replica shards must remain inventory-only"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_combined_snapshot_preserves_compact_gc_receipts_and_floors() {
+        let root = temp_root("sharded_combined_snapshot_gc_receipts");
+        let root_shard = DfsMetadataShardId::new("root");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config(&root_shard.0, DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let object_id =
+            DfsObjectId::from_legacy_named("obj_sharded_snapshot_receipts").expect("object id");
+        let retained_at =
+            OffsetDateTime::from_unix_timestamp(20).expect("receipt retention timestamp");
+        let intent_receipt = DfsWriteIntentReceipt {
+            intent_id: "intent_sharded_snapshot_42".to_string(),
+            file_system_id: file_system_id(),
+            object_id: object_id.clone(),
+            base_version: Some(version("version_sharded_snapshot_base")),
+            target_version: version("version_sharded_snapshot_target"),
+            coordinator_node_id: node("node_owner"),
+            owner_epoch: 1,
+            desired_replica_node_ids: vec![node("node_owner")],
+            policy: DfsReplicationPolicy::new(1, 1).expect("replication policy"),
+            status: DfsWriteIntentStatus::Committed,
+            content_hash: Some("blake3:sharded-snapshot-intent".to_string()),
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            terminal_at: OffsetDateTime::UNIX_EPOCH,
+            retained_at,
+        };
+        let evicted_intent_receipt = DfsWriteIntentReceipt {
+            intent_id: "intent_sharded_snapshot_41".to_string(),
+            ..intent_receipt.clone()
+        };
+        let job_receipt = DfsNamespaceJobReceipt {
+            job_id: "job_sharded_snapshot_receipt".to_string(),
+            file_system_id: file_system_id(),
+            origin: None,
+            kind: DfsNamespaceJobKind::ClearDirectoryRecursive,
+            status: DfsNamespaceJobStatus::Completed,
+            root_path: "/snapshot-job".to_string(),
+            target_path: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            terminal_at: OffsetDateTime::UNIX_EPOCH,
+            retained_at,
+        };
+        let job_floor = DfsNamespaceReceiptOrderKey {
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            identity: "job_sharded_snapshot_evicted".to_string(),
+        };
+        let advisory_lock_state = DfsAdvisoryLockStateRecord::empty(
+            file_system_id(),
+            intent_receipt.object_id.clone(),
+            9,
+        );
+        {
+            let shard = backend
+                .shard_backend_mut(&root_shard)
+                .expect("root shard backend");
+            shard.tables.intent_receipts.insert(
+                (object_id, intent_receipt.intent_id.clone()),
+                intent_receipt.clone(),
+            );
+            shard.tables.intent_receipt_retention.merge_conservative(
+                DfsWriteIntentReceiptRetentionState::eviction_delta(&evicted_intent_receipt),
+            );
+            shard
+                .tables
+                .namespace_job_receipts
+                .insert(job_receipt.job_id.clone(), job_receipt.clone());
+            shard.tables.namespace_receipt_retention.job_floor = Some(job_floor.clone());
+            shard.tables.advisory_lock_states.insert(
+                advisory_lock_state.object_id.clone(),
+                advisory_lock_state.clone(),
+            );
+        }
+
+        let snapshot =
+            DfsMetadataBackend::export_table_snapshot(&backend).expect("combined snapshot");
+        let restored = metadata_tables_from_table_snapshot(snapshot, "combined sharded snapshot")
+            .expect("restore combined snapshot tables");
+        assert_eq!(
+            restored.intent_receipts.get(&(
+                intent_receipt.object_id.clone(),
+                intent_receipt.intent_id.clone()
+            )),
+            Some(&intent_receipt)
+        );
+        assert!(
+            restored
+                .intent_receipt_retention
+                .history_expired(&evicted_intent_receipt.to_intent_record())
+        );
+        assert_eq!(
+            restored.namespace_job_receipts.get(&job_receipt.job_id),
+            Some(&job_receipt)
+        );
+        assert_eq!(
+            restored.namespace_receipt_retention.job_floor,
+            Some(job_floor)
+        );
+        assert_eq!(
+            restored
+                .advisory_lock_states
+                .get(&advisory_lock_state.object_id),
+            Some(&advisory_lock_state)
         );
 
         cleanup(&root);
@@ -14123,6 +17076,127 @@ mod tests {
     }
 
     #[test]
+    fn node_aware_sharded_maintenance_excludes_local_replica_shards() {
+        let root = temp_root("node_aware_sharded_maintenance_primary_only");
+        let local_node_id = node("node_gc_local_primary");
+        let remote_node_id = node("node_gc_remote_primary");
+        let root_shard_id = DfsMetadataShardId::new("root");
+        let services_shard_id = DfsMetadataShardId::new("services");
+        let mut root_config = shard_config("root", DfsMetadataShardAssignment::Root);
+        root_config.primary_node_id = local_node_id.clone();
+        root_config.replica_node_ids = vec![remote_node_id.clone()];
+        let mut services_config = shard_config(
+            "services",
+            DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/services".to_string(),
+            },
+        );
+        services_config.primary_node_id = remote_node_id;
+        services_config.replica_node_ids = vec![local_node_id.clone()];
+        let configs = vec![root_config, services_config];
+
+        let mut primary_tombstone = object(version("version_gc_primary_tombstone"));
+        primary_tombstone.path = "/deleted-primary.md".to_string();
+        primary_tombstone.kind = DfsObjectKind::Tombstone;
+        primary_tombstone.content_hash = None;
+        primary_tombstone.content_size_bytes = None;
+        primary_tombstone.changed_at_unix_nanos = 1;
+        let mut replica_tombstone = object(version("version_gc_replica_tombstone"));
+        replica_tombstone.object_id =
+            DfsObjectId::from_legacy_named("obj_gc_replica_tombstone").expect("object id");
+        replica_tombstone.path = "/services/deleted-replica.md".to_string();
+        replica_tombstone.kind = DfsObjectKind::Tombstone;
+        replica_tombstone.content_hash = None;
+        replica_tombstone.content_size_bytes = None;
+        replica_tombstone.changed_at_unix_nanos = 1;
+
+        {
+            let mut seed = LocalShardedMetadataBackend::new(&root, configs.clone())
+                .expect("seed sharded backend");
+            seed.put_file_system(&file_system()).expect("filesystem");
+            seed.put_object(&primary_tombstone)
+                .expect("primary tombstone");
+            seed.put_object(&replica_tombstone)
+                .expect("replica tombstone");
+        }
+
+        let inspection = LocalShardedMetadataBackend::open_for_inspection_at_node(
+            &root,
+            configs.clone(),
+            &local_node_id,
+        )
+        .expect("node-aware inspection");
+        let tombstone_projection = inspection
+            .tombstone_compaction_projection(
+                DfsTombstoneCompactionOptions::dry_run(Duration::ZERO).with_now_unix_nanos(100),
+            )
+            .expect("tombstone projection");
+        assert_eq!(tombstone_projection.scanned_tombstone_count, 1);
+        assert_eq!(tombstone_projection.eligible_tombstone_count, 1);
+        let history_projection = inspection
+            .metadata_history_gc_projection(
+                DfsMetadataHistoryGcOptions::dry_run(Duration::ZERO, 1).with_now_unix_nanos(100),
+            )
+            .expect("metadata history projection");
+        assert_eq!(
+            history_projection
+                .shards
+                .iter()
+                .map(|stats| (stats.shard_id.clone(), stats.collection_authorized))
+                .collect::<Vec<_>>(),
+            vec![
+                (root_shard_id.clone(), true),
+                (services_shard_id.clone(), false),
+            ],
+            "inspection must inventory local replicas without authorizing maintenance work"
+        );
+        drop(inspection);
+
+        let mut maintenance =
+            LocalShardedMetadataBackend::new_with_replica_repair(&root, configs, &local_node_id)
+                .expect("node-aware maintenance backend");
+        let replica_journal_head = maintenance
+            .shard_backend(&services_shard_id)
+            .expect("replica shard")
+            .journal_last_sequence();
+
+        let report = maintenance
+            .compact_tombstones(
+                DfsTombstoneCompactionOptions::compact_eligible(Duration::ZERO)
+                    .with_now_unix_nanos(100),
+            )
+            .expect("primary-only tombstone compaction");
+        assert_eq!(report.compacted_tombstone_count, 1);
+        assert_eq!(
+            maintenance
+                .shard_backend(&root_shard_id)
+                .expect("primary shard")
+                .get_object(&primary_tombstone.object_id)
+                .expect("primary object lookup"),
+            None
+        );
+        assert_eq!(
+            maintenance
+                .shard_backend(&services_shard_id)
+                .expect("replica shard")
+                .get_object(&replica_tombstone.object_id)
+                .expect("replica object lookup"),
+            Some(replica_tombstone),
+            "compaction must leave local replica metadata untouched"
+        );
+        assert_eq!(
+            maintenance
+                .shard_backend(&services_shard_id)
+                .expect("replica shard")
+                .journal_last_sequence(),
+            replica_journal_head,
+            "local replica journal must not advance during maintenance"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn sharded_backend_compaction_skips_activated_retiring_shard() {
         let root = temp_root("sharded_backend_compaction_skips_retiring_shard");
         let mut backend = LocalShardedMetadataBackend::new(
@@ -17172,8 +20246,8 @@ mod tests {
     }
 
     #[test]
-    fn table_checkpoint_compacts_terminal_namespace_history_without_losing_exact_retries() {
-        let root = temp_root("terminal_namespace_receipt_checkpoint");
+    fn table_checkpoint_preserves_terminal_namespace_history_without_journaled_gc() {
+        let root = temp_root("terminal_namespace_history_checkpoint");
         let shard_id = DfsMetadataShardId::new("root");
         let file_system = file_system();
         let current = object(version("version_namespace_receipt_1"));
@@ -17219,64 +20293,73 @@ mod tests {
             )
             .expect("commit prepare");
 
-        let full_request_bytes = serde_json::to_vec(&completed_request)
-            .expect("encode full request")
-            .len();
+        let durable_transaction = backend
+            .get_namespace_transaction(&transaction.transaction_id)
+            .expect("durable transaction lookup")
+            .expect("full durable transaction");
+        let durable_prepare = backend
+            .get_namespace_prepare(&prepare.operation_id)
+            .expect("durable prepare lookup")
+            .expect("full durable prepare");
+        let durable_request = backend
+            .get_namespace_request(
+                &completed_request.requester_node_id,
+                &completed_request.request_id,
+            )
+            .expect("durable request lookup")
+            .expect("full durable request");
         backend
             .compact_metadata_table_log_if_needed(0)
             .expect("force exact table checkpoint");
 
-        assert!(
+        assert_eq!(
             backend
                 .get_namespace_transaction(&transaction.transaction_id)
-                .unwrap()
-                .is_none()
+                .expect("checkpoint transaction lookup"),
+            Some(durable_transaction.clone())
         );
-        assert!(
+        assert_eq!(
             backend
                 .get_namespace_prepare(&prepare.operation_id)
-                .unwrap()
-                .is_none()
+                .expect("checkpoint prepare lookup"),
+            Some(durable_prepare.clone())
         );
-        assert!(
+        assert_eq!(
             backend
                 .get_namespace_request(
                     &completed_request.requester_node_id,
                     &completed_request.request_id,
                 )
-                .unwrap()
-                .is_none()
+                .expect("checkpoint request lookup"),
+            Some(durable_request.clone())
         );
-        let request_receipt = backend
-            .get_namespace_request_receipt(
-                &completed_request.requester_node_id,
-                &completed_request.request_id,
-            )
-            .expect("request receipt")
-            .expect("compacted request receipt");
-        assert_eq!(request_receipt.result, DfsNamespaceResult::Applied);
-        assert!(
-            serde_json::to_vec(&request_receipt)
-                .expect("encode compact request receipt")
-                .len()
-                < full_request_bytes,
-            "terminal receipt must discard the semantic operation and recovery diagnostics"
-        );
-        assert_eq!(backend.tables.namespace_transaction_receipts.len(), 1);
-        assert_eq!(backend.tables.namespace_prepare_receipts.len(), 1);
-        assert_eq!(backend.tables.namespace_request_receipts.len(), 1);
+        assert!(backend.tables.namespace_transaction_receipts.is_empty());
+        assert!(backend.tables.namespace_prepare_receipts.is_empty());
+        assert!(backend.tables.namespace_request_receipts.is_empty());
 
         drop(backend);
         let mut reopened =
             LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("reopen checkpoint");
         assert_eq!(
             reopened
-                .get_namespace_request_receipt(
+                .get_namespace_transaction(&transaction.transaction_id)
+                .expect("reopened transaction lookup"),
+            Some(durable_transaction)
+        );
+        assert_eq!(
+            reopened
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("reopened prepare lookup"),
+            Some(durable_prepare)
+        );
+        assert_eq!(
+            reopened
+                .get_namespace_request(
                     &completed_request.requester_node_id,
                     &completed_request.request_id,
                 )
-                .expect("reopened request receipt"),
-            Some(request_receipt)
+                .expect("reopened request lookup"),
+            Some(durable_request)
         );
 
         let commit_retry = reopened
@@ -17288,21 +20371,21 @@ mod tests {
             .expect("exact committed prepare retry");
         assert!(matches!(
             commit_retry.mutation,
-            DfsMetadataMutation::PutNamespacePrepareReceipt { .. }
+            DfsMetadataMutation::PutNamespacePrepare { .. }
         ));
         let request_retry = reopened
             .put_namespace_request_on_shard(&shard_id, &completed_request)
             .expect("exact completed request retry");
         assert!(matches!(
             request_retry.mutation,
-            DfsMetadataMutation::PutNamespaceRequestReceipt { .. }
+            DfsMetadataMutation::PutNamespaceRequest { .. }
         ));
         let transaction_retry = reopened
             .apply_namespace_transaction(&transaction)
             .expect("exact materialized transaction retry");
         assert!(matches!(
             transaction_retry.mutation,
-            DfsMetadataMutation::PutNamespaceTransactionReceipt { .. }
+            DfsMetadataMutation::ApplyNamespaceTransaction { .. }
         ));
 
         let mut conflicting_transaction = transaction.clone();
@@ -17339,96 +20422,1494 @@ mod tests {
     }
 
     #[test]
-    fn bounded_namespace_receipt_retention_preserves_live_recovery_and_expires_evicted_retries() {
-        let root = temp_root("bounded_namespace_receipt_retention");
+    fn metadata_history_gc_journals_version_removals_and_replica_restart_converges() {
+        let root = temp_root("metadata-history-gc-replica-restart");
         let shard_id = DfsMetadataShardId::new("root");
-        let file_system = file_system();
-        let current = object(version("version_namespace_retention_1"));
-        let mut committed = current.clone();
-        committed.version = version("version_namespace_retention_2");
-        committed.mode = 0o600;
-
-        let mut pending_current = object(version("version_namespace_pending_1"));
-        pending_current.object_id =
-            DfsObjectId::from_legacy_named("object_namespace_pending_retention")
-                .expect("pending object");
-        pending_current.path = "/pending-retention".to_string();
-        let mut pending_committed = pending_current.clone();
-        pending_committed.version = version("version_namespace_pending_2");
-
-        let terminal_request = namespace_request(92, DfsNamespaceRequestStatus::Pending);
-        let mut completed_request = terminal_request.clone();
-        completed_request.status = DfsNamespaceRequestStatus::Completed;
-        completed_request.result = Some(DfsNamespaceResult::Applied);
-        let mut terminal_prepare = namespace_prepare(
-            &format!("namespace-request:{}:commit", terminal_request.operation_id),
-            "root",
+        let mut source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source")).expect("source");
+        let mut replica =
+            LocalSobjMetadataBackend::new(shard_id.clone(), root.join("replica")).expect("replica");
+        let old_version = version("version_gc_old");
+        let current_version = version("version_gc_current");
+        let current = object(current_version.clone());
+        let old_record =
+            object_version_record(&current, old_version.clone(), OffsetDateTime::UNIX_EPOCH);
+        let current_record = object_version_record(
             &current,
-            committed,
+            current_version.clone(),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
         );
-        terminal_prepare.completed_request = Some(completed_request.clone());
-        terminal_prepare.operation_digest =
-            crate::service_replica::metadata_namespace_prepare_payload_digest(&terminal_prepare)
-                .expect("canonical terminal prepare digest");
-        let terminal_transaction = terminal_prepare.transaction.clone();
+        let old_receipt =
+            replica_receipt_record(&current, old_version.clone(), OffsetDateTime::UNIX_EPOCH);
 
-        let pending_request = namespace_request(93, DfsNamespaceRequestStatus::Pending);
-        let pending_prepare = namespace_prepare(
-            "namespace-retention-still-prepared",
-            "root",
-            &pending_current,
-            pending_committed,
+        source.put_file_system(&file_system()).expect("filesystem");
+        source.put_object(&current).expect("current object");
+        source.put_version(&old_record).expect("old version");
+        source
+            .put_receipt(&old_receipt)
+            .expect("old replica receipt");
+        source
+            .put_version(&current_record)
+            .expect("current version");
+
+        let initial = source
+            .journal_batch_since_limited(0, 32, usize::MAX)
+            .expect("initial journal read")
+            .expect("initial journal batch");
+        replica.apply_journal_batch(&initial).expect("seed replica");
+        let projection = source
+            .metadata_history_gc_projection(
+                DfsMetadataHistoryGcOptions::dry_run(Duration::ZERO, 1)
+                    .with_now_unix_nanos(2_000_000_000),
+            )
+            .expect("GC projection");
+        assert_eq!(
+            projection.eligible_version_count, 0,
+            "a version remains rooted until its dependent replica receipts are durably removed"
+        );
+        assert_eq!(projection.eligible_receipt_count, 1);
+        assert!(projection.shards[0].journal_size_bytes > 0);
+        assert_eq!(projection.shards[0].journal_segment_count, 1);
+        assert_eq!(
+            projection.shards[0].journal_head_sequence,
+            source.journal_last_sequence()
+        );
+        assert_eq!(
+            projection.shards[0]
+                .tables
+                .iter()
+                .find(|table| table.table == "versions")
+                .map(|table| table.record_count),
+            Some(2)
+        );
+        assert_eq!(
+            projection.shards[0]
+                .tables
+                .iter()
+                .find(|table| table.table == "versions")
+                .and_then(|table| table.oldest_record_age_nanos),
+            Some(2_000_000_000)
         );
 
+        let receipt_report = source
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(2_000_000_000)
+                    .with_max_removals(2),
+            )
+            .expect("authoritative replica-receipt GC");
+        assert_eq!(receipt_report.removed_version_count, 0);
+        assert_eq!(receipt_report.removed_receipt_count, 1);
+        assert_eq!(receipt_report.applied_record_count(), 1);
+        assert!(
+            source
+                .get_version(&current.object_id, &old_version)
+                .expect("old version remains until its receipt removal is durable")
+                .is_some()
+        );
+        let version_report = source
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(2_000_000_000)
+                    .with_max_removals(2),
+            )
+            .expect("authoritative unreferenced-version GC");
+        assert_eq!(version_report.removed_version_count, 1);
+        assert_eq!(version_report.removed_receipt_count, 0);
+        assert_eq!(version_report.applied_record_count(), 1);
+        assert_eq!(
+            source
+                .get_version(&current.object_id, &old_version)
+                .expect("source old version"),
+            None
+        );
+        assert!(
+            source
+                .receipts_for_version(&current.object_id, &old_version)
+                .expect("source old receipts")
+                .is_empty()
+        );
+
+        let gc_batch = source
+            .journal_batch_since_limited(initial.next_after_sequence, 32, usize::MAX)
+            .expect("GC journal read")
+            .expect("GC journal batch");
+        assert!(
+            gc_batch
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.mutation, DfsMetadataMutation::RemoveVersion { .. }))
+        );
+        assert!(
+            gc_batch
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.mutation, DfsMetadataMutation::RemoveReceipt { .. }))
+        );
+        replica
+            .apply_journal_batch(&gc_batch)
+            .expect("replicate GC removals");
+        assert_eq!(
+            replica
+                .get_version(&current.object_id, &old_version)
+                .expect("replica old version"),
+            None
+        );
+        assert!(
+            replica
+                .receipts_for_version(&current.object_id, &old_version)
+                .expect("replica old receipts")
+                .is_empty()
+        );
+
+        let post_gc_projection = source
+            .metadata_history_gc_projection(
+                DfsMetadataHistoryGcOptions::dry_run(Duration::ZERO, 1)
+                    .with_now_unix_nanos(2_000_000_001),
+            )
+            .expect("post-GC projection");
+        assert!(
+            post_gc_projection.shards[0].snapshot_size_bytes.is_some(),
+            "authoritative GC publishes a durable post-GC checkpoint before pruning history"
+        );
+        drop(source);
+        drop(replica);
+
+        let reopened_source = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source"))
+            .expect("reopen source");
+        let reopened_replica =
+            LocalSobjMetadataBackend::new(shard_id, root.join("replica")).expect("reopen replica");
+        for backend in [&reopened_source, &reopened_replica] {
+            assert_eq!(
+                backend
+                    .get_version(&current.object_id, &old_version)
+                    .expect("reopened old version"),
+                None
+            );
+            assert_eq!(
+                backend
+                    .get_version(&current.object_id, &current_version)
+                    .expect("reopened current version"),
+                Some(current_record.clone())
+            );
+        }
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn durable_version_pins_survive_replay_and_snapshot_until_the_last_consumer_unpins() {
+        let root = temp_root("metadata-version-pins-lifecycle");
+        let shard_id = DfsMetadataShardId::new("root");
+        let source_root = root.join("source");
+        let replica_root = root.join("replica");
+        let mut source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &source_root).expect("source");
+        let mut replica =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &replica_root).expect("replica");
+        let old_version = version("version_pin_old");
+        let current_version = version("version_pin_current");
+        let current = object(current_version.clone());
+        let old_record =
+            object_version_record(&current, old_version.clone(), OffsetDateTime::UNIX_EPOCH);
+        let current_record = object_version_record(
+            &current,
+            current_version,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+        );
+        source.put_file_system(&file_system()).expect("filesystem");
+        source.put_object(&current).expect("current object");
+        source.put_version(&old_record).expect("old version");
+        source
+            .put_version(&current_record)
+            .expect("current version");
+
+        let pin_a = DfsMetadataVersionPinRecord {
+            file_system_id: current.file_system_id.clone(),
+            object_id: current.object_id.clone(),
+            version: old_version.clone(),
+            pin_id: "checkpoint-a".to_string(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let pin_b = DfsMetadataVersionPinRecord {
+            pin_id: "checkpoint-b".to_string(),
+            ..pin_a.clone()
+        };
+        assert!(
+            source
+                .put_version_pin(&pin_a)
+                .expect("first consumer pin")
+                .is_some()
+        );
+        let sequence_after_first_pin = source.journal_last_sequence();
+        assert_eq!(
+            source.put_version_pin(&pin_a).expect("exact pin retry"),
+            None,
+            "an exact consumer retry must not grow the journal"
+        );
+        assert_eq!(source.journal_last_sequence(), sequence_after_first_pin);
+        assert!(
+            source
+                .put_version_pin(&pin_b)
+                .expect("second consumer pin")
+                .is_some()
+        );
+
+        let initial = source
+            .journal_batch_since_limited(0, 32, usize::MAX)
+            .expect("pin journal read")
+            .expect("pin journal batch");
+        replica
+            .apply_journal_batch(&initial)
+            .expect("replicate version pins");
+        drop(replica);
+        let replica =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &replica_root).expect("reopen replica");
+        assert_eq!(
+            replica
+                .version_pins_for_object(&current.object_id)
+                .expect("replayed pins"),
+            vec![pin_a.clone(), pin_b.clone()]
+        );
+        drop(replica);
+
+        let projection = source
+            .metadata_history_gc_projection(
+                DfsMetadataHistoryGcOptions::dry_run(Duration::ZERO, 1)
+                    .with_now_unix_nanos(2_000_000_000),
+            )
+            .expect("pinned GC projection");
+        assert_eq!(projection.retained_durable_pin_count, 2);
+        assert_eq!(
+            projection.eligible_version_count, 0,
+            "a durable consumer pin must root history older than the keep-latest window"
+        );
+
+        assert!(
+            source
+                .remove_version_pin(
+                    &pin_a.file_system_id,
+                    &pin_a.object_id,
+                    &pin_a.version,
+                    &pin_a.pin_id,
+                )
+                .expect("remove first consumer")
+                .is_some()
+        );
+        assert_eq!(
+            source
+                .metadata_history_gc_projection(
+                    DfsMetadataHistoryGcOptions::dry_run(Duration::ZERO, 1)
+                        .with_now_unix_nanos(2_000_000_000),
+                )
+                .expect("single-pin GC projection")
+                .eligible_version_count,
+            0,
+            "one remaining consumer must keep the shared version rooted"
+        );
+
+        source
+            .compact_metadata_table_log_if_needed(0)
+            .expect("publish pin snapshot");
+        drop(source);
+        let mut source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &source_root).expect("reopen source");
+        assert_eq!(
+            source
+                .version_pins_for_object(&current.object_id)
+                .expect("snapshot pins"),
+            vec![pin_b.clone()]
+        );
+        assert!(
+            source
+                .get_version(&current.object_id, &old_version)
+                .expect("snapshot-pinned version")
+                .is_some()
+        );
+
+        assert!(
+            source
+                .remove_version_pin(
+                    &pin_b.file_system_id,
+                    &pin_b.object_id,
+                    &pin_b.version,
+                    &pin_b.pin_id,
+                )
+                .expect("remove last consumer")
+                .is_some()
+        );
+        let report = source
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(2_000_000_000),
+            )
+            .expect("collect newly unpinned version");
+        assert_eq!(report.removed_version_count, 1);
+        assert_eq!(
+            source
+                .get_version(&current.object_id, &old_version)
+                .expect("unrooted old version"),
+            None
+        );
+        drop(source);
+
+        let source =
+            LocalSobjMetadataBackend::new(shard_id, &source_root).expect("reopen collected source");
+        assert!(
+            source
+                .version_pins_for_object(&current.object_id)
+                .expect("pins after final unpin")
+                .is_empty()
+        );
+        assert_eq!(
+            source
+                .get_version(&current.object_id, &old_version)
+                .expect("collected version after restart"),
+            None
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn version_pin_admission_fails_closed_for_missing_or_mismatched_versions() {
+        let root = temp_root("metadata-version-pin-admission");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id, &root).expect("metadata backend");
+        let current_version = version("version_pin_admission_current");
+        let current = object(current_version.clone());
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        backend
+            .put_version(&object_version_record(
+                &current,
+                current_version,
+                OffsetDateTime::UNIX_EPOCH,
+            ))
+            .expect("current version");
+
+        let missing = DfsMetadataVersionPinRecord {
+            file_system_id: current.file_system_id.clone(),
+            object_id: current.object_id.clone(),
+            version: version("version_pin_missing"),
+            pin_id: "checkpoint-missing".to_string(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        assert!(
+            backend
+                .put_version_pin(&missing)
+                .expect_err("missing metadata version must reject the pin")
+                .to_string()
+                .contains("missing metadata version")
+        );
+
+        let mismatched = DfsMetadataVersionPinRecord {
+            file_system_id: DfsFileSystemId::from_legacy_named("other-fs").expect("filesystem id"),
+            version: current.version.clone(),
+            pin_id: "checkpoint-wrong-filesystem".to_string(),
+            ..missing
+        };
+        assert!(
+            backend
+                .put_version_pin(&mismatched)
+                .expect_err("cross-filesystem pin must be rejected")
+                .to_string()
+                .contains("filesystem")
+        );
+        assert!(
+            backend
+                .version_pins_for_object(&current.object_id)
+                .expect("pins after rejected admission")
+                .is_empty()
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn cross_shard_pin_transfer_is_atomic_and_fences_owned_pins_until_finalize() {
+        let root = temp_root("cross-shard-pin-transfer-fence");
+        let shard_id = DfsMetadataShardId::new("target");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id, &root).expect("target backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+
+        let pinned_version = version("version_transfer_pinned");
+        let target_version = version("version_transfer_target");
+        let mut moved = object(target_version.clone());
+        moved.path = "/archive/readme.md".to_string();
+        let pinned_record =
+            object_version_record(&moved, pinned_version.clone(), OffsetDateTime::UNIX_EPOCH);
+        let target_record = object_version_record(
+            &moved,
+            target_version,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+        );
+        let pin = DfsMetadataVersionPinRecord {
+            file_system_id: moved.file_system_id.clone(),
+            object_id: moved.object_id.clone(),
+            version: pinned_version,
+            pin_id: "checkpoint-transfer".to_string(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+
+        let before = backend.journal_last_sequence();
+        assert!(
+            backend
+                .reconcile_cross_shard_pin_transfer(
+                    "transfer-fence",
+                    &moved,
+                    "/docs/readme.md",
+                    &[pinned_record, target_record],
+                    std::slice::from_ref(&pin),
+                )
+                .expect("atomic transfer reconcile")
+        );
+        assert_eq!(
+            backend.journal_last_sequence(),
+            before + 1,
+            "versions, owned pins, and provenance share one journal mutation"
+        );
+        assert_eq!(
+            backend
+                .cross_shard_pin_transfers_for_object(&moved.object_id)
+                .expect("transfer scan")[0]
+                .copied_pins,
+            vec![pin.clone()]
+        );
+        assert!(
+            backend
+                .put_version_pin(&pin)
+                .expect_err("exact duplicate put must remain fenced")
+                .to_string()
+                .contains("active cross-shard transfer")
+        );
+        assert!(
+            backend
+                .remove_version_pin(
+                    &pin.file_system_id,
+                    &pin.object_id,
+                    &pin.version,
+                    &pin.pin_id,
+                )
+                .expect_err("owned pin removal must remain fenced")
+                .to_string()
+                .contains("active cross-shard transfer")
+        );
+
+        backend
+            .finalize_cross_shard_pin_transfer("transfer-fence", &moved, "/docs/readme.md")
+            .expect("finalize transfer");
+        assert!(
+            backend
+                .cross_shard_pin_transfers_for_object(&moved.object_id)
+                .expect("finalized transfer scan")
+                .is_empty()
+        );
+        assert!(
+            backend
+                .remove_version_pin(
+                    &pin.file_system_id,
+                    &pin.object_id,
+                    &pin.version,
+                    &pin.pin_id,
+                )
+                .expect("remove after finalize")
+                .is_some()
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn cross_shard_pin_transfer_preserves_preexisting_identical_target_pin() {
+        let root = temp_root("cross-shard-pin-transfer-independent");
+        let mut backend = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("target"), &root)
+            .expect("target backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+
+        let pinned_version = version("version_transfer_independent");
+        let target_version = version("version_transfer_independent_target");
+        let mut moved = object(target_version.clone());
+        moved.path = "/archive/readme.md".to_string();
+        let pinned_record =
+            object_version_record(&moved, pinned_version.clone(), OffsetDateTime::UNIX_EPOCH);
+        let target_record =
+            object_version_record(&moved, target_version, OffsetDateTime::UNIX_EPOCH);
+        backend
+            .put_version(&pinned_record)
+            .expect("pre-existing pinned version");
+        let independent_pin = DfsMetadataVersionPinRecord {
+            file_system_id: moved.file_system_id.clone(),
+            object_id: moved.object_id.clone(),
+            version: pinned_version,
+            pin_id: "checkpoint-independent".to_string(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        backend
+            .put_version_pin(&independent_pin)
+            .expect("pre-existing independent pin");
+
+        assert!(
+            backend
+                .reconcile_cross_shard_pin_transfer(
+                    "transfer-independent",
+                    &moved,
+                    "/docs/readme.md",
+                    &[pinned_record, target_record],
+                    std::slice::from_ref(&independent_pin),
+                )
+                .expect("reconcile independent pin")
+        );
+        let transfers = backend
+            .cross_shard_pin_transfers_for_object(&moved.object_id)
+            .expect("transfer scan");
+        assert_eq!(transfers.len(), 1);
+        assert!(
+            transfers[0].copied_pins.is_empty(),
+            "an exact pre-existing target pin must not become transfer-owned"
+        );
+        assert_eq!(transfers[0].source_pins, vec![independent_pin.clone()]);
+        assert!(
+            backend
+                .remove_version_pin(
+                    &independent_pin.file_system_id,
+                    &independent_pin.object_id,
+                    &independent_pin.version,
+                    &independent_pin.pin_id,
+                )
+                .expect_err("acknowledged independent pin must remain fenced")
+                .to_string()
+                .contains("active cross-shard transfer")
+        );
+        backend
+            .finalize_cross_shard_pin_transfer("transfer-independent", &moved, "/docs/readme.md")
+            .expect("finalize independent transfer");
+        assert_eq!(
+            backend
+                .version_pins_for_object(&moved.object_id)
+                .expect("independent pin remains"),
+            vec![independent_pin]
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_version_pin_remove_preflights_all_transfer_owners() {
+        let root = temp_root("sharded-pin-transfer-remove-preflight");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "archive",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/archive".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+
+        let pinned_version = version("version_sharded_preflight_pinned");
+        let target_version = version("version_sharded_preflight_target");
+        let mut source_object = object(pinned_version.clone());
+        source_object.path = "/docs/readme.md".to_string();
+        let pinned_record = object_version_record(
+            &source_object,
+            pinned_version.clone(),
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        backend.put_object(&source_object).expect("source object");
+        backend.put_version(&pinned_record).expect("source version");
+        let pin = DfsMetadataVersionPinRecord {
+            file_system_id: source_object.file_system_id.clone(),
+            object_id: source_object.object_id.clone(),
+            version: pinned_version,
+            pin_id: "checkpoint-sharded-preflight".to_string(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        backend.put_version_pin(&pin).expect("source pin");
+
+        let mut moved = source_object.clone();
+        moved.path = "/archive/readme.md".to_string();
+        moved.version = target_version.clone();
+        let target_record =
+            object_version_record(&moved, target_version, OffsetDateTime::UNIX_EPOCH);
+        assert!(
+            backend
+                .reconcile_cross_shard_pin_transfer(
+                    "transfer-sharded-preflight",
+                    &moved,
+                    &source_object.path,
+                    &[pinned_record, target_record],
+                    std::slice::from_ref(&pin),
+                )
+                .expect("target reconcile")
+        );
+
+        assert!(
+            backend
+                .remove_version_pin(
+                    &pin.file_system_id,
+                    &pin.object_id,
+                    &pin.version,
+                    &pin.pin_id,
+                )
+                .expect_err("all-shard preflight must reject before source mutation")
+                .to_string()
+                .contains("active cross-shard transfer")
+        );
+        for shard_id in ["root", "archive"] {
+            assert_eq!(
+                backend
+                    .shard_backend(&DfsMetadataShardId::new(shard_id))
+                    .expect("physical shard")
+                    .version_pins_for_object(&pin.object_id)
+                    .expect("physical pin"),
+                vec![pin.clone()],
+                "failed preflight must leave shard {shard_id} unchanged"
+            );
+        }
+
+        backend
+            .finalize_cross_shard_pin_transfer(
+                "transfer-sharded-preflight",
+                &moved,
+                &source_object.path,
+            )
+            .expect("finalize target provenance");
+        assert!(
+            backend
+                .remove_version_pin(
+                    &pin.file_system_id,
+                    &pin.object_id,
+                    &pin.version,
+                    &pin.pin_id,
+                )
+                .expect("remove after finalize")
+                .is_some()
+        );
+        for shard_id in ["root", "archive"] {
+            assert!(
+                backend
+                    .shard_backend(&DfsMetadataShardId::new(shard_id))
+                    .expect("physical shard")
+                    .version_pins_for_object(&pin.object_id)
+                    .expect("physical pins after finalize")
+                    .is_empty()
+            );
+        }
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn cross_shard_source_eviction_replays_as_one_atomic_pin_and_index_transition() {
+        let root = temp_root("cross-shard-source-eviction-atomic");
+        let shard_id = DfsMetadataShardId::new("source");
+        let mut source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source")).expect("source");
+        let mut replica =
+            LocalSobjMetadataBackend::new(shard_id.clone(), root.join("replica")).expect("replica");
+        source.put_file_system(&file_system()).expect("filesystem");
+
+        let pinned_version = version("version_source_eviction_pinned");
+        let mut hardlink = object(pinned_version.clone());
+        hardlink.kind = DfsObjectKind::Hardlink;
+        hardlink.link_target_object_id = Some(
+            DfsObjectId::from_legacy_named("obj_source_eviction_target")
+                .expect("hardlink target id"),
+        );
+        let pinned_record = object_version_record(
+            &hardlink,
+            pinned_version.clone(),
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        source.put_object(&hardlink).expect("hardlink source");
+        source.put_version(&pinned_record).expect("pinned version");
+        let pin = DfsMetadataVersionPinRecord {
+            file_system_id: hardlink.file_system_id.clone(),
+            object_id: hardlink.object_id.clone(),
+            version: pinned_version,
+            pin_id: "checkpoint-source-eviction".to_string(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        source.put_version_pin(&pin).expect("source pin");
+
+        let initial = source
+            .journal_batch_since_limited(0, 32, usize::MAX)
+            .expect("initial journal")
+            .expect("initial batch");
+        replica.apply_journal_batch(&initial).expect("seed replica");
+        let fenced_sequence = source.journal_last_sequence();
+        let mut moved = hardlink.clone();
+        moved.path = "/archive/readme.md".to_string();
+        moved.version = version("version_source_eviction_target");
+        moved.changed_at_unix_nanos = 1;
+        source
+            .put_cross_shard_tombstone_if_unchanged(
+                &hardlink,
+                &moved,
+                &shard_id,
+                &DfsMetadataShardId::new("target"),
+                fenced_sequence,
+                Some("transfer-source-eviction"),
+            )
+            .expect("atomic source eviction");
+
+        let eviction = source
+            .journal_batch_since_limited(initial.next_after_sequence, 8, usize::MAX)
+            .expect("eviction journal")
+            .expect("eviction batch");
+        assert_eq!(eviction.entries.len(), 1);
+        assert!(matches!(
+            eviction.entries[0].mutation,
+            DfsMetadataMutation::FinalizeCrossShardSourceEviction { .. }
+        ));
+        assert_eq!(
+            replica
+                .get_object(&hardlink.object_id)
+                .expect("replica pre-eviction object"),
+            Some(hardlink.clone())
+        );
+        assert_eq!(
+            replica
+                .version_pins_for_object(&hardlink.object_id)
+                .expect("replica pre-eviction pins"),
+            vec![pin]
+        );
+        replica
+            .apply_journal_batch(&eviction)
+            .expect("apply atomic eviction");
+        let tombstone = replica
+            .get_object(&hardlink.object_id)
+            .expect("replica post-eviction object")
+            .expect("source tombstone");
+        assert_eq!(tombstone.kind, DfsObjectKind::Tombstone);
+        assert!(matches!(
+            tombstone.tombstone_provenance,
+            Some(crate::DfsTombstoneProvenance::SourceEviction {
+                pin_transfer_id: Some(ref transfer_id),
+                ..
+            }) if transfer_id == "transfer-source-eviction"
+        ));
+        assert!(
+            replica
+                .version_pins_for_object(&hardlink.object_id)
+                .expect("replica post-eviction pins")
+                .is_empty()
+        );
+        assert!(
+            replica
+                .hardlinks_to_object(
+                    &hardlink.file_system_id,
+                    hardlink
+                        .link_target_object_id
+                        .as_ref()
+                        .expect("hardlink target"),
+                )
+                .expect("post-eviction hardlink index")
+                .is_empty()
+        );
+
+        drop(replica);
+        let reopened =
+            LocalSobjMetadataBackend::new(shard_id, root.join("replica")).expect("reopen replica");
+        assert!(
+            reopened
+                .version_pins_for_object(&hardlink.object_id)
+                .expect("reopened pins")
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .get_object(&hardlink.object_id)
+                .expect("reopened tombstone")
+                .expect("reopened object")
+                .kind,
+            DfsObjectKind::Tombstone
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn replicated_snapshot_rejects_dangling_or_filesystem_mismatched_version_pins() {
+        let root = temp_root("metadata-version-pin-snapshot-validation");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source")).expect("source");
+        let current_version = version("version_pin_snapshot_current");
+        let current = object(current_version.clone());
+        source.put_file_system(&file_system()).expect("filesystem");
+        source.put_object(&current).expect("object");
+        source
+            .put_version(&object_version_record(
+                &current,
+                current_version.clone(),
+                OffsetDateTime::UNIX_EPOCH,
+            ))
+            .expect("version");
+        let sequence = source.journal_last_sequence();
+        let snapshot = source.export_table_snapshot();
+
+        let mut dangling = snapshot.clone();
+        dangling
+            .tables
+            .as_mut()
+            .expect("structured snapshot")
+            .version_pins
+            .push(DfsMetadataVersionPinRecord {
+                file_system_id: current.file_system_id.clone(),
+                object_id: current.object_id.clone(),
+                version: version("version_pin_snapshot_missing"),
+                pin_id: "checkpoint-dangling".to_string(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            });
+        dangling.semantic_state_fingerprint = Some(
+            dfs_metadata_table_snapshot_state_fingerprint(&dangling)
+                .expect("dangling snapshot fingerprint"),
+        );
+        let mut replica =
+            LocalSobjMetadataBackend::new(shard_id.clone(), root.join("replica")).expect("replica");
+        assert!(
+            replica
+                .replace_with_replicated_snapshot(shard_id.clone(), sequence, dangling)
+                .expect_err("dangling snapshot pin must reject")
+                .to_string()
+                .contains("missing metadata version")
+        );
+
+        let mut mismatched = snapshot;
+        mismatched
+            .tables
+            .as_mut()
+            .expect("structured snapshot")
+            .version_pins
+            .push(DfsMetadataVersionPinRecord {
+                file_system_id: DfsFileSystemId::from_legacy_named("other-fs")
+                    .expect("filesystem id"),
+                object_id: current.object_id.clone(),
+                version: current_version,
+                pin_id: "checkpoint-mismatched".to_string(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            });
+        mismatched.semantic_state_fingerprint = Some(
+            dfs_metadata_table_snapshot_state_fingerprint(&mismatched)
+                .expect("mismatched snapshot fingerprint"),
+        );
+        assert!(
+            replica
+                .replace_with_replicated_snapshot(shard_id, sequence, mismatched)
+                .expect_err("filesystem-mismatched snapshot pin must reject")
+                .to_string()
+                .contains("metadata version has filesystem")
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn replicated_snapshot_rejects_invalid_cross_shard_pin_transfer_ownership() {
+        let root = temp_root("cross-shard-pin-transfer-snapshot-validation");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source")).expect("source");
+        let current_version = version("version_transfer_snapshot_current");
+        let current = object(current_version.clone());
+        source.put_file_system(&file_system()).expect("filesystem");
+        source.put_object(&current).expect("object");
+        source
+            .put_version(&object_version_record(
+                &current,
+                current_version.clone(),
+                OffsetDateTime::UNIX_EPOCH,
+            ))
+            .expect("version");
+        let sequence = source.journal_last_sequence();
+        let snapshot = source.export_table_snapshot();
+        let owned_pin = DfsMetadataVersionPinRecord {
+            file_system_id: current.file_system_id.clone(),
+            object_id: current.object_id.clone(),
+            version: current_version.clone(),
+            pin_id: "checkpoint-transfer-snapshot".to_string(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let transfer = DfsCrossShardPinTransferRecord {
+            transfer_id: "transfer-snapshot".to_string(),
+            file_system_id: current.file_system_id.clone(),
+            object_id: current.object_id.clone(),
+            source_path: "docs/readme.md".to_string(),
+            target_path: "archive/readme.md".to_string(),
+            target_version: current_version.clone(),
+            source_pins: vec![owned_pin.clone()],
+            copied_pins: vec![owned_pin.clone()],
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let mut replica =
+            LocalSobjMetadataBackend::new(shard_id.clone(), root.join("replica")).expect("replica");
+
+        let mut missing_owned_pin = snapshot.clone();
+        missing_owned_pin
+            .tables
+            .as_mut()
+            .expect("structured snapshot")
+            .cross_shard_pin_transfers
+            .push(transfer.clone());
+        missing_owned_pin.semantic_state_fingerprint = Some(
+            dfs_metadata_table_snapshot_state_fingerprint(&missing_owned_pin)
+                .expect("missing-owned-pin fingerprint"),
+        );
+        assert!(
+            replica
+                .replace_with_replicated_snapshot(shard_id.clone(), sequence, missing_owned_pin,)
+                .expect_err("missing transfer-owned pin must reject")
+                .to_string()
+                .contains("missing its owned pin")
+        );
+
+        let mut overlapping_owner = snapshot.clone();
+        let overlapping_tables = overlapping_owner
+            .tables
+            .as_mut()
+            .expect("structured snapshot");
+        overlapping_tables.version_pins.push(owned_pin.clone());
+        overlapping_tables
+            .cross_shard_pin_transfers
+            .push(transfer.clone());
+        overlapping_tables
+            .cross_shard_pin_transfers
+            .push(DfsCrossShardPinTransferRecord {
+                transfer_id: "transfer-snapshot-other".to_string(),
+                ..transfer.clone()
+            });
+        overlapping_owner.semantic_state_fingerprint = Some(
+            dfs_metadata_table_snapshot_state_fingerprint(&overlapping_owner)
+                .expect("overlapping-owner fingerprint"),
+        );
+        assert!(
+            replica
+                .replace_with_replicated_snapshot(shard_id.clone(), sequence, overlapping_owner,)
+                .expect_err("overlapping transfer ownership must reject")
+                .to_string()
+                .contains("another active cross-shard pin transfer")
+        );
+
+        let mut missing_target_version = snapshot;
+        let missing_target_tables = missing_target_version
+            .tables
+            .as_mut()
+            .expect("structured snapshot");
+        missing_target_tables.version_pins.push(owned_pin);
+        missing_target_tables
+            .cross_shard_pin_transfers
+            .push(DfsCrossShardPinTransferRecord {
+                target_version: version("version_transfer_snapshot_missing_target"),
+                ..transfer
+            });
+        missing_target_version.semantic_state_fingerprint = Some(
+            dfs_metadata_table_snapshot_state_fingerprint(&missing_target_version)
+                .expect("missing-target-version fingerprint"),
+        );
+        assert!(
+            replica
+                .replace_with_replicated_snapshot(shard_id, sequence, missing_target_version)
+                .expect_err("missing transfer target version must reject")
+                .to_string()
+                .contains("missing target version")
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn lagging_replica_installs_authoritative_post_gc_snapshot_after_journal_gap() {
+        let root = temp_root("metadata-history-gc-lagging-snapshot");
+        let shard_id = DfsMetadataShardId::new("root");
+        let current_version = version("version_gc_gap_current");
+        let current = object(current_version.clone());
+        let current_record = object_version_record(
+            &current,
+            current_version.clone(),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::days(1),
+        );
+        let mut source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source")).expect("source");
+        let mut replica =
+            LocalSobjMetadataBackend::new(shard_id.clone(), root.join("replica")).expect("replica");
+        source.put_file_system(&file_system()).expect("filesystem");
+        source.put_object(&current).expect("current object");
+        source
+            .put_version(&current_record)
+            .expect("current version");
+        let initial = source
+            .journal_batch_since_limited(0, 16, usize::MAX)
+            .expect("initial journal read")
+            .expect("initial journal batch");
+        replica
+            .apply_journal_batch(&initial)
+            .expect("seed soon-to-be-offline replica");
+
+        let historical_count = JOURNAL_SEGMENT_ENTRY_LIMIT * 2 + 8;
+        let historical_mutations = (0..historical_count)
+            .map(|index| {
+                DfsMetadataMutation::put_version(&object_version_record(
+                    &current,
+                    version(&format!("version_gc_gap_old_{index:04}")),
+                    OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(index as i64),
+                ))
+            })
+            .collect::<Vec<_>>();
+        {
+            let _lock = source.begin_metadata_write().expect("metadata write lock");
+            let entries = source
+                .write_journal_entries_unlocked(historical_mutations)
+                .expect("append offline-replica history");
+            source
+                .materialize_written_journal_entries_unlocked(&entries)
+                .expect("materialize offline-replica history");
+        }
+        let gc_report = source
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(u64::MAX),
+            )
+            .expect("sweep history and publish post-GC checkpoint");
+        assert_eq!(gc_report.removed_version_count, historical_count as u64);
+        let gap_batch = source
+            .journal_batch_since_limited(initial.next_after_sequence, 16, usize::MAX)
+            .expect("read retained post-checkpoint suffix")
+            .expect("retained journal gap witness");
+        assert!(
+            replica.apply_journal_batch(&gap_batch).is_err(),
+            "an offline replica must reject the discontinuous suffix and switch to snapshot install"
+        );
+
+        let authoritative_sequence = source.journal_last_sequence();
+        replica
+            .replace_with_replicated_snapshot(
+                shard_id,
+                authoritative_sequence,
+                source.export_table_snapshot(),
+            )
+            .expect("install authoritative post-GC snapshot");
+        assert_eq!(
+            replica
+                .get_version(&current.object_id, &current_version)
+                .expect("replica current version"),
+            Some(current_record)
+        );
+        assert_eq!(
+            replica
+                .versions_for_object(&current.object_id)
+                .expect("replica bounded versions")
+                .len(),
+            1
+        );
+        assert_eq!(
+            replica.metadata_prefix_proof().expect("replica prefix"),
+            source.metadata_prefix_proof().expect("source prefix")
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn metadata_history_gc_compacts_then_evicts_intent_receipt_with_durable_floor() {
+        let root = temp_root("metadata-history-gc-intent-floor");
+        let shard_id = DfsMetadataShardId::new("root");
+        let coordinator_node_id = node("node_intent_gc_coordinator");
+        let intent = DfsWriteIntentRecord {
+            intent_id: "intent_gc_42".to_string(),
+            file_system_id: file_system_id(),
+            object_id: object_id(),
+            base_version: Some(version("version_intent_gc_base")),
+            target_version: version("version_intent_gc_target"),
+            coordinator_node_id: coordinator_node_id.clone(),
+            owner_epoch: 7,
+            desired_replica_node_ids: vec![node("node_owner")],
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            status: DfsWriteIntentStatus::Aborted,
+            content_hash: Some("blake3:intent-gc".to_string()),
+            object_metadata: None,
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+        };
         let mut backend =
             LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("metadata backend");
-        backend.put_file_system(&file_system).expect("filesystem");
-        backend.put_object(&current).expect("terminal current");
-        backend
-            .put_object(&pending_current)
-            .expect("pending current");
-        backend
-            .put_namespace_request_on_shard(&shard_id, &terminal_request)
-            .expect("terminal request admission");
-        backend
-            .prepare_namespace_transaction(&terminal_prepare)
-            .expect("terminal prepare");
-        backend
-            .commit_prepared_namespace_transaction(
-                &terminal_prepare.operation_id,
-                &terminal_prepare.operation_digest,
-                terminal_prepare.owner_epoch,
-            )
-            .expect("terminal commit");
-        backend
-            .put_namespace_request_on_shard(&shard_id, &pending_request)
-            .expect("pending request");
-        backend
-            .prepare_namespace_transaction(&pending_prepare)
-            .expect("pending prepare");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_intent(&intent).expect("terminal intent");
 
-        backend
-            .compact_metadata_table_log_with_namespace_retention(
-                0,
-                OffsetDateTime::now_utc(),
-                crate::metadata_tables::DfsNamespaceReceiptRetentionLimits {
-                    max_transaction_receipts: 0,
-                    max_prepare_receipts: 0,
-                    max_request_receipts: 0,
-                    max_age: time::Duration::days(365_000),
-                },
+        let compacted = backend
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(1)
+                    .with_max_removals(1),
             )
-            .expect("checkpoint with zero terminal receipt capacity");
+            .expect("compact terminal intent");
+        assert_eq!(compacted.compacted_intent_count, 1);
+        assert!(
+            !backend
+                .tables
+                .intents
+                .contains_key(&(intent.object_id.clone(), intent.intent_id.clone()))
+        );
+        assert!(
+            backend
+                .tables
+                .intent_receipts
+                .contains_key(&(intent.object_id.clone(), intent.intent_id.clone()))
+        );
+        assert_eq!(
+            backend
+                .get_intent(&intent.object_id, &intent.intent_id)
+                .expect("compacted intent lookup"),
+            Some(intent.clone())
+        );
+        let retry = backend
+            .put_intent(&intent)
+            .expect("exact compacted intent retry");
+        assert!(matches!(
+            retry.mutation,
+            DfsMetadataMutation::PutIntentReceipt { .. }
+        ));
 
-        assert!(backend.tables.namespace_transaction_receipts.is_empty());
-        assert!(backend.tables.namespace_prepare_receipts.is_empty());
-        assert!(backend.tables.namespace_request_receipts.is_empty());
+        let evicted = backend
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(2)
+                    .with_max_removals(1),
+            )
+            .expect("evict compact intent receipt");
+        assert_eq!(evicted.removed_intent_receipt_count, 1);
+        assert_eq!(
+            backend
+                .write_intent_counter_floor()
+                .expect("intent counter floor"),
+            42
+        );
+        assert!(
+            backend
+                .put_intent(&intent)
+                .expect_err("intent retry after receipt eviction must fail closed")
+                .to_string()
+                .contains("history expired")
+        );
+        drop(backend);
+
+        let mut reopened = LocalSobjMetadataBackend::new(shard_id, &root).expect("reopen backend");
+        assert_eq!(
+            reopened
+                .write_intent_counter_floor()
+                .expect("reopened intent counter floor"),
+            42
+        );
+        assert!(
+            reopened
+                .put_intent(&intent)
+                .expect_err("reopened intent retry after eviction must fail closed")
+                .to_string()
+                .contains("history expired")
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn metadata_history_gc_compacts_then_evicts_request_receipt_with_durable_floor() {
+        let root = temp_root("metadata-history-gc-request-floor");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut request = namespace_request(93, DfsNamespaceRequestStatus::Completed);
+        request.request_id = "namespace-request_01J0000000000000000000000Z".to_string();
+        request.created_at = OffsetDateTime::UNIX_EPOCH;
+        request.updated_at = OffsetDateTime::UNIX_EPOCH;
+        let mut backend =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("metadata backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend
+            .put_namespace_request_on_shard(&shard_id, &request)
+            .expect("completed request");
+
+        let compacted = backend
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(1)
+                    .with_max_removals(1),
+            )
+            .expect("compact request body");
+        assert_eq!(compacted.compacted_namespace_request_count, 1);
+        assert!(
+            backend
+                .get_namespace_request(&request.requester_node_id, &request.request_id)
+                .expect("full request lookup")
+                .is_none()
+        );
+        assert!(
+            backend
+                .get_namespace_request_receipt(&request.requester_node_id, &request.request_id)
+                .expect("request receipt lookup")
+                .is_some()
+        );
+        let retry = backend
+            .put_namespace_request_on_shard(&shard_id, &request)
+            .expect("exact compacted request retry");
+        assert!(matches!(
+            retry.mutation,
+            DfsMetadataMutation::PutNamespaceRequestReceipt { .. }
+        ));
+
+        let evicted = backend
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(2)
+                    .with_max_removals(1),
+            )
+            .expect("evict compact request receipt");
+        assert_eq!(evicted.removed_namespace_request_receipt_count, 1);
+        assert!(
+            backend
+                .get_namespace_request_receipt(&request.requester_node_id, &request.request_id)
+                .expect("evicted receipt lookup")
+                .is_none()
+        );
+        assert!(
+            backend
+                .namespace_request_history_expired_on_shard(
+                    &shard_id,
+                    &request.requester_node_id,
+                    &request.request_id,
+                )
+                .expect("request retention floor")
+        );
+        assert!(
+            backend
+                .put_namespace_request_on_shard(&shard_id, &request)
+                .expect_err("retry after receipt eviction must fail closed")
+                .to_string()
+                .contains("history expired")
+        );
+        drop(backend);
+
+        let mut reopened =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("reopen backend");
+        assert!(
+            reopened
+                .namespace_request_history_expired_on_shard(
+                    &shard_id,
+                    &request.requester_node_id,
+                    &request.request_id,
+                )
+                .expect("reopened request retention floor")
+        );
+        assert!(
+            reopened
+                .put_namespace_request_on_shard(&shard_id, &request)
+                .expect_err("reopened retry after eviction must fail closed")
+                .to_string()
+                .contains("history expired")
+        );
+
+        let mut delayed_unrelated = namespace_request(94, DfsNamespaceRequestStatus::Pending);
+        delayed_unrelated.request_id = "namespace-request_01J00000000000000000000000".to_string();
+        assert_ne!(
+            delayed_unrelated.requester_node_id,
+            request.requester_node_id
+        );
+        assert!(
+            !reopened
+                .namespace_request_history_expired_on_shard(
+                    &shard_id,
+                    &delayed_unrelated.requester_node_id,
+                    &delayed_unrelated.request_id,
+                )
+                .expect("unrelated requester retention floor"),
+            "a higher durable request floor for one requester must not poison a delayed lower request from another requester"
+        );
+        reopened
+            .put_namespace_request_on_shard(&shard_id, &delayed_unrelated)
+            .expect("admit delayed request from unrelated requester");
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn metadata_history_gc_compacts_then_evicts_transaction_receipt_with_durable_floor() {
+        let root = temp_root("metadata-history-gc-transaction-floor");
+        let shard_id = DfsMetadataShardId::new("root");
+        let transaction = DfsNamespaceTransaction {
+            transaction_id: "transaction:metadata-history-gc-floor".to_string(),
+            file_system_id: file_system_id(),
+            objects: Vec::new(),
+            versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let mut backend =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("metadata backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend
+            .apply_namespace_transaction(&transaction)
+            .expect("completed namespace transaction");
+
+        let compacted = backend
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(1)
+                    .with_max_removals(1),
+            )
+            .expect("compact transaction body");
+        assert_eq!(compacted.compacted_namespace_transaction_count, 1);
+        assert!(
+            backend
+                .get_namespace_transaction(&transaction.transaction_id)
+                .expect("full transaction lookup")
+                .is_none()
+        );
+        assert!(
+            backend
+                .tables
+                .namespace_transaction_receipts
+                .contains_key(&transaction.transaction_id)
+        );
+        let retry = backend
+            .apply_namespace_transaction(&transaction)
+            .expect("exact compacted transaction retry");
+        assert!(matches!(
+            retry.mutation,
+            DfsMetadataMutation::PutNamespaceTransactionReceipt { .. }
+        ));
+
+        let evicted = backend
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(2)
+                    .with_max_removals(1),
+            )
+            .expect("evict compact transaction receipt");
+        assert_eq!(evicted.removed_namespace_transaction_receipt_count, 1);
+        assert!(
+            backend
+                .tables
+                .namespace_transaction_receipts
+                .get(&transaction.transaction_id)
+                .is_none()
+        );
         assert!(
             backend
                 .tables
                 .namespace_receipt_retention
                 .transaction_floor
                 .is_some()
+        );
+        assert!(
+            backend
+                .apply_namespace_transaction(&transaction)
+                .expect_err("transaction retry after receipt eviction must fail closed")
+                .to_string()
+                .contains("history expired")
+        );
+        drop(backend);
+
+        let mut reopened =
+            LocalSobjMetadataBackend::new(shard_id, &root).expect("reopen transaction floor");
+        assert!(
+            reopened
+                .tables
+                .namespace_receipt_retention
+                .transaction_floor
+                .is_some()
+        );
+        assert!(
+            reopened
+                .apply_namespace_transaction(&transaction)
+                .expect_err("reopened transaction retry after eviction must fail closed")
+                .to_string()
+                .contains("history expired")
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn metadata_history_gc_compacts_then_evicts_prepare_receipt_with_durable_floor() {
+        let root = temp_root("metadata-history-gc-prepare-floor");
+        let shard_id = DfsMetadataShardId::new("root");
+        let current = object(version("version_gc_prepare_floor_current"));
+        let mut committed = current.clone();
+        committed.version = version("version_gc_prepare_floor_committed");
+        committed.mode = 0o600;
+        let prepare = namespace_prepare(
+            "namespace-prepare:metadata-history-gc-floor",
+            "root",
+            &current,
+            committed,
+        );
+        let mut backend =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("metadata backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        backend
+            .prepare_namespace_transaction(&prepare)
+            .expect("prepare namespace transaction");
+        backend
+            .abort_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect("abort namespace prepare");
+
+        let compacted = backend
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(1)
+                    .with_max_removals(1),
+            )
+            .expect("compact prepare body");
+        assert_eq!(compacted.compacted_namespace_prepare_count, 1);
+        assert!(
+            backend
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("full prepare lookup")
+                .is_none()
+        );
+        assert!(
+            backend
+                .tables
+                .namespace_prepare_receipts
+                .contains_key(&prepare.operation_id)
+        );
+        let retry = backend
+            .abort_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect("exact compacted abort retry");
+        assert!(matches!(
+            retry.mutation,
+            DfsMetadataMutation::PutNamespacePrepareReceipt { .. }
+        ));
+
+        let evicted = backend
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(2)
+                    .with_max_removals(1),
+            )
+            .expect("evict compact prepare receipt");
+        assert_eq!(evicted.removed_namespace_prepare_receipt_count, 1);
+        assert!(
+            backend
+                .tables
+                .namespace_prepare_receipts
+                .get(&prepare.operation_id)
+                .is_none()
         );
         assert!(
             backend
@@ -17439,284 +21920,1171 @@ mod tests {
         );
         assert!(
             backend
-                .tables
-                .namespace_receipt_retention
-                .opaque_request_history_evicted
-        );
-        assert_eq!(
-            backend
-                .get_namespace_request(
-                    &pending_request.requester_node_id,
-                    &pending_request.request_id,
+                .abort_prepared_namespace_transaction(
+                    &prepare.operation_id,
+                    &prepare.operation_digest,
+                    prepare.owner_epoch,
                 )
-                .expect("pending request lookup"),
-            Some(pending_request.clone())
+                .expect_err("prepare retry after receipt eviction must fail closed")
+                .to_string()
+                .contains("history expired")
         );
-        assert_eq!(
-            backend
-                .get_namespace_prepare(&pending_prepare.operation_id)
-                .expect("pending prepare lookup"),
-            Some(normalized_namespace_prepare(&pending_prepare))
-        );
-
         drop(backend);
+
         let mut reopened =
-            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("reopen checkpoint");
+            LocalSobjMetadataBackend::new(shard_id, &root).expect("reopen prepare floor");
         assert!(
             reopened
                 .tables
                 .namespace_receipt_retention
-                .opaque_request_history_evicted,
-            "the expiry fence must survive reopen"
+                .prepare_floor
+                .is_some()
         );
         assert!(
             reopened
-                .apply_namespace_transaction(&terminal_transaction)
-                .expect_err("evicted transaction retry must not reapply")
-                .to_string()
-                .contains("idempotency history expired or is unknown")
-        );
-        assert!(
-            reopened
-                .commit_prepared_namespace_transaction(
-                    &terminal_prepare.operation_id,
-                    &terminal_prepare.operation_digest,
-                    terminal_prepare.owner_epoch,
+                .abort_prepared_namespace_transaction(
+                    &prepare.operation_id,
+                    &prepare.operation_digest,
+                    prepare.owner_epoch,
                 )
-                .expect_err("evicted prepare retry must not reapply")
+                .expect_err("reopened prepare retry after eviction must fail closed")
                 .to_string()
-                .contains("idempotency history expired or is unknown")
+                .contains("history expired")
         );
-        assert!(
-            reopened
-                .put_namespace_request_on_shard(&shard_id, &completed_request)
-                .expect_err("evicted request retry must not reapply")
-                .to_string()
-                .contains("idempotency history expired or is unknown")
-        );
-        reopened
-            .put_namespace_request_on_shard(&shard_id, &pending_request)
-            .expect("pending request remains exactly retryable");
-        reopened
-            .prepare_namespace_transaction(&pending_prepare)
-            .expect("prepared transaction remains exactly retryable");
 
         cleanup(&root);
     }
 
     #[test]
-    fn namespace_receipt_retention_evicts_oldest_by_age_then_count() {
-        let mut tables = DfsMetadataTables::default();
-        let fs_id = file_system_id();
+    fn metadata_history_gc_roots_request_receipt_through_prepare_recovery_and_reopen() {
+        let root = temp_root("metadata-history-gc-prepare-request-recovery-root");
         let shard_id = DfsMetadataShardId::new("root");
-        for (index, day) in [(0, 0), (1, 5), (2, 9), (3, 10)] {
-            if index == 3 {
-                continue;
+        let current = object(version("version_gc_prepare_request_current"));
+        let mut committed = current.clone();
+        committed.version = version("version_gc_prepare_request_committed");
+        committed.mode = 0o600;
+        committed.changed_at_unix_nanos = 2;
+        let mut completed_request = namespace_request(94, DfsNamespaceRequestStatus::Completed);
+        completed_request.authority_shard_id = shard_id.clone();
+        completed_request.operation = DfsNamespaceOperation::SetMode {
+            path: current.path.clone(),
+            mode: committed.mode,
+        };
+        let mut prepare = namespace_prepare(
+            &format!(
+                "namespace-request:{}:metadata-history-gc",
+                completed_request.operation_id
+            ),
+            &shard_id.0,
+            &current,
+            committed.clone(),
+        );
+        prepare.completed_request = Some(completed_request.clone());
+        prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+                .expect("canonical request-owned prepare digest");
+
+        let mut backend =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("metadata backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        backend
+            .prepare_namespace_transaction(&prepare)
+            .expect("fused request admission and prepare");
+        backend
+            .commit_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect("commit request-owned prepare");
+        assert_eq!(
+            backend
+                .get_namespace_request(
+                    &completed_request.requester_node_id,
+                    &completed_request.request_id,
+                )
+                .expect("completed request"),
+            Some(completed_request.clone())
+        );
+
+        // Model an interrupted/later-overwritten materialization after the
+        // committed prepare and request outcome became durable. The retained
+        // namespace transaction must restore the committed object on reopen,
+        // while the full prepare depends on the compact request witness.
+        backend
+            .put_object(&current)
+            .expect("make committed namespace transaction incomplete");
+        assert_eq!(
+            backend
+                .get_object(&current.object_id)
+                .expect("incomplete transaction object"),
+            Some(current.clone())
+        );
+        let compacted = backend
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(10_000_000_000),
+            )
+            .expect("compact terminal request while prepare needs recovery");
+        assert_eq!(compacted.compacted_namespace_request_count, 1);
+        assert!(
+            backend
+                .get_namespace_request(
+                    &completed_request.requester_node_id,
+                    &completed_request.request_id,
+                )
+                .expect("compacted request body")
+                .is_none()
+        );
+        let compact_request_receipt = backend
+            .get_namespace_request_receipt(
+                &completed_request.requester_node_id,
+                &completed_request.request_id,
+            )
+            .expect("compacted request receipt lookup")
+            .expect("compacted request receipt");
+
+        let protected = backend
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(11_000_000_000),
+            )
+            .expect("retain prepare-dependent request receipt");
+        assert_eq!(protected.removed_namespace_request_receipt_count, 0);
+        assert_eq!(
+            backend
+                .get_namespace_request_receipt(
+                    &completed_request.requester_node_id,
+                    &completed_request.request_id,
+                )
+                .expect("protected request receipt"),
+            Some(compact_request_receipt.clone())
+        );
+        assert_eq!(
+            backend
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("recovery-root prepare"),
+            Some({
+                let mut committed_prepare = prepare.clone();
+                committed_prepare.status = DfsNamespacePrepareStatus::Committed;
+                committed_prepare
+            })
+        );
+        drop(backend);
+
+        let mut reopened =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("reopen for recovery");
+        assert_eq!(
+            reopened
+                .get_object(&committed.object_id)
+                .expect("recovered transaction object"),
+            Some(committed)
+        );
+        assert!(
+            reopened
+                .get_namespace_request(
+                    &completed_request.requester_node_id,
+                    &completed_request.request_id,
+                )
+                .expect("request body after recovery")
+                .is_none(),
+            "prepare recovery must not resurrect a full terminal request body"
+        );
+        assert_eq!(
+            reopened
+                .get_namespace_request_receipt(
+                    &completed_request.requester_node_id,
+                    &completed_request.request_id,
+                )
+                .expect("request receipt after recovery"),
+            Some(compact_request_receipt)
+        );
+
+        let mut compacted_prepare = false;
+        for _ in 0..16 {
+            let report = reopened
+                .gc_metadata_history_authoritative(
+                    DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                        .with_now_unix_nanos(20_000_000_000)
+                        .with_max_removals(1),
+                )
+                .expect("drain recovered prepare history");
+            compacted_prepare |= report.compacted_namespace_prepare_count != 0;
+            if report.applied_record_count() == 0 {
+                break;
             }
-            let created_at =
-                OffsetDateTime::from_unix_timestamp(day * 86_400).expect("receipt timestamp");
-            tables.namespace_transaction_receipts.insert(
-                format!("transaction-{index}"),
-                DfsNamespaceTransactionReceipt {
-                    transaction_id: format!("transaction-{index}"),
-                    file_system_id: fs_id.clone(),
-                    transaction_digest: format!("blake3:transaction-{index}"),
-                    created_at,
-                    retained_at: created_at,
-                },
-            );
-            tables.namespace_prepare_receipts.insert(
-                format!("prepare-{index}"),
-                DfsNamespacePrepareReceipt {
-                    operation_id: format!("prepare-{index}"),
-                    file_system_id: fs_id.clone(),
-                    shard_id: shard_id.clone(),
-                    owner_epoch: 1,
-                    operation_digest: format!("blake3:prepare-{index}"),
-                    transaction_id: format!("transaction-{index}"),
-                    status: DfsNamespacePrepareStatus::Committed,
-                    created_at,
-                    retained_at: created_at,
-                },
-            );
-            let requester_node_id = node(&format!("node_namespace_retention_{index}"));
-            let request_id = format!("opaque-request-{index}");
-            tables.namespace_request_receipts.insert(
-                (requester_node_id.clone(), request_id.clone()),
-                DfsNamespaceRequestReceipt {
-                    file_system_id: fs_id.clone(),
-                    requester_node_id,
-                    request_id,
-                    operation_id: format!("operation-{index}"),
-                    authority_shard_id: shard_id.clone(),
-                    command_digest: format!("blake3:request-{index}"),
-                    result: DfsNamespaceResult::Applied,
-                    posix_coordination_result: None,
-                    created_at,
-                    retained_at: created_at,
-                },
-            );
         }
-
-        tables
-            .compact_terminal_namespace_history(
-                OffsetDateTime::from_unix_timestamp(10 * 86_400).expect("checkpoint timestamp"),
-                crate::metadata_tables::DfsNamespaceReceiptRetentionLimits {
-                    max_transaction_receipts: 2,
-                    max_prepare_receipts: 2,
-                    max_request_receipts: 2,
-                    max_age: time::Duration::days(7),
-                },
-            )
-            .expect("age checkpoint");
-        assert_eq!(
-            tables
-                .namespace_transaction_receipts
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>(),
-            vec!["transaction-1".to_string(), "transaction-2".to_string()]
+        assert!(
+            compacted_prepare,
+            "the recovered prepare must become collectible"
         );
-        assert_eq!(tables.namespace_prepare_receipts.len(), 2);
-        assert_eq!(tables.namespace_request_receipts.len(), 2);
-
-        let created_at =
-            OffsetDateTime::from_unix_timestamp(10 * 86_400).expect("new receipt timestamp");
-        tables.namespace_transaction_receipts.insert(
-            "transaction-3".to_string(),
-            DfsNamespaceTransactionReceipt {
-                transaction_id: "transaction-3".to_string(),
-                file_system_id: fs_id.clone(),
-                transaction_digest: "blake3:transaction-3".to_string(),
-                created_at,
-                retained_at: created_at,
-            },
+        assert!(
+            reopened
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("drained full prepare")
+                .is_none()
         );
-        tables.namespace_prepare_receipts.insert(
-            "prepare-3".to_string(),
-            DfsNamespacePrepareReceipt {
-                operation_id: "prepare-3".to_string(),
-                file_system_id: fs_id.clone(),
-                shard_id: shard_id.clone(),
-                owner_epoch: 1,
-                operation_digest: "blake3:prepare-3".to_string(),
-                transaction_id: "transaction-3".to_string(),
-                status: DfsNamespacePrepareStatus::Committed,
-                created_at,
-                retained_at: created_at,
-            },
-        );
-        let requester_node_id = node("node_namespace_retention_3");
-        tables.namespace_request_receipts.insert(
-            (requester_node_id.clone(), "opaque-request-3".to_string()),
-            DfsNamespaceRequestReceipt {
-                file_system_id: fs_id,
-                requester_node_id,
-                request_id: "opaque-request-3".to_string(),
-                operation_id: "operation-3".to_string(),
-                authority_shard_id: shard_id,
-                command_digest: "blake3:request-3".to_string(),
-                result: DfsNamespaceResult::Applied,
-                posix_coordination_result: None,
-                created_at,
-                retained_at: created_at,
-            },
-        );
-        tables
-            .compact_terminal_namespace_history(
-                created_at,
-                crate::metadata_tables::DfsNamespaceReceiptRetentionLimits {
-                    max_transaction_receipts: 2,
-                    max_prepare_receipts: 2,
-                    max_request_receipts: 2,
-                    max_age: time::Duration::days(365_000),
-                },
-            )
-            .expect("count checkpoint");
-
-        assert_eq!(
-            tables
-                .namespace_transaction_receipts
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>(),
-            vec!["transaction-2".to_string(), "transaction-3".to_string()],
-            "count pressure must retain the newest terminal identities"
-        );
-        assert_eq!(
-            tables
-                .namespace_receipt_retention
-                .transaction_floor
-                .as_ref()
-                .map(|key| key.identity.as_str()),
-            Some("transaction-1")
-        );
-        assert_eq!(
-            tables
+        assert!(
+            reopened
+                .tables
                 .namespace_prepare_receipts
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>(),
-            vec!["prepare-2".to_string(), "prepare-3".to_string()]
+                .get(&prepare.operation_id)
+                .is_none(),
+            "the compact prepare receipt must not leak"
         );
-        assert_eq!(tables.namespace_request_receipts.len(), 2);
         assert!(
-            tables
-                .namespace_receipt_retention
-                .opaque_request_history_evicted
+            reopened
+                .get_namespace_request(
+                    &completed_request.requester_node_id,
+                    &completed_request.request_id,
+                )
+                .expect("drained request body")
+                .is_none()
+        );
+        assert!(
+            reopened
+                .get_namespace_request_receipt(
+                    &completed_request.requester_node_id,
+                    &completed_request.request_id,
+                )
+                .expect("drained request receipt")
+                .is_none()
+        );
+        drop(reopened);
+
+        let mut reopened =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("reopen drained floors");
+        assert!(
+            reopened
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("reopened drained prepare")
+                .is_none()
+        );
+        assert!(
+            reopened
+                .get_namespace_request(
+                    &completed_request.requester_node_id,
+                    &completed_request.request_id,
+                )
+                .expect("reopened drained request")
+                .is_none()
+        );
+        assert!(
+            reopened
+                .put_namespace_request_on_shard(&shard_id, &completed_request)
+                .expect_err("evicted request retry must fail closed")
+                .to_string()
+                .contains("history expired")
+        );
+        assert!(
+            reopened
+                .commit_prepared_namespace_transaction(
+                    &prepare.operation_id,
+                    &prepare.operation_digest,
+                    prepare.owner_epoch,
+                )
+                .expect_err("evicted prepare retry must fail closed")
+                .to_string()
+                .contains("history expired")
         );
 
-        let mut sortable_tables = DfsMetadataTables::default();
-        let requester_node_id = node("node_sortable_namespace_retention");
-        let old_request_id = "dfs_net_req_1_00000000000000000000000000".to_string();
-        let retained_request_id = "dfs_net_req_2_00000000000000000000000001".to_string();
-        for (request_id, second) in [
-            (old_request_id.clone(), 0),
-            (retained_request_id.clone(), 1),
-        ] {
-            sortable_tables.namespace_request_receipts.insert(
-                (requester_node_id.clone(), request_id.clone()),
-                DfsNamespaceRequestReceipt {
-                    file_system_id: file_system_id(),
-                    requester_node_id: requester_node_id.clone(),
-                    request_id,
-                    operation_id: format!("sortable-operation-{second}"),
-                    authority_shard_id: DfsMetadataShardId::new("root"),
-                    command_digest: format!("blake3:sortable-{second}"),
-                    result: DfsNamespaceResult::Applied,
-                    posix_coordination_result: None,
-                    created_at: OffsetDateTime::from_unix_timestamp(second)
-                        .expect("sortable timestamp"),
-                    retained_at: OffsetDateTime::from_unix_timestamp(second)
-                        .expect("sortable retention timestamp"),
-                },
+        cleanup(&root);
+    }
+
+    #[test]
+    fn metadata_history_gc_is_fenced_during_membership_handoff() {
+        let root = temp_root("metadata-history-gc-handoff-freeze");
+        let shard_id = DfsMetadataShardId::new("root");
+        let current_version = version("version_gc_frozen_current");
+        let current = object(current_version.clone());
+        let old_version = version("version_gc_frozen_old");
+        let old_record =
+            object_version_record(&current, old_version.clone(), OffsetDateTime::UNIX_EPOCH);
+        let current_record = object_version_record(
+            &current,
+            current_version,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+        );
+        let mut backend =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("metadata backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        backend.put_version(&old_record).expect("old version");
+        backend
+            .put_version(&current_record)
+            .expect("current version");
+        backend
+            .freeze_metadata_shard_for_membership_handoff(
+                &shard_id,
+                "metadata-history-gc-freeze",
+                1,
+            )
+            .expect("freeze shard")
+            .expect("local freeze");
+        let frozen_head = backend.journal_last_sequence();
+
+        assert!(matches!(
+            backend.gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(2_000_000_000),
+            ),
+            Err(MetadataBackendError::MembershipHandoffFrozen {
+                ref handoff_id,
+                ..
+            }) if handoff_id == "metadata-history-gc-freeze"
+        ));
+        assert_eq!(backend.journal_last_sequence(), frozen_head);
+        assert_eq!(
+            backend
+                .get_version(&current.object_id, &old_version)
+                .expect("frozen old version"),
+            Some(old_record)
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn metadata_history_gc_does_not_apply_when_journal_append_fails() {
+        let root = temp_root("metadata-history-gc-journal-append-failure");
+        let shard_id = DfsMetadataShardId::new("root");
+        let current = object(version("version_gc_append_current"));
+        let old_version = version("version_gc_append_old");
+        let old_record =
+            object_version_record(&current, old_version.clone(), OffsetDateTime::UNIX_EPOCH);
+        let current_record = object_version_record(
+            &current,
+            current.version.clone(),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+        );
+        let mut backend = LocalSobjMetadataBackend::new(shard_id, &root).expect("metadata backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        backend.put_version(&old_record).expect("old version");
+        backend
+            .put_version(&current_record)
+            .expect("current version");
+        let journal_head = backend.journal_last_sequence();
+        fs::remove_dir_all(root.join("journal").join("segments")).expect("remove journal segments");
+        fs::write(root.join("journal").join("segments"), b"not a directory")
+            .expect("block journal append");
+
+        assert!(matches!(
+            backend.gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(2_000_000_000)
+                    .with_max_removals(1),
+            ),
+            Err(MetadataBackendError::Io { .. })
+        ));
+        assert_eq!(backend.journal_last_sequence(), journal_head);
+        assert_eq!(
+            backend
+                .get_version(&current.object_id, &old_version)
+                .expect("old version after append failure"),
+            Some(old_record)
+        );
+
+        fs::remove_file(root.join("journal").join("segments")).ok();
+        cleanup(&root);
+    }
+
+    #[test]
+    fn metadata_history_gc_defers_full_checkpoint_until_bounded_drain_tail() {
+        let root = temp_root("metadata-history-gc-deferred-checkpoint");
+        let shard_id = DfsMetadataShardId::new("root");
+        let current = object(version("version_gc_deferred_current"));
+        let first_old = object_version_record(
+            &current,
+            version("version_gc_deferred_old_1"),
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        let second_old = object_version_record(
+            &current,
+            version("version_gc_deferred_old_2"),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+        );
+        let current_record = object_version_record(
+            &current,
+            current.version.clone(),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(2),
+        );
+        let mut backend =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("metadata backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        backend.put_version(&first_old).expect("first old version");
+        backend
+            .put_version(&second_old)
+            .expect("second old version");
+        backend
+            .put_version(&current_record)
+            .expect("current version");
+        backend
+            .compact_metadata_table_log_if_needed(0)
+            .expect("baseline checkpoint");
+        let snapshot_path = metadata_table_snapshot_path(&root);
+        let snapshot_before = fs::read(&snapshot_path).expect("baseline snapshot bytes");
+
+        let partial = backend
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(3_000_000_000)
+                    .with_max_removals(1),
+            )
+            .expect("partial bounded GC pass");
+        assert!(partial.max_removals_reached);
+        assert_eq!(partial.removed_version_count, 1);
+        assert_eq!(
+            fs::read(&snapshot_path).expect("snapshot after partial pass"),
+            snapshot_before,
+            "a partial drain must rely on its durable journal/table suffix instead of serializing the full shard"
+        );
+
+        drop(backend);
+        let mut reopened =
+            LocalSobjMetadataBackend::new(shard_id, &root).expect("replay partial GC suffix");
+        assert_eq!(reopened.tables.versions.len(), 2);
+        let tail = reopened
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(3_000_000_000)
+                    .with_max_removals(1),
+            )
+            .expect("bounded GC tail");
+        assert!(!tail.max_removals_reached);
+        assert_eq!(tail.removed_version_count, 1);
+        assert_eq!(reopened.tables.versions.len(), 1);
+        assert_ne!(
+            fs::read(&snapshot_path).expect("snapshot after drain tail"),
+            snapshot_before,
+            "the final batch must publish the authoritative post-GC checkpoint"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn metadata_history_gc_replays_durable_removal_after_table_apply_failure() {
+        let root = temp_root("metadata-history-gc-table-apply-failure");
+        let shard_id = DfsMetadataShardId::new("root");
+        let current = object(version("version_gc_table_current"));
+        let old_version = version("version_gc_table_old");
+        let old_record =
+            object_version_record(&current, old_version.clone(), OffsetDateTime::UNIX_EPOCH);
+        let current_record = object_version_record(
+            &current,
+            current.version.clone(),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+        );
+        let mut backend =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("metadata backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        backend.put_version(&old_record).expect("old version");
+        backend
+            .put_version(&current_record)
+            .expect("current version");
+        backend
+            .compact_metadata_table_log_if_needed(0)
+            .expect("checkpoint pre-GC state");
+        let table_path = metadata_table_path(&root);
+        let error = {
+            let _lock = backend.begin_metadata_write().expect("metadata write lock");
+            let entry = backend
+                .write_journal_unlocked(DfsMetadataMutation::remove_version(
+                    current.file_system_id.clone(),
+                    current.object_id.clone(),
+                    old_version.clone(),
+                ))
+                .expect("durable GC removal append");
+            let planned = backend
+                .plan_written_journal_entries_table_ops(std::slice::from_ref(&entry))
+                .expect("preapply GC removal");
+            fs::remove_file(&table_path).expect("remove empty materialized table log");
+            fs::create_dir(&table_path).expect("block table apply");
+            backend
+                .append_preapplied_table_ops_for_written_entries(
+                    std::slice::from_ref(&entry),
+                    planned.last_materialized_sequence,
+                    planned.table_ops,
+                    planned.rollback,
+                )
+                .expect_err("table apply fails after durable GC removal")
+        };
+        assert!(matches!(error, MetadataBackendError::Io { .. }));
+        assert_eq!(
+            backend
+                .tables
+                .versions
+                .get(&(current.object_id.clone(), old_version.clone())),
+            Some(&old_record),
+            "failed table materialization must roll the in-memory sweep back"
+        );
+        assert!(
+            backend
+                .journal_since(0)
+                .expect("durable journal")
+                .iter()
+                .any(|entry| matches!(entry.mutation, DfsMetadataMutation::RemoveVersion { .. }))
+        );
+
+        fs::remove_dir(&table_path).expect("restore materialized table log path");
+        drop(backend);
+        let reopened =
+            LocalSobjMetadataBackend::new(shard_id, &root).expect("replay durable GC tail");
+        assert_eq!(
+            reopened
+                .get_version(&current.object_id, &old_version)
+                .expect("replayed old version"),
+            None
+        );
+        assert_eq!(
+            reopened
+                .get_version(&current.object_id, &current.version)
+                .expect("replayed current version"),
+            Some(current_record)
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn metadata_history_gc_survives_snapshot_publication_failure() {
+        let root = temp_root("metadata-history-gc-snapshot-publication-failure");
+        let shard_id = DfsMetadataShardId::new("root");
+        let current = object(version("version_gc_snapshot_current"));
+        let old_version = version("version_gc_snapshot_old");
+        let old_record =
+            object_version_record(&current, old_version.clone(), OffsetDateTime::UNIX_EPOCH);
+        let current_record = object_version_record(
+            &current,
+            current.version.clone(),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+        );
+        let mut backend =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("metadata backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        backend.put_version(&old_record).expect("old version");
+        backend
+            .put_version(&current_record)
+            .expect("current version");
+        let snapshot_path = metadata_table_snapshot_path(&root);
+        if snapshot_path.is_file() {
+            fs::remove_file(&snapshot_path).expect("remove prior snapshot");
+        }
+        fs::create_dir(&snapshot_path).expect("block snapshot publication");
+
+        assert!(matches!(
+            backend.gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(2_000_000_000)
+                    .with_max_removals(1),
+            ),
+            Err(MetadataBackendError::Io { .. })
+        ));
+        assert_eq!(
+            backend
+                .get_version(&current.object_id, &old_version)
+                .expect("materialized old version"),
+            None,
+            "the journaled removal remains materialized even when checkpoint publication fails"
+        );
+
+        fs::remove_dir(&snapshot_path).expect("restore snapshot path");
+        drop(backend);
+        let reopened =
+            LocalSobjMetadataBackend::new(shard_id, &root).expect("reopen after snapshot failure");
+        assert_eq!(
+            reopened
+                .get_version(&current.object_id, &old_version)
+                .expect("reopened old version"),
+            None
+        );
+        assert_eq!(
+            reopened
+                .get_version(&current.object_id, &current.version)
+                .expect("reopened current version"),
+            Some(current_record)
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn metadata_history_gc_recovers_from_durable_snapshot_after_journal_prune_failure() {
+        let root = temp_root("metadata-history-gc-journal-prune-failure");
+        let shard_id = DfsMetadataShardId::new("root");
+        let file_system = file_system();
+        let current = object(version("version_gc_prune_current"));
+        let old_version = version("version_gc_prune_old");
+        let old_record =
+            object_version_record(&current, old_version.clone(), OffsetDateTime::UNIX_EPOCH);
+        let current_record = object_version_record(
+            &current,
+            current.version.clone(),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+        );
+        let mut backend =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("metadata backend");
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        backend.put_version(&old_record).expect("old version");
+        backend
+            .put_version(&current_record)
+            .expect("current version");
+
+        // Advance into segment two without growing the materialized tables.
+        // The GC removal will checkpoint in segment two and attempt to prune
+        // segment one only after publishing the authoritative snapshot.
+        let filler = (0..JOURNAL_SEGMENT_ENTRY_LIMIT)
+            .map(|_| DfsMetadataMutation::put_file_system(&file_system))
+            .collect::<Vec<_>>();
+        {
+            let _lock = backend.begin_metadata_write().expect("metadata write lock");
+            let entries = backend
+                .write_journal_entries_unlocked(filler)
+                .expect("append checkpoint-boundary filler");
+            backend
+                .materialize_written_journal_entries_unlocked(&entries)
+                .expect("materialize checkpoint-boundary filler");
+        }
+        let segments = root.join("journal").join("segments");
+        let first_segment = segments.join(format!("{:020}.slog", 1));
+        assert!(first_segment.is_file());
+
+        // A directory at the segment path makes deletion fail after snapshot
+        // publication. The original segment is intentionally discarded: the
+        // test proves that the durable post-GC snapshot is sufficient recovery
+        // state even when pruning reports an error.
+        fs::remove_file(&first_segment).expect("remove first segment");
+        fs::create_dir(&first_segment).expect("block first-segment pruning");
+        let error = backend
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(2_000_000_000)
+                    .with_max_removals(1),
+            )
+            .expect_err("journal pruning must report the injected failure");
+        assert!(matches!(
+            error,
+            MetadataBackendError::Io { ref path, .. } if path == &first_segment
+        ));
+        assert_eq!(
+            backend
+                .get_version(&current.object_id, &old_version)
+                .expect("materialized old version"),
+            None,
+            "the journaled GC removal is already materialized at the prune boundary"
+        );
+        assert!(
+            metadata_table_snapshot_path(&root).is_file(),
+            "the authoritative post-GC snapshot must precede pruning"
+        );
+
+        fs::remove_dir(&first_segment).expect("restore segment path");
+        drop(backend);
+        let reopened =
+            LocalSobjMetadataBackend::new(shard_id, &root).expect("recover from post-GC snapshot");
+        assert_eq!(
+            reopened
+                .get_version(&current.object_id, &old_version)
+                .expect("reopened old version"),
+            None
+        );
+        assert_eq!(
+            reopened
+                .get_version(&current.object_id, &current.version)
+                .expect("reopened current version"),
+            Some(current_record)
+        );
+        assert_eq!(
+            reopened
+                .versions_for_object(&current.object_id)
+                .expect("bounded reopened versions")
+                .len(),
+            1
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn namespace_job_receipt_survives_checkpoint_and_exact_terminal_retry() {
+        let root = temp_root("namespace-job-receipt-checkpoint");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut request = namespace_request(92, DfsNamespaceRequestStatus::Pending);
+        request.created_at = OffsetDateTime::UNIX_EPOCH;
+        request.updated_at = request.created_at;
+        let origin = DfsNamespaceJobOrigin::from_request(&request);
+        let mut job = namespace_job(92, "/users/source");
+        job.origin = Some(origin.clone());
+        job.kind = DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries;
+        job.status = DfsNamespaceJobStatus::Completed;
+        job.target_path = Some("/services/target".to_string());
+        job.completed_at = Some(job.updated_at);
+        let receipt = DfsNamespaceJobReceipt::from_job(&job, job.updated_at)
+            .expect("completed namespace job receipt");
+
+        let mut backend = LocalSobjMetadataBackend::new(shard_id, &root).expect("metadata backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_namespace_job(&job).expect("namespace job");
+        backend
+            .put_namespace_job_receipt(&receipt)
+            .expect("namespace job receipt");
+        assert_eq!(
+            backend
+                .completed_namespace_job_receipt_for_paths_since(
+                    &job.file_system_id,
+                    &job.root_path,
+                    job.target_path.as_deref().expect("target path"),
+                    &[job.kind.clone()],
+                    request.created_at,
+                    &origin,
+                )
+                .expect("completed receipt lookup"),
+            Some(receipt.clone())
+        );
+        backend
+            .compact_metadata_table_log_if_needed(0)
+            .expect("checkpoint receipt");
+        drop(backend);
+
+        let mut reopened = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root)
+            .expect("reopen checkpoint");
+        assert_eq!(
+            reopened
+                .get_namespace_job_receipt(&job.job_id)
+                .expect("reopened receipt"),
+            Some(receipt.clone())
+        );
+        reopened
+            .put_namespace_job(&job)
+            .expect("exact terminal retry uses compact receipt");
+        let mut conflicting = job;
+        conflicting.root_path = "/users/different-source".to_string();
+        assert!(
+            reopened
+                .put_namespace_job(&conflicting)
+                .expect_err("conflicting job retry must remain fenced")
+                .to_string()
+                .contains("different payload")
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn metadata_history_gc_compacts_then_evicts_job_receipt_with_durable_floor() {
+        let root = temp_root("metadata-history-gc-job-floor");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut job = namespace_job(93, "/users/job-floor");
+        job.status = DfsNamespaceJobStatus::Completed;
+        job.created_at = OffsetDateTime::UNIX_EPOCH;
+        job.updated_at = OffsetDateTime::UNIX_EPOCH;
+        job.completed_at = Some(OffsetDateTime::UNIX_EPOCH);
+
+        let mut backend =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("metadata backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_namespace_job(&job).expect("terminal job");
+
+        let compacted = backend
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(1)
+                    .with_max_removals(1),
+            )
+            .expect("compact job body");
+        assert_eq!(compacted.compacted_namespace_job_count, 1);
+        assert!(
+            backend
+                .get_namespace_job(&job.job_id)
+                .expect("full job lookup")
+                .is_none()
+        );
+        assert!(
+            backend
+                .get_namespace_job_receipt(&job.job_id)
+                .expect("job receipt lookup")
+                .is_some()
+        );
+        backend
+            .put_namespace_job(&job)
+            .expect("exact terminal retry uses compact receipt");
+
+        let evicted = backend
+            .gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(2)
+                    .with_max_removals(1),
+            )
+            .expect("evict compact job receipt");
+        assert_eq!(evicted.removed_namespace_job_receipt_count, 1);
+        assert!(
+            backend
+                .get_namespace_job_receipt(&job.job_id)
+                .expect("evicted receipt lookup")
+                .is_none()
+        );
+        assert!(
+            backend
+                .put_namespace_job(&job)
+                .expect_err("job retry after receipt eviction must fail closed")
+                .to_string()
+                .contains("history expired")
+        );
+        drop(backend);
+
+        let mut reopened =
+            LocalSobjMetadataBackend::new(shard_id, &root).expect("reopen metadata backend");
+        assert!(
+            reopened
+                .put_namespace_job(&job)
+                .expect_err("reopened job retry after receipt eviction must fail closed")
+                .to_string()
+                .contains("history expired")
+        );
+
+        let later_job = namespace_job(94, "/users/later-job");
+        reopened
+            .put_namespace_job(&later_job)
+            .expect("a later-created job remains admissible above the durable floor");
+
+        cleanup(&root);
+    }
+
+    #[test]
+    #[ignore = "100k overwrite and namespace churn acceptance benchmark"]
+    fn metadata_history_gc_high_churn_100k_remains_bounded() {
+        const OVERWRITES: usize = 100_000;
+        const NAMESPACE_REQUESTS: usize = 1_000;
+        const CONTENT_BATCH: usize = 4_096;
+        const GC_BATCH: u64 = 256;
+        const MAX_RETAINED_METADATA_RECORDS: u64 = 32;
+        const MAX_RETAINED_METADATA_BYTES: u64 = 256 * 1024;
+        const MAX_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
+        const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024;
+        const MAX_CONTENT_STORE_BYTES: u64 = 4 * 1024 * 1024;
+
+        let root = temp_root("metadata-history-gc-high-churn-100k");
+        let shard_id = DfsMetadataShardId::new("root");
+        let content_root = root.join("content");
+        let content = crate::LocalContentStore::new(&content_root).expect("content store");
+        let mut mutations = Vec::with_capacity(OVERWRITES + NAMESPACE_REQUESTS);
+        let mut current = object(version("version_churn_000000"));
+        current.content_size_bytes = Some(128);
+        let content_write_started = Instant::now();
+        let mut distinct_content_hashes = BTreeSet::new();
+        for batch_start in (0..OVERWRITES).step_by(CONTENT_BATCH) {
+            let batch_end = batch_start.saturating_add(CONTENT_BATCH).min(OVERWRITES);
+            let versions = (batch_start..batch_end)
+                .map(|index| version(&format!("version_churn_{index:06}")))
+                .collect::<Vec<_>>();
+            let payloads = (batch_start..batch_end)
+                .map(|index| {
+                    let mut payload = [0_u8; 128];
+                    payload[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                    for (offset, byte) in payload[8..].iter_mut().enumerate() {
+                        *byte = (index.wrapping_mul(131).wrapping_add(offset).wrapping_add(1)
+                            as u8)
+                            .rotate_left((offset % 8) as u32);
+                    }
+                    payload
+                })
+                .collect::<Vec<_>>();
+            let manifests = content
+                .put_object_versions(versions.iter().zip(&payloads).map(|(version, payload)| {
+                    (
+                        current.object_id.as_str(),
+                        version.as_str(),
+                        payload.as_slice(),
+                    )
+                }))
+                .expect("write unique churn manifests");
+            for (((index, version), payload), manifest) in (batch_start..batch_end)
+                .zip(versions)
+                .zip(payloads)
+                .zip(manifests)
+            {
+                assert!(
+                    distinct_content_hashes.insert(manifest.content_hash.clone()),
+                    "overwrite {index} must produce a unique content hash"
+                );
+                if index + 1 == OVERWRITES {
+                    current.version = version.clone();
+                    current.content_hash = Some(manifest.content_hash.clone());
+                    assert_eq!(payload[..8], (index as u64).to_le_bytes());
+                }
+                mutations.push(DfsMetadataMutation::put_version(&DfsObjectVersionRecord {
+                    file_system_id: current.file_system_id.clone(),
+                    object_id: current.object_id.clone(),
+                    version,
+                    content_hash: Some(manifest.content_hash),
+                    size_bytes: Some(payload.len() as u64),
+                    locations: current.current_locations.clone(),
+                    created_by_event_id: None,
+                    created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(index as i64),
+                    visible: true,
+                }));
+            }
+        }
+        assert_eq!(distinct_content_hashes.len(), OVERWRITES);
+        let namespace_requester = node("node_metadata_history_gc_churn_requester");
+        for index in 0..NAMESPACE_REQUESTS {
+            let mut request =
+                namespace_request(10_000 + index, DfsNamespaceRequestStatus::Completed);
+            request.requester_node_id = namespace_requester.clone();
+            request.created_at = OffsetDateTime::UNIX_EPOCH;
+            request.updated_at = OffsetDateTime::UNIX_EPOCH;
+            mutations.push(DfsMetadataMutation::put_namespace_request(&request));
+        }
+        let content_write_elapsed = content_write_started.elapsed();
+
+        let metadata_write_started = Instant::now();
+        let mut backend =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("metadata backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        {
+            let _lock = backend.begin_metadata_write().expect("metadata write lock");
+            let entries = backend
+                .write_journal_entries_unlocked(mutations)
+                .expect("append high-churn journal batch");
+            backend
+                .materialize_written_journal_entries_unlocked(&entries)
+                .expect("materialize high-churn batch");
+        }
+        let metadata_write_elapsed = metadata_write_started.elapsed();
+        let journal_bytes_before = tree_file_bytes(&root.join("journal"));
+        backend
+            .compact_metadata_table_log_if_needed(0)
+            .expect("publish high-churn pre-GC snapshot");
+        let snapshot_bytes_before = fs::metadata(metadata_table_snapshot_path(&root))
+            .expect("pre-GC snapshot")
+            .len();
+        let content_bytes_before = tree_file_bytes(&content_root);
+        let gc_started = Instant::now();
+        let mut passes = 0_u64;
+        loop {
+            let report = backend
+                .gc_metadata_history_authoritative(
+                    DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                        .with_now_unix_nanos(u64::MAX)
+                        .with_max_removals(GC_BATCH),
+                )
+                .expect("bounded high-churn GC pass");
+            passes = passes.saturating_add(1);
+            if report.applied_record_count() == 0 {
+                break;
+            }
+            assert!(passes < 1_000, "metadata GC did not converge");
+        }
+        let metadata_gc_elapsed = gc_started.elapsed();
+        let protection = backend
+            .metadata_content_protection()
+            .expect("post-GC content roots");
+        let content_gc_started = Instant::now();
+        let version_gc =
+            content
+                .collect_versions(
+                    ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
+                        .with_protected_versions(protection.versions.iter().map(|identity| {
+                            (identity.object_id.as_str(), identity.version.as_str())
+                        })),
+                )
+                .expect("collect high-churn manifests");
+        let retained_manifest_count =
+            (OVERWRITES as u64).saturating_sub(version_gc.deleted_version_count);
+        assert!(
+            (1..=2).contains(&retained_manifest_count),
+            "content GC must retain only the protected current version and, when filesystem timestamps tie, at most one separate keep-latest version: {version_gc:?}"
+        );
+        let mut orphan_gc_passes = 0_u64;
+        let mut deleted_orphan_count = 0_u64;
+        let mut reclaimed_packed_segment_bytes = 0_u64;
+        loop {
+            let report = content
+                .collect_garbage(
+                    ContentStoreGcOptions::delete_eligible(Duration::ZERO)
+                        .with_protected_content_hashes(
+                            protection.content_hashes.iter().map(String::as_str),
+                        ),
+                )
+                .expect("collect observed high-churn orphan blobs and packed segments");
+            orphan_gc_passes = orphan_gc_passes.saturating_add(1);
+            deleted_orphan_count = deleted_orphan_count.saturating_add(report.deleted_orphan_count);
+            reclaimed_packed_segment_bytes = reclaimed_packed_segment_bytes
+                .saturating_add(report.reclaimed_packed_segment_bytes);
+            let work_remains = report.newly_observed_orphan_count != 0
+                || report.eligible_orphan_count != 0
+                || report.stale_orphan_observation_count != 0
+                || report.eligible_packed_segment_count != 0;
+            if !work_remains {
+                break;
+            }
+            assert!(
+                orphan_gc_passes < 64,
+                "bounded packed GC did not converge after {orphan_gc_passes} passes: {report:?}"
             );
         }
-        sortable_tables
-            .compact_terminal_namespace_history(
-                OffsetDateTime::from_unix_timestamp(2).expect("sortable checkpoint"),
-                crate::metadata_tables::DfsNamespaceReceiptRetentionLimits {
-                    max_transaction_receipts: 1,
-                    max_prepare_receipts: 1,
-                    max_request_receipts: 1,
-                    max_age: time::Duration::days(365_000),
-                },
+        let content_gc_elapsed = content_gc_started.elapsed();
+        assert_eq!(deleted_orphan_count, version_gc.deleted_version_count);
+        assert!(
+            reclaimed_packed_segment_bytes >= version_gc.deleted_version_count.saturating_mul(128),
+            "physical packed reclamation must cover the deleted unique payloads"
+        );
+
+        let post_gc = backend
+            .metadata_history_gc_projection(
+                DfsMetadataHistoryGcOptions::dry_run(Duration::ZERO, 1)
+                    .with_now_unix_nanos(u64::MAX),
             )
-            .expect("sortable checkpoint");
-        assert!(sortable_tables.namespace_request_history_expired(&old_request_id));
+            .expect("post-GC projection");
+        assert_eq!(post_gc.eligible_record_count(), 0);
+        assert_eq!(backend.tables.versions.len(), 1);
+        assert!(backend.tables.namespace_requests.is_empty());
+        assert!(backend.tables.namespace_request_receipts.is_empty());
         assert!(
-            !sortable_tables.namespace_request_history_expired(&retained_request_id),
-            "a retained or newer generated request identity must remain admissible"
+            !backend.tables.namespace_receipt_retention.is_empty(),
+            "request bodies and receipts collapse to one durable eviction floor"
         );
         assert!(
-            !sortable_tables
-                .namespace_request_history_expired("dfs_net_req_3_00000000000000000000000002"),
-            "the durable floor must not reject identities newer than the evicted prefix"
+            post_gc.shards[0].total_record_count <= MAX_RETAINED_METADATA_RECORDS,
+            "retained metadata records exceed the absolute bound: {:?}",
+            post_gc.shards[0]
         );
+        assert!(
+            post_gc.shards[0].estimated_serialized_bytes <= MAX_RETAINED_METADATA_BYTES,
+            "retained metadata bytes exceed the absolute bound: {:?}",
+            post_gc.shards[0]
+        );
+        let journal_bytes_after = tree_file_bytes(&root.join("journal"));
+        let materialized_table_bytes = fs::metadata(metadata_table_path(&root))
+            .expect("post-GC materialized table log")
+            .len();
+        let snapshot_bytes_after = fs::metadata(metadata_table_snapshot_path(&root))
+            .expect("post-GC snapshot")
+            .len();
+        let content_bytes_after = tree_file_bytes(&content_root);
+        assert!(journal_bytes_after < journal_bytes_before);
+        assert!(snapshot_bytes_after < snapshot_bytes_before);
+        assert!(content_bytes_after < content_bytes_before);
+        assert_eq!(
+            post_gc.shards[0].journal_segment_count, 1,
+            "only the checkpoint gap-witness segment should remain"
+        );
+        assert!(
+            journal_bytes_after <= MAX_JOURNAL_BYTES,
+            "post-GC journal is not absolutely bounded: {journal_bytes_after} > {MAX_JOURNAL_BYTES}"
+        );
+        assert_eq!(
+            materialized_table_bytes, 0,
+            "the materialized cache log must be truncated after checkpoint"
+        );
+        assert!(
+            snapshot_bytes_after <= MAX_SNAPSHOT_BYTES,
+            "post-GC snapshot is not absolutely bounded: {snapshot_bytes_after} > {MAX_SNAPSHOT_BYTES}"
+        );
+        assert!(
+            content_bytes_after <= MAX_CONTENT_STORE_BYTES,
+            "post-GC content store is not absolutely bounded: {content_bytes_after} > {MAX_CONTENT_STORE_BYTES}"
+        );
+        let content_projection = content
+            .collect_garbage(
+                ContentStoreGcOptions::dry_run(Duration::ZERO).with_protected_content_hashes(
+                    protection.content_hashes.iter().map(String::as_str),
+                ),
+            )
+            .expect("post-GC content projection");
+        assert_eq!(content_projection.newly_observed_orphan_count, 0);
+        assert_eq!(content_projection.eligible_orphan_count, 0);
+        assert_eq!(content_projection.stale_orphan_observation_count, 0);
+        assert_eq!(content_projection.eligible_packed_segment_count, 0);
+        let content_stats = content.stats().expect("post-GC content stats");
+        assert_eq!(content_stats.manifest_count, retained_manifest_count);
+        assert_eq!(content_stats.blob_count, retained_manifest_count);
+        assert_eq!(
+            content_stats.logical_object_bytes,
+            retained_manifest_count.saturating_mul(128)
+        );
+
+        drop(backend);
+        drop(content);
+        let restart_started = Instant::now();
+        let reopened =
+            LocalSobjMetadataBackend::new(shard_id, &root).expect("restart bounded metadata");
+        let reopened_content =
+            crate::LocalContentStore::new(&content_root).expect("restart bounded content");
+        let restart_elapsed = restart_started.elapsed();
+        assert_eq!(reopened.tables.versions.len(), 1);
+        assert!(reopened.tables.namespace_requests.is_empty());
+        assert!(reopened.tables.namespace_request_receipts.is_empty());
+        let current_hash = current
+            .content_hash
+            .as_deref()
+            .expect("current content hash");
+        assert_eq!(
+            reopened_content
+                .read_manifest(current.object_id.as_str(), current.version.as_str())
+                .expect("reopened current manifest")
+                .content_hash,
+            current_hash
+        );
+        let mut expected_current_payload = [0_u8; 128];
+        let current_index = OVERWRITES - 1;
+        expected_current_payload[..8].copy_from_slice(&(current_index as u64).to_le_bytes());
+        for (offset, byte) in expected_current_payload[8..].iter_mut().enumerate() {
+            *byte = (current_index
+                .wrapping_mul(131)
+                .wrapping_add(offset)
+                .wrapping_add(1) as u8)
+                .rotate_left((offset % 8) as u32);
+        }
+        assert_eq!(
+            reopened_content
+                .read_blob(current_hash)
+                .expect("reopened current blob"),
+            expected_current_payload
+        );
+        assert!(
+            restart_elapsed < Duration::from_secs(30),
+            "bounded post-GC restart took {restart_elapsed:?}"
+        );
+        eprintln!(
+            "metadata-history-gc-high-churn overwrites={OVERWRITES} namespace_requests={NAMESPACE_REQUESTS} unique_hashes={} metadata_gc_passes={passes} orphan_gc_passes={orphan_gc_passes} content_write_ms={} metadata_write_ms={} metadata_gc_ms={} content_gc_ms={} reclaimed_packed_bytes={reclaimed_packed_segment_bytes} retained_manifests={retained_manifest_count} retained_records={} retained_metadata_bytes={} journal_bytes_before={journal_bytes_before} journal_bytes_after={journal_bytes_after} materialized_table_bytes={materialized_table_bytes} snapshot_bytes_before={snapshot_bytes_before} snapshot_bytes_after={snapshot_bytes_after} content_bytes_before={content_bytes_before} content_bytes_after={content_bytes_after} restart_ms={}",
+            distinct_content_hashes.len(),
+            content_write_elapsed.as_millis(),
+            metadata_write_elapsed.as_millis(),
+            metadata_gc_elapsed.as_millis(),
+            content_gc_elapsed.as_millis(),
+            post_gc.shards[0].total_record_count,
+            post_gc.shards[0].estimated_serialized_bytes,
+            restart_elapsed.as_millis(),
+        );
+
+        cleanup(&root);
     }
 
     fn temp_root(name: &str) -> sinomo_testdir::TestDir {
         sinomo_testdir::TestDir::new(&format!("sinomo-dfs-metadata-{name}"))
+    }
+
+    fn tree_file_bytes(path: &Path) -> u64 {
+        let Ok(metadata) = fs::metadata(path) else {
+            return 0;
+        };
+        if metadata.is_file() {
+            return metadata.len();
+        }
+        fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| tree_file_bytes(&entry.path()))
+            .fold(0_u64, u64::saturating_add)
     }
 
     fn cleanup(root: &Path) {

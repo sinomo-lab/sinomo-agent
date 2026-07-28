@@ -6829,6 +6829,7 @@ fn lifecycle_maintenance_runs_version_blob_and_tombstone_collection() {
             scrub_content: true,
             stale_staging_gc: None,
             anti_entropy: None,
+            metadata_history_gc: None,
             version_gc: Some(ContentStoreVersionGcOptions::delete_eligible(
                 std::time::Duration::from_nanos(0),
                 1,
@@ -6856,11 +6857,12 @@ fn lifecycle_maintenance_runs_version_blob_and_tombstone_collection() {
     assert_eq!(version_gc.deleted_version_count, 1);
     assert_eq!(version_gc.retained_latest_version_count, 1);
     let orphan_gc = report.orphan_gc.expect("orphan gc");
-    assert_eq!(orphan_gc.deleted_orphan_count, 1);
+    assert_eq!(orphan_gc.deleted_orphan_count, 0);
+    assert_eq!(orphan_gc.newly_observed_orphan_count, 1);
     assert!(
-        !dfs.content
+        dfs.content
             .has_blob(&version_1.content_hash)
-            .expect("v1 reclaimed")
+            .expect("v1 retained for durable orphan grace")
     );
     assert!(
         dfs.content
@@ -6872,6 +6874,27 @@ fn lifecycle_maintenance_runs_version_blob_and_tombstone_collection() {
     assert!(report.tombstone_compaction_requested);
     let tombstone_report = report.tombstone_compaction.expect("tombstone compaction");
     assert_eq!(tombstone_report.compacted_tombstone_count, 1);
+
+    let follow_up = dfs
+        .run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
+            orphan_gc: Some(ContentStoreGcOptions::delete_eligible(
+                std::time::Duration::ZERO,
+            )),
+            ..DfsLifecycleMaintenanceOptions::default()
+        })
+        .expect("follow-up lifecycle maintenance");
+    assert_eq!(
+        follow_up
+            .orphan_gc
+            .expect("follow-up orphan gc")
+            .deleted_orphan_count,
+        1
+    );
+    assert!(
+        !dfs.content
+            .has_blob(&version_1.content_hash)
+            .expect("v1 reclaimed after durable orphan observation")
+    );
     let backend = dfs.metadata_backend().expect("metadata backend");
     assert_eq!(
         backend.get_object(&object_id).expect("compacted object"),
@@ -6914,6 +6937,173 @@ fn lifecycle_maintenance_reports_skipped_tombstones_without_backend() {
     assert!(report.content_scrub.is_none());
     assert!(report.version_gc.is_none());
     assert!(report.orphan_gc.is_none());
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn lifecycle_maintenance_content_only_node_preserves_manifests_and_blobs_without_metadata_roots() {
+    let root = temp_root("lifecycle-maintenance-content-only-no-roots");
+    let node_id = NodeId::from_legacy_named("node_lifecycle_content_only").expect("node");
+    let network = InProcessNetwork::new();
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(node_id),
+        LocalContentStore::new(root.join("content")).expect("content"),
+    );
+    let version_1 = dfs
+        .content
+        .put_object_version(
+            "content-only-object",
+            "version_1",
+            b"content-only version one",
+        )
+        .expect("put first content-only version");
+    let version_2 = dfs
+        .content
+        .put_object_version(
+            "content-only-object",
+            "version_2",
+            b"content-only version two",
+        )
+        .expect("put second content-only version");
+
+    let report = dfs
+        .run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
+            scrub_content: true,
+            stale_staging_gc: Some(ContentStoreStagingGcOptions::delete_eligible(
+                std::time::Duration::ZERO,
+            )),
+            version_gc: Some(ContentStoreVersionGcOptions::delete_eligible(
+                std::time::Duration::ZERO,
+                1,
+            )),
+            orphan_gc: Some(ContentStoreGcOptions::delete_eligible(
+                std::time::Duration::ZERO,
+            )),
+            ..DfsLifecycleMaintenanceOptions::default()
+        })
+        .expect("content-only lifecycle maintenance");
+
+    assert!(!report.metadata_backend_configured);
+    assert!(report.content_gc_metadata_protection_unavailable);
+    assert!(
+        dfs_lifecycle_maintenance_notice_lines(std::slice::from_ref(&report))
+            .iter()
+            .any(|line| line.contains("metadata protection unavailable")),
+        "operators must see why destructive content GC was skipped"
+    );
+    assert!(
+        report
+            .content_scrub
+            .as_ref()
+            .expect("content scrub remains available")
+            .is_healthy()
+    );
+    assert!(
+        report.stale_staging_gc.is_some(),
+        "staging cleanup does not require metadata reachability roots"
+    );
+    assert!(
+        report.version_gc.is_none(),
+        "destructive manifest GC must fail closed without metadata roots"
+    );
+    assert!(
+        report.orphan_gc.is_none(),
+        "destructive blob GC must fail closed without metadata roots"
+    );
+    assert_eq!(
+        dfs.content
+            .read_object_version("content-only-object", "version_1")
+            .expect("first manifest remains readable")
+            .1,
+        b"content-only version one"
+    );
+    assert_eq!(
+        dfs.content
+            .read_object_version("content-only-object", "version_2")
+            .expect("second manifest remains readable")
+            .1,
+        b"content-only version two"
+    );
+    assert!(
+        dfs.content
+            .has_blob(&version_1.content_hash)
+            .expect("first blob remains")
+    );
+    assert!(
+        dfs.content
+            .has_blob(&version_2.content_hash)
+            .expect("second blob remains")
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn lifecycle_maintenance_content_only_dry_run_marks_projection_unprotected() {
+    let root = temp_root("lifecycle-maintenance-content-only-dry-run");
+    let node_id = NodeId::from_legacy_named("node_lifecycle_content_only_dry_run").expect("node");
+    let network = InProcessNetwork::new();
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(node_id),
+        LocalContentStore::new(root.join("content")).expect("content"),
+    );
+    let version_1 = dfs
+        .content
+        .put_object_version("content-only-dry-run", "version_1", b"dry-run version one")
+        .expect("put first dry-run version");
+    let version_2 = dfs
+        .content
+        .put_object_version("content-only-dry-run", "version_2", b"dry-run version two")
+        .expect("put second dry-run version");
+
+    let report = dfs
+        .run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
+            version_gc: Some(ContentStoreVersionGcOptions::dry_run(
+                std::time::Duration::ZERO,
+                1,
+            )),
+            orphan_gc: Some(ContentStoreGcOptions::dry_run(std::time::Duration::ZERO)),
+            ..DfsLifecycleMaintenanceOptions::default()
+        })
+        .expect("content-only dry-run lifecycle maintenance");
+
+    assert!(!report.metadata_backend_configured);
+    assert!(report.content_gc_metadata_protection_unavailable);
+    let version_gc = report.version_gc.expect("unprotected version projection");
+    assert!(version_gc.dry_run);
+    assert_eq!(version_gc.scanned_version_count, 2);
+    assert_eq!(version_gc.eligible_version_count, 1);
+    assert!(
+        report
+            .orphan_gc
+            .expect("unprotected orphan projection")
+            .dry_run
+    );
+    assert_eq!(
+        dfs.content
+            .read_object_version("content-only-dry-run", "version_1")
+            .expect("first dry-run manifest remains")
+            .1,
+        b"dry-run version one"
+    );
+    assert_eq!(
+        dfs.content
+            .read_object_version("content-only-dry-run", "version_2")
+            .expect("second dry-run manifest remains")
+            .1,
+        b"dry-run version two"
+    );
+    assert!(
+        dfs.content
+            .has_blob(&version_1.content_hash)
+            .expect("first dry-run blob remains")
+    );
+    assert!(
+        dfs.content
+            .has_blob(&version_2.content_hash)
+            .expect("second dry-run blob remains")
+    );
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -6986,6 +7176,64 @@ fn lifecycle_maintenance_host_applies_bounded_tombstone_compaction_options() {
         .expect("single tombstone compaction report");
     assert_eq!(report.min_tombstone_age_nanos, 17);
     assert_eq!(report.max_compactions, Some(23));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn lifecycle_shared_gc_runs_once_without_file_system_records() {
+    let root = temp_root("lifecycle-shared-gc-without-file-systems");
+    let node_id = NodeId::from_legacy_named("node_lifecycle_empty_catalog").expect("node");
+    let metadata =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+            .expect("metadata backend");
+    assert!(
+        metadata
+            .list_file_systems()
+            .expect("empty filesystem catalog")
+            .is_empty()
+    );
+    let mut dfs = NetworkedDfsService::new(
+        InProcessNetwork::new().add_node(node_id),
+        LocalContentStore::new(root.join("content")).expect("content store"),
+    )
+    .with_metadata_backend(metadata)
+    .expect("attach metadata backend");
+    let mut host = RecordingMaintenanceHost::default();
+
+    let reports = run_dfs_lifecycle_maintenance_with_host(
+        &mut dfs,
+        &mut host,
+        DfsMaintenanceRunOptions {
+            cleanup_stale_staging: true,
+            stale_staging_min_age: Duration::ZERO,
+            compact_tombstones: true,
+            tombstone_compaction_min_age: Duration::ZERO,
+            collect_metadata_history: true,
+            metadata_history_gc_min_age: Duration::ZERO,
+            collect_content_versions: true,
+            content_version_gc_min_age: Duration::ZERO,
+            collect_orphan_content: true,
+            content_orphan_gc_min_age: Duration::ZERO,
+            ..DfsMaintenanceRunOptions::default()
+        },
+    )
+    .expect("shared lifecycle maintenance");
+
+    assert_eq!(
+        reports.len(),
+        1,
+        "shared maintenance must execute exactly once without filesystem-scoped anti-entropy work"
+    );
+    let report = &reports[0];
+    assert!(report.stale_staging_gc.is_some());
+    assert!(report.metadata_history_gc.is_some());
+    assert!(report.version_gc.is_some());
+    assert!(report.orphan_gc.is_some());
+    assert!(report.tombstone_compaction.is_some());
+    assert!(report.anti_entropy.is_none());
+    assert!(host.stored.is_empty());
+    assert!(host.cleared.is_empty());
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -7156,6 +7404,7 @@ fn maintenance_tick_rebinds_activated_handoff_before_namespace_job_mutation() {
     let invalid_job = DfsNamespaceJobRecord {
         job_id: "invalid-job-behind-activated-handoff".to_string(),
         file_system_id: sifs_file_system_id(),
+        origin: None,
         kind: DfsNamespaceJobKind::ClearDirectoryRecursive,
         status: DfsNamespaceJobStatus::Running,
         root_path: "/services/sandbox/instances/handoff-rebind/work".to_string(),
@@ -27610,6 +27859,7 @@ fn sifs_namespace_job_maintenance_marks_invalid_job_failed() {
     let job = DfsNamespaceJobRecord {
         job_id: "invalid-clear-job".to_string(),
         file_system_id: sifs_file_system_id(),
+        origin: None,
         kind: DfsNamespaceJobKind::ClearDirectoryRecursive,
         status: DfsNamespaceJobStatus::Running,
         root_path: "/services/sandbox/instances/invalid-clear/work".to_string(),
@@ -34154,6 +34404,7 @@ fn lazy_metadata_hydration_restores_running_cross_shard_mutation_guards() {
     let job = DfsNamespaceJobRecord {
         job_id: "running-cross-shard-rename".to_string(),
         file_system_id: file_system.file_system_id.clone(),
+        origin: None,
         kind: DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries,
         status: DfsNamespaceJobStatus::Running,
         root_path: guarded_root.to_string(),
@@ -39015,6 +39266,523 @@ fn sifs_cluster_posix_rename_across_shard_primaries_moves_object_transactionally
 }
 
 #[test]
+fn sifs_cluster_posix_cross_shard_rename_preserves_durable_version_pin() {
+    let cluster = sifs_two_primary_cluster("sifs-xshard-pinned-rename");
+    let SifsTwoPrimaryCluster {
+        root,
+        replica_node,
+        mut users_primary,
+        services_primary,
+        mut replica,
+        ..
+    } = cluster;
+    let source_path = "/users/pinned-move.txt";
+    let target_path = "/services/pinned-moved.txt";
+    let bytes = b"pinned metadata version crosses shard primaries".to_vec();
+
+    let create_stop = Arc::new(AtomicBool::new(false));
+    let users_stop = Arc::clone(&create_stop);
+    let users_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(users_primary, users_stop));
+    let services_stop = Arc::clone(&create_stop);
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+    replica
+        .posix_write_file(
+            source_path,
+            &bytes,
+            DfsWriteOptions::replicated_eventual(vec![replica_node.clone()]),
+        )
+        .expect("create pinned source");
+    create_stop.store(true, Ordering::SeqCst);
+    users_primary = users_thread.join().expect("users create pump");
+    let services_primary = services_thread.join().expect("services create pump");
+
+    let source = users_primary
+        .posix_stat(source_path)
+        .expect("source metadata");
+    let pin = DfsMetadataVersionPinRecord {
+        file_system_id: source.file_system_id.clone(),
+        object_id: source.object_id.clone(),
+        version: source.version.clone(),
+        pin_id: "checkpoint-cross-primary-rename".to_string(),
+        created_at: time::OffsetDateTime::now_utc(),
+    };
+    users_primary
+        .metadata_backend
+        .as_mut()
+        .expect("users metadata backend")
+        .put_version_pin(&pin)
+        .expect("durable source pin")
+        .expect("new source pin");
+
+    let rename_stop = Arc::new(AtomicBool::new(false));
+    let users_stop = Arc::clone(&rename_stop);
+    let users_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(users_primary, users_stop));
+    let services_stop = Arc::clone(&rename_stop);
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+    replica
+        .posix_rename(source_path, target_path)
+        .expect("pinned cross-primary rename");
+    rename_stop.store(true, Ordering::SeqCst);
+    let mut users_primary = users_thread.join().expect("users rename pump");
+    let services_primary = services_thread.join().expect("services rename pump");
+
+    let adopted_target = services_primary
+        .posix_stat(target_path)
+        .expect("adopted target metadata");
+    assert!(
+        services_primary
+            .metadata_backend()
+            .expect("services metadata backend")
+            .version_pins_for_object(&source.object_id)
+            .expect("target pins")
+            .iter()
+            .any(|installed| installed == &pin),
+        "the destination authority must retain the exact durable source pin"
+    );
+    let retired_source = users_primary
+        .metadata_backend
+        .as_mut()
+        .expect("users metadata backend")
+        .capture_cross_shard_source_family(&source.object_id, source_path)
+        .expect("retired physical source family");
+    assert!(
+        retired_source.version_pins.is_empty(),
+        "source pins must be removed atomically with source eviction"
+    );
+    assert!(matches!(
+        retired_source.source_object.tombstone_provenance,
+        Some(DfsTombstoneProvenance::SourceEviction { .. })
+    ));
+    assert_eq!(
+        retired_source.source_object.version, adopted_target.version,
+        "source-eviction witness and installed target must name the durable job-frame generation"
+    );
+    assert!(
+        services_primary
+            .metadata_backend()
+            .expect("services metadata backend")
+            .cross_shard_pin_transfers_for_object(&source.object_id)
+            .expect("target transfer provenance")
+            .is_empty(),
+        "quorum-durable finalization must retire temporary pin-transfer provenance"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_same_node_cross_shard_adoption_recovers_pinned_source_after_crash_window() {
+    let root = temp_root("sifs-same-node-pinned-adoption-crash");
+    let node = NodeId::from_legacy_named("node_same_pinned_adoption").expect("node");
+    let shards = sifs_two_primary_shard_configs(&node, &node, 1, Vec::new(), Vec::new());
+    let mut kv = InProcessKvStore::new();
+    {
+        let mut control = DfsControlPlaneStore::new(&mut kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(node.clone())))
+            .expect("sifs filesystem config");
+        for shard in &shards {
+            control.put_metadata_shard(shard).expect("metadata shard");
+        }
+    }
+    let mut dfs = NetworkedDfsService::new(
+        ReceiveOnlyTransport::new(node.clone()),
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_control_plane(kv)
+    .with_metadata_backend(
+        open_local_sharded_metadata_backend(root.join("metadata"), shards).expect("metadata"),
+    )
+    .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap SIFS");
+
+    let source_path = "/users/crash-pinned.txt";
+    let target_path = "/services/crash-pinned.txt";
+    dfs.posix_write_file(
+        source_path,
+        b"same-node crash-window pin",
+        DfsWriteOptions::replicated_eventual(vec![node]),
+    )
+    .expect("create source");
+    let source = dfs.posix_stat(source_path).expect("source metadata");
+    let pin = DfsMetadataVersionPinRecord {
+        file_system_id: source.file_system_id.clone(),
+        object_id: source.object_id.clone(),
+        version: source.version.clone(),
+        pin_id: "checkpoint-same-node-crash".to_string(),
+        created_at: time::OffsetDateTime::now_utc(),
+    };
+    dfs.metadata_backend
+        .as_mut()
+        .expect("metadata backend")
+        .put_version_pin(&pin)
+        .expect("source pin")
+        .expect("new source pin");
+
+    let capture = dfs
+        .metadata_backend
+        .as_mut()
+        .expect("metadata backend")
+        .capture_cross_shard_source_family(&source.object_id, source_path)
+        .expect("source family");
+    let mut moved = capture.source_object.clone();
+    moved.path = target_path.to_string();
+    moved.version = crate::namespace::next_version(&source.version);
+    moved.changed_at_unix_nanos = moved.changed_at_unix_nanos.saturating_add(1);
+    let mut versions = capture.versions.clone();
+    versions.push(crate::posix::cross_shard_object_version_record(&moved));
+    let transfer_id =
+        crate::protocol::cross_shard_pin_transfer_id(&moved, source_path).expect("transfer id");
+    let pin_fingerprint =
+        crate::protocol::cross_shard_version_pin_set_fingerprint(&moved, &capture.version_pins)
+            .expect("pin fingerprint");
+
+    assert!(
+        dfs.adopt_object_at_path_local(
+            &moved,
+            source_path,
+            Some(&transfer_id),
+            &versions,
+            &capture.version_pins,
+            Some(&pin_fingerprint),
+            &capture.receipts,
+            &capture.intents,
+            &capture.intent_receipts,
+            &capture.intent_receipt_retention,
+            &capture.conflicts,
+            capture.advisory_lock_state.as_ref(),
+        )
+        .expect("destination adoption"),
+        "a copied pin must create active transfer provenance"
+    );
+    let adopted_target = dfs.posix_stat(target_path).expect("adopted target");
+    assert_eq!(adopted_target.object_id, source.object_id);
+    assert_eq!(
+        adopted_target.version, moved.version,
+        "destination publication must preserve the durable frame target generation"
+    );
+    assert!(
+        dfs.metadata_backend()
+            .expect("metadata backend")
+            .get_version(&source.object_id, &moved.version)
+            .expect("target version lookup")
+            .is_some(),
+        "the typed adoption receipt generation must exist in destination history"
+    );
+    assert_eq!(
+        dfs.metadata_backend
+            .as_mut()
+            .expect("metadata backend")
+            .capture_cross_shard_source_family(&source.object_id, source_path)
+            .expect("pre-recovery source family")
+            .version_pins,
+        vec![pin.clone()],
+        "the crash window retains the physical source pin before fenced cleanup"
+    );
+
+    // Model restart/resume after target publication but before source
+    // eviction. The object index now resolves target, so recovery must use the
+    // explicit old-path shard rather than an authority-routed pin scan.
+    dfs.run_cross_shard_adopt(&moved, source_path)
+        .expect("recover pinned source cleanup");
+    let retired = dfs
+        .metadata_backend
+        .as_mut()
+        .expect("metadata backend")
+        .capture_cross_shard_source_family(&source.object_id, source_path)
+        .expect("retired source family");
+    assert!(retired.version_pins.is_empty());
+    assert!(matches!(
+        retired.source_object.tombstone_provenance,
+        Some(DfsTombstoneProvenance::SourceEviction {
+            pin_transfer_id: Some(ref recorded),
+            ..
+        }) if recorded == &transfer_id
+    ));
+    assert_eq!(
+        dfs.metadata_backend()
+            .expect("metadata backend")
+            .version_pins_for_object(&source.object_id)
+            .expect("authoritative target pins"),
+        vec![pin],
+        "recovery must preserve the copied pin on the target authority"
+    );
+    assert!(
+        dfs.metadata_backend()
+            .expect("metadata backend")
+            .cross_shard_pin_transfers_for_object(&source.object_id)
+            .expect("finalized transfer state")
+            .is_empty()
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_stale_cross_shard_runner_without_source_cannot_bypass_active_pin_transfer() {
+    let root = temp_root("sifs-stale-runner-active-pin-transfer");
+    let node = NodeId::from_legacy_named("node_stale_runner_active_transfer").expect("node");
+    let shards = sifs_two_primary_shard_configs(&node, &node, 1, Vec::new(), Vec::new());
+    let mut kv = InProcessKvStore::new();
+    {
+        let mut control = DfsControlPlaneStore::new(&mut kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(node.clone())))
+            .expect("sifs filesystem config");
+        for shard in &shards {
+            control.put_metadata_shard(shard).expect("metadata shard");
+        }
+    }
+    let mut dfs = NetworkedDfsService::new(
+        ReceiveOnlyTransport::new(node.clone()),
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_control_plane(kv)
+    .with_metadata_backend(
+        open_local_sharded_metadata_backend(root.join("metadata"), shards).expect("metadata"),
+    )
+    .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap SIFS");
+
+    let source_path = "/users/stale-runner-source.txt";
+    let target_path = "/services/stale-runner-target.txt";
+    dfs.posix_write_file(
+        target_path,
+        b"target exists without a local physical source family",
+        DfsWriteOptions::replicated_eventual(vec![node]),
+    )
+    .expect("create target");
+    let target_stat = dfs.posix_stat(target_path).expect("target metadata");
+    let target = dfs
+        .metadata_backend()
+        .expect("metadata backend")
+        .get_object(&target_stat.object_id)
+        .expect("target object lookup")
+        .expect("target object");
+    let pin = DfsMetadataVersionPinRecord {
+        file_system_id: target.file_system_id.clone(),
+        object_id: target.object_id.clone(),
+        version: target.version.clone(),
+        pin_id: "checkpoint-stale-runner-active-transfer".to_string(),
+        created_at: time::OffsetDateTime::now_utc(),
+    };
+    let transfer_id =
+        crate::protocol::cross_shard_pin_transfer_id(&target, source_path).expect("transfer id");
+    let pin_fingerprint =
+        crate::protocol::cross_shard_version_pin_set_fingerprint(&target, &[pin.clone()])
+            .expect("pin fingerprint");
+    assert!(
+        dfs.adopt_object_at_path_local(
+            &target,
+            source_path,
+            Some(&transfer_id),
+            &[],
+            &[pin.clone()],
+            Some(&pin_fingerprint),
+            &[],
+            &[],
+            &[],
+            &DfsWriteIntentReceiptRetentionState::default(),
+            &[],
+            None,
+        )
+        .expect("install modeled target transfer"),
+        "copying a previously absent target pin must retain active transfer provenance"
+    );
+    assert_eq!(
+        dfs.metadata_backend()
+            .expect("metadata backend")
+            .cross_shard_pin_transfers_for_object(&target.object_id)
+            .expect("active transfer")
+            .len(),
+        1
+    );
+
+    let error = dfs.run_cross_shard_adopt(&target, source_path).expect_err(
+        "a stale runner without the physical source cannot finalize an active transfer",
+    );
+    assert!(
+        error.to_string().contains("active pin transfer"),
+        "unexpected stale-runner rejection: {error}"
+    );
+    assert_eq!(
+        dfs.metadata_backend()
+            .expect("metadata backend")
+            .cross_shard_pin_transfers_for_object(&target.object_id)
+            .expect("retained active transfer")
+            .len(),
+        1,
+        "the read-only proof path must not remove transfer provenance"
+    );
+    assert_eq!(
+        dfs.metadata_backend()
+            .expect("metadata backend")
+            .version_pins_for_object(&target.object_id)
+            .expect("retained copied pin"),
+        vec![pin],
+        "the stale runner must not reconcile the authoritative copied pin away"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_same_node_cross_shard_adoption_finalizes_pin_transfer_after_source_eviction_crash() {
+    let root = temp_root("sifs-same-node-pinned-finalize-crash");
+    let node = NodeId::from_legacy_named("node_same_pinned_finalize").expect("node");
+    let shards = sifs_two_primary_shard_configs(&node, &node, 1, Vec::new(), Vec::new());
+    let mut kv = InProcessKvStore::new();
+    {
+        let mut control = DfsControlPlaneStore::new(&mut kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(node.clone())))
+            .expect("sifs filesystem config");
+        for shard in &shards {
+            control.put_metadata_shard(shard).expect("metadata shard");
+        }
+    }
+    let mut dfs = NetworkedDfsService::new(
+        ReceiveOnlyTransport::new(node.clone()),
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_control_plane(kv)
+    .with_metadata_backend(
+        open_local_sharded_metadata_backend(root.join("metadata"), shards).expect("metadata"),
+    )
+    .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap SIFS");
+
+    let source_path = "/users/finalize-crash-pinned.txt";
+    let target_path = "/services/finalize-crash-pinned.txt";
+    dfs.posix_write_file(
+        source_path,
+        b"same-node finalize crash pin",
+        DfsWriteOptions::replicated_eventual(vec![node]),
+    )
+    .expect("create source");
+    let source = dfs.posix_stat(source_path).expect("source metadata");
+    let pin = DfsMetadataVersionPinRecord {
+        file_system_id: source.file_system_id.clone(),
+        object_id: source.object_id.clone(),
+        version: source.version.clone(),
+        pin_id: "checkpoint-same-node-finalize-crash".to_string(),
+        created_at: time::OffsetDateTime::now_utc(),
+    };
+    dfs.metadata_backend
+        .as_mut()
+        .expect("metadata backend")
+        .put_version_pin(&pin)
+        .expect("source pin")
+        .expect("new source pin");
+
+    let capture = dfs
+        .metadata_backend
+        .as_mut()
+        .expect("metadata backend")
+        .capture_cross_shard_source_family(&source.object_id, source_path)
+        .expect("source family");
+    let mut moved = capture.source_object.clone();
+    moved.path = target_path.to_string();
+    moved.version = crate::namespace::next_version(&capture.source_object.version);
+    moved.changed_at_unix_nanos = moved.changed_at_unix_nanos.saturating_add(1);
+    let mut versions = capture.versions.clone();
+    versions.push(crate::posix::cross_shard_object_version_record(&moved));
+    let transfer_id =
+        crate::protocol::cross_shard_pin_transfer_id(&moved, source_path).expect("transfer id");
+    let pin_fingerprint =
+        crate::protocol::cross_shard_version_pin_set_fingerprint(&moved, &capture.version_pins)
+            .expect("pin fingerprint");
+
+    assert!(
+        dfs.adopt_object_at_path_local(
+            &moved,
+            source_path,
+            Some(&transfer_id),
+            &versions,
+            &capture.version_pins,
+            Some(&pin_fingerprint),
+            &capture.receipts,
+            &capture.intents,
+            &capture.intent_receipts,
+            &capture.intent_receipt_retention,
+            &capture.conflicts,
+            capture.advisory_lock_state.as_ref(),
+        )
+        .expect("destination adoption"),
+        "a copied pin must create active transfer provenance"
+    );
+    dfs.metadata_backend
+        .as_mut()
+        .expect("metadata backend")
+        .evict_object_record_for_foreign_shard_move_with_pin_fence(
+            &moved,
+            source_path,
+            &capture.source_object,
+            capture.source_journal_sequence,
+            &capture.version_pins,
+            Some(&transfer_id),
+        )
+        .expect("fenced source eviction");
+
+    let retired_before_recovery = dfs
+        .metadata_backend
+        .as_mut()
+        .expect("metadata backend")
+        .capture_cross_shard_source_family(&source.object_id, source_path)
+        .expect("retired source family");
+    assert!(retired_before_recovery.version_pins.is_empty());
+    assert!(matches!(
+        retired_before_recovery.source_object.tombstone_provenance,
+        Some(DfsTombstoneProvenance::SourceEviction {
+            pin_transfer_id: Some(ref recorded),
+            ..
+        }) if recorded == &transfer_id
+    ));
+    assert_eq!(
+        dfs.metadata_backend()
+            .expect("metadata backend")
+            .cross_shard_pin_transfers_for_object(&source.object_id)
+            .expect("active target transfer")
+            .len(),
+        1,
+        "the modeled crash leaves target transfer provenance active"
+    );
+
+    // Resume from the durable source-eviction witness. Recovery must finalize
+    // only the matching target transfer and must not attempt to recopy pins
+    // from the now-empty source shard.
+    dfs.run_cross_shard_adopt(&moved, source_path)
+        .expect("recover target finalization");
+    assert_eq!(
+        dfs.metadata_backend()
+            .expect("metadata backend")
+            .version_pins_for_object(&source.object_id)
+            .expect("target pins"),
+        vec![pin],
+        "finalization recovery must retain the adopted durable pin"
+    );
+    assert_eq!(
+        dfs.posix_stat(target_path).expect("adopted target").version,
+        moved.version,
+        "finalization recovery must retain the durable frame target generation"
+    );
+    assert!(
+        dfs.metadata_backend()
+            .expect("metadata backend")
+            .cross_shard_pin_transfers_for_object(&source.object_id)
+            .expect("finalized transfer")
+            .is_empty(),
+        "recovery must retire only temporary transfer provenance"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn sifs_cluster_posix_services_routed_rename_then_unlink_is_read_your_write() {
     let cluster = sifs_two_primary_cluster("sifs-services-rename-unlink-ryw");
     let SifsTwoPrimaryCluster {
@@ -39755,6 +40523,43 @@ fn sifs_cluster_posix_cross_shard_rename_pending_replay_reconciles_completed_job
         (report.resumed_job_count, report.completed_job_count),
         (1, 1),
         "the parked cross-shard rename must complete independently of the outer response: {report:?}"
+    );
+    let completed_job = cluster
+        .users_primary
+        .metadata_backend
+        .as_ref()
+        .expect("metadata backend")
+        .get_namespace_job(&parked_job.job_id)
+        .expect("completed namespace job lookup")
+        .expect("completed namespace job");
+    assert_eq!(
+        completed_job.origin,
+        Some(DfsNamespaceJobOrigin::from_request(&pending_request)),
+        "new cross-shard sagas must retain the exact durable request identity"
+    );
+    let gc_report = cluster
+        .users_primary
+        .metadata_backend
+        .as_mut()
+        .expect("metadata backend")
+        .gc_metadata_history(
+            DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1).with_max_removals(256),
+        )
+        .expect("run metadata history GC while outer request is pending");
+    assert_eq!(
+        gc_report.compacted_namespace_job_count, 0,
+        "GC must retain a completed job while its owning request is still pending"
+    );
+    assert!(
+        cluster
+            .users_primary
+            .metadata_backend
+            .as_ref()
+            .expect("metadata backend")
+            .get_namespace_job(&parked_job.job_id)
+            .expect("post-GC completed namespace job lookup")
+            .is_some(),
+        "the completed job remains the durable success witness until the outer request is terminal"
     );
 
     // A second runner can retain the original frames after the first runner
@@ -40814,9 +41619,14 @@ fn sifs_cluster_posix_rejects_adoption_from_non_source_primary() {
                 operation: DfsNamespaceOperation::AdoptObjectAtPath {
                     object: rogue_object,
                     source_path: "/users/rogue-src.txt".to_string(),
+                    pin_transfer_id: None,
                     versions: Vec::new(),
+                    version_pins: Vec::new(),
+                    version_pin_set_fingerprint: None,
                     receipts: Vec::new(),
                     intents: Vec::new(),
+                    intent_receipts: Vec::new(),
+                    intent_receipt_retention: DfsWriteIntentReceiptRetentionState::default(),
                     conflicts: Vec::new(),
                     advisory_lock_state: None,
                 },

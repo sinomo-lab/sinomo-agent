@@ -14,6 +14,9 @@ use crate::advisory_lock::{
 use crate::intent::write_intent_status_is_active;
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_hardlink::{object_is_hardlink_to_target, sort_hardlinks_by_path};
+use crate::metadata_history_gc::{
+    DfsMetadataContentProtection, DfsMetadataHistoryGcOptions, DfsMetadataHistoryGcReport,
+};
 use crate::metadata_journal::bounded_metadata_journal_batch;
 use crate::metadata_keys::{normalize_posix_path, write_intent_page_cursor};
 use crate::metadata_limits::OBJECT_LOCAL_METADATA_PAGE_SIZE;
@@ -660,6 +663,191 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// Create or replace an object-version record and journal the mutation.
     fn put_version(&mut self, version: &DfsObjectVersionRecord) -> Result<DfsMetadataJournalEntry>;
 
+    /// Durably retain one immutable metadata version for an independent
+    /// checkpoint or recovery consumer.
+    ///
+    /// This is intentionally unrelated to namespace path pins or content
+    /// placement pins. Implementations must journal the pin before reporting
+    /// success.
+    fn put_version_pin(
+        &mut self,
+        pin: &DfsMetadataVersionPinRecord,
+    ) -> Result<Option<DfsMetadataJournalEntry>> {
+        let _ = pin;
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support durable version pins".to_string(),
+        ))
+    }
+
+    /// Remove one exact consumer's durable version pin. Other pin identities
+    /// for the same immutable version remain authoritative GC roots.
+    fn remove_version_pin(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        pin_id: &str,
+    ) -> Result<Option<DfsMetadataJournalEntry>> {
+        let _ = (file_system_id, object_id, version, pin_id);
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support durable version pins".to_string(),
+        ))
+    }
+
+    /// List all durable version pins attached to one object. The object-family
+    /// migration path uses this to preserve checkpoint roots with authority.
+    ///
+    /// Backends that do not implement durable version pins must fail closed:
+    /// silently returning an empty set could let migration or GC discard a
+    /// version still protected by an implementation-specific checkpoint.
+    fn version_pins_for_object(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> Result<Vec<DfsMetadataVersionPinRecord>> {
+        let _ = object_id;
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support durable version pin scans".to_string(),
+        ))
+    }
+
+    /// Return one bounded page of durable pins in `(version, pin_id)` order.
+    ///
+    /// Migration code must use this page API instead of first materializing
+    /// the complete pin set so its per-pass record budget remains meaningful.
+    fn version_pins_for_object_page(
+        &self,
+        object_id: &DfsObjectId,
+        after: Option<&DfsMetadataVersionPinPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsMetadataVersionPinPage> {
+        let _ = (object_id, after, max_entries);
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support bounded durable version pin scans".to_string(),
+        ))
+    }
+
+    /// Preinstall the exact immutable-version and durable-pin family on the
+    /// shard selected by `object.path`, before a cross-shard adoption makes
+    /// that object visible there. Implementations must reconcile stale copied
+    /// pins to the exact supplied set.
+    fn install_cross_shard_version_pin_family(
+        &mut self,
+        object: &DfsObjectMetadata,
+        versions: &[DfsObjectVersionRecord],
+        pins: &[DfsMetadataVersionPinRecord],
+    ) -> Result<()> {
+        let _ = (object, versions, pins);
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support fenced cross-shard version-pin installation"
+                .to_string(),
+        ))
+    }
+
+    /// Reconcile one deterministic cross-primary handoff's source pin set on
+    /// the destination. Implementations must update provenance and every
+    /// provenance-owned pin as one journal mutation.
+    fn reconcile_cross_shard_pin_transfer(
+        &mut self,
+        transfer_id: &str,
+        object: &DfsObjectMetadata,
+        source_path: &str,
+        versions: &[DfsObjectVersionRecord],
+        source_pins: &[DfsMetadataVersionPinRecord],
+    ) -> Result<bool> {
+        let _ = (transfer_id, object, source_path, versions, source_pins);
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support durable cross-shard pin transfers".to_string(),
+        ))
+    }
+
+    /// Journal the completion of a destination pin transfer after the source
+    /// shard's fenced eviction is durable. Missing provenance is an
+    /// idempotent already-finalized result.
+    fn finalize_cross_shard_pin_transfer(
+        &mut self,
+        transfer_id: &str,
+        object: &DfsObjectMetadata,
+        source_path: &str,
+    ) -> Result<()> {
+        let _ = (transfer_id, object, source_path);
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support cross-shard pin-transfer finalization".to_string(),
+        ))
+    }
+
+    /// Return active target-side pin-transfer provenance for one object.
+    fn cross_shard_pin_transfers_for_object(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> Result<Vec<DfsCrossShardPinTransferRecord>> {
+        let _ = object_id;
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support cross-shard pin-transfer scans".to_string(),
+        ))
+    }
+
+    /// Install one exact active pin-transfer record while physically moving an
+    /// authoritative object family between metadata shards.
+    ///
+    /// Unlike ordinary handoff reconciliation, this operation preserves the
+    /// source record's identity, timestamps, and owned-pin set exactly. The
+    /// transfer and every owned pin must become durable in one journal
+    /// mutation so a crash cannot leave unowned copied pins behind.
+    fn install_cross_shard_pin_transfer_for_authoritative_migration(
+        &mut self,
+        transfer: &DfsCrossShardPinTransferRecord,
+        versions: &[DfsObjectVersionRecord],
+    ) -> Result<()> {
+        let _ = (transfer, versions);
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support authoritative pin-transfer migration".to_string(),
+        ))
+    }
+
+    /// Remove one target-side transfer record before replacing a physically
+    /// migrated object's durable pin family. Missing provenance is an
+    /// idempotent already-removed result; owned pins remain for the subsequent
+    /// explicit pin-clear stage.
+    fn remove_cross_shard_pin_transfer_for_authoritative_migration(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        transfer_id: &str,
+    ) -> Result<()> {
+        let _ = (file_system_id, object_id, transfer_id);
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support authoritative pin-transfer removal".to_string(),
+        ))
+    }
+
+    /// Capture the exact source-authority pin set and its journal head under
+    /// one shard writer lock. The destination payload and later source
+    /// eviction fence must use this same capture.
+    fn capture_cross_shard_source_pin_fence(
+        &mut self,
+        object_id: &DfsObjectId,
+    ) -> Result<DfsCrossShardVersionPinFence> {
+        let _ = object_id;
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support cross-shard source pin fences".to_string(),
+        ))
+    }
+
+    /// Capture the complete physical source family from the shard selected by
+    /// `source_path`, without following an object authority index that may
+    /// already point at the destination after a crash.
+    fn capture_cross_shard_source_family(
+        &mut self,
+        object_id: &DfsObjectId,
+        source_path: &str,
+    ) -> Result<DfsCrossShardSourceFamily> {
+        let _ = (object_id, source_path);
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support path-anchored cross-shard source capture"
+                .to_string(),
+        ))
+    }
+
     /// Store an object record and its version. Implementations may override
     /// this to persist both records in one durable metadata batch.
     fn put_object_and_version(
@@ -804,6 +992,67 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         self.put_intent(intent)
     }
 
+    /// Install one full intent from a source shard that is still authoritative
+    /// for the object's metadata family.
+    ///
+    /// Unlike an ordinary retry, this may cross a destination retention floor:
+    /// the source's durable record is the exact history being transferred, not
+    /// an unproven request being admitted as fresh.
+    fn put_migrated_intent_for_object(
+        &mut self,
+        object: Option<&DfsObjectMetadata>,
+        intent: &DfsWriteIntentRecord,
+    ) -> Result<DfsMetadataJournalEntry>;
+
+    /// Install one exact compact intent receipt while moving an authoritative
+    /// object metadata family. Implementations must preserve the receipt shape
+    /// instead of expanding it through `DfsWriteIntentRecord`.
+    fn put_intent_receipt_for_object(
+        &mut self,
+        object: Option<&DfsObjectMetadata>,
+        receipt: &DfsWriteIntentReceipt,
+    ) -> Result<DfsMetadataJournalEntry>;
+
+    /// Merge source-shard receipt-eviction floors into the destination through
+    /// the normal authoritative journal/table path.
+    fn merge_intent_receipt_retention_for_object(
+        &mut self,
+        object: Option<&DfsObjectMetadata>,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        retention: &DfsWriteIntentReceiptRetentionState,
+    ) -> Result<DfsMetadataJournalEntry>;
+
+    /// Return full intents, compact receipts, and conservative eviction floors
+    /// from one shard-local metadata snapshot.
+    fn object_write_intent_history(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> Result<DfsObjectWriteIntentHistory>;
+
+    /// Fetch the exact compact representation for one intent, if compaction
+    /// has replaced its full body.
+    fn get_intent_receipt(
+        &self,
+        object_id: &DfsObjectId,
+        intent_id: &str,
+    ) -> Result<Option<DfsWriteIntentReceipt>> {
+        Ok(self
+            .object_write_intent_history(object_id)?
+            .receipts
+            .into_iter()
+            .find(|receipt| receipt.intent_id == intent_id))
+    }
+
+    /// Return the conservative receipt-eviction floor owned by the object's
+    /// current metadata shard.
+    fn intent_receipt_retention_for_object(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> Result<DfsWriteIntentReceiptRetentionState> {
+        Ok(self.object_write_intent_history(object_id)?.retention)
+    }
+
     /// Store a write intent and its receipts. Implementations may override
     /// this to persist them in one durable metadata batch.
     fn put_intent_and_receipts_for_object(
@@ -826,6 +1075,12 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         object_id: &DfsObjectId,
         intent_id: &str,
     ) -> Result<Option<DfsWriteIntentRecord>>;
+
+    /// Highest generated intent counter which must not be reused after compact
+    /// receipts have been evicted.
+    fn write_intent_counter_floor(&self) -> Result<u64> {
+        Ok(0)
+    }
 
     /// Compatibility helper that drains all intents for one object.
     fn intents_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsWriteIntentRecord>> {
@@ -1261,6 +1516,29 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(DfsTombstoneCompactionReport::default())
     }
 
+    /// Project retention-eligible metadata history and its next deadline
+    /// without authoring journal entries.
+    fn metadata_history_gc_projection(
+        &self,
+        options: DfsMetadataHistoryGcOptions,
+    ) -> Result<DfsMetadataHistoryGcReport> {
+        Ok(DfsMetadataHistoryGcReport::for_options(&options))
+    }
+
+    /// Append and materialize a bounded authoritative metadata-history GC
+    /// batch. Implementations must journal every observable removal.
+    fn gc_metadata_history(
+        &mut self,
+        options: DfsMetadataHistoryGcOptions,
+    ) -> Result<DfsMetadataHistoryGcReport> {
+        let _ = options;
+        Ok(DfsMetadataHistoryGcReport::default())
+    }
+
+    /// Return the exact metadata roots which local version-manifest and blob
+    /// reclamation must preserve.
+    fn metadata_content_protection(&self) -> Result<DfsMetadataContentProtection>;
+
     /// Records that an object moved to a metadata shard owned by another
     /// node: journals a same-object-id tombstone in the shard that held the
     /// record (so that shard's replicas observe the departure) and repoints
@@ -1273,6 +1551,32 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     ) -> Result<()> {
         let _ = (moved_object, source_path);
         Ok(())
+    }
+
+    /// Complete a cross-primary source eviction only if the source journal
+    /// head and exact durable pin set still match what the destination
+    /// acknowledged. Implementations must remove the copied source pins and
+    /// author the source-eviction marker under one metadata writer fence.
+    fn evict_object_record_for_foreign_shard_move_with_pin_fence(
+        &mut self,
+        moved_object: &DfsObjectMetadata,
+        source_path: &str,
+        expected_source_object: &DfsObjectMetadata,
+        expected_source_journal_sequence: u64,
+        expected_version_pins: &[DfsMetadataVersionPinRecord],
+        pin_transfer_id: Option<&str>,
+    ) -> Result<()> {
+        let _ = (
+            moved_object,
+            source_path,
+            expected_source_object,
+            expected_source_journal_sequence,
+            expected_version_pins,
+            pin_transfer_id,
+        );
+        Err(MetadataBackendError::Serde(
+            "metadata backend does not support fenced cross-shard source eviction".to_string(),
+        ))
     }
 
     /// Durably create or advance one routed namespace request admission record
@@ -1310,9 +1614,10 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     fn namespace_request_history_expired_on_shard(
         &self,
         shard_id: &DfsMetadataShardId,
+        requester_node_id: &NodeId,
         request_id: &str,
     ) -> Result<bool> {
-        let _ = (shard_id, request_id);
+        let _ = (shard_id, requester_node_id, request_id);
         Ok(false)
     }
 
@@ -1350,6 +1655,46 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// Fetch a namespace maintenance job by id.
     fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {
         let _ = job_id;
+        Ok(None)
+    }
+
+    /// Persist compact terminal evidence for a namespace job.
+    ///
+    /// This does not remove the full job. Metadata history GC journals that
+    /// transition separately after every recovery root has been checked.
+    fn put_namespace_job_receipt(&mut self, receipt: &DfsNamespaceJobReceipt) -> Result<()> {
+        let _ = receipt;
+        Ok(())
+    }
+
+    /// Fetch compact terminal namespace-job evidence by durable job id.
+    fn get_namespace_job_receipt(&self, job_id: &str) -> Result<Option<DfsNamespaceJobReceipt>> {
+        let _ = job_id;
+        Ok(None)
+    }
+
+    /// Find completed job evidence for an exact durable routed request.
+    ///
+    /// Receipts written from legacy jobs have no `origin`; implementations
+    /// conservatively retain the historical path/kind/time fallback for those
+    /// rows while requiring an exact identity match for new receipts.
+    fn completed_namespace_job_receipt_for_paths_since(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        root_path: &str,
+        target_path: &str,
+        kinds: &[DfsNamespaceJobKind],
+        created_at: time::OffsetDateTime,
+        origin: &DfsNamespaceJobOrigin,
+    ) -> Result<Option<DfsNamespaceJobReceipt>> {
+        let _ = (
+            file_system_id,
+            root_path,
+            target_path,
+            kinds,
+            created_at,
+            origin,
+        );
         Ok(None)
     }
 

@@ -21,7 +21,8 @@ use crate::{
     ContentStoreStagingGcReport, ContentStoreVersionGcOptions, ContentStoreVersionGcReport,
     DFS_PENDING_TRANSFER_STALE_AFTER, DfsCommittedWorkTracker, DfsControlPlaneKvClient,
     DfsDistributedWriteResult, DfsError, DfsFileSystemId, DfsMessageSender, DfsMessageTransport,
-    DfsMetadataBackend, DfsMetadataJournalBatchSender, DfsMetadataJournalPublisherHost,
+    DfsMetadataBackend, DfsMetadataHistoryGcOptions, DfsMetadataHistoryGcReport,
+    DfsMetadataJournalBatchSender, DfsMetadataJournalPublisherHost,
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
     DfsMetadataJournalReplicationTransport, DfsMetadataNodeTransport, DfsMetadataShardConfig,
     DfsMetadataShardId, DfsMetadataSnapshotInstallSender, DfsNamespaceJobMaintenanceReport,
@@ -435,6 +436,8 @@ pub struct DfsLifecycleMaintenanceOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orphan_gc: Option<ContentStoreGcOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_history_gc: Option<DfsMetadataHistoryGcOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tombstone_compaction: Option<DfsTombstoneCompactionOptions>,
 }
 
@@ -450,6 +453,14 @@ pub struct DfsLifecycleMaintenanceReport {
     pub version_gc: Option<ContentStoreVersionGcReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orphan_gc: Option<ContentStoreGcReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_history_gc: Option<DfsMetadataHistoryGcReport>,
+    /// Content GC was requested but no metadata backend could provide the
+    /// reachability roots needed to make deletion safe. Destructive content GC
+    /// is skipped in this state; any returned dry-run report is an explicitly
+    /// unprotected upper-bound projection.
+    #[serde(default)]
+    pub content_gc_metadata_protection_unavailable: bool,
     pub metadata_backend_configured: bool,
     pub tombstone_compaction_requested: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -467,6 +478,13 @@ pub const DEFAULT_DFS_STALE_WRITE_INTENT_MIN_AGE: Duration = Duration::from_secs
 pub const DEFAULT_DFS_TOMBSTONE_COMPACTION_MIN_AGE: Duration =
     Duration::from_secs(7 * 24 * 60 * 60);
 pub const DEFAULT_DFS_TOMBSTONE_COMPACTION_MAX_RECORDS: u64 = 256;
+pub const DEFAULT_DFS_METADATA_HISTORY_GC_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+pub const DEFAULT_DFS_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS: u64 = 2;
+pub const DEFAULT_DFS_METADATA_HISTORY_GC_MAX_RECORDS: u64 = 256;
+pub const DEFAULT_DFS_CONTENT_VERSION_GC_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+pub const DEFAULT_DFS_CONTENT_VERSION_GC_MAX_RECORDS: u64 = 256;
+pub const DEFAULT_DFS_CONTENT_ORPHAN_GC_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+pub const DEFAULT_DFS_CONTENT_ORPHAN_GC_MAX_RECORDS: u64 = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsAntiEntropyCursorRecord {
@@ -952,6 +970,17 @@ pub struct DfsMaintenanceRunOptions {
     pub compact_tombstones: bool,
     pub tombstone_compaction_min_age: Duration,
     pub tombstone_compaction_max_records: u64,
+    pub collect_metadata_history: bool,
+    pub metadata_history_gc_min_age: Duration,
+    pub metadata_history_gc_keep_latest_versions: u64,
+    pub metadata_history_gc_max_records: u64,
+    pub collect_content_versions: bool,
+    pub content_version_gc_min_age: Duration,
+    pub content_version_gc_keep_latest_versions: u64,
+    pub content_version_gc_max_records: u64,
+    pub collect_orphan_content: bool,
+    pub content_orphan_gc_min_age: Duration,
+    pub content_orphan_gc_max_records: u64,
 }
 
 impl Default for DfsMaintenanceRunOptions {
@@ -965,6 +994,19 @@ impl Default for DfsMaintenanceRunOptions {
             compact_tombstones: false,
             tombstone_compaction_min_age: DEFAULT_DFS_TOMBSTONE_COMPACTION_MIN_AGE,
             tombstone_compaction_max_records: DEFAULT_DFS_TOMBSTONE_COMPACTION_MAX_RECORDS,
+            collect_metadata_history: false,
+            metadata_history_gc_min_age: DEFAULT_DFS_METADATA_HISTORY_GC_MIN_AGE,
+            metadata_history_gc_keep_latest_versions:
+                DEFAULT_DFS_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS,
+            metadata_history_gc_max_records: DEFAULT_DFS_METADATA_HISTORY_GC_MAX_RECORDS,
+            collect_content_versions: false,
+            content_version_gc_min_age: DEFAULT_DFS_CONTENT_VERSION_GC_MIN_AGE,
+            content_version_gc_keep_latest_versions:
+                DEFAULT_DFS_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS,
+            content_version_gc_max_records: DEFAULT_DFS_CONTENT_VERSION_GC_MAX_RECORDS,
+            collect_orphan_content: false,
+            content_orphan_gc_min_age: DEFAULT_DFS_CONTENT_ORPHAN_GC_MIN_AGE,
+            content_orphan_gc_max_records: DEFAULT_DFS_CONTENT_ORPHAN_GC_MAX_RECORDS,
         }
     }
 }
@@ -1014,6 +1056,45 @@ pub fn run_dfs_lifecycle_maintenance_with_host<T: DfsMessageTransport>(
         DfsTombstoneCompactionOptions::compact_eligible(options.tombstone_compaction_min_age)
             .with_max_compactions(options.tombstone_compaction_max_records)
     });
+    let mut metadata_history_gc = options.collect_metadata_history.then(|| {
+        DfsMetadataHistoryGcOptions::delete_eligible(
+            options.metadata_history_gc_min_age,
+            options.metadata_history_gc_keep_latest_versions,
+        )
+        .with_max_removals(options.metadata_history_gc_max_records)
+    });
+    let mut version_gc = options.collect_content_versions.then(|| {
+        ContentStoreVersionGcOptions::delete_eligible(
+            options.content_version_gc_min_age,
+            options.content_version_gc_keep_latest_versions,
+        )
+        .with_max_deletions(options.content_version_gc_max_records)
+    });
+    let mut orphan_gc = options.collect_orphan_content.then(|| {
+        ContentStoreGcOptions::delete_eligible(options.content_orphan_gc_min_age)
+            .with_max_deletions(options.content_orphan_gc_max_records)
+    });
+
+    if file_systems.is_empty() {
+        let shared_maintenance_requested = stale_staging_gc.is_some()
+            || metadata_history_gc.is_some()
+            || version_gc.is_some()
+            || orphan_gc.is_some()
+            || tombstone_compaction.is_some();
+        if shared_maintenance_requested {
+            reports.push(
+                service.run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
+                    stale_staging_gc,
+                    metadata_history_gc,
+                    version_gc,
+                    orphan_gc,
+                    tombstone_compaction,
+                    ..DfsLifecycleMaintenanceOptions::default()
+                })?,
+            );
+        }
+        return Ok(reports);
+    }
 
     for file_system in file_systems {
         let saved_cursor = host.load_anti_entropy_cursor(&file_system.file_system_id)?;
@@ -1037,6 +1118,9 @@ pub fn run_dfs_lifecycle_maintenance_with_host<T: DfsMessageTransport>(
                 max_issues: options.anti_entropy_max_issues,
                 repair_metadata: options.repair_metadata,
             }),
+            metadata_history_gc: metadata_history_gc.take(),
+            version_gc: version_gc.take(),
+            orphan_gc: orphan_gc.take(),
             tombstone_compaction: tombstone_compaction.take(),
             ..DfsLifecycleMaintenanceOptions::default()
         })?;
@@ -1262,6 +1346,12 @@ pub fn dfs_lifecycle_maintenance_notice_lines(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     for report in reports {
+        if report.content_gc_metadata_protection_unavailable {
+            lines.push(
+                "DFS content GC metadata protection unavailable: destructive manifest/blob collection skipped; dry-run projections are unprotected"
+                    .to_string(),
+            );
+        }
         if let Some(staging_gc) = report.stale_staging_gc.as_ref()
             && (staging_gc.deleted_staging_count > 0 || staging_gc.max_deletions_reached)
         {
@@ -1273,6 +1363,59 @@ pub fn dfs_lifecycle_maintenance_notice_lines(
                 staging_gc.deleted_staging_bytes,
                 staging_gc.dry_run,
                 staging_gc.max_deletions_reached
+            ));
+        }
+        if let Some(metadata_gc) = report.metadata_history_gc.as_ref()
+            && (metadata_gc.applied_record_count() > 0 || metadata_gc.max_removals_reached)
+        {
+            lines.push(format!(
+                "DFS metadata history GC: applied={} versions={} replica_receipts={} intent_bodies={} intent_receipts={} conflicts={} visible_commits={} namespace_bodies={} namespace_receipts={} dry_run={} max_removals_reached={}",
+                metadata_gc.applied_record_count(),
+                metadata_gc.removed_version_count,
+                metadata_gc.removed_receipt_count,
+                metadata_gc.compacted_intent_count,
+                metadata_gc.removed_intent_receipt_count,
+                metadata_gc.removed_conflict_count,
+                metadata_gc.removed_visible_commit_count,
+                metadata_gc
+                    .compacted_namespace_job_count
+                    .saturating_add(metadata_gc.compacted_namespace_transaction_count)
+                    .saturating_add(metadata_gc.compacted_namespace_prepare_count)
+                    .saturating_add(metadata_gc.compacted_namespace_request_count),
+                metadata_gc
+                    .removed_namespace_job_receipt_count
+                    .saturating_add(metadata_gc.removed_namespace_transaction_receipt_count)
+                    .saturating_add(metadata_gc.removed_namespace_prepare_receipt_count)
+                    .saturating_add(metadata_gc.removed_namespace_request_receipt_count),
+                metadata_gc.dry_run,
+                metadata_gc.max_removals_reached,
+            ));
+        }
+        if let Some(version_gc) = report.version_gc.as_ref()
+            && (version_gc.deleted_version_count > 0 || version_gc.max_deletions_reached)
+        {
+            lines.push(format!(
+                "DFS content version GC: scanned={} eligible={} deleted={} logical_bytes_deleted={} protected={} dry_run={} max_deletions_reached={}",
+                version_gc.scanned_version_count,
+                version_gc.eligible_version_count,
+                version_gc.deleted_version_count,
+                version_gc.deleted_logical_bytes,
+                version_gc.retained_protected_version_count,
+                version_gc.dry_run,
+                version_gc.max_deletions_reached,
+            ));
+        }
+        if let Some(orphan_gc) = report.orphan_gc.as_ref()
+            && (orphan_gc.deleted_orphan_count > 0 || orphan_gc.max_deletions_reached)
+        {
+            lines.push(format!(
+                "DFS orphan content GC: eligible={} deleted={} bytes_deleted={} protected={} dry_run={} max_deletions_reached={}",
+                orphan_gc.eligible_orphan_count,
+                orphan_gc.deleted_orphan_count,
+                orphan_gc.deleted_orphan_bytes,
+                orphan_gc.retained_protected_orphan_count,
+                orphan_gc.dry_run,
+                orphan_gc.max_deletions_reached,
             ));
         }
         let Some(anti_entropy) = report.anti_entropy.as_ref() else {

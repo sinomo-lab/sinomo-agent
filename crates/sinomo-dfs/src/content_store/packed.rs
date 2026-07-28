@@ -1,9 +1,10 @@
 use super::{
     BlobRangeReader, BlobReader, ContentStoreError, ContentStoreStatsDelta, LocalContentStore,
-    Result, content_durable_file_error, hash_hex,
+    Result, content_durable_file_error, ensure_bytes_match_hash, hash_hex,
 };
 use crate::content_store::fs_ops::{
-    create_dir_all, file_len_if_exists, sync_dir, write_file_atomic,
+    create_dir_all, file_len_if_exists, read_dir, remove_file_if_exists_and_sync_parent, sync_dir,
+    write_file_atomic,
 };
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -11,11 +12,13 @@ use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
 use sinomo_core::storage::durable_file;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
-use std::time::{Duration, Instant, SystemTime};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::{Instant, SystemTime};
 
 pub(super) const PACKED_BLOB_INDEX_VERSION: u32 = 1;
 pub(super) const PACKED_BLOB_DIR: &str = "blob-packs";
@@ -27,6 +30,7 @@ const PACKED_BLOB_LANE_COUNT: u8 = 8;
 const PACKED_BLOB_LANE_DIR: &str = "lanes";
 pub(super) const PACKED_BLOB_SMALL_LIMIT_BYTES: u64 = 16 * 1024;
 pub(super) const PACKED_BLOB_SEGMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(test)]
 const PACKED_BLOB_INDEX_CACHE_TTL: Duration = Duration::from_secs(1);
 #[cfg(not(test))]
 const PACKED_BLOB_INDEX_CHECKPOINT_LOG_BYTES: u64 = 8 * 1024 * 1024;
@@ -127,6 +131,44 @@ struct PackedBlobIndexReplayProgress {
     valid_offset: u64,
     record_count: u64,
     record_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub(super) struct PackedBlobSegmentGcReport {
+    pub(super) scanned_segment_count: u64,
+    pub(super) eligible_segment_count: u64,
+    pub(super) eligible_reclaimable_bytes: u64,
+    pub(super) compacted_segment_count: u64,
+    pub(super) reclaimed_segment_bytes: u64,
+    pub(super) checkpointed_index_lane_count: u64,
+    pub(super) truncated_index_log_bytes: u64,
+    pub(super) retained_limit_segment_count: u64,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct PackedBlobIndexRemovalBatch {
+    pub(super) removed_hashes: BTreeSet<String>,
+    pub(super) modified_lanes: BTreeSet<u8>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PackedBlobSegmentGcCandidate {
+    lane: u8,
+    segment_id: String,
+    size_bytes: u64,
+    live_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct PackedBlobSegmentGcCandidates {
+    scanned_segment_count: u64,
+    eligible: Vec<PackedBlobSegmentGcCandidate>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct PackedBlobSegmentCompaction {
+    reclaimed_segment_bytes: u64,
+    truncated_index_log_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -447,6 +489,7 @@ impl LocalContentStore {
         Ok(cache)
     }
 
+    #[cfg(test)]
     fn read_cached_packed_blob_location_for_lane(
         &self,
         lane: u8,
@@ -496,6 +539,7 @@ impl LocalContentStore {
         cache.entries.remove(&lane);
     }
 
+    #[cfg(test)]
     pub(super) fn packed_blob_location(&self, hash: &str) -> Result<Option<PackedBlobLocation>> {
         let lane = packed_blob_lane_for_hash(hash)?;
         if let Some(location) = self.read_cached_packed_blob_location_for_lane(lane, hash)? {
@@ -755,69 +799,518 @@ impl LocalContentStore {
         Ok(stats_delta)
     }
 
+    #[allow(dead_code)]
     pub(super) fn remove_packed_blob_index_entry(&self, hash: &str) -> Result<bool> {
-        let target_lane = packed_blob_lane_for_hash(hash)?;
-        let mut locks = Vec::with_capacity(2);
-        locks.push(self.lock_packed_blob_lane(0)?);
-        if target_lane != 0 {
-            locks.push(self.lock_packed_blob_lane(target_lane)?);
-        }
-        let mut removed = false;
-        for lane in [0, target_lane] {
-            if lane == 0 && target_lane == 0 && removed {
-                continue;
-            }
-            let index = self.read_packed_blob_index_lane_for_update_unlocked(lane)?;
-            let lane_removed = index.entries.contains_key(hash);
-            let next_segment_id = index.next_segment_id;
-            drop(index);
-            if lane_removed {
-                self.append_packed_blob_index_log_entry_unlocked(
-                    lane,
-                    &PackedBlobIndexLogEntry {
-                        version: PACKED_BLOB_INDEX_VERSION,
-                        content_hash: hash.to_owned(),
-                        location: None,
-                        next_segment_id,
-                    },
-                )?;
-                removed = true;
-            }
-            if target_lane == 0 {
-                break;
-            }
-        }
-        drop(locks);
-        Ok(removed)
+        Ok(self
+            .remove_packed_blob_index_entries(&[hash.to_owned()])?
+            .contains(hash))
     }
 
+    /// Durably tombstone packed hashes with one lock acquisition and one
+    /// append/sync per affected lane.
+    ///
+    /// Lane zero remains part of every hash's removal set because it owns the
+    /// pre-sharding layout. Holding all affected lane locks in numeric order
+    /// preserves the global packed-index lock order used by batched writes.
+    pub(super) fn remove_packed_blob_index_entries(
+        &self,
+        hashes: &[String],
+    ) -> Result<BTreeSet<String>> {
+        Ok(self
+            .remove_packed_blob_index_entries_impl(hashes, true)?
+            .removed_hashes)
+    }
+
+    pub(super) fn remove_packed_blob_index_entries_deferred_checkpoint(
+        &self,
+        hashes: &[String],
+    ) -> Result<PackedBlobIndexRemovalBatch> {
+        self.remove_packed_blob_index_entries_impl(hashes, false)
+    }
+
+    fn remove_packed_blob_index_entries_impl(
+        &self,
+        hashes: &[String],
+        allow_automatic_checkpoint: bool,
+    ) -> Result<PackedBlobIndexRemovalBatch> {
+        let mut hashes_by_lane = BTreeMap::<u8, BTreeSet<String>>::new();
+        for hash in hashes {
+            let target_lane = packed_blob_lane_for_hash(hash)?;
+            hashes_by_lane.entry(0).or_default().insert(hash.clone());
+            if target_lane != 0 {
+                hashes_by_lane
+                    .entry(target_lane)
+                    .or_default()
+                    .insert(hash.clone());
+            }
+        }
+        if hashes_by_lane.is_empty() {
+            return Ok(PackedBlobIndexRemovalBatch::default());
+        }
+
+        let _locks = hashes_by_lane
+            .keys()
+            .copied()
+            .map(|lane| self.lock_packed_blob_lane(lane))
+            .collect::<Result<Vec<_>>>()?;
+        let mut report = PackedBlobIndexRemovalBatch::default();
+        for (lane, lane_hashes) in hashes_by_lane {
+            let index = self.read_packed_blob_index_lane_for_update_unlocked(lane)?;
+            let next_segment_id = index.next_segment_id;
+            let records = lane_hashes
+                .into_iter()
+                .filter(|hash| index.entries.contains_key(hash))
+                .map(|content_hash| PackedBlobIndexLogEntry {
+                    version: PACKED_BLOB_INDEX_VERSION,
+                    content_hash,
+                    location: None,
+                    next_segment_id,
+                })
+                .collect::<Vec<_>>();
+            drop(index);
+            if records.is_empty() {
+                continue;
+            }
+            report
+                .removed_hashes
+                .extend(records.iter().map(|record| record.content_hash.clone()));
+            report.modified_lanes.insert(lane);
+            self.append_packed_blob_index_log_entries_unlocked_with_sync_and_checkpoint(
+                lane,
+                &records,
+                true,
+                allow_automatic_checkpoint,
+            )?;
+        }
+        Ok(report)
+    }
+
+    pub(super) fn checkpoint_packed_blob_index_lanes_after_gc(
+        &self,
+        lanes: &BTreeSet<u8>,
+    ) -> Result<(u64, u64)> {
+        let mut checkpointed_lane_count = 0_u64;
+        let mut truncated_log_bytes = 0_u64;
+        for lane in lanes {
+            let _lock = self.lock_packed_blob_lane(*lane)?;
+            truncated_log_bytes = truncated_log_bytes
+                .saturating_add(self.checkpoint_packed_blob_index_after_gc_unlocked(*lane)?);
+            checkpointed_lane_count = checkpointed_lane_count.saturating_add(1);
+        }
+        Ok((checkpointed_lane_count, truncated_log_bytes))
+    }
+
+    /// Reclaim physical bytes left behind by durable packed-index tombstones.
+    ///
+    /// Logical orphan deletion deliberately publishes its index tombstone
+    /// first. This pass derives obsolete segment ranges from the durable index,
+    /// so a crash between those phases merely leaves reclaimable bytes for the
+    /// next pass. Repacking is limited by segment count and every segment is
+    /// capped by `PACKED_BLOB_SEGMENT_MAX_BYTES`.
+    pub(super) fn collect_packed_blob_segment_garbage(
+        &self,
+        dry_run: bool,
+        max_compactions: u64,
+    ) -> Result<PackedBlobSegmentGcReport> {
+        let candidates = self.packed_blob_segment_gc_candidates()?;
+        let mut report = PackedBlobSegmentGcReport {
+            scanned_segment_count: candidates.scanned_segment_count,
+            eligible_segment_count: candidates.eligible.len() as u64,
+            eligible_reclaimable_bytes: candidates
+                .eligible
+                .iter()
+                .map(|candidate| candidate.size_bytes.saturating_sub(candidate.live_bytes))
+                .fold(0_u64, u64::saturating_add),
+            ..PackedBlobSegmentGcReport::default()
+        };
+        if dry_run {
+            report.retained_limit_segment_count = report
+                .eligible_segment_count
+                .saturating_sub(max_compactions);
+            return Ok(report);
+        }
+
+        for candidate in candidates
+            .eligible
+            .iter()
+            .take(usize::try_from(max_compactions).unwrap_or(usize::MAX))
+        {
+            let Some(compaction) =
+                self.compact_packed_blob_segment(candidate.lane, &candidate.segment_id)?
+            else {
+                continue;
+            };
+            report.compacted_segment_count = report.compacted_segment_count.saturating_add(1);
+            report.reclaimed_segment_bytes = report
+                .reclaimed_segment_bytes
+                .saturating_add(compaction.reclaimed_segment_bytes);
+            report.checkpointed_index_lane_count =
+                report.checkpointed_index_lane_count.saturating_add(1);
+            report.truncated_index_log_bytes = report
+                .truncated_index_log_bytes
+                .saturating_add(compaction.truncated_index_log_bytes);
+        }
+        report.retained_limit_segment_count = report
+            .eligible_segment_count
+            .saturating_sub(report.compacted_segment_count);
+        Ok(report)
+    }
+
+    fn packed_blob_segment_gc_candidates(&self) -> Result<PackedBlobSegmentGcCandidates> {
+        let mut report = PackedBlobSegmentGcCandidates::default();
+        for lane in 0..PACKED_BLOB_LANE_COUNT {
+            let index = self.read_packed_blob_index_lane_unlocked_with_tail_policy(lane, false)?;
+            let mut live_ranges_by_segment = BTreeMap::<String, Vec<(u64, u64)>>::new();
+            for location in index.entries.values() {
+                let end = location
+                    .offset
+                    .checked_add(location.size_bytes)
+                    .ok_or_else(|| ContentStoreError::InvalidContentLayout {
+                        message: format!(
+                            "packed blob range overflows during GC: lane={lane}, segment={}",
+                            location.segment_id
+                        ),
+                    })?;
+                live_ranges_by_segment
+                    .entry(location.segment_id.clone())
+                    .or_default()
+                    .push((location.offset, end));
+            }
+
+            let segments_root = self
+                .packed_blob_lane_root(lane)
+                .join(PACKED_BLOB_SEGMENT_DIR);
+            if !segments_root.exists() {
+                continue;
+            }
+            let mut segment_entries = read_dir(&segments_root)?;
+            segment_entries.sort_by_key(|entry| entry.path());
+            for entry in segment_entries {
+                let path = entry.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("pack") {
+                    continue;
+                }
+                let metadata = entry.metadata().map_err(|source| ContentStoreError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                if !metadata.is_file() {
+                    continue;
+                }
+                report.scanned_segment_count = report.scanned_segment_count.saturating_add(1);
+                let size_bytes = metadata.len();
+                let Some(segment_id) = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                let mut ranges = live_ranges_by_segment
+                    .remove(&segment_id)
+                    .unwrap_or_default();
+                ranges.sort_unstable();
+                let mut live_bytes = 0_u64;
+                let mut previous_end = 0_u64;
+                for (start, end) in &ranges {
+                    if *end > size_bytes {
+                        return Err(ContentStoreError::InvalidContentLayout {
+                            message: format!(
+                                "packed GC live range exceeds segment: lane={lane}, segment={segment_id}, end={end}, len={size_bytes}"
+                            ),
+                        });
+                    }
+                    if *start < previous_end {
+                        return Err(ContentStoreError::InvalidContentLayout {
+                            message: format!(
+                                "packed GC found overlapping live ranges: lane={lane}, segment={segment_id}, start={start}, previous_end={previous_end}"
+                            ),
+                        });
+                    }
+                    live_bytes = live_bytes.saturating_add(end.saturating_sub(*start));
+                    previous_end = *end;
+                }
+                if ranges.is_empty() || live_bytes < size_bytes {
+                    report.eligible.push(PackedBlobSegmentGcCandidate {
+                        lane,
+                        segment_id,
+                        size_bytes,
+                        live_bytes,
+                    });
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    fn compact_packed_blob_segment(
+        &self,
+        lane: u8,
+        segment_id: &str,
+    ) -> Result<Option<PackedBlobSegmentCompaction>> {
+        let _lock = self.lock_packed_blob_lane(lane)?;
+        let index = self.read_packed_blob_index_lane_for_update_unlocked(lane)?;
+        let mut live_entries = index
+            .entries
+            .iter()
+            .filter(|(_, location)| location.segment_id == segment_id)
+            .map(|(hash, location)| (hash.clone(), location.clone()))
+            .collect::<Vec<_>>();
+        let mut next_segment_id = index.next_segment_id.max(1);
+        let referenced_segment_ids = index
+            .entries
+            .values()
+            .map(|location| location.segment_id.clone())
+            .collect::<BTreeSet<_>>();
+        drop(index);
+
+        let old_path = self.packed_blob_segment_path_for_lane(lane, segment_id);
+        let Some(old_len) = file_len_if_exists(&old_path)? else {
+            return Ok(None);
+        };
+        live_entries.sort_by(|left, right| {
+            left.1
+                .offset
+                .cmp(&right.1.offset)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let live_len = live_entries
+            .iter()
+            .map(|(_, location)| location.size_bytes)
+            .fold(0_u64, u64::saturating_add);
+        if !live_entries.is_empty() && live_len >= old_len {
+            return Ok(None);
+        }
+        if live_entries.is_empty() {
+            let truncated_index_log_bytes =
+                self.checkpoint_packed_blob_index_after_gc_unlocked(lane)?;
+            return remove_file_if_exists_and_sync_parent(&old_path).map(|removed| {
+                removed.then_some(PackedBlobSegmentCompaction {
+                    reclaimed_segment_bytes: old_len,
+                    truncated_index_log_bytes,
+                })
+            });
+        }
+        if old_len > PACKED_BLOB_SEGMENT_MAX_BYTES {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: format!(
+                    "packed segment exceeds bounded GC size: lane={lane}, segment={segment_id}, len={old_len}, max={PACKED_BLOB_SEGMENT_MAX_BYTES}"
+                ),
+            });
+        }
+
+        let mut old_file = fs::File::open(&old_path).map_err(|source| ContentStoreError::Io {
+            path: old_path.clone(),
+            source,
+        })?;
+        let mut repacked = Vec::with_capacity(usize::try_from(live_len).unwrap_or(usize::MAX));
+        let mut records = Vec::with_capacity(live_entries.len());
+        for (hash, location) in &live_entries {
+            let end = location
+                .offset
+                .checked_add(location.size_bytes)
+                .ok_or_else(|| ContentStoreError::InvalidContentLayout {
+                    message: format!(
+                        "packed blob range overflows during compaction: hash={hash}, segment={segment_id}"
+                    ),
+                })?;
+            if end > old_len {
+                return Err(ContentStoreError::InvalidContentLayout {
+                    message: format!(
+                        "packed blob range exceeds segment during compaction: hash={hash}, segment={segment_id}, end={end}, len={old_len}"
+                    ),
+                });
+            }
+            old_file
+                .seek(SeekFrom::Start(location.offset))
+                .map_err(|source| ContentStoreError::Io {
+                    path: old_path.clone(),
+                    source,
+                })?;
+            let start = repacked.len();
+            let new_len = start
+                .checked_add(usize::try_from(location.size_bytes).map_err(|_| {
+                    ContentStoreError::InvalidContentLayout {
+                        message: format!(
+                            "packed blob is too large to compact: hash={hash}, bytes={}",
+                            location.size_bytes
+                        ),
+                    }
+                })?)
+                .ok_or_else(|| ContentStoreError::InvalidContentLayout {
+                    message: "packed compaction buffer length overflow".to_string(),
+                })?;
+            repacked.resize(new_len, 0);
+            old_file
+                .read_exact(&mut repacked[start..new_len])
+                .map_err(|source| ContentStoreError::Io {
+                    path: old_path.clone(),
+                    source,
+                })?;
+            ensure_bytes_match_hash(hash, &repacked[start..new_len])?;
+        }
+
+        let (new_segment_id, new_path) = loop {
+            let candidate = format!("{next_segment_id:016x}.pack");
+            let candidate_path = self.packed_blob_segment_path_for_lane(lane, &candidate);
+            next_segment_id = next_segment_id.saturating_add(1);
+            if candidate != segment_id
+                && !referenced_segment_ids.contains(&candidate)
+                && !candidate_path.exists()
+            {
+                break (candidate, candidate_path);
+            }
+            if next_segment_id == u64::MAX {
+                return Err(ContentStoreError::InvalidContentLayout {
+                    message: format!("packed segment id space exhausted for lane {lane}"),
+                });
+            }
+        };
+        write_file_atomic(&new_path, &repacked)?;
+
+        let mut offset = 0_u64;
+        for (hash, location) in live_entries {
+            records.push(PackedBlobIndexLogEntry {
+                version: PACKED_BLOB_INDEX_VERSION,
+                content_hash: hash,
+                location: Some(PackedBlobLocation {
+                    lane,
+                    segment_id: new_segment_id.clone(),
+                    offset,
+                    size_bytes: location.size_bytes,
+                }),
+                next_segment_id,
+            });
+            offset = offset.saturating_add(location.size_bytes);
+        }
+        // The replacement segment is durable before the new locations. The old
+        // segment remains until every location record is durably appended, so a
+        // torn append can only leave readable copies in both generations.
+        self.append_packed_blob_index_log_entries_unlocked(lane, &records)?;
+        let truncated_index_log_bytes =
+            self.checkpoint_packed_blob_index_after_gc_unlocked(lane)?;
+        remove_file_if_exists_and_sync_parent(&old_path)?;
+        Ok(Some(PackedBlobSegmentCompaction {
+            reclaimed_segment_bytes: old_len.saturating_sub(live_len),
+            truncated_index_log_bytes,
+        }))
+    }
+
+    fn checkpoint_packed_blob_index_after_gc_unlocked(&self, lane: u8) -> Result<u64> {
+        // A preceding durable append may have attempted automatic checkpoint
+        // maintenance and invalidated the process cache if that best-effort
+        // checkpoint failed. Reload the authoritative snapshot-plus-log pair
+        // before requiring the GC checkpoint.
+        let index = self.read_packed_blob_index_lane_for_update_unlocked(lane)?;
+        drop(index);
+        let log_path = self.packed_blob_index_log_path_for_lane(lane);
+        let before_len = file_len_if_exists(&log_path)?.unwrap_or(0);
+        if !self.checkpoint_packed_blob_index_lane_unlocked(lane)? {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: format!("packed GC could not checkpoint the loaded index for lane {lane}"),
+            });
+        }
+        let after_len = file_len_if_exists(&log_path)?.unwrap_or(0);
+        Ok(before_len.saturating_sub(after_len))
+    }
+
+    /// Resolve and open a packed blob while holding the lane's shared lock.
+    ///
+    /// Segment compaction publishes replacement index locations and removes the
+    /// retired segment under the exclusive form of the same lock. Keeping the
+    /// shared lock through `File::open` closes the otherwise unsafe gap between
+    /// returning an index location and opening its segment. The file handle is
+    /// sufficient after this method returns: Unix keeps an unlinked inode alive,
+    /// while platforms that forbid unlinking an open file make compaction retry.
     pub(super) fn open_packed_blob_reader(
         &self,
-        location: &PackedBlobLocation,
+        hash: &str,
         offset: u64,
         max_bytes: usize,
-    ) -> Result<BlobReader> {
-        let opened = self.open_packed_blob_range_file(location, offset, max_bytes)?;
-        Ok(BlobReader::with_remaining(
-            opened.file,
-            opened.size_bytes,
-            opened.remaining_bytes,
-        ))
+    ) -> Result<Option<(PackedBlobLocation, BlobReader)>> {
+        let Some((location, opened)) =
+            self.open_packed_blob_range_file_for_hash(hash, offset, max_bytes)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((
+            location,
+            BlobReader::with_remaining(opened.file, opened.size_bytes, opened.remaining_bytes),
+        )))
     }
 
     pub(super) fn open_packed_blob_range_reader(
         &self,
-        location: &PackedBlobLocation,
+        hash: &str,
         offset: u64,
         max_bytes: usize,
-    ) -> Result<BlobRangeReader> {
-        let opened = self.open_packed_blob_range_file(location, offset, max_bytes)?;
-        Ok(BlobRangeReader::new(
-            opened.file,
-            opened.offset,
-            opened.size_bytes,
-            opened.remaining_bytes,
-        ))
+    ) -> Result<Option<(PackedBlobLocation, BlobRangeReader)>> {
+        let Some((location, opened)) =
+            self.open_packed_blob_range_file_for_hash(hash, offset, max_bytes)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((
+            location,
+            BlobRangeReader::new(
+                opened.file,
+                opened.offset,
+                opened.size_bytes,
+                opened.remaining_bytes,
+            ),
+        )))
+    }
+
+    pub(super) fn packed_blob_readable_size(&self, hash: &str) -> Result<Option<u64>> {
+        let Some((location, _lock)) = self.packed_blob_location_and_read_lock(hash)? else {
+            return Ok(None);
+        };
+        if !self.packed_blob_location_readable(&location)? {
+            return Ok(None);
+        }
+        Ok(Some(location.size_bytes))
+    }
+
+    fn open_packed_blob_range_file_for_hash(
+        &self,
+        hash: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<Option<(PackedBlobLocation, OpenedPackedBlobRange)>> {
+        let Some((location, _lock)) = self.packed_blob_location_and_read_lock(hash)? else {
+            return Ok(None);
+        };
+        let opened = self.open_packed_blob_range_file(&location, offset, max_bytes)?;
+        Ok(Some((location, opened)))
+    }
+
+    fn packed_blob_location_and_read_lock(
+        &self,
+        hash: &str,
+    ) -> Result<Option<(PackedBlobLocation, Option<PackedBlobLockGuard>)>> {
+        let target_lane = packed_blob_lane_for_hash(hash)?;
+        for lane in [target_lane, 0] {
+            let lock = self.lock_packed_blob_lane_for_read(lane)?;
+            // The shared lane lock makes the snapshot-plus-log fingerprint
+            // stable while the process cache is refreshed. Replaying the
+            // complete lane index for every small packed read made a scrub of
+            // N distinct blobs quadratic in the lane cardinality.
+            let cache = self.refresh_packed_blob_index_lane_cache_unlocked(lane, false)?;
+            let location = cache
+                .entries
+                .get(&lane)
+                .and_then(|entry| entry.index.entries.get(hash))
+                .cloned();
+            drop(cache);
+            if let Some(location) = location {
+                return Ok(Some((location, lock)));
+            }
+            drop(lock);
+            if target_lane == 0 {
+                break;
+            }
+        }
+        Ok(None)
     }
 
     fn open_packed_blob_range_file(
@@ -965,6 +1458,21 @@ impl LocalContentStore {
         entries: &[PackedBlobIndexLogEntry],
         sync_writes: bool,
     ) -> Result<()> {
+        self.append_packed_blob_index_log_entries_unlocked_with_sync_and_checkpoint(
+            lane,
+            entries,
+            sync_writes,
+            true,
+        )
+    }
+
+    fn append_packed_blob_index_log_entries_unlocked_with_sync_and_checkpoint(
+        &self,
+        lane: u8,
+        entries: &[PackedBlobIndexLogEntry],
+        sync_writes: bool,
+        allow_automatic_checkpoint: bool,
+    ) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -1004,6 +1512,7 @@ impl LocalContentStore {
             .len();
         self.apply_packed_blob_index_log_entries_to_cache_unlocked(lane, entries, log_offset)?;
         if sync_writes
+            && allow_automatic_checkpoint
             && let Err(error) = self.maybe_checkpoint_packed_blob_index_lane_unlocked(lane)
         {
             // The append log is already durable, so checkpoint maintenance
@@ -1300,6 +1809,25 @@ mod tests {
         unreachable!("u64 test nonce space must contain every packed lane")
     }
 
+    fn packed_lane_segment_bytes(store: &LocalContentStore, lane: u8) -> u64 {
+        let root = store
+            .packed_blob_lane_root(lane)
+            .join(PACKED_BLOB_SEGMENT_DIR);
+        if !root.is_dir() {
+            return 0;
+        }
+        fs::read_dir(root)
+            .expect("read packed segment directory")
+            .map(|entry| {
+                entry
+                    .expect("packed segment entry")
+                    .metadata()
+                    .expect("packed segment metadata")
+                    .len()
+            })
+            .fold(0_u64, u64::saturating_add)
+    }
+
     #[test]
     fn packed_index_append_batch_is_legacy_byte_identical() {
         let entries = [
@@ -1375,6 +1903,129 @@ mod tests {
         assert_eq!(
             store.read_blob(&legacy_hash).expect("legacy fallback read"),
             legacy_bytes
+        );
+    }
+
+    #[test]
+    fn packed_segment_gc_reclaims_bytes_checkpoints_index_and_survives_restart() {
+        const LANE: u8 = 3;
+        let root = sinomo_testdir::TestDir::new("dfs-packed-segment-gc");
+        let store = LocalContentStore::new(&root).expect("content store");
+        let (retained_hash, retained_bytes) = test_blob_for_lane(LANE, 1);
+        let (removed_hash_a, removed_bytes_a) = test_blob_for_lane(LANE, 1_000);
+        let (removed_hash_b, removed_bytes_b) = test_blob_for_lane(LANE, 2_000);
+        for (hash, bytes) in [
+            (&retained_hash, retained_bytes.as_slice()),
+            (&removed_hash_a, removed_bytes_a.as_slice()),
+            (&removed_hash_b, removed_bytes_b.as_slice()),
+        ] {
+            assert!(
+                store
+                    .write_packed_blob(hash, bytes)
+                    .expect("write packed blob")
+            );
+        }
+
+        let old_location = store
+            .packed_blob_location(&retained_hash)
+            .expect("retained packed lookup")
+            .expect("retained packed location");
+        assert_eq!(
+            packed_lane_segment_bytes(&store, LANE),
+            retained_bytes.len() as u64
+                + removed_bytes_a.len() as u64
+                + removed_bytes_b.len() as u64
+        );
+        #[cfg(unix)]
+        let (_, mut reader_opened_before_gc) = store
+            .open_packed_blob_reader(&retained_hash, 0, usize::MAX)
+            .expect("open retained packed blob")
+            .expect("retained packed reader");
+        assert!(
+            store
+                .remove_packed_blob_index_entry(&removed_hash_a)
+                .expect("tombstone first packed blob")
+        );
+        assert!(
+            store
+                .remove_packed_blob_index_entry(&removed_hash_b)
+                .expect("tombstone second packed blob")
+        );
+
+        let projection = store
+            .collect_packed_blob_segment_garbage(true, 1)
+            .expect("project packed segment GC");
+        assert_eq!(projection.eligible_segment_count, 1);
+        assert_eq!(
+            projection.eligible_reclaimable_bytes,
+            removed_bytes_a.len() as u64 + removed_bytes_b.len() as u64
+        );
+        assert_eq!(projection.compacted_segment_count, 0);
+        assert!(
+            store.packed_blob_location_path(&old_location).is_file(),
+            "dry-run must not remove the source segment"
+        );
+
+        let report = store
+            .collect_packed_blob_segment_garbage(false, 1)
+            .expect("compact packed segment");
+        assert_eq!(report.compacted_segment_count, 1);
+        assert_eq!(
+            report.reclaimed_segment_bytes,
+            removed_bytes_a.len() as u64 + removed_bytes_b.len() as u64
+        );
+        assert_eq!(report.checkpointed_index_lane_count, 1);
+        assert!(report.truncated_index_log_bytes > 0);
+        assert_eq!(report.retained_limit_segment_count, 0);
+        assert!(
+            !store.packed_blob_location_path(&old_location).exists(),
+            "retired segment must be removed after replacement locations are durable"
+        );
+        assert_eq!(
+            packed_lane_segment_bytes(&store, LANE),
+            retained_bytes.len() as u64
+        );
+        assert_eq!(
+            fs::metadata(store.packed_blob_index_log_path_for_lane(LANE))
+                .expect("checkpointed packed index log")
+                .len(),
+            0
+        );
+
+        #[cfg(unix)]
+        {
+            let mut bytes_from_preopened_reader = Vec::new();
+            reader_opened_before_gc
+                .read_to_end(&mut bytes_from_preopened_reader)
+                .expect("read retained blob from pre-GC file handle");
+            assert_eq!(bytes_from_preopened_reader, retained_bytes);
+            drop(reader_opened_before_gc);
+        }
+        drop(store);
+
+        let reopened = LocalContentStore::new(&root).expect("reopen compacted content store");
+        assert_eq!(
+            reopened
+                .read_blob(&retained_hash)
+                .expect("read retained blob after restart"),
+            retained_bytes
+        );
+        assert!(
+            !reopened
+                .has_blob(&removed_hash_a)
+                .expect("first hash absent")
+        );
+        assert!(
+            !reopened
+                .has_blob(&removed_hash_b)
+                .expect("second hash absent")
+        );
+        assert_eq!(
+            reopened
+                .collect_packed_blob_segment_garbage(true, 1)
+                .expect("project compacted store")
+                .eligible_segment_count,
+            0
         );
     }
 
@@ -1482,6 +2133,67 @@ mod tests {
         let index = &cache.entries.get(&LANE).expect("updated packed lane").index;
         assert!(index.entries.contains_key(&external_hash));
         assert!(index.entries.contains_key(&final_hash));
+    }
+
+    #[test]
+    fn packed_reads_reuse_cache_and_replay_only_external_tail() {
+        const LANE: u8 = 4;
+        let root = sinomo_testdir::TestDir::new("dfs-packed-index-incremental-reads");
+        let writer = LocalContentStore::new(&root).expect("writer content store");
+        let blobs = (0..16_u64)
+            .map(|index| test_blob_for_lane(LANE, index.saturating_mul(100)))
+            .collect::<Vec<_>>();
+        for (hash, bytes) in &blobs {
+            assert!(
+                writer
+                    .write_packed_blob(hash, bytes)
+                    .expect("write unique packed blob")
+            );
+        }
+        drop(writer);
+
+        let reader = LocalContentStore::new(&root).expect("reader content store");
+        for (hash, bytes) in &blobs {
+            assert_eq!(reader.read_blob(hash).expect("read packed blob"), *bytes);
+        }
+        let (full_load_count, replay_count_before_external) = {
+            let cache = reader
+                .packed_index_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (cache.full_load_count, cache.tail_replay_record_count)
+        };
+        assert_eq!(
+            full_load_count, 1,
+            "repeated reads in one lane must load its index only once"
+        );
+
+        let external = LocalContentStore::new(&root).expect("external writer");
+        let (external_hash, external_bytes) = test_blob_for_lane(LANE, 10_000);
+        assert!(
+            external
+                .write_packed_blob(&external_hash, &external_bytes)
+                .expect("append external packed blob")
+        );
+        assert_eq!(
+            reader
+                .read_blob(&external_hash)
+                .expect("read externally appended packed blob"),
+            external_bytes
+        );
+        let cache = reader
+            .packed_index_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            cache.full_load_count, 1,
+            "an external append must not force a complete lane reload"
+        );
+        assert_eq!(
+            cache.tail_replay_record_count,
+            replay_count_before_external.saturating_add(1),
+            "the reader must replay the external writer's one-record tail"
+        );
     }
 
     #[test]
