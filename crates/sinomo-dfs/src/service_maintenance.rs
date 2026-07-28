@@ -51,30 +51,40 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             report.checked_local_location_count =
                 report.checked_local_location_count.saturating_add(1);
-            let verified_local_size = match self
-                .content
-                .read_manifest(object.object_id.as_str(), object.version.as_str())
-            {
-                Ok(manifest)
-                    if manifest.content_hash == content_hash
-                        && self
-                            .content
-                            .manifest_content_available(&manifest)
-                            .unwrap_or(false) =>
-                {
-                    Some(manifest.size_bytes)
-                }
-                Ok(_) => None,
-                Err(_) => self
+            let local_metadata_primary =
+                options.repair_metadata && self.is_local_metadata_primary_for_object(&object)?;
+            let verified_local_size = if local_metadata_primary {
+                match self
                     .content
-                    .open_blob_reader(&content_hash)
-                    .ok()
-                    .map(|reader| reader.size_bytes()),
+                    .read_manifest(object.object_id.as_str(), object.version.as_str())
+                {
+                    Ok(manifest)
+                        if manifest.content_hash == content_hash
+                            && self
+                                .content
+                                .manifest_content_available(&manifest)
+                                .unwrap_or(false) =>
+                    {
+                        Some(manifest.size_bytes)
+                    }
+                    Ok(_) => None,
+                    Err(_)
+                        if object
+                            .content_size_bytes
+                            .is_none_or(|expected_size| expected_size == 0) =>
+                    {
+                        self.content
+                            .open_blob_reader(&content_hash)
+                            .ok()
+                            .map(|reader| reader.size_bytes())
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
             };
-            if options.repair_metadata
-                && let Some(actual_size) = verified_local_size
+            if let Some(actual_size) = verified_local_size
                 && object.content_size_bytes != Some(actual_size)
-                && self.is_local_metadata_primary_for_object(&object)?
             {
                 let expected_size = object.content_size_bytes;
                 self.content.put_blob_only_manifest(
