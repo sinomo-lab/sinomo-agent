@@ -1259,6 +1259,15 @@ pub struct AvailableAgentSkill {
     pub description: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ExplicitAgentSkillContext {
+    pub name: String,
+    pub description: String,
+    pub instructions: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ContextAssemblyReport {
     pub report_id: TaskId,
@@ -6273,6 +6282,13 @@ where
         Ok(self.lock_state()?.control.session.clone())
     }
 
+    pub fn load_explicit_skill_context(
+        &self,
+        skill_id: &str,
+    ) -> Result<ExplicitAgentSkillContext, AgentError> {
+        self.agent.load_explicit_skill_context(skill_id)
+    }
+
     pub fn replace_session(&self, session: AgentSession) -> Result<(), AgentError> {
         self.reap_finished_worker()?;
         let mut state = self.lock_state()?;
@@ -8417,6 +8433,32 @@ impl<M: InteractionModel> Agent<M> {
 
     pub fn tool_registry(&self) -> AgentToolRegistry {
         self.tools.clone()
+    }
+
+    pub fn load_explicit_skill_context(
+        &self,
+        skill_id: &str,
+    ) -> Result<ExplicitAgentSkillContext, AgentError> {
+        let skill_plan = self.skill_plan();
+        let skill = skill_plan
+            .get(skill_id)
+            .ok_or_else(|| AgentError::Runtime {
+                detail: format!(
+                    "skill `{skill_id}` is not available to agent `{}`",
+                    self.config.definition.key()
+                ),
+            })?;
+        let document = standard_skill_document(skill).ok_or_else(|| AgentError::Runtime {
+            detail: format!(
+                "skill `{skill_id}` does not include a valid readable SKILL.md matching its descriptor"
+            ),
+        })?;
+        Ok(ExplicitAgentSkillContext {
+            name: skill.id.clone(),
+            description: skill.description.clone(),
+            instructions: document.body,
+            resources: skill.resource_paths.clone(),
+        })
     }
 
     pub fn register_tool<T: AgentTool + 'static>(&self, tool: T) -> Option<AgentToolDescriptor> {
@@ -15090,6 +15132,63 @@ mod tests {
             Some(entry.content_hash.as_str())
         );
         assert_eq!(skill.embedded_text.as_deref(), Some(text));
+    }
+
+    #[test]
+    fn explicit_skill_context_loads_standard_instructions_and_resource_names() {
+        let markdown = "---\nname: explicit-shortcut\ndescription: Explicitly selected workflow.\n---\n\n# Explicit shortcut\nFollow the explicit workflow.\n";
+        let resource = crate::AgentSkillPackageFile {
+            relative_path: "references/checklist.md".to_string(),
+            bytes: b"# Checklist\nVerify the result.\n".to_vec(),
+        };
+        let write = crate::SkillCatalogWrite::from_agent_skill_package(
+            None,
+            "1.0.0",
+            crate::SkillCatalogSource::user("user.test"),
+            crate::AgentSkillPackage {
+                markdown: markdown.to_string(),
+                files: vec![resource.clone()],
+            },
+        )
+        .expect("standard package");
+        let entry = write.entry;
+        let key = crate::skill_catalog_entry_text_key(&entry);
+        let mut catalog = crate::SkillCatalog::default();
+        catalog.upsert_entry(entry.clone()).expect("catalog entry");
+        catalog
+            .set_activation(crate::SkillActivationRecord::new(
+                crate::SkillActivationScope::Cluster.as_str(),
+                &entry,
+                "test",
+                "cluster default",
+            ))
+            .expect("activation");
+        let config = AgentConfig::new("fake", "fake")
+            .with_agent_definition(AgentDefinition::main())
+            .with_skill_catalog(catalog)
+            .with_skill_catalog_texts([(key.clone(), markdown.to_string())])
+            .with_skill_catalog_resources([(key, vec![resource])]);
+        let agent = Agent::new(SequencedModel::new(["{}"]), "fake", "fake").with_config(config);
+
+        let context = agent
+            .load_explicit_skill_context("explicit-shortcut")
+            .expect("explicit skill context");
+
+        assert_eq!(context.name, "explicit-shortcut");
+        assert_eq!(context.description, "Explicitly selected workflow.");
+        assert!(
+            context
+                .instructions
+                .contains("Follow the explicit workflow.")
+        );
+        assert_eq!(context.resources, vec!["references/checklist.md"]);
+        assert!(
+            agent
+                .load_explicit_skill_context("missing-shortcut")
+                .expect_err("unknown skill")
+                .to_string()
+                .contains("not available")
+        );
     }
 
     #[test]

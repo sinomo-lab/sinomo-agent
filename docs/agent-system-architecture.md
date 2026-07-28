@@ -157,6 +157,16 @@ with one listed resource reads that file with a bounded model-visible payload;
 resources are never eagerly injected. Skill activation output remains in the
 ordinary traced tool transcript.
 
+Direct and terminal chat also support `/skill <name> [request]`. This is an
+explicit, turn-scoped invocation: the host validates that the skill is
+available to the selected agent, loads the complete instruction body before
+the model call, records `interaction.skill.activated`, and leaves listed
+resources on demand through `skill_activate`. The trailing request remains
+user-level input through a typed `explicit_skill_request` context attachment;
+it is never promoted into system instructions. Existing administrative chat
+commands such as `/skill list` and `/skill activate ...` retain their CLI
+meaning.
+
 The experimental `allowed-tools` field is descriptive metadata. It does not
 grant a capability, change the current tool surface, or bypass Sinomo policy,
 workspace, sandbox, device, network, or host authority checks.
