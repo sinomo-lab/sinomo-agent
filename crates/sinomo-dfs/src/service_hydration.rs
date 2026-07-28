@@ -1339,7 +1339,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Err(ContentStoreError::Io { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
-                Ok(None)
+                match self.content.open_blob_reader(content_hash) {
+                    Ok(reader) => Ok(Some(reader.size_bytes())),
+                    Err(ContentStoreError::Io { source, .. })
+                        if source.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        Ok(None)
+                    }
+                    Err(error) => Err(error.into()),
+                }
             }
             Err(error) => Err(error.into()),
         }

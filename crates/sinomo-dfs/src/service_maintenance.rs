@@ -38,7 +38,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         report.next_cursor = page.next_cursor;
         let local_node_id = self.node_id.clone();
 
-        for object in page.objects {
+        for mut object in page.objects {
             report.scanned_object_count = report.scanned_object_count.saturating_add(1);
             if !matches!(object.kind, DfsObjectKind::File | DfsObjectKind::Symlink) {
                 continue;
@@ -51,6 +51,63 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             report.checked_local_location_count =
                 report.checked_local_location_count.saturating_add(1);
+            let verified_local_size = match self
+                .content
+                .read_manifest(object.object_id.as_str(), object.version.as_str())
+            {
+                Ok(manifest)
+                    if manifest.content_hash == content_hash
+                        && self
+                            .content
+                            .manifest_content_available(&manifest)
+                            .unwrap_or(false) =>
+                {
+                    Some(manifest.size_bytes)
+                }
+                Ok(_) => None,
+                Err(_) => self
+                    .content
+                    .open_blob_reader(&content_hash)
+                    .ok()
+                    .map(|reader| reader.size_bytes()),
+            };
+            if options.repair_metadata
+                && let Some(actual_size) = verified_local_size
+                && object.content_size_bytes != Some(actual_size)
+                && self.is_local_metadata_primary_for_object(&object)?
+            {
+                let expected_size = object.content_size_bytes;
+                self.content.put_blob_only_manifest(
+                    object.object_id.as_str(),
+                    object.version.as_str(),
+                    &content_hash,
+                    actual_size,
+                )?;
+                object.content_size_bytes = Some(actual_size);
+                self.put_visible_object_and_version_in_metadata_backend(
+                    &object,
+                    Some(actual_size),
+                )?;
+                self.metadata.add_object(object.clone())?;
+                report.stale_local_location_count =
+                    report.stale_local_location_count.saturating_add(1);
+                report.repaired_location_count = report.repaired_location_count.saturating_add(1);
+                record_anti_entropy_issue(
+                    &mut report,
+                    options.max_issues,
+                    DfsAntiEntropyIssue {
+                        object_id: object.object_id,
+                        version: object.version,
+                        path: object.path,
+                        content_hash,
+                        reason: format!(
+                            "local verified content size differs from metadata: expected {expected_size:?}, actual {actual_size}"
+                        ),
+                        repaired: true,
+                    },
+                );
+                continue;
+            }
             let Some(reason) = self.local_content_anti_entropy_issue_reason(&object, &content_hash)
             else {
                 continue;
