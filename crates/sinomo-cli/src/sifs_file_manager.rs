@@ -36,6 +36,7 @@ use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -509,8 +510,30 @@ impl SifsFileManagerBackend {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
         self.refresh_service_peer_targets(&mut service);
-        service
-            .posix_read_file_distributed(&path)
+        if let Ok(mut local) = service.posix_open_file_stream(&path) {
+            let size_bytes = usize::try_from(local.size_bytes)
+                .map_err(|_| format!("cannot read SIFS file {path}: length does not fit usize"))?;
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(size_bytes).map_err(|_| {
+                format!("cannot read SIFS file {path}: cannot reserve {size_bytes} bytes")
+            })?;
+            local
+                .reader
+                .read_to_end(&mut bytes)
+                .map_err(|error| format!("cannot read SIFS file {path}: {error}"))?;
+            return Ok(bytes);
+        }
+
+        // `FileManagerBackend` remains a Vec-returning compatibility API, but
+        // remote DFS now returns its response head before any body bytes and
+        // preserves transport-owned chunks until this final boundary.
+        let remote = block_on_sifs_posix_future(
+            &self.rpc_runtime,
+            service.posix_open_remote_file_stream(&path),
+        )
+        .map_err(|error| format!("cannot read SIFS file {path}: {error}"))?;
+        drop(service);
+        block_on_sifs_posix_future(&self.rpc_runtime, remote.collect_to_vec())
             .map_err(|error| format!("cannot read SIFS file {path}: {error}"))
     }
 
@@ -3071,6 +3094,30 @@ where
             message: "SIFS metadata publication cannot block a current-thread Tokio runtime; use the async transport"
                 .to_string(),
         });
+    }
+    rpc_runtime.runtime.block_on(future)
+}
+
+fn block_on_sifs_posix_future<F, T>(
+    rpc_runtime: &SifsRpcRuntime,
+    future: F,
+) -> Result<T, DfsPosixError>
+where
+    F: Future<Output = Result<T, DfsPosixError>>,
+{
+    if let Ok(current) = tokio::runtime::Handle::try_current() {
+        if matches!(
+            current.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            return tokio::task::block_in_place(|| rpc_runtime.runtime.block_on(future));
+        }
+        return Err(DfsError::Network {
+            message:
+                "SIFS streamed read cannot block a current-thread Tokio runtime; use the async POSIX stream API"
+                    .to_string(),
+        }
+        .into());
     }
     rpc_runtime.runtime.block_on(future)
 }

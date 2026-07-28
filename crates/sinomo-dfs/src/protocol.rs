@@ -64,6 +64,10 @@ pub struct DfsDirectReadRequest {
     pub version: DfsVersion,
     pub content_hash: String,
     pub content_size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_max_bytes: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

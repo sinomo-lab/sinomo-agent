@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::sync::Arc;
 
-use sinomo_core::node::NodeId;
-use time::OffsetDateTime;
+use sinomo_core::{Id, node::NodeId};
+use time::{Duration, OffsetDateTime};
 
 use crate::advisory_lock::DfsAdvisoryLockStateRecord;
 use crate::metadata_keys::{
@@ -17,10 +17,12 @@ use crate::metadata_keys::{
 };
 use crate::metadata_records::{
     DfsConflictRecord, DfsDirFragmentId, DfsDirFragmentRecord, DfsInodeId, DfsInodeRecord,
-    DfsMetadataPrefixProof, DfsMetadataTableOp, DfsNamespaceJobRecord, DfsNamespacePrepareRecord,
-    DfsNamespacePrepareStatus, DfsNamespaceRequestRecord, DfsNamespaceRequestStatus,
-    DfsNamespaceTransaction, DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord,
-    DfsVisibleVersionCommitRecord, DfsWriteIntentRecord, normalized_object_metadata,
+    DfsMetadataPrefixProof, DfsMetadataTableOp, DfsNamespaceJobRecord, DfsNamespacePrepareReceipt,
+    DfsNamespacePrepareRecord, DfsNamespacePrepareStatus, DfsNamespaceReceiptOrderKey,
+    DfsNamespaceReceiptRetentionState, DfsNamespaceRequestReceipt, DfsNamespaceRequestRecord,
+    DfsNamespaceRequestStatus, DfsNamespaceTransaction, DfsNamespaceTransactionReceipt,
+    DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord, DfsVisibleVersionCommitRecord,
+    DfsWriteIntentRecord, normalized_object_metadata,
 };
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
@@ -48,7 +50,9 @@ pub(crate) struct DfsMetadataTables {
     pub(crate) advisory_lock_states: BTreeMap<DfsObjectId, DfsAdvisoryLockStateRecord>,
     pub(crate) visible_commits: BTreeMap<(DfsObjectId, DfsVersion), DfsVisibleVersionCommitRecord>,
     pub(crate) namespace_transactions: BTreeMap<String, DfsNamespaceTransaction>,
+    pub(crate) namespace_transaction_receipts: BTreeMap<String, DfsNamespaceTransactionReceipt>,
     pub(crate) namespace_prepares: BTreeMap<String, DfsNamespacePrepareRecord>,
+    pub(crate) namespace_prepare_receipts: BTreeMap<String, DfsNamespacePrepareReceipt>,
     namespace_prepare_object_owners:
         BTreeMap<DfsFileSystemId, BTreeMap<DfsObjectId, BTreeSet<String>>>,
     namespace_prepare_path_owners: BTreeMap<DfsFileSystemId, BTreeMap<String, BTreeSet<String>>>,
@@ -56,9 +60,35 @@ pub(crate) struct DfsMetadataTables {
     pub(crate) namespace_prepare_request_owners: BTreeMap<(NodeId, String), BTreeSet<String>>,
     pub(crate) namespace_jobs: BTreeMap<String, DfsNamespaceJobRecord>,
     pub(crate) namespace_requests: BTreeMap<(NodeId, String), DfsNamespaceRequestRecord>,
+    pub(crate) namespace_request_receipts: BTreeMap<(NodeId, String), DfsNamespaceRequestReceipt>,
+    pub(crate) namespace_receipt_retention: DfsNamespaceReceiptRetentionState,
     /// Derived oldest-attempt-first recovery index. Terminal idempotency rows
     /// stay in `namespace_requests` without participating in maintenance scans.
     pub(crate) pending_namespace_request_order: BTreeSet<(OffsetDateTime, NodeId, String)>,
+}
+
+pub(crate) const DEFAULT_NAMESPACE_TRANSACTION_RECEIPT_LIMIT: usize = 4_096;
+pub(crate) const DEFAULT_NAMESPACE_PREPARE_RECEIPT_LIMIT: usize = 4_096;
+pub(crate) const DEFAULT_NAMESPACE_REQUEST_RECEIPT_LIMIT: usize = 4_096;
+pub(crate) const DEFAULT_NAMESPACE_RECEIPT_RETENTION_DAYS: i64 = 7;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DfsNamespaceReceiptRetentionLimits {
+    pub(crate) max_transaction_receipts: usize,
+    pub(crate) max_prepare_receipts: usize,
+    pub(crate) max_request_receipts: usize,
+    pub(crate) max_age: Duration,
+}
+
+impl Default for DfsNamespaceReceiptRetentionLimits {
+    fn default() -> Self {
+        Self {
+            max_transaction_receipts: DEFAULT_NAMESPACE_TRANSACTION_RECEIPT_LIMIT,
+            max_prepare_receipts: DEFAULT_NAMESPACE_PREPARE_RECEIPT_LIMIT,
+            max_request_receipts: DEFAULT_NAMESPACE_REQUEST_RECEIPT_LIMIT,
+            max_age: Duration::days(DEFAULT_NAMESPACE_RECEIPT_RETENTION_DAYS),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -145,6 +175,38 @@ pub(crate) fn namespace_prepare_footprint(
     (object_ids, paths)
 }
 
+fn namespace_transaction_order_key(
+    transaction: &DfsNamespaceTransaction,
+) -> DfsNamespaceReceiptOrderKey {
+    DfsNamespaceReceiptOrderKey {
+        created_at: transaction.created_at,
+        identity: transaction.transaction_id.clone(),
+    }
+}
+
+fn namespace_prepare_order_key(prepare: &DfsNamespacePrepareRecord) -> DfsNamespaceReceiptOrderKey {
+    DfsNamespaceReceiptOrderKey {
+        created_at: prepare.transaction.created_at,
+        identity: prepare.operation_id.clone(),
+    }
+}
+
+fn namespace_request_order_token(request_id: &str) -> Option<String> {
+    let candidate = request_id.rsplit('_').next().unwrap_or(request_id);
+    Id::new(candidate.to_string())
+        .ok()
+        .map(|id| id.as_str().to_ascii_lowercase())
+}
+
+fn update_order_floor(
+    floor: &mut Option<DfsNamespaceReceiptOrderKey>,
+    evicted: DfsNamespaceReceiptOrderKey,
+) {
+    if floor.as_ref().is_none_or(|current| evicted > *current) {
+        *floor = Some(evicted);
+    }
+}
+
 impl DfsMetadataTables {
     pub(crate) fn has_materialized_state(&self) -> bool {
         !self.file_systems.is_empty()
@@ -155,11 +217,228 @@ impl DfsMetadataTables {
             || !self.conflicts.is_empty()
             || !self.advisory_lock_states.is_empty()
             || !self.namespace_transactions.is_empty()
+            || !self.namespace_transaction_receipts.is_empty()
             || !self.namespace_jobs.is_empty()
             || !self.namespace_requests.is_empty()
+            || !self.namespace_request_receipts.is_empty()
             || !self.compacted_tombstones.is_empty()
             || !self.visible_commits.is_empty()
             || !self.namespace_prepares.is_empty()
+            || !self.namespace_prepare_receipts.is_empty()
+            || self.namespace_receipt_retention != DfsNamespaceReceiptRetentionState::default()
+    }
+
+    /// Fold terminal namespace history into fixed-size idempotency receipts.
+    ///
+    /// Callers only persist this image at an exact materialized journal
+    /// checkpoint. Pending requests and prepared transactions remain complete
+    /// because autonomous recovery still needs their semantic payload.
+    pub(crate) fn compact_terminal_namespace_history(
+        &mut self,
+        checkpoint_time: OffsetDateTime,
+        limits: DfsNamespaceReceiptRetentionLimits,
+    ) -> Result<(), serde_json::Error> {
+        // Build every fallible digest before changing the live tables. The
+        // checkpoint can fail without losing the complete recovery records.
+        let transaction_receipts = self
+            .namespace_transactions
+            .values()
+            .map(|transaction| {
+                DfsNamespaceTransactionReceipt::from_transaction(transaction, checkpoint_time)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let terminal_prepares = self
+            .namespace_prepares
+            .values()
+            .filter_map(|prepare| {
+                DfsNamespacePrepareReceipt::from_prepare(prepare, checkpoint_time)
+            })
+            .collect::<Vec<_>>();
+        let completed_requests = self
+            .namespace_requests
+            .values()
+            .filter_map(|request| {
+                DfsNamespaceRequestReceipt::from_request(request, checkpoint_time)
+            })
+            .collect::<Vec<_>>();
+
+        for receipt in transaction_receipts {
+            self.namespace_transactions.remove(&receipt.transaction_id);
+            self.namespace_transaction_receipts
+                .insert(receipt.transaction_id.clone(), receipt);
+        }
+        for receipt in terminal_prepares {
+            self.namespace_prepares.remove(&receipt.operation_id);
+            self.namespace_prepare_receipts
+                .insert(receipt.operation_id.clone(), receipt);
+        }
+        for receipt in completed_requests {
+            let key = (
+                receipt.requester_node_id.clone(),
+                receipt.request_id.clone(),
+            );
+            self.namespace_requests.remove(&key);
+            self.namespace_request_receipts.insert(key, receipt);
+        }
+        self.evict_terminal_namespace_receipts(checkpoint_time, limits);
+        self.rebuild_namespace_prepare_footprint_indexes();
+        self.rebuild_namespace_prepare_request_index();
+        self.rebuild_pending_namespace_request_index();
+        Ok(())
+    }
+
+    pub(crate) fn namespace_transaction_history_expired(
+        &self,
+        transaction: &DfsNamespaceTransaction,
+    ) -> bool {
+        self.namespace_receipt_retention
+            .transaction_floor
+            .as_ref()
+            .is_some_and(|floor| namespace_transaction_order_key(transaction) <= *floor)
+    }
+
+    pub(crate) fn namespace_prepare_history_expired(
+        &self,
+        prepare: &DfsNamespacePrepareRecord,
+    ) -> bool {
+        self.namespace_receipt_retention
+            .prepare_floor
+            .as_ref()
+            .is_some_and(|floor| namespace_prepare_order_key(prepare) <= *floor)
+    }
+
+    pub(crate) fn namespace_prepare_history_has_evictions(&self) -> bool {
+        self.namespace_receipt_retention.prepare_floor.is_some()
+    }
+
+    pub(crate) fn namespace_request_history_expired(&self, request_id: &str) -> bool {
+        match namespace_request_order_token(request_id) {
+            Some(token) => self
+                .namespace_receipt_retention
+                .max_evicted_request_order_token
+                .as_ref()
+                .is_some_and(|floor| token <= *floor),
+            None => {
+                self.namespace_receipt_retention
+                    .opaque_request_history_evicted
+            }
+        }
+    }
+
+    fn evict_terminal_namespace_receipts(
+        &mut self,
+        checkpoint_time: OffsetDateTime,
+        limits: DfsNamespaceReceiptRetentionLimits,
+    ) {
+        let cutoff = checkpoint_time.checked_sub(limits.max_age);
+
+        let mut transactions = self
+            .namespace_transaction_receipts
+            .values()
+            .map(|receipt| {
+                (
+                    (
+                        receipt.retained_at,
+                        DfsNamespaceReceiptOrderKey {
+                            created_at: receipt.created_at,
+                            identity: receipt.transaction_id.clone(),
+                        },
+                    ),
+                    receipt.transaction_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        transactions.sort();
+        let transaction_age_count = cutoff.map_or(0, |cutoff| {
+            transactions.partition_point(|((retained_at, _), _)| *retained_at < cutoff)
+        });
+        let transaction_excess = transactions
+            .len()
+            .saturating_sub(limits.max_transaction_receipts);
+        for ((_, order_key), transaction_id) in transactions
+            .into_iter()
+            .take(transaction_age_count.max(transaction_excess))
+        {
+            self.namespace_transaction_receipts.remove(&transaction_id);
+            update_order_floor(
+                &mut self.namespace_receipt_retention.transaction_floor,
+                order_key,
+            );
+        }
+
+        let mut prepares = self
+            .namespace_prepare_receipts
+            .values()
+            .map(|receipt| {
+                (
+                    (
+                        receipt.retained_at,
+                        DfsNamespaceReceiptOrderKey {
+                            created_at: receipt.created_at,
+                            identity: receipt.operation_id.clone(),
+                        },
+                    ),
+                    receipt.operation_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        prepares.sort();
+        let prepare_age_count = cutoff.map_or(0, |cutoff| {
+            prepares.partition_point(|((retained_at, _), _)| *retained_at < cutoff)
+        });
+        let prepare_excess = prepares.len().saturating_sub(limits.max_prepare_receipts);
+        for ((_, order_key), operation_id) in prepares
+            .into_iter()
+            .take(prepare_age_count.max(prepare_excess))
+        {
+            self.namespace_prepare_receipts.remove(&operation_id);
+            update_order_floor(
+                &mut self.namespace_receipt_retention.prepare_floor,
+                order_key,
+            );
+        }
+
+        let mut requests = self
+            .namespace_request_receipts
+            .iter()
+            .map(|(key, receipt)| {
+                (
+                    (
+                        receipt.retained_at,
+                        receipt.requester_node_id.clone(),
+                        receipt.request_id.clone(),
+                    ),
+                    key.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        requests.sort();
+        let request_age_count = cutoff.map_or(0, |cutoff| {
+            requests.partition_point(|((created_at, _, _), _)| *created_at < cutoff)
+        });
+        let request_excess = requests.len().saturating_sub(limits.max_request_receipts);
+        for (_, key) in requests
+            .into_iter()
+            .take(request_age_count.max(request_excess))
+        {
+            if self.namespace_request_receipts.remove(&key).is_some() {
+                self.note_evicted_request_id(&key.1);
+            }
+        }
+    }
+
+    fn note_evicted_request_id(&mut self, request_id: &str) {
+        let Some(token) = namespace_request_order_token(request_id) else {
+            self.namespace_receipt_retention
+                .opaque_request_history_evicted = true;
+            return;
+        };
+        let floor = &mut self
+            .namespace_receipt_retention
+            .max_evicted_request_order_token;
+        if floor.as_ref().is_none_or(|current| token > *current) {
+            *floor = Some(token);
+        }
     }
 
     fn put_intent_indexed(&mut self, intent: DfsWriteIntentRecord) {
@@ -593,17 +872,51 @@ impl DfsMetadataTables {
                 self.visible_commits.insert((object_id, version), commit);
             }
             DfsMetadataTableOp::PutNamespaceTransaction { transaction } => {
+                self.namespace_transaction_receipts
+                    .remove(&transaction.transaction_id);
                 self.namespace_transactions
                     .insert(transaction.transaction_id.clone(), transaction);
             }
+            DfsMetadataTableOp::PutNamespaceTransactionReceipt { receipt } => {
+                self.namespace_transactions.remove(&receipt.transaction_id);
+                self.namespace_transaction_receipts
+                    .insert(receipt.transaction_id.clone(), receipt);
+            }
             DfsMetadataTableOp::PutNamespacePrepare { prepare } => {
+                self.namespace_prepare_receipts
+                    .remove(&prepare.operation_id);
                 self.put_namespace_prepare_indexed(prepare);
+            }
+            DfsMetadataTableOp::PutNamespacePrepareReceipt { receipt } => {
+                if let Some(previous) = self.namespace_prepares.remove(&receipt.operation_id) {
+                    self.unindex_namespace_prepare_footprint(&previous);
+                    self.unindex_namespace_prepare_request(&previous);
+                }
+                self.namespace_prepare_receipts
+                    .insert(receipt.operation_id.clone(), receipt);
             }
             DfsMetadataTableOp::PutNamespaceJob { job } => {
                 self.namespace_jobs.insert(job.job_id.clone(), job);
             }
             DfsMetadataTableOp::PutNamespaceRequest { request } => {
+                self.namespace_request_receipts.remove(&(
+                    request.requester_node_id.clone(),
+                    request.request_id.clone(),
+                ));
                 self.put_namespace_request_indexed(request);
+            }
+            DfsMetadataTableOp::PutNamespaceRequestReceipt { receipt } => {
+                let key = (
+                    receipt.requester_node_id.clone(),
+                    receipt.request_id.clone(),
+                );
+                if let Some(previous) = self.namespace_requests.remove(&key)
+                    && previous.status == DfsNamespaceRequestStatus::Pending
+                {
+                    self.pending_namespace_request_order
+                        .remove(&Self::namespace_request_order_key(&previous));
+                }
+                self.namespace_request_receipts.insert(key, receipt);
             }
         }
     }
@@ -764,9 +1077,12 @@ pub(crate) struct DfsMetadataTableRollback {
     advisory_lock_states: BTreeMap<DfsObjectId, Option<DfsAdvisoryLockStateRecord>>,
     visible_commits: BTreeMap<(DfsObjectId, DfsVersion), Option<DfsVisibleVersionCommitRecord>>,
     namespace_transactions: BTreeMap<String, Option<DfsNamespaceTransaction>>,
+    namespace_transaction_receipts: BTreeMap<String, Option<DfsNamespaceTransactionReceipt>>,
     namespace_prepares: BTreeMap<String, Option<DfsNamespacePrepareRecord>>,
+    namespace_prepare_receipts: BTreeMap<String, Option<DfsNamespacePrepareReceipt>>,
     namespace_jobs: BTreeMap<String, Option<DfsNamespaceJobRecord>>,
     namespace_requests: BTreeMap<(NodeId, String), Option<DfsNamespaceRequestRecord>>,
+    namespace_request_receipts: BTreeMap<(NodeId, String), Option<DfsNamespaceRequestReceipt>>,
 }
 
 impl DfsMetadataTableRollback {
@@ -922,29 +1238,91 @@ impl DfsMetadataTableRollback {
                 &tables.visible_commits,
                 (object_id.clone(), version.clone()),
             ),
-            DfsMetadataTableOp::PutNamespaceTransaction { transaction } => record_rollback_value(
-                &mut self.namespace_transactions,
-                &tables.namespace_transactions,
-                transaction.transaction_id.clone(),
-            ),
-            DfsMetadataTableOp::PutNamespacePrepare { prepare } => record_rollback_value(
-                &mut self.namespace_prepares,
-                &tables.namespace_prepares,
-                prepare.operation_id.clone(),
-            ),
+            DfsMetadataTableOp::PutNamespaceTransaction { transaction } => {
+                record_rollback_value(
+                    &mut self.namespace_transactions,
+                    &tables.namespace_transactions,
+                    transaction.transaction_id.clone(),
+                );
+                record_rollback_value(
+                    &mut self.namespace_transaction_receipts,
+                    &tables.namespace_transaction_receipts,
+                    transaction.transaction_id.clone(),
+                );
+            }
+            DfsMetadataTableOp::PutNamespaceTransactionReceipt { receipt } => {
+                record_rollback_value(
+                    &mut self.namespace_transactions,
+                    &tables.namespace_transactions,
+                    receipt.transaction_id.clone(),
+                );
+                record_rollback_value(
+                    &mut self.namespace_transaction_receipts,
+                    &tables.namespace_transaction_receipts,
+                    receipt.transaction_id.clone(),
+                );
+            }
+            DfsMetadataTableOp::PutNamespacePrepare { prepare } => {
+                record_rollback_value(
+                    &mut self.namespace_prepares,
+                    &tables.namespace_prepares,
+                    prepare.operation_id.clone(),
+                );
+                record_rollback_value(
+                    &mut self.namespace_prepare_receipts,
+                    &tables.namespace_prepare_receipts,
+                    prepare.operation_id.clone(),
+                );
+            }
+            DfsMetadataTableOp::PutNamespacePrepareReceipt { receipt } => {
+                record_rollback_value(
+                    &mut self.namespace_prepares,
+                    &tables.namespace_prepares,
+                    receipt.operation_id.clone(),
+                );
+                record_rollback_value(
+                    &mut self.namespace_prepare_receipts,
+                    &tables.namespace_prepare_receipts,
+                    receipt.operation_id.clone(),
+                );
+            }
             DfsMetadataTableOp::PutNamespaceJob { job } => record_rollback_value(
                 &mut self.namespace_jobs,
                 &tables.namespace_jobs,
                 job.job_id.clone(),
             ),
-            DfsMetadataTableOp::PutNamespaceRequest { request } => record_rollback_value(
-                &mut self.namespace_requests,
-                &tables.namespace_requests,
-                (
+            DfsMetadataTableOp::PutNamespaceRequest { request } => {
+                let key = (
                     request.requester_node_id.clone(),
                     request.request_id.clone(),
-                ),
-            ),
+                );
+                record_rollback_value(
+                    &mut self.namespace_requests,
+                    &tables.namespace_requests,
+                    key.clone(),
+                );
+                record_rollback_value(
+                    &mut self.namespace_request_receipts,
+                    &tables.namespace_request_receipts,
+                    key,
+                );
+            }
+            DfsMetadataTableOp::PutNamespaceRequestReceipt { receipt } => {
+                let key = (
+                    receipt.requester_node_id.clone(),
+                    receipt.request_id.clone(),
+                );
+                record_rollback_value(
+                    &mut self.namespace_requests,
+                    &tables.namespace_requests,
+                    key.clone(),
+                );
+                record_rollback_value(
+                    &mut self.namespace_request_receipts,
+                    &tables.namespace_request_receipts,
+                    key,
+                );
+            }
         }
     }
 
@@ -974,11 +1352,23 @@ impl DfsMetadataTableRollback {
             &mut tables.namespace_transactions,
             self.namespace_transactions,
         );
+        rollback_map(
+            &mut tables.namespace_transaction_receipts,
+            self.namespace_transaction_receipts,
+        );
         rollback_map(&mut tables.namespace_prepares, self.namespace_prepares);
+        rollback_map(
+            &mut tables.namespace_prepare_receipts,
+            self.namespace_prepare_receipts,
+        );
         tables.rebuild_namespace_prepare_footprint_indexes();
         tables.rebuild_namespace_prepare_request_index();
         rollback_map(&mut tables.namespace_jobs, self.namespace_jobs);
         rollback_map(&mut tables.namespace_requests, self.namespace_requests);
+        rollback_map(
+            &mut tables.namespace_request_receipts,
+            self.namespace_request_receipts,
+        );
         tables.rebuild_pending_namespace_request_index();
     }
 }

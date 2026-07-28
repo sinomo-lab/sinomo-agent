@@ -402,10 +402,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if recovered > 0 {
                 let mut unresolved = Vec::with_capacity(locally_authoritative.len());
                 for request in locally_authoritative {
-                    let current = self
+                    let backend = self
                         .metadata_backend
                         .as_ref()
-                        .expect("metadata backend checked above")
+                        .expect("metadata backend checked above");
+                    if backend
+                        .get_namespace_request_receipt(
+                            &request.requester_node_id,
+                            &request.request_id,
+                        )?
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    let current = backend
                         .get_namespace_request(&request.requester_node_id, &request.request_id)?
                         .ok_or_else(|| DfsError::Metadata {
                             message: format!(
@@ -446,7 +456,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .as_ref()
                 .expect("metadata backend checked above")
                 .get_namespace_request(&request.requester_node_id, &request.request_id)?;
-            if current.is_some_and(|current| current.status == DfsNamespaceRequestStatus::Completed)
+            let compacted = self
+                .metadata_backend
+                .as_ref()
+                .expect("metadata backend checked above")
+                .get_namespace_request_receipt(&request.requester_node_id, &request.request_id)?
+                .is_some();
+            if compacted
+                || current
+                    .is_some_and(|current| current.status == DfsNamespaceRequestStatus::Completed)
             {
                 report.resolved = report.resolved.saturating_add(1);
                 report.remaining = report.remaining.saturating_sub(1);
@@ -492,13 +510,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         recovering: bool,
     ) -> Result<DurableNamespaceRequestAdmission, DfsError> {
         let digest = namespace_command_digest(command)?;
-        let existing = self
+        let backend = self
             .metadata_backend
             .as_ref()
             .ok_or_else(|| DfsError::Metadata {
                 message: "routed namespace mutation requires durable request admission".to_string(),
-            })?
-            .get_namespace_request(requester_node_id, &command.request_id)?;
+            })?;
+        if let Some(receipt) =
+            backend.get_namespace_request_receipt(requester_node_id, &command.request_id)?
+        {
+            if receipt.file_system_id != command.file_system_id || receipt.command_digest != digest
+            {
+                return Ok(DurableNamespaceRequestAdmission::Reject {
+                    reason: format!(
+                        "namespace request id {}/{} was already used for a different command",
+                        requester_node_id, command.request_id
+                    ),
+                });
+            }
+            return Ok(DurableNamespaceRequestAdmission::Replay {
+                result: receipt.result,
+                posix_coordination_result: receipt.posix_coordination_result,
+            });
+        }
+        let existing = backend.get_namespace_request(requester_node_id, &command.request_id)?;
         if let Some(mut existing) = existing {
             if existing.file_system_id != command.file_system_id
                 || existing.command_digest != digest
@@ -527,17 +562,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             command.request_id.clone(),
                         )]);
                         self.recover_durable_namespace_prepares_for_requests(&request_key, 1)?;
-                        existing = self
+                        let recovered = self
                             .metadata_backend
                             .as_ref()
                             .expect("metadata backend checked above")
-                            .get_namespace_request(requester_node_id, &command.request_id)?
-                            .ok_or_else(|| DfsError::Metadata {
+                            .get_namespace_request(requester_node_id, &command.request_id)?;
+                        if let Some(recovered) = recovered {
+                            existing = recovered;
+                        } else if let Some(receipt) = self
+                            .metadata_backend
+                            .as_ref()
+                            .expect("metadata backend checked above")
+                            .get_namespace_request_receipt(requester_node_id, &command.request_id)?
+                        {
+                            return Ok(DurableNamespaceRequestAdmission::Replay {
+                                result: receipt.result,
+                                posix_coordination_result: receipt.posix_coordination_result,
+                            });
+                        } else {
+                            return Err(DfsError::Metadata {
                                 message: format!(
                                     "request-owned namespace prepare lost admission {}/{} during recovery",
                                     requester_node_id, command.request_id
                                 ),
-                            })?;
+                            });
+                        }
                     }
                     if existing.status == DfsNamespaceRequestStatus::Pending {
                         return Ok(DurableNamespaceRequestAdmission::Reject {
@@ -572,6 +621,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     })
                 }
             };
+        }
+        if backend.namespace_request_history_expired_on_shard(&shard_id, &command.request_id)? {
+            return Ok(DurableNamespaceRequestAdmission::Reject {
+                reason: format!(
+                    "namespace request {}/{} idempotency history expired or is unknown",
+                    requester_node_id, command.request_id
+                ),
+            });
         }
 
         let now = time::OffsetDateTime::now_utc();
@@ -612,6 +669,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         result: DfsNamespaceResult,
         posix_coordination_result: Option<DfsPosixCoordinationResult>,
     ) -> Result<(DfsNamespaceResult, Option<DfsPosixCoordinationResult>), DfsError> {
+        if let Some(receipt) = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "routed namespace mutation lost its durable request backend".to_string(),
+            })?
+            .get_namespace_request_receipt(&record.requester_node_id, &record.request_id)?
+        {
+            if receipt.command_digest != record.command_digest
+                || receipt.file_system_id != record.file_system_id
+            {
+                return Err(DfsError::Metadata {
+                    message: format!(
+                        "namespace request receipt {}/{} conflicts with the active command",
+                        record.requester_node_id, record.request_id
+                    ),
+                });
+            }
+            return Ok((receipt.result, receipt.posix_coordination_result));
+        }
         if let Some(existing) = self
             .metadata_backend
             .as_ref()

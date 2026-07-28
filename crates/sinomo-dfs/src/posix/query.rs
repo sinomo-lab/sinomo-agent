@@ -42,11 +42,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .split('/')
             .filter(|component| !component.is_empty())
             .collect::<Vec<_>>();
+        // One capability walk observes one immutable shard catalog. Refreshing
+        // the control-plane catalog for every component made deep-path lookup
+        // cost proportional to both path depth and catalog size, and could
+        // route different components through different topology generations.
+        let shard_snapshot = self.refresh_sifs_metadata_shards()?;
         let mut current = "/".to_string();
         // The filesystem root is part of every capability path. Validate it
         // explicitly instead of assuming the ordinary resolver's invariant.
         let file_system_root = self
-            .lookup_sifs_path_direct_distributed_synced(&current)?
+            .lookup_sifs_path_direct_distributed_synced_from_snapshot(
+                &current,
+                shard_snapshot.as_deref(),
+            )?
             .ok_or_else(|| DfsPosixError::NotFound {
                 path: current.clone(),
             })?;
@@ -72,7 +80,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             for (index, component) in components.iter().enumerate() {
                 current = join_posix_path(&current, component);
                 let object = self
-                    .lookup_sifs_path_direct_distributed_synced(&current)?
+                    .lookup_sifs_path_direct_distributed_synced_from_snapshot(
+                        &current,
+                        shard_snapshot.as_deref(),
+                    )?
                     .ok_or_else(|| DfsPosixError::NotFound {
                         path: current.clone(),
                     })?;
@@ -184,27 +195,45 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_stat(&self, path: &str) -> Result<DfsStat> {
         self.with_metadata_lookup_cache(|service| {
             let path = service.resolve_existing_posix_path(path, true)?;
-            service.posix_lstat(&path)
+            service.stat_resolved_posix_path(&path)
         })
     }
 
     pub fn posix_stat_distributed(&mut self, path: &str) -> Result<DfsStat> {
         self.check_cancelled("distributed stat")?;
         let path = self.resolve_existing_posix_path_distributed(path, true)?;
-        self.posix_lstat_distributed(&path)
+        let shard_snapshot = self.refresh_sifs_metadata_shards()?;
+        let object = self
+            .lookup_sifs_path_direct_distributed_synced_from_snapshot(
+                &path,
+                shard_snapshot.as_deref(),
+            )?
+            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+        if object.kind == DfsObjectKind::Tombstone {
+            return Err(DfsPosixError::NotFound { path });
+        }
+        self.stat_object_for_path(&object, &path)
     }
 
     pub fn posix_lstat(&self, path: &str) -> Result<DfsStat> {
         self.with_metadata_lookup_cache(|service| {
             let path = service.resolve_existing_posix_path(path, false)?;
-            let object = service
-                .lookup_sifs_path(&path)?
-                .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-            if object.kind == DfsObjectKind::Tombstone {
-                return Err(DfsPosixError::NotFound { path });
-            }
-            service.stat_object_for_path(&object, &path)
+            service.stat_resolved_posix_path(&path)
         })
+    }
+
+    fn stat_resolved_posix_path(&self, path: &str) -> Result<DfsStat> {
+        let object = self
+            .lookup_sifs_path(path)?
+            .ok_or_else(|| DfsPosixError::NotFound {
+                path: path.to_string(),
+            })?;
+        if object.kind == DfsObjectKind::Tombstone {
+            return Err(DfsPosixError::NotFound {
+                path: path.to_string(),
+            });
+        }
+        self.stat_object_for_path(&object, path)
     }
 
     pub fn posix_lstat_distributed(&mut self, path: &str) -> Result<DfsStat> {

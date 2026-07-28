@@ -899,7 +899,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // failover guard and must update it on every replayed transition.
             DfsMetadataMutation::PutAdvisoryLockState { .. }
             | DfsMetadataMutation::PutNamespacePrepare { .. }
-            | DfsMetadataMutation::PutNamespaceRequest { .. } => {}
+            | DfsMetadataMutation::PutNamespaceRequest { .. }
+            | DfsMetadataMutation::PutNamespaceTransactionReceipt { .. }
+            | DfsMetadataMutation::PutNamespacePrepareReceipt { .. }
+            | DfsMetadataMutation::PutNamespaceRequestReceipt { .. } => {}
             DfsMetadataMutation::PutNamespaceJob { job, .. } => {
                 let Some(job) = job.as_ref() else {
                     self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
@@ -1032,7 +1035,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             DfsMetadataMutation::PutAdvisoryLockState { .. }
             | DfsMetadataMutation::PutNamespacePrepare { .. }
-            | DfsMetadataMutation::PutNamespaceRequest { .. } => {}
+            | DfsMetadataMutation::PutNamespaceRequest { .. }
+            | DfsMetadataMutation::PutNamespaceTransactionReceipt { .. }
+            | DfsMetadataMutation::PutNamespacePrepareReceipt { .. }
+            | DfsMetadataMutation::PutNamespaceRequestReceipt { .. } => {}
             DfsMetadataMutation::PutNamespaceJob { job_id, .. } => {
                 let job = self
                     .metadata_backend

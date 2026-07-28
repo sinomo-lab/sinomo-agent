@@ -6,7 +6,7 @@ use crate::metadata_records::{DfsDirectoryPageCursor, DfsNamespaceJobKind};
 use crate::protocol::DfsNamespacePosixError;
 use crate::{
     DfsConflictReadView, DfsError, DfsFileSystemId, DfsObjectId, DfsObjectKind,
-    DfsReplicationPolicy, DfsVersion,
+    DfsReplicationPolicy, DfsVerifiedReadStream, DfsVersion,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::DfsObjectPolicy;
@@ -148,6 +148,55 @@ pub struct DfsPosixFileRangeReadStream {
     pub total_size_bytes: u64,
     pub range_size_bytes: u64,
     pub reader: ObjectVersionReader,
+}
+
+/// Remote POSIX full-file read retaining the object-RPC owned-chunk stream.
+///
+/// Callers should consume `stream.next_chunk()` and await its finalizer.
+/// [`Self::collect_to_vec`] is the explicit compatibility path for APIs which
+/// still require one contiguous byte vector.
+#[derive(Debug)]
+pub struct DfsPosixRemoteFileReadStream {
+    pub object_id: DfsObjectId,
+    pub version: DfsVersion,
+    pub content_hash: String,
+    pub size_bytes: usize,
+    pub stream: DfsVerifiedReadStream,
+}
+
+impl DfsPosixRemoteFileReadStream {
+    pub async fn collect_to_vec(self) -> Result<Vec<u8>> {
+        self.stream
+            .collect_to_vec(self.size_bytes)
+            .await
+            .map(|(bytes, _completion)| bytes)
+            .map_err(DfsError::from_network)
+            .map_err(Into::into)
+    }
+}
+
+/// Remote POSIX range read retaining the same object-RPC owned-chunk stream as
+/// a full read.
+#[derive(Debug)]
+pub struct DfsPosixRemoteFileRangeReadStream {
+    pub object_id: DfsObjectId,
+    pub version: DfsVersion,
+    pub content_hash: String,
+    pub offset: u64,
+    pub total_size_bytes: u64,
+    pub range_size_bytes: usize,
+    pub stream: DfsVerifiedReadStream,
+}
+
+impl DfsPosixRemoteFileRangeReadStream {
+    pub async fn collect_to_vec(self) -> Result<Vec<u8>> {
+        self.stream
+            .collect_to_vec(self.range_size_bytes)
+            .await
+            .map(|(bytes, _completion)| bytes)
+            .map_err(DfsError::from_network)
+            .map_err(Into::into)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

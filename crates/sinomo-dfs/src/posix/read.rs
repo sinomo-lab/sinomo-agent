@@ -16,12 +16,13 @@ use crate::posix_model::{
 };
 use crate::posix_path::normalize_posix_path;
 use crate::{
-    DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest, DfsError, DfsMessageTransport,
-    DfsNetworkMessage, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsPosixFilePrefixRead,
-    DfsReadData, DfsReadRangeData, DfsReadResult, DfsVersion, NetworkedDfsRangeReadOutcome,
-    NetworkedDfsRangeReadStreamOutcome, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
-    NetworkedDfsReadStreamOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
-    sifs_file_system_id,
+    DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest, DfsDirectReadClientResult,
+    DfsError, DfsMessageTransport, DfsNetworkMessage, DfsNodeTransport, DfsObjectId, DfsObjectKind,
+    DfsObjectMetadata, DfsPosixFilePrefixRead, DfsPosixRemoteFileRangeReadStream,
+    DfsPosixRemoteFileReadStream, DfsReadData, DfsReadRangeData, DfsReadResult, DfsVersion,
+    NetworkedDfsRangeReadOutcome, NetworkedDfsRangeReadStreamOutcome, NetworkedDfsReadFreshness,
+    NetworkedDfsReadOutcome, NetworkedDfsReadStreamOutcome, NetworkedDfsService,
+    NetworkedDfsServiceEvent, sifs_file_system_id,
 };
 use sinomo_core::events::EventId;
 use sinomo_core::node::NodeId;
@@ -1326,6 +1327,76 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
                 Err(read_conflict_error(path, conflicts))
             }
+        }
+    }
+}
+
+impl NetworkedDfsService<DfsNodeTransport> {
+    /// Resolves current path metadata and opens the remote full-file body
+    /// without materializing it into a `Vec`.
+    ///
+    /// Local reads continue to use [`Self::posix_open_file_stream`]. This
+    /// method is the public POSIX boundary for a caller that needs a remote
+    /// replica and wants ownership-bearing object-RPC chunks.
+    pub async fn posix_open_remote_file_stream(
+        &mut self,
+        path: &str,
+    ) -> Result<DfsPosixRemoteFileReadStream> {
+        self.check_cancelled("distributed stream read")?;
+        let (path, object) = self.distributed_posix_file_content_object(path, true)?;
+        let response = self
+            .read_remote_object_metadata_stream(&object, None)
+            .await?;
+        match response.result {
+            DfsDirectReadClientResult::Found(data) => Ok(DfsPosixRemoteFileReadStream {
+                object_id: data.object_id,
+                version: data.version,
+                content_hash: data.content_hash,
+                size_bytes: data.content_size_bytes,
+                stream: data.stream,
+            }),
+            DfsDirectReadClientResult::NotFound => Err(DfsPosixError::NotFound { path }),
+            DfsDirectReadClientResult::Rejected { reason } => {
+                Err(DfsError::Distributed { message: reason }.into())
+            }
+            DfsDirectReadClientResult::RangeFound(_) => Err(DfsError::Serialization {
+                message: "full POSIX remote read received a range response".to_string(),
+            }
+            .into()),
+        }
+    }
+
+    /// Resolves current path metadata and opens a remote bounded range through
+    /// the same stream-native object-RPC carrier as a full read.
+    pub async fn posix_open_remote_file_range_stream(
+        &mut self,
+        path: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<DfsPosixRemoteFileRangeReadStream> {
+        self.check_cancelled("distributed range stream read")?;
+        let (path, object) = self.distributed_posix_file_content_object(path, true)?;
+        let response = self
+            .read_remote_object_metadata_stream(&object, Some((offset, max_bytes)))
+            .await?;
+        match response.result {
+            DfsDirectReadClientResult::RangeFound(data) => Ok(DfsPosixRemoteFileRangeReadStream {
+                object_id: data.object_id,
+                version: data.version,
+                content_hash: data.content_hash,
+                offset: data.offset,
+                total_size_bytes: data.total_size_bytes,
+                range_size_bytes: data.range_size_bytes,
+                stream: data.stream,
+            }),
+            DfsDirectReadClientResult::NotFound => Err(DfsPosixError::NotFound { path }),
+            DfsDirectReadClientResult::Rejected { reason } => {
+                Err(DfsError::Distributed { message: reason }.into())
+            }
+            DfsDirectReadClientResult::Found(_) => Err(DfsError::Serialization {
+                message: "POSIX remote range read received a full-object response".to_string(),
+            }
+            .into()),
         }
     }
 }

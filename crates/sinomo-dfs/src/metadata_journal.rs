@@ -994,6 +994,65 @@ pub(crate) fn journal_segment_id(sequence: u64) -> u64 {
         .saturating_add(1)
 }
 
+/// Remove complete journal segments strictly older than an authoritative,
+/// durable materialization checkpoint.
+///
+/// The segment containing `checkpoint_sequence` is deliberately retained even
+/// when the checkpoint lands on its final entry. A replica whose cursor
+/// predates the retained suffix will therefore receive a non-contiguous first
+/// entry, reject it, and enter the existing authoritative snapshot-repair
+/// path. Never pruning the checkpoint segment also keeps a bounded durable
+/// witness for that gap when no newer writes exist.
+pub(crate) fn prune_segmented_journal_before_checkpoint(
+    root: &Path,
+    checkpoint_sequence: u64,
+) -> Result<usize> {
+    if checkpoint_sequence == 0 {
+        return Ok(0);
+    }
+    let retain_segment_id = journal_segment_id(checkpoint_sequence);
+    if retain_segment_id <= 1 {
+        return Ok(0);
+    }
+    let segments_dir = root.join("journal").join("segments");
+    if !segments_dir.exists() {
+        return Ok(0);
+    }
+
+    let mut removed_paths = Vec::new();
+    for entry in read_dir(&segments_dir)? {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("slog") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Ok(segment_id) = stem.parse::<u64>() else {
+            continue;
+        };
+        if segment_id >= retain_segment_id {
+            continue;
+        }
+        remove_file_if_exists(&path)?;
+        removed_paths.push(path);
+    }
+    if removed_paths.is_empty() {
+        return Ok(0);
+    }
+
+    {
+        let mut cache = journal_segment_index_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for path in &removed_paths {
+            cache.entries.remove(path);
+        }
+    }
+    sync_dir(&segments_dir)?;
+    Ok(removed_paths.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1024,6 +1083,55 @@ mod tests {
             next_after_sequence: last.sequence,
             entries,
         }
+    }
+
+    #[test]
+    fn checkpoint_pruning_retains_a_gap_witness_for_snapshot_fallback() {
+        let root = sinomo_testdir::TestDir::new("dfs-journal-checkpoint-pruning");
+        let first_in_segment_two = JOURNAL_SEGMENT_ENTRY_LIMIT + 1;
+        let first_in_segment_three = JOURNAL_SEGMENT_ENTRY_LIMIT * 2 + 1;
+        for sequence in [1, first_in_segment_two, first_in_segment_three] {
+            append_segmented_journal_entry(root.path(), &test_journal_entry(sequence))
+                .expect("append checkpoint segment witness");
+        }
+
+        // Prime the per-process index so pruning must invalidate stale cache
+        // entries as well as remove the durable files.
+        assert_eq!(
+            journal_entries_since_limited_with_next_sequence(
+                root.path(),
+                0,
+                usize::MAX,
+                first_in_segment_three + 1,
+            )
+            .expect("read unpruned segments")
+            .len(),
+            3
+        );
+        assert_eq!(
+            prune_segmented_journal_before_checkpoint(root.path(), first_in_segment_three)
+                .expect("prune checkpointed segments"),
+            2
+        );
+
+        let segments = root.join("journal").join("segments");
+        assert!(!segments.join(format!("{:020}.slog", 1)).exists());
+        assert!(!segments.join(format!("{:020}.slog", 2)).exists());
+        assert!(segments.join(format!("{:020}.slog", 3)).is_file());
+        assert_eq!(
+            journal_entries_since_limited_with_next_sequence(
+                root.path(),
+                0,
+                usize::MAX,
+                first_in_segment_three + 1,
+            )
+            .expect("read retained checkpoint segment")
+            .into_iter()
+            .map(|entry| entry.sequence)
+            .collect::<Vec<_>>(),
+            vec![first_in_segment_three],
+            "a lagging replica must observe a non-contiguous retained entry and request a snapshot"
+        );
     }
 
     fn linear_bounded_metadata_journal_batch(

@@ -1079,6 +1079,8 @@ mod tests {
             version,
             content_hash: manifest.content_hash,
             content_size_bytes: bytes.len() as u64,
+            range_offset: None,
+            range_max_bytes: None,
         };
         let service = DfsDataPlaneService::new(Arc::new(StubDfsDataPlaneHost::default()));
         let cache_probe = service.clone();

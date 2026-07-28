@@ -458,12 +458,27 @@ pub enum DfsMetadataMutation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transaction: Option<DfsNamespaceTransaction>,
     },
+    /// Fixed-size idempotency evidence for a namespace transaction whose
+    /// materialized objects are already captured by an authoritative table
+    /// snapshot.
+    PutNamespaceTransactionReceipt {
+        file_system_id: DfsFileSystemId,
+        transaction_id: String,
+        receipt: DfsNamespaceTransactionReceipt,
+    },
     PutNamespacePrepare {
         file_system_id: DfsFileSystemId,
         operation_id: String,
         status: DfsNamespacePrepareStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prepare: Option<DfsNamespacePrepareRecord>,
+    },
+    /// Compact terminal prepare evidence. Prepared records never use this
+    /// mutation because recovery still needs their complete transaction.
+    PutNamespacePrepareReceipt {
+        file_system_id: DfsFileSystemId,
+        operation_id: String,
+        receipt: DfsNamespacePrepareReceipt,
     },
     PutNamespaceJob {
         file_system_id: DfsFileSystemId,
@@ -477,6 +492,14 @@ pub enum DfsMetadataMutation {
         request_id: String,
         request: DfsNamespaceRequestRecord,
     },
+    /// Compact canonical response retained after a completed request no longer
+    /// needs its operation or recovery diagnostics.
+    PutNamespaceRequestReceipt {
+        file_system_id: DfsFileSystemId,
+        requester_node_id: NodeId,
+        request_id: String,
+        receipt: DfsNamespaceRequestReceipt,
+    },
 }
 
 impl DfsMetadataMutation {
@@ -484,7 +507,10 @@ impl DfsMetadataMutation {
         match self {
             Self::PutFileSystem { .. }
             | Self::PutNamespaceJob { .. }
-            | Self::PutNamespaceRequest { .. } => {}
+            | Self::PutNamespaceRequest { .. }
+            | Self::PutNamespaceRequestReceipt { .. }
+            | Self::PutNamespaceTransactionReceipt { .. }
+            | Self::PutNamespacePrepareReceipt { .. } => {}
             Self::PutObject { object_id, .. }
             | Self::PutVersion { object_id, .. }
             | Self::PutReceipt { object_id, .. }
@@ -647,12 +673,39 @@ impl DfsMetadataMutation {
         }
     }
 
+    pub(crate) fn put_namespace_request_receipt(receipt: &DfsNamespaceRequestReceipt) -> Self {
+        Self::PutNamespaceRequestReceipt {
+            file_system_id: receipt.file_system_id.clone(),
+            requester_node_id: receipt.requester_node_id.clone(),
+            request_id: receipt.request_id.clone(),
+            receipt: receipt.clone(),
+        }
+    }
+
     pub(crate) fn put_namespace_prepare(prepare: &DfsNamespacePrepareRecord) -> Self {
         Self::PutNamespacePrepare {
             file_system_id: prepare.file_system_id.clone(),
             operation_id: prepare.operation_id.clone(),
             status: prepare.status.clone(),
             prepare: Some(prepare.clone()),
+        }
+    }
+
+    pub(crate) fn put_namespace_prepare_receipt(receipt: &DfsNamespacePrepareReceipt) -> Self {
+        Self::PutNamespacePrepareReceipt {
+            file_system_id: receipt.file_system_id.clone(),
+            operation_id: receipt.operation_id.clone(),
+            receipt: receipt.clone(),
+        }
+    }
+
+    pub(crate) fn put_namespace_transaction_receipt(
+        receipt: &DfsNamespaceTransactionReceipt,
+    ) -> Self {
+        Self::PutNamespaceTransactionReceipt {
+            file_system_id: receipt.file_system_id.clone(),
+            transaction_id: receipt.transaction_id.clone(),
+            receipt: receipt.clone(),
         }
     }
 
@@ -704,6 +757,43 @@ pub struct DfsNamespaceTransaction {
     pub advisory_lock_states: Vec<DfsAdvisoryLockStateRecord>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+}
+
+/// Fixed-size identity retained once a namespace transaction is known to be
+/// completely represented by a durable materialized snapshot.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceTransactionReceipt {
+    pub transaction_id: String,
+    pub file_system_id: DfsFileSystemId,
+    pub transaction_digest: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    /// Start of this terminal identity's bounded exact-retry window.
+    #[serde(with = "time::serde::rfc3339")]
+    pub retained_at: OffsetDateTime,
+}
+
+impl DfsNamespaceTransactionReceipt {
+    pub(crate) fn from_transaction(
+        transaction: &DfsNamespaceTransaction,
+        retained_at: OffsetDateTime,
+    ) -> Result<Self, serde_json::Error> {
+        let encoded = serde_json::to_vec(transaction)?;
+        Ok(Self {
+            transaction_id: transaction.transaction_id.clone(),
+            file_system_id: transaction.file_system_id.clone(),
+            transaction_digest: format!("blake3:{}", blake3::hash(&encoded).to_hex()),
+            created_at: transaction.created_at,
+            retained_at,
+        })
+    }
+
+    pub(crate) fn matches_transaction(
+        &self,
+        transaction: &DfsNamespaceTransaction,
+    ) -> Result<bool, serde_json::Error> {
+        Ok(self == &Self::from_transaction(transaction, self.retained_at)?)
+    }
 }
 
 /// Expected visible version for one object in a hidden namespace prepare.
@@ -769,6 +859,52 @@ pub struct DfsNamespacePrepareRecord {
     pub status: DfsNamespacePrepareStatus,
 }
 
+/// Terminal namespace-prepare identity retained after the complete hidden
+/// transaction is no longer needed for recovery.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespacePrepareReceipt {
+    pub operation_id: String,
+    pub file_system_id: DfsFileSystemId,
+    pub shard_id: DfsMetadataShardId,
+    pub owner_epoch: u64,
+    pub operation_digest: String,
+    pub transaction_id: String,
+    pub status: DfsNamespacePrepareStatus,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    /// Start of this terminal identity's bounded exact-retry window.
+    #[serde(with = "time::serde::rfc3339")]
+    pub retained_at: OffsetDateTime,
+}
+
+impl DfsNamespacePrepareReceipt {
+    pub(crate) fn from_prepare(
+        prepare: &DfsNamespacePrepareRecord,
+        retained_at: OffsetDateTime,
+    ) -> Option<Self> {
+        (prepare.status != DfsNamespacePrepareStatus::Prepared).then(|| Self {
+            operation_id: prepare.operation_id.clone(),
+            file_system_id: prepare.file_system_id.clone(),
+            shard_id: prepare.shard_id.clone(),
+            owner_epoch: prepare.owner_epoch,
+            operation_digest: prepare.operation_digest.clone(),
+            transaction_id: prepare.transaction.transaction_id.clone(),
+            status: prepare.status.clone(),
+            created_at: prepare.transaction.created_at,
+            retained_at,
+        })
+    }
+
+    pub(crate) fn matches_prepare_identity(&self, prepare: &DfsNamespacePrepareRecord) -> bool {
+        self.operation_id == prepare.operation_id
+            && self.file_system_id == prepare.file_system_id
+            && self.shard_id == prepare.shard_id
+            && self.owner_epoch == prepare.owner_epoch
+            && self.operation_digest == prepare.operation_digest
+            && self.transaction_id == prepare.transaction.transaction_id
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsNamespaceRequestStatus {
@@ -802,6 +938,106 @@ pub struct DfsNamespaceRequestRecord {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+/// Compact, canonical response retained for exact retries after a completed
+/// namespace request's operation and recovery bookkeeping have been folded
+/// into an authoritative materialized snapshot.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceRequestReceipt {
+    pub file_system_id: DfsFileSystemId,
+    pub requester_node_id: NodeId,
+    pub request_id: String,
+    pub operation_id: String,
+    pub authority_shard_id: DfsMetadataShardId,
+    pub command_digest: String,
+    pub result: DfsNamespaceResult,
+    pub posix_coordination_result: Option<DfsPosixCoordinationResult>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    /// Start of this terminal identity's bounded exact-retry window.
+    #[serde(with = "time::serde::rfc3339")]
+    pub retained_at: OffsetDateTime,
+}
+
+impl DfsNamespaceRequestReceipt {
+    pub(crate) fn from_request(
+        request: &DfsNamespaceRequestRecord,
+        retained_at: OffsetDateTime,
+    ) -> Option<Self> {
+        if request.status != DfsNamespaceRequestStatus::Completed {
+            return None;
+        }
+        Some(Self {
+            file_system_id: request.file_system_id.clone(),
+            requester_node_id: request.requester_node_id.clone(),
+            request_id: request.request_id.clone(),
+            operation_id: request.operation_id.clone(),
+            authority_shard_id: request.authority_shard_id.clone(),
+            command_digest: request.command_digest.clone(),
+            result: request.result.clone()?,
+            posix_coordination_result: request.posix_coordination_result.clone(),
+            created_at: request.created_at,
+            retained_at,
+        })
+    }
+
+    pub(crate) fn matches_completed_request(&self, request: &DfsNamespaceRequestRecord) -> bool {
+        Self::from_request(request, self.retained_at).as_ref() == Some(self)
+    }
+}
+
+/// Durable high-water marks for terminal idempotency receipts evicted by a
+/// bounded table checkpoint.
+///
+/// Full pending/prepared records are never covered by these floors. A command
+/// at or below a floor is explicitly expired/unknown instead of being admitted
+/// as a fresh mutation after its exact receipt has left the bounded window.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceReceiptRetentionState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_floor: Option<DfsNamespaceReceiptOrderKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepare_floor: Option<DfsNamespaceReceiptOrderKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_evicted_request_order_token: Option<String>,
+    #[serde(default)]
+    pub opaque_request_history_evicted: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
+pub struct DfsNamespaceReceiptOrderKey {
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    pub identity: String,
+}
+
+impl DfsNamespaceReceiptRetentionState {
+    pub(crate) fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub(crate) fn merge_conservative(&mut self, other: Self) {
+        self.transaction_floor = match (self.transaction_floor.take(), other.transaction_floor) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (Some(key), None) | (None, Some(key)) => Some(key),
+            (None, None) => None,
+        };
+        self.prepare_floor = match (self.prepare_floor.take(), other.prepare_floor) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (Some(key), None) | (None, Some(key)) => Some(key),
+            (None, None) => None,
+        };
+        self.max_evicted_request_order_token = match (
+            self.max_evicted_request_order_token.take(),
+            other.max_evicted_request_order_token,
+        ) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (Some(token), None) | (None, Some(token)) => Some(token),
+            (None, None) => None,
+        };
+        self.opaque_request_history_evicted |= other.opaque_request_history_evicted;
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1373,9 +1609,20 @@ pub(crate) struct DfsMetadataTableSnapshotTables {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) namespace_transactions: Vec<DfsNamespaceTransaction>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) namespace_transaction_receipts: Vec<DfsNamespaceTransactionReceipt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) namespace_prepares: Vec<DfsNamespacePrepareRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) namespace_prepare_receipts: Vec<DfsNamespacePrepareReceipt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) namespace_jobs: Vec<DfsNamespaceJobRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) namespace_request_receipts: Vec<DfsNamespaceRequestReceipt>,
+    #[serde(
+        default,
+        skip_serializing_if = "DfsNamespaceReceiptRetentionState::is_empty"
+    )]
+    pub(crate) namespace_receipt_retention: DfsNamespaceReceiptRetentionState,
     pub(crate) namespace_requests: Vec<DfsNamespaceRequestRecord>,
 }
 
@@ -1501,14 +1748,23 @@ pub(crate) enum DfsMetadataTableOp {
     PutNamespaceTransaction {
         transaction: DfsNamespaceTransaction,
     },
+    PutNamespaceTransactionReceipt {
+        receipt: DfsNamespaceTransactionReceipt,
+    },
     PutNamespacePrepare {
         prepare: DfsNamespacePrepareRecord,
+    },
+    PutNamespacePrepareReceipt {
+        receipt: DfsNamespacePrepareReceipt,
     },
     PutNamespaceJob {
         job: DfsNamespaceJobRecord,
     },
     PutNamespaceRequest {
         request: DfsNamespaceRequestRecord,
+    },
+    PutNamespaceRequestReceipt {
+        receipt: DfsNamespaceRequestReceipt,
     },
 }
 
@@ -1586,9 +1842,12 @@ pub(crate) fn metadata_journal_batch_file_system_id(
             | DfsMetadataMutation::PutConflict { file_system_id, .. }
             | DfsMetadataMutation::PutAdvisoryLockState { file_system_id, .. }
             | DfsMetadataMutation::ApplyNamespaceTransaction { file_system_id, .. }
+            | DfsMetadataMutation::PutNamespaceTransactionReceipt { file_system_id, .. }
             | DfsMetadataMutation::PutNamespacePrepare { file_system_id, .. }
+            | DfsMetadataMutation::PutNamespacePrepareReceipt { file_system_id, .. }
             | DfsMetadataMutation::PutNamespaceJob { file_system_id, .. }
-            | DfsMetadataMutation::PutNamespaceRequest { file_system_id, .. } => {
+            | DfsMetadataMutation::PutNamespaceRequest { file_system_id, .. }
+            | DfsMetadataMutation::PutNamespaceRequestReceipt { file_system_id, .. } => {
                 Some(file_system_id.clone())
             }
         })

@@ -168,8 +168,9 @@ pub(crate) use direct_read::{
     DFS_DIRECT_READ_STATUS_FOUND, DFS_DIRECT_READ_STATUS_METADATA_KEY, dfs_direct_read_rpc_result,
 };
 pub use direct_read::{
-    DfsDirectReadAttachmentResponse, DfsDirectReadClientData, DfsDirectReadClientResponse,
-    DfsDirectReadClientResult, dfs_direct_read_response_from_rpc_result, dfs_direct_read_rpc_call,
+    DfsDirectReadAttachmentResponse, DfsDirectReadClientData, DfsDirectReadClientRangeData,
+    DfsDirectReadClientResponse, DfsDirectReadClientResult, DfsReadStreamCompletion,
+    DfsVerifiedReadStream, dfs_direct_read_response_from_rpc_result, dfs_direct_read_rpc_call,
     dfs_direct_read_rpc_request, handle_dfs_direct_read_rpc_request,
 };
 pub use discovery::{
@@ -276,8 +277,9 @@ pub use metadata_records::{
     DfsMetadataSummary, DfsMetadataTableSnapshot, DfsNamespaceJobFrame, DfsNamespaceJobKind,
     DfsNamespaceJobPage, DfsNamespaceJobPageCursor, DfsNamespaceJobRecord, DfsNamespaceJobStatus,
     DfsNamespaceObjectVersionExpectation, DfsNamespacePathOccupantExpectation,
-    DfsNamespacePrepareRecord, DfsNamespacePrepareStatus, DfsNamespaceRequestRecord,
-    DfsNamespaceRequestStatus, DfsNamespaceTransaction, DfsObjectPage, DfsObjectPageCursor,
+    DfsNamespacePrepareReceipt, DfsNamespacePrepareRecord, DfsNamespacePrepareStatus,
+    DfsNamespaceRequestReceipt, DfsNamespaceRequestRecord, DfsNamespaceRequestStatus,
+    DfsNamespaceTransaction, DfsNamespaceTransactionReceipt, DfsObjectPage, DfsObjectPageCursor,
     DfsObjectVersionPage, DfsObjectVersionPageCursor, DfsObjectVersionRecord,
     DfsObjectVersionScanCursor, DfsObjectVersionScanPage, DfsPathRecord,
     DfsPendingNamespaceRequestPage, DfsPendingNamespaceRequestPageCursor, DfsReplicaReceiptPage,
@@ -424,7 +426,8 @@ pub use posix_model::{
     DfsDirEntry, DfsDirEntryPage, DfsNamespaceJobFailure, DfsNamespaceJobMaintenanceReport,
     DfsPosixCreateAttrs, DfsPosixDirectorySyncTarget, DfsPosixError, DfsPosixFilePrefixRead,
     DfsPosixFileRangeReadStream, DfsPosixFileReadStream, DfsPosixFileSyncEvidence,
-    DfsPosixFileSyncTarget, DfsPosixSyncKind, DfsStat, DfsWriteOptions,
+    DfsPosixFileSyncTarget, DfsPosixRemoteFileRangeReadStream, DfsPosixRemoteFileReadStream,
+    DfsPosixSyncKind, DfsStat, DfsWriteOptions,
 };
 pub use protocol::{
     DfsBlobTransferResult, DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest,

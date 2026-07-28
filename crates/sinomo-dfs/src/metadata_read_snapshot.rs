@@ -12,8 +12,9 @@ use std::sync::{Arc, Mutex};
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_records::DfsMetadataPrefixProof;
 use crate::metadata_table_store::{
-    metadata_table_path, metadata_table_snapshot_fingerprint, read_metadata_table_state,
-    read_metadata_table_state_lenient, replay_metadata_table_batches_from,
+    metadata_table_checkpoint_log_path, metadata_table_path, metadata_table_snapshot_fingerprint,
+    read_metadata_table_state, read_metadata_table_state_lenient,
+    replay_metadata_table_batches_from,
 };
 use crate::metadata_tables::{
     DfsMetadataTableState, DfsMetadataTables, DfsMetadataTablesSnapshot,
@@ -28,6 +29,15 @@ pub(crate) fn refresh_metadata_tables(
     table_snapshot_fingerprint: &mut Option<MetadataTableSnapshotFingerprint>,
     prefix_proof: &mut Option<DfsMetadataPrefixProof>,
 ) -> Result<()> {
+    if metadata_table_checkpoint_log_path(root).is_file() {
+        let state = read_metadata_table_state(root)?;
+        *tables = state.tables;
+        *table_log_offset = state.table_log_offset;
+        *materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
+        *table_snapshot_fingerprint = state.snapshot_fingerprint;
+        *prefix_proof = state.prefix_proof;
+        return Ok(());
+    }
     reload_metadata_tables_if_snapshot_changed(
         root,
         tables,
@@ -37,15 +47,16 @@ pub(crate) fn refresh_metadata_tables(
         prefix_proof,
     )?;
     let path = metadata_table_path(root);
-    if !path.is_file() {
-        return Ok(());
-    }
-    let len = fs::metadata(&path)
-        .map(|metadata| metadata.len())
-        .map_err(|source| MetadataBackendError::Io {
-            path: path.clone(),
-            source,
-        })?;
+    let len = match fs::metadata(&path) {
+        Ok(metadata) => metadata.len(),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(MetadataBackendError::Io {
+                path: path.clone(),
+                source,
+            });
+        }
+    };
     if len < *table_log_offset {
         let state = read_metadata_table_state(root)?;
         *tables = state.tables;
@@ -53,6 +64,9 @@ pub(crate) fn refresh_metadata_tables(
         *materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
         *table_snapshot_fingerprint = state.snapshot_fingerprint;
         *prefix_proof = state.prefix_proof;
+        return Ok(());
+    }
+    if len == *table_log_offset {
         return Ok(());
     }
     let replay = replay_metadata_table_batches_from(&path, *table_log_offset, tables)?;
@@ -74,6 +88,12 @@ pub(crate) fn current_tables_snapshot<'a>(
     table_snapshot_fingerprint: &Option<MetadataTableSnapshotFingerprint>,
     read_snapshot_cache: &Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
 ) -> Result<DfsMetadataTablesSnapshot<'a>> {
+    if metadata_table_checkpoint_log_path(root).is_file() {
+        return Ok(snapshot_from_state(
+            read_snapshot_cache,
+            read_metadata_table_state_lenient(root)?,
+        ));
+    }
     let path = metadata_table_path(root);
     let current_snapshot_fingerprint = metadata_table_snapshot_fingerprint(root)?;
     let metadata = match fs::metadata(&path) {

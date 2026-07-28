@@ -2608,6 +2608,8 @@ fn dfs_direct_read_peer_transport_adapters_observe_connectivity() {
         version: DfsVersion::generate(),
         content_hash: content_hash(&expected_bytes),
         content_size_bytes: expected_bytes.len() as u64,
+        range_offset: None,
+        range_max_bytes: None,
     };
 
     let peer = Arc::new(RecordingPeerTransport::default());
@@ -3077,6 +3079,8 @@ async fn direct_read_rpc_keeps_blob_in_the_session_attachment() {
         version: version.clone(),
         content_hash: manifest.content_hash.clone(),
         content_size_bytes: bytes.len() as u64,
+        range_offset: None,
+        range_max_bytes: None,
     };
     let direct_request = dfs_direct_read_rpc_request(&direct_read).expect("direct request");
     assert!(direct_request.is_response_retry_safe());
@@ -3115,6 +3119,395 @@ async fn direct_read_rpc_keeps_blob_in_the_session_attachment() {
     assert_eq!(data.version, version);
     assert_eq!(data.bytes, bytes);
     std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn direct_read_stream_exposes_chunks_before_incremental_digest_finalization() {
+    let object_id = DfsObjectId::generate();
+    let version = DfsVersion::generate();
+    let expected = (0..(512 * 1024))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let mut corrupted = expected.clone();
+    let last = corrupted.len() - 1;
+    corrupted[last] ^= 0x5a;
+    let response = DfsReadResponse {
+        request_id: "direct-read-incremental-finalizer".to_string(),
+        object_id: object_id.clone(),
+        result: DfsReadResult::Found(DfsReadData {
+            object_id,
+            version,
+            content_hash: Some(content_hash(&expected)),
+            bytes: expected,
+        }),
+    };
+    let rpc_result = dfs_direct_read_rpc_result(response).expect("direct-read response head");
+    let (head, _) = rpc_result.into_parts();
+    let streamed =
+        dfs_direct_read_response_from_rpc_result(sinomo_core::network::ObjectRpcResult::new(
+            head,
+            sinomo_core::network::ObjectRpcIncomingBody::bytes(corrupted),
+        ))
+        .expect("stream response head is valid");
+    let DfsDirectReadClientResult::Found(mut data) = streamed.result else {
+        panic!("expected found stream");
+    };
+
+    // Returning the response head and first chunk must not wait for a
+    // whole-body allocation or a digest over a contiguous Vec.
+    let first = data
+        .stream
+        .next_chunk()
+        .await
+        .expect("first stream chunk")
+        .expect("non-empty stream");
+    assert!(!first.is_empty());
+    assert!(data.stream.completion().is_none());
+    let error = data
+        .stream
+        .finish()
+        .await
+        .expect_err("corruption is rejected by the EOF finalizer");
+    assert!(error.to_string().contains("hash mismatch"));
+}
+
+#[tokio::test]
+async fn direct_range_read_uses_the_same_stream_and_compatibility_collector() {
+    let root = temp_root("direct-range-stream");
+    let data_dir = SinomoDataDir::new(&root);
+    data_dir.ensure_root_layout().expect("root layout");
+    let object_id = DfsObjectId::generate();
+    let version = DfsVersion::generate();
+    let bytes = (0..(768 * 1024))
+        .map(|index| (index % 239) as u8)
+        .collect::<Vec<_>>();
+    let content = LocalContentStore::new(data_dir.dfs_dir().join("content")).expect("content");
+    let manifest = content
+        .put_object_version(object_id.as_str(), version.as_str(), &bytes)
+        .expect("put object version");
+    let request = DfsDirectReadRequest {
+        request_id: "direct-range-stream".to_string(),
+        object_id: object_id.clone(),
+        version: version.clone(),
+        content_hash: manifest.content_hash.clone(),
+        content_size_bytes: bytes.len() as u64,
+        range_offset: Some(111_111),
+        range_max_bytes: Some(300_000),
+    };
+    let attachment_response = handle_dfs_direct_read_rpc_request(
+        &data_dir,
+        dfs_direct_read_rpc_request(&request).expect("range request"),
+    )
+    .expect("range attachment");
+    let received = attachment_response
+        .attachment
+        .collect_to_vec(300_000)
+        .await
+        .expect("collect test transport attachment");
+    let streamed =
+        dfs_direct_read_response_from_rpc_result(sinomo_core::network::ObjectRpcResult::new(
+            attachment_response.response,
+            sinomo_core::network::ObjectRpcIncomingBody::bytes(received),
+        ))
+        .expect("decode range stream");
+    let compatible = streamed
+        .collect_to_read_response()
+        .await
+        .expect("explicit compatibility collection");
+    let DfsReadResult::RangeFound(data) = compatible.result else {
+        panic!("expected range result");
+    };
+    assert_eq!(data.object_id, object_id);
+    assert_eq!(data.version, version);
+    assert_eq!(data.offset, 111_111);
+    assert_eq!(data.total_size_bytes, bytes.len() as u64);
+    assert_eq!(data.bytes, bytes[111_111..411_111]);
+}
+
+fn node_transport_with_streamed_direct_read_body(
+    local: NodeId,
+    remote: NodeId,
+    body: ObjectRpcIncomingBody,
+) -> DfsNodeTransport {
+    let body = Arc::new(Mutex::new(Some(body)));
+    let body_for_sender = Arc::clone(&body);
+    let async_direct_sender: AsyncDfsDirectReadSender =
+        Arc::new(move |_target_node_id, request, _options| {
+            let request = request.clone();
+            let body = body_for_sender.lock().expect("stream body slot").take();
+            Box::pin(async move {
+                let body = body.ok_or_else(|| {
+                    DfsPeerTransportError::new("stream test body was requested more than once")
+                })?;
+                let content_size_bytes =
+                    usize::try_from(request.content_size_bytes).map_err(|_| {
+                        DfsPeerTransportError::new("stream test content length does not fit usize")
+                    })?;
+                let stream = DfsVerifiedReadStream::new(
+                    body,
+                    content_size_bytes,
+                    Some(request.content_hash.clone()),
+                )
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+                Ok(DfsDirectReadClientResponse {
+                    request_id: request.request_id,
+                    object_id: request.object_id.clone(),
+                    result: DfsDirectReadClientResult::Found(DfsDirectReadClientData {
+                        object_id: request.object_id,
+                        version: request.version,
+                        content_hash: request.content_hash,
+                        content_size_bytes,
+                        stream,
+                    }),
+                })
+            })
+        });
+    let async_sender: AsyncDfsMessageSender = Arc::new(|_target_node_id, _command, _options| {
+        Box::pin(async {
+            Err(DfsPeerTransportError::new(
+                "stream-native direct read must not use the message sender",
+            ))
+        })
+    });
+    let sync_sender: DfsMessageSender = Arc::new(|_target_node_id, _command, _options| {
+        Err(DfsPeerTransportError::new(
+            "stream-native direct read must not use the synchronous message sender",
+        ))
+    });
+    let sync_direct_sender: DfsDirectReadSender =
+        Arc::new(|_target_node_id, _request, _options| {
+            Err(DfsPeerTransportError::new(
+                "stream-native direct read must not use the synchronous direct sender",
+            ))
+        });
+    DfsNodeTransport::new_with_message_peer_senders(
+        local,
+        [remote],
+        sync_sender,
+        async_sender,
+        sync_direct_sender,
+        async_direct_sender,
+    )
+}
+
+#[tokio::test]
+async fn stream_native_read_is_bounded_for_direct_and_relayed_results() {
+    const CHUNK_BYTES: usize = 32 * 1024;
+    const HEAD_TIMEOUT: Duration = Duration::from_millis(100);
+    const FIRST_CHUNK_TIMEOUT: Duration = Duration::from_millis(100);
+
+    for relay_hops in [0_usize, 1] {
+        let local = NodeId::from_legacy_named(format!("node_stream_read_source_{relay_hops}"))
+            .expect("local");
+        let remote = NodeId::from_legacy_named(format!("node_stream_read_target_{relay_hops}"))
+            .expect("remote");
+        let object_id = DfsObjectId::from_legacy_named(format!("object_stream_read_{relay_hops}"))
+            .expect("object");
+        let version = DfsVersion::from_legacy_named(format!("version_stream_read_{relay_hops}"))
+            .expect("version");
+        let chunks = (0..3)
+            .map(|chunk_index| {
+                (0..CHUNK_BYTES)
+                    .map(|byte_index| ((chunk_index * 37 + byte_index) % 251) as u8)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let expected = chunks.concat();
+        let expected_hash = content_hash(&expected);
+
+        let (source_sender, endpoint_capacity, endpoint_body, relay_task) = if relay_hops == 0 {
+            let (sender, body) =
+                ObjectRpcIncomingBody::test_channel(Some(expected.len() as u64), 1);
+            (sender.clone(), sender, body, None)
+        } else {
+            let (source_sender, mut relay_input) =
+                ObjectRpcIncomingBody::test_channel(Some(expected.len() as u64), 1);
+            let (relay_sender, endpoint_body) =
+                ObjectRpcIncomingBody::test_channel(Some(expected.len() as u64), 1);
+            let endpoint_capacity = relay_sender.clone();
+            // Model the opaque one-hop relay as an ownership transfer
+            // between bounded records. Production relay buffer identity is
+            // covered in sinomo-network; this test covers the DFS-facing
+            // stream contract on top of that topology.
+            let relay_task = tokio::spawn(async move {
+                while let Some(chunk) =
+                    relay_input
+                        .next_chunk()
+                        .await
+                        .map_err(|source| NetworkError::Io {
+                            operation: "read relayed DFS test chunk".to_string(),
+                            detail: source.to_string(),
+                        })?
+                {
+                    relay_sender.send_chunk(chunk).await?;
+                }
+                Ok::<(), NetworkError>(())
+            });
+            (
+                source_sender,
+                endpoint_capacity,
+                endpoint_body,
+                Some(relay_task),
+            )
+        };
+
+        let transport =
+            node_transport_with_streamed_direct_read_body(local, remote.clone(), endpoint_body);
+        let request = DfsDirectReadRequest {
+            request_id: format!("stream-read-{relay_hops}"),
+            object_id,
+            version,
+            content_hash: expected_hash.clone(),
+            content_size_bytes: expected.len() as u64,
+            range_offset: None,
+            range_max_bytes: None,
+        };
+
+        // The response head must arrive before the producer has supplied any
+        // body bytes. This is the observable time-to-first-chunk boundary: the
+        // caller can begin polling the body rather than waiting for collection.
+        let response = tokio::time::timeout(
+            HEAD_TIMEOUT,
+            transport.read_object_stream(&remote, &request),
+        )
+        .await
+        .expect("stream response head must not wait for the body")
+        .expect("stream response head");
+        let DfsDirectReadClientResult::Found(mut data) = response.result else {
+            panic!("expected found stream for {relay_hops}-hop read");
+        };
+        assert_eq!(data.stream.observed_size_bytes(), 0);
+
+        assert!(
+            source_sender
+                .try_send(chunks[0].clone())
+                .expect("enqueue first test chunk"),
+            "the empty source ring must accept the first chunk"
+        );
+        tokio::time::timeout(FIRST_CHUNK_TIMEOUT, async {
+            while endpoint_capacity.available_chunk_capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first chunk must reach the DFS-facing bounded ring");
+        assert!(
+            !endpoint_capacity
+                .try_send(vec![0; CHUNK_BYTES])
+                .expect("probe bounded endpoint ring"),
+            "the DFS-facing stream must not buffer a second chunk past its configured bound"
+        );
+
+        let first_chunk_started = Instant::now();
+        let first = tokio::time::timeout(FIRST_CHUNK_TIMEOUT, data.stream.next_chunk())
+            .await
+            .expect("first DFS chunk time")
+            .expect("read first DFS chunk")
+            .expect("non-empty DFS body");
+        let time_to_first_chunk = first_chunk_started.elapsed();
+        assert_eq!(first.as_ref(), chunks[0].as_slice());
+        assert!(
+            time_to_first_chunk < FIRST_CHUNK_TIMEOUT,
+            "first chunk exceeded the functional timeout"
+        );
+
+        drop(endpoint_capacity);
+        let remaining_chunks = chunks[1..].to_vec();
+        let producer = tokio::spawn(async move {
+            for chunk in remaining_chunks {
+                source_sender.send(chunk).await?;
+            }
+            Ok::<(), NetworkError>(())
+        });
+        let completion = data
+            .stream
+            .finish()
+            .await
+            .expect("incremental DFS digest finalizer");
+        producer
+            .await
+            .expect("join test body producer")
+            .expect("produce test body");
+        if let Some(relay_task) = relay_task {
+            relay_task
+                .await
+                .expect("join one-hop relay")
+                .expect("forward one-hop body");
+        }
+        assert_eq!(completion.content_size_bytes, expected.len());
+        assert_eq!(
+            completion.verified_content_hash.as_deref(),
+            Some(expected_hash.as_str())
+        );
+    }
+}
+
+#[tokio::test]
+async fn posix_remote_stream_returns_before_body_collection() {
+    let local = NodeId::from_legacy_named("node_posix_stream_source").expect("local");
+    let remote = NodeId::from_legacy_named("node_posix_stream_target").expect("remote");
+    let object_id = DfsObjectId::from_legacy_named("object_posix_stream").expect("object");
+    let version = DfsVersion::from_legacy_named("version_posix_stream").expect("version");
+    let bytes = vec![0x5a; 48 * 1024];
+    let expected_hash = content_hash(&bytes);
+    let (body_sender, body) = ObjectRpcIncomingBody::test_channel(Some(bytes.len() as u64), 1);
+    let transport =
+        node_transport_with_streamed_direct_read_body(local.clone(), remote.clone(), body);
+    let root = temp_root("posix-remote-stream-head");
+    let mut service = NetworkedDfsService::new(
+        transport,
+        LocalContentStore::new(root.join("content")).expect("content"),
+    );
+    service
+        .add_file_system(DfsFileSystem::sifs(local))
+        .expect("SIFS metadata");
+    service
+        .add_object_metadata(DfsObjectMetadata {
+            object_id: object_id.clone(),
+            file_system_id: sifs_file_system_id(),
+            path: "/stream-native-read.bin".to_string(),
+            kind: DfsObjectKind::File,
+            tombstone_provenance: None,
+            owner_node_id: remote.clone(),
+            current_locations: vec![remote],
+            content_hash: Some(expected_hash.clone()),
+            content_size_bytes: Some(bytes.len() as u64),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: version.clone(),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        })
+        .expect("remote object metadata");
+
+    // No body chunk has been produced. Any hidden compatibility collector in
+    // the POSIX or service layer would block this future until timeout.
+    let opened = tokio::time::timeout(
+        Duration::from_millis(100),
+        service.posix_open_remote_file_stream("/stream-native-read.bin"),
+    )
+    .await
+    .expect("POSIX stream head must not collect its body")
+    .expect("open POSIX remote stream");
+    assert_eq!(opened.object_id, object_id);
+    assert_eq!(opened.version, version);
+    assert_eq!(opened.content_hash, expected_hash);
+    assert_eq!(opened.stream.observed_size_bytes(), 0);
+
+    body_sender
+        .send(bytes)
+        .await
+        .expect("produce POSIX stream body");
+    drop(body_sender);
+    let completion = opened.stream.finish().await.expect("finalize POSIX stream");
+    assert_eq!(completion.content_size_bytes, 48 * 1024);
 }
 
 #[test]
@@ -3267,9 +3660,14 @@ fn node_transport_async_read_message_uses_direct_sender_and_queues_response() {
                         result: DfsDirectReadClientResult::Found(
                             DfsDirectReadClientData {
                                 content_size_bytes: bytes_for_sender.len(),
-                                attachment: sinomo_core::network::ObjectRpcIncomingBody::bytes(
-                                    bytes_for_sender,
-                                ),
+                                stream: DfsVerifiedReadStream::new(
+                                    sinomo_core::network::ObjectRpcIncomingBody::bytes(
+                                        bytes_for_sender,
+                                    ),
+                                    request.content_size_bytes as usize,
+                                    Some(request.content_hash.clone()),
+                                )
+                                .expect("valid direct-read stream"),
                                 object_id: request.object_id.clone(),
                                 version: request.version.clone(),
                                 content_hash: request.content_hash.clone(),

@@ -903,23 +903,26 @@ impl LocalContentStore {
                 .collect();
         }
 
+        let hashes = versions
+            .iter()
+            .map(|(_, _, bytes)| content_hash(bytes))
+            .collect::<Vec<_>>();
         let mut manifests = Vec::with_capacity(versions.len());
         let mut blob_writes = Vec::new();
         let mut quota_delta = ContentStoreQuotaDelta::default();
         {
-            let _lock = self.lock_packed_blobs()?;
-            let mut index = self.read_packed_blob_index_for_update_unlocked()?;
-            for (object_id, version, bytes) in &versions {
-                let hash = content_hash(bytes);
+            let _locks =
+                self.lock_packed_blob_lanes_for_hashes(hashes.iter().map(String::as_str))?;
+            for ((object_id, version, bytes), hash) in versions.iter().zip(&hashes) {
                 let manifest_path = self.manifest_path(object_id, version);
                 if manifest_path.is_file() {
                     let existing = decode_manifest(&read_file(&manifest_path)?)?;
-                    if existing.content_hash != hash {
+                    if existing.content_hash != *hash {
                         return Err(ContentStoreError::VersionHashConflict {
                             object_id: (*object_id).to_owned(),
                             version: (*version).to_owned(),
                             existing_hash: existing.content_hash,
-                            new_hash: hash,
+                            new_hash: hash.clone(),
                         });
                     }
                     self.ensure_content_manifest_index_best_effort(&existing);
@@ -931,17 +934,18 @@ impl LocalContentStore {
                 let manifest = ContentManifest {
                     object_id: (*object_id).to_owned(),
                     version: (*version).to_owned(),
-                    content_hash: hash,
+                    content_hash: hash.clone(),
                     size_bytes: bytes.len() as u64,
                     extents: Vec::new(),
                 };
                 let loose_readable = blob_path.is_file()
                     && file_content_hash(&blob_path)
                         .is_ok_and(|actual| actual == manifest.content_hash);
-                let packed_readable = match index.entries.get(&manifest.content_hash) {
-                    Some(location) => self.packed_blob_location_readable(location)?,
-                    None => false,
-                };
+                let packed_readable =
+                    match self.packed_blob_location_for_update_unlocked(&manifest.content_hash)? {
+                        Some(location) => self.packed_blob_location_readable(&location)?,
+                        None => false,
+                    };
                 if !loose_readable && !packed_readable {
                     quota_delta.blob_bytes =
                         quota_delta.blob_bytes.saturating_add(bytes.len() as u64);
@@ -950,7 +954,7 @@ impl LocalContentStore {
                 manifests.push(manifest);
             }
             self.ensure_quota_delta(quota_delta)?;
-            let blob_delta = self.write_packed_blobs_unlocked(&mut index, &blob_writes)?;
+            let blob_delta = self.write_packed_blobs_unlocked(&blob_writes)?;
             if !blob_delta.is_zero() {
                 self.apply_stats_delta(blob_delta)?;
             }
@@ -1128,7 +1132,7 @@ impl LocalContentStore {
         reader
             .read_to_end(&mut bytes)
             .map_err(|source| ContentStoreError::Io {
-                path: self.packed_blob_segment_path(&location.segment_id),
+                path: self.packed_blob_location_path(&location),
                 source,
             })?;
         ensure_bytes_match_hash(hash, &bytes)?;
@@ -1880,7 +1884,7 @@ impl LocalContentStore {
         reader
             .read_to_end(&mut bytes)
             .map_err(|source| ContentStoreError::Io {
-                path: self.packed_blob_segment_path(&location.segment_id),
+                path: self.packed_blob_location_path(&location),
                 source,
             })?;
         Ok(content_hash(&bytes) == hash)
@@ -2940,8 +2944,11 @@ impl LocalContentStore {
         let mut blob_writes = Vec::new();
         let mut invalid_loose_blobs = Vec::new();
         {
-            let _lock = self.lock_packed_blobs()?;
-            let mut index = self.read_packed_blob_index_for_update_unlocked()?;
+            let _locks = self.lock_packed_blob_lanes_for_hashes(
+                prepared
+                    .iter()
+                    .map(|prepared| prepared.manifest.content_hash.as_str()),
+            )?;
             for prepared in &prepared {
                 let hash = prepared.manifest.content_hash.as_str();
                 if prepared.blob_path.is_file() {
@@ -2950,8 +2957,8 @@ impl LocalContentStore {
                     }
                     invalid_loose_blobs.push(prepared.blob_path.clone());
                 }
-                if let Some(location) = index.entries.get(hash)
-                    && self.packed_blob_location_readable(location)?
+                if let Some(location) = self.packed_blob_location_for_update_unlocked(hash)?
+                    && self.packed_blob_location_readable(&location)?
                 {
                     continue;
                 }
@@ -2961,7 +2968,7 @@ impl LocalContentStore {
                 blob_writes.push((prepared.manifest.content_hash.clone(), prepared.bytes));
             }
             self.ensure_quota_delta(quota_delta)?;
-            let blob_delta = self.write_packed_blobs_unlocked(&mut index, &blob_writes)?;
+            let blob_delta = self.write_packed_blobs_unlocked(&blob_writes)?;
             if !blob_delta.is_zero() {
                 self.apply_stats_delta(blob_delta)?;
             }
@@ -3365,7 +3372,7 @@ impl LocalContentStore {
                 return Ok(());
             };
             if !checked_blobs.contains_key(content_hash) {
-                let segment_path = self.packed_blob_segment_path(&location.segment_id);
+                let segment_path = self.packed_blob_location_path(&location);
                 let mut reader = match self.open_packed_blob_reader(&location, 0, usize::MAX) {
                     Ok(reader) => reader,
                     Err(error) => {
@@ -3406,7 +3413,7 @@ impl LocalContentStore {
                     object_id: object_id.to_owned(),
                     version: version.to_owned(),
                     content_hash: content_hash.to_owned(),
-                    path: self.packed_blob_segment_path(&location.segment_id),
+                    path: self.packed_blob_location_path(&location),
                     actual_hash: checked.actual_hash.clone(),
                 });
                 return Ok(());
@@ -3418,7 +3425,7 @@ impl LocalContentStore {
                         object_id: object_id.to_owned(),
                         version: version.to_owned(),
                         content_hash: content_hash.to_owned(),
-                        path: self.packed_blob_segment_path(&location.segment_id),
+                        path: self.packed_blob_location_path(&location),
                         expected_size_bytes: size_bytes,
                         actual_size_bytes: checked.size_bytes,
                     });
@@ -3432,7 +3439,7 @@ impl LocalContentStore {
                         object_id: object_id.to_owned(),
                         version: version.to_owned(),
                         content_hash: content_hash.to_owned(),
-                        path: self.packed_blob_segment_path(&location.segment_id),
+                        path: self.packed_blob_location_path(&location),
                         blob_offset,
                         size_bytes,
                         blob_size_bytes: checked.size_bytes,
@@ -3555,7 +3562,7 @@ impl LocalContentStore {
             if referenced_blobs.contains(&content_hash) {
                 continue;
             }
-            let path = self.packed_blob_segment_path(&location.segment_id);
+            let path = self.packed_blob_location_path(&location);
             report.orphan_blob_count = report.orphan_blob_count.saturating_add(1);
             report.orphan_blob_bytes = report.orphan_blob_bytes.saturating_add(location.size_bytes);
             report
@@ -5545,12 +5552,25 @@ mod tests {
                 .exists(),
             "small content should avoid one loose blob file per object"
         );
-        let segment_files = fs::read_dir(root.join(PACKED_BLOB_DIR).join(PACKED_BLOB_SEGMENT_DIR))
-            .expect("pack segment dir")
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.path().is_file())
-            .count();
-        assert_eq!(segment_files, 1);
+        let first_location = store
+            .packed_blob_location(&first.content_hash)
+            .expect("first packed lookup")
+            .expect("first packed location");
+        let second_location = store
+            .packed_blob_location(&second.content_hash)
+            .expect("second packed lookup")
+            .expect("second packed location");
+        let segment_paths = [
+            store.packed_blob_location_path(&first_location),
+            store.packed_blob_location_path(&second_location),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        assert!(segment_paths.iter().all(|path| path.is_file()));
+        assert!(
+            (1..=2).contains(&segment_paths.len()),
+            "two small blobs occupy at most one segment in each hash lane"
+        );
 
         assert_eq!(
             store
@@ -5610,11 +5630,25 @@ mod tests {
             .expect("put second packed object");
 
         assert!(
-            store.packed_blob_index_log_path().is_file(),
+            store
+                .packed_blob_index_log_path_for_hash(&first.content_hash)
+                .expect("first packed lane log path")
+                .is_file()
+                && store
+                    .packed_blob_index_log_path_for_hash(&second.content_hash)
+                    .expect("second packed lane log path")
+                    .is_file(),
             "small packed writes should append compact index records"
         );
         assert!(
-            !store.packed_blob_index_path().exists(),
+            !store
+                .packed_blob_index_path_for_hash(&first.content_hash)
+                .expect("first packed lane index path")
+                .exists()
+                && !store
+                    .packed_blob_index_path_for_hash(&second.content_hash)
+                    .expect("second packed lane index path")
+                    .exists(),
             "small packed writes should not rewrite the full index snapshot on every object"
         );
 
@@ -5640,8 +5674,8 @@ mod tests {
     }
 
     #[test]
-    fn packed_blob_index_cache_is_invalidated_after_local_write() {
-        let root = temp_root("packed_blob_index_cache_is_invalidated_after_local_write");
+    fn packed_blob_index_cache_advances_after_local_write() {
+        let root = temp_root("packed_blob_index_cache_advances_after_local_write");
         let store = LocalContentStore::new(&root).expect("create store");
 
         let first = store
@@ -5660,9 +5694,9 @@ mod tests {
         assert!(
             store
                 .packed_blob_location(&second.content_hash)
-                .expect("read invalidated packed cache")
+                .expect("read advanced packed cache")
                 .is_some(),
-            "same-process packed writes must invalidate the cached index"
+            "same-process packed writes must advance the authoritative cache"
         );
 
         cleanup(&root);
