@@ -8771,6 +8771,9 @@ pub(crate) fn metadata_journal_rejection_allows_snapshot_repair(reason: &str) ->
             && reason.contains("semantic checksum mismatch"))
         || (reason.contains("metadata journal sequence")
             && reason.contains("already exists with a different entry"))
+        || (reason.contains("metadata journal sequence")
+            && reason.contains("within durable prefix")
+            && reason.contains("is missing while replaying shard"))
         || reason.contains("failed to decode segmented journal entry")
         || (reason.contains("metadata journal prefix probe") && reason.contains("state mismatch"))
         || ((reason.contains("metadata journal batch")
@@ -10513,6 +10516,9 @@ mod cursor_update_tests {
         ));
         assert!(metadata_journal_rejection_allows_snapshot_repair(
             "metadata serialization error: metadata shard root cannot extend prefix 2216 with journal entry root:2216"
+        ));
+        assert!(metadata_journal_rejection_allows_snapshot_repair(
+            "metadata serialization error: metadata journal sequence 14159 is within durable prefix 14162 but is missing while replaying shard root"
         ));
         assert!(metadata_journal_rejection_allows_snapshot_repair(
             "metadata serialization error: DFS metadata table snapshot semantic checksum mismatch"
