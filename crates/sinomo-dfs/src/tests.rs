@@ -20128,6 +20128,34 @@ fn hydrate_from_metadata_backend_scans_receipts_once_globally() {
 }
 
 #[test]
+fn recovery_hydration_can_cancel_between_synchronous_backend_phases() {
+    let root = temp_root("recovery-hydration-cancels-between-phases");
+    let node = NodeId::from_legacy_named("node_recovery_hydration_cancel").expect("node");
+    let backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+            .expect("metadata backend");
+    let mut service = NetworkedDfsService::new(
+        InProcessNetwork::new().add_node(node),
+        LocalContentStore::new(root.join("content")).expect("content store"),
+    );
+    service.metadata_backend = Some(Box::new(backend));
+    let cancellation_checks = AtomicUsize::new(0);
+
+    let completed = service
+        .hydrate_from_metadata_backend_for_commit_promotion_recovery_until_cancelled(&|| {
+            cancellation_checks.fetch_add(1, Ordering::SeqCst) >= 1
+        })
+        .expect("cancellable recovery hydration");
+
+    assert!(!completed);
+    assert!(
+        cancellation_checks.load(Ordering::SeqCst) >= 2,
+        "hydration must recheck foreground cancellation after synchronous backend work"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn recovery_hydration_skips_fully_repaired_committed_pending_write() {
     let root = temp_root("hydrate-skips-fully-repaired-committed");
     let owner = NodeId::from_legacy_named("node_hydrate_full_owner").expect("node");

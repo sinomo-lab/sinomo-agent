@@ -85,8 +85,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// write-intent recovery path so receipt threshold evidence remains part
     /// of the visibility decision.
     pub(crate) fn recover_durable_namespace_prepares(&mut self) -> Result<(), DfsError> {
+        let completed = self.recover_durable_namespace_prepares_until_cancelled(&|| false)?;
+        debug_assert!(
+            completed,
+            "non-cancellable DFS namespace-prepare recovery was cancelled"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn recover_durable_namespace_prepares_until_cancelled(
+        &mut self,
+        should_cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<bool, DfsError> {
         if self.control_plane.is_none() {
-            return Ok(());
+            return Ok(true);
+        }
+        if should_cancel() {
+            return Ok(false);
         }
         let snapshot = self
             .metadata_backend
@@ -94,6 +109,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .expect("metadata backend exists during hydration")
             .export_table_snapshot()?;
         let tables = metadata_tables_from_table_snapshot(snapshot, "DFS prepare recovery")?;
+        if should_cancel() {
+            return Ok(false);
+        }
         let mut aborted_write_prepares = tables
             .intents
             .values()
@@ -108,6 +126,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .collect::<Vec<_>>();
         aborted_write_prepares.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
         for prepare in aborted_write_prepares {
+            if should_cancel() {
+                return Ok(false);
+            }
             let Some(authority_object) = self.namespace_prepare_authority_object(&prepare)? else {
                 continue;
             };
@@ -146,9 +167,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         prepares.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
 
         for prepare in prepares {
+            if should_cancel() {
+                return Ok(false);
+            }
             self.recover_one_durable_namespace_prepare(prepare)?;
         }
-        Ok(())
+        Ok(!should_cancel())
     }
 
     /// Finish request-owned prepares before replaying their namespace command.
@@ -268,23 +292,46 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// legitimately survive a shard move; duplicate keys are therefore
     /// omitted from this adoption map so recovery fails closed instead of
     /// assigning ambiguous work to whichever shard happened to scan last.
+    #[cfg(test)]
     pub(crate) fn durable_write_intent_shards(
         &self,
     ) -> Result<BTreeMap<(DfsObjectId, String), DfsMetadataShardId>, DfsError> {
+        let intent_shards = self
+            .durable_write_intent_shards_until_cancelled(&|| false)?
+            .expect("non-cancellable DFS write-intent shard scan was cancelled");
+        Ok(intent_shards)
+    }
+
+    pub(crate) fn durable_write_intent_shards_until_cancelled(
+        &self,
+        should_cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<BTreeMap<(DfsObjectId, String), DfsMetadataShardId>>, DfsError> {
         let Some(backend) = self.metadata_backend.as_ref() else {
-            return Ok(BTreeMap::new());
+            return Ok(Some(BTreeMap::new()));
+        };
+        if should_cancel() {
+            return Ok(None);
         };
         let mut intent_shards = BTreeMap::new();
         let mut ambiguous_intents = BTreeSet::new();
         for status in backend.metadata_shard_statuses()? {
+            if should_cancel() {
+                return Ok(None);
+            }
             let Some(snapshot) = backend.export_shard_table_snapshot(&status.shard_id)? else {
                 continue;
             };
+            if should_cancel() {
+                return Ok(None);
+            }
             let tables = metadata_tables_from_table_snapshot(
                 snapshot,
                 "DFS shard-scoped write-intent recovery",
             )?;
             for ((object_id, intent_id), _) in tables.intents {
+                if should_cancel() {
+                    return Ok(None);
+                }
                 let key = (object_id, intent_id);
                 if ambiguous_intents.contains(&key) {
                     continue;
@@ -298,7 +345,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         }
-        Ok(intent_shards)
+        Ok(Some(intent_shards))
     }
 
     /// Adopt an exact non-terminal write intent on the certified current

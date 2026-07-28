@@ -249,6 +249,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(self)
     }
 
+    pub(crate) fn with_boxed_metadata_backend_for_commit_promotion_recovery_until_cancelled(
+        mut self,
+        backend: Box<dyn DfsMetadataBackend>,
+        should_cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<Self>, DfsError> {
+        self.metadata_backend = Some(backend);
+        if !self.hydrate_from_metadata_backend_for_commit_promotion_recovery_until_cancelled(
+            should_cancel,
+        )? {
+            return Ok(None);
+        }
+        Ok(Some(self))
+    }
+
     pub fn with_boxed_metadata_backend_lazy(
         mut self,
         backend: Box<dyn DfsMetadataBackend>,

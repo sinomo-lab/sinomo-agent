@@ -116,6 +116,7 @@ pub(crate) use cluster_service::{
     open_cluster_dfs_service_with_message_sender_lazy,
     open_cluster_dfs_service_with_peer_transports_for_nodes,
     open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state,
+    open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state_until_cancelled,
 };
 pub(crate) use content_store::content_hash;
 pub use content_store::{
@@ -242,6 +243,7 @@ pub use maintenance::{
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state,
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions,
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions_and_committed_work_tracker,
+    run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions_and_committed_work_tracker_until_hydration_cancelled,
     run_cluster_dfs_maintenance_tick_with_peer_transport, run_dfs_lifecycle_maintenance_with_host,
     run_dfs_maintenance_tick_with_async_host,
     run_dfs_maintenance_tick_with_async_host_and_execution_exclusions,
