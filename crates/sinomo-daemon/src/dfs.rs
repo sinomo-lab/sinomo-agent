@@ -9038,11 +9038,9 @@ mod tests {
             .expect("status after configured maintenance");
         assert_eq!(status.pending_namespace_job_count, 0);
         assert_eq!(status.failed_namespace_job_count, 0);
-        assert!(
-            !daemon_dfs_pending_maintenance_work(&paths)
-                .expect("pending maintenance after tick")
-                .has_work()
-        );
+        let pending =
+            daemon_dfs_pending_maintenance_work(&paths).expect("pending maintenance after tick");
+        assert!(!pending.has_work(), "unexpected pending work: {pending:#?}");
         let backend =
             open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths).expect("metadata backend");
         let job = backend
@@ -10748,6 +10746,12 @@ mod tests {
                 compares: Vec::new(),
                 success: vec![
                     sinomo_core::kv::KvOp::put_serde(
+                        file_system_config_key(&file_system.file_system_id),
+                        &DfsFileSystemConfig::from(&file_system),
+                        None,
+                    )
+                    .expect("filesystem config op"),
+                    sinomo_core::kv::KvOp::put_serde(
                         metadata_shard_key(&file_system.file_system_id, "root"),
                         &root_shard,
                         None,
@@ -10825,9 +10829,19 @@ mod tests {
         assert_eq!(pending.pending_namespace_job_count, 0);
         assert_eq!(pending.metadata_replica_lag_count, 2);
         assert_eq!(pending.pending_local_membership_handoff_count, 0);
+        assert_eq!(pending.due_time_based_maintenance_count, 1);
+        assert_eq!(pending.content_gc_expected_shard_count, 2);
+        assert_eq!(pending.content_gc_covered_shard_count, 0);
+        assert_eq!(
+            pending.content_gc_catalog_blocked_reasons,
+            vec![DfsContentRootCatalogIncompleteReason::CatalogNotDurablyInstalled]
+        );
+        assert!(pending.should_trigger_background_maintenance());
+        let mut metadata_lag_only = pending.clone();
+        metadata_lag_only.due_time_based_maintenance_count = 0;
         assert!(
-            !pending.should_trigger_background_maintenance(),
-            "metadata lag is observable here but owned by retained exact-shard publishers"
+            !metadata_lag_only.should_trigger_background_maintenance(),
+            "metadata lag alone is observable but owned by retained exact-shard publishers: {metadata_lag_only:#?}"
         );
         let DaemonDfsInspectionResponse::FileSystem {
             file_system: Some(file_system_view),

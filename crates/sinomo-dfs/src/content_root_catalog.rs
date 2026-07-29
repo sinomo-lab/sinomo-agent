@@ -27,6 +27,8 @@ pub const DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES: usize = 256;
 pub const DEFAULT_DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRIES: usize =
     DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES;
 const DFS_METADATA_PREFIX_PROOF_DIGEST_PREFIX: &str = "dfs-metadata-prefix-v1:blake3:";
+const DFS_CONTENT_ROOT_CATALOG_JSON_TOPOLOGY_PREFIX: &[u8] =
+    b"sinomo-dfs-content-root-catalog-topology-json-v1\0";
 
 fn catalog_error(detail: impl Into<String>) -> MetadataBackendError {
     MetadataBackendError::Serde(detail.into())
@@ -1549,7 +1551,11 @@ pub fn dfs_content_root_catalog_topology_digest(
     shards: &[DfsMetadataShardConfig],
 ) -> Result<String, MetadataBackendError> {
     let canonical = canonical_content_root_catalog_shards(shards);
-    Ok(blake3::hash(&encode_sobj(&canonical)?).to_hex().to_string())
+    Ok(
+        blake3::hash(&encode_content_root_catalog_topology(&canonical)?)
+            .to_hex()
+            .to_string(),
+    )
 }
 
 /// Digest the complete namespace topology which shares one content store.
@@ -1564,11 +1570,38 @@ pub fn dfs_content_root_catalog_topology_digest_with_file_systems(
     let mut canonical_file_systems = file_systems.to_vec();
     canonical_file_systems.sort_by(|left, right| left.file_system_id.cmp(&right.file_system_id));
     let canonical_shards = canonical_content_root_catalog_shards(shards);
-    Ok(
-        blake3::hash(&encode_sobj(&(canonical_file_systems, canonical_shards))?)
-            .to_hex()
-            .to_string(),
-    )
+    Ok(blake3::hash(&encode_content_root_catalog_topology(&(
+        canonical_file_systems,
+        canonical_shards,
+    ))?)
+    .to_hex()
+    .to_string())
+}
+
+fn encode_content_root_catalog_topology(
+    topology: &impl Serialize,
+) -> Result<Vec<u8>, MetadataBackendError> {
+    match encode_sobj(topology) {
+        Ok(encoded) => Ok(encoded),
+        Err(sobj_error) => {
+            // SOBJ collections require every element to share one inferred
+            // shape. Valid DFS topology can contain mixed enum variants and
+            // policy records with different omitted optional fields, so retain
+            // the legacy digest whenever SOBJ can represent the value and use
+            // a domain-separated canonical JSON fallback otherwise.
+            let json = serde_json::to_vec(topology).map_err(|json_error| {
+                catalog_error(format!(
+                    "DFS content-root catalog topology cannot be encoded as SOBJ ({sobj_error}) or JSON ({json_error})"
+                ))
+            })?;
+            let mut encoded = Vec::with_capacity(
+                DFS_CONTENT_ROOT_CATALOG_JSON_TOPOLOGY_PREFIX.len() + json.len(),
+            );
+            encoded.extend_from_slice(DFS_CONTENT_ROOT_CATALOG_JSON_TOPOLOGY_PREFIX);
+            encoded.extend_from_slice(&json);
+            Ok(encoded)
+        }
+    }
 }
 
 fn canonical_content_root_catalog_shards(
@@ -2056,6 +2089,35 @@ mod tests {
             second.generation_fingerprint().expect("second generation"),
             "a later complete observation must advance durable absence proof even when the metadata head is unchanged"
         );
+    }
+
+    #[test]
+    fn topology_digest_supports_mixed_sifs_policies_and_shard_assignments() {
+        let mut file_system = file_system_config();
+        file_system.subtree_policies = vec![
+            crate::DfsSubtreePolicy::legacy("/files/local", DfsObjectPolicy::LocalOwned),
+            crate::DfsSubtreePolicy::legacy("/services", DfsObjectPolicy::ReplicatedEventual),
+        ];
+        let root_shard = shard_config();
+        let mut services_shard = root_shard.clone();
+        services_shard.shard_id = "services".to_string();
+        services_shard.assignment = DfsMetadataShardAssignment::PathPrefix {
+            prefix: "/services".to_string(),
+        };
+        let shards = vec![root_shard, services_shard];
+
+        let first = dfs_content_root_catalog_topology_digest_with_file_systems(
+            &[file_system.clone()],
+            &shards,
+        )
+        .expect("mixed SIFS topology digest");
+        let second =
+            dfs_content_root_catalog_topology_digest_with_file_systems(&[file_system], &shards)
+                .expect("stable mixed SIFS topology digest");
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(dfs_content_root_catalog_topology_digest(&shards).is_ok());
     }
 
     #[test]

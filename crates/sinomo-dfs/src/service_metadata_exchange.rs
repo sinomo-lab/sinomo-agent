@@ -202,11 +202,34 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut pending_handoffs = Vec::new();
         for entry in control_plane.range_prefix("/dfs/filesystems/")? {
             if content_root_catalog_file_system_config_key_is_exact(&entry.key) {
-                file_systems.push(entry.decode::<DfsFileSystemConfig>()?);
+                file_systems.push(entry.decode::<DfsFileSystemConfig>().map_err(|error| {
+                    DfsError::Metadata {
+                        message: format!(
+                            "content-root catalog filesystem config {} is invalid: {error}",
+                            entry.key
+                        ),
+                    }
+                })?);
             } else if content_root_catalog_metadata_shard_key_is_exact(&entry.key) {
-                shards.push(entry.decode::<DfsMetadataShardConfig>()?);
+                shards.push(entry.decode::<DfsMetadataShardConfig>().map_err(|error| {
+                    DfsError::Metadata {
+                        message: format!(
+                            "content-root catalog metadata shard {} is invalid: {error}",
+                            entry.key
+                        ),
+                    }
+                })?);
             } else if content_root_catalog_membership_handoff_key_is_exact(&entry.key) {
-                pending_handoffs.push(entry.decode::<DfsMetadataShardMembershipHandoff>()?);
+                pending_handoffs.push(
+                    entry
+                        .decode::<DfsMetadataShardMembershipHandoff>()
+                        .map_err(|error| DfsError::Metadata {
+                            message: format!(
+                                "content-root catalog membership handoff {} is invalid: {error}",
+                                entry.key
+                            ),
+                        })?,
+                );
             }
         }
         Ok(Some(DfsContentRootCatalogTopologySnapshot::canonical(
