@@ -6042,6 +6042,12 @@ fn log_dfs_metadata_replication_report(report: DfsMetadataJournalReplicationRepo
     for line in sinomo_dfs::dfs_metadata_replication_notice_lines(&report) {
         tracing::warn!("sinomo daemon {line}");
     }
+    for line in sinomo_dfs::dfs_metadata_replication_fault_notice_lines(&report) {
+        tracing::warn!(
+            healing_class = "fault-inconsistency",
+            "sinomo daemon {line}"
+        );
+    }
 }
 
 pub(crate) fn schedule_daemon_dfs_metadata_publish_on_runtime(

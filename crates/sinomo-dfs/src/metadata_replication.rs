@@ -921,6 +921,32 @@ pub enum DfsMetadataJournalReplicationOutcome {
         next_after_sequence: u64,
         archived_existing: bool,
     },
+    CursorDurabilityInconsistencyDetected {
+        target_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        cursor_after_sequence: u64,
+        durable_head_sequence: u64,
+    },
+    CursorDurabilityInconsistencyHealed {
+        target_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        previous_cursor_after_sequence: u64,
+        next_after_sequence: u64,
+    },
+    CursorDurabilityInconsistencySnapshotInstalled {
+        target_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        previous_cursor_after_sequence: u64,
+        next_after_sequence: u64,
+        archived_existing: bool,
+    },
+    CursorDurabilityInconsistencyUnhealed {
+        target_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        cursor_after_sequence: u64,
+        durable_head_sequence: u64,
+        reason: String,
+    },
     Failed {
         target_node_id: NodeId,
         shard_id: DfsMetadataShardId,
@@ -943,6 +969,7 @@ pub fn dfs_metadata_replication_sent_count(report: &DfsMetadataJournalReplicatio
                 outcome,
                 DfsMetadataJournalReplicationOutcome::Applied { .. }
                     | DfsMetadataJournalReplicationOutcome::SnapshotInstalled { .. }
+                    | DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencySnapshotInstalled { .. }
             )
         })
         .count()
@@ -971,28 +998,172 @@ pub fn dfs_metadata_replication_notice_lines(
             )),
             DfsMetadataJournalReplicationOutcome::Rejected {
                 target_node_id,
+                shard_id,
                 reason,
                 ..
             }
             | DfsMetadataJournalReplicationOutcome::Failed {
                 target_node_id,
+                shard_id,
                 reason,
                 ..
-            } => Some(format!(
-                "DFS metadata replication to {target_node_id} failed: {reason}"
-            )),
+            } => {
+                if dfs_metadata_report_has_cursor_durability_inconsistency(
+                    report,
+                    target_node_id,
+                    shard_id,
+                ) {
+                    None
+                } else {
+                    Some(format!(
+                        "DFS metadata replication to {target_node_id} failed: {reason}"
+                    ))
+                }
+            }
             DfsMetadataJournalReplicationOutcome::BacklogRemaining {
                 target_node_id,
+                shard_id,
                 max_batches,
                 ..
-            } => Some(format!(
-                "DFS metadata replication to {target_node_id} still has backlog after {max_batches} batches"
-            )),
+            } => {
+                if dfs_metadata_report_has_cursor_durability_inconsistency(
+                    report,
+                    target_node_id,
+                    shard_id,
+                ) {
+                    None
+                } else {
+                    Some(format!(
+                        "DFS metadata replication to {target_node_id} still has backlog after {max_batches} batches"
+                    ))
+                }
+            }
             DfsMetadataJournalReplicationOutcome::NoChanges { .. }
             | DfsMetadataJournalReplicationOutcome::MissingRoute { .. }
             | DfsMetadataJournalReplicationOutcome::TopologyMismatchSuppressed { .. }
             | DfsMetadataJournalReplicationOutcome::MissingShard { .. }
-            | DfsMetadataJournalReplicationOutcome::NotPrimary { .. } => None,
+            | DfsMetadataJournalReplicationOutcome::NotPrimary { .. }
+            | DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyDetected {
+                ..
+            }
+            | DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyHealed {
+                ..
+            }
+            | DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencySnapshotInstalled {
+                ..
+            }
+            | DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyUnhealed {
+                ..
+            } => None,
+        })
+        .collect()
+}
+
+fn dfs_metadata_report_has_cursor_durability_inconsistency(
+    report: &DfsMetadataJournalReplicationReport,
+    target_node_id: &NodeId,
+    shard_id: &DfsMetadataShardId,
+) -> bool {
+    report.outcomes.iter().any(|outcome| {
+        matches!(
+            outcome,
+            DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyDetected {
+                target_node_id: detected_target,
+                shard_id: detected_shard,
+                ..
+            } if detected_target == target_node_id && detected_shard == shard_id
+        )
+    })
+}
+
+pub fn dfs_metadata_replication_fault_notice_lines(
+    report: &DfsMetadataJournalReplicationReport,
+) -> Vec<String> {
+    report
+        .outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyDetected {
+                target_node_id,
+                shard_id,
+                cursor_after_sequence,
+                durable_head_sequence,
+            } => Some(format!(
+                "DFS metadata fault healing detected an outbound cursor/durability inconsistency for shard {} target {target_node_id}: cursor={cursor_after_sequence}, durable_head={durable_head_sequence}",
+                shard_id.0
+            )),
+            DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyHealed {
+                target_node_id,
+                shard_id,
+                previous_cursor_after_sequence,
+                next_after_sequence,
+            } => Some(format!(
+                "DFS metadata fault healing reconstructed the outbound cursor for shard {} target {target_node_id} after exact-prefix verification: cursor={previous_cursor_after_sequence}->{next_after_sequence}",
+                shard_id.0
+            )),
+            DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencySnapshotInstalled {
+                target_node_id,
+                shard_id,
+                previous_cursor_after_sequence,
+                next_after_sequence,
+                archived_existing,
+            } => Some(format!(
+                "DFS metadata fault healing repaired shard {} target {target_node_id} with an authoritative snapshot and reconstructed its outbound cursor: cursor={previous_cursor_after_sequence}->{next_after_sequence}, archived_existing={archived_existing}",
+                shard_id.0
+            )),
+            DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyUnhealed {
+                target_node_id,
+                shard_id,
+                cursor_after_sequence,
+                durable_head_sequence,
+                reason,
+            } => Some(format!(
+                "DFS metadata fault healing could not repair the outbound cursor/durability inconsistency for shard {} target {target_node_id}: cursor={cursor_after_sequence}, durable_head={durable_head_sequence}, reason={reason}",
+                shard_id.0
+            )),
+            DfsMetadataJournalReplicationOutcome::Rejected {
+                target_node_id,
+                shard_id,
+                reason,
+            }
+            | DfsMetadataJournalReplicationOutcome::Failed {
+                target_node_id,
+                shard_id,
+                reason,
+            } if dfs_metadata_report_has_cursor_durability_inconsistency(
+                report,
+                target_node_id,
+                shard_id,
+            ) => Some(format!(
+                "DFS metadata fault healing for shard {} target {target_node_id} failed: {reason}",
+                shard_id.0
+            )),
+            DfsMetadataJournalReplicationOutcome::BacklogRemaining {
+                target_node_id,
+                shard_id,
+                after_sequence,
+                max_batches,
+            } if dfs_metadata_report_has_cursor_durability_inconsistency(
+                report,
+                target_node_id,
+                shard_id,
+            ) => Some(format!(
+                "DFS metadata fault healing for shard {} target {target_node_id} was deferred at sequence {after_sequence} after {max_batches} batches",
+                shard_id.0
+            )),
+            DfsMetadataJournalReplicationOutcome::MissingRoute {
+                target_node_id,
+                shard_id,
+                ..
+            } if dfs_metadata_report_has_cursor_durability_inconsistency(
+                report,
+                target_node_id,
+                shard_id,
+            ) => Some(format!(
+                "DFS metadata fault healing for shard {} target {target_node_id} is waiting for a replication route",
+                shard_id.0
+            )),
+            _ => None,
         })
         .collect()
 }
@@ -1075,11 +1246,13 @@ enum DfsMetadataPublishRetryClass {
 fn dfs_metadata_publish_retry_class(
     report: &DfsMetadataJournalReplicationReport,
 ) -> DfsMetadataPublishRetryClass {
-    if report
-        .outcomes
-        .iter()
-        .any(|outcome| matches!(outcome, DfsMetadataJournalReplicationOutcome::Failed { .. }))
-    {
+    if report.outcomes.iter().any(|outcome| {
+        matches!(
+            outcome,
+            DfsMetadataJournalReplicationOutcome::Failed { .. }
+                | DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyUnhealed { .. }
+        )
+    }) {
         return DfsMetadataPublishRetryClass::Failed;
     }
     let backlog = report
@@ -1106,6 +1279,11 @@ fn dfs_metadata_publish_retry_class(
                     applied_target == *target_node_id && applied_shard == *shard_id && *entries > 0
                 }
                 DfsMetadataJournalReplicationOutcome::SnapshotInstalled {
+                    target_node_id: installed_target,
+                    shard_id: installed_shard,
+                    ..
+                } => installed_target == *target_node_id && installed_shard == *shard_id,
+                DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencySnapshotInstalled {
                     target_node_id: installed_target,
                     shard_id: installed_shard,
                     ..
@@ -2820,6 +2998,13 @@ pub(crate) struct DfsPreparedMetadataJournalTargetPublish {
     pub(crate) commands: Vec<DfsMetadataJournalBatchCommand>,
     pub(crate) backlog_after_sequence: Option<u64>,
     pub(crate) caught_up_probe: bool,
+    cursor_durability_inconsistency: Option<DfsMetadataCursorDurabilityInconsistency>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DfsMetadataCursorDurabilityInconsistency {
+    cursor_after_sequence: u64,
+    durable_head_sequence: u64,
 }
 
 fn validate_prepared_caught_up_probe(
@@ -2828,17 +3013,27 @@ fn validate_prepared_caught_up_probe(
     if !target.caught_up_probe {
         return Ok(());
     }
-    let valid = target.commands.len() == 1 && {
+    let expected_probe_sequence = target
+        .cursor_durability_inconsistency
+        .map(|inconsistency| inconsistency.durable_head_sequence)
+        .unwrap_or(target.after_sequence);
+    let valid_inconsistency = target
+        .cursor_durability_inconsistency
+        .is_none_or(|inconsistency| {
+            inconsistency.cursor_after_sequence == target.after_sequence
+                && inconsistency.cursor_after_sequence < inconsistency.durable_head_sequence
+        });
+    let valid = valid_inconsistency && target.commands.len() == 1 && {
         let command = &target.commands[0];
         command.batch.entries.is_empty()
             && command.batch.shard_id == target.shard_id
-            && command.batch.next_after_sequence == target.after_sequence
+            && command.batch.next_after_sequence == expected_probe_sequence
             && command.verify_prefix_only
             && command.prefix_probe.as_ref().is_some_and(|probe| {
                 probe.file_system_id.as_ref() == Some(&target.file_system_id)
                     && probe.authority_epoch == Some(target.shard_epoch)
                     && probe.shard_id == target.shard_id
-                    && probe.journal_sequence == target.after_sequence
+                    && probe.journal_sequence == expected_probe_sequence
                     && !probe.barrier_id.is_empty()
                     && !probe.state_fingerprint.is_empty()
                     && probe.primary_handoff_id.is_none()
@@ -2851,7 +3046,7 @@ fn validate_prepared_caught_up_probe(
         Err(DfsError::Metadata {
             message: format!(
                 "caught-up metadata probe for shard {} must contain exactly one empty exact-prefix batch at sequence {}",
-                target.shard_id.0, target.after_sequence
+                target.shard_id.0, expected_probe_sequence
             ),
         })
     }
@@ -3382,6 +3577,14 @@ enum DfsPreparedMetadataJournalPayload {
     CaughtUp {
         state_fingerprint: String,
     },
+    CursorDurabilityInconsistency {
+        durable_head_sequence: u64,
+        state_fingerprint: String,
+    },
+    CursorDurabilityInconsistencyUnhealed {
+        durable_head_sequence: u64,
+        reason: String,
+    },
     Batches {
         batches: Vec<DfsMetadataJournalBatch>,
         backlog_after_sequence: Option<u64>,
@@ -3414,6 +3617,25 @@ fn prepare_dfs_metadata_journal_target_publish(
                 )?
                 else {
                     if batches.is_empty() {
+                        let durable_head_sequence = backend.journal_last_sequence()?;
+                        if after_sequence < durable_head_sequence {
+                            let state_fingerprint =
+                                crate::service_sync::metadata_shard_state_fingerprint_at(
+                                    backend,
+                                    &shard_id,
+                                    durable_head_sequence,
+                                )?;
+                            break DfsPreparedMetadataJournalPayload::CursorDurabilityInconsistency {
+                                durable_head_sequence,
+                                state_fingerprint,
+                            };
+                        }
+                        if after_sequence > durable_head_sequence {
+                            break DfsPreparedMetadataJournalPayload::CursorDurabilityInconsistencyUnhealed {
+                                durable_head_sequence,
+                                reason: "the outbound cursor is ahead of the local durable metadata head; refusing to lower it without stronger recovery evidence".to_string(),
+                            };
+                        }
                         if !options.probe_caught_up_replicas {
                             break DfsPreparedMetadataJournalPayload::NoChanges;
                         }
@@ -3486,9 +3708,54 @@ fn prepare_dfs_metadata_journal_target_publish(
                     commands: vec![command],
                     backlog_after_sequence: None,
                     caught_up_probe: true,
+                    cursor_durability_inconsistency: None,
                 },
             })
         }
+        DfsPreparedMetadataJournalPayload::CursorDurabilityInconsistency {
+            durable_head_sequence,
+            state_fingerprint,
+        } => {
+            let command = dfs_metadata_caught_up_probe_command(
+                local_node_id,
+                &target_node_id,
+                &file_system_id,
+                &shard_id,
+                shard_epoch,
+                durable_head_sequence,
+                state_fingerprint,
+            );
+            Ok(DfsPreparedMetadataJournalTargetPublishResult::Publish {
+                target: DfsPreparedMetadataJournalTargetPublish {
+                    target_node_id,
+                    file_system_id,
+                    shard_id,
+                    shard_epoch,
+                    after_sequence,
+                    commands: vec![command],
+                    backlog_after_sequence: None,
+                    caught_up_probe: true,
+                    cursor_durability_inconsistency: Some(
+                        DfsMetadataCursorDurabilityInconsistency {
+                            cursor_after_sequence: after_sequence,
+                            durable_head_sequence,
+                        },
+                    ),
+                },
+            })
+        }
+        DfsPreparedMetadataJournalPayload::CursorDurabilityInconsistencyUnhealed {
+            durable_head_sequence,
+            reason,
+        } => Ok(DfsPreparedMetadataJournalTargetPublishResult::NoChanges {
+            outcome: DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyUnhealed {
+                target_node_id,
+                shard_id,
+                cursor_after_sequence: after_sequence,
+                durable_head_sequence,
+                reason,
+            },
+        }),
         DfsPreparedMetadataJournalPayload::Batches {
             batches,
             backlog_after_sequence,
@@ -3515,6 +3782,7 @@ fn prepare_dfs_metadata_journal_target_publish(
                     commands,
                     backlog_after_sequence,
                     caught_up_probe: false,
+                    cursor_durability_inconsistency: None,
                 },
             })
         }
@@ -4077,6 +4345,7 @@ mod explicitly_unreachable_target_tests {
             commands: Vec::new(),
             backlog_after_sequence: None,
             caught_up_probe: false,
+            cursor_durability_inconsistency: None,
         };
         let mut plan = DfsPreparedClusterMetadataJournalPublish {
             data_dir: SinomoDataDir::new(std::env::temp_dir()),
@@ -4316,7 +4585,18 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
         commands,
         backlog_after_sequence,
         caught_up_probe,
+        cursor_durability_inconsistency,
     } = target;
+    if let Some(inconsistency) = cursor_durability_inconsistency {
+        outcomes.push(
+            DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyDetected {
+                target_node_id: target_node_id.clone(),
+                shard_id: shard_id.clone(),
+                cursor_after_sequence: inconsistency.cursor_after_sequence,
+                durable_head_sequence: inconsistency.durable_head_sequence,
+            },
+        );
+    }
     if !transport.has_metadata_replication_route(&target_node_id) {
         outcomes.push(DfsMetadataJournalReplicationOutcome::MissingRoute {
             target_node_id,
@@ -4397,7 +4677,16 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
                     next_after_sequence,
                 )?;
                 after_sequence = next_after_sequence;
-                if caught_up_probe {
+                if let Some(inconsistency) = cursor_durability_inconsistency {
+                    outcomes.push(
+                        DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyHealed {
+                            target_node_id: target_node_id.clone(),
+                            shard_id: shard_id.clone(),
+                            previous_cursor_after_sequence: inconsistency.cursor_after_sequence,
+                            next_after_sequence,
+                        },
+                    );
+                } else if caught_up_probe {
                     outcomes.push(DfsMetadataJournalReplicationOutcome::NoChanges {
                         target_node_id: target_node_id.clone(),
                         shard_id: shard_id.clone(),
@@ -4426,6 +4715,7 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
                         transport,
                         options,
                         target_started_at,
+                        cursor_durability_inconsistency,
                         outcomes,
                     )?;
                 } else {
@@ -4474,6 +4764,7 @@ fn execute_prepared_dfs_metadata_snapshot_repair(
     transport: &mut dyn DfsMetadataJournalReplicationTransport,
     options: DfsMetadataJournalReplicationOptions,
     target_started_at: Instant,
+    cursor_durability_inconsistency: Option<DfsMetadataCursorDurabilityInconsistency>,
     outcomes: &mut Vec<DfsMetadataJournalReplicationOutcome>,
 ) -> Result<(), DfsError> {
     let command = build_local_dfs_metadata_snapshot_install_command(
@@ -4529,12 +4820,24 @@ fn execute_prepared_dfs_metadata_snapshot_repair(
                 shard_id,
                 command.next_after_sequence,
             )?;
-            outcomes.push(DfsMetadataJournalReplicationOutcome::SnapshotInstalled {
-                target_node_id: target_node_id.clone(),
-                shard_id: shard_id.clone(),
-                next_after_sequence: command.next_after_sequence,
-                archived_existing,
-            });
+            if let Some(inconsistency) = cursor_durability_inconsistency {
+                outcomes.push(
+                    DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencySnapshotInstalled {
+                        target_node_id: target_node_id.clone(),
+                        shard_id: shard_id.clone(),
+                        previous_cursor_after_sequence: inconsistency.cursor_after_sequence,
+                        next_after_sequence: command.next_after_sequence,
+                        archived_existing,
+                    },
+                );
+            } else {
+                outcomes.push(DfsMetadataJournalReplicationOutcome::SnapshotInstalled {
+                    target_node_id: target_node_id.clone(),
+                    shard_id: shard_id.clone(),
+                    next_after_sequence: command.next_after_sequence,
+                    archived_existing,
+                });
+            }
         }
         DfsMetadataSnapshotInstallResult::Rejected {
             reason: snapshot_reason,
@@ -4590,6 +4893,7 @@ mod concurrent_target_publish_tests {
             }],
             backlog_after_sequence: None,
             caught_up_probe: false,
+            cursor_durability_inconsistency: None,
         }
     }
 
@@ -4968,7 +5272,18 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
         commands,
         backlog_after_sequence,
         caught_up_probe,
+        cursor_durability_inconsistency,
     } = target;
+    if let Some(inconsistency) = cursor_durability_inconsistency {
+        outcomes.push(
+            DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyDetected {
+                target_node_id: target_node_id.clone(),
+                shard_id: shard_id.clone(),
+                cursor_after_sequence: inconsistency.cursor_after_sequence,
+                durable_head_sequence: inconsistency.durable_head_sequence,
+            },
+        );
+    }
     if !transport.has_metadata_replication_route(&target_node_id) {
         outcomes.push(DfsMetadataJournalReplicationOutcome::MissingRoute {
             target_node_id,
@@ -5051,7 +5366,16 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
                 )
                 .await?;
                 after_sequence = next_after_sequence;
-                if caught_up_probe {
+                if let Some(inconsistency) = cursor_durability_inconsistency {
+                    outcomes.push(
+                        DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyHealed {
+                            target_node_id: target_node_id.clone(),
+                            shard_id: shard_id.clone(),
+                            previous_cursor_after_sequence: inconsistency.cursor_after_sequence,
+                            next_after_sequence,
+                        },
+                    );
+                } else if caught_up_probe {
                     outcomes.push(DfsMetadataJournalReplicationOutcome::NoChanges {
                         target_node_id: target_node_id.clone(),
                         shard_id: shard_id.clone(),
@@ -5080,6 +5404,7 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
                         transport,
                         options,
                         target_started_at,
+                        cursor_durability_inconsistency,
                         outcomes,
                     )
                     .await?;
@@ -5129,6 +5454,7 @@ async fn execute_prepared_dfs_metadata_snapshot_repair_async(
     transport: &dyn AsyncDfsMetadataJournalReplicationTransport,
     options: DfsMetadataJournalReplicationOptions,
     target_started_at: Instant,
+    cursor_durability_inconsistency: Option<DfsMetadataCursorDurabilityInconsistency>,
     outcomes: &mut Vec<DfsMetadataJournalReplicationOutcome>,
 ) -> Result<(), DfsError> {
     let mut command = build_local_dfs_metadata_snapshot_install_command_async(
@@ -5193,12 +5519,24 @@ async fn execute_prepared_dfs_metadata_snapshot_repair_async(
                 command.next_after_sequence,
             )
             .await?;
-            outcomes.push(DfsMetadataJournalReplicationOutcome::SnapshotInstalled {
-                target_node_id: target_node_id.clone(),
-                shard_id: shard_id.clone(),
-                next_after_sequence: command.next_after_sequence,
-                archived_existing,
-            });
+            if let Some(inconsistency) = cursor_durability_inconsistency {
+                outcomes.push(
+                    DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencySnapshotInstalled {
+                        target_node_id: target_node_id.clone(),
+                        shard_id: shard_id.clone(),
+                        previous_cursor_after_sequence: inconsistency.cursor_after_sequence,
+                        next_after_sequence: command.next_after_sequence,
+                        archived_existing,
+                    },
+                );
+            } else {
+                outcomes.push(DfsMetadataJournalReplicationOutcome::SnapshotInstalled {
+                    target_node_id: target_node_id.clone(),
+                    shard_id: shard_id.clone(),
+                    next_after_sequence: command.next_after_sequence,
+                    archived_existing,
+                });
+            }
         }
         DfsMetadataSnapshotInstallResult::Rejected {
             reason: snapshot_reason,
@@ -9476,6 +9814,363 @@ mod cursor_update_tests {
                 },
             )
         }
+    }
+
+    struct PromotedSnapshotCursorFixture {
+        _target: sinomo_testdir::TestDir,
+        source_data_dir: SinomoDataDir,
+        receiver_data_dir: SinomoDataDir,
+        source_node_id: NodeId,
+        receiver_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        file_system: DfsFileSystem,
+        shard_epoch: u64,
+        durable_head_sequence: u64,
+    }
+
+    fn promoted_snapshot_cursor_fixture(
+        name: &str,
+        seed_receiver_with_exact_snapshot: bool,
+    ) -> PromotedSnapshotCursorFixture {
+        let target = sinomo_testdir::TestDir::new(name);
+        let source_data_dir = SinomoDataDir::new(target.path().join("source"));
+        let receiver_data_dir = SinomoDataDir::new(target.path().join("receiver"));
+        source_data_dir
+            .ensure_root_layout()
+            .expect("source root layout");
+        receiver_data_dir
+            .ensure_root_layout()
+            .expect("receiver root layout");
+        let source_node_id =
+            NodeId::from_legacy_named(format!("{name}_source")).expect("source node identifier");
+        let receiver_node_id = NodeId::from_legacy_named(format!("{name}_receiver"))
+            .expect("receiver node identifier");
+        let shard_id = DfsMetadataShardId::new("root");
+        let file_system = DfsFileSystem::sifs(source_node_id.clone());
+
+        let mut snapshot_source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), target.path().join("snapshot-source"))
+                .expect("snapshot source backend");
+        snapshot_source
+            .put_file_system(&file_system)
+            .expect("snapshot source filesystem");
+        let durable_head_sequence = snapshot_source.journal_last_sequence();
+        assert!(durable_head_sequence > 0);
+        let snapshot = snapshot_source.export_table_snapshot();
+
+        let source_root = local_dfs_metadata_shard_path(&source_data_dir, &shard_id);
+        let mut promoted_source = LocalSobjMetadataBackend::new(shard_id.clone(), &source_root)
+            .expect("promoted source backend");
+        promoted_source
+            .replace_with_replicated_snapshot(
+                shard_id.clone(),
+                durable_head_sequence,
+                snapshot.clone(),
+            )
+            .expect("install promoted source snapshot");
+        assert_eq!(
+            promoted_source
+                .journal_batch_for_shard_since_limited(&shard_id, 0, 64, 1024 * 1024)
+                .expect("inspect promoted source journal"),
+            None,
+            "the promotion fixture must reproduce an exact durable prefix with no retained journal suffix"
+        );
+
+        let receiver_root = local_dfs_metadata_shard_path(&receiver_data_dir, &shard_id);
+        let mut receiver = LocalSobjMetadataBackend::new(shard_id.clone(), receiver_root)
+            .expect("receiver backend");
+        if seed_receiver_with_exact_snapshot {
+            receiver
+                .replace_with_replicated_snapshot(shard_id.clone(), durable_head_sequence, snapshot)
+                .expect("seed exact receiver snapshot");
+        }
+
+        let shard_epoch = 7;
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: shard_id.0.clone(),
+            primary_node_id: source_node_id.clone(),
+            replica_node_ids: vec![receiver_node_id.clone()],
+            epoch: shard_epoch,
+            assignment: crate::DfsMetadataShardAssignment::Root,
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        configure_replica_shard(&receiver_data_dir, &receiver_node_id, &shard);
+
+        PromotedSnapshotCursorFixture {
+            _target: target,
+            source_data_dir,
+            receiver_data_dir,
+            source_node_id,
+            receiver_node_id,
+            shard_id,
+            file_system,
+            shard_epoch,
+            durable_head_sequence,
+        }
+    }
+
+    fn prepare_promoted_snapshot_cursor_healing(
+        fixture: &PromotedSnapshotCursorFixture,
+        after_sequence: u64,
+    ) -> DfsPreparedMetadataJournalTargetPublishResult {
+        let mut source_backend = LocalSobjMetadataBackend::new(
+            fixture.shard_id.clone(),
+            local_dfs_metadata_shard_path(&fixture.source_data_dir, &fixture.shard_id),
+        )
+        .expect("reopen promoted source");
+        prepare_dfs_metadata_journal_target_publish(
+            &mut source_backend,
+            &fixture.source_node_id,
+            fixture.receiver_node_id.clone(),
+            fixture.file_system.file_system_id.clone(),
+            fixture.shard_id.clone(),
+            fixture.shard_epoch,
+            after_sequence,
+            DfsMetadataJournalReplicationOptions::default(),
+            &mut BTreeMap::new(),
+        )
+        .expect("prepare promoted snapshot cursor healing")
+    }
+
+    #[test]
+    fn promoted_snapshot_primary_heals_missing_cursor_with_exact_prefix_proof() {
+        let fixture =
+            promoted_snapshot_cursor_fixture("sinomo-dfs-promoted-snapshot-cursor-proof", true);
+        let target_publish = match prepare_promoted_snapshot_cursor_healing(&fixture, 0) {
+            DfsPreparedMetadataJournalTargetPublishResult::Publish { target } => target,
+            DfsPreparedMetadataJournalTargetPublishResult::NoChanges { outcome } => {
+                panic!("cursor inconsistency unexpectedly skipped: {outcome:?}")
+            }
+        };
+        assert!(target_publish.caught_up_probe);
+        assert_eq!(
+            target_publish.cursor_durability_inconsistency,
+            Some(DfsMetadataCursorDurabilityInconsistency {
+                cursor_after_sequence: 0,
+                durable_head_sequence: fixture.durable_head_sequence,
+            })
+        );
+        assert_eq!(target_publish.commands.len(), 1);
+        assert!(target_publish.commands[0].verify_prefix_only);
+        assert!(target_publish.commands[0].batch.entries.is_empty());
+        assert_eq!(
+            target_publish.commands[0].batch.next_after_sequence,
+            fixture.durable_head_sequence
+        );
+
+        let mut transport = LocalReplicaRecoveryTransport {
+            receiver_data_dir: fixture.receiver_data_dir.clone(),
+            source_node_id: fixture.source_node_id.clone(),
+            target_node_id: fixture.receiver_node_id.clone(),
+            journal_rejection_reason: None,
+            snapshot_install_calls: 0,
+        };
+        let mut outcomes = Vec::new();
+        execute_prepared_dfs_metadata_journal_target_publish(
+            &fixture.source_data_dir,
+            &fixture.source_node_id,
+            target_publish,
+            &mut transport,
+            DfsMetadataJournalReplicationOptions::default(),
+            &mut outcomes,
+        )
+        .expect("heal promoted snapshot cursor");
+
+        assert_eq!(
+            outcomes,
+            vec![
+                DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyDetected {
+                    target_node_id: fixture.receiver_node_id.clone(),
+                    shard_id: fixture.shard_id.clone(),
+                    cursor_after_sequence: 0,
+                    durable_head_sequence: fixture.durable_head_sequence,
+                },
+                DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyHealed {
+                    target_node_id: fixture.receiver_node_id.clone(),
+                    shard_id: fixture.shard_id.clone(),
+                    previous_cursor_after_sequence: 0,
+                    next_after_sequence: fixture.durable_head_sequence,
+                },
+            ]
+        );
+        assert_eq!(transport.snapshot_install_calls, 0);
+        assert_eq!(
+            metadata_cursor::metadata_replication_cursor(
+                &local_dfs_metadata_shard_path(&fixture.source_data_dir, &fixture.shard_id),
+                &fixture.receiver_node_id,
+                &fixture.shard_id,
+            )
+            .expect("healed sender cursor"),
+            fixture.durable_head_sequence
+        );
+        let report = DfsMetadataJournalReplicationReport {
+            outcomes: outcomes.clone(),
+        };
+        assert!(dfs_metadata_replication_notice_lines(&report).is_empty());
+        assert_eq!(
+            dfs_metadata_replication_fault_notice_lines(&report).len(),
+            2
+        );
+        assert!(!dfs_metadata_replication_report_needs_retry(&report));
+    }
+
+    #[test]
+    fn promoted_snapshot_primary_repairs_stale_replica_before_healing_cursor() {
+        let fixture =
+            promoted_snapshot_cursor_fixture("sinomo-dfs-promoted-snapshot-cursor-snapshot", false);
+        let target_publish = match prepare_promoted_snapshot_cursor_healing(&fixture, 0) {
+            DfsPreparedMetadataJournalTargetPublishResult::Publish { target } => target,
+            DfsPreparedMetadataJournalTargetPublishResult::NoChanges { outcome } => {
+                panic!("cursor inconsistency unexpectedly skipped: {outcome:?}")
+            }
+        };
+        let mut transport = LocalReplicaRecoveryTransport {
+            receiver_data_dir: fixture.receiver_data_dir.clone(),
+            source_node_id: fixture.source_node_id.clone(),
+            target_node_id: fixture.receiver_node_id.clone(),
+            journal_rejection_reason: None,
+            snapshot_install_calls: 0,
+        };
+        let mut outcomes = Vec::new();
+        execute_prepared_dfs_metadata_journal_target_publish(
+            &fixture.source_data_dir,
+            &fixture.source_node_id,
+            target_publish,
+            &mut transport,
+            DfsMetadataJournalReplicationOptions::default(),
+            &mut outcomes,
+        )
+        .expect("repair stale replica and sender cursor");
+
+        assert_eq!(transport.snapshot_install_calls, 1);
+        assert!(
+            transport.journal_rejection_reason.as_deref().is_some_and(
+                |reason| reason.contains("metadata journal prefix probe state mismatch")
+            )
+        );
+        assert!(matches!(
+            outcomes.as_slice(),
+            [
+                DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyDetected {
+                    cursor_after_sequence: 0,
+                    durable_head_sequence,
+                    ..
+                },
+                DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencySnapshotInstalled {
+                    previous_cursor_after_sequence: 0,
+                    next_after_sequence,
+                    ..
+                },
+            ] if *durable_head_sequence == fixture.durable_head_sequence
+                && *next_after_sequence == fixture.durable_head_sequence
+        ));
+        let repaired_receiver = LocalSobjMetadataBackend::new(
+            fixture.shard_id.clone(),
+            local_dfs_metadata_shard_path(&fixture.receiver_data_dir, &fixture.shard_id),
+        )
+        .expect("reopen repaired receiver");
+        assert_eq!(
+            repaired_receiver
+                .get_file_system(&fixture.file_system.file_system_id)
+                .expect("read repaired filesystem"),
+            Some(fixture.file_system.clone())
+        );
+        assert_eq!(
+            metadata_cursor::metadata_replication_cursor(
+                &local_dfs_metadata_shard_path(&fixture.source_data_dir, &fixture.shard_id),
+                &fixture.receiver_node_id,
+                &fixture.shard_id,
+            )
+            .expect("healed sender cursor"),
+            fixture.durable_head_sequence
+        );
+        let report = DfsMetadataJournalReplicationReport { outcomes };
+        assert!(dfs_metadata_replication_notice_lines(&report).is_empty());
+        assert_eq!(
+            dfs_metadata_replication_fault_notice_lines(&report).len(),
+            2
+        );
+        assert!(!dfs_metadata_replication_report_needs_retry(&report));
+    }
+
+    #[test]
+    fn cursor_ahead_of_durable_head_is_logged_and_never_lowered() {
+        let fixture =
+            promoted_snapshot_cursor_fixture("sinomo-dfs-cursor-ahead-of-durability", true);
+        let cursor_after_sequence = fixture.durable_head_sequence.saturating_add(1);
+        let outcome =
+            match prepare_promoted_snapshot_cursor_healing(&fixture, cursor_after_sequence) {
+                DfsPreparedMetadataJournalTargetPublishResult::NoChanges { outcome } => outcome,
+                DfsPreparedMetadataJournalTargetPublishResult::Publish { target } => {
+                    panic!("cursor ahead of durability must not publish: {target:?}")
+                }
+            };
+        let report = DfsMetadataJournalReplicationReport {
+            outcomes: vec![outcome],
+        };
+        assert!(matches!(
+            report.outcomes.as_slice(),
+            [DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyUnhealed {
+                cursor_after_sequence: observed_cursor,
+                durable_head_sequence,
+                ..
+            }] if *observed_cursor == cursor_after_sequence
+                && *durable_head_sequence == fixture.durable_head_sequence
+        ));
+        assert!(dfs_metadata_replication_notice_lines(&report).is_empty());
+        assert_eq!(
+            dfs_metadata_replication_fault_notice_lines(&report).len(),
+            1
+        );
+        assert!(dfs_metadata_replication_report_needs_retry(&report));
+    }
+
+    #[test]
+    fn cursor_fault_healing_notices_are_separate_from_normal_replication_notices() {
+        let normal_target =
+            NodeId::from_legacy_named("normal_replication_target").expect("normal target");
+        let fault_target = NodeId::from_legacy_named("fault_healing_target").expect("fault target");
+        let shard_id = DfsMetadataShardId::new("root");
+        let report = DfsMetadataJournalReplicationReport {
+            outcomes: vec![
+                DfsMetadataJournalReplicationOutcome::Applied {
+                    target_node_id: normal_target.clone(),
+                    shard_id: shard_id.clone(),
+                    entries: 4,
+                    next_after_sequence: 8,
+                },
+                DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyDetected {
+                    target_node_id: fault_target.clone(),
+                    shard_id: shard_id.clone(),
+                    cursor_after_sequence: 0,
+                    durable_head_sequence: 8,
+                },
+                DfsMetadataJournalReplicationOutcome::Failed {
+                    target_node_id: fault_target.clone(),
+                    shard_id: shard_id.clone(),
+                    reason: "exact-prefix probe timed out".to_string(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            dfs_metadata_replication_notice_lines(&report),
+            vec![format!(
+                "replicated 4 DFS metadata journal entries to {normal_target}"
+            )]
+        );
+        assert_eq!(
+            dfs_metadata_replication_fault_notice_lines(&report),
+            vec![
+                format!(
+                    "DFS metadata fault healing detected an outbound cursor/durability inconsistency for shard root target {fault_target}: cursor=0, durable_head=8"
+                ),
+                format!(
+                    "DFS metadata fault healing for shard root target {fault_target} failed: exact-prefix probe timed out"
+                ),
+            ]
+        );
     }
 
     #[test]
