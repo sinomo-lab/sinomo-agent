@@ -387,6 +387,31 @@ fn append_table_batch(
         }
         return Err(error);
     }
+    let semantic_op_count = ops
+        .iter()
+        .filter(|op| matches!(op, DfsMetadataTableOp::CommitNamespacePrepare { .. }))
+        .count();
+    // Foreground callers must isolate a semantic marker so dependency
+    // validation observes the exact preceding durable table state. Replica
+    // replay can legitimately preapply several journal entries in order and
+    // then append one table batch containing Prepared plus Commit (or multiple
+    // independent commits); its rollback proves that ordered validation has
+    // already succeeded.
+    if rollback.is_none() && semantic_op_count > 0 && (semantic_op_count != 1 || ops.len() != 1) {
+        if let Some(rollback) = rollback.take() {
+            rollback.rollback(state.tables);
+        }
+        return Err(MetadataBackendError::Serde(format!(
+            "metadata table batch {sequence} must isolate its compact namespace commit marker"
+        )));
+    }
+    if rollback.is_none() {
+        for op in &ops {
+            if let Err(error) = state.tables.validate_checked(op) {
+                return Err(error);
+            }
+        }
+    }
     let Some(prefix_proof) = state.prefix_proof.as_ref() else {
         if let Some(rollback) = rollback {
             rollback.rollback(state.tables);
@@ -422,7 +447,7 @@ fn append_table_batch(
     *state.table_log_offset = state.table_log_offset.saturating_add(written);
     if apply_after_append {
         for op in batch.ops {
-            state.tables.apply(op);
+            state.tables.apply_checked(op)?;
         }
     }
     *state.materialized_through_sequence = (*state.materialized_through_sequence).max(sequence);
@@ -519,7 +544,8 @@ mod tests {
     use crate::metadata_io::write_file_atomic;
     use crate::metadata_read_snapshot::current_tables_snapshot;
     use crate::metadata_records::{
-        DfsMetadataShardId, DfsNamespaceTransaction, dfs_metadata_prefix_proof_seed,
+        DfsMetadataShardId, DfsNamespacePrepareRecord, DfsNamespacePrepareStatus,
+        DfsNamespaceTransaction, dfs_metadata_prefix_proof_seed,
     };
     use crate::metadata_table_store::{metadata_table_snapshot_path, read_metadata_table_state};
     use std::sync::{Arc, Mutex};
@@ -537,6 +563,248 @@ mod tests {
                 created_at: OffsetDateTime::UNIX_EPOCH,
             },
         }
+    }
+
+    fn namespace_prepare(
+        operation_id: &str,
+        status: DfsNamespacePrepareStatus,
+    ) -> DfsNamespacePrepareRecord {
+        let file_system_id =
+            DfsFileSystemId::from_legacy_named("fs_table_semantic_prepare").expect("filesystem");
+        DfsNamespacePrepareRecord {
+            operation_id: operation_id.to_string(),
+            file_system_id: file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new("shard_table_semantic_prepare"),
+            owner_epoch: 7,
+            operation_digest: format!("digest_{operation_id}"),
+            expected_object_versions: Vec::new(),
+            expected_path_occupants: Vec::new(),
+            content_receipts: Vec::new(),
+            transaction: DfsNamespaceTransaction {
+                transaction_id: format!("txn_{operation_id}"),
+                file_system_id,
+                objects: Vec::new(),
+                versions: Vec::new(),
+                advisory_lock_states: Vec::new(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            },
+            completed_request: None,
+            completed_request_completion: None,
+            status,
+        }
+    }
+
+    fn namespace_prepare_commit_op(prepare: &DfsNamespacePrepareRecord) -> DfsMetadataTableOp {
+        DfsMetadataTableOp::CommitNamespacePrepare {
+            operation_id: prepare.operation_id.clone(),
+            operation_digest: prepare.operation_digest.clone(),
+            owner_epoch: prepare.owner_epoch,
+        }
+    }
+
+    #[test]
+    fn compact_namespace_commit_reopens_from_materialized_table_log() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-table-semantic-reopen");
+        let shard_id = DfsMetadataShardId::new("shard_table_semantic_prepare");
+        let prepare = namespace_prepare(
+            "operation_semantic_reopen",
+            DfsNamespacePrepareStatus::Prepared,
+        );
+        let mut tables = DfsMetadataTables::default();
+        let mut table_log_offset = 0;
+        let mut materialized_through_sequence = 0;
+        let mut table_snapshot_fingerprint = None;
+        let mut prefix_proof = Some(dfs_metadata_prefix_proof_seed(
+            &shard_id,
+            1,
+            "semantic-reopen-prepare",
+        ));
+        append_and_apply_table_ops(
+            root.path(),
+            TableMaterializationState {
+                tables: &mut tables,
+                table_log_offset: &mut table_log_offset,
+                materialized_through_sequence: &mut materialized_through_sequence,
+                table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
+                prefix_proof: &mut prefix_proof,
+            },
+            1,
+            vec![DfsMetadataTableOp::PutNamespacePrepare {
+                prepare: prepare.clone(),
+            }],
+            u64::MAX,
+        )
+        .expect("append prepared body");
+
+        prefix_proof = Some(dfs_metadata_prefix_proof_seed(
+            &shard_id,
+            2,
+            "semantic-reopen-commit",
+        ));
+        append_and_apply_table_ops(
+            root.path(),
+            TableMaterializationState {
+                tables: &mut tables,
+                table_log_offset: &mut table_log_offset,
+                materialized_through_sequence: &mut materialized_through_sequence,
+                table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
+                prefix_proof: &mut prefix_proof,
+            },
+            2,
+            vec![namespace_prepare_commit_op(&prepare)],
+            u64::MAX,
+        )
+        .expect("append compact commit marker");
+
+        assert_eq!(
+            tables
+                .namespace_prepares
+                .get(&prepare.operation_id)
+                .map(|prepare| &prepare.status),
+            Some(&DfsNamespacePrepareStatus::Committed)
+        );
+        assert!(
+            tables
+                .namespace_transactions
+                .contains_key(&prepare.transaction.transaction_id)
+        );
+
+        let reopened =
+            read_metadata_table_state(root.path()).expect("replay materialized table log");
+        assert_eq!(reopened.tables, tables);
+        assert_eq!(reopened.materialized_through_sequence, Some(2));
+    }
+
+    #[test]
+    fn compact_namespace_commit_dependency_rejects_before_durable_append() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-table-semantic-missing-prepare");
+        let prepare = namespace_prepare(
+            "operation_semantic_missing",
+            DfsNamespacePrepareStatus::Prepared,
+        );
+        let mut tables = DfsMetadataTables::default();
+        let mut table_log_offset = 0;
+        let mut materialized_through_sequence = 0;
+        let mut table_snapshot_fingerprint = None;
+        let mut prefix_proof = Some(dfs_metadata_prefix_proof_seed(
+            &prepare.shard_id,
+            1,
+            "semantic-missing-prepare",
+        ));
+
+        let error = append_and_apply_table_ops(
+            root.path(),
+            TableMaterializationState {
+                tables: &mut tables,
+                table_log_offset: &mut table_log_offset,
+                materialized_through_sequence: &mut materialized_through_sequence,
+                table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
+                prefix_proof: &mut prefix_proof,
+            },
+            1,
+            vec![namespace_prepare_commit_op(&prepare)],
+            u64::MAX,
+        )
+        .expect_err("a semantic marker without its prepared body must fail");
+
+        assert!(matches!(error, MetadataBackendError::Serde(_)));
+        assert_eq!(table_log_offset, 0);
+        assert_eq!(materialized_through_sequence, 0);
+        assert_eq!(
+            read_metadata_table_state(root.path())
+                .expect("empty table state")
+                .tables,
+            tables
+        );
+    }
+
+    #[test]
+    fn compact_namespace_commit_fences_digest_epoch_and_aborted_prepare() {
+        let prepare = namespace_prepare(
+            "operation_semantic_fences",
+            DfsNamespacePrepareStatus::Prepared,
+        );
+        let mut tables = DfsMetadataTables::default();
+        tables.apply(DfsMetadataTableOp::PutNamespacePrepare {
+            prepare: prepare.clone(),
+        });
+
+        let mut wrong_digest = namespace_prepare_commit_op(&prepare);
+        let DfsMetadataTableOp::CommitNamespacePrepare {
+            operation_digest, ..
+        } = &mut wrong_digest
+        else {
+            unreachable!("compact marker")
+        };
+        *operation_digest = "wrong_digest".to_string();
+        assert!(tables.validate_checked(&wrong_digest).is_err());
+
+        let mut wrong_epoch = namespace_prepare_commit_op(&prepare);
+        let DfsMetadataTableOp::CommitNamespacePrepare { owner_epoch, .. } = &mut wrong_epoch
+        else {
+            unreachable!("compact marker")
+        };
+        *owner_epoch += 1;
+        assert!(tables.validate_checked(&wrong_epoch).is_err());
+
+        let mut aborted = prepare.clone();
+        aborted.status = DfsNamespacePrepareStatus::Aborted;
+        tables.apply(DfsMetadataTableOp::PutNamespacePrepare { prepare: aborted });
+        assert!(
+            tables
+                .validate_checked(&namespace_prepare_commit_op(&prepare))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn compact_namespace_commit_append_failure_rolls_back_materialization() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-table-semantic-append-failure");
+        let blocked_root = root.path().join("not-a-directory");
+        fs::write(&blocked_root, b"block metadata table directory").expect("blocking file");
+        let prepare = namespace_prepare(
+            "operation_semantic_rollback",
+            DfsNamespacePrepareStatus::Prepared,
+        );
+        let mut tables = DfsMetadataTables::default();
+        tables.apply(DfsMetadataTableOp::PutNamespacePrepare {
+            prepare: prepare.clone(),
+        });
+        let before = tables.clone();
+        let marker = namespace_prepare_commit_op(&prepare);
+        let mut rollback = DfsMetadataTableRollback::default();
+        tables
+            .apply_checked_with_rollback(marker.clone(), &mut rollback)
+            .expect("preapply compact commit");
+        assert_ne!(tables, before);
+
+        let mut table_log_offset = 0;
+        let mut materialized_through_sequence = 0;
+        let mut table_snapshot_fingerprint = None;
+        let mut prefix_proof = Some(dfs_metadata_prefix_proof_seed(
+            &prepare.shard_id,
+            1,
+            "semantic-append-failure",
+        ));
+        append_preapplied_table_ops(
+            &blocked_root,
+            TableMaterializationState {
+                tables: &mut tables,
+                table_log_offset: &mut table_log_offset,
+                materialized_through_sequence: &mut materialized_through_sequence,
+                table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
+                prefix_proof: &mut prefix_proof,
+            },
+            1,
+            vec![marker],
+            u64::MAX,
+            rollback,
+        )
+        .expect_err("failed marker append must roll back its materialized state");
+
+        assert_eq!(tables, before);
+        assert_eq!(table_log_offset, 0);
+        assert_eq!(materialized_through_sequence, 0);
     }
 
     #[test]

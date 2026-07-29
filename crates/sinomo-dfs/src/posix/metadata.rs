@@ -34,6 +34,7 @@ std::thread_local! {
 pub(super) struct ResolvedPosixPath {
     pub(super) path: String,
     pub(super) components: Vec<ResolvedPosixPathComponent>,
+    terminal_object: Option<DfsObjectMetadata>,
 }
 
 #[derive(Debug)]
@@ -178,6 +179,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .path)
     }
 
+    /// Resolve a path while retaining the exact terminal metadata observed by
+    /// the final post-symlink walk. The returned object has already followed a
+    /// hardlink, matching the object that subsequent POSIX kind checks use.
+    pub(super) fn resolve_posix_path_distributed_with_terminal_object(
+        &mut self,
+        path: &str,
+    ) -> Result<(String, Option<DfsObjectMetadata>)> {
+        let mut resolved = self.resolve_posix_path_distributed_walk(path, true, false)?;
+        // The component walker has no component to observe for the filesystem
+        // root, so retain that one exact lookup here.
+        if resolved.path == "/" {
+            resolved.terminal_object = self
+                .lookup_sifs_path("/")?
+                .map(|object| self.resolve_hardlink_target(&object))
+                .transpose()?;
+        }
+        Ok((resolved.path, resolved.terminal_object))
+    }
+
     /// Resolve a path and retain the exact component metadata observed during
     /// the final (post-symlink) walk. `mkdir_all` consumes this result directly
     /// instead of resolving the path and then looking up the same chain again.
@@ -274,9 +294,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     return Ok(ResolvedPosixPath {
                         path: resolved,
                         components: observed.unwrap_or_default(),
+                        terminal_object: None,
                     });
                 };
                 if object.kind == DfsObjectKind::Tombstone {
+                    let terminal_object = final_component.then(|| object.clone());
                     if let Some(observed) = observed.as_mut() {
                         observed.push(ResolvedPosixPathComponent {
                             path: candidate.clone(),
@@ -293,6 +315,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     return Ok(ResolvedPosixPath {
                         path: resolved,
                         components: observed.unwrap_or_default(),
+                        terminal_object,
                     });
                 }
                 if let Some(observed) = observed.as_mut() {
@@ -315,12 +338,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     restarted = true;
                     break;
                 }
+                let terminal_object = final_component.then_some(object);
                 resolved = candidate;
+                if terminal_object.is_some() {
+                    return Ok(ResolvedPosixPath {
+                        path: resolved,
+                        components: observed.unwrap_or_default(),
+                        terminal_object,
+                    });
+                }
             }
             if !restarted {
                 return Ok(ResolvedPosixPath {
                     path: resolved,
                     components: observed.unwrap_or_default(),
+                    terminal_object: None,
                 });
             }
         }

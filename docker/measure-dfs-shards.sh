@@ -4,10 +4,11 @@
 # shard layout, measures each primary in a sequential single-shard attribution
 # window, then starts three remote client lanes concurrently to measure aggregate
 # utilization. Every phase resolves and samples the exact main-daemon host PID
-# separately from whole-container cgroup-v2 CPU/pressure/I/O and
-# network-namespace counters. Utilization gates use main-daemon process CPU;
-# cgroup CPU remains diagnostic telemetry so helper/client activity cannot make
-# a primary look saturated.
+# separately from whole-container cgroup-v2 CPU/pressure/I/O/memory and
+# network-namespace counters. Host available memory is sampled once per
+# interval. Utilization gates use main-daemon process CPU; cgroup CPU remains
+# diagnostic telemetry so helper/client activity cannot make a primary look
+# saturated. Any cgroup OOM event fails the gate.
 #
 # This script never creates, restarts, or removes containers or volumes. Use
 # docker/test-cluster.sh to form the cluster first. A one-byte payload minimizes
@@ -37,8 +38,15 @@
 #   SINOMO_DFS_PERF_COMPOSE_OVERRIDE        optional second compose file used to form the project
 #   SINOMO_DFS_PERF_FILES                   files per shard lane per phase (1024)
 #   SINOMO_DFS_PERF_BYTES                   bytes per file (1)
+#   SINOMO_DFS_PERF_MIN_FILES_PER_SECOND    default isolated-write/aggregate floor (1000)
+#   SINOMO_DFS_PERF_MIN_ISOLATED_FILES_PER_SECOND
+#                                             required bulk write+commit publications/s per isolated lane
+#   SINOMO_DFS_PERF_MIN_CONCURRENT_AGGREGATE_FILES_PER_SECOND
+#                                             required end-to-end concurrent cluster publications/s
+#   SINOMO_DFS_PERF_MIN_CONCURRENT_LANE_FILES_PER_SECOND
+#                                             optional bulk write+commit concurrent per-lane floor (0)
 #   SINOMO_DFS_PERF_SAMPLE_SECONDS          sample interval (0.05)
-#   SINOMO_DFS_PERF_MIN_PRIMARY_CPU_PERCENT isolated/aggregate CPU floor (80)
+#   SINOMO_DFS_PERF_MIN_PRIMARY_CPU_PERCENT isolated diagnostic/aggregate CPU floor (80)
 #   SINOMO_DFS_PERF_MIN_LANE_MS             minimum measured lane window (500)
 #   SINOMO_DFS_PERF_MAX_IDLE_MS             max low-CPU hot-path streak (100)
 #   SINOMO_DFS_PERF_WARMUP_MS               launch/grace interval (250)
@@ -47,11 +55,12 @@
 #   SINOMO_DFS_PERF_ARTIFACTS               output directory
 #
 # `cluster.dfs.bulk-write` must expose probe-level retry_count diagnostics. Any
-# retry, command failure, cgroup throttle, sub-threshold isolated-main-daemon
-# average, an avoidable ready-work low-CPU streak (runnable daemon threads with
-# no observed CPU/I/O pressure or storage/network progress), or sub-threshold
-# concurrent three-lane main-daemon utilization fails this gate. Sleeping and
-# externally progressing low-CPU samples remain evidence, not inferred faults.
+# retry, command failure, cgroup throttle, an avoidable ready-work low-CPU
+# streak (runnable daemon threads with no observed CPU/I/O pressure or
+# storage/network progress), sub-threshold isolated bulk write throughput, or
+# sub-threshold concurrent cluster throughput/utilization fails this gate.
+# Sleeping and externally progressing low-CPU samples remain evidence, not
+# inferred faults.
 
 set -euo pipefail
 
@@ -62,6 +71,10 @@ COMPOSE_OVERRIDE_FILE="${SINOMO_DFS_PERF_COMPOSE_OVERRIDE:-}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-${SINOMO_DFS_PERF_PROJECT:-sinomo-dfs-test}}"
 FILES="${SINOMO_DFS_PERF_FILES:-1024}"
 BYTES="${SINOMO_DFS_PERF_BYTES:-1}"
+DEFAULT_MIN_FILES_PER_SECOND="${SINOMO_DFS_PERF_MIN_FILES_PER_SECOND:-1000}"
+MIN_ISOLATED_FILES_PER_SECOND="${SINOMO_DFS_PERF_MIN_ISOLATED_FILES_PER_SECOND:-$DEFAULT_MIN_FILES_PER_SECOND}"
+MIN_CONCURRENT_AGGREGATE_FILES_PER_SECOND="${SINOMO_DFS_PERF_MIN_CONCURRENT_AGGREGATE_FILES_PER_SECOND:-$DEFAULT_MIN_FILES_PER_SECOND}"
+MIN_CONCURRENT_LANE_FILES_PER_SECOND="${SINOMO_DFS_PERF_MIN_CONCURRENT_LANE_FILES_PER_SECOND:-0}"
 SAMPLE_SECONDS="${SINOMO_DFS_PERF_SAMPLE_SECONDS:-0.05}"
 MIN_PRIMARY_CPU_PERCENT="${SINOMO_DFS_PERF_MIN_PRIMARY_CPU_PERCENT:-80}"
 MIN_LANE_MS="${SINOMO_DFS_PERF_MIN_LANE_MS:-500}"
@@ -150,11 +163,20 @@ run_container_timeout() {
     docker exec -i "${container_id[$node]}" "$@"
 }
 
-for command in docker jq timeout date awk sed grep cmp getconf; do
+for command in docker jq timeout date awk sed grep cmp getconf sort; do
   require_command "$command"
 done
 require_positive_uint SINOMO_DFS_PERF_FILES "$FILES"
 require_positive_uint SINOMO_DFS_PERF_BYTES "$BYTES"
+require_positive_uint SINOMO_DFS_PERF_MIN_FILES_PER_SECOND "$DEFAULT_MIN_FILES_PER_SECOND"
+require_positive_uint \
+  SINOMO_DFS_PERF_MIN_ISOLATED_FILES_PER_SECOND "$MIN_ISOLATED_FILES_PER_SECOND"
+require_positive_uint \
+  SINOMO_DFS_PERF_MIN_CONCURRENT_AGGREGATE_FILES_PER_SECOND \
+  "$MIN_CONCURRENT_AGGREGATE_FILES_PER_SECOND"
+require_uint \
+  SINOMO_DFS_PERF_MIN_CONCURRENT_LANE_FILES_PER_SECOND \
+  "$MIN_CONCURRENT_LANE_FILES_PER_SECOND"
 require_positive_uint SINOMO_DFS_PERF_MIN_PRIMARY_CPU_PERCENT "$MIN_PRIMARY_CPU_PERCENT"
 require_positive_uint SINOMO_DFS_PERF_MIN_LANE_MS "$MIN_LANE_MS"
 require_uint SINOMO_DFS_PERF_MAX_IDLE_MS "$MAX_IDLE_MS"
@@ -206,7 +228,9 @@ for node in "${NODES[@]}"; do
     || die "cannot read cgroup CPU stats for $node at $CGROUP_ROOT$cgroup_path"
   [[ -r "$CGROUP_ROOT$cgroup_path/cgroup.procs" ]] \
     || die "cannot inspect cgroup processes for $node at $CGROUP_ROOT$cgroup_path"
-  for cgroup_file in cpu.pressure io.pressure memory.pressure io.stat cpu.max cpuset.cpus.effective; do
+  for cgroup_file in \
+    cpu.pressure io.pressure memory.pressure memory.current memory.peak memory.events \
+    io.stat cpu.max cpuset.cpus.effective; do
     [[ -r "$CGROUP_ROOT$cgroup_path/$cgroup_file" ]] \
       || die "cannot read cgroup metric $cgroup_file for $node at $CGROUP_ROOT$cgroup_path"
   done
@@ -379,6 +403,13 @@ done
   printf 'files_per_lane_per_phase\t%s\n' "$FILES"
   printf 'measurement_phases\tisolated-per-lane,concurrent-three-lane\n'
   printf 'bytes_per_file\t%s\n' "$BYTES"
+  printf 'default_min_files_per_second\t%s\n' "$DEFAULT_MIN_FILES_PER_SECOND"
+  printf 'min_isolated_data_write_files_per_second_per_lane\t%s\n' \
+    "$MIN_ISOLATED_FILES_PER_SECOND"
+  printf 'min_concurrent_aggregate_files_per_second\t%s\n' \
+    "$MIN_CONCURRENT_AGGREGATE_FILES_PER_SECOND"
+  printf 'min_concurrent_data_write_files_per_second_per_lane\t%s\n' \
+    "$MIN_CONCURRENT_LANE_FILES_PER_SECOND"
   printf 'sample_seconds\t%s\n' "$SAMPLE_SECONDS"
   printf 'clock_ticks_per_second\t%s\n' "$CLK_TCK"
   printf 'min_primary_cpu_percent\t%s\n' "$MIN_PRIMARY_CPU_PERCENT"
@@ -406,6 +437,14 @@ sample_nr_throttled=0
 sample_throttled_usec=0
 sample_pressure_some=0
 sample_pressure_full=0
+sample_memory_current=0
+sample_memory_peak=0
+sample_memory_low=0
+sample_memory_high=0
+sample_memory_max=0
+sample_memory_oom=0
+sample_memory_oom_kill=0
+sample_memory_oom_group_kill=0
 sample_io_rbytes=0
 sample_io_wbytes=0
 sample_rx_bytes=0
@@ -423,6 +462,10 @@ sample_process_voluntary_context_switches=0
 sample_process_nonvoluntary_context_switches=0
 sample_process_read_bytes=-1
 sample_process_write_bytes=-1
+sample_host_memory_total_bytes=0
+sample_host_memory_available_bytes=0
+sample_host_swap_total_bytes=0
+sample_host_swap_free_bytes=0
 
 read_process_observation() {
   local host_pid="$1" stat rest status_file key value state
@@ -461,7 +504,7 @@ read_process_observation() {
           ))
           ;;
       esac
-    done <"$status_file"
+    done <"$status_file" 2>/dev/null
     [[ -n "$state" ]] || continue
     sample_process_thread_count=$((sample_process_thread_count + 1))
     case "$state" in
@@ -524,6 +567,62 @@ read_pressure() {
   done <"$file"
 }
 
+read_memory_observation() {
+  local cgroup="$1" key value
+  IFS= read -r sample_memory_current <"$cgroup/memory.current"
+  IFS= read -r sample_memory_peak <"$cgroup/memory.peak"
+  sample_memory_low=0
+  sample_memory_high=0
+  sample_memory_max=0
+  sample_memory_oom=0
+  sample_memory_oom_kill=0
+  sample_memory_oom_group_kill=0
+  while read -r key value _; do
+    case "$key" in
+      low) sample_memory_low="$value" ;;
+      high) sample_memory_high="$value" ;;
+      max) sample_memory_max="$value" ;;
+      oom) sample_memory_oom="$value" ;;
+      oom_kill) sample_memory_oom_kill="$value" ;;
+      oom_group_kill) sample_memory_oom_group_kill="$value" ;;
+    esac
+  done <"$cgroup/memory.events"
+}
+
+read_host_memory_observation() {
+  local key value
+  sample_host_memory_total_bytes=0
+  sample_host_memory_available_bytes=0
+  sample_host_swap_total_bytes=0
+  sample_host_swap_free_bytes=0
+  while read -r key value _; do
+    case "$key" in
+      MemTotal:) sample_host_memory_total_bytes=$((value * 1024)) ;;
+      MemAvailable:) sample_host_memory_available_bytes=$((value * 1024)) ;;
+      SwapTotal:) sample_host_swap_total_bytes=$((value * 1024)) ;;
+      SwapFree:) sample_host_swap_free_bytes=$((value * 1024)) ;;
+    esac
+  done </proc/meminfo
+  (( sample_host_memory_total_bytes > 0 && sample_host_memory_available_bytes > 0 )) \
+    || die "cannot read host memory totals from /proc/meminfo"
+}
+
+record_host_memory_observation() {
+  local timestamp_ns="$1" elapsed_ms="$2" phase="$3" workload_lanes="$4"
+  read_host_memory_observation
+  if (( host_min_memory_available_bytes < 0 \
+      || sample_host_memory_available_bytes < host_min_memory_available_bytes )); then
+    host_min_memory_available_bytes="$sample_host_memory_available_bytes"
+  fi
+  host_last_memory_available_bytes="$sample_host_memory_available_bytes"
+  host_last_swap_free_bytes="$sample_host_swap_free_bytes"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$timestamp_ns" "$elapsed_ms" "$phase" "$workload_lanes" \
+    "$sample_host_memory_total_bytes" "$sample_host_memory_available_bytes" \
+    "$sample_host_swap_total_bytes" "$sample_host_swap_free_bytes" \
+    >>"$ARTIFACTS/host-memory.csv"
+}
+
 read_io_stat() {
   local file="$1" _device rest token
   local -a tokens=()
@@ -578,6 +677,15 @@ declare -A initial_io_pressure_some=()
 declare -A initial_io_pressure_full=()
 declare -A initial_memory_pressure_some=()
 declare -A initial_memory_pressure_full=()
+declare -A initial_memory_current=()
+declare -A initial_memory_peak=()
+declare -A initial_memory_low=()
+declare -A initial_memory_high=()
+declare -A initial_memory_max=()
+declare -A initial_memory_oom=()
+declare -A initial_memory_oom_kill=()
+declare -A initial_memory_oom_group_kill=()
+declare -A max_sampled_memory_current=()
 declare -A initial_io_rbytes=()
 declare -A initial_io_wbytes=()
 declare -A initial_rx_bytes=()
@@ -619,6 +727,7 @@ declare -A classification_current=()
 declare -A classification_current_streak_usec=()
 declare -A classification_max_streak_usec=()
 
+printf 'node\tkey\tvalue\n' >"$ARTIFACTS/memory-events.before.tsv"
 baseline_timestamp_ns="$(date +%s%N)"
 for node in "${NODES[@]}"; do
   cgroup="${container_cgroup[$node]}"
@@ -656,6 +765,19 @@ for node in "${NODES[@]}"; do
   read_pressure "$cgroup/memory.pressure"
   initial_memory_pressure_some[$node]="$sample_pressure_some"
   initial_memory_pressure_full[$node]="$sample_pressure_full"
+  read_memory_observation "$cgroup"
+  initial_memory_current[$node]="$sample_memory_current"
+  initial_memory_peak[$node]="$sample_memory_peak"
+  initial_memory_low[$node]="$sample_memory_low"
+  initial_memory_high[$node]="$sample_memory_high"
+  initial_memory_max[$node]="$sample_memory_max"
+  initial_memory_oom[$node]="$sample_memory_oom"
+  initial_memory_oom_kill[$node]="$sample_memory_oom_kill"
+  initial_memory_oom_group_kill[$node]="$sample_memory_oom_group_kill"
+  max_sampled_memory_current[$node]="$sample_memory_current"
+  while read -r memory_event_key memory_event_value _; do
+    printf '%s\t%s\t%s\n' "$node" "$memory_event_key" "$memory_event_value"
+  done <"$cgroup/memory.events" >>"$ARTIFACTS/memory-events.before.tsv"
   read_io_stat "$cgroup/io.stat"
   initial_io_rbytes[$node]="$sample_io_rbytes"
   initial_io_wbytes[$node]="$sample_io_wbytes"
@@ -682,7 +804,7 @@ for lane in "${LANES[@]}"; do
 done
 
 printf '%s\n' \
-  'timestamp_ns,elapsed_ms,phase,workload_lanes,node,active_primary_lanes,main_daemon_host_pid,main_daemon_leader_state,main_daemon_thread_count,main_daemon_runnable_threads,main_daemon_sleeping_threads,main_daemon_uninterruptible_threads,main_daemon_other_threads,main_daemon_cpu_ticks,main_daemon_cpu_usage_usec,main_daemon_cpu_percent,main_daemon_thread_voluntary_context_switches,main_daemon_thread_voluntary_context_switches_delta,main_daemon_thread_nonvoluntary_context_switches,main_daemon_thread_nonvoluntary_context_switches_delta,main_daemon_read_bytes,main_daemon_read_bytes_delta,main_daemon_write_bytes,main_daemon_write_bytes_delta,cgroup_cpu_usage_usec,cgroup_cpu_percent,nr_throttled,throttled_usec,cpu_some_usec,cpu_full_usec,io_some_usec,io_full_usec,memory_some_usec,memory_full_usec,io_rbytes,io_wbytes,rx_bytes,tx_bytes,cpu_pressure_some_delta_usec,io_pressure_some_delta_usec,cgroup_io_bytes_delta,network_bytes_delta,low_cpu_classification' \
+  'timestamp_ns,elapsed_ms,phase,workload_lanes,node,active_primary_lanes,main_daemon_host_pid,main_daemon_leader_state,main_daemon_thread_count,main_daemon_runnable_threads,main_daemon_sleeping_threads,main_daemon_uninterruptible_threads,main_daemon_other_threads,main_daemon_cpu_ticks,main_daemon_cpu_usage_usec,main_daemon_cpu_percent,main_daemon_thread_voluntary_context_switches,main_daemon_thread_voluntary_context_switches_delta,main_daemon_thread_nonvoluntary_context_switches,main_daemon_thread_nonvoluntary_context_switches_delta,main_daemon_read_bytes,main_daemon_read_bytes_delta,main_daemon_write_bytes,main_daemon_write_bytes_delta,cgroup_cpu_usage_usec,cgroup_cpu_percent,nr_throttled,throttled_usec,cpu_some_usec,cpu_full_usec,io_some_usec,io_full_usec,memory_some_usec,memory_full_usec,io_rbytes,io_wbytes,rx_bytes,tx_bytes,cpu_pressure_some_delta_usec,io_pressure_some_delta_usec,cgroup_io_bytes_delta,network_bytes_delta,low_cpu_classification,memory_current_bytes,memory_peak_bytes,memory_events_low,memory_events_high,memory_events_max,memory_events_oom,memory_events_oom_kill,memory_events_oom_group_kill' \
   >"$ARTIFACTS/timeline.csv"
 
 declare -A workload_pid=()
@@ -703,6 +825,17 @@ iteration_overlap_cgroup_usage=0
 min_cpu_milli=$((MIN_PRIMARY_CPU_PERCENT * 1000))
 measurement_started_ns="$(date +%s%N)"
 docker_log_since="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+printf '%s\n' \
+  'timestamp_ns,elapsed_ms,phase,workload_lanes,memory_total_bytes,memory_available_bytes,swap_total_bytes,swap_free_bytes' \
+  >"$ARTIFACTS/host-memory.csv"
+host_min_memory_available_bytes=-1
+host_last_memory_available_bytes=0
+host_last_swap_free_bytes=0
+record_host_memory_observation "$measurement_started_ns" 0 preflight ""
+host_initial_memory_total_bytes="$sample_host_memory_total_bytes"
+host_initial_memory_available_bytes="$sample_host_memory_available_bytes"
+host_initial_swap_total_bytes="$sample_host_swap_total_bytes"
+host_initial_swap_free_bytes="$sample_host_swap_free_bytes"
 declare -A main_daemon_stderr_start_bytes=()
 main_daemon_stderr_capture_done=0
 main_daemon_stderr_scan_done=0
@@ -959,6 +1092,7 @@ launch_workload() {
       --param "base=$base" \
       --param "files=$FILES" \
       --param "bytes=$BYTES" \
+      --param "min-files-per-second=0" \
       --param "timeout-seconds=$TIMEOUT_SECONDS"
   ) >"$ARTIFACTS/workload-$phase-$lane.json" \
     2>"$ARTIFACTS/workload-$phase-$lane.stderr.log" &
@@ -977,6 +1111,8 @@ sample_phase() {
   local process_nonvoluntary_context_switches process_nonvoluntary_context_switches_delta
   local process_read_bytes process_read_bytes_delta process_write_bytes process_write_bytes_delta
   local cpu_some cpu_full io_some io_full memory_some memory_full
+  local memory_current memory_peak memory_low memory_high memory_max
+  local memory_oom memory_oom_kill memory_oom_group_kill
   local io_rbytes io_wbytes rx_bytes tx_bytes primary_lanes elapsed_ms
   local cpu_pressure_some_delta io_pressure_some_delta cgroup_io_bytes_delta network_bytes_delta
   local nr_throttled_delta sample_classification
@@ -984,6 +1120,8 @@ sample_phase() {
   for lane in "${active_lanes[@]}"; do
     workload_lanes="${workload_lanes:+$workload_lanes+}$lane"
   done
+  elapsed_ms=$(((now_ns - measurement_started_ns) / 1000000))
+  record_host_memory_observation "$now_ns" "$elapsed_ms" "$phase" "$workload_lanes"
   iteration_overlap_process_usage=0
   iteration_overlap_cgroup_usage=0
   for node in "${NODES[@]}"; do
@@ -1060,6 +1198,18 @@ sample_phase() {
     read_pressure "$cgroup/memory.pressure"
     memory_some="$sample_pressure_some"
     memory_full="$sample_pressure_full"
+    read_memory_observation "$cgroup"
+    memory_current="$sample_memory_current"
+    memory_peak="$sample_memory_peak"
+    memory_low="$sample_memory_low"
+    memory_high="$sample_memory_high"
+    memory_max="$sample_memory_max"
+    memory_oom="$sample_memory_oom"
+    memory_oom_kill="$sample_memory_oom_kill"
+    memory_oom_group_kill="$sample_memory_oom_group_kill"
+    if (( memory_current > max_sampled_memory_current[$node] )); then
+      max_sampled_memory_current[$node]="$memory_current"
+    fi
     read_io_stat "$cgroup/io.stat"
     io_rbytes="$sample_io_rbytes"
     io_wbytes="$sample_io_wbytes"
@@ -1170,8 +1320,7 @@ sample_phase() {
       overlap_process_write_bytes=$((overlap_process_write_bytes + process_write_bytes_delta))
     fi
 
-    elapsed_ms=$(((now_ns - measurement_started_ns) / 1000000))
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "$now_ns" "$elapsed_ms" "$phase" "$workload_lanes" "$node" "$primary_lanes" \
       "$daemon_host_pid" "$process_leader_state" "$process_thread_count" \
       "$process_runnable_threads" "$process_sleeping_threads" \
@@ -1187,6 +1336,8 @@ sample_phase() {
       "$io_rbytes" "$io_wbytes" "$rx_bytes" "$tx_bytes" \
       "$cpu_pressure_some_delta" "$io_pressure_some_delta" \
       "$cgroup_io_bytes_delta" "$network_bytes_delta" "$sample_classification" \
+      "$memory_current" "$memory_peak" "$memory_low" "$memory_high" "$memory_max" \
+      "$memory_oom" "$memory_oom_kill" "$memory_oom_group_kill" \
       >>"$ARTIFACTS/timeline.csv"
 
     previous_usage[$node]="$usage_usec"
@@ -1278,6 +1429,7 @@ done
 
 log "workload: measuring concurrent three-shard aggregate utilization"
 active_lanes=("${LANES[@]}")
+concurrent_phase_started_ns="$(date +%s%N)"
 for lane in "${LANES[@]}"; do
   ready_lanes[$lane]=0
   launch_workload concurrent "$lane"
@@ -1318,6 +1470,10 @@ done
 for lane in "${LANES[@]}"; do
   wait_for_workload concurrent "$lane"
 done
+concurrent_phase_finished_ns="$(date +%s%N)"
+concurrent_wall_usec=$((
+  (concurrent_phase_finished_ns - concurrent_phase_started_ns + 999) / 1000
+))
 workloads_finished=1
 capture_main_daemon_stderr_workload
 if ! scan_main_daemon_stderr_workload; then
@@ -1335,16 +1491,38 @@ for node in "${NODES[@]}"; do
   fi
 done
 
-printf 'phase\tlane\tclient\tprimary\tshard\tfiles\telapsed_ms\tfiles_per_second\tretry_count\n' \
+printf 'phase\tlane\tclient\tprimary\tshard\tfiles\telapsed_ms\tend_to_end_files_per_second\twrite_elapsed_ms\tdata_write_files_per_second\tretry_count\n' \
   >"$ARTIFACTS/workloads.tsv"
+concurrent_total_files=0
 for phase in isolated concurrent; do
   for lane in "${LANES[@]}"; do
     result="$ARTIFACTS/workload-$phase-$lane.json"
     stderr_file="$ARTIFACTS/workload-$phase-$lane.stderr.log"
-    if ! jq -e '
+    if ! jq -e --argjson expected_files "$FILES" '
       .status == "passed"
       and (.diagnostics.retry_count | type) == "number"
+      and .diagnostics.retry_count >= 0
+      and .diagnostics.retry_count == (.diagnostics.retry_count | floor)
       and (.diagnostics.retry_reasons | type) == "array"
+      and all(.diagnostics.retry_reasons[]; type == "string")
+      and (
+        (.diagnostics.retry_count == 0 and (.diagnostics.retry_reasons | length) == 0)
+        or
+        (.diagnostics.retry_count > 0 and (.diagnostics.retry_reasons | length) > 0)
+      )
+      and (.diagnostics.files | type) == "number"
+      and .diagnostics.files == $expected_files
+      and .diagnostics.files == (.diagnostics.files | floor)
+      and (.diagnostics.elapsed_ms | type) == "number"
+      and .diagnostics.elapsed_ms > 0
+      and .diagnostics.elapsed_ms == (.diagnostics.elapsed_ms | floor)
+      and (.diagnostics.files_per_second | type) == "number"
+      and .diagnostics.files_per_second > 0
+      and (.diagnostics.write_elapsed_ms | type) == "number"
+      and .diagnostics.write_elapsed_ms > 0
+      and .diagnostics.write_elapsed_ms == (.diagnostics.write_elapsed_ms | floor)
+      and (.diagnostics.data_write_bytes_per_second | type) == "number"
+      and .diagnostics.data_write_bytes_per_second > 0
     ' "$result" >/dev/null 2>&1; then
       log "$phase/$lane workload omitted a passing result with retry telemetry"
       workload_failed=1
@@ -1361,16 +1539,57 @@ for phase in isolated concurrent; do
       log "$phase/$lane workload stderr contains an error/retry marker"
       workload_failed=1
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    files_completed="$(jq -r '.diagnostics.files' "$result")"
+    elapsed_ms="$(jq -r '.diagnostics.elapsed_ms' "$result")"
+    files_per_second="$(jq -r '.diagnostics.files_per_second' "$result")"
+    write_elapsed_ms="$(jq -r '.diagnostics.write_elapsed_ms' "$result")"
+    data_write_files_per_second="$(
+      jq -r --argjson bytes_per_file "$BYTES" \
+        '.diagnostics.data_write_bytes_per_second / $bytes_per_file' "$result"
+    )"
+    if [[ ! "$files_completed" =~ ^[0-9]+$ ]] || (( files_completed != FILES )); then
+      log "$phase/$lane completed $files_completed files, expected $FILES"
+      workload_failed=1
+    fi
+    if [[ "$phase" == "concurrent" ]]; then
+      concurrent_total_files=$((concurrent_total_files + files_completed))
+      lane_data_write_min="$MIN_CONCURRENT_LANE_FILES_PER_SECOND"
+    else
+      lane_data_write_min="$MIN_ISOLATED_FILES_PER_SECOND"
+    fi
+    if ! jq -e \
+      --argjson bytes_per_file "$BYTES" \
+      --argjson minimum "$lane_data_write_min" \
+      '(.diagnostics.data_write_bytes_per_second / $bytes_per_file) >= $minimum' \
+      "$result" >/dev/null; then
+      log "$phase/$lane bulk write throughput was ${data_write_files_per_second} publications/s, below $lane_data_write_min"
+      workload_failed=1
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$phase" "$lane" "${lane_client[$lane]}" "${lane_primary_service[$lane]}" \
-      "${lane_shard[$lane]}" "$(jq -r '.diagnostics.files' "$result")" \
-      "$(jq -r '.diagnostics.elapsed_ms' "$result")" \
-      "$(jq -r '.diagnostics.files_per_second' "$result")" "$retry_count" \
+      "${lane_shard[$lane]}" "$files_completed" "$elapsed_ms" \
+      "$files_per_second" "$write_elapsed_ms" "$data_write_files_per_second" \
+      "$retry_count" \
       >>"$ARTIFACTS/workloads.tsv"
   done
 done
 
 gate_failed="$workload_failed"
+concurrent_wall_ms=$((concurrent_wall_usec / 1000))
+concurrent_aggregate_milli=0
+if (( concurrent_wall_usec > 0 )); then
+  concurrent_aggregate_milli=$((concurrent_total_files * 1000000000 / concurrent_wall_usec))
+fi
+printf -v concurrent_aggregate_files_per_second '%d.%03d' \
+  $((concurrent_aggregate_milli / 1000)) $((concurrent_aggregate_milli % 1000))
+if (( concurrent_wall_ms < MIN_LANE_MS )); then
+  log "concurrent cluster wall-clock window was only ${concurrent_wall_ms}ms; increase SINOMO_DFS_PERF_FILES"
+  gate_failed=1
+fi
+if (( concurrent_aggregate_milli < MIN_CONCURRENT_AGGREGATE_FILES_PER_SECOND * 1000 )); then
+  log "concurrent cluster throughput was ${concurrent_aggregate_files_per_second} publications/s, below ${MIN_CONCURRENT_AGGREGATE_FILES_PER_SECOND}"
+  gate_failed=1
+fi
 printf '%s\n' \
   'lane,primary,main_daemon_host_pid,active_ms,main_daemon_average_cpu_percent,cgroup_average_cpu_percent,max_main_daemon_low_cpu_streak_ms,max_avoidable_ready_work_low_cpu_streak_ms,main_daemon_thread_voluntary_context_switches_delta,main_daemon_thread_nonvoluntary_context_switches_delta,main_daemon_process_io_observed,main_daemon_read_bytes_delta,main_daemon_write_bytes_delta' \
   >"$ARTIFACTS/isolated-primary-summary.csv"
@@ -1411,8 +1630,7 @@ for lane in "${LANES[@]}"; do
     gate_failed=1
   fi
   if (( average_cpu_milli < min_cpu_milli )); then
-    log "isolated ${lane_primary_service[$lane]}/$lane main daemon averaged ${average_cpu}% CPU, below ${MIN_PRIMARY_CPU_PERCENT}%"
-    gate_failed=1
+    log "isolated ${lane_primary_service[$lane]}/$lane main daemon averaged ${average_cpu}% CPU, below the ${MIN_PRIMARY_CPU_PERCENT}% diagnostic floor; avoidable-idle classification determines failure"
   fi
   if (( max_avoidable_idle > MAX_IDLE_MS )); then
     log "isolated ${lane_primary_service[$lane]}/$lane main daemon had a ${max_avoidable_idle}ms low-CPU ready-work streak with no observed CPU/I/O pressure or storage/network progress"
@@ -1530,6 +1748,14 @@ for lane in "${LANES[@]}"; do
   fi
 done
 {
+  printf 'concurrent_wall_ms\t%s\n' "$concurrent_wall_ms"
+  printf 'concurrent_total_files\t%s\n' "$concurrent_total_files"
+  printf 'concurrent_aggregate_files_per_second\t%s\n' \
+    "$concurrent_aggregate_files_per_second"
+  printf 'min_concurrent_aggregate_files_per_second\t%s\n' \
+    "$MIN_CONCURRENT_AGGREGATE_FILES_PER_SECOND"
+  printf 'min_concurrent_data_write_files_per_second_per_lane\t%s\n' \
+    "$MIN_CONCURRENT_LANE_FILES_PER_SECOND"
   printf 'overlap_ms\t%s\n' "$overlap_ms"
   printf 'three_lane_main_daemon_efficiency_percent\t%s\n' "$aggregate_efficiency"
   printf 'three_lane_cgroup_efficiency_percent\t%s\n' "$cgroup_aggregate_efficiency"
@@ -1639,11 +1865,96 @@ for node in "${NODES[@]}"; do
   fi
 done
 
+printf '%s\n' \
+  'phase,workload_lanes,node,samples,memory_current_first_bytes,memory_current_last_bytes,memory_current_min_bytes,memory_current_max_bytes,memory_peak_first_bytes,memory_peak_last_bytes' \
+  >"$ARTIFACTS/memory-phase-summary.csv"
+awk -F, '
+  NR == 1 { next }
+  {
+    key = $3 SUBSEP $4 SUBSEP $5
+    if (!(key in samples)) {
+      phase[key] = $3
+      lanes[key] = $4
+      node[key] = $5
+      current_first[key] = $44
+      current_min[key] = $44
+      current_max[key] = $44
+      peak_first[key] = $45
+    }
+    samples[key] += 1
+    current_last[key] = $44
+    peak_last[key] = $45
+    if ($44 < current_min[key]) current_min[key] = $44
+    if ($44 > current_max[key]) current_max[key] = $44
+  }
+  END {
+    for (key in samples) {
+      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+        phase[key], lanes[key], node[key], samples[key],
+        current_first[key], current_last[key], current_min[key], current_max[key],
+        peak_first[key], peak_last[key]
+    }
+  }
+' "$ARTIFACTS/timeline.csv" \
+  | sort -t, -k1,1 -k2,2 -k3,3 >>"$ARTIFACTS/memory-phase-summary.csv"
+
+printf '%s\n' \
+  'node,memory_current_initial_bytes,memory_current_sampled_peak_bytes,memory_current_final_bytes,memory_peak_initial_bytes,memory_peak_final_bytes,memory_peak_growth_bytes,memory_events_low_delta,memory_events_high_delta,memory_events_max_delta,memory_events_oom_delta,memory_events_oom_kill_delta,memory_events_oom_group_kill_delta' \
+  >"$ARTIFACTS/memory-summary.csv"
+printf 'node\tkey\tvalue\n' >"$ARTIFACTS/memory-events.after.tsv"
+for node in "${NODES[@]}"; do
+  read_memory_observation "${container_cgroup[$node]}"
+  memory_peak_growth=$((sample_memory_peak - initial_memory_peak[$node]))
+  memory_low_delta=$((sample_memory_low - initial_memory_low[$node]))
+  memory_high_delta=$((sample_memory_high - initial_memory_high[$node]))
+  memory_max_delta=$((sample_memory_max - initial_memory_max[$node]))
+  memory_oom_delta=$((sample_memory_oom - initial_memory_oom[$node]))
+  memory_oom_kill_delta=$((sample_memory_oom_kill - initial_memory_oom_kill[$node]))
+  memory_oom_group_kill_delta=$((
+    sample_memory_oom_group_kill - initial_memory_oom_group_kill[$node]
+  ))
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$node" "${initial_memory_current[$node]}" \
+    "${max_sampled_memory_current[$node]}" "$sample_memory_current" \
+    "${initial_memory_peak[$node]}" "$sample_memory_peak" "$memory_peak_growth" \
+    "$memory_low_delta" "$memory_high_delta" "$memory_max_delta" \
+    "$memory_oom_delta" "$memory_oom_kill_delta" "$memory_oom_group_kill_delta" \
+    >>"$ARTIFACTS/memory-summary.csv"
+  while read -r memory_event_key memory_event_value _; do
+    printf '%s\t%s\t%s\n' "$node" "$memory_event_key" "$memory_event_value"
+  done <"${container_cgroup[$node]}/memory.events" >>"$ARTIFACTS/memory-events.after.tsv"
+  if (( memory_peak_growth < 0 || memory_low_delta < 0 || memory_high_delta < 0 \
+      || memory_max_delta < 0 || memory_oom_delta < 0 || memory_oom_kill_delta < 0 \
+      || memory_oom_group_kill_delta < 0 )); then
+    log "$node cumulative cgroup memory counter regressed during the measurement"
+    gate_failed=1
+  fi
+  if (( memory_oom_delta != 0 || memory_oom_kill_delta != 0 \
+      || memory_oom_group_kill_delta != 0 )); then
+    log "$node experienced cgroup OOM activity during the measurement"
+    gate_failed=1
+  fi
+done
+
+memory_final_timestamp_ns="$(date +%s%N)"
+memory_final_elapsed_ms=$(((memory_final_timestamp_ns - measurement_started_ns) / 1000000))
+record_host_memory_observation \
+  "$memory_final_timestamp_ns" "$memory_final_elapsed_ms" postflight ""
+{
+  printf 'memory_total_bytes\t%s\n' "$host_initial_memory_total_bytes"
+  printf 'memory_available_initial_bytes\t%s\n' "$host_initial_memory_available_bytes"
+  printf 'memory_available_minimum_bytes\t%s\n' "$host_min_memory_available_bytes"
+  printf 'memory_available_final_bytes\t%s\n' "$host_last_memory_available_bytes"
+  printf 'swap_total_bytes\t%s\n' "$host_initial_swap_total_bytes"
+  printf 'swap_free_initial_bytes\t%s\n' "$host_initial_swap_free_bytes"
+  printf 'swap_free_final_bytes\t%s\n' "$host_last_swap_free_bytes"
+} >"$ARTIFACTS/host-memory-summary.tsv"
+
 log "results: $ARTIFACTS"
-log "three-lane overlap=${overlap_ms}ms main-daemon efficiency=${aggregate_efficiency}% cgroup efficiency=${cgroup_aggregate_efficiency}%"
+log "concurrent cluster=${concurrent_aggregate_files_per_second} publications/s over ${concurrent_wall_ms}ms; three-lane overlap=${overlap_ms}ms main-daemon efficiency=${aggregate_efficiency}% cgroup efficiency=${cgroup_aggregate_efficiency}%"
 if (( gate_failed != 0 )); then
   log "DFS shard performance gate FAILED"
   exit 1
 fi
 
-log "DFS shard performance gate passed: isolated primaries stayed active and the concurrent three-lane phase met the configured aggregate utilization floor"
+log "DFS shard performance gate passed: isolated lanes met their bulk write+commit publication floor and the concurrent cluster met its end-to-end aggregate publication and utilization floors"

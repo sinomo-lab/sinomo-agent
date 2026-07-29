@@ -111,6 +111,7 @@ struct PosixBulkLocalWrite<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PosixBulkParentTouch {
     path: String,
+    object: DfsObjectMetadata,
     metadata_shard: Option<DfsMetadataShardConfig>,
 }
 
@@ -1394,6 +1395,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    fn resolve_posix_bulk_parent(&mut self, path: &str) -> Result<(String, DfsObjectMetadata)> {
+        let (mut path, mut parent) =
+            self.resolve_posix_path_distributed_with_terminal_object(path)?;
+        if parent
+            .as_ref()
+            .is_none_or(|parent| parent.kind == DfsObjectKind::Tombstone)
+        {
+            // Ordinary path resolution deliberately stays local. Preserve the
+            // previous remote-primary/stale-tombstone recovery path when this
+            // node does not have a live terminal parent to reuse.
+            (path, parent) = self.lookup_sifs_path_distributed_synced(&path, false)?;
+        }
+        let parent = parent.ok_or_else(|| DfsPosixError::MissingParent { path: path.clone() })?;
+        if parent.kind == DfsObjectKind::Tombstone {
+            return Err(DfsPosixError::MissingParent { path });
+        }
+        let parent = self.resolve_hardlink_target(&parent)?;
+        if parent.kind != DfsObjectKind::Directory {
+            return Err(DfsPosixError::NotDirectory { path });
+        }
+        Ok((path, parent))
+    }
+
     pub fn posix_write_files_local_eventual_with_known_parents<'a, I>(
         &mut self,
         files: I,
@@ -1408,7 +1432,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
         let mut prepared = Vec::with_capacity(files.len());
         let mut seen_objects = BTreeSet::new();
-        let mut resolved_parents = BTreeMap::<String, String>::new();
+        let mut resolved_parents = BTreeMap::<String, (String, DfsObjectMetadata)>::new();
         let metadata_shard_snapshot = self.refresh_sifs_metadata_shards()?;
         for (path, bytes) in &files {
             let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
@@ -1427,10 +1451,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let Some(parent) = parent_posix_path(&path) else {
                 return Err(DfsPosixError::IsDirectory { path });
             };
-            let resolved_parent = match resolved_parents.get(&parent) {
+            let (resolved_parent, parent_object) = match resolved_parents.get(&parent) {
                 Some(resolved) => resolved.clone(),
                 None => {
-                    let resolved = self.resolve_posix_path_distributed(&parent, true)?;
+                    let resolved = self.resolve_posix_bulk_parent(&parent)?;
                     resolved_parents.insert(parent.clone(), resolved.clone());
                     resolved
                 }
@@ -1490,6 +1514,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let parent_touch = if touch_parent_on_create {
                 Some(PosixBulkParentTouch {
                     path: resolved_parent.clone(),
+                    object: parent_object.clone(),
                     metadata_shard: match metadata_shard_snapshot.as_deref() {
                         Some(shards) => self.select_sifs_metadata_shard_for_path_from_snapshot(
                             &resolved_parent,
@@ -1531,7 +1556,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut prepared = Vec::with_capacity(files.len());
         let mut seen_objects = BTreeSet::new();
         let mut seen_paths = BTreeSet::new();
-        let mut resolved_parents = BTreeMap::<String, String>::new();
+        let mut resolved_parents = BTreeMap::<String, (String, DfsObjectMetadata)>::new();
         let metadata_shard_snapshot = self.refresh_sifs_metadata_shards()?;
         for (path, bytes) in files {
             let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
@@ -1541,10 +1566,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let Some(parent) = parent_posix_path(&path) else {
                 return Err(DfsPosixError::IsDirectory { path });
             };
-            let resolved_parent = match resolved_parents.get(&parent) {
+            let (resolved_parent, parent_object) = match resolved_parents.get(&parent) {
                 Some(resolved) => resolved.clone(),
                 None => {
-                    let resolved = self.resolve_posix_path_distributed(&parent, true)?;
+                    let resolved = self.resolve_posix_bulk_parent(&parent)?;
                     resolved_parents.insert(parent.clone(), resolved.clone());
                     resolved
                 }
@@ -1553,11 +1578,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Err(DfsPosixError::InvalidPath { path });
             };
             let path = join_posix_path(&resolved_parent, child_name);
-            if !seen_paths.insert(path.clone())
-                || self
-                    .lookup_sifs_path(&path)?
-                    .is_some_and(|object| object.kind != DfsObjectKind::Tombstone)
-            {
+            // Duplicate paths can be rejected locally. Existing-path
+            // exclusivity is checked from one coherent shard snapshot by the
+            // authoritative CommitLocalEventualBatch handler and fenced again
+            // by namespace prepare/commit, so the requester must not reopen
+            // metadata once per file.
+            if !seen_paths.insert(path.clone()) {
                 return Err(DfsPosixError::AlreadyExists { path });
             }
             let object = new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
@@ -1572,6 +1598,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             let parent_touch = Some(PosixBulkParentTouch {
                 path: resolved_parent.clone(),
+                object: parent_object.clone(),
                 metadata_shard: match metadata_shard_snapshot.as_deref() {
                     Some(shards) => self.select_sifs_metadata_shard_for_path_from_snapshot(
                         &resolved_parent,
@@ -1649,8 +1676,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let mut touched_parent_objects =
             BTreeMap::<(MetadataAuthorityKey, DfsObjectId), DfsObjectMetadata>::new();
-        let mut resolved_parent_objects =
-            BTreeMap::<(MetadataAuthorityKey, String), DfsObjectMetadata>::new();
         for write in &prepared {
             let Some(parent_touch) = write.parent_touch.as_ref() else {
                 continue;
@@ -1659,23 +1684,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             metadata_shards
                 .entry(metadata_authority.clone())
                 .or_insert_with(|| parent_touch.metadata_shard.clone());
-            let parent_cache_key = (metadata_authority.clone(), parent_touch.path.clone());
-            let parent = if let Some(parent) = resolved_parent_objects.get(&parent_cache_key) {
-                parent.clone()
-            } else {
-                let parent = match self.lookup_sifs_path(&parent_touch.path)? {
-                    Some(parent) if parent.kind != DfsObjectKind::Tombstone => parent,
-                    _ => {
-                        let (_, parent) =
-                            self.lookup_sifs_path_distributed_synced(&parent_touch.path, false)?;
-                        parent.ok_or_else(|| DfsPosixError::MissingParent {
-                            path: parent_touch.path.clone(),
-                        })?
-                    }
-                };
-                resolved_parent_objects.insert(parent_cache_key, parent.clone());
-                parent
-            };
+            let parent = &parent_touch.object;
             if parent.kind == DfsObjectKind::Tombstone {
                 return Err(DfsPosixError::MissingParent {
                     path: parent_touch.path.clone(),
@@ -1688,6 +1697,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             let key = (metadata_authority, parent.object_id.clone());
             touched_parent_objects.entry(key).or_insert_with(|| {
+                // This object is the exact version observed while resolving
+                // the parent. The namespace prepare still fences its path and
+                // predecessor version authoritatively before applying this
+                // increment, so reusing it does not turn the commit into a
+                // blind parent overwrite.
                 let mut parent = parent.clone();
                 parent.version = next_version(&parent.version);
                 parent.modified_at_unix_nanos = write_time;
@@ -1780,6 +1794,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map_err(DfsPosixError::from)
             };
             if let Err(source) = result {
+                // An authoritative create-only rejection proves that this
+                // shard group committed nothing. Preserve O_EXCL/EEXIST when
+                // no earlier shard group was committed; once earlier groups
+                // are visible the caller still needs the partial-commit
+                // boundary.
+                if committed_metadata_paths.is_empty()
+                    && matches!(&source, DfsPosixError::AlreadyExists { .. })
+                {
+                    return Err(source);
+                }
                 let unattempted_metadata_paths = all_metadata_paths
                     .difference(&committed_metadata_paths)
                     .filter(|path| !group_metadata_paths.contains(*path))

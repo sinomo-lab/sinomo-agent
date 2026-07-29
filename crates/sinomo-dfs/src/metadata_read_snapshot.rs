@@ -8,6 +8,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::UNIX_EPOCH;
 
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_records::DfsMetadataPrefixProof;
@@ -25,6 +26,8 @@ use crate::metadata_tables::{
 thread_local! {
     static METADATA_DURABLE_TABLE_PROBES: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static METADATA_CHECKPOINT_SNAPSHOT_DECODES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -35,6 +38,16 @@ pub(crate) fn reset_metadata_durable_table_probes() {
 #[cfg(test)]
 pub(crate) fn metadata_durable_table_probes() -> usize {
     METADATA_DURABLE_TABLE_PROBES.get()
+}
+
+#[cfg(test)]
+fn reset_metadata_checkpoint_snapshot_decodes() {
+    METADATA_CHECKPOINT_SNAPSHOT_DECODES.set(0);
+}
+
+#[cfg(test)]
+fn metadata_checkpoint_snapshot_decodes() -> usize {
+    METADATA_CHECKPOINT_SNAPSHOT_DECODES.get()
 }
 
 pub(crate) fn refresh_metadata_tables(
@@ -106,10 +119,27 @@ pub(crate) fn current_tables_snapshot<'a>(
 ) -> Result<DfsMetadataTablesSnapshot<'a>> {
     #[cfg(test)]
     METADATA_DURABLE_TABLE_PROBES.set(METADATA_DURABLE_TABLE_PROBES.get().saturating_add(1));
-    if metadata_table_checkpoint_log_path(root).is_file() {
+    let checkpoint_fingerprint = metadata_table_checkpoint_fingerprint(root)?;
+    if checkpoint_fingerprint.is_some() {
+        let path = metadata_table_path(root);
+        let current_snapshot_fingerprint = metadata_table_snapshot_fingerprint(root)?;
+        let table_log_offset = metadata_table_log_len(&path)?;
+        if let Some(tables) = cached_or_advanced_read_snapshot(
+            read_snapshot_cache,
+            &path,
+            &current_snapshot_fingerprint,
+            &checkpoint_fingerprint,
+            table_log_offset,
+        )? {
+            return Ok(DfsMetadataTablesSnapshot::Shared(tables));
+        }
+        #[cfg(test)]
+        METADATA_CHECKPOINT_SNAPSHOT_DECODES
+            .set(METADATA_CHECKPOINT_SNAPSHOT_DECODES.get().saturating_add(1));
         return Ok(snapshot_from_state(
             read_snapshot_cache,
             read_metadata_table_state_lenient(root)?,
+            checkpoint_fingerprint,
         ));
     }
     let path = metadata_table_path(root);
@@ -132,13 +162,14 @@ pub(crate) fn current_tables_snapshot<'a>(
                     read_snapshot_cache,
                     &path,
                     &current_snapshot_fingerprint,
+                    &None,
                     len,
                 )? {
                     return Ok(DfsMetadataTablesSnapshot::Shared(tables));
                 }
                 if len < table_log_offset {
                     let state = read_metadata_table_state_lenient(root)?;
-                    return Ok(snapshot_from_state(read_snapshot_cache, state));
+                    return Ok(snapshot_from_state(read_snapshot_cache, state, None));
                 }
                 let mut tables = live_tables.clone();
                 let replay =
@@ -154,7 +185,7 @@ pub(crate) fn current_tables_snapshot<'a>(
                     snapshot_fingerprint: current_snapshot_fingerprint,
                     prefix_proof: replay.prefix_proof,
                 };
-                return Ok(snapshot_from_state(read_snapshot_cache, state));
+                return Ok(snapshot_from_state(read_snapshot_cache, state, None));
             }
         }
     }
@@ -163,18 +194,20 @@ pub(crate) fn current_tables_snapshot<'a>(
         read_snapshot_cache,
         &path,
         &current_snapshot_fingerprint,
+        &None,
         table_log_offset,
     )? {
         return Ok(DfsMetadataTablesSnapshot::Shared(tables));
     }
     let state = read_metadata_table_state_lenient(root)?;
-    Ok(snapshot_from_state(read_snapshot_cache, state))
+    Ok(snapshot_from_state(read_snapshot_cache, state, None))
 }
 
 fn cached_or_advanced_read_snapshot(
     read_snapshot_cache: &Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
     path: &Path,
     snapshot_fingerprint: &Option<MetadataTableSnapshotFingerprint>,
+    checkpoint_fingerprint: &Option<MetadataTableSnapshotFingerprint>,
     table_log_offset: u64,
 ) -> Result<Option<Arc<DfsMetadataTables>>> {
     let Ok(mut cache) = read_snapshot_cache.lock() else {
@@ -184,6 +217,7 @@ fn cached_or_advanced_read_snapshot(
         return Ok(None);
     };
     if cache.snapshot_fingerprint != *snapshot_fingerprint
+        || cache.checkpoint_fingerprint != *checkpoint_fingerprint
         || cache.table_log_offset > table_log_offset
     {
         return Ok(None);
@@ -204,16 +238,59 @@ fn cached_or_advanced_read_snapshot(
 fn snapshot_from_state<'a>(
     read_snapshot_cache: &Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
     state: DfsMetadataTableState,
+    checkpoint_fingerprint: Option<MetadataTableSnapshotFingerprint>,
 ) -> DfsMetadataTablesSnapshot<'a> {
     let tables = Arc::new(state.tables);
     if let Ok(mut cache) = read_snapshot_cache.lock() {
         *cache = Some(MetadataTableReadSnapshotCache {
             snapshot_fingerprint: state.snapshot_fingerprint.clone(),
+            checkpoint_fingerprint,
             table_log_offset: state.table_log_offset,
             tables: Arc::clone(&tables),
         });
     }
     DfsMetadataTablesSnapshot::Shared(tables)
+}
+
+fn metadata_table_checkpoint_fingerprint(
+    root: &Path,
+) -> Result<Option<MetadataTableSnapshotFingerprint>> {
+    metadata_table_file_fingerprint(&metadata_table_checkpoint_log_path(root))
+}
+
+fn metadata_table_file_fingerprint(
+    path: &Path,
+) -> Result<Option<MetadataTableSnapshotFingerprint>> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(MetadataBackendError::Io {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    let modified_unix_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    Ok(Some(MetadataTableSnapshotFingerprint {
+        len: metadata.len(),
+        modified_unix_nanos,
+    }))
+}
+
+fn metadata_table_log_len(path: &Path) -> Result<u64> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(source) => Err(MetadataBackendError::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
 }
 
 fn reload_metadata_tables_if_snapshot_changed(
@@ -235,4 +312,306 @@ fn reload_metadata_tables_if_snapshot_changed(
     *table_snapshot_fingerprint = state.snapshot_fingerprint;
     *prefix_proof = state.prefix_proof;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, OpenOptions};
+
+    use sinomo_core::node::NodeId;
+
+    use super::*;
+    use crate::metadata_records::{DfsMetadataTableBatch, DfsMetadataTableOp};
+    use crate::metadata_table_store::{
+        append_metadata_table_batch, metadata_table_checkpoint_log_path, metadata_table_path,
+        persist_metadata_table_snapshot, rotate_metadata_table_log_for_checkpoint,
+    };
+    use crate::{DfsFileSystem, DfsFileSystemId};
+
+    fn file_system(label: &str, display_name_bytes: usize) -> DfsFileSystem {
+        DfsFileSystem {
+            file_system_id: DfsFileSystemId::from_legacy_named(format!("fs_{label}"))
+                .expect("valid filesystem id"),
+            display_name: label.repeat(display_name_bytes.max(1)),
+            owner_node_id: NodeId::from_legacy_named("node_owner").expect("valid owner node"),
+            subtree_policies: Vec::new(),
+        }
+    }
+
+    fn append_file_system(root: &Path, sequence: u64, file_system: DfsFileSystem) -> u64 {
+        append_metadata_table_batch(
+            root,
+            &DfsMetadataTableBatch {
+                sequence,
+                ops: vec![DfsMetadataTableOp::PutFileSystem { file_system }],
+                prefix_proof: None,
+            },
+        )
+        .expect("append metadata table batch")
+    }
+
+    fn shared_tables(snapshot: DfsMetadataTablesSnapshot<'_>) -> Arc<DfsMetadataTables> {
+        match snapshot {
+            DfsMetadataTablesSnapshot::Shared(tables) => tables,
+            DfsMetadataTablesSnapshot::Borrowed(_) => {
+                panic!("rotated checkpoint snapshot must be owned")
+            }
+        }
+    }
+
+    fn setup_rotated_checkpoint(
+        root: &Path,
+        checkpoint_file_system: DfsFileSystem,
+    ) -> Option<MetadataTableSnapshotFingerprint> {
+        persist_metadata_table_snapshot(root, &DfsMetadataTables::default(), None, None)
+            .expect("persist empty metadata snapshot");
+        append_file_system(root, 1, checkpoint_file_system);
+        assert!(
+            rotate_metadata_table_log_for_checkpoint(root, 0)
+                .expect("rotate metadata table checkpoint"),
+            "non-empty active table log must rotate"
+        );
+        metadata_table_snapshot_fingerprint(root).expect("snapshot fingerprint")
+    }
+
+    #[test]
+    fn checkpoint_snapshot_cache_decodes_once_and_advances_active_suffix() {
+        let root =
+            sinomo_testdir::TestDir::new("sinomo-dfs-metadata-checkpoint-read-snapshot-cache");
+        let checkpoint_file_system = file_system("checkpoint", 1);
+        let suffix_file_system = file_system("suffix", 1);
+        let snapshot_fingerprint =
+            setup_rotated_checkpoint(root.path(), checkpoint_file_system.clone());
+        let live_tables = DfsMetadataTables::default();
+        let cache = Arc::new(Mutex::new(None));
+        reset_metadata_checkpoint_snapshot_decodes();
+
+        let first = shared_tables(
+            current_tables_snapshot(
+                root.path(),
+                &live_tables,
+                0,
+                0,
+                &snapshot_fingerprint,
+                &cache,
+            )
+            .expect("read rotated checkpoint snapshot"),
+        );
+        assert!(
+            first
+                .file_systems
+                .contains_key(&checkpoint_file_system.file_system_id)
+        );
+        let first_ptr = Arc::as_ptr(&first);
+        drop(first);
+
+        let repeated = shared_tables(
+            current_tables_snapshot(
+                root.path(),
+                &live_tables,
+                0,
+                0,
+                &snapshot_fingerprint,
+                &cache,
+            )
+            .expect("reuse rotated checkpoint snapshot"),
+        );
+        assert_eq!(Arc::as_ptr(&repeated), first_ptr);
+        assert_eq!(metadata_checkpoint_snapshot_decodes(), 1);
+        drop(repeated);
+
+        append_file_system(root.path(), 2, suffix_file_system.clone());
+        let advanced = shared_tables(
+            current_tables_snapshot(
+                root.path(),
+                &live_tables,
+                0,
+                0,
+                &snapshot_fingerprint,
+                &cache,
+            )
+            .expect("advance cached snapshot through active suffix"),
+        );
+        assert_eq!(Arc::as_ptr(&advanced), first_ptr);
+        assert!(
+            advanced
+                .file_systems
+                .contains_key(&checkpoint_file_system.file_system_id)
+        );
+        assert!(
+            advanced
+                .file_systems
+                .contains_key(&suffix_file_system.file_system_id)
+        );
+        assert_eq!(
+            metadata_checkpoint_snapshot_decodes(),
+            1,
+            "active suffix replay must not decode the immutable checkpoint again"
+        );
+    }
+
+    #[test]
+    fn checkpoint_snapshot_cache_invalidates_changed_removed_and_shrunk_generations() {
+        let root = sinomo_testdir::TestDir::new(
+            "sinomo-dfs-metadata-checkpoint-read-snapshot-invalidation",
+        );
+        let original_checkpoint = file_system("original", 1);
+        let replacement_checkpoint = file_system("replacement", 17);
+        let first_suffix = file_system("first_suffix", 1);
+        let removed_suffix = file_system("removed_suffix", 1);
+        let snapshot_fingerprint =
+            setup_rotated_checkpoint(root.path(), original_checkpoint.clone());
+        let first_suffix_len = append_file_system(root.path(), 2, first_suffix.clone());
+        let live_tables = DfsMetadataTables::default();
+        let cache = Arc::new(Mutex::new(None));
+        reset_metadata_checkpoint_snapshot_decodes();
+
+        let initial = shared_tables(
+            current_tables_snapshot(
+                root.path(),
+                &live_tables,
+                0,
+                0,
+                &snapshot_fingerprint,
+                &cache,
+            )
+            .expect("cache original checkpoint generation"),
+        );
+        assert!(
+            initial
+                .file_systems
+                .contains_key(&original_checkpoint.file_system_id)
+        );
+        drop(initial);
+        assert_eq!(metadata_checkpoint_snapshot_decodes(), 1);
+
+        let replacement_root =
+            sinomo_testdir::TestDir::new("sinomo-dfs-metadata-checkpoint-replacement");
+        append_file_system(replacement_root.path(), 1, replacement_checkpoint.clone());
+        let checkpoint_path = metadata_table_checkpoint_log_path(root.path());
+        let checkpoint_fingerprint_before =
+            metadata_table_checkpoint_fingerprint(root.path()).expect("checkpoint fingerprint");
+        fs::copy(
+            metadata_table_path(replacement_root.path()),
+            &checkpoint_path,
+        )
+        .expect("replace immutable checkpoint generation");
+        let checkpoint_fingerprint_after =
+            metadata_table_checkpoint_fingerprint(root.path()).expect("replacement fingerprint");
+        assert_ne!(
+            checkpoint_fingerprint_after, checkpoint_fingerprint_before,
+            "replacement fixture must change the checkpoint fingerprint"
+        );
+
+        let replaced = shared_tables(
+            current_tables_snapshot(
+                root.path(),
+                &live_tables,
+                0,
+                0,
+                &snapshot_fingerprint,
+                &cache,
+            )
+            .expect("reload changed checkpoint generation"),
+        );
+        assert!(
+            replaced
+                .file_systems
+                .contains_key(&replacement_checkpoint.file_system_id)
+        );
+        assert!(
+            !replaced
+                .file_systems
+                .contains_key(&original_checkpoint.file_system_id)
+        );
+        assert_eq!(metadata_checkpoint_snapshot_decodes(), 2);
+        drop(replaced);
+
+        append_file_system(root.path(), 3, removed_suffix.clone());
+        let advanced = shared_tables(
+            current_tables_snapshot(
+                root.path(),
+                &live_tables,
+                0,
+                0,
+                &snapshot_fingerprint,
+                &cache,
+            )
+            .expect("advance replacement checkpoint suffix"),
+        );
+        assert!(
+            advanced
+                .file_systems
+                .contains_key(&removed_suffix.file_system_id)
+        );
+        drop(advanced);
+        assert_eq!(metadata_checkpoint_snapshot_decodes(), 2);
+
+        OpenOptions::new()
+            .write(true)
+            .open(metadata_table_path(root.path()))
+            .expect("open active table log")
+            .set_len(first_suffix_len)
+            .expect("shrink active table log to first complete batch");
+        let shrunk = shared_tables(
+            current_tables_snapshot(
+                root.path(),
+                &live_tables,
+                0,
+                0,
+                &snapshot_fingerprint,
+                &cache,
+            )
+            .expect("reload after active log shrink"),
+        );
+        assert!(
+            shrunk
+                .file_systems
+                .contains_key(&first_suffix.file_system_id)
+        );
+        assert!(
+            !shrunk
+                .file_systems
+                .contains_key(&removed_suffix.file_system_id)
+        );
+        assert_eq!(metadata_checkpoint_snapshot_decodes(), 3);
+        drop(shrunk);
+
+        fs::remove_file(checkpoint_path).expect("remove installed checkpoint generation");
+        let without_checkpoint = shared_tables(
+            current_tables_snapshot(
+                root.path(),
+                &live_tables,
+                0,
+                0,
+                &snapshot_fingerprint,
+                &cache,
+            )
+            .expect("invalidate checkpoint cache after removal"),
+        );
+        assert!(
+            without_checkpoint
+                .file_systems
+                .contains_key(&first_suffix.file_system_id)
+        );
+        assert!(
+            !without_checkpoint
+                .file_systems
+                .contains_key(&replacement_checkpoint.file_system_id)
+        );
+        assert_eq!(
+            cache
+                .lock()
+                .expect("snapshot cache")
+                .as_ref()
+                .expect("replacement non-checkpoint cache")
+                .checkpoint_fingerprint,
+            None
+        );
+        assert_eq!(
+            metadata_checkpoint_snapshot_decodes(),
+            3,
+            "checkpoint removal must leave the checkpoint decode path"
+        );
+    }
 }

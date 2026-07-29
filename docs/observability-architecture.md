@@ -231,11 +231,13 @@ exporter scans, and human-facing diagnostics.
 
 `docker/measure-dfs-shards.sh` resolves the main daemon's container PID to one
 host PID in the node cgroup and records process CPU separately from whole-cgroup
-CPU, pressure, I/O, throttling, and network counters. Its utilization gates use
-only main-daemon CPU. The sampled CPU ownership is exact, while the beginning
-and end of a workload window remain approximate because client process liveness
-plus a warmup interval bracket the remote server operation; DFS performance
-traces are the finer-grained source for those launch edges.
+CPU, pressure, I/O, memory, throttling, and network counters. Concurrent
+utilization gates use only main-daemon CPU; an isolated average below the
+configured CPU floor remains diagnostic unless the ready-work classifier also
+finds an avoidable idle streak. The sampled CPU ownership is exact, while the
+beginning and end of a workload window remain approximate because client
+process liveness plus a warmup interval bracket the remote server operation;
+DFS performance traces are the finer-grained source for those launch edges.
 
 The same timeline records daemon thread states, voluntary and involuntary
 context switches, process I/O when the kernel exposes it, and interval deltas
@@ -255,6 +257,20 @@ hardware is used through more shards and writes or through content hashing,
 replica transfer, and transport work. Passing the configurable utilization
 floor means that this bounded target stayed work-conserving; it is not a claim
 that one shard saturated the entire host.
+
+Each `cluster.dfs.bulk-write` lane reports two completed logical small-file
+publication rates. `data_write_files_per_second` measures the deferred bulk
+write plus its authoritative metadata commit; it excludes the separately timed
+one-off parent-directory setup and final publish scheduling. The end-to-end
+rate retains those setup costs. The Docker gate requires every isolated lane's
+bulk write phase to sustain at least 1,000 publications/s by default, then
+requires the concurrent cluster to sustain 1,000 end-to-end publications/s
+over a conservative wall-clock envelope from before the first lane launch
+through the last lane exit. Concurrent per-lane rates remain visible but have
+no default floor. These are logical bulk publications, not independently
+durable POSIX syscalls. Override `SINOMO_DFS_PERF_MIN_FILES_PER_SECOND` only
+when intentionally measuring a different storage regime, and retain the
+configured floors with the artifacts.
 
 The crate-level `network-blob` benchmark is a complementary tmpfs-backed,
 in-process measurement when its root is under `/dev/shm`:
@@ -312,6 +328,8 @@ run. Preserve the disk suite under `target/cluster-test-artifacts/<run>/` and
 the algorithm evidence under `target/dfs-shard-perf/<run>/`, especially
 `timeline.csv`, `isolated-primary-summary.csv`, `aggregate-summary.tsv`,
 `sample-classification-summary.csv`, `workloads.tsv`,
+`memory-summary.csv`, `memory-phase-summary.csv`, `host-memory.csv`,
+`host-memory-summary.tsv`,
 `main-daemon-stderr-workload.tsv`, the per-node
 `main-daemon-<node>.workload.stderr.log` files, and the before/after health,
 doctor, DFS-status, and shard-layout files. The daemon-stderr manifest records

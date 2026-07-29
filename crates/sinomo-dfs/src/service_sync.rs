@@ -3944,6 +3944,7 @@ mod tests {
                 created_at: time::OffsetDateTime::UNIX_EPOCH,
             },
             completed_request: None,
+            completed_request_completion: None,
             status: crate::DfsNamespacePrepareStatus::Prepared,
         };
         prepare.operation_digest =

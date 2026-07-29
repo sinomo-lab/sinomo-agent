@@ -11958,6 +11958,7 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
         content_receipts: Vec::new(),
         transaction,
         completed_request: None,
+        completed_request_completion: None,
         status: DfsNamespacePrepareStatus::Prepared,
     };
     prepare.operation_digest =
@@ -12155,6 +12156,7 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
             created_at: OffsetDateTime::now_utc(),
         },
         completed_request: None,
+        completed_request_completion: None,
         status: DfsNamespacePrepareStatus::Prepared,
     };
     prepare.operation_digest =
@@ -12573,6 +12575,7 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
             created_at: OffsetDateTime::UNIX_EPOCH,
         },
         completed_request: None,
+        completed_request_completion: None,
         status: DfsNamespacePrepareStatus::Prepared,
     };
     prepare.operation_digest =
@@ -13314,6 +13317,101 @@ fn metadata_journal_missing_namespace_transaction_payload_uses_keyed_replay() {
     assert!(
         dfs.metadata.object(&unrelated.object_id).is_none(),
         "missing-payload namespace transaction replay should not scan and import the whole file system"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn metadata_journal_compact_namespace_commit_refreshes_affected_service_objects() {
+    let root = temp_root("metadata-journal-compact-namespace-commit-service-refresh");
+    let owner = NodeId::from_legacy_named("node_compact_commit_service_owner").expect("owner");
+    let file_system = file_system(owner.clone());
+    let shard_id = DfsMetadataShardId::new("root");
+    let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+    backend.put_file_system(&file_system).expect("filesystem");
+
+    let mut current = file_metadata(owner.clone());
+    current.file_system_id = file_system.file_system_id.clone();
+    current.object_id =
+        DfsObjectId::from_legacy_named("obj_compact_commit_service").expect("object");
+    current.path = "/services/compact-commit-service.txt".to_string();
+    current.version =
+        DfsVersion::from_legacy_named("version_compact_commit_service_1").expect("version");
+    backend.put_object(&current).expect("current object");
+    let seed_entries = backend.journal_since(0).expect("seed journal");
+
+    let mut committed = current.clone();
+    committed.version =
+        DfsVersion::from_legacy_named("version_compact_commit_service_2").expect("version");
+    committed.mode = 0o600;
+    let mut prepare = DfsNamespacePrepareRecord {
+        operation_id: "operation-compact-commit-service".to_string(),
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: shard_id.clone(),
+        owner_epoch: 1,
+        operation_digest: String::new(),
+        expected_object_versions: vec![DfsNamespaceObjectVersionExpectation {
+            object_id: current.object_id.clone(),
+            expected_version: Some(current.version.clone()),
+        }],
+        expected_path_occupants: vec![DfsNamespacePathOccupantExpectation {
+            path: current.path.clone(),
+            expected_object_id: Some(current.object_id.clone()),
+        }],
+        content_receipts: Vec::new(),
+        transaction: DfsNamespaceTransaction {
+            transaction_id: "transaction-compact-commit-service".to_string(),
+            file_system_id: file_system.file_system_id.clone(),
+            objects: vec![committed.clone()],
+            versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        },
+        completed_request: None,
+        completed_request_completion: None,
+        status: DfsNamespacePrepareStatus::Prepared,
+    };
+    prepare.operation_digest =
+        crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+            .expect("prepare digest");
+    backend
+        .prepare_namespace_transaction(&prepare)
+        .expect("prepared transaction");
+    let commit_entry = backend
+        .commit_prepared_namespace_transaction(
+            &prepare.operation_id,
+            &prepare.operation_digest,
+            prepare.owner_epoch,
+        )
+        .expect("compact commit");
+    assert_eq!(
+        commit_entry.mutation.affected_object_ids(),
+        BTreeSet::from([current.object_id.clone()])
+    );
+
+    let network = InProcessNetwork::new();
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let mut dfs = NetworkedDfsService::new(network.add_node(owner), content);
+    dfs.apply_metadata_journal_batch_to_service_state(&DfsMetadataJournalBatch {
+        shard_id: shard_id.clone(),
+        next_after_sequence: seed_entries.last().expect("seed entry").sequence,
+        entries: seed_entries,
+    })
+    .expect("seed stale service state");
+    assert_eq!(dfs.metadata.object(&current.object_id), Some(&current));
+
+    dfs.metadata_backend = Some(Box::new(backend));
+    dfs.apply_metadata_journal_batch_to_service_state(&DfsMetadataJournalBatch {
+        shard_id,
+        next_after_sequence: commit_entry.sequence,
+        entries: vec![commit_entry],
+    })
+    .expect("refresh compact commit");
+    assert_eq!(
+        dfs.metadata.object(&current.object_id),
+        Some(&committed),
+        "compact commit IDs must refresh the service cache from authoritative metadata"
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -30815,6 +30913,59 @@ fn sifs_posix_create_bulk_local_eventual_rejects_existing_paths() {
         b"bulk create alpha"
     );
 
+    dfs.posix_unlink(path_a).expect("tombstone existing path");
+    let recreated = dfs
+        .posix_create_files_local_eventual_with_known_parents(vec![(
+            path_a,
+            b"bulk recreate alpha".as_slice(),
+        )])
+        .expect("bulk recreate tombstoned path");
+    assert_eq!(recreated.len(), 1);
+    assert_eq!(
+        dfs.posix_read_file(path_a).expect("read recreated a"),
+        b"bulk recreate alpha"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_posix_create_bulk_local_eventual_avoids_per_file_requester_lookups() {
+    let root = temp_root("sifs-posix-create-bulk-requester-lookups");
+    let node_id =
+        NodeId::from_legacy_named("node_sifs_create_bulk_requester_lookups").expect("node");
+    let work = "/services/sandbox/instances/sandbox_create_bulk_requester_lookups/work";
+    let mut dfs = networked_sifs_with_backend(&root, node_id);
+    dfs.posix_mkdir_all(work).expect("mkdir");
+    let owned_files = (0..64)
+        .map(|index| {
+            (
+                format!("{work}/file-{index:03}.txt"),
+                format!("bulk-{index:03}").into_bytes(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    crate::posix::reset_posix_metadata_raw_lookup_count();
+    let stats = dfs
+        .posix_create_files_local_eventual_with_known_parents(
+            owned_files
+                .iter()
+                .map(|(path, bytes)| (path.as_str(), bytes.as_slice())),
+        )
+        .expect("bulk create");
+    let raw_lookup_count = crate::posix::posix_metadata_raw_lookup_count();
+
+    assert_eq!(stats.len(), owned_files.len());
+    let parent_component_count = work.trim_matches('/').split('/').count();
+    let single_parent_walk_bound = parent_component_count + 1;
+    assert!(
+        raw_lookup_count <= single_parent_walk_bound,
+        "bulk create performed {raw_lookup_count} raw point lookups for {} files; \
+         resolving {parent_component_count} parent components once requires at most \
+         {single_parent_walk_bound} lookups, and commit must reuse that terminal observation",
+        owned_files.len(),
+    );
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -39449,9 +39600,11 @@ fn local_eventual_batch_shard_selection_lists_control_plane_once_for_bulk_paths(
             writes,
         },
     };
+    crate::metadata_backend::reset_metadata_current_tables_snapshot_calls();
     let event = dfs
         .handle_namespace_request(requester.clone(), command.clone())
         .expect("commit local-eventual batch namespace request");
+    let table_snapshot_calls = crate::metadata_backend::metadata_current_tables_snapshot_calls();
 
     assert!(matches!(
         event,
@@ -39460,6 +39613,11 @@ fn local_eventual_batch_shard_selection_lists_control_plane_once_for_bulk_paths(
             ..
         }
     ));
+    assert!(
+        table_snapshot_calls <= 32,
+        "64-file local-eventual validation opened {table_snapshot_calls} metadata table \
+         snapshots; validation should use a bounded number of coherent bulk snapshots"
+    );
     assert_eq!(
         range_prefix_calls.load(Ordering::SeqCst),
         1,

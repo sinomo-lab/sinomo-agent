@@ -15,9 +15,68 @@ use crate::*;
 
 const DFS_METADATA_AUTHORITY_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const DFS_METADATA_AUTHORITY_PROBE_IDLE_WAIT: Duration = Duration::from_millis(5);
+/// Structural bound for the full-member data-plane authority probe.
+///
+/// Measuring the encoded batch here would repeat the expensive serialization
+/// this guard avoids. Each counted item becomes an independently materialized
+/// metadata record, so the count is a cheap, conservative proxy for the probe
+/// payload and clone cost.
+const DFS_METADATA_AUTHORITY_PROBE_NAMESPACE_RECORD_LIMIT: usize = 256;
 
 static DFS_METADATA_SHARD_PUBLICATION_LOCKS: OnceLock<(Mutex<BTreeSet<String>>, Condvar)> =
     OnceLock::new();
+
+fn oversized_namespace_prepare_record_count(
+    shard: &DfsMetadataShardConfig,
+    operation: &DfsMetadataAuthorityOperation,
+    prepared_batch: &DfsMetadataJournalBatch,
+) -> Option<usize> {
+    let DfsMetadataAuthorityOperation::NamespaceMutation {
+        operation_id,
+        file_system_id,
+        prepare_sequence,
+        payload_digest,
+    } = operation
+    else {
+        return None;
+    };
+    let entry = prepared_batch
+        .entries
+        .iter()
+        .find(|entry| entry.sequence == *prepare_sequence)?;
+    let DfsMetadataMutation::PutNamespacePrepare {
+        file_system_id: mutation_file_system_id,
+        operation_id: mutation_operation_id,
+        status,
+        prepare: Some(prepare),
+    } = &entry.mutation
+    else {
+        return None;
+    };
+    if file_system_id != &shard.file_system_id
+        || mutation_file_system_id != file_system_id
+        || mutation_operation_id != operation_id
+        || status != &DfsNamespacePrepareStatus::Prepared
+        || prepare.status != DfsNamespacePrepareStatus::Prepared
+        || prepare.file_system_id != *file_system_id
+        || prepare.shard_id.0 != shard.shard_id
+        || prepare.owner_epoch != shard.epoch
+        || prepare.operation_id != *operation_id
+        || prepare.operation_digest != *payload_digest
+    {
+        return None;
+    }
+    let record_count = prepare
+        .transaction
+        .objects
+        .len()
+        .saturating_add(prepare.transaction.versions.len())
+        .saturating_add(prepare.transaction.advisory_lock_states.len())
+        .saturating_add(prepare.expected_object_versions.len())
+        .saturating_add(prepare.expected_path_occupants.len())
+        .saturating_add(prepare.content_receipts.len());
+    (record_count > DFS_METADATA_AUTHORITY_PROBE_NAMESPACE_RECORD_LIMIT).then_some(record_count)
+}
 
 /// Process-wide serialization between the final canonical metadata publication
 /// check and retiring-primary fence capture for one shard.
@@ -281,41 +340,55 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 epoch: shard.epoch,
             });
         }
-        let acknowledged_node_ids = self.fresh_metadata_shard_authority_acknowledgements(
-            shard,
-            operation,
-            prepared_batch,
-            DFS_METADATA_AUTHORITY_PROBE_TIMEOUT,
-        )?;
         let required_node_ids = std::iter::once(shard.primary_node_id.clone())
             .chain(shard.replica_node_ids.iter().cloned())
             .collect::<BTreeSet<_>>();
-        dfs_perf_trace(format_args!(
-            "metadata_authority action=probe shard={} epoch={} prepare={} acknowledgements={} required={}",
-            shard.shard_id,
-            shard.epoch,
-            prepared_batch.next_after_sequence,
-            acknowledged_node_ids.len(),
-            required_node_ids.len(),
-        ));
-        if acknowledged_node_ids == required_node_ids
-            && self.metadata_shard_assignment_still_exact(shard)?
+        if let Some(record_count) =
+            oversized_namespace_prepare_record_count(shard, operation, prepared_batch)
         {
-            return Ok(DfsCanonicalAuthorization::FullShard {
-                operation_digest: metadata_authority_operation_digest(operation).to_string(),
-                expected_shard: shard.clone(),
-                acknowledged_node_ids: acknowledged_node_ids.into_iter().collect(),
-                prepare_sequence: prepared_batch.next_after_sequence,
-            });
+            dfs_perf_trace(format_args!(
+                "metadata_authority action=cluster_quorum_direct reason=oversized_namespace_prepare shard={} epoch={} prepare={} records={} limit={} required={}",
+                shard.shard_id,
+                shard.epoch,
+                metadata_authority_operation_prepare_sequence(operation),
+                record_count,
+                DFS_METADATA_AUTHORITY_PROBE_NAMESPACE_RECORD_LIMIT,
+                required_node_ids.len(),
+            ));
+        } else {
+            let acknowledged_node_ids = self.fresh_metadata_shard_authority_acknowledgements(
+                shard,
+                operation,
+                prepared_batch,
+                DFS_METADATA_AUTHORITY_PROBE_TIMEOUT,
+            )?;
+            dfs_perf_trace(format_args!(
+                "metadata_authority action=probe shard={} epoch={} prepare={} acknowledgements={} required={}",
+                shard.shard_id,
+                shard.epoch,
+                prepared_batch.next_after_sequence,
+                acknowledged_node_ids.len(),
+                required_node_ids.len(),
+            ));
+            if acknowledged_node_ids == required_node_ids
+                && self.metadata_shard_assignment_still_exact(shard)?
+            {
+                return Ok(DfsCanonicalAuthorization::FullShard {
+                    operation_digest: metadata_authority_operation_digest(operation).to_string(),
+                    expected_shard: shard.clone(),
+                    acknowledged_node_ids: acknowledged_node_ids.into_iter().collect(),
+                    prepare_sequence: prepared_batch.next_after_sequence,
+                });
+            }
+            dfs_perf_trace(format_args!(
+                "metadata_authority action=cluster_quorum_fallback shard={} epoch={} prepare={} acknowledgements={} required={}",
+                shard.shard_id,
+                shard.epoch,
+                metadata_authority_operation_prepare_sequence(operation),
+                acknowledged_node_ids.len(),
+                required_node_ids.len(),
+            ));
         }
-        dfs_perf_trace(format_args!(
-            "metadata_authority action=cluster_quorum_fallback shard={} epoch={} prepare={} acknowledgements={} required={}",
-            shard.shard_id,
-            shard.epoch,
-            metadata_authority_operation_prepare_sequence(operation),
-            acknowledged_node_ids.len(),
-            required_node_ids.len(),
-        ));
         let operation_digest = metadata_authority_operation_digest(operation);
         let Some(permit_id) = self.certify_exact_metadata_shard_operation(
             shard,
@@ -1192,6 +1265,7 @@ pub(crate) fn metadata_namespace_prepare_payload_digest(
         &prepare.expected_path_occupants,
         &prepare.transaction,
         &prepare.completed_request,
+        &prepare.completed_request_completion,
     ))
 }
 
@@ -1832,6 +1906,124 @@ mod authority_probe_tests {
         )
     }
 
+    fn prepared_namespace_authority_fixture(
+        object: &DfsObjectMetadata,
+        shard: &DfsMetadataShardConfig,
+        object_count: usize,
+    ) -> (DfsMetadataAuthorityOperation, DfsMetadataJournalBatch) {
+        let objects = (0..object_count)
+            .map(|index| {
+                let mut candidate = object.clone();
+                candidate.object_id =
+                    DfsObjectId::from_legacy_named(format!("object_namespace_authority_{index}"))
+                        .expect("namespace object id");
+                candidate.path = format!("/namespace-authority-{index}");
+                candidate.version =
+                    DfsVersion::from_legacy_named(format!("version_namespace_authority_{index}"))
+                        .expect("namespace object version");
+                candidate
+            })
+            .collect::<Vec<_>>();
+        let prepare_sequence = 17;
+        let mut prepare = DfsNamespacePrepareRecord {
+            operation_id: "operation_namespace_authority_probe".to_string(),
+            file_system_id: shard.file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
+            owner_epoch: shard.epoch,
+            operation_digest: String::new(),
+            expected_object_versions: Vec::new(),
+            expected_path_occupants: Vec::new(),
+            content_receipts: Vec::new(),
+            transaction: DfsNamespaceTransaction {
+                transaction_id: "transaction_namespace_authority_probe".to_string(),
+                file_system_id: shard.file_system_id.clone(),
+                objects,
+                versions: Vec::new(),
+                advisory_lock_states: Vec::new(),
+                created_at: OffsetDateTime::now_utc(),
+            },
+            completed_request: None,
+            completed_request_completion: None,
+            status: DfsNamespacePrepareStatus::Prepared,
+        };
+        prepare.operation_digest =
+            metadata_namespace_prepare_payload_digest(&prepare).expect("namespace prepare digest");
+        let operation =
+            metadata_authority_operation_for_namespace_prepare(&prepare, prepare_sequence)
+                .expect("namespace authority operation");
+        (
+            operation,
+            DfsMetadataJournalBatch {
+                shard_id: prepare.shard_id.clone(),
+                entries: vec![DfsMetadataJournalEntry {
+                    shard_id: prepare.shard_id.clone(),
+                    sequence: prepare_sequence,
+                    created_at: OffsetDateTime::now_utc(),
+                    mutation: DfsMetadataMutation::put_namespace_prepare(&prepare),
+                }],
+                next_after_sequence: prepare_sequence,
+            },
+        )
+    }
+
+    fn persisted_small_namespace_authority_fixture(
+        service: &mut NetworkedDfsService<AuthorityProbeTransport>,
+        object: &DfsObjectMetadata,
+        shard: &DfsMetadataShardConfig,
+    ) -> (DfsMetadataAuthorityOperation, DfsMetadataJournalBatch) {
+        let mut committed = object.clone();
+        committed.version = DfsVersion::from_legacy_named("version_small_namespace_authority_2")
+            .expect("committed version");
+        committed.changed_at_unix_nanos = object.changed_at_unix_nanos.saturating_add(1);
+        let mut prepare = DfsNamespacePrepareRecord {
+            operation_id: "operation_small_namespace_authority".to_string(),
+            file_system_id: object.file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
+            owner_epoch: shard.epoch,
+            operation_digest: String::new(),
+            expected_object_versions: vec![DfsNamespaceObjectVersionExpectation {
+                object_id: object.object_id.clone(),
+                expected_version: Some(object.version.clone()),
+            }],
+            expected_path_occupants: vec![DfsNamespacePathOccupantExpectation {
+                path: object.path.clone(),
+                expected_object_id: Some(object.object_id.clone()),
+            }],
+            content_receipts: Vec::new(),
+            transaction: DfsNamespaceTransaction {
+                transaction_id: "transaction_small_namespace_authority".to_string(),
+                file_system_id: object.file_system_id.clone(),
+                objects: vec![committed],
+                versions: Vec::new(),
+                advisory_lock_states: Vec::new(),
+                created_at: OffsetDateTime::now_utc(),
+            },
+            completed_request: None,
+            completed_request_completion: None,
+            status: DfsNamespacePrepareStatus::Prepared,
+        };
+        prepare.operation_digest =
+            metadata_namespace_prepare_payload_digest(&prepare).expect("namespace prepare digest");
+        let entry = service
+            .metadata_backend
+            .as_mut()
+            .expect("namespace authority metadata backend")
+            .prepare_namespace_transaction(&prepare)
+            .expect("persist small namespace prepare");
+        let prepare_sequence = entry.sequence;
+        let operation =
+            metadata_authority_operation_for_namespace_prepare(&prepare, prepare_sequence)
+                .expect("namespace authority operation");
+        (
+            operation,
+            DfsMetadataJournalBatch {
+                shard_id: prepare.shard_id,
+                entries: vec![entry],
+                next_after_sequence: prepare_sequence,
+            },
+        )
+    }
+
     #[test]
     fn persisted_write_authority_requires_the_exact_intent_and_w_receipts() {
         let replica = node("node_persisted_authority_replica");
@@ -1955,6 +2147,7 @@ mod authority_probe_tests {
                 created_at: OffsetDateTime::now_utc(),
             },
             completed_request: None,
+            completed_request_completion: None,
             status: DfsNamespacePrepareStatus::Prepared,
         };
         prepare.operation_digest =
@@ -2072,6 +2265,75 @@ mod authority_probe_tests {
         assert_eq!(txn_calls.load(Ordering::SeqCst), 1);
         assert!(service.pending_metadata_authority_probes.is_empty());
         assert!(service.metadata_authority_probe_results.is_empty());
+    }
+
+    #[test]
+    fn oversized_namespace_authority_uses_kv_without_data_plane_probe() {
+        let replicas = vec![
+            node("node_oversized_namespace_authority_replica_a"),
+            node("node_oversized_namespace_authority_replica_b"),
+        ];
+        let (mut service, object, _, shard, txn_calls, _) =
+            authority_fixture(ProbeBehavior::Accept, replicas);
+        let sent = Arc::clone(&service.transport.sent);
+        let (operation, prepared_batch) = prepared_namespace_authority_fixture(
+            &object,
+            &shard,
+            DFS_METADATA_AUTHORITY_PROBE_NAMESPACE_RECORD_LIMIT + 1,
+        );
+
+        let authorization = service
+            .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
+            .expect("oversized namespace prepare uses exact KV certification");
+        assert!(
+            matches!(
+                authorization,
+                DfsCanonicalAuthorization::ClusterQuorum { .. }
+            ),
+            "oversized namespace prepares must bypass the full-member data-plane probe"
+        );
+        assert_eq!(txn_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            sent.lock().expect("sent messages").is_empty(),
+            "the direct certification path must not copy or send the prepared batch"
+        );
+        drop(
+            service
+                .validate_canonical_authorization(&authorization, &operation)
+                .expect("direct certification remains subject to canonical revalidation"),
+        );
+    }
+
+    #[test]
+    fn small_namespace_authority_keeps_full_shard_probe() {
+        let replicas = vec![
+            node("node_small_namespace_authority_replica_a"),
+            node("node_small_namespace_authority_replica_b"),
+        ];
+        let expected_probe_count = replicas.len();
+        let (mut service, object, _, shard, txn_calls, _) =
+            authority_fixture(ProbeBehavior::Accept, replicas);
+        let sent = Arc::clone(&service.transport.sent);
+        let (operation, prepared_batch) =
+            persisted_small_namespace_authority_fixture(&mut service, &object, &shard);
+
+        let authorization = service
+            .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
+            .expect("small namespace prepare keeps full-shard authority");
+        assert!(
+            matches!(authorization, DfsCanonicalAuthorization::FullShard { .. }),
+            "small namespace prepares should retain the healthy data-plane path"
+        );
+        assert_eq!(txn_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            sent.lock().expect("sent messages").len(),
+            expected_probe_count
+        );
+        drop(
+            service
+                .validate_canonical_authorization(&authorization, &operation)
+                .expect("full-shard evidence remains subject to canonical revalidation"),
+        );
     }
 
     #[test]

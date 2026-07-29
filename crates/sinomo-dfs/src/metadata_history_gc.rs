@@ -1528,7 +1528,7 @@ fn namespace_request_receipt_has_prepare_dependency(
 ) -> bool {
     tables.namespace_prepares.values().any(|prepare| {
         prepare.status != DfsNamespacePrepareStatus::Aborted
-            && prepare
+            && (prepare
                 .completed_request
                 .as_ref()
                 .is_some_and(|completion| {
@@ -1536,6 +1536,14 @@ fn namespace_request_receipt_has_prepare_dependency(
                         && completion.request_id == receipt.request_id
                         && receipt.matches_completed_request(completion)
                 })
+                || prepare
+                    .completed_request_completion
+                    .as_ref()
+                    .is_some_and(|completion| {
+                        completion.requester_node_id == receipt.requester_node_id
+                            && completion.request_id == receipt.request_id
+                            && receipt.matches_completion(completion)
+                    }))
     })
 }
 
@@ -1624,6 +1632,20 @@ fn namespace_prepare_is_recovery_root(
                             .namespace_request_receipts
                             .get(&key)
                             .is_some_and(|receipt| receipt.matches_completed_request(completion))
+                    })
+                || prepare
+                    .completed_request_completion
+                    .as_ref()
+                    .is_some_and(|completion| {
+                        let key = completion.request_key();
+                        !tables
+                            .namespace_requests
+                            .get(&key)
+                            .is_some_and(|request| completion.matches_completed_request(request))
+                            && !tables
+                                .namespace_request_receipts
+                                .get(&key)
+                                .is_some_and(|receipt| receipt.matches_completion(completion))
                     })
         }
     }

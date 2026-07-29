@@ -32,6 +32,26 @@ pub fn register_storage_paths(
             "dynamic DFS object manifests stored as sinomo-object files",
         ),
         (
+            "dfs/content/catalog",
+            "durable authoritative DFS content-root catalogs",
+        ),
+        (
+            "dfs/content/content-reservations",
+            "legacy single-version pre-catalog content reservations",
+        ),
+        (
+            "dfs/content/content-reservation-reconciliation-cursor.sobj",
+            "durable DFS content reservation reconciliation cursor",
+        ),
+        (
+            "dfs/content/manifest-absence-observations",
+            "durable first-absence observations for manifest collection",
+        ),
+        (
+            "dfs/content/orphan-observations",
+            "durable first-absence observations for orphan blob collection",
+        ),
+        (
             "dfs/content/stats.sobj",
             "durable approximate DFS content-store counters",
         ),
@@ -285,6 +305,11 @@ mod tests {
         for path in [
             "dfs/content/blob-packs/index.sobj",
             "dfs/content/blob-packs/segments/0000000000000000.pack",
+            "dfs/content/catalog/metadata-content-roots.sobj",
+            "dfs/content/content-reservations/ab/abcdef.sobj",
+            "dfs/content/content-reservation-reconciliation-cursor.sobj",
+            "dfs/content/manifest-absence-observations/ab/abcdef.sobj",
+            "dfs/content/orphan-observations/ab/abcdef.sobj",
             "dfs/content/stats.sobj",
             "dfs/anti-entropy-cursors/sifs.sobj",
             "dfs/metadata/services/records/tables/materialized.slog",

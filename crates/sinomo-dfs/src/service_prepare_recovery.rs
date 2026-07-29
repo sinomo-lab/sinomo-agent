@@ -581,6 +581,7 @@ mod tests {
                 created_at: OffsetDateTime::UNIX_EPOCH,
             },
             completed_request: None,
+            completed_request_completion: None,
             status: DfsNamespacePrepareStatus::Prepared,
         };
         prepare.operation_digest =
@@ -1289,6 +1290,7 @@ mod tests {
                 created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(123),
             },
             completed_request: None,
+            completed_request_completion: None,
             status: DfsNamespacePrepareStatus::Prepared,
         };
         prepare.operation_digest =
