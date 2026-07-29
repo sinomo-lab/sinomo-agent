@@ -4482,6 +4482,7 @@ impl LocalSobjMetadataBackend {
             activated_epoch: None,
             journal_sequence,
             state_fingerprint,
+            rebind_prefix_proof: Some(prefix_proof.clone()),
         };
         write_sobj_atomic(&self.membership_handoff_write_freeze_path(), &freeze)?;
         self.instance_authority_epoch = None;
@@ -4518,9 +4519,6 @@ impl LocalSobjMetadataBackend {
                 activated_epoch
             )));
         }
-        if existing.activated_epoch == Some(activated_epoch) {
-            return Ok(true);
-        }
         if existing
             .activated_epoch
             .is_some_and(|current| current != activated_epoch)
@@ -4534,9 +4532,35 @@ impl LocalSobjMetadataBackend {
                 activated_epoch
             )));
         }
+        let marker_changed = existing.activated_epoch != Some(activated_epoch)
+            || existing.rebind_prefix_proof.is_none();
         let mut activated = existing;
         activated.activated_epoch = Some(activated_epoch);
-        write_sobj_atomic(&self.membership_handoff_write_freeze_path(), &activated)?;
+        if activated.rebind_prefix_proof.is_none() {
+            let current = self.prefix_proof.as_ref().ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "metadata shard {} legacy membership handoff {} has no current exact prefix proof",
+                    self.shard_id.0, handoff_id
+                ))
+            })?;
+            if !current.is_well_formed()
+                || current.journal_sequence < activated.journal_sequence
+                || (current.journal_sequence == activated.journal_sequence
+                    && current.digest != activated.state_fingerprint)
+            {
+                return Err(MetadataBackendError::Serde(format!(
+                    "metadata shard {} legacy membership handoff {} cannot bind current prefix {} to marker prefix {}",
+                    self.shard_id.0,
+                    handoff_id,
+                    current.journal_sequence,
+                    activated.journal_sequence
+                )));
+            }
+            activated.rebind_prefix_proof = Some(current.clone());
+        }
+        if marker_changed {
+            write_sobj_atomic(&self.membership_handoff_write_freeze_path(), &activated)?;
+        }
         Ok(true)
     }
 
@@ -19798,6 +19822,13 @@ mod tests {
         assert_eq!(freeze.journal_sequence, frozen_head);
         assert_eq!(freeze.activated_epoch, None);
         assert!(!freeze.state_fingerprint.is_empty());
+        assert_eq!(
+            freeze
+                .rebind_prefix_proof
+                .as_ref()
+                .map(|proof| (proof.journal_sequence, proof.digest.as_str())),
+            Some((freeze.journal_sequence, freeze.state_fingerprint.as_str()))
+        );
 
         assert!(matches!(
             backend.put_object(&object(version("version_frozen_write"))),
@@ -19865,6 +19896,20 @@ mod tests {
             .put_object(&object(version("version_after_handoff_activation")))
             .expect("normal metadata append resumes after activation");
         assert!(reopened.journal_last_sequence() > frozen_head);
+        let checkpoint_proof = reopened
+            .metadata_prefix_proof()
+            .expect("post-activation prefix proof");
+        reopened
+            .compact_metadata_table_log_if_needed(0)
+            .expect("checkpoint activated metadata generation");
+        assert_eq!(
+            reopened
+                .metadata_shard_write_freeze(&shard_id)
+                .expect("read checkpointed active generation")
+                .and_then(|marker| marker.rebind_prefix_proof),
+            Some(checkpoint_proof),
+            "checkpoint publication must advance the restart proof before pruning journal history"
+        );
 
         cleanup(&root);
     }

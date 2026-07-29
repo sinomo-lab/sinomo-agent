@@ -10,11 +10,18 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use crate::DfsMetadataShardWriteFreeze;
 use crate::metadata_cursor::journal_write_lock_path;
 use crate::metadata_error::{MetadataBackendError, Result};
-use crate::metadata_journal::prune_segmented_journal_before_checkpoint;
+use crate::metadata_io::{read_sobj_optional, write_sobj_atomic};
+use crate::metadata_journal::{
+    durable_journal_entries_since_limited, prune_segmented_journal_before_checkpoint,
+};
 use crate::metadata_lock::metadata_write_lock;
-use crate::metadata_records::{DfsMetadataPrefixProof, DfsMetadataTableBatch, DfsMetadataTableOp};
+use crate::metadata_records::{
+    DFS_METADATA_PREFIX_PROOF_VERSION, DfsMetadataPrefixProof, DfsMetadataTableBatch,
+    DfsMetadataTableOp, dfs_metadata_prefix_proof_after,
+};
 use crate::metadata_table_store::{
     append_metadata_table_batch, encode_metadata_table_snapshot,
     install_encoded_metadata_table_snapshot, metadata_table_checkpoint_log_path,
@@ -93,6 +100,13 @@ pub(crate) fn compact_metadata_table_log_if_needed(
     *state.table_log_offset = fs::metadata(&path)
         .map(|metadata| metadata.len())
         .map_err(|source| MetadataBackendError::Io { path, source })?;
+    let checkpoint_proof = state.prefix_proof.as_ref().ok_or_else(|| {
+        MetadataBackendError::Serde(format!(
+            "metadata table checkpoint at {} has no exact journal-prefix proof",
+            root.display()
+        ))
+    })?;
+    advance_activated_handoff_rebind_checkpoint(root, checkpoint_proof)?;
     // Snapshot publication and table-log truncation are durable before any
     // source history disappears. Lagging replicas observe the retained
     // checkpoint segment as a discontinuity and use snapshot repair.
@@ -224,12 +238,139 @@ fn run_metadata_table_checkpoint_worker(root: &Path, max_log_bytes: u64) -> Resu
     }
     install_encoded_metadata_table_snapshot(root, &snapshot_bytes)?;
     remove_metadata_table_checkpoint_log(root)?;
+    advance_activated_handoff_rebind_checkpoint(root, &prefix_proof)?;
     // The installed snapshot and newer table-log suffix are durable before
     // source history is pruned. Retaining the checkpoint journal segment
     // leaves a discontinuity that forces lagging replicas through snapshot
     // installation rather than reporting a false empty suffix.
     prune_segmented_journal_before_checkpoint(root, checkpoint_sequence)?;
     Ok(true)
+}
+
+fn membership_handoff_write_freeze_path(root: &Path) -> PathBuf {
+    root.join("journal")
+        .join("membership-handoff-write-freeze.sobj")
+}
+
+/// Advance an activated handoff's restart proof before checkpoint pruning can
+/// remove the journal entries that connect the previous proof to this one.
+///
+/// The marker write is atomic and happens while the caller holds the shard
+/// write lock. A crash before this write leaves the old journal history
+/// available; a crash after it can safely restart validation at the new exact
+/// prefix.
+fn advance_activated_handoff_rebind_checkpoint(
+    root: &Path,
+    checkpoint: &DfsMetadataPrefixProof,
+) -> Result<()> {
+    let path = membership_handoff_write_freeze_path(root);
+    let Some(mut freeze) = read_sobj_optional::<DfsMetadataShardWriteFreeze>(&path)? else {
+        return Ok(());
+    };
+    if freeze.activated_epoch.is_none() {
+        return Ok(());
+    }
+    if !checkpoint.is_well_formed() {
+        return Err(MetadataBackendError::Serde(format!(
+            "metadata table checkpoint at {} has a malformed exact prefix proof",
+            root.display()
+        )));
+    }
+
+    let base = DfsMetadataPrefixProof {
+        version: DFS_METADATA_PREFIX_PROOF_VERSION,
+        journal_sequence: freeze.journal_sequence,
+        digest: freeze.state_fingerprint.clone(),
+    };
+    let mut reconstructed = freeze
+        .rebind_prefix_proof
+        .clone()
+        .unwrap_or_else(|| base.clone());
+    if !base.is_well_formed()
+        || !reconstructed.is_well_formed()
+        || reconstructed.journal_sequence < base.journal_sequence
+        || (reconstructed.journal_sequence == base.journal_sequence
+            && reconstructed.digest != base.digest)
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "metadata shard handoff {} at {} has an invalid rebind prefix checkpoint",
+            freeze.handoff_id,
+            root.display()
+        )));
+    }
+    if checkpoint.journal_sequence < reconstructed.journal_sequence {
+        // A background worker may finish an older captured generation after a
+        // newer synchronous checkpoint has already advanced the marker.
+        return Ok(());
+    }
+    if checkpoint.journal_sequence == reconstructed.journal_sequence {
+        if checkpoint.digest != reconstructed.digest {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata shard handoff {} at {} has divergent prefix proofs at sequence {}",
+                freeze.handoff_id,
+                root.display(),
+                checkpoint.journal_sequence
+            )));
+        }
+    } else {
+        while reconstructed.journal_sequence < checkpoint.journal_sequence {
+            let entries =
+                durable_journal_entries_since_limited(root, reconstructed.journal_sequence, 1024)?;
+            if entries.is_empty() {
+                return Err(MetadataBackendError::Serde(format!(
+                    "metadata shard handoff {} at {} cannot advance rebind proof from sequence {} to checkpoint {}",
+                    freeze.handoff_id,
+                    root.display(),
+                    reconstructed.journal_sequence,
+                    checkpoint.journal_sequence
+                )));
+            }
+            let previous_sequence = reconstructed.journal_sequence;
+            for entry in entries {
+                if entry.sequence > checkpoint.journal_sequence {
+                    break;
+                }
+                if entry.sequence != reconstructed.journal_sequence.saturating_add(1) {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata shard handoff {} at {} has a journal gap after sequence {}",
+                        freeze.handoff_id,
+                        root.display(),
+                        reconstructed.journal_sequence
+                    )));
+                }
+                reconstructed =
+                    dfs_metadata_prefix_proof_after(&reconstructed, &entry).map_err(|source| {
+                        MetadataBackendError::Serde(format!(
+                            "metadata shard handoff {} at {} cannot encode rebind entry {}: {source}",
+                            freeze.handoff_id,
+                            root.display(),
+                            entry.sequence
+                        ))
+                })?;
+            }
+            if reconstructed.journal_sequence <= previous_sequence {
+                return Err(MetadataBackendError::Serde(format!(
+                    "metadata shard handoff {} at {} made no rebind checkpoint progress",
+                    freeze.handoff_id,
+                    root.display()
+                )));
+            }
+        }
+        if &reconstructed != checkpoint {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata shard handoff {} at {} checkpoint proof diverges at sequence {}",
+                freeze.handoff_id,
+                root.display(),
+                checkpoint.journal_sequence
+            )));
+        }
+    }
+
+    if freeze.rebind_prefix_proof.as_ref() != Some(checkpoint) {
+        freeze.rebind_prefix_proof = Some(checkpoint.clone());
+        write_sobj_atomic(&path, &freeze)?;
+    }
+    Ok(())
 }
 
 fn append_table_batch(

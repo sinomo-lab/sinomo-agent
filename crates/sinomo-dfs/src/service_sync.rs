@@ -205,6 +205,7 @@ pub(crate) fn rebind_completed_metadata_shard_membership_handoff(
             &shard_id,
             freeze.journal_sequence,
             &freeze.state_fingerprint,
+            freeze.rebind_prefix_proof.as_ref(),
         )?
     {
         return Ok(false);
@@ -1982,18 +1983,27 @@ fn metadata_shard_prefix_matches_or_extends_marker(
     shard_id: &DfsMetadataShardId,
     marker_sequence: u64,
     marker_fingerprint: &str,
+    rebind_prefix_proof: Option<&DfsMetadataPrefixProof>,
 ) -> Result<bool, DfsError> {
     let Some(current) = backend.metadata_prefix_proof(shard_id)? else {
         return Ok(false);
     };
-    let mut reconstructed = DfsMetadataPrefixProof {
+    let marker = DfsMetadataPrefixProof {
         version: DFS_METADATA_PREFIX_PROOF_VERSION,
         journal_sequence: marker_sequence,
         digest: marker_fingerprint.to_string(),
     };
+    let mut reconstructed = rebind_prefix_proof
+        .cloned()
+        .unwrap_or_else(|| marker.clone());
+    let legacy_marker = rebind_prefix_proof.is_none();
     if !current.is_well_formed()
+        || !marker.is_well_formed()
         || !reconstructed.is_well_formed()
-        || current.journal_sequence < marker_sequence
+        || reconstructed.journal_sequence < marker.journal_sequence
+        || (reconstructed.journal_sequence == marker.journal_sequence
+            && reconstructed.digest != marker.digest)
+        || current.journal_sequence < reconstructed.journal_sequence
     {
         return Ok(false);
     }
@@ -2005,17 +2015,24 @@ fn metadata_shard_prefix_matches_or_extends_marker(
             DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
         )?
         else {
-            return Ok(false);
+            return Ok(legacy_marker
+                && reconstructed == marker
+                && current.journal_sequence > marker.journal_sequence);
         };
         if batch.entries.is_empty() || batch.shard_id != *shard_id {
             return Ok(false);
         }
         let previous_sequence = reconstructed.journal_sequence;
         for entry in batch.entries {
-            if entry.shard_id != *shard_id
-                || entry.sequence != reconstructed.journal_sequence.saturating_add(1)
-                || entry.sequence > current.journal_sequence
-            {
+            if entry.shard_id != *shard_id {
+                return Ok(false);
+            }
+            if entry.sequence != reconstructed.journal_sequence.saturating_add(1) {
+                return Ok(legacy_marker
+                    && reconstructed == marker
+                    && entry.sequence > marker.journal_sequence.saturating_add(1));
+            }
+            if entry.sequence > current.journal_sequence {
                 return Ok(false);
             }
             reconstructed =
@@ -4094,6 +4111,7 @@ mod tests {
                 &shard_id,
                 marker.journal_sequence,
                 &marker.digest,
+                Some(&marker),
             )
             .expect("verify contiguous extension")
         );
@@ -4104,8 +4122,116 @@ mod tests {
                 &shard_id,
                 marker.journal_sequence,
                 &divergent,
+                Some(&marker),
             )
             .expect("reject divergent extension")
+        );
+    }
+
+    #[test]
+    fn completed_legacy_handoff_rebinds_after_checkpoint_pruned_its_prefix_history() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-legacy-handoff-pruned-prefix");
+        let local = node("node_legacy_handoff_pruned_prefix");
+        let replica = node("node_legacy_handoff_pruned_prefix_replica");
+        let file_system_id = sifs_file_system_id();
+        let retiring = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "services".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: vec![replica.clone()],
+            epoch: 18,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/services".to_string(),
+            },
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let active = DfsMetadataShardConfig {
+            epoch: retiring.epoch + 1,
+            ..retiring.clone()
+        };
+        let shard_id = DfsMetadataShardId::new(&retiring.shard_id);
+        let metadata_root = root.path().join("metadata");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
+            .expect("metadata backend");
+        backend
+            .put_file_system(&DfsFileSystem::sifs(local.clone()))
+            .expect("filesystem");
+        let handoff_id = "handoff-legacy-pruned-prefix";
+        let freeze = backend
+            .freeze_metadata_shard_for_membership_handoff(&shard_id, handoff_id, retiring.epoch)
+            .expect("freeze retiring generation")
+            .expect("local shard");
+        backend
+            .clear_metadata_shard_membership_handoff_freeze(&shard_id, handoff_id, active.epoch)
+            .expect("bind activated generation");
+        backend
+            .put_object(&directory_object("/services/after-handoff", local.clone()))
+            .expect("post-handoff append");
+        let current = backend
+            .metadata_prefix_proof()
+            .expect("current exact prefix");
+
+        let marker = backend
+            .metadata_shard_write_freeze(&shard_id)
+            .expect("active marker")
+            .expect("durable active marker");
+        let segment_path = metadata_root
+            .join("journal")
+            .join("segments")
+            .join(format!("{:020}.slog", 1));
+        std::fs::remove_file(&segment_path).expect("simulate checkpoint-pruned marker segment");
+        assert!(
+            !metadata_shard_prefix_matches_or_extends_marker(
+                &backend,
+                &shard_id,
+                marker.journal_sequence,
+                &marker.state_fingerprint,
+                marker.rebind_prefix_proof.as_ref(),
+            )
+            .expect("a current marker must fail closed when its checkpoint history is missing")
+        );
+
+        let mut legacy_marker = marker;
+        legacy_marker.rebind_prefix_proof = None;
+        crate::metadata_io::write_sobj_atomic(
+            &metadata_root
+                .join("journal")
+                .join("membership-handoff-write-freeze.sobj"),
+            &legacy_marker,
+        )
+        .expect("install legacy activated marker");
+        drop(backend);
+
+        let mut reopened = LocalSobjMetadataBackend::new(shard_id.clone(), &metadata_root)
+            .expect("reopen checkpointed legacy marker");
+        let proof = DfsMetadataShardMembershipHandoffProof {
+            handoff_id: handoff_id.to_string(),
+            retiring_shard: retiring,
+            desired_shard: active.clone(),
+            journal_sequence: freeze.journal_sequence,
+            state_fingerprint: freeze.state_fingerprint,
+            acknowledged_node_ids: vec![local.clone(), replica],
+        };
+        assert!(
+            rebind_completed_metadata_shard_membership_handoff(
+                &mut reopened,
+                &local,
+                &active,
+                None,
+                Some(&proof),
+            )
+            .expect("rebind completed legacy handoff")
+        );
+        let upgraded = reopened
+            .metadata_shard_write_freeze(&shard_id)
+            .expect("read upgraded marker")
+            .expect("upgraded marker remains durable");
+        assert_eq!(upgraded.rebind_prefix_proof, Some(current));
+        assert!(
+            !reopened
+                .metadata_shard_authoritative_writes_frozen(&shard_id)
+                .expect("fresh lane authority"),
+            "the exact completed legacy handoff must restore authoritative writes"
         );
     }
 

@@ -53,6 +53,15 @@ pub struct DfsMetadataShardWriteFreeze {
     pub activated_epoch: Option<u64>,
     pub journal_sequence: u64,
     pub state_fingerprint: String,
+    /// Exact durable descendant from which a freshly opened lane can resume
+    /// validating the prefix after older journal segments are checkpointed.
+    ///
+    /// New markers start at the handoff prefix. Checkpoint publication
+    /// advances this proof before pruning the journal history needed to
+    /// reconstruct it. `None` is accepted only for markers written by older
+    /// binaries and is upgraded during their first exact-proof rebind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebind_prefix_proof: Option<crate::DfsMetadataPrefixProof>,
 }
 
 /// Capability for one replica ingest from an already validated active source.
