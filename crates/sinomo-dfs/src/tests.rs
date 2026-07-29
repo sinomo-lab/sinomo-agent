@@ -31810,6 +31810,11 @@ fn sifs_posix_read_updates_atime_without_changing_mtime() {
         stat.version, before.version,
         "atime update must advance the DFS metadata version so it persists across distributed reconciliation"
     );
+    assert_eq!(
+        dfs.posix_read_file(file_path)
+            .expect("metadata-only version remains content-readable"),
+        b"content"
+    );
 
     std::fs::remove_dir_all(root).ok();
 }

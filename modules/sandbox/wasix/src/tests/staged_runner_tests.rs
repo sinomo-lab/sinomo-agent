@@ -1379,17 +1379,20 @@ fn local_staged_runner_preserves_write_before_quota_failure() {
     store.save_manifest(&manifest).expect("save limits");
     let runner = LocalStagedSandboxCommandRunner::new().expect("runner");
 
-    let outcome = runner
+    let error = runner
         .run_module(
             &store,
             &manifest.sandbox_id,
-            wasi_write_file_module("out.txt"),
+            wasix_write_absolute_file_module("/work/out.txt"),
             vec!["write".to_string()],
             1_000,
         )
-        .expect("run");
+        .expect_err("written-byte quota");
 
-    assert_ne!(outcome.response.exit_status, 0);
+    assert!(matches!(
+        error,
+        SandboxCommandExecutionError::Fs(SandboxFsError::QuotaExceeded { .. })
+    ));
     let fs = LocalSandboxFileSystem::new(layout);
     assert_eq!(
         fs.read(&SandboxPath::new("/work/out.txt").expect("out"), None)
@@ -10630,9 +10633,8 @@ fn sifs_staged_runner_executes_process_plan_and_syncs_command_history() {
         b"hello\n"
     );
 
-    replica_dfs
-        .process_incoming()
-        .expect("replica receives process plan output");
+    let mut owner_dfs = sifs_fs.into_inner();
+    settle_networked_dfs_replication(&mut owner_dfs, &mut replica_dfs);
     let replica_backend =
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
             .expect("replica metadata reload");
@@ -10791,10 +10793,10 @@ fn sifs_staged_runner_executes_wasix_process_plan_with_concurrent_fd_pipe_and_mo
         LocalContentStore::new(runtime_root.join("content")).expect("content"),
     );
     dfs.bootstrap_distributed_sifs().expect("bootstrap");
-    dfs.posix_mkdir_all("/services/sandbox/shared")
+    dfs.posix_mkdir_all("/services/sandbox-shared")
         .expect("mount source");
     dfs.posix_write_file(
-        "/services/sandbox/shared/input.txt",
+        "/services/sandbox-shared/input.txt",
         b"mounted\n",
         DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
     )
@@ -10810,7 +10812,7 @@ fn sifs_staged_runner_executes_wasix_process_plan_with_concurrent_fd_pipe_and_mo
         )
         .expect("create");
     manifest.mounts.push(SandboxMount {
-        source_sifs_path: "/services/sandbox/shared".to_string(),
+        source_sifs_path: "/services/sandbox-shared".to_string(),
         mount_path: SandboxPath::new("/shared").expect("mount path"),
         mode: SandboxMountMode::ReadWrite,
     });
@@ -10847,6 +10849,7 @@ fn sifs_staged_runner_executes_wasix_process_plan_with_concurrent_fd_pipe_and_mo
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
     let mut policy = SandboxPolicy::default();
     policy.allow_unsigned_toolchains = true;
+    policy.allow_read_write_sifs_mounts = true;
     let outcome = runner
         .run_toolchain_process_plan_with_policy(
             toolchain_store.into_inner(),
@@ -11607,9 +11610,8 @@ fn sifs_staged_runner_command_progress_resumes_from_replica_node() {
         "command changed paths should include the durable workspace write"
     );
 
-    replica_dfs
-        .process_incoming()
-        .expect("replica receives command progress");
+    let mut owner_dfs = outcome.dfs;
+    settle_networked_dfs_replication(&mut owner_dfs, &mut replica_dfs);
     let replica_backend =
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
             .expect("replica metadata reload");
@@ -11640,7 +11642,7 @@ fn sifs_staged_runner_command_progress_resumes_from_replica_node() {
         load_command_record(&mut replica_fs, &command.response.command_id).expect("replica record");
     assert_eq!(record.status, SandboxCommandRecordStatus::Completed);
 
-    drop(outcome.dfs);
+    drop(owner_dfs);
     fs::remove_dir_all(runtime_root).ok();
     fs::remove_dir_all(local_root).ok();
 }

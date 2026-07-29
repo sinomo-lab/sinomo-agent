@@ -2119,7 +2119,9 @@ mod tests {
         ClusterKvTxnCommitResult, KvAuthoritativeRead, KvAuthorityBasis, KvAuthorityProof,
         KvCommandDigest, KvEntry, KvLocalRead, KvRevision, KvSnapshot, KvTxnResponse, KvVersion,
     };
-    use sinomo_core::network::{ObjectRpcIncomingBody, ObjectRpcOutgoingResponse};
+    use sinomo_core::network::{
+        ObjectRpcIncomingBody, ObjectRpcOutgoingResponse, ObjectRpcResponse,
+    };
     use sinomo_core::service::ResponseSink;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3092,20 +3094,12 @@ mod tests {
 
     #[derive(Default)]
     struct VecSink {
-        frames: Arc<Mutex<Vec<ObjectRpcResponse>>>,
+        frames: Arc<Mutex<Vec<ObjectRpcOutgoingResponse>>>,
     }
 
     impl ResponseSink for VecSink {
         fn send(self: Box<Self>, response: ObjectRpcOutgoingResponse) -> Result<(), ServiceError> {
-            if !response.body.is_empty() {
-                return Err(ServiceError::Service(
-                    "config test sink received an unexpected response body".to_string(),
-                ));
-            }
-            self.frames
-                .lock()
-                .expect("sink lock")
-                .push(response.response);
+            self.frames.lock().expect("sink lock").push(response);
             Ok(())
         }
     }
@@ -3139,6 +3133,10 @@ mod tests {
             .expect("frames")
             .pop()
             .expect("response frame");
+        let response = response
+            .into_materialized_value_response(usize::MAX)
+            .await
+            .expect("materialize response value");
         let response: ConfigSearchResponse = response.decode_body().expect("decode");
         assert_eq!(response.definitions.len(), 1);
     }

@@ -24086,6 +24086,7 @@ mod tests {
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancel_from_thread = cancelled.clone();
+        let cancelled_from_open = cancelled.clone();
         let dropped = Arc::new(AtomicBool::new(false));
         let dropped_from_open = dropped.clone();
         let (started_tx, started_rx) = mpsc::sync_channel(1);
@@ -24105,6 +24106,12 @@ mod tests {
             None,
             move || {
                 started_tx.send(()).expect("signal device open");
+                let cancellation_deadline = Instant::now() + Duration::from_secs(1);
+                while !cancelled_from_open.load(Ordering::Acquire)
+                    && Instant::now() < cancellation_deadline
+                {
+                    thread::sleep(Duration::from_millis(1));
+                }
                 thread::sleep(Duration::from_millis(75));
                 Ok(DropProbe(dropped_from_open))
             },

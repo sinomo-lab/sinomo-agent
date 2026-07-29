@@ -641,9 +641,8 @@ fn sandbox_http_fetch_to_file_stores_response_body_and_audit_record_in_sifs() {
         .expect("load audit"),
         result.record
     );
-    replica_dfs
-        .process_incoming()
-        .expect("replica receives fetched body and audit record");
+    let mut owner_dfs = sandbox_fs.into_inner();
+    settle_networked_dfs_replication(&mut owner_dfs, &mut replica_dfs);
     let replica_backend =
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
             .expect("replica metadata reload");

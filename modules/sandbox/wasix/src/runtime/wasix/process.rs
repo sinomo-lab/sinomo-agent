@@ -1,5 +1,6 @@
 use crate::{SANDBOX_WASIX_MAX_TASKS, SandboxWasiError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 use wasmer::{Global, Value};
 use wasmer_wasix::{
     WasiRuntimeError,
@@ -60,6 +61,7 @@ pub(super) fn run_wasix_process_tree(
     let metering_global_pre_run = Arc::clone(&metering_global);
     let metering_global_recycle = Arc::clone(&metering_global);
     let metering_exhausted_recycle = Arc::clone(&metering_exhausted);
+    let (metering_recycle_tx, metering_recycle_rx) = mpsc::sync_channel(1);
     tasks
         .task_wasm(
             TaskWasm::new(Box::new(run_exec), env, module, true, true)
@@ -77,16 +79,16 @@ pub(super) fn run_wasix_process_tree(
                     })
                 }))
                 .with_recycle(Box::new(move |mut props| {
-                    if let Some(global) = metering_global_recycle
+                    let exhausted = metering_global_recycle
                         .lock()
                         .expect("metering global")
                         .clone()
-                    {
-                        metering_exhausted_recycle.store(
-                            matches!(global.get(&mut props.store), Value::I32(1)),
-                            std::sync::atomic::Ordering::SeqCst,
-                        );
-                    }
+                        .is_some_and(|global| {
+                            matches!(global.get(&mut props.store), Value::I32(1))
+                        });
+                    metering_exhausted_recycle
+                        .store(exhausted, std::sync::atomic::Ordering::SeqCst);
+                    let _ = metering_recycle_tx.try_send(exhausted);
                 })),
         )
         .map_err(|error| SandboxWasiError::Runtime {
@@ -107,10 +109,24 @@ pub(super) fn run_wasix_process_tree(
     );
     budget_guard.finish();
     let wait_result = wait_result??;
-    if let Some(error) = budget_guard.termination_error(
-        timeout_ms,
-        metering_exhausted.load(std::sync::atomic::Ordering::SeqCst),
-    ) {
+    let metering_enabled = metering_global.lock().expect("metering global").is_some();
+    let process_failed = match &wait_result {
+        Ok(code) => code.raw() != 0,
+        Err(_) => true,
+    };
+    let observed_metering_exhaustion = metering_exhausted.load(std::sync::atomic::Ordering::SeqCst);
+    // The WASIX join handle can report the guest's synthetic failure exit
+    // before the task recycler publishes the metering global. On a failed
+    // metered process, synchronize with that recycler so instruction-budget
+    // exhaustion cannot race into an ordinary guest exit.
+    let metering_exhausted = if metering_enabled && process_failed {
+        metering_recycle_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap_or(observed_metering_exhaustion)
+    } else {
+        observed_metering_exhaustion
+    };
+    if let Some(error) = budget_guard.termination_error(timeout_ms, metering_exhausted) {
         Err(error)
     } else {
         Ok(wait_result)

@@ -9220,8 +9220,14 @@ fn cluster_state_sync_rejects_unsafe_voter_reconfiguration() {
         removed_detail.contains("invalid raft config transition"),
         "unexpected voter removal error: {removed_detail}"
     );
-    assert!(removed_detail.contains("overlapping old/new quorum"));
-    assert!(removed_detail.contains("refusing to remove"));
+    assert!(
+        removed_detail.contains("every old/new quorum overlaps"),
+        "unexpected voter removal safety detail: {removed_detail}"
+    );
+    assert!(
+        removed_detail.contains("refusing to remove"),
+        "unexpected voter removal safety detail: {removed_detail}"
+    );
 
     let mut direct_voter_state = state.clone();
     let peer_id = NodeId::from_legacy_named("node_direct_voter").expect("peer");
@@ -9247,8 +9253,14 @@ fn cluster_state_sync_rejects_unsafe_voter_reconfiguration() {
         added_detail.contains("invalid raft config transition"),
         "unexpected direct voter add error: {added_detail}"
     );
-    assert!(added_detail.contains("must already be a committed learner or non-voting member"));
-    assert!(added_detail.contains(peer_id.as_str()));
+    assert!(
+        added_detail.contains("must already be a committed learner or non-voting member"),
+        "unexpected direct voter add detail: {added_detail}"
+    );
+    assert!(
+        added_detail.contains(peer_id.as_str()),
+        "unexpected direct voter add detail: {added_detail}"
+    );
 }
 
 #[test]

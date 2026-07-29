@@ -851,33 +851,32 @@ mod tests {
         ObjectRpcIncomingBody, ObjectRpcOutgoingResponse, ObjectRpcResponse,
     };
     use sinomo_runtime::service::{ResponseSink, ServiceRegistry, ServiceSigner};
-    use std::future::Future;
-    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
     #[derive(Clone, Default)]
     struct TestSink {
-        frames: Arc<Mutex<Vec<ObjectRpcResponse>>>,
+        frames: Arc<Mutex<Vec<ObjectRpcOutgoingResponse>>>,
     }
 
     impl TestSink {
-        fn frames(&self) -> Vec<ObjectRpcResponse> {
-            self.frames.lock().expect("frames lock").clone()
+        async fn frames(&self) -> Vec<ObjectRpcResponse> {
+            let frames = std::mem::take(&mut *self.frames.lock().expect("frames lock"));
+            let mut responses = Vec::with_capacity(frames.len());
+            for frame in frames {
+                responses.push(
+                    frame
+                        .into_materialized_value_response(usize::MAX)
+                        .await
+                        .expect("materialize agent test response"),
+                );
+            }
+            responses
         }
     }
 
     impl ResponseSink for TestSink {
         fn send(self: Box<Self>, response: ObjectRpcOutgoingResponse) -> Result<(), ServiceError> {
-            if !response.body.is_empty() {
-                return Err(ServiceError::Service(
-                    "agent test sink received an unexpected response body".to_string(),
-                ));
-            }
-            self.frames
-                .lock()
-                .expect("frames lock")
-                .push(response.response);
+            self.frames.lock().expect("frames lock").push(response);
             Ok(())
         }
     }
@@ -964,8 +963,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn agent_runtime_service_reads_persisted_session_progress() {
+    #[tokio::test]
+    async fn agent_runtime_service_reads_persisted_session_progress() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-runtime-service");
         let data_dir = SinomoDataDir::new(&root);
         let store = FileAgentSessionStore::for_data_dir(&data_dir);
@@ -1051,9 +1050,9 @@ mod tests {
         )
         .expect("request");
 
-        block_on_ready(registry.dispatch(ctx, request)).expect("dispatch");
+        registry.dispatch(ctx, request).await.expect("dispatch");
 
-        let frames = sink.frames();
+        let frames = sink.frames().await;
         assert_eq!(frames.len(), 1);
         let response: AgentSessionInspectResponse =
             frames[0].decode_body().expect("inspect response");
@@ -1089,8 +1088,8 @@ mod tests {
         assert!(!registry.owns(AGENT_SESSION_RESUME_ROUTE));
     }
 
-    #[test]
-    fn runtime_control_service_dispatches_to_injected_host() {
+    #[tokio::test]
+    async fn runtime_control_service_dispatches_to_injected_host() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-runtime-control-service");
         let data_dir = SinomoDataDir::new(&root);
         let host = Arc::new(TestControlHost::default());
@@ -1122,10 +1121,10 @@ mod tests {
         )
         .expect("request");
 
-        block_on_ready(registry.dispatch(ctx, request)).expect("dispatch");
+        registry.dispatch(ctx, request).await.expect("dispatch");
 
         assert_eq!(host.calls(), vec!["steer"]);
-        let frames = sink.frames();
+        let frames = sink.frames().await;
         assert_eq!(frames.len(), 1);
         let response: AgentSessionControlResponse =
             frames[0].decode_body().expect("control response");
@@ -1134,8 +1133,8 @@ mod tests {
         assert_eq!(response.result.sequence, 1);
     }
 
-    #[test]
-    fn runtime_control_service_dispatches_resume_to_injected_host() {
+    #[tokio::test]
+    async fn runtime_control_service_dispatches_resume_to_injected_host() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-runtime-resume-service");
         let data_dir = SinomoDataDir::new(&root);
         let host = Arc::new(TestControlHost::default());
@@ -1159,10 +1158,10 @@ mod tests {
         )
         .expect("request");
 
-        block_on_ready(registry.dispatch(ctx, request)).expect("dispatch");
+        registry.dispatch(ctx, request).await.expect("dispatch");
 
         assert_eq!(host.calls(), vec!["resume"]);
-        let frames = sink.frames();
+        let frames = sink.frames().await;
         assert_eq!(frames.len(), 1);
         let response: AgentSessionResumeResponse =
             frames[0].decode_body().expect("resume response");
@@ -1177,8 +1176,9 @@ mod tests {
         assert!(response.control_snapshot.is_some());
     }
 
-    #[test]
-    fn runtime_control_resume_falls_back_to_persisted_metadata_when_live_runtime_is_missing() {
+    #[tokio::test]
+    async fn runtime_control_resume_falls_back_to_persisted_metadata_when_live_runtime_is_missing()
+    {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-runtime-resume-fallback");
         let data_dir = SinomoDataDir::new(&root);
         let store = FileAgentSessionStore::for_data_dir(&data_dir);
@@ -1231,9 +1231,9 @@ mod tests {
         )
         .expect("request");
 
-        block_on_ready(registry.dispatch(ctx, request)).expect("dispatch");
+        registry.dispatch(ctx, request).await.expect("dispatch");
 
-        let frames = sink.frames();
+        let frames = sink.frames().await;
         assert_eq!(frames.len(), 1);
         let response: AgentSessionResumeResponse =
             frames[0].decode_body().expect("resume response");
@@ -1266,8 +1266,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn runtime_control_registry_routes_service_calls_to_live_runtime() {
+    #[tokio::test]
+    async fn runtime_control_registry_routes_service_calls_to_live_runtime() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-runtime-control-registry");
         let data_dir = SinomoDataDir::new(&root);
         let session_id =
@@ -1308,9 +1308,9 @@ mod tests {
         )
         .expect("request");
 
-        block_on_ready(registry.dispatch(ctx, request)).expect("dispatch");
+        registry.dispatch(ctx, request).await.expect("dispatch");
 
-        let frames = sink.frames();
+        let frames = sink.frames().await;
         assert_eq!(frames.len(), 1);
         let response: AgentSessionControlResponse =
             frames[0].decode_body().expect("control response");
@@ -1329,8 +1329,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn runtime_control_registry_removes_queued_input_over_route() {
+    #[tokio::test]
+    async fn runtime_control_registry_removes_queued_input_over_route() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-runtime-control-remove");
         let data_dir = SinomoDataDir::new(&root);
         let session_id =
@@ -1385,9 +1385,9 @@ mod tests {
         )
         .expect("request");
 
-        block_on_ready(registry.dispatch(ctx, request)).expect("dispatch");
+        registry.dispatch(ctx, request).await.expect("dispatch");
 
-        let frames = sink.frames();
+        let frames = sink.frames().await;
         assert_eq!(frames.len(), 1);
         let response: AgentSessionControlResponse =
             frames[0].decode_body().expect("control response");
@@ -1462,39 +1462,4 @@ mod tests {
             buffered_event_count: 0,
         }
     }
-
-    fn block_on_ready<F: Future>(future: F) -> F::Output {
-        let waker = noop_waker();
-        let mut context = Context::from_waker(&waker);
-        let mut future = Box::pin(future);
-        loop {
-            match Pin::new(&mut future).poll(&mut context) {
-                Poll::Ready(output) => return output,
-                Poll::Pending => std::thread::yield_now(),
-            }
-        }
-    }
-
-    fn noop_waker() -> Waker {
-        unsafe { Waker::from_raw(noop_raw_waker()) }
-    }
-
-    fn noop_raw_waker() -> RawWaker {
-        RawWaker::new(std::ptr::null(), &NOOP_WAKER_VTABLE)
-    }
-
-    static NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-        noop_waker_clone,
-        noop_waker_wake,
-        noop_waker_wake,
-        noop_waker_drop,
-    );
-
-    unsafe fn noop_waker_clone(_: *const ()) -> RawWaker {
-        noop_raw_waker()
-    }
-
-    unsafe fn noop_waker_wake(_: *const ()) {}
-
-    unsafe fn noop_waker_drop(_: *const ()) {}
 }

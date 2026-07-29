@@ -203,6 +203,7 @@ impl From<DfsDistributedError> for DfsError {
 impl From<MetadataBackendError> for DfsError {
     fn from(error: MetadataBackendError) -> Self {
         match error {
+            MetadataBackendError::AlreadyExists { path } => Self::AlreadyExists { path },
             MetadataBackendError::DirectoryNotEmpty { path } => Self::DirectoryNotEmpty { path },
             error => Self::Metadata {
                 message: error.to_string(),

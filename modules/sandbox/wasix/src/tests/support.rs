@@ -31,6 +31,28 @@ pub(super) fn unique_test_dir(prefix: &str) -> PathBuf {
     root.join(format!("{prefix}-{nanos}"))
 }
 
+pub(super) fn settle_networked_dfs_replication<T: sinomo_dfs::DfsMessageTransport>(
+    owner: &mut sinomo_dfs::NetworkedDfsService<T>,
+    replica: &mut sinomo_dfs::NetworkedDfsService<T>,
+) {
+    let mut quiet_rounds = 0;
+    for _ in 0..32 {
+        let owner_events = owner.process_incoming().expect("owner replication pump");
+        let replica_events = replica
+            .process_incoming()
+            .expect("replica replication pump");
+        if owner_events.is_empty() && replica_events.is_empty() {
+            quiet_rounds += 1;
+            if quiet_rounds == 2 {
+                return;
+            }
+        } else {
+            quiet_rounds = 0;
+        }
+    }
+    panic!("test DFS replication did not quiesce after 32 rounds");
+}
+
 pub(super) fn busybox_applet_config_symbol(command: &str) -> Option<&'static str> {
     Some(match command {
         "cat" => "CONFIG_CAT=y",

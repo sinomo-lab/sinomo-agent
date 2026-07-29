@@ -626,20 +626,12 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct CollectingSink {
-        frames: Arc<Mutex<Vec<ObjectRpcResponse>>>,
+        frames: Arc<Mutex<Vec<ObjectRpcOutgoingResponse>>>,
     }
 
     impl ResponseSink for CollectingSink {
         fn send(self: Box<Self>, response: ObjectRpcOutgoingResponse) -> Result<(), ServiceError> {
-            if !response.body.is_empty() {
-                return Err(ServiceError::Service(
-                    "sandbox test sink received an unexpected response body".to_string(),
-                ));
-            }
-            self.frames
-                .lock()
-                .expect("sink lock")
-                .push(response.response);
+            self.frames.lock().expect("sink lock").push(response);
             Ok(())
         }
     }
@@ -702,14 +694,22 @@ mod tests {
         assert!(registry.owns(SANDBOX_STATUS_ROUTE));
 
         let dir = sinomo_testdir::TestDir::new("sinomo-service-sandbox-test");
-        let request =
-            ObjectRpcRequest::encode_body(SANDBOX_STATUS_ROUTE, "sandbox", &()).expect("encode");
+        let request = ObjectRpcRequest::encode_body(
+            SANDBOX_STATUS_ROUTE,
+            "sandbox",
+            &crate::SandboxStatusRequest {
+                sandbox_id: SandboxId::from_legacy_named("sandbox_unavailable_factory")
+                    .expect("sandbox"),
+            },
+        )
+        .expect("encode");
         let error = registry
             .dispatch(local_context(&dir, CollectingSink::default()), request)
             .await
             .expect_err("factory failure should surface");
         assert!(
-            matches!(error, ServiceError::NotClustered(route) if route == SANDBOX_STATUS_ROUTE)
+            matches!(error, ServiceError::NotClustered(ref route) if route == SANDBOX_STATUS_ROUTE),
+            "unexpected factory error: {error}"
         );
     }
 
@@ -861,13 +861,17 @@ exit 0
             .dispatch(local_context(&dir, cancel_sink), cancel_request)
             .await
             .expect("cancel route");
-        let cancel_response: SandboxRunCancelResponse = cancel_frames
+        let cancel_response = cancel_frames
             .lock()
             .expect("cancel frames")
-            .first()
-            .expect("cancel response")
-            .decode_body()
-            .expect("cancel response body");
+            .pop()
+            .expect("cancel response");
+        let cancel_response = cancel_response
+            .into_materialized_value_response(usize::MAX)
+            .await
+            .expect("materialize cancel response");
+        let cancel_response: SandboxRunCancelResponse =
+            cancel_response.decode_body().expect("cancel response body");
         assert_eq!(cancel_response.operation_id, operation_id);
         assert!(cancel_response.cancelled);
 
@@ -932,17 +936,12 @@ exit 0
             .lock()
             .expect("active cancellations")
             .insert(operation_id.to_string(), token);
-        let request = ObjectRpcRequest::encode_body(
-            SANDBOX_RUN_CANCEL_ROUTE,
-            "sandbox",
-            &ObjectRpcCancelRequest::new(operation_id, "too late"),
+        let response = dispatch_sandbox_run_cancel_request(
+            &active,
+            ObjectRpcCancelRequest::new(operation_id, "too late"),
+            Some(operation_id.to_string()),
         )
-        .expect("cancel request")
-        .with_cancels_operation_id(operation_id);
-
-        let response =
-            dispatch_sandbox_run_cancel_request(&active, request).expect("cancel response");
-        let response: SandboxRunCancelResponse = response.decode_body().expect("response body");
+        .expect("cancel response");
         assert!(!response.cancelled);
         assert!(response.detail.contains("completing"));
     }

@@ -132,6 +132,10 @@ fn posix_error_is_retryable_write_serialization(error: &DfsPosixError) -> bool {
     .any(|marker| message.contains(marker))
 }
 
+fn posix_error_is_concurrent_create_winner(error: &DfsPosixError) -> bool {
+    matches!(error, DfsPosixError::Dfs(DfsError::AlreadyExists { .. }))
+}
+
 fn posix_error_is_routed_namespace_unavailable(error: &DfsPosixError) -> bool {
     matches!(error, DfsPosixError::Dfs(DfsError::Network { .. }))
 }
@@ -1892,7 +1896,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     true,
                 ) {
                     Ok(stat) => return Ok(stat),
-                    Err(error) if posix_error_is_retryable_write_serialization(&error) => {
+                    Err(error)
+                        if posix_error_is_retryable_write_serialization(&error)
+                            || (!exclusive_create
+                                && posix_error_is_concurrent_create_winner(&error)) =>
+                    {
                         self.check_cancelled("POSIX blind-write serialization retry")?;
                         let now = Instant::now();
                         if now >= write_deadline {
@@ -3033,6 +3041,15 @@ mod replica_candidate_tests {
         assert!(!posix_error_is_retryable_write_serialization(
             &distributed_posix_error("duplicate DFS write intent id intent-a")
         ));
+    }
+
+    #[test]
+    fn concurrent_create_winner_is_retried_only_by_nonexclusive_writes() {
+        let error = DfsPosixError::Dfs(DfsError::AlreadyExists {
+            path: "/notes/shared.md".to_string(),
+        });
+        assert!(posix_error_is_concurrent_create_winner(&error));
+        assert!(!posix_error_is_retryable_write_serialization(&error));
     }
 
     #[test]

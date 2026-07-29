@@ -551,6 +551,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
 
+        // Metadata-only changes (for example atime updates) advance the
+        // visible object version without changing its immutable content
+        // identity. Packed and extent-backed values may not have a loose blob
+        // at `content_hash`, so recover them through the per-object
+        // content-identity index before falling back to a raw blob lookup.
+        if let (Some(expected_hash), Some(size_bytes)) =
+            (object.content_hash.as_ref(), object.content_size_bytes)
+            && let Ok(Some((_manifest, bytes))) = self.content.read_object_content_range(
+                object.object_id.as_str(),
+                expected_hash,
+                size_bytes,
+                0,
+                usize::MAX,
+            )
+        {
+            return Ok(NetworkedDfsReadOutcome::Found {
+                data: DfsReadData {
+                    object_id: object.object_id.clone(),
+                    version: object.version.clone(),
+                    content_hash: Some(expected_hash.clone()),
+                    bytes,
+                },
+                freshness: NetworkedDfsReadFreshness::Current,
+            });
+        }
+
         if let Some(expected_hash) = object.content_hash.as_ref()
             && let Ok(bytes) = self.content.read_blob(expected_hash)
         {

@@ -87,20 +87,12 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct VecSink {
-        frames: Arc<Mutex<Vec<ObjectRpcResponse>>>,
+        frames: Arc<Mutex<Vec<ObjectRpcOutgoingResponse>>>,
     }
 
     impl ResponseSink for VecSink {
         fn send(self: Box<Self>, response: ObjectRpcOutgoingResponse) -> Result<(), ServiceError> {
-            if !response.body.is_empty() {
-                return Err(ServiceError::Service(
-                    "rollout test sink received an unexpected response body".to_string(),
-                ));
-            }
-            self.frames
-                .lock()
-                .expect("sink lock")
-                .push(response.response);
+            self.frames.lock().expect("sink lock").push(response);
             Ok(())
         }
     }
@@ -159,13 +151,15 @@ mod tests {
 
         let disposition = registry.dispatch(ctx, request).await.expect("dispatch");
         assert_eq!(disposition, ServiceDisposition::Continue);
-        let report: String = frames
+        let response = frames
             .lock()
             .expect("frames")
-            .first()
+            .pop()
             .expect("a response frame")
-            .decode_body()
-            .expect("decode report");
+            .into_materialized_value_response(usize::MAX)
+            .await
+            .expect("materialize diagnostics response");
+        let report: String = response.decode_body().expect("decode report");
         assert!(report.contains("rollout root:"));
     }
 }

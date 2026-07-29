@@ -127,12 +127,12 @@ fn sandbox_policy_denies_duplicate_mount_paths() {
     let policy = SandboxPolicy::default();
     let mounts = vec![
         SandboxMount {
-            source_sifs_path: "/services/sandbox/a".to_string(),
+            source_sifs_path: "/services/sandbox-shared/a".to_string(),
             mount_path: SandboxPath::new("/work").expect("mount path"),
-            mode: SandboxMountMode::ReadWrite,
+            mode: SandboxMountMode::ReadOnly,
         },
         SandboxMount {
-            source_sifs_path: "/services/sandbox/b".to_string(),
+            source_sifs_path: "/services/sandbox-shared/b".to_string(),
             mount_path: SandboxPath::new("/work").expect("mount path"),
             mode: SandboxMountMode::ReadOnly,
         },

@@ -110,7 +110,7 @@ fn sandbox_manifest_uses_services_sandbox_root_and_default_tmp_policy() {
     assert_eq!(manifest.temp_policy, SandboxTempPolicy::ClearOnSessionStart);
     assert_eq!(
         sandbox_manifest_path(&sandbox_id),
-        format!("/services/sandbox/instances/{sandbox_id}/manifest.sobj")
+        format!("/services/sandbox/control/{sandbox_id}/manifest.sobj")
     );
 }
 

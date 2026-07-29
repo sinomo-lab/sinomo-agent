@@ -6389,10 +6389,9 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 ))
             })?;
         if self.get_object(&child.object_id)?.is_some() {
-            return Err(MetadataBackendError::Serde(format!(
-                "combined create object {} is already durable",
-                child.object_id
-            )));
+            return Err(MetadataBackendError::AlreadyExists {
+                path: child.path.clone(),
+            });
         }
         let Some(expected_content_hash) = pending_intent.content_hash.as_deref() else {
             return Err(MetadataBackendError::Serde(format!(
@@ -6426,10 +6425,9 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 || occupant.object_id == child.object_id
                 || pending_intent.create_predecessor_object_id.as_ref() != Some(&occupant.object_id)
         }) {
-            return Err(MetadataBackendError::Serde(format!(
-                "combined create path {} is already occupied",
-                child.path
-            )));
+            return Err(MetadataBackendError::AlreadyExists {
+                path: child.path.clone(),
+            });
         }
         let parent_path = normalized_child_path
             .rsplit_once('/')
@@ -6467,9 +6465,6 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         if durable_parent.kind != DfsObjectKind::Directory
             || touched_parent.kind != DfsObjectKind::Directory
             || touched_parent.object_id != durable_parent.object_id
-            || touched_parent.version == durable_parent.version
-            || touched_parent.modified_at_unix_nanos <= durable_parent.modified_at_unix_nanos
-            || touched_parent.changed_at_unix_nanos <= durable_parent.changed_at_unix_nanos
             || touched_parent.last_modified_by_event_id.is_none()
             || parent_transition_base != durable_parent
             || touched_parent_version.is_none_or(|version| {
@@ -6491,6 +6486,16 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 touched_parent.version,
                 touched_parent_version.is_some()
             )));
+        }
+        if touched_parent.version == durable_parent.version
+            || touched_parent.modified_at_unix_nanos <= durable_parent.modified_at_unix_nanos
+            || touched_parent.changed_at_unix_nanos <= durable_parent.changed_at_unix_nanos
+        {
+            return Err(MetadataBackendError::Conflict {
+                object_id: durable_parent.object_id,
+                expected: touched_parent.version.clone(),
+                current: durable_parent.version,
+            });
         }
         let mut durable_replica_node_ids = BTreeSet::new();
         for receipt in receipts {
@@ -13981,8 +13986,11 @@ mod tests {
             )
             .expect_err("a create batch must compare-and-publish the child exactly once");
         assert!(
-            duplicate_error.to_string().contains("already durable"),
-            "duplicate child publication should fail at the object-id precondition: {duplicate_error}"
+            matches!(
+                duplicate_error,
+                MetadataBackendError::AlreadyExists { ref path } if path == &child.path
+            ),
+            "duplicate child publication should return typed path occupancy: {duplicate_error}"
         );
 
         drop(backend);

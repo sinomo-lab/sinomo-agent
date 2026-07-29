@@ -19,6 +19,7 @@ pub mod remote_management;
 pub mod sifs;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -49,6 +50,7 @@ const IN_PROCESS_DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// Cluster initialization replaces the identity captured by foundational daemon services. Give
 /// the old embedded daemon time to drain before binding its replacement to the same address.
 const IN_PROCESS_DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+static LOCAL_FALLBACK_DATA_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// A legacy Android node only needs this migration once. Keep transient retries
 /// bounded and sparse so a disconnected phone does not turn compatibility work
 /// into an unbounded background wake source.
@@ -635,13 +637,15 @@ pub(crate) fn run_with_timeout<T: Send + 'static>(
 }
 
 fn local_fallback_data_dir() -> (SinomoDataDir, Arc<LocalFallbackDataDirCleanup>) {
+    let sequence = LOCAL_FALLBACK_DATA_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "sinomo-app-local-fallback-test-{}-{}",
+        "sinomo-app-local-fallback-test-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
-            .as_nanos()
+            .as_nanos(),
+        sequence,
     ));
     let _ = std::fs::remove_dir_all(&path);
     let cleanup = Arc::new(LocalFallbackDataDirCleanup { path: path.clone() });
@@ -1118,6 +1122,8 @@ mod tests {
         let default_root = app_config::default_data_dir().root();
         let backend = Backend::local_fallback();
         let root = backend.data_dir.root();
+        let second_backend = Backend::local_fallback();
+        let second_root = second_backend.data_dir.root();
         assert_eq!(
             backend.node.role,
             NodeRole::Workstation,
@@ -1134,6 +1140,10 @@ mod tests {
                 .is_some_and(|name| name.starts_with("sinomo-app-local-fallback-test-")),
             "unit-test fallback data dir should be visibly test-scoped: {root:?}"
         );
+        assert_ne!(
+            root, second_root,
+            "concurrent fallback backends must never share a data directory"
+        );
         assert!(root.exists(), "fallback test data dir should be created");
 
         drop(backend);
@@ -1141,6 +1151,10 @@ mod tests {
         assert!(
             !root.exists(),
             "fallback test data dir should be removed when the backend drops"
+        );
+        assert!(
+            second_root.exists(),
+            "dropping one backend must not remove another backend's data directory"
         );
     }
 

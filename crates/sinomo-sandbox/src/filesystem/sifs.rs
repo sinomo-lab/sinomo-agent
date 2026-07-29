@@ -104,14 +104,10 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
             .strip_prefix(root)
             .and_then(|tail| tail.strip_prefix('/'))
         {
-            let tmp_prefix = format!("tmp/{}/", self.temp_epoch);
-            if let Some(tmp_tail) = tail.strip_prefix(&tmp_prefix) {
-                return SandboxPath::new(format!("/tmp/{tmp_tail}")).ok();
-            }
-            if tail == format!("tmp/{}", self.temp_epoch) {
-                return SandboxPath::new("/tmp").ok();
-            }
-            return SandboxPath::new(format!("/{tail}")).ok();
+            return self.sandbox_path_for_workspace_tail(tail);
+        }
+        if let Some(tail) = sandbox_generation_tail_for_instance_alias(&normalized, &self.root) {
+            return self.sandbox_path_for_workspace_tail(tail);
         }
         for mount in &self.mounts {
             let source = normalize_sandbox_sifs_root(&mount.source_sifs_path);
@@ -124,8 +120,29 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
             {
                 return mount.mount_path.join(tail).ok();
             }
+            if let Some(tail) = sandbox_generation_tail_for_instance_alias(&normalized, &source) {
+                return if tail.is_empty() {
+                    Some(mount.mount_path.clone())
+                } else {
+                    mount.mount_path.join(tail).ok()
+                };
+            }
         }
         None
+    }
+
+    fn sandbox_path_for_workspace_tail(&self, tail: &str) -> Option<SandboxPath> {
+        if tail.is_empty() {
+            return SandboxPath::new("/").ok();
+        }
+        let tmp_prefix = format!("tmp/{}/", self.temp_epoch);
+        if let Some(tmp_tail) = tail.strip_prefix(&tmp_prefix) {
+            return SandboxPath::new(format!("/tmp/{tmp_tail}")).ok();
+        }
+        if tail == format!("tmp/{}", self.temp_epoch) {
+            return SandboxPath::new("/tmp").ok();
+        }
+        SandboxPath::new(format!("/{tail}")).ok()
     }
 
     fn mount_resolution(&self, path: &SandboxPath) -> Option<SifsMountResolution> {
@@ -622,8 +639,35 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
         Ok(())
     }
 
+    fn ensure_file_allows_read_mut(&mut self, path: &SandboxPath) -> Result<(), SandboxFsError> {
+        let metadata = self.stat_raw_mut(path)?;
+        if metadata.is_dir {
+            return Err(SandboxFsError::IsDirectory { path: path.clone() });
+        }
+        if !sandbox_mode_allows_file_read(metadata.mode) {
+            return Err(SandboxFsError::ReadOnly { path: path.clone() });
+        }
+        Ok(())
+    }
+
     fn ensure_directory_allows_list(&self, path: &SandboxPath) -> Result<(), SandboxFsError> {
         let metadata = self.stat_raw(path)?;
+        if !metadata.is_dir {
+            return Err(SandboxFsError::NotDirectory { path: path.clone() });
+        }
+        if !sandbox_mode_allows_directory_read(metadata.mode)
+            || !sandbox_mode_allows_directory_search(metadata.mode)
+        {
+            return Err(SandboxFsError::ReadOnly { path: path.clone() });
+        }
+        Ok(())
+    }
+
+    fn ensure_directory_allows_list_mut(
+        &mut self,
+        path: &SandboxPath,
+    ) -> Result<(), SandboxFsError> {
+        let metadata = self.stat_raw_mut(path)?;
         if !metadata.is_dir {
             return Err(SandboxFsError::NotDirectory { path: path.clone() });
         }
@@ -752,7 +796,7 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
         if sandbox_path_is_dev_tree(&resolved) {
             return Err(SandboxFsError::NotFound { path: path.clone() });
         }
-        self.ensure_directory_allows_list(&resolved)?;
+        self.ensure_directory_allows_list_mut(&resolved)?;
         let entries = match self
             .dfs
             .posix_list_dir_distributed(&self.sifs_path(&resolved))
@@ -846,6 +890,38 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(())
     }
+}
+
+fn sandbox_generation_tail_for_instance_alias<'a>(
+    generation_path: &'a str,
+    instance_alias: &str,
+) -> Option<&'a str> {
+    let instances_prefix = format!("{SIFS_SANDBOX_ROOT}/instances/");
+    let alias = instance_alias.strip_prefix(&instances_prefix)?;
+    let (sandbox_id, alias_tail) = alias
+        .split_once('/')
+        .map_or((alias, ""), |(sandbox_id, tail)| (sandbox_id, tail));
+    if sandbox_id.is_empty() {
+        return None;
+    }
+
+    let generation_prefix = format!("{SIFS_SANDBOX_ROOT}/generations/{sandbox_id}/");
+    let after_incarnation = generation_path
+        .strip_prefix(&generation_prefix)?
+        .split_once('/')?
+        .1;
+    let generation_tail = after_incarnation
+        .split_once('/')
+        .map_or("", |(_, tail)| tail);
+    if alias_tail.is_empty() {
+        return Some(generation_tail);
+    }
+    if generation_tail == alias_tail {
+        return Some("");
+    }
+    generation_tail
+        .strip_prefix(alias_tail)
+        .and_then(|tail| tail.strip_prefix('/'))
 }
 
 struct SifsMountResolution {
@@ -1076,7 +1152,7 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
         if sandbox_path_is_dev_tree(&resolved) {
             return Err(SandboxFsError::NotFound { path: path.clone() });
         }
-        self.ensure_file_allows_read(&resolved)?;
+        self.ensure_file_allows_read_mut(&resolved)?;
         self.read_sifs_file_mut(path, &resolved, range, true)
     }
 

@@ -19,6 +19,99 @@ use crate::posix_path::parent_posix_path;
 use crate::transfer::PendingNetworkedWrite;
 use crate::*;
 
+const CREATE_PARENT_TOUCH_MAX_REBASE_ATTEMPTS: usize = 32;
+
+fn commit_create_with_parent_touch_rebase(
+    backend: &mut dyn DfsMetadataBackend,
+    pending_intent: &DfsWriteIntentRecord,
+    receipts: &[DfsReplicaReceiptRecord],
+    transaction: &mut DfsNamespaceTransaction,
+    committed_intent: &DfsWriteIntentRecord,
+    touched_parent: &mut Option<DfsObjectMetadata>,
+) -> Result<(), DfsError> {
+    for _ in 0..CREATE_PARENT_TOUCH_MAX_REBASE_ATTEMPTS {
+        match backend.commit_create_intent_receipts_and_namespace(
+            pending_intent,
+            receipts,
+            transaction,
+            committed_intent,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(MetadataBackendError::Conflict { object_id, .. })
+                if touched_parent
+                    .as_ref()
+                    .is_some_and(|parent| parent.object_id == object_id) =>
+            {
+                let touch_event_id = touched_parent
+                    .as_ref()
+                    .and_then(|parent| parent.last_modified_by_event_id.clone())
+                    .ok_or_else(|| DfsError::Metadata {
+                        message: format!(
+                            "create transaction {} parent touch has no event identity",
+                            transaction.transaction_id
+                        ),
+                    })?;
+                let mut parent =
+                    backend
+                        .get_object(&object_id)?
+                        .ok_or_else(|| DfsError::Metadata {
+                            message: format!(
+                                "create transaction {} parent {} disappeared during rebase",
+                                transaction.transaction_id, object_id
+                            ),
+                        })?;
+                if parent.kind != DfsObjectKind::Directory {
+                    return Err(DfsError::Metadata {
+                        message: format!(
+                            "create transaction {} parent {} became {:?} during rebase",
+                            transaction.transaction_id, object_id, parent.kind
+                        ),
+                    });
+                }
+                let touch_time = dfs_now_unix_nanos()
+                    .max(parent.modified_at_unix_nanos.saturating_add(1))
+                    .max(parent.changed_at_unix_nanos.saturating_add(1));
+                parent.modified_at_unix_nanos = touch_time;
+                parent.changed_at_unix_nanos = touch_time;
+                parent.version = namespace::next_version(&parent.version);
+                parent.last_modified_by_event_id = Some(touch_event_id);
+
+                let transaction_parent = transaction
+                    .objects
+                    .iter_mut()
+                    .find(|candidate| candidate.object_id == object_id)
+                    .ok_or_else(|| DfsError::Metadata {
+                        message: format!(
+                            "create transaction {} is missing conflicted parent {}",
+                            transaction.transaction_id, object_id
+                        ),
+                    })?;
+                *transaction_parent = parent.clone();
+                let transaction_parent_version = transaction
+                    .versions
+                    .iter_mut()
+                    .find(|candidate| candidate.object_id == object_id)
+                    .ok_or_else(|| DfsError::Metadata {
+                        message: format!(
+                            "create transaction {} is missing conflicted parent {} version",
+                            transaction.transaction_id, object_id
+                        ),
+                    })?;
+                *transaction_parent_version =
+                    object_version_record(&parent, parent.content_size_bytes);
+                *touched_parent = Some(parent);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(DfsError::Metadata {
+        message: format!(
+            "create transaction {} parent touch did not settle after {} rebases",
+            transaction.transaction_id, CREATE_PARENT_TOUCH_MAX_REBASE_ATTEMPTS
+        ),
+    })
+}
+
 pub(crate) fn ensure_atomic_create_parent_touch_shard(
     file_system_id: &DfsFileSystemId,
     local_node_id: &NodeId,
@@ -107,26 +200,34 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         let create_operation_id = format!("namespace:create:{}", intent.intent_id);
-        let clustered_first_visible_create = if self.control_plane.is_some() {
-            let transient_create = self
-                .transient_metadata_object_ids
-                .contains(&intent.object_id);
-            let backend = self
-                .metadata_backend
-                .as_ref()
-                .ok_or_else(|| DfsError::Metadata {
+        let transient_create = self
+            .transient_metadata_object_ids
+            .contains(&intent.object_id);
+        let first_visible_create = match self.metadata_backend.as_ref() {
+            Some(backend) => {
+                let durable_create_prepare = backend
+                    .get_namespace_prepare(&create_operation_id)?
+                    .is_some();
+                durable_create_prepare
+                    || if self.control_plane.is_some() {
+                        transient_create || backend.get_object(&intent.object_id)?.is_none()
+                    } else {
+                        // Standalone first publication needs the atomic
+                        // child-plus-parent create primitive only for namespace
+                        // creates. Hydrated transient content intents without
+                        // a visible object retain the legacy publication path.
+                        intent.touch_parent_on_create
+                    }
+            }
+            None if self.control_plane.is_some() => {
+                return Err(DfsError::Metadata {
                     message: "clustered canonical write requires a durable metadata backend"
                         .to_string(),
-                })?;
-            backend
-                .get_namespace_prepare(&create_operation_id)?
-                .is_some()
-                || transient_create
-                || backend.get_object(&intent.object_id)?.is_none()
-        } else {
-            false
+                });
+            }
+            None => false,
         };
-        if clustered_first_visible_create {
+        if first_visible_create {
             let base_object = self.current_read_object_metadata(&intent.object_id)?;
             self.commit_ready_intent_batched(
                 &intent,
@@ -135,7 +236,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 pending.size_bytes,
             )?;
         }
-        if !clustered_first_visible_create {
+        if !first_visible_create {
             let durable_receipts: Vec<DistributedReplicaReceipt> = self
                 .coordinator
                 .receipts_for_intent(intent_id)
@@ -1362,11 +1463,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             })
             .transpose()?;
         let first_visible_create = intent.touch_parent_on_create
-            || self
-                .transient_metadata_object_ids
-                .contains(&intent.object_id)
             || durable_create_prepare.is_some()
-            || !durable_object_exists;
+            || (self.control_plane.is_some()
+                && (self
+                    .transient_metadata_object_ids
+                    .contains(&intent.object_id)
+                    || !durable_object_exists));
         // The combined backend operation validates receipt identity and hash
         // under the same write lock as visible publication. A separate lookup
         // here would replay/clone a large externally advanced metadata table
@@ -1417,7 +1519,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             })
             .collect::<Vec<_>>();
         let mut touched_parent = None;
-        let create_transaction = if first_visible_create {
+        let mut create_transaction = if first_visible_create {
             if let Some(prepare) = durable_create_prepare.as_ref() {
                 let recovered_object = prepare
                     .transaction
@@ -1487,11 +1589,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Some(prepare.transaction.clone())
             } else {
                 if durable_object_exists {
-                    return Err(DfsError::Distributed {
-                        message: format!(
-                            "cannot batch first publication for already-durable object {}",
-                            intent.object_id
-                        ),
+                    self.abort_pending_write(&intent.intent_id)?;
+                    return Err(DfsError::AlreadyExists {
+                        path: committed_object.path.clone(),
                     });
                 }
                 if let Some(backend) = self.metadata_backend.as_ref() {
@@ -1686,12 +1786,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     prepare.owner_epoch,
                 )?;
                 backend.put_intent_for_object(Some(&committed_object), &intent_record)?;
-            } else if let Some(transaction) = create_transaction.as_ref() {
-                backend.commit_create_intent_receipts_and_namespace(
+            } else if let Some(transaction) = create_transaction.as_mut() {
+                commit_create_with_parent_touch_rebase(
+                    backend.as_mut(),
                     &pending_intent_record,
                     &receipts,
                     transaction,
                     &intent_record,
+                    &mut touched_parent,
                 )?;
             } else {
                 backend.put_object_version_intent_and_receipts(

@@ -1353,6 +1353,25 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
+    async fn materialize_test_value_call(call: ObjectRpcCall) -> Result<ObjectRpcRequest, String> {
+        let streamed_value = call.has_streamed_value_body();
+        let ObjectRpcCall { mut request, body } = call;
+        if body.is_empty() {
+            return Ok(request);
+        }
+        if !streamed_value {
+            return Err(format!(
+                "test route {} received an unexpected semantic attachment",
+                request.route
+            ));
+        }
+        request.body = body
+            .collect_to_vec(usize::MAX)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(request)
+    }
+
     #[derive(Default)]
     struct FakeRemoteTransport {
         cancelled: AtomicBool,
@@ -1367,8 +1386,7 @@ mod tests {
     impl AgentRemoteObjectRpcTransport for FakeRemoteTransport {
         fn call<'a>(&'a self, call: ObjectRpcCall) -> AgentRemoteObjectRpcFuture<'a> {
             Box::pin(async move {
-                assert!(call.body.is_empty());
-                let request = call.request;
+                let request = materialize_test_value_call(call).await?;
                 let response = match request.route.as_str() {
                     "/remote/tool/run" => {
                         *self.start_operation_id.lock().expect("start op lock") =
@@ -1443,19 +1461,18 @@ mod tests {
     impl AgentRemoteObjectRpcTransport for FakeFileTransferTransport {
         fn call<'a>(&'a self, call: ObjectRpcCall) -> AgentRemoteObjectRpcFuture<'a> {
             Box::pin(async move {
-                let request = call.request;
-                match request.route.as_str() {
+                let route = call.request.route.clone();
+                match route.as_str() {
                     REMOTE_MANAGEMENT_FS_WRITE_ROUTE => {
+                        let ObjectRpcCall { request, body } = call;
                         let write: RemoteManagementFileWriteRequest =
                             request.decode_body().map_err(|error| error.to_string())?;
-                        let declared_length = call
-                            .body
+                        let declared_length = body
                             .total_bytes()
                             .ok_or_else(|| "test upload did not declare a length".to_string())?;
                         let collect_bytes = usize::try_from(declared_length)
                             .map_err(|_| "test upload does not fit this host".to_string())?;
-                        let uploaded = call
-                            .body
+                        let uploaded = body
                             .collect_to_vec(collect_bytes)
                             .await
                             .map_err(|error| error.to_string())?;
@@ -1487,7 +1504,7 @@ mod tests {
                         Ok(ObjectRpcResult::value(response))
                     }
                     REMOTE_MANAGEMENT_FS_READ_ROUTE => {
-                        assert!(call.body.is_empty());
+                        let request = materialize_test_value_call(call).await?;
                         let read: RemoteManagementFileReadRequest =
                             request.decode_body().map_err(|error| error.to_string())?;
                         self.read_calls.fetch_add(1, Ordering::SeqCst);
@@ -1932,11 +1949,11 @@ mod tests {
                       call: ObjectRpcCall| {
                     let received = Arc::clone(&received_for_transport);
                     Box::pin(async move {
-                        assert!(call.body.is_empty());
-                        let request: RemoteManagementSystemObserveRequest = call
-                            .request
-                            .decode_body()
-                            .map_err(|error| error.to_string())?;
+                        let request: RemoteManagementSystemObserveRequest =
+                            materialize_test_value_call(call)
+                                .await?
+                                .decode_body()
+                                .map_err(|error| error.to_string())?;
                         *received.lock().expect("received lock") = Some(request);
                         let mut observation = sinomo_runtime::remote_management::RemoteManagementSystemObservation::default();
                         observation.devices.push(

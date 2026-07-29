@@ -3326,13 +3326,26 @@ struct ReadinessRemoteObjectRpcTransport {
     cancel_calls: AtomicUsize,
 }
 
+async fn materialize_readiness_value_call(call: ObjectRpcCall) -> Result<ObjectRpcRequest, String> {
+    let streamed_value = call.has_streamed_value_body();
+    let ObjectRpcCall { mut request, body } = call;
+    if body.is_empty() {
+        return Ok(request);
+    }
+    if !streamed_value {
+        return Err("readiness transport received an unexpected attachment".to_string());
+    }
+    request.body = body
+        .collect_to_vec(usize::MAX)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(request)
+}
+
 impl AgentRemoteObjectRpcTransport for ReadinessRemoteObjectRpcTransport {
     fn call<'a>(&'a self, call: ObjectRpcCall) -> AgentRemoteObjectRpcFuture<'a> {
         Box::pin(async move {
-            if !call.body.is_empty() {
-                return Err("readiness transport received an unexpected attachment".to_string());
-            }
-            let request = call.request;
+            let request = materialize_readiness_value_call(call).await?;
             let response = match request.route.as_str() {
                 "/agent/readiness/remote-tool/run" => {
                     *self.start_operation_id.lock().expect("start op lock") =
@@ -5471,6 +5484,17 @@ where
 }
 
 fn block_on_readiness_future<F: Future>(future: F) -> F::Output {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build agent readiness Tokio runtime")
+            .block_on(future);
+    }
+
+    // Readiness can also be invoked by a caller already running on Tokio.
+    // Poll in that entered runtime so deferred SOBJ materialization can use
+    // its blocking pool without attempting to nest another runtime.
     let waker = readiness_noop_waker();
     let mut context = Context::from_waker(&waker);
     let mut future = Box::pin(future);

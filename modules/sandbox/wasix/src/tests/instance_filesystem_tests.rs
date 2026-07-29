@@ -84,7 +84,7 @@ fn sifs_sandbox_instance_store_creates_loads_and_saves_manifest() {
         format!("{}/home", sandbox_instance_root(&sandbox_id)),
         format!("{}/tmp", sandbox_instance_root(&sandbox_id)),
         format!("{}/work", sandbox_instance_root(&sandbox_id)),
-        format!("{}/checkpoints", sandbox_instance_root(&sandbox_id)),
+        sandbox_checkpoint_root(&sandbox_id),
         format!("{}/logs", sandbox_instance_root(&sandbox_id)),
         format!("{}/artifacts", sandbox_instance_root(&sandbox_id)),
     ] {
@@ -173,6 +173,19 @@ fn sifs_sandbox_instance_store_checkpoints_resumes_and_destroys() {
             OffsetDateTime::now_utc(),
         )
         .expect("resume");
+    let resume_transaction_id = resumed
+        .pending_reconciliation
+        .as_ref()
+        .expect("resume transaction")
+        .transaction_id
+        .clone();
+    let resumed = store
+        .clear_reconciliation_transaction(
+            &sandbox_id,
+            &resume_transaction_id,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("finalize resume");
 
     let sandbox_fs = SifsSandboxFileSystem::new(store.into_inner(), &resumed);
     assert_eq!(
@@ -340,8 +353,10 @@ fn sifs_sandbox_instance_checkpoint_fetches_remote_manifest_file_and_symlink() {
     .expect("reader metadata backend");
     let mut reader_store = SifsSandboxInstanceStore::new(reader_dfs);
 
+    let stop_owner = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let owner_worker = {
         let owner_dfs = Arc::clone(&owner_dfs);
+        let stop_owner = Arc::clone(&stop_owner);
         std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let mut served = 0usize;
@@ -360,7 +375,7 @@ fn sifs_sandbox_instance_checkpoint_fetches_remote_manifest_file_and_symlink() {
                         )
                     })
                     .count();
-                if served >= 3 {
+                if stop_owner.load(std::sync::atomic::Ordering::Acquire) && events.is_empty() {
                     return served;
                 }
                 assert!(
@@ -371,18 +386,22 @@ fn sifs_sandbox_instance_checkpoint_fetches_remote_manifest_file_and_symlink() {
             }
         })
     };
-    let checkpoint = reader_store
-        .create_checkpoint(&sandbox_id, OffsetDateTime::now_utc())
-        .expect("reader checkpoint");
-    assert_eq!(owner_worker.join().expect("owner worker"), 3);
-
     let resumed = reader_store
-        .resume_checkpoint(
-            &sandbox_id,
-            &checkpoint.checkpoint_id,
-            OffsetDateTime::now_utc(),
-        )
-        .expect("reader resume checkpoint");
+        .create_checkpoint(&sandbox_id, OffsetDateTime::now_utc())
+        .and_then(|checkpoint| {
+            reader_store.resume_checkpoint(
+                &sandbox_id,
+                &checkpoint.checkpoint_id,
+                OffsetDateTime::now_utc(),
+            )
+        });
+    stop_owner.store(true, std::sync::atomic::Ordering::Release);
+    let served = owner_worker.join().expect("owner worker");
+    let resumed = resumed.expect("reader checkpoint and resume");
+    assert!(
+        served >= 4,
+        "checkpoint should fetch its remote manifest, generation link, file, and symlink content"
+    );
     let reader_fs = SifsSandboxFileSystem::new(reader_store.into_inner(), &resumed);
     let link = SandboxPath::new("/work/link.txt").expect("link");
     assert_eq!(
@@ -410,7 +429,7 @@ fn sifs_sandbox_instance_checkpoint_preserves_hardlinks() {
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
             .expect("metadata");
     let mut dfs = NetworkedDfsService::new(
-        network.add_node(node_id),
+        network.add_node(node_id.clone()),
         LocalContentStore::new(runtime_root.join("content")).expect("content"),
     )
     .with_metadata_backend(metadata_backend)
@@ -444,10 +463,8 @@ fn sifs_sandbox_instance_checkpoint_preserves_hardlinks() {
     let reload_metadata_backend =
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
             .expect("reload metadata");
-    let reload_node = NodeId::from_legacy_named("node_sifs_instance_checkpoint_hardlink_reload")
-        .expect("node reload");
     let reload_dfs = NetworkedDfsService::new(
-        network.add_node(reload_node),
+        network.add_node(node_id),
         LocalContentStore::new(runtime_root.join("content")).expect("reload content"),
     )
     .with_metadata_backend(reload_metadata_backend)
@@ -518,12 +535,26 @@ fn sifs_sandbox_instance_reboot_applies_tmp_policy_without_clearing_work() {
         .expect("reboot");
     assert!(cleared_tmp);
     assert_eq!(rebooted.temp_epoch, 1);
-    assert!(matches!(
+    assert_eq!(
         store
             .dfs
-            .posix_read_file(&format!("{}/tmp/0/cache.txt", manifest.workspace_root)),
-        Err(DfsPosixError::NotFound { .. }) | Err(DfsPosixError::MissingParent { .. })
-    ));
+            .posix_read_file(&format!("{}/tmp/0/cache.txt", manifest.workspace_root))
+            .expect("prior temp generation remains immutable"),
+        b"tmp"
+    );
+    let reboot_transaction_id = rebooted
+        .pending_reconciliation
+        .as_ref()
+        .expect("reboot transaction")
+        .transaction_id
+        .clone();
+    let rebooted = store
+        .clear_reconciliation_transaction(
+            &sandbox_id,
+            &reboot_transaction_id,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("finalize reboot");
     let sandbox_fs = SifsSandboxFileSystem::new(store.into_inner(), &rebooted);
     assert_eq!(
         sandbox_fs
@@ -551,6 +582,19 @@ fn sifs_sandbox_instance_reboot_applies_tmp_policy_without_clearing_work() {
         .expect("reboot retain");
     assert!(!cleared_tmp);
     assert_eq!(retained.temp_epoch, 1);
+    let retained_transaction_id = retained
+        .pending_reconciliation
+        .as_ref()
+        .expect("retained reboot transaction")
+        .transaction_id
+        .clone();
+    let retained = store
+        .clear_reconciliation_transaction(
+            &sandbox_id,
+            &retained_transaction_id,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("finalize retained reboot");
     let sandbox_fs = SifsSandboxFileSystem::new(store.into_inner(), &retained);
     assert_eq!(
         sandbox_fs
@@ -2474,23 +2518,12 @@ fn sifs_sandbox_read_file_requests_and_completes_remote_content_fetch() {
     )
     .with_metadata_backend(reader_backend)
     .expect("reader metadata backend");
-    let reader_store = SifsSandboxInstanceStore::new(reader_dfs);
-    let mut reader_fs = SifsSandboxFileSystem::new(reader_store.into_inner(), &manifest);
-
-    assert_eq!(
-        reader_fs.stat(&file).expect("remote file stat").len,
-        b"remote progress".len() as u64
-    );
-    assert_eq!(
-        reader_fs.stat(&link).expect("remote symlink lstat").len,
-        "remote.txt".len() as u64
-    );
-
+    let stop_owner = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let owner_worker = {
         let owner_dfs = Arc::clone(&owner_dfs);
+        let stop_owner = Arc::clone(&stop_owner);
         std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let mut served = 0usize;
             let mut served_events = Vec::new();
             loop {
                 let events = owner_dfs
@@ -2507,9 +2540,8 @@ fn sifs_sandbox_read_file_requests_and_completes_remote_content_fetch() {
                         )
                     })
                     .count();
-                served += served_now;
                 served_events.extend(events);
-                if served >= 2 {
+                if stop_owner.load(std::sync::atomic::Ordering::Acquire) && served_now == 0 {
                     return served_events;
                 }
                 assert!(
@@ -2520,13 +2552,39 @@ fn sifs_sandbox_read_file_requests_and_completes_remote_content_fetch() {
             }
         })
     };
+    let reader_store = SifsSandboxInstanceStore::new(reader_dfs);
+    let mut reader_fs = SifsSandboxFileSystem::new(reader_store.into_inner(), &manifest);
+
+    // Mutable metadata resolution may hydrate the remote generation-link body.
+    let file_stat = reader_fs.stat_mut(&file);
+    let link_stat = reader_fs.stat_mut(&link);
+    let sandbox_direct_contents = reader_fs.read_file(&file, None);
+    let contents = reader_fs.read_file(&link, None);
+    stop_owner.store(true, std::sync::atomic::Ordering::Release);
+    let owner_events = owner_worker.join().expect("owner worker");
+
     assert_eq!(
-        reader_fs
-            .read_file(&link, None)
-            .expect("reader resolves remote symlink and remote target"),
+        file_stat.expect("remote file stat").len,
+        b"remote progress".len() as u64
+    );
+    assert_eq!(
+        link_stat.expect("remote symlink lstat").len,
+        "remote.txt".len() as u64
+    );
+    assert_eq!(
+        sandbox_direct_contents.expect("sandbox distributed file read"),
         b"remote progress"
     );
-    let owner_events = owner_worker.join().expect("owner worker");
+
+    assert_eq!(
+        contents.unwrap_or_else(|error| {
+            panic!(
+                "reader should resolve remote symlink and remote target: {error}; \
+                 owner events: {owner_events:?}"
+            )
+        }),
+        b"remote progress"
+    );
     assert!(
         owner_events.iter().any(|event| matches!(
             event,

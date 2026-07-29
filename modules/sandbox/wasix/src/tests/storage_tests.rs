@@ -135,17 +135,20 @@ fn destroy_finalization_stops_on_lease_loss_and_cannot_walk_a_recreated_control_
     let recreated = store
         .create(sandbox_id.clone(), toolchain, OffsetDateTime::now_utc())
         .expect("same id can be recreated after finalization");
-    assert!(matches!(
-        store.finalize_destroy(&sandbox_id, &destroy_txn),
-        Err(SandboxStoreError::ReconciliationPending { .. })
-    ));
+    let stale_finalize = store
+        .finalize_destroy(&sandbox_id, &destroy_txn)
+        .expect_err("old destroy transaction cannot enter a recreated control root");
+    assert!(
+        stale_finalize.to_string().contains("is not pending"),
+        "unexpected stale destroy error: {stale_finalize}"
+    );
     assert!(
         store
             .dfs
             .posix_lstat_distributed(&sandbox_instance_root(&sandbox_id))
             .is_ok()
     );
-    assert!(recreated.pending_reconciliation.is_some());
+    assert!(recreated.pending_reconciliation.is_none());
     fs::remove_dir_all(runtime_root).ok();
 }
 

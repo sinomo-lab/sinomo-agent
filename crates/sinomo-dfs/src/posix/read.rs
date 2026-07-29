@@ -516,7 +516,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object: DfsObjectMetadata,
         index: usize,
     ) -> Result<PosixBulkReadPlan> {
-        match self.read_object_metadata_local_if_current_location(&object)? {
+        match self.read_authoritative_object_metadata_local_or_pending(&object)? {
             NetworkedDfsReadOutcome::Found {
                 data: DfsReadData { bytes, .. },
                 ..
@@ -711,20 +711,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 data: DfsReadData { bytes, .. },
                 ..
             } => {
-                let mut object = self
-                    .object_by_id(&object.object_id)?
-                    .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-                (_, object) = self.posix_file_content_object(path.clone(), object)?;
-                // Only the metadata authority may journal the atime update;
-                // appending it on a replica would fork the replica's journal
-                // from the shard primary's stream (noatime-style degradation
-                // on non-primary nodes).
-                if !self.is_local_metadata_primary_for_object(&object)? {
-                    return Ok(bytes);
+                let atime_update = (|| -> Result<()> {
+                    // A read-only namespace lookup may resolve authoritative
+                    // metadata without materializing it in this node's local
+                    // mirror. Only the metadata authority may journal atime;
+                    // replicas and outside readers intentionally use noatime
+                    // semantics.
+                    if !self.is_local_metadata_primary_for_object(&object)? {
+                        return Ok(());
+                    }
+                    let Some(mut object) = self.object_by_id(&object.object_id)? else {
+                        return Ok(());
+                    };
+                    (_, object) = self.posix_file_content_object(path.clone(), object)?;
+                    object.accessed_at_unix_nanos = now_unix_nanos();
+                    object.version = next_version(&object.version);
+                    self.add_object_metadata(object)?;
+                    Ok(())
+                })();
+                if let Err(error) = atime_update {
+                    // The content read above is already authoritative and
+                    // complete. Access-time bookkeeping must never turn that
+                    // success into a false data-access failure.
+                    tracing::warn!(
+                        target: "sinomo.dfs.posix",
+                        path = %path,
+                        error = %error,
+                        "completed distributed read without access-time update"
+                    );
                 }
-                object.accessed_at_unix_nanos = now_unix_nanos();
-                object.version = next_version(&object.version);
-                self.add_object_metadata(object)?;
                 Ok(bytes)
             }
             NetworkedDfsReadOutcome::PendingReplication { .. }
@@ -1045,7 +1060,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // non-replica's incomplete local object shard.
         let mut object = object.clone();
         self.apply_transient_remote_read_location_prunes(&mut object);
-        let initial = self.read_object_metadata_local_if_current_location(&object)?;
+        let initial = self.read_authoritative_object_metadata_local_or_pending(&object)?;
         if !matches!(initial, NetworkedDfsReadOutcome::PendingReplication { .. }) {
             return Ok(initial);
         }
@@ -1075,7 +1090,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
             self.apply_transient_remote_read_location_prunes(&mut object);
-            let current = self.read_object_metadata_local_if_current_location(&object)?;
+            let current = self.read_authoritative_object_metadata_local_or_pending(&object)?;
             if !matches!(current, NetworkedDfsReadOutcome::PendingReplication { .. }) {
                 return Ok(current);
             }
@@ -1258,14 +1273,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<NetworkedDfsRangeReadOutcome> {
-        if !object.current_locations.contains(&self.node_id) && object.content_hash.is_some() {
-            return Ok(NetworkedDfsRangeReadOutcome::PendingReplication {
-                object_id: object.object_id.clone(),
-                version: object.version.clone(),
-                content_hash: object.content_hash.clone(),
-                current_locations: object.current_locations.clone(),
-            });
-        }
+        // `current_locations` is a routing hint, not an authority check. A
+        // metadata-only version change can race the receipt that adds this node
+        // to the latest location set while the exact immutable content is
+        // already local. Always try that content identity before going remote.
         match self.read_object_metadata_local_range_with_state(object, offset, max_bytes, false) {
             Ok(outcome) => Ok(outcome),
             Err(DfsError::UnknownObject { object_id })
@@ -1287,18 +1298,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
-    fn read_object_metadata_local_if_current_location(
+    fn read_authoritative_object_metadata_local_or_pending(
         &self,
         object: &DfsObjectMetadata,
     ) -> Result<NetworkedDfsReadOutcome> {
-        if !object.current_locations.contains(&self.node_id) && object.content_hash.is_some() {
-            return Ok(NetworkedDfsReadOutcome::PendingReplication {
-                object_id: object.object_id.clone(),
-                version: object.version.clone(),
-                content_hash: object.content_hash.clone(),
-                current_locations: object.current_locations.clone(),
-            });
-        }
+        // The authoritative metadata's content identity is stronger evidence
+        // than a lagging location projection. Exact matching local content
+        // remains readable even when a metadata-only mutation advanced the
+        // visible version before the replica receipt updated locations.
         Ok(self.read_object_metadata_local_content_with_state(object, false)?)
     }
 

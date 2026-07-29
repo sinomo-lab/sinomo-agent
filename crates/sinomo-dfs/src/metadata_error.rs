@@ -36,6 +36,8 @@ pub enum MetadataBackendError {
         expected: DfsVersion,
         current: DfsVersion,
     },
+    #[error("path already exists: {path}")]
+    AlreadyExists { path: String },
     #[error("directory is not empty: {path}")]
     DirectoryNotEmpty { path: String },
 }

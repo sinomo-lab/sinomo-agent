@@ -936,8 +936,10 @@ mod tests {
         .expect("reader metadata backend");
         let mut reader_fs = SifsSandboxFileSystem::new(reader_dfs, &manifest);
 
+        let stop_owner = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let owner_worker = {
             let owner_dfs = Arc::clone(&owner_dfs);
+            let stop_owner = Arc::clone(&stop_owner);
             std::thread::spawn(move || {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 let mut served = 0usize;
@@ -956,7 +958,7 @@ mod tests {
                             )
                         })
                         .count();
-                    if served >= 1 {
+                    if stop_owner.load(std::sync::atomic::Ordering::Acquire) && events.is_empty() {
                         return served;
                     }
                     assert!(
@@ -970,9 +972,14 @@ mod tests {
         let snapshot = snapshot_sandbox_filesystem_with_roots(
             &mut reader_fs,
             &[SandboxPath::new("/work").expect("work")],
-        )
-        .expect("snapshot");
-        assert_eq!(owner_worker.join().expect("owner worker"), 2);
+        );
+        stop_owner.store(true, std::sync::atomic::Ordering::Release);
+        let served = owner_worker.join().expect("owner worker");
+        let snapshot = snapshot.expect("snapshot");
+        assert!(
+            served >= 3,
+            "snapshot should fetch the generation link, file, and symlink content"
+        );
 
         let target = SandboxPath::new("/work/target.txt").expect("target");
         let link = SandboxPath::new("/work/link.txt").expect("link");

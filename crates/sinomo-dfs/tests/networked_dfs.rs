@@ -2286,6 +2286,7 @@ fn networked_dfs_uses_kv_only_for_bounded_control_plane_records() {
     replica_dfs
         .add_object_metadata(metadata)
         .expect("replica object");
+    replica_dfs = replica_dfs.with_control_plane(control_plane.clone());
 
     let write = owner_dfs
         .write_distributed_eventual(
@@ -2302,16 +2303,18 @@ fn networked_dfs_uses_kv_only_for_bounded_control_plane_records() {
         .expect("write");
     assert!(matches!(write, NetworkedDfsWriteOutcome::Pending { .. }));
 
-    replica_dfs.process_incoming().expect("replica stage");
-    owner_dfs.process_incoming().expect("owner commit");
+    let replica_events = replica_dfs.process_incoming().expect("replica stage");
+    let owner_events = owner_dfs.process_incoming().expect("owner commit");
 
+    let owner_version = owner_dfs
+        .metadata()
+        .object(&object_id)
+        .expect("owner metadata")
+        .version
+        .clone();
     assert_eq!(
-        owner_dfs
-            .metadata()
-            .object(&object_id)
-            .expect("owner metadata")
-            .version,
-        version_2
+        owner_version, version_2,
+        "owner must publish after the replica receipt; initial={version_1}, replica_events={replica_events:?}, owner_events={owner_events:?}"
     );
     control_plane.with_client(|kv| {
         let control = DfsControlPlaneStore::new(kv);
@@ -2928,21 +2931,64 @@ fn networked_dfs_routes_non_primary_write_to_metadata_shard_primary() {
         }
     ));
 
-    let primary_events = primary_dfs.process_incoming().expect("primary incoming");
-    assert!(primary_events.iter().any(|event| {
-        matches!(
-            event,
-            NetworkedDfsServiceEvent::RemoteWriteServed {
-                requester_node_id,
-                result:
-                    DfsDistributedWriteResult::Outcome {
-                        outcome: NetworkedDfsWriteOutcome::Committed { .. },
-                    },
-                ..
-            } if requester_node_id == &writer
-        )
-    }));
-    let writer_events = writer_dfs.process_incoming().expect("writer incoming");
+    let initial_primary_events = primary_dfs.process_incoming().expect("primary incoming");
+    assert!(
+        initial_primary_events.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::RemoteWriteServed {
+                    requester_node_id,
+                    result:
+                        DfsDistributedWriteResult::Outcome {
+                            outcome: NetworkedDfsWriteOutcome::Pending { .. },
+                        },
+                    ..
+                } if requester_node_id == &writer
+            )
+        }),
+        "metadata primary must keep the foreground response pending while its desired local copy and metadata replica converge: {initial_primary_events:?}"
+    );
+    let initial_writer_events = writer_dfs
+        .process_incoming()
+        .expect("writer applies prepare and serves primary fetch");
+    assert!(
+        initial_writer_events.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::RemoteWriteCompleted {
+                    primary_node_id,
+                    result:
+                        DfsDistributedWriteResult::Outcome {
+                            outcome: NetworkedDfsWriteOutcome::Pending { .. },
+                        },
+                    ..
+                } if primary_node_id == &primary
+            )
+        }),
+        "writer must retain the routed write after the primary's pending response: {initial_writer_events:?}"
+    );
+    let committed_primary_events = primary_dfs
+        .process_incoming()
+        .expect("primary completes local fetch and metadata prepare");
+    assert!(
+        committed_primary_events.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::RemoteWriteServed {
+                    requester_node_id,
+                    result:
+                        DfsDistributedWriteResult::Outcome {
+                            outcome: NetworkedDfsWriteOutcome::Committed { .. },
+                        },
+                    ..
+                } if requester_node_id == &writer
+            )
+        }),
+        "metadata primary must commit after foreground convergence: {committed_primary_events:?}"
+    );
+    let writer_events = writer_dfs
+        .process_incoming()
+        .expect("writer receives committed response");
     assert!(writer_events.iter().any(|event| {
         matches!(
             event,
@@ -3083,21 +3129,62 @@ fn networked_dfs_strict_routed_write_completion_resolves_remote_intent_alias() {
         }
     ));
 
-    let primary_events = primary_dfs.process_incoming().expect("primary incoming");
-    assert!(primary_events.iter().any(|event| {
-        matches!(
-            event,
-            NetworkedDfsServiceEvent::RemoteWriteServed {
-                requester_node_id,
-                result:
-                    DfsDistributedWriteResult::Outcome {
-                        outcome: NetworkedDfsWriteOutcome::Committed { .. },
-                    },
-                ..
-            } if requester_node_id == &writer
-        )
-    }));
+    let initial_primary_events = primary_dfs.process_incoming().expect("primary incoming");
+    assert!(
+        initial_primary_events.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::RemoteWriteServed {
+                    requester_node_id,
+                    result:
+                        DfsDistributedWriteResult::Outcome {
+                            outcome: NetworkedDfsWriteOutcome::Pending { .. },
+                        },
+                    ..
+                } if requester_node_id == &writer
+            )
+        }),
+        "strict routed write must remain pending until the primary's desired local copy and metadata replica converge: {initial_primary_events:?}"
+    );
 
+    let initial_writer_events = writer_dfs
+        .process_incoming()
+        .expect("writer applies strict prepare and serves primary fetch");
+    assert!(
+        initial_writer_events.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::RemoteWriteCompleted {
+                    primary_node_id,
+                    result:
+                        DfsDistributedWriteResult::Outcome {
+                            outcome: NetworkedDfsWriteOutcome::Pending { .. },
+                        },
+                    ..
+                } if primary_node_id == &primary
+            )
+        }),
+        "writer must retain the strict routed write after the pending response: {initial_writer_events:?}"
+    );
+    let committed_primary_events = primary_dfs
+        .process_incoming()
+        .expect("primary completes strict local fetch and metadata prepare");
+    assert!(
+        committed_primary_events.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::RemoteWriteServed {
+                    requester_node_id,
+                    result:
+                        DfsDistributedWriteResult::Outcome {
+                            outcome: NetworkedDfsWriteOutcome::Committed { .. },
+                        },
+                    ..
+                } if requester_node_id == &writer
+            )
+        }),
+        "metadata primary must commit the strict routed write after foreground convergence: {committed_primary_events:?}"
+    );
     let writer_events = writer_dfs
         .process_incoming()
         .expect("writer receives strict completion");
@@ -3238,20 +3325,61 @@ fn routed_write_response_from_retired_primary_fails_closed_after_requester_becom
         }
     ));
 
-    let primary_events = primary_dfs.process_incoming().expect("primary incoming");
-    assert!(primary_events.iter().any(|event| {
-        matches!(
-            event,
-            NetworkedDfsServiceEvent::RemoteWriteServed {
-                requester_node_id,
-                result:
-                    DfsDistributedWriteResult::Outcome {
-                        outcome: NetworkedDfsWriteOutcome::Committed { .. },
-                    },
-                ..
-            } if requester_node_id == &writer
-        )
-    }));
+    let initial_primary_events = primary_dfs.process_incoming().expect("primary incoming");
+    assert!(
+        initial_primary_events.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::RemoteWriteServed {
+                    requester_node_id,
+                    result:
+                        DfsDistributedWriteResult::Outcome {
+                            outcome: NetworkedDfsWriteOutcome::Pending { .. },
+                        },
+                    ..
+                } if requester_node_id == &writer
+            )
+        }),
+        "routed write must remain pending while the primary's desired local copy and metadata replica converge: {initial_primary_events:?}"
+    );
+    let initial_writer_events = writer_dfs
+        .process_incoming()
+        .expect("writer applies prepare and serves retired primary fetch");
+    assert!(
+        initial_writer_events.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::RemoteWriteCompleted {
+                    primary_node_id,
+                    result:
+                        DfsDistributedWriteResult::Outcome {
+                            outcome: NetworkedDfsWriteOutcome::Pending { .. },
+                        },
+                    ..
+                } if primary_node_id == &primary
+            )
+        }),
+        "writer must retain the routed write until final completion: {initial_writer_events:?}"
+    );
+    let committed_primary_events = primary_dfs
+        .process_incoming()
+        .expect("primary completes local fetch and metadata prepare");
+    assert!(
+        committed_primary_events.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::RemoteWriteServed {
+                    requester_node_id,
+                    result:
+                        DfsDistributedWriteResult::Outcome {
+                            outcome: NetworkedDfsWriteOutcome::Committed { .. },
+                        },
+                    ..
+                } if requester_node_id == &writer
+            )
+        }),
+        "metadata primary must commit before authority transfer: {committed_primary_events:?}"
+    );
     control_plane.with_client(|kv| {
         DfsControlPlaneStore::new(kv)
             .put_metadata_shard(&DfsMetadataShardConfig {
