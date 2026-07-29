@@ -212,6 +212,21 @@ pub(crate) fn namespace_prepare_expectations_from_lookups(
 /// scans as primitives so service and operator code can walk large namespaces
 /// without materializing every record class at once.
 pub trait DfsMetadataBackend: std::fmt::Debug + Send {
+    /// Pin one coherent in-memory metadata generation for a bounded bulk read.
+    ///
+    /// Full-catalog hydration calls many paging and point-read methods through
+    /// this trait. Durable local backends may refresh once at the start of the
+    /// scope and then serve those reads from that generation instead of
+    /// polling the same snapshot, log, and checkpoint files for every record.
+    /// Implementations must resume ordinary freshness checks after the
+    /// matching end call.
+    fn begin_consistent_read_snapshot(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// End one bounded coherent-read scope opened above.
+    fn end_consistent_read_snapshot(&mut self) {}
+
     /// Create or replace a filesystem record and journal the mutation.
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry>;
 
@@ -1144,6 +1159,19 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         max_entries: usize,
     ) -> Result<DfsWriteIntentScanPage>;
 
+    /// Return one cursor-bounded page of durable write intents from one exact
+    /// local metadata shard.
+    ///
+    /// Recovery uses this shard-scoped view to retain intent provenance across
+    /// authority movement. It must include historical duplicates which the
+    /// merged global scan deliberately filters from ordinary callers.
+    fn write_intents_on_shard_page(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after: Option<&DfsWriteIntentScanCursor>,
+        max_entries: usize,
+    ) -> Result<Option<DfsWriteIntentScanPage>>;
+
     /// Return one cursor-bounded global page of object-version records.
     fn version_records_page(
         &self,
@@ -1477,6 +1505,13 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         let _ = operation_id;
         Ok(None)
     }
+
+    /// Return only hidden namespace prepares which still require recovery.
+    ///
+    /// Replica snapshot export is intentionally not the inspection API here:
+    /// it clones and fingerprints every metadata table even though recovery
+    /// needs only this bounded active subset.
+    fn list_prepared_namespace_prepares(&self) -> Result<Vec<DfsNamespacePrepareRecord>>;
 
     /// Move an exact non-terminal write intent to a newer shard-owner epoch.
     ///
@@ -1830,6 +1865,20 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         _shard_id: &DfsMetadataShardId,
     ) -> Result<()> {
         Ok(())
+    }
+
+    /// Refresh one shard only when its cached durable generation changed.
+    ///
+    /// The default preserves compatibility for backends that cannot compare a
+    /// cached generation cheaply. Sharded local backends use this cold-path
+    /// variant during service rebind so an unchanged activated marker does not
+    /// rebuild the complete derived object-to-shard index on every open.
+    fn refresh_metadata_shard_durable_view_if_changed(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<bool> {
+        self.refresh_metadata_shard_durable_view(shard_id)?;
+        Ok(true)
     }
 
     /// Return the durable membership-handoff write freeze for one shard.

@@ -1,3 +1,8 @@
+---
+name: remote-management
+description: Bounded remote shell and system observation guidance.
+---
+
 # Remote Management Compute Use
 
 Use the remote-management routes for bounded host inspection and command

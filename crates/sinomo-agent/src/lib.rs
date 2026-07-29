@@ -2020,20 +2020,20 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
         AgentToolSpec::new(
             AgentToolKind::SkillSearch,
             "skill_search",
-            "Search skills declared by the active agent package or installed module resources.",
+            "Search the available Agent Skills catalog by name or description.",
             false,
         ),
         AgentToolSpec::new(
             AgentToolKind::SkillDescribe,
             "skill_describe",
-            "Describe one skill, including provenance, path, targeting metadata, and embedded text when available.",
+            "Inspect Agent Skills metadata and provenance without activating its instructions.",
             false,
         ),
         AgentToolSpec::new(
             AgentToolKind::SkillActivate,
             "skill_activate",
-            "Request activation of a disclosed skill through the host runtime when an activation executor is attached.",
-            true,
+            "Load the selected Agent Skills SKILL.md instructions and list bundled resources.",
+            false,
         ),
     ]);
     tools

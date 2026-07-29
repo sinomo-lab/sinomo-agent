@@ -128,7 +128,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use time::OffsetDateTime;
 
-const DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES: u64 = 64 * 1024 * 1024;
+// Table-log replay is paid by every full SIFS service open. Keep the active
+// append generation bounded enough that cold hydration does not spend seconds
+// rebuilding a shard, while the checkpoint worker still rotates it in the
+// background so foreground writes are not blocked on snapshot encoding.
+const DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES: u64 = 8 * 1024 * 1024;
 
 struct PlannedWrittenJournalTableOps {
     applied: usize,
@@ -155,6 +159,7 @@ thread_local! {
     static METADATA_BEGIN_WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METADATA_CURRENT_TABLES_SNAPSHOT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METADATA_BACKEND_OPEN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static METADATA_EXPORT_TABLE_SNAPSHOT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METADATA_JOURNAL_WRITE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static NAMESPACE_RECOVERY_PLANNER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static NAMESPACE_PREPARED_COMMIT_REFERENCE_PLANNER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -189,6 +194,21 @@ pub(crate) fn reset_metadata_backend_open_calls() {
 #[cfg(test)]
 pub(crate) fn metadata_backend_open_calls() -> usize {
     METADATA_BACKEND_OPEN_CALLS.get()
+}
+
+#[cfg(test)]
+pub(crate) fn record_metadata_backend_open_calls_from_workers(count: usize) {
+    METADATA_BACKEND_OPEN_CALLS.set(METADATA_BACKEND_OPEN_CALLS.get().saturating_add(count));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_metadata_export_table_snapshot_calls() {
+    METADATA_EXPORT_TABLE_SNAPSHOT_CALLS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn metadata_export_table_snapshot_calls() -> usize {
+    METADATA_EXPORT_TABLE_SNAPSHOT_CALLS.get()
 }
 
 #[cfg(test)]
@@ -1741,6 +1761,7 @@ pub struct LocalSobjMetadataBackend {
     table_snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
     read_snapshot_cache: Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
     content_root_catalog_snapshot_cache: Option<Arc<DfsContentRootCatalogSnapshotCache>>,
+    consistent_read_snapshot_depth: usize,
     #[cfg(test)]
     receipt_scan_counters: Arc<MetadataReceiptScanCounters>,
     #[cfg(test)]
@@ -1776,6 +1797,7 @@ impl LocalSobjMetadataBackend {
             table_snapshot_fingerprint: None,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
             content_root_catalog_snapshot_cache: None,
+            consistent_read_snapshot_depth: 0,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
             #[cfg(test)]
@@ -1896,6 +1918,7 @@ impl LocalSobjMetadataBackend {
             table_snapshot_fingerprint: state.snapshot_fingerprint,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
             content_root_catalog_snapshot_cache: None,
+            consistent_read_snapshot_depth: 0,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
             #[cfg(test)]
@@ -1948,6 +1971,7 @@ impl LocalSobjMetadataBackend {
             table_snapshot_fingerprint: state.snapshot_fingerprint,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
             content_root_catalog_snapshot_cache: None,
+            consistent_read_snapshot_depth: 0,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
             #[cfg(test)]
@@ -2185,6 +2209,9 @@ impl LocalSobjMetadataBackend {
 
     /// Export the current materialized table state for replica snapshot repair.
     pub fn export_table_snapshot(&self) -> DfsMetadataTableSnapshot {
+        #[cfg(test)]
+        METADATA_EXPORT_TABLE_SNAPSHOT_CALLS
+            .set(METADATA_EXPORT_TABLE_SNAPSHOT_CALLS.get().saturating_add(1));
         let mut snapshot = DfsMetadataTableSnapshot {
             format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
             materialized_through_sequence: Some(self.materialized_through_sequence),
@@ -2281,6 +2308,7 @@ impl LocalSobjMetadataBackend {
             table_snapshot_fingerprint: None,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
             content_root_catalog_snapshot_cache: None,
+            consistent_read_snapshot_depth: 0,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
             #[cfg(test)]
@@ -4649,6 +4677,9 @@ impl LocalSobjMetadataBackend {
                 .get()
                 .saturating_add(1),
         );
+        if self.consistent_read_snapshot_depth > 0 {
+            return Ok(DfsMetadataTablesSnapshot::Borrowed(&self.tables));
+        }
         metadata_read_snapshot::current_tables_snapshot(
             &self.root,
             &self.tables,
@@ -4656,6 +4687,22 @@ impl LocalSobjMetadataBackend {
             self.materialized_through_sequence,
             &self.table_snapshot_fingerprint,
             &self.read_snapshot_cache,
+        )
+    }
+
+    pub(crate) fn cached_table_generation(
+        &self,
+    ) -> (
+        u64,
+        u64,
+        Option<MetadataTableSnapshotFingerprint>,
+        Option<DfsMetadataPrefixProof>,
+    ) {
+        (
+            self.table_log_offset,
+            self.materialized_through_sequence,
+            self.table_snapshot_fingerprint.clone(),
+            self.prefix_proof.clone(),
         )
     }
 
@@ -4983,6 +5030,19 @@ impl LocalSobjMetadataBackend {
 }
 
 impl DfsMetadataBackend for LocalSobjMetadataBackend {
+    fn begin_consistent_read_snapshot(&mut self) -> Result<()> {
+        if self.consistent_read_snapshot_depth == 0 {
+            let _lock = self.metadata_write_lock()?;
+            self.refresh_after_metadata_write_lock()?;
+        }
+        self.consistent_read_snapshot_depth = self.consistent_read_snapshot_depth.saturating_add(1);
+        Ok(())
+    }
+
+    fn end_consistent_read_snapshot(&mut self) {
+        self.consistent_read_snapshot_depth = self.consistent_read_snapshot_depth.saturating_sub(1);
+    }
+
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry> {
         let _lock = self.begin_metadata_write()?;
         self.write_journal_entry_and_apply_table_ops_unlocked(
@@ -6996,6 +7056,18 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         Ok(write_intents_page_from_tables(&tables, after, max_entries))
     }
 
+    fn write_intents_on_shard_page(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after: Option<&DfsWriteIntentScanCursor>,
+        max_entries: usize,
+    ) -> Result<Option<DfsWriteIntentScanPage>> {
+        if shard_id != &self.shard_id {
+            return Ok(None);
+        }
+        self.write_intents_page(after, max_entries).map(Some)
+    }
+
     fn commit_visible_version(
         &mut self,
         expected_version: &DfsVersion,
@@ -7515,6 +7587,16 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     ) -> Result<Option<DfsNamespacePrepareRecord>> {
         let tables = self.current_tables_snapshot()?;
         Ok(tables.namespace_prepares.get(operation_id).cloned())
+    }
+
+    fn list_prepared_namespace_prepares(&self) -> Result<Vec<DfsNamespacePrepareRecord>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables
+            .namespace_prepares
+            .values()
+            .filter(|prepare| prepare.status == DfsNamespacePrepareStatus::Prepared)
+            .cloned()
+            .collect())
     }
 
     fn tombstone_compaction_projection(
@@ -15097,6 +15179,59 @@ mod tests {
             "sequential external reads should reuse the cached table allocation"
         );
         assert!(second_offset > first_offset);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_consistent_read_snapshot_polls_once_and_resumes_external_freshness() {
+        let root = temp_root("local_backend_consistent_read_snapshot");
+        let mut writer =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("writer backend");
+        writer.put_file_system(&file_system()).expect("filesystem");
+        let mut reader =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("reader backend");
+
+        reader
+            .begin_consistent_read_snapshot()
+            .expect("pin consistent read snapshot");
+        crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+        for _ in 0..128 {
+            assert_eq!(
+                reader.get_object(&object_id()).expect("pinned lookup"),
+                None
+            );
+        }
+        assert_eq!(
+            crate::metadata_read_snapshot::metadata_durable_table_probes(),
+            0,
+            "bulk reads inside one coherent snapshot must not poll durable table files per record"
+        );
+
+        let external = object(version("version_external"));
+        writer.put_object(&external).expect("external object");
+        assert_eq!(
+            reader
+                .get_object(&external.object_id)
+                .expect("pinned external lookup"),
+            None,
+            "the bounded read scope must retain its coherent starting generation"
+        );
+        crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+        reader.end_consistent_read_snapshot();
+        assert_eq!(
+            reader
+                .get_object(&external.object_id)
+                .expect("fresh external lookup"),
+            Some(external),
+            "ordinary cross-process freshness checks must resume after hydration"
+        );
+        assert_eq!(
+            crate::metadata_read_snapshot::metadata_durable_table_probes(),
+            1
+        );
 
         cleanup(&root);
     }

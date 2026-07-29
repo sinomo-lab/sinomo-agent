@@ -10,11 +10,47 @@ use sinomo_core::DfsWriteReceipt;
 use sinomo_core::events::EventId;
 use time::OffsetDateTime;
 
-use crate::metadata_pages::{try_walk_metadata_pages, walk_metadata_pages};
 use crate::transfer::PendingNetworkedWrite;
 use crate::*;
 
 type HydrationReceiptsByVersion = BTreeMap<(DfsObjectId, DfsVersion), Vec<DfsReplicaReceiptRecord>>;
+
+#[cfg(test)]
+thread_local! {
+    static FULL_METADATA_HYDRATION_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_full_metadata_hydration_calls() {
+    FULL_METADATA_HYDRATION_CALLS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn full_metadata_hydration_calls() -> usize {
+    FULL_METADATA_HYDRATION_CALLS.get()
+}
+
+fn hydration_never_cancelled() -> bool {
+    false
+}
+
+fn try_walk_metadata_pages_until_cancelled<C, E>(
+    should_cancel: &(dyn Fn() -> bool + Sync),
+    mut fetch_page: impl FnMut(Option<&C>) -> std::result::Result<Option<C>, E>,
+) -> std::result::Result<bool, E> {
+    let mut cursor = None;
+    loop {
+        if should_cancel() {
+            return Ok(false);
+        }
+        let next_cursor = fetch_page(cursor.as_ref())?;
+        let Some(next_cursor) = next_cursor else {
+            return Ok(!should_cancel());
+        };
+        cursor = Some(next_cursor);
+    }
+}
 
 fn durable_path_object_fences_replayed_create(
     durable_path_object: &DfsObjectMetadata,
@@ -48,12 +84,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn rebuild_cross_shard_namespace_locks(&mut self) -> Result<(), DfsError> {
+        let completed =
+            self.rebuild_cross_shard_namespace_locks_until_cancelled(&hydration_never_cancelled)?;
+        debug_assert!(
+            completed,
+            "non-cancellable DFS namespace-lock hydration was cancelled"
+        );
+        Ok(())
+    }
+
+    fn rebuild_cross_shard_namespace_locks_until_cancelled(
+        &mut self,
+        should_cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<bool, DfsError> {
         self.cross_shard_namespace_locks.clear();
         let Some(backend) = self.metadata_backend.as_ref() else {
-            return Ok(());
+            return Ok(true);
         };
         let mut locks = Vec::new();
-        walk_metadata_pages(|cursor| {
+        if !try_walk_metadata_pages_until_cancelled(should_cancel, |cursor| {
             let page =
                 backend.list_namespace_jobs_page(cursor, DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE)?;
             for job in page.jobs {
@@ -68,12 +117,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     locks.push((job.file_system_id.clone(), job.root_path.clone()));
                 }
             }
-            Ok(page.next_cursor)
-        })?;
+            Ok::<_, DfsError>(page.next_cursor)
+        })? {
+            return Ok(false);
+        }
         for (file_system_id, path) in locks {
+            if should_cancel() {
+                return Ok(false);
+            }
             self.lock_cross_shard_namespace_path(&file_system_id, &path);
         }
-        Ok(())
+        Ok(!should_cancel())
     }
 
     fn apply_cross_shard_namespace_job_guard(&mut self, job: &DfsNamespaceJobRecord) {
@@ -93,7 +147,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn hydrate_from_metadata_backend(&mut self) -> Result<(), DfsError> {
-        self.hydrate_from_metadata_backend_with_promotion_recovery(false)
+        let completed = self
+            .hydrate_from_metadata_backend_with_promotion_recovery_until_cancelled(
+                false,
+                &hydration_never_cancelled,
+            )?;
+        debug_assert!(completed, "non-cancellable DFS hydration was cancelled");
+        Ok(())
     }
 
     /// Hydrate durable service state and reconstruct post-response replica
@@ -107,22 +167,71 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn hydrate_from_metadata_backend_for_commit_promotion_recovery(
         &mut self,
     ) -> Result<(), DfsError> {
-        self.hydrate_from_metadata_backend_with_promotion_recovery(true)
+        let completed = self
+            .hydrate_from_metadata_backend_with_promotion_recovery_until_cancelled(
+                true,
+                &hydration_never_cancelled,
+            )?;
+        debug_assert!(
+            completed,
+            "non-cancellable DFS recovery hydration was cancelled"
+        );
+        Ok(())
     }
 
-    fn hydrate_from_metadata_backend_with_promotion_recovery(
+    pub(crate) fn hydrate_from_metadata_backend_for_commit_promotion_recovery_until_cancelled(
+        &mut self,
+        should_cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<bool, DfsError> {
+        self.hydrate_from_metadata_backend_with_promotion_recovery_until_cancelled(
+            true,
+            should_cancel,
+        )
+    }
+
+    fn hydrate_from_metadata_backend_with_promotion_recovery_until_cancelled(
         &mut self,
         reconstruct_commit_promotions: bool,
-    ) -> Result<(), DfsError> {
+        should_cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<bool, DfsError> {
         if self.metadata_backend.is_none() {
-            return Ok(());
-        };
+            return Ok(true);
+        }
+        if should_cancel() {
+            return Ok(false);
+        }
+        self.metadata_backend
+            .as_deref_mut()
+            .expect("metadata backend checked above")
+            .begin_consistent_read_snapshot()?;
+        let result = self
+            .hydrate_from_consistent_metadata_snapshot_with_promotion_recovery_until_cancelled(
+                reconstruct_commit_promotions,
+                should_cancel,
+            );
+        self.metadata_backend
+            .as_deref_mut()
+            .expect("metadata backend remains installed during hydration")
+            .end_consistent_read_snapshot();
+        result
+    }
+
+    fn hydrate_from_consistent_metadata_snapshot_with_promotion_recovery_until_cancelled(
+        &mut self,
+        reconstruct_commit_promotions: bool,
+        should_cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<bool, DfsError> {
+        #[cfg(test)]
+        FULL_METADATA_HYDRATION_CALLS.set(FULL_METADATA_HYDRATION_CALLS.get().saturating_add(1));
 
         let file_systems = self
             .metadata_backend
             .as_ref()
             .expect("metadata backend checked above")
             .list_file_systems()?;
+        if should_cancel() {
+            return Ok(false);
+        }
 
         self.metadata = DfsMetadataStore::new();
         self.tombstones_by_metadata_path.clear();
@@ -138,9 +247,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .observe_restored_intent_counter_floor(intent_counter_floor);
         self.pending_writes.clear();
         self.pending_reads.clear();
-        self.rebuild_cross_shard_namespace_locks()?;
-
+        if !self.rebuild_cross_shard_namespace_locks_until_cancelled(should_cancel)? {
+            return Ok(false);
+        }
         for file_system in &file_systems {
+            if should_cancel() {
+                return Ok(false);
+            }
             self.metadata.add_file_system(file_system.clone());
         }
         if !self
@@ -156,10 +269,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // A certified current primary may safely rebind and finish standalone
         // prepares now; write-coupled create prepares remain gated on their
         // durable write receipts below.
-        self.recover_durable_namespace_prepares()?;
-
+        if !self.recover_durable_namespace_prepares_until_cancelled(should_cancel)? {
+            return Ok(false);
+        }
         for file_system in &file_systems {
-            try_walk_metadata_pages(|cursor| {
+            if !try_walk_metadata_pages_until_cancelled(should_cancel, |cursor| {
                 let page = self
                     .metadata_backend
                     .as_ref()
@@ -179,14 +293,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     self.metadata.add_object(object.clone())?;
                 }
                 Ok::<_, DfsError>(page.next_cursor)
-            })?;
+            })? {
+                return Ok(false);
+            }
         }
-
         // Conflicts already have a global cursor-backed index. Scanning that
         // index once avoids one empty per-object lookup (and its table refresh
         // checks) for every hydrated object. On a mount with thousands of
         // objects and no conflicts, the old N+1 path dominated startup.
-        try_walk_metadata_pages(|cursor| {
+        if !try_walk_metadata_pages_until_cancelled(should_cancel, |cursor| {
             let page = self
                 .metadata_backend
                 .as_ref()
@@ -196,15 +311,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.metadata.add_conflict(conflict);
             }
             Ok::<_, DfsError>(page.next_cursor)
-        })?;
-
+        })? {
+            return Ok(false);
+        }
         // Receipts already have a global cursor-backed index. Materialize it
         // once for restart hydration instead of doing two object/version scans
         // for every restorable intent (coordinator receipt restore followed by
         // visible-location recovery). Besides being linear, this avoids one
         // object-shard-index lookup per intent scan on sharded backends.
         let mut receipts_by_version = HydrationReceiptsByVersion::new();
-        try_walk_metadata_pages(|cursor| {
+        if !try_walk_metadata_pages_until_cancelled(should_cancel, |cursor| {
             let page = self
                 .metadata_backend
                 .as_ref()
@@ -220,12 +336,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .push(receipt);
             }
             Ok::<_, DfsError>(page.next_cursor)
-        })?;
-
-        let durable_write_intent_shards = self.durable_write_intent_shards()?;
+        })? {
+            return Ok(false);
+        }
+        let Some(durable_write_intent_shards) =
+            self.durable_write_intent_shards_until_cancelled(should_cancel)?
+        else {
+            return Ok(false);
+        };
         let mut pending_write_records = Vec::new();
         let mut recovered_commit_promotion_records = Vec::new();
-        try_walk_metadata_pages(|intent_scan_cursor| {
+        if !try_walk_metadata_pages_until_cancelled(should_cancel, |intent_scan_cursor| {
             let intent_page = self
                 .metadata_backend
                 .as_ref()
@@ -361,10 +482,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
             Ok(intent_page.next_cursor)
-        })?;
+        })? {
+            return Ok(false);
+        }
         self.coordinator.rebuild_repair_jobs_after_bulk_restore();
         if reconstruct_commit_promotions {
             for intent_record in &recovered_commit_promotion_records {
+                if should_cancel() {
+                    return Ok(false);
+                }
                 self.queue_recovered_commit_promotions(intent_record)?;
             }
         }
@@ -377,6 +503,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .collect();
         let mut recovered_commit_ready_intent_ids = Vec::new();
         for (intent_record, locally_adopted_intent) in pending_write_records {
+            if should_cancel() {
+                return Ok(false);
+            }
             if !self
                 .coordinator
                 .intent(&intent_record.intent_id)
@@ -457,10 +586,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         for intent_id in recovered_commit_ready_intent_ids {
+            if should_cancel() {
+                return Ok(false);
+            }
             self.apply_recovered_commit_ready_intent(&intent_id)?;
             self.cleanup_committed_pending_write_if_repaired(&intent_id);
         }
-
         // Request-owned namespace prepares were completed before the object
         // scan above. Any admission which crashed before it could persist a
         // prepare is now safe to resume from its exact durable operation. The
@@ -469,8 +600,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let _ = self.recover_pending_namespace_requests_bounded(
             crate::service_routed_namespace::DFS_NAMESPACE_REQUEST_RECOVERY_BATCH_LIMIT,
         )?;
+        if should_cancel() {
+            return Ok(false);
+        }
         self.seed_local_metadata_journal_cursors_from_backend()?;
-        Ok(())
+        Ok(!should_cancel())
     }
 
     /// Reconstruct post-response CommitVersion work from durable committed
@@ -1380,7 +1514,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Err(ContentStoreError::Io { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
-                Ok(None)
+                match self.content.open_blob_reader(content_hash) {
+                    Ok(reader) => Ok(Some(reader.size_bytes())),
+                    Err(ContentStoreError::Io { source, .. })
+                        if source.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        Ok(None)
+                    }
+                    Err(error) => Err(error.into()),
+                }
             }
             Err(error) => Err(error.into()),
         }

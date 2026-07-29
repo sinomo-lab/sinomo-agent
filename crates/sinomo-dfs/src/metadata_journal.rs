@@ -58,25 +58,75 @@ struct JournalSegmentFileIdentity {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(windows)]
+    volume_serial_number: Option<u32>,
+    #[cfg(windows)]
+    file_index: Option<u64>,
 }
 
 impl JournalSegmentFileIdentity {
-    fn from_metadata(metadata: &fs::Metadata) -> Self {
+    fn from_file_metadata(file: &fs::File, metadata: &fs::Metadata) -> Self {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
 
+            let _ = file;
             Self {
                 created: metadata.created().ok(),
                 device: metadata.dev(),
                 inode: metadata.ino(),
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
+            use std::mem::MaybeUninit;
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::HANDLE;
+            use windows_sys::Win32::Storage::FileSystem::{
+                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+            };
+
+            let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+            // SAFETY: `file` owns a live OS handle and `information` points to
+            // writable storage for the exact structure required by Win32.
+            let has_information = unsafe {
+                GetFileInformationByHandle(file.as_raw_handle() as HANDLE, information.as_mut_ptr())
+                    != 0
+            };
+            let information = has_information.then(|| unsafe { information.assume_init() });
+
+            Self {
+                created: metadata.created().ok(),
+                volume_serial_number: information
+                    .as_ref()
+                    .map(|information| information.dwVolumeSerialNumber),
+                file_index: information.as_ref().map(|information| {
+                    (u64::from(information.nFileIndexHigh) << 32)
+                        | u64::from(information.nFileIndexLow)
+                }),
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = file;
             Self {
                 created: metadata.created().ok(),
             }
+        }
+    }
+
+    fn supports_append_extension(&self) -> bool {
+        #[cfg(unix)]
+        {
+            true
+        }
+        #[cfg(windows)]
+        {
+            self.volume_serial_number.is_some() && self.file_index.is_some()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            false
         }
     }
 }
@@ -163,6 +213,23 @@ pub(crate) struct DfsMetadataJournalHead {
     pub(crate) next_sequence: u64,
 }
 
+/// Validated O(1) locator for the durable tail record.
+///
+/// `head.sobj` remains a deferred sequence hint and is never trusted alone.
+/// This sidecar is written only after a complete highest-segment scan. A later
+/// open may trust the head without decoding the whole segment only when the
+/// same highest segment still has the exact recorded length and the record at
+/// `record_start` decodes as the final expected sequence. Any append, segment
+/// rotation, replacement, or torn tail invalidates the locator and falls back
+/// to the bounded scan.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct DfsMetadataJournalTailHint {
+    next_sequence: u64,
+    segment_id: u64,
+    record_start: u64,
+    file_len: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub(crate) struct DfsMetadataReplayCursor {
     pub(crate) shard_id: DfsMetadataShardId,
@@ -177,16 +244,20 @@ pub(crate) fn recover_next_journal_sequence(root: &Path) -> Result<u64> {
     let head_path = journal_dir.join("head.sobj");
     let head_next_sequence =
         read_sobj_optional::<DfsMetadataJournalHead>(&head_path)?.map(|head| head.next_sequence);
-    // `head.sobj` and the local materialization cursor are deferred hints.
-    // They may agree while both lag a fully durable append, so agreement is
-    // not proof that the highest journal segment contains no later entry.
-    // Reopen is a cold path: inspect the bounded highest segment and repair
-    // the hint before admitting a sequence that could otherwise be reused.
     let mut max_sequence = head_next_sequence
         .map(|next_sequence| next_sequence.saturating_sub(1))
         .unwrap_or(0);
-
-    max_sequence = max_sequence.max(max_segmented_journal_sequence(root)?);
+    let mut segmented_tail_hint = None;
+    // `head.sobj` and the local materialization cursor are deferred hints.
+    // They may agree while both lag a fully durable append. The tail locator
+    // proves that no bytes follow the expected last record; otherwise inspect
+    // the bounded highest segment and repair both hints before admitting a
+    // sequence that could otherwise be reused.
+    if !validated_journal_tail_hint(root, head_next_sequence)? {
+        let (segmented_max_sequence, tail_hint) = max_segmented_journal_sequence(root)?;
+        max_sequence = max_sequence.max(segmented_max_sequence);
+        segmented_tail_hint = tail_hint;
+    }
     for (sequence, _, _) in legacy_journal_entry_paths_since(root, 0)? {
         max_sequence = max_sequence.max(sequence);
     }
@@ -194,6 +265,13 @@ pub(crate) fn recover_next_journal_sequence(root: &Path) -> Result<u64> {
     let next_sequence = max_sequence.saturating_add(1).max(1);
     if head_next_sequence != Some(next_sequence) {
         write_sobj_atomic(&head_path, &DfsMetadataJournalHead { next_sequence })?;
+    }
+    if let Some(tail_hint) = segmented_tail_hint
+        && tail_hint.next_sequence == next_sequence
+    {
+        // The locator is a derived optimization, not a durability boundary.
+        // A failed write only makes the next open repeat the bounded scan.
+        let _ = write_sobj_atomic(&journal_tail_hint_path(root), &tail_hint);
     }
     Ok(next_sequence)
 }
@@ -203,14 +281,14 @@ pub(crate) fn read_next_journal_sequence_lenient(root: &Path) -> Result<u64> {
         return Ok(next_sequence.max(1));
     }
 
-    let mut max_sequence = max_segmented_journal_sequence(root)?;
+    let (mut max_sequence, _) = max_segmented_journal_sequence(root)?;
     for (sequence, _, _) in legacy_journal_entry_paths_since(root, 0)? {
         max_sequence = max_sequence.max(sequence);
     }
     Ok(max_sequence.saturating_add(1).max(1))
 }
 
-fn highest_segmented_journal_path(root: &Path) -> Result<Option<PathBuf>> {
+fn highest_segmented_journal_path(root: &Path) -> Result<Option<(u64, PathBuf)>> {
     let segments_dir = root.join("journal").join("segments");
     if !segments_dir.exists() {
         return Ok(None);
@@ -234,7 +312,7 @@ fn highest_segmented_journal_path(root: &Path) -> Result<Option<PathBuf>> {
             highest = Some((segment_id, path));
         }
     }
-    Ok(highest.map(|(_, path)| path))
+    Ok(highest)
 }
 
 fn journal_head_next_sequence(root: &Path) -> Result<Option<u64>> {
@@ -244,15 +322,85 @@ fn journal_head_next_sequence(root: &Path) -> Result<Option<u64>> {
     )
 }
 
-fn max_segmented_journal_sequence(root: &Path) -> Result<u64> {
-    let Some(path) = highest_segmented_journal_path(root)? else {
-        return Ok(0);
+fn journal_tail_hint_path(root: &Path) -> PathBuf {
+    root.join("journal").join("tail.sobj")
+}
+
+fn validated_journal_tail_hint(root: &Path, head_next_sequence: Option<u64>) -> Result<bool> {
+    let Some(head_next_sequence) = head_next_sequence.filter(|sequence| *sequence > 1) else {
+        return Ok(false);
+    };
+    let Some(hint) =
+        read_sobj_optional::<DfsMetadataJournalTailHint>(&journal_tail_hint_path(root))
+            .unwrap_or(None)
+    else {
+        return Ok(false);
+    };
+    if hint.next_sequence != head_next_sequence
+        || hint.file_len <= hint.record_start
+        || journal_segment_id(head_next_sequence.saturating_sub(1)) != hint.segment_id
+    {
+        return Ok(false);
+    }
+    let Some((segment_id, path)) = highest_segmented_journal_path(root)? else {
+        return Ok(false);
+    };
+    if segment_id != hint.segment_id {
+        return Ok(false);
+    }
+    let mut file = fs::File::open(&path).map_err(|source| MetadataBackendError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let file_len = file
+        .metadata()
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.clone(),
+            source,
+        })?
+        .len();
+    if file_len != hint.file_len {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(hint.record_start))
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    let Some(entry) = read_next_segmented_journal_entry(&mut file, &path)? else {
+        return Ok(false);
+    };
+    let record_end = file
+        .stream_position()
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    Ok(record_end == hint.file_len && entry.sequence.saturating_add(1) == head_next_sequence)
+}
+
+fn max_segmented_journal_sequence(
+    root: &Path,
+) -> Result<(u64, Option<DfsMetadataJournalTailHint>)> {
+    let Some((segment_id, path)) = highest_segmented_journal_path(root)? else {
+        return Ok((0, None));
     };
     let mut max_sequence = 0;
     for entry in read_segmented_journal_file_since_limited(&path, 0, usize::MAX)? {
         max_sequence = max_sequence.max(entry.sequence);
     }
-    Ok(max_sequence)
+    let tail_hint = cached_journal_segment_index(&path).and_then(|index| {
+        let tail = index.entries.last()?;
+        (tail.sequence == max_sequence && index.indexed_bytes == index.observed_file_len).then_some(
+            DfsMetadataJournalTailHint {
+                next_sequence: max_sequence.saturating_add(1).max(1),
+                segment_id,
+                record_start: tail.record_start,
+                file_len: index.observed_file_len,
+            },
+        )
+    });
+    Ok((max_sequence, tail_hint))
 }
 
 pub(crate) fn append_segmented_journal_entry(
@@ -792,7 +940,7 @@ pub(crate) fn read_segmented_journal_file_since_limited(
         source,
     })?;
     let file_bytes = metadata.len();
-    let identity = JournalSegmentFileIdentity::from_metadata(&metadata);
+    let identity = JournalSegmentFileIdentity::from_file_metadata(&file, &metadata);
     let modified = metadata.modified().ok();
     let cached = cached_journal_segment_index(path);
     let cache_hit = cached.as_ref().is_some_and(|cached| {
@@ -801,8 +949,12 @@ pub(crate) fn read_segmented_journal_file_since_limited(
             && cached.modified == modified
     });
     let can_extend = cached.as_ref().is_some_and(|cached| {
+        // Unix inode/device and Windows volume/file-index pairs survive an
+        // append while distinguishing replacement files. Other platforms only
+        // expose the weaker creation timestamp, so retain the mtime fence
+        // there instead of extending a possibly stale offset index.
         cached.identity == identity
-            && (cfg!(unix) || cached.modified == modified)
+            && (cached.identity.supports_append_extension() || cached.modified == modified)
             && cached.indexed_bytes == cached.observed_file_len
             && file_bytes > cached.observed_file_len
     });
@@ -1088,6 +1240,49 @@ mod tests {
                 file_system: None,
             },
         }
+    }
+
+    #[test]
+    fn recovered_tail_hint_skips_unchanged_highest_segment_scan() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-journal-tail-hint");
+        for sequence in 1..=128 {
+            append_segmented_journal_entry(root.path(), &test_journal_entry(sequence))
+                .expect("append journal entry");
+        }
+
+        reset_journal_segment_index_cache();
+        reset_metadata_journal_decoded_records();
+        assert_eq!(
+            recover_next_journal_sequence(root.path()).expect("recover initial tail"),
+            129
+        );
+        assert_eq!(metadata_journal_decoded_records(), 128);
+        assert!(journal_tail_hint_path(root.path()).is_file());
+
+        reset_journal_segment_index_cache();
+        reset_metadata_journal_decoded_records();
+        assert_eq!(
+            recover_next_journal_sequence(root.path()).expect("recover validated tail"),
+            129
+        );
+        assert_eq!(
+            metadata_journal_decoded_records(),
+            0,
+            "an unchanged durable tail must be validated from its final record"
+        );
+
+        append_segmented_journal_entry(root.path(), &test_journal_entry(129))
+            .expect("append beyond validated tail");
+        reset_journal_segment_index_cache();
+        reset_metadata_journal_decoded_records();
+        assert_eq!(
+            recover_next_journal_sequence(root.path()).expect("recover appended tail"),
+            130
+        );
+        assert!(
+            metadata_journal_decoded_records() > 0,
+            "a changed segment length must invalidate the tail hint"
+        );
     }
 
     fn journal_batch_for_prefix(

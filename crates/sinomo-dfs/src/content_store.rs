@@ -3063,8 +3063,20 @@ impl LocalContentStore {
                 ),
             });
         }
+        self.manifest_storage_candidate_available(&manifest)
+    }
+
+    /// Checks whether a validated manifest has addressable storage of the
+    /// expected size without reading or hashing its payload bytes.
+    ///
+    /// This is suitable for bounded anti-entropy availability scans. Content
+    /// consumers and explicit scrubs still perform end-to-end hash validation.
+    pub(crate) fn manifest_storage_candidate_available(
+        &self,
+        manifest: &ContentManifest,
+    ) -> Result<bool> {
         if manifest.extents.is_empty() {
-            return match self.open_blob_stream(expected_hash) {
+            return match self.open_blob_stream(&manifest.content_hash) {
                 Ok(reader) => Ok(reader.size_bytes() == manifest.size_bytes),
                 Err(error) if content_error_is_not_found(&error) => Ok(false),
                 Err(error) => Err(error),
@@ -7793,6 +7805,33 @@ mod tests {
                     &patched.content_hash,
                 )
                 .expect("object-version candidate")
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn manifest_storage_candidate_probe_does_not_hash_payload_bytes() {
+        let root = temp_root("manifest_storage_candidate_non_hashing");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let bytes = vec![0x2a; PACKED_BLOB_SMALL_LIMIT_BYTES as usize + 1];
+        let manifest = store
+            .put_object_version("object-candidate", "v1", &bytes)
+            .expect("put object version");
+        let blob_path = store.blob_path(&manifest.content_hash).expect("blob path");
+        std::fs::write(&blob_path, vec![0x5a; bytes.len()]).expect("corrupt same-size blob");
+
+        assert!(
+            store
+                .manifest_storage_candidate_available(&manifest)
+                .expect("candidate probe"),
+            "the bounded availability probe should check addressability and size only"
+        );
+        assert!(
+            !store
+                .manifest_content_available(&manifest)
+                .expect("full verification"),
+            "the explicit integrity probe should still detect the corrupted bytes"
         );
 
         cleanup(&root);

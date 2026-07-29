@@ -17,6 +17,7 @@ use crate::{
     InteractionSession, SkillCatalog, TaskId, agent_output_contract, parse_agent_loop_response,
     render_agent_package_system_prompt, render_agent_system_prompt_with_descriptors,
 };
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sinomo_lm::{
     LanguageModelCustomToolFormat, LanguageModelCustomToolSpec, LanguageModelErrorCategory,
@@ -49,6 +50,8 @@ const CONTEXT_ESTIMATE_BYTES_PER_TOKEN: usize = 4;
 const DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS: usize = 32 * 1024;
 const DEFAULT_RETRIEVED_MEMORY_RECORDS: usize = 8;
 const DEFAULT_RETRIEVED_MEMORY_BYTES: usize = 16 * 1024;
+const DEFAULT_SKILL_RESOURCE_BYTES: usize = 256 * 1024;
+const MAX_SKILL_RESOURCE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -1242,10 +1245,27 @@ pub struct TurnContext {
     pub async_update: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_tool_specs: Vec<AgentToolDescriptor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_skills: Vec<AvailableAgentSkill>,
     pub budget_estimate: ContextBudgetEstimate,
     pub report: ContextAssemblyReport,
     pub context_frame: ContextFrame,
     pub context_delta: ContextDelta,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AvailableAgentSkill {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ExplicitAgentSkillContext {
+    pub name: String,
+    pub description: String,
+    pub instructions: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1332,6 +1352,7 @@ pub enum ContextBlockKind {
     SystemInstructions,
     ToolSchemas,
     ToolSurface,
+    AvailableSkills,
     WorkspaceFacts,
     InstructionFile,
     PromptReference,
@@ -2086,6 +2107,7 @@ fn context_block_source_kind(kind: &ContextBlockKind) -> &'static str {
         ContextBlockKind::SystemInstructions => "system_instructions",
         ContextBlockKind::ToolSchemas => "tool_schemas",
         ContextBlockKind::ToolSurface => "agent_tool_surface",
+        ContextBlockKind::AvailableSkills => "available_skills",
         ContextBlockKind::WorkspaceFacts => "workspace_facts",
         ContextBlockKind::InstructionFile => "instruction_file",
         ContextBlockKind::PromptReference => "prompt_reference",
@@ -2899,6 +2921,7 @@ impl ContextAssembler {
             memory_evidence_bundle: None,
             async_update,
             available_tool_specs: tool_descriptors,
+            available_skills: Vec::new(),
             budget_estimate,
             report,
             context_frame,
@@ -4451,6 +4474,8 @@ pub struct AgentConfig {
     pub skill_catalog: SkillCatalog,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub skill_catalog_texts: BTreeMap<String, String>,
+    #[serde(skip)]
+    pub skill_catalog_resources: BTreeMap<String, Vec<crate::AgentSkillPackageFile>>,
     #[serde(default = "default_workspace_instruction_files")]
     pub workspace_instruction_files: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4500,6 +4525,7 @@ impl AgentConfig {
             module_tool_projection: AgentModuleToolProjection::default(),
             skill_catalog: SkillCatalog::default(),
             skill_catalog_texts: BTreeMap::new(),
+            skill_catalog_resources: BTreeMap::new(),
             workspace_instruction_files: default_workspace_instruction_files(),
             instruction_file_max_bytes: Some(DEFAULT_WORKSPACE_INSTRUCTION_FILE_BYTES),
             expand_prompt_references: default_expand_prompt_references(),
@@ -4656,6 +4682,14 @@ impl AgentConfig {
         texts: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
         self.skill_catalog_texts = texts.into_iter().collect();
+        self
+    }
+
+    pub fn with_skill_catalog_resources(
+        mut self,
+        resources: impl IntoIterator<Item = (String, Vec<crate::AgentSkillPackageFile>)>,
+    ) -> Self {
+        self.skill_catalog_resources = resources.into_iter().collect();
         self
     }
 
@@ -6248,6 +6282,13 @@ where
         Ok(self.lock_state()?.control.session.clone())
     }
 
+    pub fn load_explicit_skill_context(
+        &self,
+        skill_id: &str,
+    ) -> Result<ExplicitAgentSkillContext, AgentError> {
+        self.agent.load_explicit_skill_context(skill_id)
+    }
+
     pub fn replace_session(&self, session: AgentSession) -> Result<(), AgentError> {
         self.reap_finished_worker()?;
         let mut state = self.lock_state()?;
@@ -7502,34 +7543,188 @@ impl<'a> AgentToolOrchestrator<'a> {
                 serde_json::json!({ "error": "unknown_skill", "skill": skill_id }),
             );
         };
+        let Some(markdown) = skill.embedded_text.as_deref() else {
+            let activation = skill_activation_metadata(skill);
+            let output = serde_json::json!({
+                "error": "skill_content_unavailable",
+                "skill": skill.id,
+                "activation": activation,
+                "reason": "the skill descriptor does not include readable SKILL.md content",
+            });
+            let evidence = AgentToolEvidence::availability_only(
+                false,
+                "skill activation requires readable SKILL.md content",
+            )
+            .with_output_value(&output, false)
+            .with_record_value(
+                "skill_disclosure",
+                serde_json::json!({
+                    "operation": "activate",
+                    "skill": skill.id,
+                    "available": false,
+                    "mode": "dedicated_tool",
+                }),
+            )
+            .with_record_value(
+                AGENT_SKILL_USAGE_EVIDENCE_KIND,
+                serde_json::json!({
+                    "operation": "activate",
+                    "skill": skill.id,
+                    "available": false,
+                    "mode": "dedicated_tool",
+                }),
+            );
+            return AgentToolOutcome {
+                call_id: TaskId::generate(),
+                step_index,
+                call_index,
+                call: call.clone(),
+                status: AgentToolStatus::Blocked,
+                summary: format!("skill `{}` has no readable SKILL.md content", skill.id),
+                output,
+                event_id: None,
+                evidence,
+            };
+        };
+        let document = match crate::parse_skill_markdown(markdown) {
+            Ok(document) if document.name() == skill.id => document,
+            Ok(document) => {
+                return bridge_failed_outcome(
+                    session,
+                    step_index,
+                    call_index,
+                    call,
+                    format!(
+                        "skill descriptor `{}` does not match SKILL.md name `{}`",
+                        skill.id,
+                        document.name()
+                    ),
+                    serde_json::json!({
+                        "error": "skill_name_mismatch",
+                        "skill": skill.id,
+                        "frontmatter_name": document.name(),
+                    }),
+                );
+            }
+            Err(error) => {
+                return bridge_failed_outcome(
+                    session,
+                    step_index,
+                    call_index,
+                    call,
+                    format!(
+                        "skill `{}` is not a valid Agent Skills package: {error}",
+                        skill.id
+                    ),
+                    serde_json::json!({
+                        "error": "invalid_agent_skill",
+                        "skill": skill.id,
+                        "detail": error.to_string(),
+                    }),
+                );
+            }
+        };
+        if document.description() != skill.description {
+            return bridge_failed_outcome(
+                session,
+                step_index,
+                call_index,
+                call,
+                format!(
+                    "skill descriptor `{}` description does not match SKILL.md frontmatter",
+                    skill.id
+                ),
+                serde_json::json!({
+                    "error": "skill_description_mismatch",
+                    "skill": skill.id,
+                }),
+            );
+        }
         let activation = skill_activation_metadata(skill);
-        let output = serde_json::json!({
-            "error": "skill_activation_unavailable",
-            "skill": skill.id,
-            "activation": activation,
-            "reason": "generic skill activation is host/runtime-owned; attach a host runtime activation executor before activating skills",
-        });
+        let requested_resource = json_input_string(call, "resource");
+        let output = if let Some(resource_path) = requested_resource.as_deref() {
+            let Some(bytes) = skill.resource_contents.get(resource_path) else {
+                return bridge_failed_outcome(
+                    session,
+                    step_index,
+                    call_index,
+                    call,
+                    format!(
+                        "skill `{}` does not contain readable resource `{resource_path}`",
+                        skill.id
+                    ),
+                    serde_json::json!({
+                        "error": "unknown_skill_resource",
+                        "skill": skill.id,
+                        "resource": resource_path,
+                        "available_resources": &skill.resource_paths,
+                    }),
+                );
+            };
+            let max_bytes = json_input_usize(call, "max_bytes")
+                .unwrap_or(DEFAULT_SKILL_RESOURCE_BYTES)
+                .min(MAX_SKILL_RESOURCE_BYTES);
+            let truncated = bytes.len() > max_bytes;
+            let visible = &bytes[..bytes.len().min(max_bytes)];
+            let (encoding, content) = match std::str::from_utf8(visible) {
+                Ok(text) => ("utf-8", text.to_string()),
+                Err(_) => (
+                    "base64",
+                    base64::engine::general_purpose::STANDARD.encode(visible),
+                ),
+            };
+            serde_json::json!({
+                "skill": skill.id,
+                "activation": activation,
+                "resource_content": {
+                    "path": resource_path,
+                    "byte_len": bytes.len(),
+                    "content_bytes": visible.len(),
+                    "truncated": truncated,
+                    "encoding": encoding,
+                    "content": content,
+                },
+            })
+        } else {
+            serde_json::json!({
+                "skill": skill.id,
+                "activation": activation,
+                "skill_content": {
+                    "name": skill.id,
+                    "instructions": document.body,
+                    "skill_directory": skill.path.as_deref().map(std::path::Path::new).and_then(std::path::Path::parent).map(|path| path.display().to_string()),
+                    "resources": &skill.resource_paths,
+                },
+            })
+        };
+        let operation = if requested_resource.is_some() {
+            "resource_read"
+        } else {
+            "activate"
+        };
         let evidence = AgentToolEvidence::availability_only(
-            false,
-            "skill activation requires a host runtime activation executor",
+            true,
+            "loaded Agent Skills instructions through the dedicated activation tool",
         )
         .with_output_value(&output, false)
         .with_record_value(
             "skill_disclosure",
             serde_json::json!({
-                "operation": "activate",
+                "operation": operation,
                 "skill": skill.id,
-                "available": false,
-                "mode": "host_runtime",
+                "resource": requested_resource,
+                "available": true,
+                "mode": "dedicated_tool",
             }),
         )
         .with_record_value(
             AGENT_SKILL_USAGE_EVIDENCE_KIND,
             serde_json::json!({
-                "operation": "activate",
+                "operation": operation,
                 "skill": skill.id,
-                "available": false,
-                "mode": "host_runtime",
+                "resource": requested_resource,
+                "available": true,
+                "mode": "dedicated_tool",
             }),
         );
         AgentToolOutcome {
@@ -7537,10 +7732,10 @@ impl<'a> AgentToolOrchestrator<'a> {
             step_index,
             call_index,
             call: call.clone(),
-            status: AgentToolStatus::Blocked,
-            summary: format!(
-                "skill `{}` activation requires a host runtime activation executor",
-                skill.id
+            status: AgentToolStatus::Succeeded,
+            summary: requested_resource.map_or_else(
+                || format!("activated skill `{}`", skill.id),
+                |resource| format!("read skill `{}` resource `{resource}`", skill.id),
             ),
             output,
             event_id: None,
@@ -7560,11 +7755,17 @@ impl<'a> AgentToolOrchestrator<'a> {
             .skill_plan
             .matching(query.as_deref())
             .into_iter()
+            .filter(|skill| standard_skill_document(skill).is_some())
             .take(max_results)
             .map(|skill| {
                 serde_json::json!({
                     "id": &skill.id,
                     "description": &skill.description,
+                    "license": &skill.license,
+                    "compatibility": &skill.compatibility,
+                    "allowed_tools": &skill.allowed_tools,
+                    "metadata": &skill.metadata,
+                    "resources": &skill.resource_paths,
                     "source": &skill.source,
                     "package_declared": skill.package_declared,
                     "module_id": &skill.module_id,
@@ -7649,9 +7850,22 @@ impl<'a> AgentToolOrchestrator<'a> {
                 serde_json::json!({ "error": "unknown_skill", "skill": skill_id }),
             );
         };
+        if standard_skill_document(skill).is_none() {
+            return bridge_failed_outcome(
+                session,
+                step_index,
+                call_index,
+                call,
+                format!("skill `{skill_id}` has no valid Agent Skills package"),
+                serde_json::json!({
+                    "error": "invalid_agent_skill",
+                    "skill": skill_id,
+                }),
+            );
+        }
         let output = serde_json::json!({
             "skill": skill_id,
-            "descriptor": skill,
+            "descriptor": skill_descriptor_metadata(skill),
             "activation": skill_activation_metadata(skill),
         });
         let evidence = AgentToolEvidence::availability_only(true, "inspected planned agent skill")
@@ -7959,13 +8173,45 @@ impl<'a> AgentToolOrchestrator<'a> {
     }
 }
 
-fn skill_activation_metadata(skill: &AgentSkillDescriptor) -> serde_json::Value {
+fn skill_descriptor_metadata(skill: &AgentSkillDescriptor) -> serde_json::Value {
     serde_json::json!({
-        "mode": "host_runtime",
-        "available": false,
-        "reason": "generic skill activation is host/runtime-owned; use skill_describe for descriptor text and a host-provided activation surface when one is attached",
+        "id": &skill.id,
+        "description": &skill.description,
+        "license": &skill.license,
+        "compatibility": &skill.compatibility,
+        "allowed_tools": &skill.allowed_tools,
+        "metadata": &skill.metadata,
+        "resources": &skill.resource_paths,
+        "source": &skill.source,
+        "package_declared": skill.package_declared,
+        "module_id": &skill.module_id,
+        "module_version": &skill.module_version,
+        "path": &skill.path,
+        "target_agents": &skill.target_agents,
+        "model_families": &skill.model_families,
         "activation_tags": &skill.activation_tags,
         "required_capabilities": &skill.required_capabilities,
+        "catalog_version": &skill.catalog_version,
+        "catalog_content_hash": &skill.catalog_content_hash,
+        "catalog_base_hash": &skill.catalog_base_hash,
+        "catalog_status": &skill.catalog_status,
+        "catalog_manifest_path": &skill.catalog_manifest_path,
+        "has_skill_content": skill.embedded_text.is_some(),
+    })
+}
+
+fn skill_activation_metadata(skill: &AgentSkillDescriptor) -> serde_json::Value {
+    serde_json::json!({
+        "mode": "dedicated_tool",
+        "available": skill.embedded_text.is_some(),
+        "reason": if skill.embedded_text.is_some() {
+            "skill_activate loads the SKILL.md instructions and lists bundled resources"
+        } else {
+            "the descriptor does not include readable SKILL.md content"
+        },
+        "activation_tags": &skill.activation_tags,
+        "required_capabilities": &skill.required_capabilities,
+        "allowed_tools": &skill.allowed_tools,
     })
 }
 
@@ -8187,6 +8433,32 @@ impl<M: InteractionModel> Agent<M> {
 
     pub fn tool_registry(&self) -> AgentToolRegistry {
         self.tools.clone()
+    }
+
+    pub fn load_explicit_skill_context(
+        &self,
+        skill_id: &str,
+    ) -> Result<ExplicitAgentSkillContext, AgentError> {
+        let skill_plan = self.skill_plan();
+        let skill = skill_plan
+            .get(skill_id)
+            .ok_or_else(|| AgentError::Runtime {
+                detail: format!(
+                    "skill `{skill_id}` is not available to agent `{}`",
+                    self.config.definition.key()
+                ),
+            })?;
+        let document = standard_skill_document(skill).ok_or_else(|| AgentError::Runtime {
+            detail: format!(
+                "skill `{skill_id}` does not include a valid readable SKILL.md matching its descriptor"
+            ),
+        })?;
+        Ok(ExplicitAgentSkillContext {
+            name: skill.id.clone(),
+            description: skill.description.clone(),
+            instructions: document.body,
+            resources: skill.resource_paths.clone(),
+        })
     }
 
     pub fn register_tool<T: AgentTool + 'static>(&self, tool: T) -> Option<AgentToolDescriptor> {
@@ -9685,6 +9957,9 @@ impl<M: InteractionModel> Agent<M> {
         step_index: usize,
     ) -> Result<TurnContext, AgentError> {
         let tool_plan = self.tool_plan(input);
+        let skill_plan = self.skill_plan();
+        let available_skills = standard_available_skills(&skill_plan);
+        let has_available_skills = !available_skills.is_empty();
         let readiness_issues = tool_plan.readiness_issues();
         let unready_visible_tools = readiness_issues
             .iter()
@@ -9695,6 +9970,13 @@ impl<M: InteractionModel> Agent<M> {
                 .model_visible_descriptors()
                 .into_iter()
                 .filter(|descriptor| !unready_visible_tools.contains(descriptor.spec.name.as_str()))
+                .filter(|descriptor| {
+                    has_available_skills
+                        || !matches!(
+                            descriptor.spec.name.as_str(),
+                            "skill_search" | "skill_describe" | "skill_activate"
+                        )
+                })
                 .collect(),
             AgentOutputFormat::Text => Vec::new(),
         };
@@ -9710,6 +9992,44 @@ impl<M: InteractionModel> Agent<M> {
             tool_descriptors,
             step_index,
         )?;
+        context.available_skills = available_skills;
+        if !context.available_skills.is_empty() {
+            let skill_catalog_bytes = serde_json::to_vec(&context.available_skills)
+                .map(|bytes| bytes.len())
+                .unwrap_or_default();
+            context.report.included.push(ContextSource {
+                kind: "available_skills".to_string(),
+                label: format!("{} Agent Skills", context.available_skills.len()),
+                bytes: skill_catalog_bytes,
+            });
+            context.budget_estimate.lanes.push(ContextBudgetLane {
+                kind: "fixed_prompt".to_string(),
+                label: "Agent Skills discovery catalog".to_string(),
+                bytes: skill_catalog_bytes,
+                priority: 0,
+            });
+            context.budget_estimate.total_bytes += skill_catalog_bytes;
+            let skill_catalog_block = context_block(
+                ContextBlockKind::AvailableSkills,
+                format!("agent/skills/{}", self.config.definition.key()),
+                format!("{} Agent Skills", context.available_skills.len()),
+                0,
+                ContextCachePolicy::StablePrefix,
+                serde_json::to_value(&context.available_skills).unwrap_or(serde_json::Value::Null),
+            );
+            let insertion_index = context
+                .context_frame
+                .blocks
+                .iter()
+                .position(|block| block.kind == ContextBlockKind::ToolSchemas)
+                .map(|index| index.saturating_add(1))
+                .unwrap_or(1)
+                .min(context.context_frame.blocks.len());
+            context
+                .context_frame
+                .blocks
+                .insert(insertion_index, skill_catalog_block);
+        }
         let policy_bytes = serde_json::to_vec(&self.tool_surface)
             .map(|bytes| bytes.len())
             .unwrap_or_default();
@@ -9891,12 +10211,16 @@ impl<M: InteractionModel> Agent<M> {
             .active_entries_for_scopes(agent_keys.iter().map(String::as_str))
             .into_iter()
             .map(|entry| {
-                let text = self
-                    .config
-                    .skill_catalog_texts
-                    .get(&crate::skill_catalog_entry_text_key(entry))
-                    .cloned();
-                entry.to_agent_descriptor(text)
+                let key = crate::skill_catalog_entry_text_key(entry);
+                let text = self.config.skill_catalog_texts.get(&key).cloned();
+                let mut descriptor = entry.to_agent_descriptor(text);
+                if let Some(resources) = self.config.skill_catalog_resources.get(&key) {
+                    descriptor.resource_contents = resources
+                        .iter()
+                        .map(|resource| (resource.relative_path.clone(), resource.bytes.clone()))
+                        .collect();
+                }
+                descriptor
             });
         AgentSkillPlan::from_package_modules_and_catalog(
             self.config.definition.skills.clone(),
@@ -9905,6 +10229,25 @@ impl<M: InteractionModel> Agent<M> {
             catalog_descriptors,
         )
     }
+}
+
+fn standard_available_skills(skill_plan: &AgentSkillPlan) -> Vec<AvailableAgentSkill> {
+    skill_plan
+        .skills
+        .iter()
+        .filter_map(|skill| {
+            standard_skill_document(skill).map(|_| AvailableAgentSkill {
+                name: skill.id.clone(),
+                description: skill.description.clone(),
+            })
+        })
+        .collect()
+}
+
+fn standard_skill_document(skill: &AgentSkillDescriptor) -> Option<crate::SkillMarkdownDocument> {
+    let text = skill.embedded_text.as_deref()?;
+    let document = crate::parse_skill_markdown(text).ok()?;
+    (document.name() == skill.id && document.description() == skill.description).then_some(document)
 }
 
 fn language_model_message_from_transcript_item(
@@ -10433,19 +10776,32 @@ fn render_turn_context_message(
         .collect::<Vec<_>>();
     session_context.insert("memory_evidence".to_string(), serde_json::json!(evidence));
 
+    let mut stable_prefix = serde_json::json!({
+        "runtime": {
+            "provider": turn_context.provider,
+            "model": turn_context.model,
+            "agent_output_format": turn_context.output_format,
+            "response_format": turn_context.response_format,
+            "available_tool_count": turn_context.available_tool_specs.len(),
+        },
+        "run_context": &turn_context.run_context,
+        "loaded_instruction_files": turn_context.loaded_instruction_files,
+    });
+    if !turn_context.available_skills.is_empty()
+        && let Some(object) = stable_prefix.as_object_mut()
+    {
+        object.insert(
+            "agent_skills".to_string(),
+            serde_json::json!({
+                "instructions": "When a task matches an available skill description, call skill_activate with its name before proceeding. If its instructions require a listed resource, call skill_activate again with that relative resource path and load only the resources needed.",
+                "available": turn_context.available_skills,
+            }),
+        );
+    }
+
     serde_json::to_string_pretty(&serde_json::json!({
         "kind": "turn_context",
-        "stable_prefix": {
-            "runtime": {
-                "provider": turn_context.provider,
-                "model": turn_context.model,
-                "agent_output_format": turn_context.output_format,
-                "response_format": turn_context.response_format,
-                "available_tool_count": turn_context.available_tool_specs.len(),
-            },
-            "run_context": &turn_context.run_context,
-            "loaded_instruction_files": turn_context.loaded_instruction_files,
-        },
+        "stable_prefix": stable_prefix,
         "session_context": session_context,
         "volatile_tail": {
             "step_index": turn_context.report.step_index,
@@ -14430,18 +14786,20 @@ mod tests {
             sinomo_runtime::module::ModuleSurfaces::default()
                 .with_declarative_resource(
                     sinomo_runtime::module::ModuleDeclarativeResourceExport::skill(
-                        "skill.rust.debug",
-                        "skills/rust/SKILL.md",
+                        "rust-debug",
+                        "skills/rust-debug/SKILL.md",
                     )
-                    .with_description("Debug Rust test failures.")
+                    .with_description("Debug Rust test failures. Use for failing Rust tests.")
                     .with_target_agent("coding-agent")
                     .with_activation_tag("debug")
-                    .with_embedded_text("# Rust debugging\nInspect the failing assertion first."),
+                    .with_embedded_text(
+                        "---\nname: rust-debug\ndescription: Debug Rust test failures. Use for failing Rust tests.\n---\n\n# Rust debugging\nInspect the failing assertion first.",
+                    ),
                 )
                 .with_declarative_resource(
                     sinomo_runtime::module::ModuleDeclarativeResourceExport::skill(
-                        "skill.other.agent",
-                        "skills/other/SKILL.md",
+                        "other-agent",
+                        "skills/other-agent/SKILL.md",
                     )
                     .with_target_agent("background-agent"),
                 ),
@@ -14451,7 +14809,7 @@ mod tests {
             loader_states: Vec::new(),
         };
         let skill_plan = AgentSkillPlan::from_package_and_modules(
-            ["skill.package.only", "skill.rust.debug"],
+            ["package-only", "rust-debug"],
             &module_projection,
             ["coding-agent"],
         );
@@ -14498,7 +14856,7 @@ mod tests {
             .expect("matches");
         assert!(
             matches.iter().any(|entry| {
-                entry.get("id").and_then(serde_json::Value::as_str) == Some("skill.rust.debug")
+                entry.get("id").and_then(serde_json::Value::as_str) == Some("rust-debug")
                     && entry.get("source").and_then(serde_json::Value::as_str) == Some("module")
                     && entry
                         .get("package_declared")
@@ -14511,17 +14869,17 @@ mod tests {
                     && entry
                         .pointer("/activation/mode")
                         .and_then(serde_json::Value::as_str)
-                        == Some("host_runtime")
+                        == Some("dedicated_tool")
                     && entry
                         .pointer("/activation/available")
                         .and_then(serde_json::Value::as_bool)
-                        == Some(false)
+                        == Some(true)
             }),
             "{matches:?}"
         );
         assert!(
             !matches.iter().any(|entry| {
-                entry.get("id").and_then(serde_json::Value::as_str) == Some("skill.other.agent")
+                entry.get("id").and_then(serde_json::Value::as_str) == Some("other-agent")
             }),
             "{matches:?}"
         );
@@ -14535,7 +14893,7 @@ mod tests {
             &AgentToolCall {
                 call_id: None,
                 tool: "skill_describe".to_string(),
-                input: serde_json::json!({ "skill": "skill.rust.debug" }),
+                input: serde_json::json!({ "skill": "rust-debug" }),
                 r#async: false,
                 summary: "describe rust skill".to_string(),
             },
@@ -14544,23 +14902,23 @@ mod tests {
         assert_eq!(
             describe
                 .output
-                .pointer("/descriptor/embedded_text")
-                .and_then(serde_json::Value::as_str),
-            Some("# Rust debugging\nInspect the failing assertion first.")
+                .pointer("/descriptor/has_skill_content")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
         );
         assert_eq!(
             describe
                 .output
                 .pointer("/activation/mode")
                 .and_then(serde_json::Value::as_str),
-            Some("host_runtime")
+            Some("dedicated_tool")
         );
         assert_eq!(
             describe
                 .output
                 .pointer("/activation/available")
                 .and_then(serde_json::Value::as_bool),
-            Some(false)
+            Some(true)
         );
         assert!(describe.evidence.record_value("skill_disclosure").is_some());
         assert!(describe.evidence.record_value("skill_usage").is_some());
@@ -14575,48 +14933,88 @@ mod tests {
                 call_id: None,
                 tool: "skill_activate".to_string(),
                 input: serde_json::json!({
-                    "skill": "skill.rust.debug",
+                    "skill": "rust-debug",
                     "reason": "load debugging guidance"
                 }),
                 r#async: false,
                 summary: "activate rust skill".to_string(),
             },
         );
-        assert_eq!(activate.status, AgentToolStatus::Blocked);
+        assert_eq!(activate.status, AgentToolStatus::Succeeded);
         assert_eq!(
             activate
                 .output
-                .get("error")
+                .pointer("/skill_content/name")
                 .and_then(serde_json::Value::as_str),
-            Some("skill_activation_unavailable")
+            Some("rust-debug")
         );
         assert_eq!(
             activate
                 .output
                 .pointer("/activation/mode")
                 .and_then(serde_json::Value::as_str),
-            Some("host_runtime")
+            Some("dedicated_tool")
         );
         assert_eq!(
             activate
                 .output
                 .pointer("/activation/available")
                 .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            activate.evidence.availability.reason,
-            "skill activation requires a host runtime activation executor"
+            Some(true)
         );
         assert!(activate.evidence.record_value("skill_disclosure").is_some());
         assert!(activate.evidence.record_value("skill_usage").is_some());
+
+        let unreadable_search = orchestrator.execute(
+            &registry,
+            &input.session,
+            &plan,
+            0,
+            3,
+            &AgentToolCall {
+                call_id: None,
+                tool: "skill_search".to_string(),
+                input: serde_json::json!({ "query": "package-only" }),
+                r#async: false,
+                summary: "search unreadable package reference".to_string(),
+            },
+        );
+        assert_eq!(
+            unreadable_search
+                .output
+                .get("count")
+                .and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+        let unreadable_describe = orchestrator.execute(
+            &registry,
+            &input.session,
+            &plan,
+            0,
+            4,
+            &AgentToolCall {
+                call_id: None,
+                tool: "skill_describe".to_string(),
+                input: serde_json::json!({ "skill": "package-only" }),
+                r#async: false,
+                summary: "describe unreadable package reference".to_string(),
+            },
+        );
+        assert_eq!(unreadable_describe.status, AgentToolStatus::Failed);
+        assert_eq!(
+            unreadable_describe
+                .output
+                .get("error")
+                .and_then(serde_json::Value::as_str),
+            Some("invalid_agent_skill")
+        );
     }
 
     #[test]
     fn skill_disclosure_includes_active_catalog_skills() {
-        let text = "# Catalog skill\nUse the SIFS catalog version.";
+        let text = "---\nname: catalog-debug\ndescription: Catalog-backed debug workflow.\n---\n\n# Catalog skill\nUse the SIFS catalog version.";
         let entry = crate::SkillCatalogEntry::new(
-            "skill.catalog.debug",
+            "catalog-debug",
             "1.0.0",
             crate::SkillCatalogSource::user("user.test"),
             text,
@@ -14635,11 +15033,13 @@ mod tests {
             .expect("activation");
         let catalog_entries =
             catalog.active_entries_for_scopes([crate::SkillActivationScope::Cluster.as_str()]);
-        let skill_plan = AgentSkillPlan::from_package_modules_and_catalog_entries(
+        let skill_plan = AgentSkillPlan::from_package_modules_and_catalog(
             std::iter::empty::<String>(),
             &AgentModuleToolProjection::default(),
             ["coding-agent"],
-            catalog_entries,
+            catalog_entries
+                .into_iter()
+                .map(|entry| entry.to_agent_descriptor(Some(text.to_string()))),
         );
 
         let registry = AgentToolRegistry::new();
@@ -14679,7 +15079,7 @@ mod tests {
             .expect("matches");
         assert!(
             matches.iter().any(|value| {
-                value.get("id").and_then(serde_json::Value::as_str) == Some("skill.catalog.debug")
+                value.get("id").and_then(serde_json::Value::as_str) == Some("catalog-debug")
                     && value.get("source").and_then(serde_json::Value::as_str) == Some("catalog")
                     && value
                         .get("catalog_version")
@@ -14696,9 +15096,9 @@ mod tests {
 
     #[test]
     fn agent_skill_plan_includes_cluster_active_catalog_skills() {
-        let text = "# Catalog shortcut\nUse the catalog shortcut.";
+        let text = "---\nname: catalog-shortcut\ndescription: Catalog-backed shortcut workflow.\n---\n\n# Catalog shortcut\nUse the catalog shortcut.";
         let entry = crate::SkillCatalogEntry::new(
-            "skill.catalog.shortcut",
+            "catalog-shortcut",
             "1.0.0",
             crate::SkillCatalogSource::user("user.test"),
             text,
@@ -14724,9 +15124,7 @@ mod tests {
         let agent = Agent::new(SequencedModel::new(["{}"]), "fake", "fake").with_config(config);
 
         let skill_plan = agent.skill_plan();
-        let skill = skill_plan
-            .get("skill.catalog.shortcut")
-            .expect("catalog skill");
+        let skill = skill_plan.get("catalog-shortcut").expect("catalog skill");
         assert_eq!(skill.source, crate::tools::AgentSkillSource::Catalog);
         assert_eq!(skill.catalog_version.as_deref(), Some("1.0.0"));
         assert_eq!(
@@ -14737,15 +15135,73 @@ mod tests {
     }
 
     #[test]
+    fn explicit_skill_context_loads_standard_instructions_and_resource_names() {
+        let markdown = "---\nname: explicit-shortcut\ndescription: Explicitly selected workflow.\n---\n\n# Explicit shortcut\nFollow the explicit workflow.\n";
+        let resource = crate::AgentSkillPackageFile {
+            relative_path: "references/checklist.md".to_string(),
+            bytes: b"# Checklist\nVerify the result.\n".to_vec(),
+        };
+        let write = crate::SkillCatalogWrite::from_agent_skill_package(
+            None,
+            "1.0.0",
+            crate::SkillCatalogSource::user("user.test"),
+            crate::AgentSkillPackage {
+                markdown: markdown.to_string(),
+                files: vec![resource.clone()],
+            },
+        )
+        .expect("standard package");
+        let entry = write.entry;
+        let key = crate::skill_catalog_entry_text_key(&entry);
+        let mut catalog = crate::SkillCatalog::default();
+        catalog.upsert_entry(entry.clone()).expect("catalog entry");
+        catalog
+            .set_activation(crate::SkillActivationRecord::new(
+                crate::SkillActivationScope::Cluster.as_str(),
+                &entry,
+                "test",
+                "cluster default",
+            ))
+            .expect("activation");
+        let config = AgentConfig::new("fake", "fake")
+            .with_agent_definition(AgentDefinition::main())
+            .with_skill_catalog(catalog)
+            .with_skill_catalog_texts([(key.clone(), markdown.to_string())])
+            .with_skill_catalog_resources([(key, vec![resource])]);
+        let agent = Agent::new(SequencedModel::new(["{}"]), "fake", "fake").with_config(config);
+
+        let context = agent
+            .load_explicit_skill_context("explicit-shortcut")
+            .expect("explicit skill context");
+
+        assert_eq!(context.name, "explicit-shortcut");
+        assert_eq!(context.description, "Explicitly selected workflow.");
+        assert!(
+            context
+                .instructions
+                .contains("Follow the explicit workflow.")
+        );
+        assert_eq!(context.resources, vec!["references/checklist.md"]);
+        assert!(
+            agent
+                .load_explicit_skill_context("missing-shortcut")
+                .expect_err("unknown skill")
+                .to_string()
+                .contains("not available")
+        );
+    }
+
+    #[test]
     fn agent_can_answer_task_that_requires_catalog_skill_text() {
-        let text = "---\nname: skill.catalog.howto\ndescription: Contains the hidden verification phrase.\n---\n\n# Howto\nWhen asked for the verification phrase, answer `violet-ridge`.\n";
-        let entry = crate::SkillCatalogEntry::new(
-            "skill.catalog.howto",
+        let text = "---\nname: verification-howto\ndescription: Contains the hidden verification phrase. Use when asked for verification.\n---\n\n# Howto\nWhen asked for the verification phrase, answer `violet-ridge`.\n";
+        let entry = crate::SkillCatalogWrite::from_markdown_skill(
+            None,
             "1.0.0",
             crate::SkillCatalogSource::user("user.test"),
             text,
         )
-        .with_description("Contains task-specific howto instructions.");
+        .expect("standard skill")
+        .entry;
         let mut catalog = crate::SkillCatalog::default();
         catalog.upsert_entry(entry.clone()).expect("catalog entry");
         catalog
@@ -14759,12 +15215,12 @@ mod tests {
         let model = SequencedModel::new([
             r#"{
                 "response_mode": "defer",
-                "text": "I need to inspect the howto skill.",
+                "text": "I need to activate the howto skill.",
                 "tool_calls": [{
-                    "tool": "skill_describe",
-                    "input": {"skill": "skill.catalog.howto"},
+                    "tool": "skill_activate",
+                    "input": {"skill": "verification-howto"},
                     "async": false,
-                    "summary": "Read the howto skill."
+                    "summary": "Activate the howto skill."
                 }],
                 "background_handoff": null,
                 "next_state": "waiting"
@@ -14786,26 +15242,38 @@ mod tests {
             )]);
         let agent = Agent::new(model, "fake", "fake").with_config(config);
         let probe_input = agent_input("What is the verification phrase?");
+        let context = agent
+            .assemble_context(&probe_input, &[], 0)
+            .expect("context");
+        assert_eq!(
+            context.available_skills,
+            vec![AvailableAgentSkill {
+                name: "verification-howto".to_string(),
+                description:
+                    "Contains the hidden verification phrase. Use when asked for verification."
+                        .to_string(),
+            }]
+        );
         let probe_plan = agent.tool_plan(&probe_input);
         assert!(
-            probe_plan.is_executable("skill_describe"),
-            "skill_describe plan entry: {:?}",
-            probe_plan.entry("skill_describe")
+            probe_plan.is_executable("skill_activate"),
+            "skill_activate plan entry: {:?}",
+            probe_plan.entry("skill_activate")
         );
 
         let run = agent.run(&probe_input).expect("run");
 
         assert_eq!(run.final_decision.text, "violet-ridge");
         assert_eq!(run.tool_results.len(), 1);
-        assert_eq!(run.tool_results[0].call.tool, "skill_describe");
+        assert_eq!(run.tool_results[0].call.tool, "skill_activate");
         assert_eq!(
             run.tool_results[0].status,
             AgentToolStatus::Succeeded,
-            "skill_describe output: {}",
+            "skill_activate output: {}",
             run.tool_results[0].output
         );
         assert!(
-            run.tool_results[0].output["descriptor"]["embedded_text"]
+            run.tool_results[0].output["skill_content"]["instructions"]
                 .as_str()
                 .is_some_and(|value| value.contains("violet-ridge"))
         );
@@ -14814,6 +15282,94 @@ mod tests {
                 .evidence
                 .record_value("skill_usage")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn skill_activation_loads_bundled_resources_on_demand() {
+        let markdown = "---\nname: scripted-skill\ndescription: Run a bundled script. Use for scripted verification.\n---\n\n# Scripted skill\nRead `scripts/check.sh` when needed.\n";
+        let resource = crate::AgentSkillPackageFile {
+            relative_path: "scripts/check.sh".to_string(),
+            bytes: b"#!/bin/sh\nprintf verified\n".to_vec(),
+        };
+        let write = crate::SkillCatalogWrite::from_agent_skill_package(
+            None,
+            "1.0.0",
+            crate::SkillCatalogSource::user("user.test"),
+            crate::AgentSkillPackage {
+                markdown: markdown.to_string(),
+                files: vec![resource.clone()],
+            },
+        )
+        .expect("standard package");
+        let entry = write.entry;
+        let key = crate::skill_catalog_entry_text_key(&entry);
+        let mut catalog = crate::SkillCatalog::default();
+        catalog.upsert_entry(entry.clone()).expect("catalog entry");
+        catalog
+            .set_activation(crate::SkillActivationRecord::new(
+                crate::SkillActivationScope::Cluster.as_str(),
+                &entry,
+                "test",
+                "cluster default",
+            ))
+            .expect("activation");
+        let config = AgentConfig::new("fake", "fake")
+            .with_agent_definition(AgentDefinition::main())
+            .with_skill_catalog(catalog)
+            .with_skill_catalog_texts([(key.clone(), markdown.to_string())])
+            .with_skill_catalog_resources([(key, vec![resource])]);
+        let agent = Agent::new(SequencedModel::new(["{}"]), "fake", "fake").with_config(config);
+        let skill_plan = agent.skill_plan();
+        let registry = AgentToolRegistry::new();
+        let plan = AgentToolPlanner::plan(
+            registry.descriptors(),
+            &AgentModuleToolProjection::default(),
+            std::iter::empty::<AgentToolSpec>(),
+            std::iter::empty::<AgentToolSpec>(),
+            false,
+            ["discovery"],
+            registry.generation(),
+        );
+        let input = agent_input("read the scripted skill resource");
+        let policy = AgentToolSurface::default_for_role(AgentRole::Deliberation);
+        let run_context = AgentRunContext::default();
+        let orchestrator =
+            AgentToolOrchestrator::new(&policy, None, &run_context).with_skill_plan(skill_plan);
+
+        let outcome = orchestrator.execute(
+            &registry,
+            &input.session,
+            &plan,
+            0,
+            0,
+            &AgentToolCall {
+                call_id: None,
+                tool: "skill_activate".to_string(),
+                input: serde_json::json!({
+                    "skill": "scripted-skill",
+                    "resource": "scripts/check.sh",
+                }),
+                r#async: false,
+                summary: "read bundled script".to_string(),
+            },
+        );
+
+        assert_eq!(outcome.status, AgentToolStatus::Succeeded);
+        assert_eq!(
+            outcome
+                .output
+                .pointer("/resource_content/content")
+                .and_then(serde_json::Value::as_str),
+            Some("#!/bin/sh\nprintf verified\n")
+        );
+        assert_eq!(
+            outcome
+                .evidence
+                .record_value("skill_usage")
+                .and_then(|value| value.get("operation"))
+                .and_then(serde_json::Value::as_str),
+            Some("resource_read")
         );
     }
 

@@ -3067,13 +3067,16 @@ struct DaemonDfsMaintenanceForegroundPreemption {
 }
 
 impl DaemonDfsMaintenanceForegroundPreemption {
+    fn is_requested(&self) -> bool {
+        self.gate.foreground_generation.load(Ordering::Acquire) != self.foreground_generation
+    }
+
     async fn requested(&self) {
         loop {
             let notified = self.gate.foreground_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.gate.foreground_generation.load(Ordering::Acquire) != self.foreground_generation
-            {
+            if self.is_requested() {
                 return;
             }
             notified.await;
@@ -5700,6 +5703,7 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
                 runtime,
                 committed_work_tracker.clone(),
                 &mut deferred_work,
+                &foreground_preemption,
             )
             .await
         })
@@ -5753,6 +5757,7 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     runtime: &tokio::runtime::Handle,
     committed_work_tracker: DfsCommittedWorkTracker,
     deferred_work: &mut Option<(Arc<DaemonDfsDetachedSendRuntime>, DfsNodeDetachedSendWorker)>,
+    foreground_preemption: &DaemonDfsMaintenanceForegroundPreemption,
 ) -> Result<bool, DaemonError> {
     // Broad maintenance owns the mutation generation, but the independently
     // locked lightweight lane contains no hydrated all-shard view and serves
@@ -5781,7 +5786,7 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     let async_peer_transport = daemon_dfs_async_peer_transport(&data_dir, runtime);
     let options = daemon_dfs_maintenance_tick_options();
     let maintenance_result =
-        sinomo_dfs::run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions_and_committed_work_tracker(
+        sinomo_dfs::run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions_and_committed_work_tracker_until_hydration_cancelled(
             runtime,
             data_dir.clone(),
             cluster_paths.clone(),
@@ -5790,6 +5795,7 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
             detached_send_runtime.state.clone(),
             execution_exclusions,
             committed_work_tracker,
+            &|| foreground_preemption.is_requested(),
             daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(runtime)),
             options,
         )
@@ -7532,6 +7538,8 @@ mod tests {
             .map_err(DaemonError::from)?;
         let execution_exclusions =
             daemon_dfs_maintenance_execution_exclusions(&cluster_paths, &cluster_state);
+        let foreground_preemption =
+            daemon_dfs_message_execution_gate(&data_dir)?.begin_maintenance_interest();
         let mut deferred_work = None;
         let result = runtime.block_on(run_daemon_dfs_maintenance_tick_with_admission(
             data_dir,
@@ -7541,6 +7549,7 @@ mod tests {
             runtime.handle(),
             DfsCommittedWorkTracker::new(),
             &mut deferred_work,
+            &foreground_preemption,
         ));
         if let Some((detached_runtime, worker)) = deferred_work {
             schedule_daemon_dfs_message_deferred_work(

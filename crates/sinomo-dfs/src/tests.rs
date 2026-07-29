@@ -9023,6 +9023,81 @@ fn local_content_anti_entropy_accepts_hash_addressed_blob_without_version_manife
 }
 
 #[test]
+fn local_content_anti_entropy_repairs_size_from_verified_hash_addressed_blob() {
+    let root = temp_root("local-content-anti-entropy-repairs-size");
+    let node_id = NodeId::from_legacy_named("node_anti_entropy_size").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("fs_anti_entropy_size").expect("fs");
+    let network = InProcessNetwork::new();
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let metadata =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+            .expect("metadata");
+    let mut dfs = NetworkedDfsService::new(network.add_node(node_id.clone()), content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "anti entropy size".to_string(),
+        owner_node_id: node_id.clone(),
+        subtree_policies: Vec::new(),
+    };
+    dfs.add_file_system(file_system).expect("filesystem");
+
+    let bytes = b"verified hash-addressed bytes with incorrect metadata size";
+    let mut object = file_metadata(node_id.clone());
+    object.file_system_id = file_system_id.clone();
+    object.object_id =
+        DfsObjectId::from_legacy_named("obj_anti_entropy_wrong_size").expect("object");
+    object.version = DfsVersion::from_legacy_named("version_wrong_size").expect("ver");
+    object.path = "/anti/wrong-size.bin".to_string();
+    let manifest = dfs
+        .content
+        .put_object_version_blob_only(object.object_id.as_str(), object.version.as_str(), bytes)
+        .expect("hash-addressed blob");
+    object.current_locations = vec![node_id.clone()];
+    object.content_hash = Some(manifest.content_hash.clone());
+    object.content_size_bytes = Some(0);
+    dfs.metadata_backend
+        .as_mut()
+        .expect("metadata backend")
+        .put_object_and_version(&object, &object_version_record(&object, Some(0)))
+        .expect("incorrect-size metadata");
+
+    let report = dfs
+        .run_local_content_anti_entropy(DfsAntiEntropyOptions {
+            file_system_id,
+            after: None,
+            max_objects: 8,
+            max_issues: 8,
+            repair_metadata: true,
+        })
+        .expect("anti entropy");
+
+    assert_eq!(report.stale_local_location_count, 1);
+    assert_eq!(report.repaired_location_count, 1);
+    assert_eq!(report.issue_count, 1);
+    assert!(report.issues[0].repaired);
+    let backend = dfs.metadata_backend().expect("metadata backend");
+    let repaired = backend
+        .get_object(&object.object_id)
+        .expect("object")
+        .expect("repaired object");
+    assert_eq!(repaired.content_size_bytes, Some(bytes.len() as u64));
+    let repaired_version = backend
+        .get_version(&object.object_id, &object.version)
+        .expect("version")
+        .expect("repaired version");
+    assert_eq!(repaired_version.size_bytes, Some(bytes.len() as u64));
+    let repaired_manifest = dfs
+        .content
+        .read_manifest(object.object_id.as_str(), object.version.as_str())
+        .expect("repaired manifest");
+    assert_eq!(repaired_manifest.size_bytes, bytes.len() as u64);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn add_object_metadata_batch_persists_visible_versions_in_one_transaction() {
     let root = temp_root("add-object-metadata-batch-visible-versions");
     let owner = NodeId::from_legacy_named("node_batch_visible_owner").expect("node");
@@ -14064,6 +14139,23 @@ fn routed_exclusive_create_replays_only_the_exact_request_and_rolls_back_rejecti
             exclusive_create: true,
         }
     };
+
+    let fresh_replay_probe = command_for(
+        "exclusive-create-fresh-replay-probe",
+        "/users/exclusive-routed-probe",
+    );
+    crate::metadata_sharded_backend::reset_sharded_metadata_object_id_lookup_count();
+    assert!(
+        service
+            .replayed_routed_write_outcome_if_known(&requester, &fresh_replay_probe)
+            .expect("fresh exclusive-create replay lookup")
+            .is_none()
+    );
+    assert_eq!(
+        crate::metadata_sharded_backend::sharded_metadata_object_id_lookup_count(),
+        0,
+        "fresh exclusive-create replay detection must stay on the path-selected shard"
+    );
 
     let command = command_for("exclusive-create-original", "/users/exclusive-routed");
     let first = service
@@ -20524,6 +20616,34 @@ fn hydrate_from_metadata_backend_scans_receipts_once_globally() {
 }
 
 #[test]
+fn recovery_hydration_can_cancel_between_synchronous_backend_phases() {
+    let root = temp_root("recovery-hydration-cancels-between-phases");
+    let node = NodeId::from_legacy_named("node_recovery_hydration_cancel").expect("node");
+    let backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+            .expect("metadata backend");
+    let mut service = NetworkedDfsService::new(
+        InProcessNetwork::new().add_node(node),
+        LocalContentStore::new(root.join("content")).expect("content store"),
+    );
+    service.metadata_backend = Some(Box::new(backend));
+    let cancellation_checks = AtomicUsize::new(0);
+
+    let completed = service
+        .hydrate_from_metadata_backend_for_commit_promotion_recovery_until_cancelled(&|| {
+            cancellation_checks.fetch_add(1, Ordering::SeqCst) >= 1
+        })
+        .expect("cancellable recovery hydration");
+
+    assert!(!completed);
+    assert!(
+        cancellation_checks.load(Ordering::SeqCst) >= 2,
+        "hydration must recheck foreground cancellation after synchronous backend work"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn recovery_hydration_skips_fully_repaired_committed_pending_write() {
     let root = temp_root("hydrate-skips-fully-repaired-committed");
     let owner = NodeId::from_legacy_named("node_hydrate_full_owner").expect("node");
@@ -22240,6 +22360,34 @@ fn pending_write_size_hint_ignores_backend_version_with_wrong_hash() {
             .expect("wrong-hash size hint"),
         Some(999)
     );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn pending_write_size_hint_uses_verified_hash_addressed_blob_without_manifest() {
+    let root = temp_root("pending-size-uses-hash-addressed-blob");
+    let owner = NodeId::from_legacy_named("node_size_hint_blob_owner").expect("node");
+    let object_id = DfsObjectId::from_legacy_named("obj_size_hint_hash_blob").expect("object");
+    let version = DfsVersion::from_legacy_named("version_size_hint_hash_blob").expect("version");
+    let bytes = b"pending content retained only as a hash-addressed blob";
+    let dfs = networked_sifs_with_backend(&root, owner);
+    let manifest = dfs
+        .content
+        .put_object_version_blob_only(object_id.as_str(), version.as_str(), bytes)
+        .expect("hash-addressed blob");
+
+    assert!(
+        dfs.content
+            .read_manifest(object_id.as_str(), version.as_str())
+            .is_err(),
+        "the regression requires a collected per-version manifest"
+    );
+    assert_eq!(
+        dfs.pending_write_size_hint(&object_id, &version, &manifest.content_hash)
+            .expect("size hint"),
+        Some(bytes.len() as u64)
+    );
+
     std::fs::remove_dir_all(root).ok();
 }
 

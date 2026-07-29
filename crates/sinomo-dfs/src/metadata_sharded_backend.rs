@@ -86,6 +86,22 @@ fn is_source_eviction_tombstone(object: &DfsObjectMetadata) -> bool {
 
 const ROUTING_TOPOLOGY_HISTORY_LIMIT: usize = 4;
 
+#[cfg(test)]
+thread_local! {
+    static SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_sharded_metadata_object_id_lookup_count() {
+    SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn sharded_metadata_object_id_lookup_count() -> usize {
+    SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT.get()
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 struct DfsMetadataRoutingTopologyHistory {
     #[serde(default)]
@@ -245,7 +261,7 @@ impl LocalShardedMetadataBackend {
         canonicalize_routing_topology(&mut shards);
         let routing_history = load_routing_topology_history(&root, &shards, initialize_layout)?;
         let mut shard_configs = BTreeMap::new();
-        let mut backends = BTreeMap::new();
+        let mut shard_opens = Vec::with_capacity(shards.len());
         for shard in shards {
             let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
             if shard_configs
@@ -258,31 +274,63 @@ impl LocalShardedMetadataBackend {
                 )));
             }
             let shard_root = root.join(key_segment(&shard_id.0));
-            let backend = if initialize_layout {
-                match LocalSobjMetadataBackend::new(shard_id.clone(), shard_root.clone()) {
-                    Ok(backend) => backend,
-                    Err(open_error)
-                        if replica_repair_local_node_id
-                            .is_some_and(|local_node_id| shard.primary_node_id != *local_node_id) =>
-                    {
-                        LocalSobjMetadataBackend::open_for_replica_repair(
-                            shard_id.clone(),
-                            shard_root,
-                        )
-                        .map_err(|repair_error| {
-                            MetadataBackendError::Serde(format!(
-                                "cannot open replica metadata shard {}: {open_error}; repair-only open failed: {repair_error}",
-                                shard.shard_id
-                            ))
-                        })?
-                    }
-                    Err(error) => return Err(error),
-                }
-            } else {
-                LocalSobjMetadataBackend::open_for_inspection(shard_id.clone(), shard_root)?
-            };
-            backends.insert(shard_id, backend);
+            shard_opens.push((shard, shard_id, shard_root));
         }
+        let replica_repair_local_node_id = replica_repair_local_node_id.cloned();
+        let opened = std::thread::scope(|scope| {
+            let handles = shard_opens
+                .into_iter()
+                .map(|(shard, shard_id, shard_root)| {
+                    let replica_repair_local_node_id = replica_repair_local_node_id.as_ref();
+                    scope.spawn(move || {
+                        let backend = if initialize_layout {
+                            match LocalSobjMetadataBackend::new(
+                                shard_id.clone(),
+                                shard_root.clone(),
+                            ) {
+                                Ok(backend) => backend,
+                                Err(open_error)
+                                    if replica_repair_local_node_id.is_some_and(|local_node_id| {
+                                        shard.primary_node_id != *local_node_id
+                                    }) =>
+                                {
+                                    LocalSobjMetadataBackend::open_for_replica_repair(
+                                        shard_id.clone(),
+                                        shard_root,
+                                    )
+                                    .map_err(|repair_error| {
+                                        MetadataBackendError::Serde(format!(
+                                            "cannot open replica metadata shard {}: {open_error}; repair-only open failed: {repair_error}",
+                                            shard.shard_id
+                                        ))
+                                    })?
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        } else {
+                            LocalSobjMetadataBackend::open_for_inspection(
+                                shard_id.clone(),
+                                shard_root,
+                            )?
+                        };
+                        Ok((shard_id, backend))
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().map_err(|_| {
+                        MetadataBackendError::Serde(
+                            "local DFS metadata shard open worker panicked".to_string(),
+                        )
+                    })?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        #[cfg(test)]
+        crate::metadata_backend::record_metadata_backend_open_calls_from_workers(opened.len());
+        let backends = opened.into_iter().collect::<BTreeMap<_, _>>();
         let routing_indexes = compile_routing_indexes(shard_configs.values().cloned())?;
         let fallback_routing_indexes = routing_history
             .fallbacks
@@ -292,7 +340,7 @@ impl LocalShardedMetadataBackend {
 
         Ok(Self {
             root,
-            local_node_id: replica_repair_local_node_id.cloned(),
+            local_node_id: replica_repair_local_node_id,
             shard_configs,
             routing_indexes,
             fallback_routing_indexes,
@@ -693,6 +741,40 @@ impl LocalShardedMetadataBackend {
             self.reconcile_object_shard_index(object_id)?;
         }
         Ok(())
+    }
+
+    fn refresh_metadata_shard_durable_view_and_reconcile(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        reconcile_unchanged: bool,
+    ) -> Result<bool> {
+        let generation_before = self.shard_backend(shard_id)?.cached_table_generation();
+        let mut affected_object_ids = self
+            .shard_backend(shard_id)?
+            .export_table_snapshot()
+            .tables
+            .into_iter()
+            .flat_map(|tables| tables.objects)
+            .map(|object| object.object_id)
+            .collect::<BTreeSet<_>>();
+        self.shard_backend_mut(shard_id)?
+            .refresh_metadata_shard_durable_view(shard_id)?;
+        let changed = self.shard_backend(shard_id)?.cached_table_generation() != generation_before;
+        if !changed && !reconcile_unchanged {
+            return Ok(false);
+        }
+        affected_object_ids.extend(
+            self.shard_backend(shard_id)?
+                .export_table_snapshot()
+                .tables
+                .into_iter()
+                .flat_map(|tables| tables.objects)
+                .map(|object| object.object_id),
+        );
+        self.begin_consistent_read_snapshot()?;
+        let result = self.reconcile_object_shard_indexes(affected_object_ids.iter());
+        self.end_consistent_read_snapshot();
+        result.map(|()| changed)
     }
 
     fn indexed_shard_id_for_object(
@@ -1273,6 +1355,33 @@ impl LocalShardedMetadataBackend {
 }
 
 impl DfsMetadataBackend for LocalShardedMetadataBackend {
+    fn begin_consistent_read_snapshot(&mut self) -> Result<()> {
+        let shard_ids = self.shards.keys().cloned().collect::<Vec<_>>();
+        for (index, shard_id) in shard_ids.iter().enumerate() {
+            let begin = self
+                .shards
+                .get_mut(shard_id)
+                .expect("collected shard id remains installed")
+                .begin_consistent_read_snapshot();
+            if let Err(error) = begin {
+                for pinned_shard_id in &shard_ids[..index] {
+                    self.shards
+                        .get_mut(pinned_shard_id)
+                        .expect("pinned shard remains installed")
+                        .end_consistent_read_snapshot();
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn end_consistent_read_snapshot(&mut self) {
+        for backend in self.shards.values_mut() {
+            backend.end_consistent_read_snapshot();
+        }
+    }
+
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry> {
         let shard_ids = self.configured_shard_ids_for_file_system(&file_system.file_system_id)?;
         let mut last_entry = None;
@@ -1374,6 +1483,12 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn get_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsObjectMetadata>> {
+        #[cfg(test)]
+        SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT.set(
+            SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT
+                .get()
+                .saturating_add(1),
+        );
         if let Some(shard_id) = self.shard_id_for_object(object_id)? {
             return self.shard_backend(&shard_id)?.get_object(object_id);
         }
@@ -2734,6 +2849,18 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         })
     }
 
+    fn write_intents_on_shard_page(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        after: Option<&DfsWriteIntentScanCursor>,
+        max_entries: usize,
+    ) -> Result<Option<DfsWriteIntentScanPage>> {
+        let Some(backend) = self.shards.get(shard_id) else {
+            return Ok(None);
+        };
+        backend.write_intents_on_shard_page(shard_id, after, max_entries)
+    }
+
     fn version_records_page(
         &self,
         after: Option<&DfsObjectVersionScanCursor>,
@@ -3723,6 +3850,24 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(found)
     }
 
+    fn list_prepared_namespace_prepares(&self) -> Result<Vec<DfsNamespacePrepareRecord>> {
+        let mut prepares = BTreeMap::new();
+        for backend in self.shards.values() {
+            for prepare in backend.list_prepared_namespace_prepares()? {
+                if prepares
+                    .insert(prepare.operation_id.clone(), prepare.clone())
+                    .is_some()
+                {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "namespace prepare {} exists on multiple local shards",
+                        prepare.operation_id
+                    )));
+                }
+            }
+        }
+        Ok(prepares.into_values().collect())
+    }
+
     fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {
         let mut found = None;
         for backend in self.shards.values() {
@@ -3992,25 +4137,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn refresh_metadata_shard_durable_view(&mut self, shard_id: &DfsMetadataShardId) -> Result<()> {
-        let mut affected_object_ids = self
-            .shard_backend(shard_id)?
-            .export_table_snapshot()
-            .tables
-            .into_iter()
-            .flat_map(|tables| tables.objects)
-            .map(|object| object.object_id)
-            .collect::<BTreeSet<_>>();
-        self.shard_backend_mut(shard_id)?
-            .refresh_metadata_shard_durable_view(shard_id)?;
-        affected_object_ids.extend(
-            self.shard_backend(shard_id)?
-                .export_table_snapshot()
-                .tables
-                .into_iter()
-                .flat_map(|tables| tables.objects)
-                .map(|object| object.object_id),
-        );
-        self.reconcile_object_shard_indexes(affected_object_ids.iter())
+        self.refresh_metadata_shard_durable_view_and_reconcile(shard_id, true)?;
+        Ok(())
+    }
+
+    fn refresh_metadata_shard_durable_view_if_changed(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<bool> {
+        self.refresh_metadata_shard_durable_view_and_reconcile(shard_id, false)
     }
 
     fn metadata_shard_write_freeze(

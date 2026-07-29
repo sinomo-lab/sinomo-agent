@@ -34,12 +34,12 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const REMOTE_MANAGEMENT_LOCAL_PERMISSION: &str = "remote-management";
 
-const COMPUTE_USE_SKILL_ID: &str = "skill.remote-management.compute-use";
+const COMPUTE_USE_SKILL_ID: &str = "remote-management";
 const COMPUTE_USE_SKILL_PATH: &str = "skills/remote-management/SKILL.md";
-const FILE_TRANSFER_SKILL_ID: &str = "skill.remote-management.file-transfer";
-const FILE_TRANSFER_SKILL_PATH: &str = "skills/remote-management/file-transfer/SKILL.md";
-const NODE_CONFIG_SKILL_ID: &str = "skill.remote-management.node-config";
-const NODE_CONFIG_SKILL_PATH: &str = "skills/remote-management/node-config/SKILL.md";
+const FILE_TRANSFER_SKILL_ID: &str = "file-transfer";
+const FILE_TRANSFER_SKILL_PATH: &str = "skills/file-transfer/SKILL.md";
+const NODE_CONFIG_SKILL_ID: &str = "node-config";
+const NODE_CONFIG_SKILL_PATH: &str = "skills/node-config/SKILL.md";
 
 const COMPUTE_USE_PROMPT_ID: &str = "prompt.remote-management.compute-use";
 const COMPUTE_USE_PROMPT_PATH: &str = "prompts/remote-management-compute-use.md";
@@ -49,10 +49,8 @@ const NODE_CONFIG_PROMPT_ID: &str = "prompt.remote-management.node-config";
 const NODE_CONFIG_PROMPT_PATH: &str = "prompts/remote-management-node-config.md";
 
 const COMPUTE_USE_SKILL_MARKDOWN: &str = include_str!("../skills/remote-management/SKILL.md");
-const FILE_TRANSFER_SKILL_MARKDOWN: &str =
-    include_str!("../skills/remote-management/file-transfer/SKILL.md");
-const NODE_CONFIG_SKILL_MARKDOWN: &str =
-    include_str!("../skills/remote-management/node-config/SKILL.md");
+const FILE_TRANSFER_SKILL_MARKDOWN: &str = include_str!("../skills/file-transfer/SKILL.md");
+const NODE_CONFIG_SKILL_MARKDOWN: &str = include_str!("../skills/node-config/SKILL.md");
 const COMPUTE_USE_PROMPT_MARKDOWN: &str =
     include_str!("../prompts/remote-management-compute-use.md");
 const FILE_TRANSFER_PROMPT_MARKDOWN: &str =

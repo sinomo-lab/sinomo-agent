@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use time::OffsetDateTime;
 
-use crate::metadata_table_store::metadata_tables_from_table_snapshot;
 use crate::*;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -19,20 +18,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok(false);
         };
-        let tables = metadata_tables_from_table_snapshot(
-            backend.export_table_snapshot()?,
-            "DFS membership handoff prepare drain",
-        )?;
-        let write_prepare_ids = tables
-            .intents
-            .values()
+        let write_prepare_ids = backend
+            .all_intents()?
+            .into_iter()
             .map(|intent| format!("namespace:create:{}", intent.intent_id))
             .collect::<BTreeSet<_>>();
-        Ok(tables.namespace_prepares.values().any(|prepare| {
-            prepare.shard_id == *shard_id
-                && prepare.status == DfsNamespacePrepareStatus::Prepared
-                && !write_prepare_ids.contains(&prepare.operation_id)
-        }))
+        Ok(backend
+            .list_prepared_namespace_prepares()?
+            .iter()
+            .any(|prepare| {
+                prepare.shard_id == *shard_id && !write_prepare_ids.contains(&prepare.operation_id)
+            }))
     }
 
     fn certified_local_recovery_shard(
@@ -85,29 +81,63 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// write-intent recovery path so receipt threshold evidence remains part
     /// of the visibility decision.
     pub(crate) fn recover_durable_namespace_prepares(&mut self) -> Result<(), DfsError> {
+        let completed = self.recover_durable_namespace_prepares_until_cancelled(&|| false)?;
+        debug_assert!(
+            completed,
+            "non-cancellable DFS namespace-prepare recovery was cancelled"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn recover_durable_namespace_prepares_until_cancelled(
+        &mut self,
+        should_cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<bool, DfsError> {
         if self.control_plane.is_none() {
-            return Ok(());
+            return Ok(true);
         }
-        let snapshot = self
+        if should_cancel() {
+            return Ok(false);
+        }
+        let backend = self
             .metadata_backend
             .as_ref()
-            .expect("metadata backend exists during hydration")
-            .export_table_snapshot()?;
-        let tables = metadata_tables_from_table_snapshot(snapshot, "DFS prepare recovery")?;
-        let mut aborted_write_prepares = tables
-            .intents
-            .values()
-            .filter(|intent| intent.status == DfsWriteIntentStatus::Aborted)
-            .filter_map(|intent| {
-                tables
-                    .namespace_prepares
-                    .get(&format!("namespace:create:{}", intent.intent_id))
-                    .filter(|prepare| prepare.status == DfsNamespacePrepareStatus::Prepared)
-                    .cloned()
-            })
+            .expect("metadata backend exists during hydration");
+        let mut write_prepare_ids = BTreeSet::new();
+        let mut aborted_write_prepare_ids = BTreeSet::new();
+        let mut intent_cursor = None;
+        loop {
+            if should_cancel() {
+                return Ok(false);
+            }
+            let page = backend
+                .write_intents_page(intent_cursor.as_ref(), DFS_METADATA_OBJECT_INTENT_PAGE_SIZE)?;
+            for intent in page.intents {
+                let prepare_id = format!("namespace:create:{}", intent.intent_id);
+                if intent.status == DfsWriteIntentStatus::Aborted {
+                    aborted_write_prepare_ids.insert(prepare_id.clone());
+                }
+                write_prepare_ids.insert(prepare_id);
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            intent_cursor = Some(next_cursor);
+        }
+        if should_cancel() {
+            return Ok(false);
+        }
+        let prepared_namespace_prepares = backend.list_prepared_namespace_prepares()?;
+        let mut aborted_write_prepares = prepared_namespace_prepares
+            .iter()
+            .filter(|prepare| aborted_write_prepare_ids.contains(&prepare.operation_id))
+            .cloned()
             .collect::<Vec<_>>();
         aborted_write_prepares.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
         for prepare in aborted_write_prepares {
+            if should_cancel() {
+                return Ok(false);
+            }
             let Some(authority_object) = self.namespace_prepare_authority_object(&prepare)? else {
                 continue;
             };
@@ -130,25 +160,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     prepare.owner_epoch,
                 )?;
         }
-        let write_prepare_ids = tables
-            .intents
-            .values()
-            .map(|intent| format!("namespace:create:{}", intent.intent_id))
-            .collect::<BTreeSet<_>>();
-        let mut prepares = tables
-            .namespace_prepares
-            .into_values()
-            .filter(|prepare| {
-                prepare.status == DfsNamespacePrepareStatus::Prepared
-                    && !write_prepare_ids.contains(&prepare.operation_id)
-            })
+        let mut prepares = prepared_namespace_prepares
+            .into_iter()
+            .filter(|prepare| !write_prepare_ids.contains(&prepare.operation_id))
             .collect::<Vec<_>>();
         prepares.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
 
         for prepare in prepares {
+            if should_cancel() {
+                return Ok(false);
+            }
             self.recover_one_durable_namespace_prepare(prepare)?;
         }
-        Ok(())
+        Ok(!should_cancel())
     }
 
     /// Finish request-owned prepares before replaying their namespace command.
@@ -268,37 +292,68 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// legitimately survive a shard move; duplicate keys are therefore
     /// omitted from this adoption map so recovery fails closed instead of
     /// assigning ambiguous work to whichever shard happened to scan last.
+    #[cfg(test)]
     pub(crate) fn durable_write_intent_shards(
         &self,
     ) -> Result<BTreeMap<(DfsObjectId, String), DfsMetadataShardId>, DfsError> {
+        let intent_shards = self
+            .durable_write_intent_shards_until_cancelled(&|| false)?
+            .expect("non-cancellable DFS write-intent shard scan was cancelled");
+        Ok(intent_shards)
+    }
+
+    pub(crate) fn durable_write_intent_shards_until_cancelled(
+        &self,
+        should_cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<BTreeMap<(DfsObjectId, String), DfsMetadataShardId>>, DfsError> {
         let Some(backend) = self.metadata_backend.as_ref() else {
-            return Ok(BTreeMap::new());
+            return Ok(Some(BTreeMap::new()));
+        };
+        if should_cancel() {
+            return Ok(None);
         };
         let mut intent_shards = BTreeMap::new();
         let mut ambiguous_intents = BTreeSet::new();
         for status in backend.metadata_shard_statuses()? {
-            let Some(snapshot) = backend.export_shard_table_snapshot(&status.shard_id)? else {
-                continue;
-            };
-            let tables = metadata_tables_from_table_snapshot(
-                snapshot,
-                "DFS shard-scoped write-intent recovery",
-            )?;
-            for ((object_id, intent_id), _) in tables.intents {
-                let key = (object_id, intent_id);
-                if ambiguous_intents.contains(&key) {
-                    continue;
+            if should_cancel() {
+                return Ok(None);
+            }
+            let mut cursor = None;
+            loop {
+                if should_cancel() {
+                    return Ok(None);
                 }
-                if intent_shards
-                    .insert(key.clone(), status.shard_id.clone())
-                    .is_some()
-                {
-                    intent_shards.remove(&key);
-                    ambiguous_intents.insert(key);
+                let Some(page) = backend.write_intents_on_shard_page(
+                    &status.shard_id,
+                    cursor.as_ref(),
+                    DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
+                )?
+                else {
+                    break;
+                };
+                for intent in page.intents {
+                    if should_cancel() {
+                        return Ok(None);
+                    }
+                    let key = (intent.object_id, intent.intent_id);
+                    if ambiguous_intents.contains(&key) {
+                        continue;
+                    }
+                    if intent_shards
+                        .insert(key.clone(), status.shard_id.clone())
+                        .is_some()
+                    {
+                        intent_shards.remove(&key);
+                        ambiguous_intents.insert(key);
+                    }
                 }
+                let Some(next_cursor) = page.next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
             }
         }
-        Ok(intent_shards)
+        Ok(Some(intent_shards))
     }
 
     /// Adopt an exact non-terminal write intent on the certified current
@@ -593,6 +648,7 @@ mod tests {
         let shard = recovery_shard(&new_primary, 2);
         let control_plane = recovery_control_plane(&file_system, &shard);
         let network = InProcessNetwork::new();
+        crate::metadata_backend::reset_metadata_export_table_snapshot_calls();
         let recovered = NetworkedDfsService::new(
             network.add_node(new_primary),
             LocalContentStore::new(root.join("content")).expect("content"),
@@ -603,6 +659,11 @@ mod tests {
                 .expect("reopen backend"),
         )
         .expect("current primary recovers prepare");
+        assert_eq!(
+            crate::metadata_backend::metadata_export_table_snapshot_calls(),
+            0,
+            "ordinary hydration must not export and fingerprint a full replica snapshot"
+        );
 
         assert_eq!(
             recovered

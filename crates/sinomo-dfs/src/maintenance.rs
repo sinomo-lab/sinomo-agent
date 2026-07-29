@@ -44,6 +44,7 @@ use crate::{
     open_cluster_dfs_service_with_message_sender,
     open_cluster_dfs_service_with_peer_transports_for_nodes,
     open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state,
+    open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state_until_cancelled,
     publish_dfs_metadata_journal_with_host,
     refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport,
 };
@@ -181,6 +182,7 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport(
         None,
         DfsMaintenanceExecutionExclusions::default(),
         None,
+        None,
         control_plane,
         options,
     )
@@ -240,6 +242,7 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_deta
         Some(detached_send_state),
         execution_exclusions,
         None,
+        None,
         control_plane,
         options,
     )
@@ -274,6 +277,43 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_deta
         Some(detached_send_state),
         execution_exclusions,
         Some(committed_work_tracker),
+        None,
+        control_plane,
+        options,
+    )
+    .await
+}
+
+/// Run cluster DFS maintenance with cooperative cancellation during the
+/// synchronous recovery hydrate which precedes the async maintenance phases.
+///
+/// Cancellation leaves the partially hydrated service owned by this call and
+/// destroys it before returning. Durable recovery mutations are replay-safe;
+/// the caller-retained committed-work tracker preserves any follow-up edges.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions_and_committed_work_tracker_until_hydration_cancelled(
+    runtime: &tokio::runtime::Handle,
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    sync_peer_transport: Arc<dyn DfsPeerTransport>,
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    detached_send_state: DfsNodeDetachedSendState,
+    execution_exclusions: DfsMaintenanceExecutionExclusions,
+    committed_work_tracker: DfsCommittedWorkTracker,
+    should_cancel_hydration: &(dyn Fn() -> bool + Sync),
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    options: DfsMaintenanceTickOptions,
+) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
+    run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional_detached_state(
+        runtime,
+        data_dir,
+        cluster_paths,
+        sync_peer_transport,
+        peer_transport,
+        Some(detached_send_state),
+        execution_exclusions,
+        Some(committed_work_tracker),
+        Some(should_cancel_hydration),
         control_plane,
         options,
     )
@@ -290,6 +330,7 @@ async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional
     detached_send_state: Option<DfsNodeDetachedSendState>,
     execution_exclusions: DfsMaintenanceExecutionExclusions,
     committed_work_tracker: Option<DfsCommittedWorkTracker>,
+    should_cancel_hydration: Option<&(dyn Fn() -> bool + Sync)>,
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
     options: DfsMaintenanceTickOptions,
 ) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
@@ -314,8 +355,27 @@ async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional
     let file_system = distributed_sifs(local_node_id.clone());
     let metadata_shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
     let peer_node_ids = cluster_dfs_peer_node_ids(&state);
-    let mut service = match detached_send_state {
-        Some(detached_send_state) => {
+    let mut service = match (detached_send_state, should_cancel_hydration) {
+        (Some(detached_send_state), Some(should_cancel_hydration)) => {
+            let Some(service) =
+                open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state_until_cancelled(
+                    &data_dir,
+                    &cluster_paths,
+                    local_node_id.clone(),
+                    peer_node_ids.clone(),
+                    sync_peer_transport,
+                    Arc::clone(&peer_transport),
+                    detached_send_state,
+                    control_plane,
+                    committed_work_tracker.clone(),
+                    should_cancel_hydration,
+                )?
+            else {
+                return Ok(None);
+            };
+            service
+        }
+        (Some(detached_send_state), None) => {
             open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state(
                 &data_dir,
                 &cluster_paths,
@@ -327,7 +387,7 @@ async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional
                 control_plane,
             )?
         }
-        None => open_cluster_dfs_service_with_peer_transports_for_nodes(
+        (None, _) => open_cluster_dfs_service_with_peer_transports_for_nodes(
             &data_dir,
             &cluster_paths,
             local_node_id.clone(),

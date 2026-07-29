@@ -180,7 +180,7 @@ fn skill_update_descriptor() -> AgentToolDescriptor {
     AgentToolDescriptor::new(AgentToolSpec::new(
         AgentToolKind::SkillUpdate,
         "skill_update",
-        "Persist a prompt-based improvement as a new catalog skill version from full SKILL.md markdown.",
+        "Persist a prompt-based improvement as a new catalog skill version from a complete Agent Skills-compliant SKILL.md.",
         true,
     ))
     .with_capabilities([AgentToolCapability::ManageSkills])
@@ -194,7 +194,7 @@ fn skill_update_descriptor() -> AgentToolDescriptor {
             },
             "markdown": {
                 "type": "string",
-                "description": "Full replacement SKILL.md content. Include portable frontmatter when possible."
+                "description": "Full replacement SKILL.md content with required Agent Skills name and description YAML frontmatter."
             },
             "version": {
                 "type": "string",
@@ -248,6 +248,11 @@ fn skill_entry_json(entry: &SkillCatalogEntry) -> serde_json::Value {
         "id": &entry.skill_id,
         "version": &entry.version,
         "description": &entry.description,
+        "license": &entry.license,
+        "compatibility": &entry.compatibility,
+        "allowed_tools": &entry.allowed_tools,
+        "metadata": &entry.metadata,
+        "resources": &entry.resources,
         "source": {
             "kind": entry.source.kind.as_str(),
             "id": &entry.source.source_id,

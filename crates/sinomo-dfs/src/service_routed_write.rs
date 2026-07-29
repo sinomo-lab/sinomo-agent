@@ -122,16 +122,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(None);
         }
         if let Some(expected_event_id) = routed_exclusive_create_event_id(command) {
-            let exact_create_is_still_visible =
-                match self.current_read_object_metadata(&command.request.object_id) {
-                    Ok(object) => {
-                        object.kind != DfsObjectKind::Tombstone
-                            && object.version == command.request.target_version
-                            && object.last_modified_by_event_id.as_ref() == Some(&expected_event_id)
-                    }
-                    Err(DfsError::UnknownObject { .. }) => false,
-                    Err(error) => return Err(error),
-                };
+            let object = command
+                .object_metadata
+                .as_ref()
+                .expect("exclusive-create replay identity requires object metadata");
+            let path_key = crate::posix_path::normalized_posix_path_key(&object.path)
+                .unwrap_or_else(|| object.path.clone());
+            // A successful exclusive create is replayable only while the exact
+            // object remains visible at the path carried by the request.
+            // Resolve that path through its authoritative shard instead of
+            // looking up a brand-new object id with no shard index. The latter
+            // falls back across every shard and makes cold creates pay for
+            // unrelated journal refreshes before their normal path check.
+            let exact_create_is_still_visible = self
+                .authoritative_metadata_object_for_path(&command.request.file_system_id, &path_key)?
+                .is_some_and(|visible| {
+                    visible.object_id == command.request.object_id
+                        && visible.kind != DfsObjectKind::Tombstone
+                        && visible.version == command.request.target_version
+                        && visible.last_modified_by_event_id.as_ref() == Some(&expected_event_id)
+                });
             if !exact_create_is_still_visible {
                 return Ok(None);
             }

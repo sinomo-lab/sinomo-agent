@@ -69,6 +69,16 @@ pub fn daemon_sifs(address: impl Into<String>) -> Result<VfsHandle> {
     VfsHandle::new(Arc::new(DaemonSifsVfsBackend::new(address.into())), "/")
 }
 
+pub fn daemon_sifs_with_timeout(
+    address: impl Into<String>,
+    timeout: Duration,
+) -> Result<VfsHandle> {
+    VfsHandle::new(
+        Arc::new(DaemonSifsVfsBackend::new(address.into()).with_timeout(timeout)),
+        "/",
+    )
+}
+
 /// How mounted-SIFS reads resolve.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MountedSifsReadMode {

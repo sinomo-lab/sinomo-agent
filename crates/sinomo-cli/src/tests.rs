@@ -6072,7 +6072,7 @@ fn agent_readiness_parser_accepts_json() {
 }
 
 #[test]
-fn skill_parsers_accept_markdown_catalog_management_options() {
+fn skill_parsers_accept_agent_skills_package_management_options() {
     assert_eq!(
         super::parse_skill_list_schema_for_test(&["--all".to_string(), "--json".to_string()])
             .expect("skill list"),
@@ -6126,14 +6126,14 @@ fn skill_parsers_accept_markdown_catalog_management_options() {
         super::parse_skill_export_schema_for_test(&[
             "rust-debug".to_string(),
             "--output".to_string(),
-            "SKILL.md".to_string(),
+            "exported-skills".to_string(),
             "--json".to_string(),
         ])
         .expect("skill export"),
         SkillExportOptions {
             skill_id: "rust-debug".to_string(),
             version: None,
-            output: Some(PathBuf::from("SKILL.md")),
+            output: Some(PathBuf::from("exported-skills")),
             json: true,
         }
     );

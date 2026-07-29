@@ -1,3 +1,8 @@
+---
+name: file-transfer
+description: Single-session streaming remote file transfer guidance.
+---
+
 # Remote Management File Transfer
 
 Use the path-oriented `remote_file_get` and `remote_file_put` tools for complete
