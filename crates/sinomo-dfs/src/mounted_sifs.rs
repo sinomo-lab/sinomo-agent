@@ -22,7 +22,7 @@ use crate::{
     DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
     DfsPeerTransportFuture, DfsPosixError, NetworkedDfsService, cluster_dfs_peer_node_ids,
     content_services_prefix, fallback_dfs_node_id,
-    open_cluster_dfs_service_with_peer_transports_for_nodes,
+    open_cluster_dfs_service_with_peer_transports_for_nodes_lazy,
 };
 
 pub type MountedSifsService = NetworkedDfsService<DfsNodeTransport>;
@@ -260,7 +260,12 @@ fn open_mounted_sifs_service_from_context(
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
     cancellation: Option<crate::DfsCancellationFlag>,
 ) -> Result<OpenedMountedSifsService, DfsError> {
-    let mut service = open_cluster_dfs_service_with_peer_transports_for_nodes(
+    // A mounted client does not own maintenance or recovery. Hydrate only the
+    // filesystem records needed to route canonical operations; path/object
+    // metadata remains authoritative in the backend and is loaded on demand.
+    // Full metadata hydration here made every short-lived app/CLI catalog load
+    // scan the entire local SIFS replica before its first distributed read.
+    let mut service = open_cluster_dfs_service_with_peer_transports_for_nodes_lazy(
         data_dir,
         cluster_paths,
         local_node_id.clone(),

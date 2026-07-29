@@ -18,6 +18,7 @@ use crate::{
 #[derive(Clone, Copy)]
 enum ClusterDfsServiceHydration {
     Foreground,
+    Lazy,
     CommitPromotionRecovery,
 }
 
@@ -98,6 +99,29 @@ pub(crate) fn open_cluster_dfs_service_with_peer_transports_for_nodes(
         async_peer_transport,
         DfsNodeDetachedSendState::default(),
         control_plane,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn open_cluster_dfs_service_with_peer_transports_for_nodes_lazy(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    local_node_id: NodeId,
+    peer_node_ids: Vec<NodeId>,
+    peer_transport: Arc<dyn DfsPeerTransport>,
+    async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsError> {
+    open_cluster_dfs_service_with_peer_transports_for_nodes_and_state(
+        data_dir,
+        cluster_paths,
+        local_node_id,
+        peer_node_ids,
+        peer_transport,
+        async_peer_transport,
+        DfsNodeDetachedSendState::default(),
+        control_plane,
+        ClusterDfsServiceHydration::Lazy,
     )
 }
 
@@ -220,6 +244,7 @@ fn open_cluster_dfs_service_with_peer_transports_for_nodes_and_state(
     let metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
     match hydration {
         ClusterDfsServiceHydration::Foreground => service.with_boxed_metadata_backend(metadata),
+        ClusterDfsServiceHydration::Lazy => service.with_boxed_metadata_backend_lazy(metadata),
         ClusterDfsServiceHydration::CommitPromotionRecovery => {
             service.with_boxed_metadata_backend_for_commit_promotion_recovery(metadata)
         }

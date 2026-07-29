@@ -118,6 +118,7 @@ pub(crate) use cluster_service::{
     open_cluster_dfs_service_with_peer_transports_for_nodes,
     open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state,
     open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state_until_cancelled,
+    open_cluster_dfs_service_with_peer_transports_for_nodes_lazy,
 };
 pub(crate) use content_store::content_hash;
 pub use content_store::{
