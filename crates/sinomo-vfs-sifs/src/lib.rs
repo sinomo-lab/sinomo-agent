@@ -6,7 +6,8 @@
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use sinomo_core::network::ObjectRpcRequest;
+use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network::{ClusterPaths, ObjectRpcRequest};
 pub use sinomo_dfs::DfsCancellationFlag;
 use sinomo_dfs::{
     DfsDirEntry, DfsDirectoryPageCursor, DfsObjectId, DfsObjectKind, DfsPosixError, DfsStat,
@@ -25,27 +26,6 @@ pub fn mounted_sifs(data_dir: Option<PathBuf>) -> Result<VfsHandle> {
     VfsHandle::new(Arc::new(MountedSifsVfsBackend::open(data_dir)?), "/")
 }
 
-/// Mounted SIFS serving reads from this node's local mirror: stat/list/read
-/// never route to peers or wait on distributed freshness, so they stay fast —
-/// and never burn CPU in retry loops — while the cluster/DFS link is degraded
-/// (a normal state on mobile devices). Writes still replicate normally.
-///
-/// Use for node-local catalog/config artifacts (agent definitions, skills)
-/// where a stale-but-instant answer beats blocking on cluster consensus; the
-/// local mirror converges through background replication.
-pub fn mounted_sifs_local_reads(data_dir: Option<PathBuf>) -> Result<VfsHandle> {
-    VfsHandle::new(
-        Arc::new(MountedSifsVfsBackend::open_with_options(
-            data_dir,
-            MountedSifsOpenOptions {
-                read_mode: MountedSifsReadMode::LocalMirror,
-                cancellation: None,
-            },
-        )?),
-        "/",
-    )
-}
-
 /// Mounted SIFS with a cooperative cancellation flag: budgeted callers flip the
 /// flag to make in-flight and subsequent distributed operations return a
 /// `Cancelled` error promptly instead of running out their network timeouts.
@@ -57,7 +37,6 @@ pub fn mounted_sifs_with_cancellation(
         Arc::new(MountedSifsVfsBackend::open_with_options(
             data_dir,
             MountedSifsOpenOptions {
-                read_mode: MountedSifsReadMode::Distributed,
                 cancellation: Some(cancellation),
             },
         )?),
@@ -79,27 +58,14 @@ pub fn daemon_sifs_with_timeout(
     )
 }
 
-/// How mounted-SIFS reads resolve.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum MountedSifsReadMode {
-    /// Route through distributed freshness/consensus machinery (full SIFS
-    /// semantics; can wait on peers).
-    #[default]
-    Distributed,
-    /// Serve stat/list/read from the local metadata/content mirror only.
-    LocalMirror,
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct MountedSifsOpenOptions {
-    pub read_mode: MountedSifsReadMode,
     pub cancellation: Option<DfsCancellationFlag>,
 }
 
 #[derive(Debug)]
 pub struct MountedSifsVfsBackend {
     opened: Mutex<OpenedMountedSifsService>,
-    read_mode: MountedSifsReadMode,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -118,21 +84,48 @@ impl MountedSifsVfsBackend {
         data_dir: Option<PathBuf>,
         options: MountedSifsOpenOptions,
     ) -> Result<Self> {
-        let opened =
-            sinomo_dfs::open_mounted_sifs_service_with_cancellation(data_dir, options.cancellation)
-                .map_err(|source| VfsError::Backend {
+        let data_dir = match data_dir {
+            Some(path) => SinomoDataDir::new(path),
+            None => SinomoDataDir::from_env_or_home().map_err(|source| VfsError::Backend {
+                backend: "mounted-sifs".to_string(),
+                path: "/".to_string(),
+                detail: source.to_string(),
+            })?,
+        };
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let opened = if cluster_paths.state.exists() {
+            let peer_transport = Arc::new(
+                sinomo_api::DaemonDfsPeerTransport::connect(data_dir.clone()).map_err(|source| {
+                    VfsError::Backend {
+                        backend: "mounted-sifs".to_string(),
+                        path: "/".to_string(),
+                        detail: source.to_string(),
+                    }
+                })?,
+            );
+            let sync_peer_transport: Arc<dyn sinomo_dfs::DfsPeerTransport> =
+                peer_transport.clone();
+            let async_peer_transport: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = peer_transport;
+            sinomo_dfs::open_mounted_sifs_service_with_peer_transports_and_default_control_plane_and_cancellation(
+                data_dir,
+                sync_peer_transport,
+                async_peer_transport,
+                options.cancellation,
+            )
+        } else {
+            sinomo_dfs::open_mounted_sifs_service_with_cancellation(
+                Some(data_dir.root()),
+                options.cancellation,
+            )
+        }
+        .map_err(|source| VfsError::Backend {
                     backend: "mounted-sifs".to_string(),
                     path: "/".to_string(),
                     detail: source.to_string(),
                 })?;
         Ok(Self {
             opened: Mutex::new(opened),
-            read_mode: options.read_mode,
         })
-    }
-
-    fn local_reads(&self) -> bool {
-        self.read_mode == MountedSifsReadMode::LocalMirror
     }
 
     fn lock(&self, path: &str) -> Result<std::sync::MutexGuard<'_, OpenedMountedSifsService>> {
@@ -143,16 +136,8 @@ impl MountedSifsVfsBackend {
         })
     }
 
-    fn stat_exists(
-        opened: &mut OpenedMountedSifsService,
-        path: &str,
-        local_reads: bool,
-    ) -> Result<bool> {
-        let stat = if local_reads {
-            opened.service.posix_stat(path)
-        } else {
-            opened.service.posix_stat_distributed(path)
-        };
+    fn stat_exists(opened: &mut OpenedMountedSifsService, path: &str) -> Result<bool> {
+        let stat = opened.service.posix_stat_distributed(path);
         match stat {
             Ok(_) => Ok(true),
             Err(DfsPosixError::NotFound { .. }) => Ok(false),
@@ -168,23 +153,19 @@ impl VfsBackend for MountedSifsVfsBackend {
 
     fn stat(&self, path: &str) -> Result<VfsMetadata> {
         let mut opened = self.lock(path)?;
-        let stat = if self.local_reads() {
-            opened.service.posix_stat(path)
-        } else {
-            opened.service.posix_stat_distributed(path)
-        }
-        .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
+        let stat = opened
+            .service
+            .posix_stat_distributed(path)
+            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
         Ok(metadata_from_dfs_stat(stat))
     }
 
     fn lstat(&self, path: &str) -> Result<VfsMetadata> {
         let mut opened = self.lock(path)?;
-        let stat = if self.local_reads() {
-            opened.service.posix_namespace_lstat(path)
-        } else {
-            opened.service.posix_namespace_lstat_distributed(path)
-        }
-        .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
+        let stat = opened
+            .service
+            .posix_namespace_lstat_distributed(path)
+            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
         Ok(metadata_from_dfs_stat(stat))
     }
 
@@ -199,12 +180,10 @@ impl VfsBackend for MountedSifsVfsBackend {
 
     fn list(&self, path: &str) -> Result<Vec<VfsDirEntry>> {
         let mut opened = self.lock(path)?;
-        let entries = if self.local_reads() {
-            opened.service.posix_list_dir(path)
-        } else {
-            opened.service.posix_list_dir_distributed(path)
-        }
-        .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
+        let entries = opened
+            .service
+            .posix_list_dir_distributed(path)
+            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
         Ok(entries.into_iter().map(dir_entry_from_dfs).collect())
     }
 
@@ -218,16 +197,10 @@ impl VfsBackend for MountedSifsVfsBackend {
             .map(|cursor| decode_directory_cursor(path, cursor))
             .transpose()?;
         let mut opened = self.lock(path)?;
-        let page = if self.local_reads() {
-            opened
-                .service
-                .posix_list_dir_page(path, after.as_ref(), max_entries)
-        } else {
-            opened
-                .service
-                .posix_list_dir_distributed_page(path, after.as_ref(), max_entries)
-        }
-        .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
+        let page = opened
+            .service
+            .posix_list_dir_distributed_page(path, after.as_ref(), max_entries)
+            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
         Ok(VfsBackendDirectoryPage {
             directory_metadata: None,
             entries: page.entries.into_iter().map(dir_entry_from_dfs).collect(),
@@ -287,34 +260,26 @@ impl VfsBackend for MountedSifsVfsBackend {
 
     fn read(&self, path: &str) -> Result<Vec<u8>> {
         let mut opened = self.lock(path)?;
-        if self.local_reads() {
-            opened.service.posix_read_file(path)
-        } else {
-            opened.service.posix_read_file_distributed(path)
-        }
-        .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))
+        opened
+            .service
+            .posix_read_file_distributed(path)
+            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))
     }
 
     fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<VfsFileRead> {
         let mut opened = self.lock(path)?;
-        let stat = if self.local_reads() {
-            opened.service.posix_stat(path)
-        } else {
-            opened.service.posix_stat_distributed(path)
-        }
-        .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
+        let stat = opened
+            .service
+            .posix_stat_distributed(path)
+            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
         let length = usize::try_from(max_bytes).map_err(|_| VfsError::InvalidPath {
             path: path.to_string(),
             detail: "read prefix length does not fit this platform".to_string(),
         })?;
-        let bytes = if self.local_reads() {
-            opened.service.posix_read_file_range(path, 0, length)
-        } else {
-            opened
-                .service
-                .posix_read_file_range_distributed(path, 0, length)
-        }
-        .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
+        let bytes = opened
+            .service
+            .posix_read_file_range_distributed(path, 0, length)
+            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
         Ok(VfsFileRead {
             bytes,
             truncated: stat.size_bytes.unwrap_or(0) > max_bytes,
@@ -369,13 +334,7 @@ impl VfsBackend for MountedSifsVfsBackend {
     fn write(&self, path: &str, bytes: &[u8], options: &VfsWriteOptions) -> Result<()> {
         let mut opened = self.lock(path)?;
         if options.create_mode != VfsCreateMode::CreateNew {
-            enforce_sifs_create_mode(
-                &mut opened,
-                path,
-                options,
-                self.backend_name(),
-                self.local_reads(),
-            )?;
+            enforce_sifs_create_mode(&mut opened, path, options, self.backend_name())?;
         }
         let mut candidates = if options.durability == VfsWriteDurability::Local {
             vec![opened.service.node_id().clone()]
@@ -811,9 +770,8 @@ fn enforce_sifs_create_mode(
     path: &str,
     options: &VfsWriteOptions,
     backend: &str,
-    local_reads: bool,
 ) -> Result<()> {
-    let exists = MountedSifsVfsBackend::stat_exists(opened, path, local_reads)?;
+    let exists = MountedSifsVfsBackend::stat_exists(opened, path)?;
     enforce_create_mode(path, exists, options).map_err(|source| match source {
         VfsError::Conflict { path, detail } => VfsError::Backend {
             backend: backend.to_string(),
@@ -995,49 +953,35 @@ mod tests {
     }
 
     #[test]
-    fn local_mirror_reads_serve_same_node_writes() {
-        let root = temp_data_dir("local-mirror");
-        let distributed = mounted_sifs(Some(root.clone())).expect("open distributed handle");
-        distributed
+    fn mounted_sifs_reopened_handle_serves_same_node_writes() {
+        let root = temp_data_dir("reopened-handle");
+        let writer = mounted_sifs(Some(root.clone())).expect("open writer");
+        writer
             .create_dir_all("catalog")
             .expect("create catalog dir");
-        distributed
+        writer
             .write_with_options(
                 "catalog/entry.json",
                 b"{\"id\":1}".to_vec(),
                 VfsWriteOptions::service_artifact(),
             )
-            .expect("write through distributed handle");
-        drop(distributed);
+            .expect("write through writer handle");
+        drop(writer);
 
-        let local = mounted_sifs_local_reads(Some(root.clone())).expect("open local-reads handle");
+        let reader = mounted_sifs(Some(root.clone())).expect("open reader");
         assert_eq!(
-            local.read("catalog/entry.json").expect("local read"),
+            reader.read("catalog/entry.json").expect("read"),
             b"{\"id\":1}".to_vec(),
-            "local mirror should serve data written on this node"
+            "a reopened mounted-SIFS handle should serve current data"
         );
-        let names = local
+        let names = reader
             .list_if_exists("catalog")
-            .expect("local list")
+            .expect("list")
             .into_iter()
             .map(|entry| entry.name)
             .collect::<Vec<_>>();
         assert!(names.contains(&"entry.json".to_string()), "{names:?}");
-        assert!(local.stat("catalog/entry.json").is_ok());
-
-        // Writes through a local-reads handle keep working (they replicate
-        // normally); only the read side is pinned to the local mirror.
-        local
-            .write_with_options(
-                "catalog/second.json",
-                b"{}".to_vec(),
-                VfsWriteOptions::service_artifact(),
-            )
-            .expect("write through local-reads handle");
-        assert_eq!(
-            local.read("catalog/second.json").expect("read own write"),
-            b"{}".to_vec()
-        );
+        assert!(reader.stat("catalog/entry.json").is_ok());
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1058,7 +1002,7 @@ mod tests {
         }
         drop(setup);
 
-        let handle = mounted_sifs_local_reads(Some(root.clone())).expect("open local handle");
+        let handle = mounted_sifs(Some(root.clone())).expect("open handle");
         let mut cursor = None;
         let mut names = Vec::new();
         let mut page_sizes = Vec::new();
@@ -1135,7 +1079,7 @@ mod tests {
             "unexpected losing create: {loser}"
         );
 
-        let reader = mounted_sifs_local_reads(Some(root.clone())).expect("open reader");
+        let reader = mounted_sifs(Some(root.clone())).expect("open reader");
         let contents = reader.read("notes/shared.md").expect("read winner");
         assert!(contents == b"left" || contents == b"right", "{contents:?}");
         let _ = std::fs::remove_dir_all(root);

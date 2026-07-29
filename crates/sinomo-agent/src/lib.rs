@@ -1650,12 +1650,7 @@ impl AgentCatalog {
         data_dir: &sinomo_runtime::local::SinomoDataDir,
     ) -> Result<Self, AgentCatalogError> {
         let mut catalog = Self::built_ins();
-        // Catalog reads serve this node's local SIFS mirror: definitions are
-        // node-local config converged by background replication, and routing
-        // reads through distributed freshness wedged every catalog consumer
-        // (and burned CPU in retry loops) whenever the cluster link degraded —
-        // a normal state on mobile devices.
-        let store = AgentDefinitionSifsStore::open_local_reads(Some(data_dir.root()))?;
+        let store = AgentDefinitionSifsStore::open(Some(data_dir.root()))?;
         for definition in store.load_definitions()? {
             catalog.upsert(definition)?;
         }
@@ -1731,14 +1726,6 @@ pub struct AgentDefinitionSifsStore {
 impl AgentDefinitionSifsStore {
     pub fn open(data_dir: Option<PathBuf>) -> Result<Self, AgentDefinitionStoreError> {
         Self::open_with_handle(sinomo_runtime::vfs::mounted_sifs(data_dir))
-    }
-
-    /// Open with reads served from the local SIFS mirror (no distributed
-    /// routing). The right mode for loading definitions: instant and immune to
-    /// a degraded cluster link, at the cost of foreign-node saves appearing
-    /// only once background replication lands. Writes still replicate.
-    pub fn open_local_reads(data_dir: Option<PathBuf>) -> Result<Self, AgentDefinitionStoreError> {
-        Self::open_with_handle(sinomo_runtime::vfs::mounted_sifs_local_reads(data_dir))
     }
 
     fn open_with_handle(
@@ -3660,26 +3647,24 @@ mod tests {
     }
 
     #[test]
-    fn local_reads_store_serves_definitions_saved_through_the_distributed_store() {
-        let root = sinomo_testdir::TestDir::new("sinomo-agent-definition-store-local");
+    fn agent_catalog_loads_definitions_from_mounted_sifs() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-definition-store-catalog");
         let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
         let writer = AgentDefinitionSifsStore::open(Some(data_dir.root())).expect("open writer");
         let definition =
-            AgentDefinition::custom("local-agent", AgentRole::Deliberation, "Stay local.");
+            AgentDefinition::custom("catalog-agent", AgentRole::Deliberation, "Stay consistent.");
         writer.save_definition(&definition).expect("save");
 
-        // The read path used by catalog loads pins reads to the local SIFS
-        // mirror so a degraded cluster link cannot wedge or spin it.
-        let reader = AgentDefinitionSifsStore::open_local_reads(Some(data_dir.root()))
-            .expect("open local-reads store");
+        let reader =
+            AgentDefinitionSifsStore::open(Some(data_dir.root())).expect("open reader store");
         let loaded = reader.load_definitions().expect("load definitions");
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].key(), "local-agent");
+        assert_eq!(loaded[0].key(), "catalog-agent");
 
         let catalog = AgentCatalog::load_from_data_dir(&data_dir).expect("catalog load");
         assert!(
-            catalog.get("local-agent").is_some(),
-            "catalog load (local reads) should surface the stored definition"
+            catalog.get("catalog-agent").is_some(),
+            "catalog load should surface the mounted-SIFS definition"
         );
     }
 

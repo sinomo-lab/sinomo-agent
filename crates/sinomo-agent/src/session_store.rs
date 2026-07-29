@@ -12,7 +12,7 @@ use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::vfs::{
     VfsAppendOptions, VfsDirectoryCursor, VfsError, VfsHandle, VfsObjectKind, VfsRemoveOptions,
-    VfsWriteOptions, mounted_sifs_local_reads,
+    VfsWriteOptions, mounted_sifs,
 };
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -974,7 +974,7 @@ impl FileAgentSessionStore {
             return Some(store.clone());
         }
         let data_dir = self.roaming_activity_data_dir.clone()?;
-        let vfs = mounted_sifs_local_reads(Some(data_dir)).ok()?;
+        let vfs = mounted_sifs(Some(data_dir)).ok()?;
         let store = AgentTaskActivityProjectionStore::from_vfs(vfs);
         *cached = Some(store.clone());
         Some(store)

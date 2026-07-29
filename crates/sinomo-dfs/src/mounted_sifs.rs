@@ -148,6 +148,25 @@ pub fn open_mounted_sifs_service_with_peer_transports_and_default_control_plane(
     sync_peer_transport: Arc<dyn DfsPeerTransport>,
     async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
 ) -> Result<OpenedMountedSifsService, DfsError> {
+    open_mounted_sifs_service_with_peer_transports_and_default_control_plane_and_cancellation(
+        data_dir,
+        sync_peer_transport,
+        async_peer_transport,
+        None,
+    )
+}
+
+/// Like [`open_mounted_sifs_service_with_peer_transports_and_default_control_plane`],
+/// with a cooperative cancellation flag installed before namespace bootstrap.
+///
+/// Budgeted application mounts use this entry point so abandoning catalog
+/// hydration also cancels the daemon-backed distributed work it started.
+pub fn open_mounted_sifs_service_with_peer_transports_and_default_control_plane_and_cancellation(
+    data_dir: SinomoDataDir,
+    sync_peer_transport: Arc<dyn DfsPeerTransport>,
+    async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    cancellation: Option<crate::DfsCancellationFlag>,
+) -> Result<OpenedMountedSifsService, DfsError> {
     let (cluster_paths, cluster_state, local_node_id, peer_node_ids) =
         mounted_sifs_cluster_context(&data_dir)?;
     let control_plane = cluster_paths.kv_paths().snapshot.exists().then(|| {
@@ -165,7 +184,7 @@ pub fn open_mounted_sifs_service_with_peer_transports_and_default_control_plane(
         sync_peer_transport,
         async_peer_transport,
         control_plane,
-        None,
+        cancellation,
     )
 }
 

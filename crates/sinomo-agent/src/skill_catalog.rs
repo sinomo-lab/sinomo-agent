@@ -1663,12 +1663,7 @@ impl SkillCatalogSifsStore {
     }
 
     pub fn open(data_dir: Option<PathBuf>) -> Result<Self, SkillCatalogError> {
-        // Skill catalog reads serve this node's local SIFS mirror: catalog and
-        // activation state are node-local config converged by background
-        // replication, and distributed-freshness reads wedged every consumer
-        // (and burned CPU in retry loops) whenever the cluster link degraded —
-        // a normal state on mobile devices. Writes still replicate normally.
-        let vfs = sinomo_runtime::vfs::mounted_sifs_local_reads(data_dir).map_err(|source| {
+        let vfs = sinomo_runtime::vfs::mounted_sifs(data_dir).map_err(|source| {
             SkillCatalogError::Store {
                 path: SKILL_CATALOG_SIFS_ROOT.to_string(),
                 detail: source.to_string(),
