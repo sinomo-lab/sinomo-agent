@@ -200,6 +200,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if should_cancel() {
             return Ok(false);
         }
+        self.metadata_backend
+            .as_deref_mut()
+            .expect("metadata backend checked above")
+            .begin_consistent_read_snapshot()?;
+        let result = self
+            .hydrate_from_consistent_metadata_snapshot_with_promotion_recovery_until_cancelled(
+                reconstruct_commit_promotions,
+                should_cancel,
+            );
+        self.metadata_backend
+            .as_deref_mut()
+            .expect("metadata backend remains installed during hydration")
+            .end_consistent_read_snapshot();
+        result
+    }
+
+    fn hydrate_from_consistent_metadata_snapshot_with_promotion_recovery_until_cancelled(
+        &mut self,
+        reconstruct_commit_promotions: bool,
+        should_cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<bool, DfsError> {
         #[cfg(test)]
         FULL_METADATA_HYDRATION_CALLS.set(FULL_METADATA_HYDRATION_CALLS.get().saturating_add(1));
 

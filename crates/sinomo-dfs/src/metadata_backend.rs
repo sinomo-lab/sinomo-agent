@@ -1748,6 +1748,7 @@ pub struct LocalSobjMetadataBackend {
     instance_authority_epoch: Option<u64>,
     table_snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
     read_snapshot_cache: Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
+    consistent_read_snapshot_depth: usize,
     #[cfg(test)]
     receipt_scan_counters: Arc<MetadataReceiptScanCounters>,
 }
@@ -1780,6 +1781,7 @@ impl LocalSobjMetadataBackend {
             instance_authority_epoch: None,
             table_snapshot_fingerprint: None,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
+            consistent_read_snapshot_depth: 0,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
         };
@@ -1897,6 +1899,7 @@ impl LocalSobjMetadataBackend {
             instance_authority_epoch: None,
             table_snapshot_fingerprint: state.snapshot_fingerprint,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
+            consistent_read_snapshot_depth: 0,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
         })
@@ -1946,6 +1949,7 @@ impl LocalSobjMetadataBackend {
             instance_authority_epoch: None,
             table_snapshot_fingerprint: state.snapshot_fingerprint,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
+            consistent_read_snapshot_depth: 0,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
         };
@@ -2279,6 +2283,7 @@ impl LocalSobjMetadataBackend {
             instance_authority_epoch: None,
             table_snapshot_fingerprint: None,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
+            consistent_read_snapshot_depth: 0,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
         };
@@ -4645,6 +4650,9 @@ impl LocalSobjMetadataBackend {
                 .get()
                 .saturating_add(1),
         );
+        if self.consistent_read_snapshot_depth > 0 {
+            return Ok(DfsMetadataTablesSnapshot::Borrowed(&self.tables));
+        }
         metadata_read_snapshot::current_tables_snapshot(
             &self.root,
             &self.tables,
@@ -4652,6 +4660,22 @@ impl LocalSobjMetadataBackend {
             self.materialized_through_sequence,
             &self.table_snapshot_fingerprint,
             &self.read_snapshot_cache,
+        )
+    }
+
+    pub(crate) fn cached_table_generation(
+        &self,
+    ) -> (
+        u64,
+        u64,
+        Option<MetadataTableSnapshotFingerprint>,
+        Option<DfsMetadataPrefixProof>,
+    ) {
+        (
+            self.table_log_offset,
+            self.materialized_through_sequence,
+            self.table_snapshot_fingerprint.clone(),
+            self.prefix_proof.clone(),
         )
     }
 
@@ -4979,6 +5003,19 @@ impl LocalSobjMetadataBackend {
 }
 
 impl DfsMetadataBackend for LocalSobjMetadataBackend {
+    fn begin_consistent_read_snapshot(&mut self) -> Result<()> {
+        if self.consistent_read_snapshot_depth == 0 {
+            let _lock = self.metadata_write_lock()?;
+            self.refresh_after_metadata_write_lock()?;
+        }
+        self.consistent_read_snapshot_depth = self.consistent_read_snapshot_depth.saturating_add(1);
+        Ok(())
+    }
+
+    fn end_consistent_read_snapshot(&mut self) {
+        self.consistent_read_snapshot_depth = self.consistent_read_snapshot_depth.saturating_sub(1);
+    }
+
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry> {
         let _lock = self.begin_metadata_write()?;
         self.write_journal_entry_and_apply_table_ops_unlocked(
@@ -14975,6 +15012,59 @@ mod tests {
             "sequential external reads should reuse the cached table allocation"
         );
         assert!(second_offset > first_offset);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_consistent_read_snapshot_polls_once_and_resumes_external_freshness() {
+        let root = temp_root("local_backend_consistent_read_snapshot");
+        let mut writer =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("writer backend");
+        writer.put_file_system(&file_system()).expect("filesystem");
+        let mut reader =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("reader backend");
+
+        reader
+            .begin_consistent_read_snapshot()
+            .expect("pin consistent read snapshot");
+        crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+        for _ in 0..128 {
+            assert_eq!(
+                reader.get_object(&object_id()).expect("pinned lookup"),
+                None
+            );
+        }
+        assert_eq!(
+            crate::metadata_read_snapshot::metadata_durable_table_probes(),
+            0,
+            "bulk reads inside one coherent snapshot must not poll durable table files per record"
+        );
+
+        let external = object(version("version_external"));
+        writer.put_object(&external).expect("external object");
+        assert_eq!(
+            reader
+                .get_object(&external.object_id)
+                .expect("pinned external lookup"),
+            None,
+            "the bounded read scope must retain its coherent starting generation"
+        );
+        crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+        reader.end_consistent_read_snapshot();
+        assert_eq!(
+            reader
+                .get_object(&external.object_id)
+                .expect("fresh external lookup"),
+            Some(external),
+            "ordinary cross-process freshness checks must resume after hydration"
+        );
+        assert_eq!(
+            crate::metadata_read_snapshot::metadata_durable_table_probes(),
+            1
+        );
 
         cleanup(&root);
     }

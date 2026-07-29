@@ -739,6 +739,40 @@ impl LocalShardedMetadataBackend {
         Ok(())
     }
 
+    fn refresh_metadata_shard_durable_view_and_reconcile(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        reconcile_unchanged: bool,
+    ) -> Result<bool> {
+        let generation_before = self.shard_backend(shard_id)?.cached_table_generation();
+        let mut affected_object_ids = self
+            .shard_backend(shard_id)?
+            .export_table_snapshot()
+            .tables
+            .into_iter()
+            .flat_map(|tables| tables.objects)
+            .map(|object| object.object_id)
+            .collect::<BTreeSet<_>>();
+        self.shard_backend_mut(shard_id)?
+            .refresh_metadata_shard_durable_view(shard_id)?;
+        let changed = self.shard_backend(shard_id)?.cached_table_generation() != generation_before;
+        if !changed && !reconcile_unchanged {
+            return Ok(false);
+        }
+        affected_object_ids.extend(
+            self.shard_backend(shard_id)?
+                .export_table_snapshot()
+                .tables
+                .into_iter()
+                .flat_map(|tables| tables.objects)
+                .map(|object| object.object_id),
+        );
+        self.begin_consistent_read_snapshot()?;
+        let result = self.reconcile_object_shard_indexes(affected_object_ids.iter());
+        self.end_consistent_read_snapshot();
+        result.map(|()| changed)
+    }
+
     fn indexed_shard_id_for_object(
         &self,
         object_id: &DfsObjectId,
@@ -1317,6 +1351,33 @@ impl LocalShardedMetadataBackend {
 }
 
 impl DfsMetadataBackend for LocalShardedMetadataBackend {
+    fn begin_consistent_read_snapshot(&mut self) -> Result<()> {
+        let shard_ids = self.shards.keys().cloned().collect::<Vec<_>>();
+        for (index, shard_id) in shard_ids.iter().enumerate() {
+            let begin = self
+                .shards
+                .get_mut(shard_id)
+                .expect("collected shard id remains installed")
+                .begin_consistent_read_snapshot();
+            if let Err(error) = begin {
+                for pinned_shard_id in &shard_ids[..index] {
+                    self.shards
+                        .get_mut(pinned_shard_id)
+                        .expect("pinned shard remains installed")
+                        .end_consistent_read_snapshot();
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn end_consistent_read_snapshot(&mut self) {
+        for backend in self.shards.values_mut() {
+            backend.end_consistent_read_snapshot();
+        }
+    }
+
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry> {
         let shard_ids = self.configured_shard_ids_for_file_system(&file_system.file_system_id)?;
         let mut last_entry = None;
@@ -4043,25 +4104,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn refresh_metadata_shard_durable_view(&mut self, shard_id: &DfsMetadataShardId) -> Result<()> {
-        let mut affected_object_ids = self
-            .shard_backend(shard_id)?
-            .export_table_snapshot()
-            .tables
-            .into_iter()
-            .flat_map(|tables| tables.objects)
-            .map(|object| object.object_id)
-            .collect::<BTreeSet<_>>();
-        self.shard_backend_mut(shard_id)?
-            .refresh_metadata_shard_durable_view(shard_id)?;
-        affected_object_ids.extend(
-            self.shard_backend(shard_id)?
-                .export_table_snapshot()
-                .tables
-                .into_iter()
-                .flat_map(|tables| tables.objects)
-                .map(|object| object.object_id),
-        );
-        self.reconcile_object_shard_indexes(affected_object_ids.iter())
+        self.refresh_metadata_shard_durable_view_and_reconcile(shard_id, true)?;
+        Ok(())
+    }
+
+    fn refresh_metadata_shard_durable_view_if_changed(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<bool> {
+        self.refresh_metadata_shard_durable_view_and_reconcile(shard_id, false)
     }
 
     fn metadata_shard_write_freeze(

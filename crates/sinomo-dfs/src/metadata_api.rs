@@ -208,6 +208,21 @@ pub(crate) fn namespace_prepare_expectations_from_lookups(
 /// scans as primitives so service and operator code can walk large namespaces
 /// without materializing every record class at once.
 pub trait DfsMetadataBackend: std::fmt::Debug + Send {
+    /// Pin one coherent in-memory metadata generation for a bounded bulk read.
+    ///
+    /// Full-catalog hydration calls many paging and point-read methods through
+    /// this trait. Durable local backends may refresh once at the start of the
+    /// scope and then serve those reads from that generation instead of
+    /// polling the same snapshot, log, and checkpoint files for every record.
+    /// Implementations must resume ordinary freshness checks after the
+    /// matching end call.
+    fn begin_consistent_read_snapshot(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// End one bounded coherent-read scope opened above.
+    fn end_consistent_read_snapshot(&mut self) {}
+
     /// Create or replace a filesystem record and journal the mutation.
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry>;
 
@@ -1828,6 +1843,20 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         _shard_id: &DfsMetadataShardId,
     ) -> Result<()> {
         Ok(())
+    }
+
+    /// Refresh one shard only when its cached durable generation changed.
+    ///
+    /// The default preserves compatibility for backends that cannot compare a
+    /// cached generation cheaply. Sharded local backends use this cold-path
+    /// variant during service rebind so an unchanged activated marker does not
+    /// rebuild the complete derived object-to-shard index on every open.
+    fn refresh_metadata_shard_durable_view_if_changed(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<bool> {
+        self.refresh_metadata_shard_durable_view(shard_id)?;
+        Ok(true)
     }
 
     /// Return the durable membership-handoff write freeze for one shard.

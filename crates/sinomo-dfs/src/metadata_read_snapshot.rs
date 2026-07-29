@@ -21,6 +21,22 @@ use crate::metadata_tables::{
     MetadataTableReadSnapshotCache, MetadataTableSnapshotFingerprint, max_optional_sequence,
 };
 
+#[cfg(test)]
+thread_local! {
+    static METADATA_DURABLE_TABLE_PROBES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_metadata_durable_table_probes() {
+    METADATA_DURABLE_TABLE_PROBES.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn metadata_durable_table_probes() -> usize {
+    METADATA_DURABLE_TABLE_PROBES.get()
+}
+
 pub(crate) fn refresh_metadata_tables(
     root: &Path,
     tables: &mut DfsMetadataTables,
@@ -88,6 +104,8 @@ pub(crate) fn current_tables_snapshot<'a>(
     table_snapshot_fingerprint: &Option<MetadataTableSnapshotFingerprint>,
     read_snapshot_cache: &Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
 ) -> Result<DfsMetadataTablesSnapshot<'a>> {
+    #[cfg(test)]
+    METADATA_DURABLE_TABLE_PROBES.set(METADATA_DURABLE_TABLE_PROBES.get().saturating_add(1));
     if metadata_table_checkpoint_log_path(root).is_file() {
         return Ok(snapshot_from_state(
             read_snapshot_cache,

@@ -175,7 +175,7 @@ pub(crate) fn rebind_completed_metadata_shard_membership_handoff(
     // opened before canonical replication caught up a different backend
     // handle. Refresh only the marker-bearing cold path before comparing the
     // exact completion prefix.
-    backend.refresh_metadata_shard_durable_view(&shard_id)?;
+    backend.refresh_metadata_shard_durable_view_if_changed(&shard_id)?;
     let Some(freeze) = backend.metadata_shard_write_freeze(&shard_id)? else {
         return Ok(false);
     };
