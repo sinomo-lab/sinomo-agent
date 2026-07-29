@@ -1030,7 +1030,9 @@ pub fn dfs_events_should_publish_metadata(events: &[NetworkedDfsServiceEvent]) -
         | NetworkedDfsServiceEvent::RepairRetryFailed { .. }
         | NetworkedDfsServiceEvent::MetadataJournalBatchApplied { .. }
         | NetworkedDfsServiceEvent::MetadataJournalBatchRejected { .. }
-        | NetworkedDfsServiceEvent::MetadataSnapshotInstalled { .. } => false,
+        | NetworkedDfsServiceEvent::MetadataSnapshotInstalled { .. }
+        | NetworkedDfsServiceEvent::ContentRootCatalogPageServed { .. }
+        | NetworkedDfsServiceEvent::ContentRootCatalogPageReceived { .. } => false,
     })
 }
 

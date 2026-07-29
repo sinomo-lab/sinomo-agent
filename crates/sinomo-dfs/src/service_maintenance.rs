@@ -111,41 +111,115 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 (Some(_), None) | (None, _) => None,
             };
         let content_gc_requested = options.version_gc.is_some() || options.orphan_gc.is_some();
-        // A content-only service can hold valid manifests and blobs without a
-        // local metadata catalog. Absence of that catalog is not evidence that
-        // the authoritative root set is empty.
-        let content_protection = if content_gc_requested {
-            self.metadata_backend
-                .as_ref()
-                .map(|backend| backend.metadata_content_protection())
-                .transpose()?
-        } else {
-            None
-        };
+        // A local metadata image is not a cluster-wide reachability proof. Only
+        // a complete, topology-current, freshness-checked catalog assembled
+        // from every exact shard primary can authorize destructive collection.
+        let content_root_catalog_validation = options.content_root_catalog_validation;
+        let content_protection = content_root_catalog_validation
+            .as_ref()
+            .filter(|validation| validation.is_collection_authorized())
+            .and_then(|validation| validation.protection().cloned());
+        let catalog_observation = content_root_catalog_validation
+            .as_ref()
+            .filter(|validation| validation.is_collection_authorized())
+            .and_then(|validation| {
+                validation
+                    .catalog_generation()
+                    .map(str::to_string)
+                    .zip(validation.catalog_generated_at_unix_nanos())
+                    .zip(validation.catalog_installed_at_unix_nanos())
+                    .map(
+                        |((generation, generated_at_unix_nanos), installed_at_unix_nanos)| {
+                            (generation, generated_at_unix_nanos, installed_at_unix_nanos)
+                        },
+                    )
+            });
         let content_gc_metadata_protection_unavailable =
             content_gc_requested && content_protection.is_none();
-        let version_gc =
-            match (options.version_gc, content_protection.as_ref()) {
-                (Some(options), Some(content_protection)) => {
-                    let options =
-                        options.with_protected_versions(content_protection.versions.iter().map(
+        let content_reservation_reconciliation = match (
+            content_gc_requested,
+            content_protection.as_ref(),
+            options.content_reservation_reconciliation,
+        ) {
+            (true, Some(content_protection), Some(mut reconciliation)) => {
+                let Some((catalog_generation, _, catalog_installed_at_unix_nanos)) =
+                    catalog_observation.as_ref()
+                else {
+                    return Err(DfsError::Metadata {
+                        message: "authorized DFS content-root catalog validation omitted its sealed observation times"
+                            .to_string(),
+                    });
+                };
+                reconciliation.catalog_generation = catalog_generation.clone();
+                // This legacy-named option field is consumed as causal local
+                // observation time by reservation reconciliation.
+                reconciliation.catalog_generated_at_unix_nanos = *catalog_installed_at_unix_nanos;
+                let versions = content_protection
+                    .versions
+                    .iter()
+                    .map(|identity| {
+                        (
+                            identity.object_id.as_str().to_string(),
+                            identity.version.as_str().to_string(),
+                        )
+                    })
+                    .collect();
+                let content_hashes = content_protection.content_hashes.iter().cloned().collect();
+                Some(self.content.reconcile_content_reservations_with_catalog(
+                    &versions,
+                    &content_hashes,
+                    reconciliation,
+                )?)
+            }
+            _ => None,
+        };
+        let version_gc = match (options.version_gc, content_protection.as_ref()) {
+            (Some(options), Some(content_protection)) => {
+                let Some((catalog_generation, _, catalog_installed_at_unix_nanos)) =
+                    catalog_observation.as_ref()
+                else {
+                    return Err(DfsError::Metadata {
+                            message: "authorized DFS content-root catalog validation omitted its sealed observation times"
+                                .to_string(),
+                        });
+                };
+                let options =
+                    options
+                        .with_catalog_observation(
+                            catalog_generation.clone(),
+                            *catalog_installed_at_unix_nanos,
+                        )
+                        .with_protected_versions(content_protection.versions.iter().map(
                             |identity| (identity.object_id.as_str(), identity.version.as_str()),
                         ));
-                    Some(self.content.collect_versions(options)?)
-                }
-                // Dry runs do not mutate manifests or their storage indexes. Keep
-                // their candidate projection observable, with the report-level
-                // unavailable flag making the missing roots explicit.
-                (Some(options), None) if options.dry_run => {
-                    Some(self.content.collect_versions(options)?)
-                }
-                (Some(_), None) | (None, _) => None,
-            };
+                Some(self.content.collect_versions(options)?)
+            }
+            // Dry runs do not mutate manifests or their storage indexes. Keep
+            // their candidate projection observable, with the report-level
+            // unavailable flag making the missing roots explicit.
+            (Some(options), None) if options.dry_run => {
+                Some(self.content.collect_versions(options)?)
+            }
+            (Some(_), None) | (None, _) => None,
+        };
         let orphan_gc = match (options.orphan_gc, content_protection.as_ref()) {
             (Some(options), Some(content_protection)) => {
-                let options = options.with_protected_content_hashes(
-                    content_protection.content_hashes.iter().map(String::as_str),
-                );
+                let Some((catalog_generation, _, catalog_installed_at_unix_nanos)) =
+                    catalog_observation.as_ref()
+                else {
+                    return Err(DfsError::Metadata {
+                        message: "authorized DFS content-root catalog validation omitted its sealed observation times"
+                            .to_string(),
+                    });
+                };
+                let options = options
+                    .with_catalog_observation(
+                        catalog_generation.clone(),
+                        *catalog_installed_at_unix_nanos,
+                    )
+                    .with_protected_content_hashes(
+                        content_protection.content_hashes.iter().map(String::as_str),
+                    );
                 Some(self.content.collect_garbage(options)?)
             }
             // Orphan-GC dry runs neither persist first-observation markers nor
@@ -154,6 +228,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Some(self.content.collect_garbage(options)?)
             }
             (Some(_), None) | (None, _) => None,
+        };
+        let durable_content_reservation_count = if content_gc_requested {
+            self.content.content_reservation_roots()?.reservation_count
+        } else {
+            0
         };
         let tombstone_compaction_requested = options.tombstone_compaction.is_some();
         let metadata_backend_configured = self.metadata_backend.is_some();
@@ -170,6 +249,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             version_gc,
             orphan_gc,
             metadata_history_gc,
+            content_root_catalog_validation,
+            content_reservation_reconciliation,
+            durable_content_reservation_count,
             content_gc_metadata_protection_unavailable,
             metadata_backend_configured,
             tombstone_compaction_requested,

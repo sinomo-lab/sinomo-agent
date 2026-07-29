@@ -1,12 +1,13 @@
 use crate::{
     DfsAdvisoryLockCommand, DfsAdvisoryLockOutcome, DfsAdvisoryLockStateRecord, DfsConflictRecord,
-    DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataPrefixProof, DfsMetadataShardConfig,
-    DfsMetadataShardId, DfsMetadataTableSnapshot, DfsMetadataVersionPinRecord,
-    DfsNamespaceJobRecord, DfsNamespaceTransaction, DfsObjectId, DfsObjectMetadata,
-    DfsObjectVersionRecord, DfsPosixCreateAttrs, DfsPosixDirectorySyncCertificate,
-    DfsPosixDirectorySyncTarget, DfsPosixFileSyncCertificate, DfsPosixFileSyncTarget,
-    DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsVersion, DfsWriteIntentReceipt,
-    DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord, NetworkedDfsWriteOutcome,
+    DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest, DfsFileSystemId,
+    DfsMetadataJournalBatch, DfsMetadataPrefixProof, DfsMetadataShardConfig, DfsMetadataShardId,
+    DfsMetadataTableSnapshot, DfsMetadataVersionPinRecord, DfsNamespaceJobRecord,
+    DfsNamespaceTransaction, DfsObjectId, DfsObjectMetadata, DfsObjectVersionRecord,
+    DfsPosixCreateAttrs, DfsPosixDirectorySyncCertificate, DfsPosixDirectorySyncTarget,
+    DfsPosixFileSyncCertificate, DfsPosixFileSyncTarget, DfsReplicaReceiptRecord,
+    DfsReplicationPolicy, DfsVersion, DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState,
+    DfsWriteIntentRecord, NetworkedDfsWriteOutcome,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
@@ -1203,4 +1204,6 @@ pub enum DfsNetworkMessage {
     MetadataJournalBatchResponse(DfsMetadataJournalBatchResponse),
     MetadataSnapshotInstall(DfsMetadataSnapshotInstallCommand),
     MetadataSnapshotInstallResponse(DfsMetadataSnapshotInstallResponse),
+    ContentRootCatalogPageRequest(DfsContentRootCatalogPageRequest),
+    ContentRootCatalogPageResponse(DfsContentRootCatalogPage),
 }

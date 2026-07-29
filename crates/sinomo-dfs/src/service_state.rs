@@ -695,6 +695,20 @@ pub enum NetworkedDfsServiceEvent {
         shard_id: DfsMetadataShardId,
         next_after_sequence: u64,
     },
+    ContentRootCatalogPageServed {
+        requester_node_id: NodeId,
+        file_system_id: DfsFileSystemId,
+        shard_id: DfsMetadataShardId,
+        entry_count: usize,
+        complete: bool,
+    },
+    ContentRootCatalogPageReceived {
+        primary_node_id: NodeId,
+        file_system_id: DfsFileSystemId,
+        shard_id: DfsMetadataShardId,
+        entry_count: usize,
+        complete: bool,
+    },
     OwnerHandoffCompleted {
         file_system_id: DfsFileSystemId,
         object_id: DfsObjectId,

@@ -71,6 +71,8 @@ fn dfs_operation_for_route(route: &str) -> &'static str {
         crate::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE
         | crate::DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE => "metadata_snapshot",
         crate::DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE => "metadata_snapshot_response",
+        crate::DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_ROUTE => "content_root_catalog",
+        crate::DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_RESPONSE_ROUTE => "content_root_catalog_response",
         _ => "unknown",
     }
 }

@@ -11,6 +11,10 @@ use crate::advisory_lock::{
     DfsAdvisoryLockApplyResult, DfsAdvisoryLockCommand, DfsAdvisoryLockStateRecord,
     DfsAdvisoryLockTransitionContext,
 };
+use crate::content_root_catalog::{
+    DfsContentRootCatalogIncompleteReason, DfsContentRootCatalogPage,
+    DfsContentRootCatalogPageRequest,
+};
 use crate::intent::write_intent_status_is_active;
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_hardlink::{object_is_hardlink_to_target, sort_hardlinks_by_path};
@@ -1533,6 +1537,24 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     ) -> Result<DfsMetadataHistoryGcReport> {
         let _ = options;
         Ok(DfsMetadataHistoryGcReport::default())
+    }
+
+    /// Return one bounded, stable page of shard-local content reachability
+    /// roots from an exact durable metadata cut.
+    ///
+    /// Clustered callers validate primary authority and topology before
+    /// invoking this method. Backends which cannot expose an authoritative
+    /// shard image fail closed with a structured, rootless page.
+    fn content_root_catalog_page(
+        &mut self,
+        request: &DfsContentRootCatalogPageRequest,
+    ) -> Result<DfsContentRootCatalogPage> {
+        request.validate()?;
+        Ok(DfsContentRootCatalogPage::incomplete_for_request(
+            request,
+            DfsContentRootCatalogIncompleteReason::MetadataBackendUnavailable,
+            crate::metadata_tombstone::metadata_now_unix_nanos(),
+        ))
     }
 
     /// Return the exact metadata roots which local version-manifest and blob

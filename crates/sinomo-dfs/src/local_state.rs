@@ -14,11 +14,12 @@ use sinomo_core::node::NodeId;
 
 use crate::{
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsConflictRecord, DfsError,
-    DfsFileSystemId, DfsMetadataBackend, DfsMetadataShardConfig, DfsMetadataShardId, DfsObjectId,
-    DfsOperatorFileSystemView, DfsOperatorInspector, DfsOperatorObjectView, DfsOperatorRepairView,
-    DfsOperatorStatus, DfsPinAddRequest, DfsPinMode, DfsPinRecord, DfsPinStoreError,
-    LocalDfsPinStore, LocalShardedMetadataBackend, LocalSobjMetadataBackend, MetadataBackendError,
-    default_dfs_repair_attempt_snapshot_path, metadata_shards_prefix,
+    DfsFileSystemConfig, DfsFileSystemId, DfsMetadataBackend, DfsMetadataShardConfig,
+    DfsMetadataShardHeadWatermark, DfsMetadataShardId, DfsMetadataShardMembershipHandoff,
+    DfsObjectId, DfsOperatorFileSystemView, DfsOperatorInspector, DfsOperatorObjectView,
+    DfsOperatorRepairView, DfsOperatorStatus, DfsPinAddRequest, DfsPinMode, DfsPinRecord,
+    DfsPinStoreError, LocalDfsPinStore, LocalShardedMetadataBackend, LocalSobjMetadataBackend,
+    MetadataBackendError, default_dfs_repair_attempt_snapshot_path, metadata_shards_prefix,
     read_dfs_repair_attempt_snapshot, resolve_dfs_conflicts, sifs_file_system_id,
     use_dfs_conflict_version,
 };
@@ -309,6 +310,206 @@ pub fn cluster_dfs_metadata_shards(
     Ok(shards)
 }
 
+/// Return every exact metadata-shard assignment whose namespace shares this
+/// node's content store.
+///
+/// The cluster KV prefix also contains filesystem configs, handoff proofs,
+/// watermarks, and placement records. Filtering the key shape before decoding
+/// prevents those compact control records from being mistaken for shard
+/// assignments while still making cross-filesystem catalog coverage explicit.
+pub fn cluster_dfs_all_metadata_shards(
+    cluster_paths: &ClusterPaths,
+) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
+    let mut shards = sinomo_core::kv::read_cluster_kv_prefix_entries(
+        &cluster_paths.kv_paths(),
+        "/dfs/filesystems/",
+    )
+    .map_err(DfsError::from)?
+    .into_iter()
+    .filter(|entry| dfs_metadata_shard_config_key_is_exact(&entry.key))
+    .map(|entry| entry.decode::<DfsMetadataShardConfig>())
+    .collect::<Result<Vec<_>, _>>()?;
+    shards.sort_by(|left, right| {
+        left.file_system_id
+            .cmp(&right.file_system_id)
+            .then_with(|| left.shard_id.cmp(&right.shard_id))
+    });
+    shards.dedup_by(|left, right| {
+        left.file_system_id == right.file_system_id && left.shard_id == right.shard_id
+    });
+    Ok(shards)
+}
+
+/// Return every configured filesystem whose namespace shares this node's
+/// content store. Filesystem records are part of the positive catalog
+/// coverage proof even while shard bootstrap is incomplete.
+pub fn cluster_dfs_all_file_system_configs(
+    cluster_paths: &ClusterPaths,
+) -> Result<Vec<DfsFileSystemConfig>, DfsError> {
+    let mut file_systems = sinomo_core::kv::read_cluster_kv_prefix_entries(
+        &cluster_paths.kv_paths(),
+        "/dfs/filesystems/",
+    )
+    .map_err(DfsError::from)?
+    .into_iter()
+    .filter(|entry| dfs_file_system_config_key_is_exact(&entry.key))
+    .map(|entry| entry.decode::<DfsFileSystemConfig>())
+    .collect::<Result<Vec<_>, _>>()?;
+    file_systems.sort_by(|left, right| left.file_system_id.cmp(&right.file_system_id));
+    file_systems.dedup_by(|left, right| left.file_system_id == right.file_system_id);
+    Ok(file_systems)
+}
+
+/// Return every in-progress metadata membership handoff across the shared
+/// content store. A non-empty result blocks destructive collection unless a
+/// future catalog format explicitly unions both generations.
+pub fn cluster_dfs_all_metadata_shard_membership_handoffs(
+    cluster_paths: &ClusterPaths,
+) -> Result<Vec<DfsMetadataShardMembershipHandoff>, DfsError> {
+    let mut handoffs = sinomo_core::kv::read_cluster_kv_prefix_entries(
+        &cluster_paths.kv_paths(),
+        "/dfs/filesystems/",
+    )
+    .map_err(DfsError::from)?
+    .into_iter()
+    .filter(|entry| dfs_metadata_shard_membership_handoff_key_is_exact(&entry.key))
+    .map(|entry| entry.decode::<DfsMetadataShardMembershipHandoff>())
+    .collect::<Result<Vec<_>, _>>()?;
+    handoffs.sort_by(|left, right| {
+        left.retiring_shard
+            .file_system_id
+            .cmp(&right.retiring_shard.file_system_id)
+            .then_with(|| {
+                left.retiring_shard
+                    .shard_id
+                    .cmp(&right.retiring_shard.shard_id)
+            })
+            .then_with(|| left.handoff_id.cmp(&right.handoff_id))
+    });
+    handoffs.dedup_by(|left, right| left.handoff_id == right.handoff_id);
+    Ok(handoffs)
+}
+
+pub fn cluster_dfs_all_metadata_shard_head_watermarks(
+    cluster_paths: &ClusterPaths,
+) -> Result<Vec<DfsMetadataShardHeadWatermark>, DfsError> {
+    let mut watermarks = sinomo_core::kv::read_cluster_kv_prefix_entries(
+        &cluster_paths.kv_paths(),
+        "/dfs/filesystems/",
+    )
+    .map_err(DfsError::from)?
+    .into_iter()
+    .filter(|entry| dfs_metadata_shard_head_watermark_key_is_exact(&entry.key))
+    .map(|entry| entry.decode::<DfsMetadataShardHeadWatermark>())
+    .collect::<Result<Vec<_>, _>>()?;
+    watermarks.sort_by(|left, right| {
+        left.file_system_id
+            .cmp(&right.file_system_id)
+            .then_with(|| left.shard_id.cmp(&right.shard_id))
+            .then_with(|| left.epoch.cmp(&right.epoch))
+    });
+    watermarks.dedup_by(|left, right| {
+        left.file_system_id == right.file_system_id
+            && left.shard_id == right.shard_id
+            && left.epoch == right.epoch
+    });
+    Ok(watermarks)
+}
+
+fn dfs_file_system_config_key_is_exact(key: &str) -> bool {
+    let mut segments = key.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (
+            Some(""),
+            Some("dfs"),
+            Some("filesystems"),
+            Some(file_system_id),
+            Some("config"),
+            None,
+        ) if !file_system_id.is_empty()
+    )
+}
+
+fn dfs_metadata_shard_config_key_is_exact(key: &str) -> bool {
+    let mut segments = key.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (
+            Some(""),
+            Some("dfs"),
+            Some("filesystems"),
+            Some(file_system_id),
+            Some("metadata-shards"),
+            Some(shard_id),
+            None,
+        ) if !file_system_id.is_empty() && !shard_id.is_empty()
+    )
+}
+
+fn dfs_metadata_shard_membership_handoff_key_is_exact(key: &str) -> bool {
+    let mut segments = key.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (
+            Some(""),
+            Some("dfs"),
+            Some("filesystems"),
+            Some(file_system_id),
+            Some("metadata-membership-handoffs"),
+            Some(shard_id),
+            None,
+        ) if !file_system_id.is_empty() && !shard_id.is_empty()
+    )
+}
+
+fn dfs_metadata_shard_head_watermark_key_is_exact(key: &str) -> bool {
+    let mut segments = key.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (
+            Some(""),
+            Some("dfs"),
+            Some("filesystems"),
+            Some(file_system_id),
+            Some("metadata-head-watermarks"),
+            Some(shard_id),
+            None,
+        ) if !file_system_id.is_empty() && !shard_id.is_empty()
+    )
+}
+
 pub fn inspect_cluster_aware_dfs_status(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -504,6 +705,29 @@ mod tests {
             metadata_shards: Vec::new(),
             repair_attempts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn global_content_catalog_key_filters_distinguish_configs_shards_handoffs_and_watermarks() {
+        let base = "/dfs/filesystems/sifs";
+        assert!(dfs_file_system_config_key_is_exact(&format!(
+            "{base}/config"
+        )));
+        assert!(!dfs_file_system_config_key_is_exact(&format!(
+            "{base}/metadata-shards/root"
+        )));
+        assert!(dfs_metadata_shard_config_key_is_exact(&format!(
+            "{base}/metadata-shards/root"
+        )));
+        assert!(dfs_metadata_shard_membership_handoff_key_is_exact(
+            &format!("{base}/metadata-membership-handoffs/root")
+        ));
+        assert!(dfs_metadata_shard_head_watermark_key_is_exact(&format!(
+            "{base}/metadata-head-watermarks/root"
+        )));
+        assert!(!dfs_metadata_shard_membership_handoff_key_is_exact(
+            &format!("{base}/metadata-membership-handoffs/root/proof")
+        ));
     }
 
     #[test]

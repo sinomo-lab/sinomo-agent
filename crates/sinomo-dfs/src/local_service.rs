@@ -233,7 +233,9 @@ impl<T: DfsMessageTransport> LocalOwnedDfsService<T> {
                 | DfsNetworkMessage::MetadataJournalBatch(_)
                 | DfsNetworkMessage::MetadataJournalBatchResponse(_)
                 | DfsNetworkMessage::MetadataSnapshotInstall(_)
-                | DfsNetworkMessage::MetadataSnapshotInstallResponse(_) => {}
+                | DfsNetworkMessage::MetadataSnapshotInstallResponse(_)
+                | DfsNetworkMessage::ContentRootCatalogPageRequest(_)
+                | DfsNetworkMessage::ContentRootCatalogPageResponse(_) => {}
             }
         }
 

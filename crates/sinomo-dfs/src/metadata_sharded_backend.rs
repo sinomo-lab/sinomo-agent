@@ -14,6 +14,10 @@ use crate::advisory_lock::{
     DfsAdvisoryLockApplyResult, DfsAdvisoryLockCommand, DfsAdvisoryLockStateRecord,
     DfsAdvisoryLockTransitionContext, prepare_advisory_lock_state_for_migration,
 };
+use crate::content_root_catalog::{
+    DfsContentRootCatalogIncompleteReason, DfsContentRootCatalogPage,
+    DfsContentRootCatalogPageRequest, DfsContentRootCatalogShardIdentity,
+};
 use crate::control_plane::{
     DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardRoutingIndex,
 };
@@ -3407,6 +3411,35 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             protection.merge(backend.metadata_content_protection()?);
         }
         Ok(protection)
+    }
+
+    fn content_root_catalog_page(
+        &mut self,
+        request: &DfsContentRootCatalogPageRequest,
+    ) -> Result<DfsContentRootCatalogPage> {
+        request.validate()?;
+        let observed_identity = self
+            .shard_configs
+            .get(&request.identity.shard_id.0)
+            .map(DfsContentRootCatalogShardIdentity::from_config);
+        let Some(observed_identity) = observed_identity else {
+            return Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                request,
+                DfsContentRootCatalogIncompleteReason::UnknownShard,
+                metadata_now_unix_nanos(),
+            ));
+        };
+        if observed_identity != request.identity {
+            return Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                request,
+                DfsContentRootCatalogIncompleteReason::AuthorityChanged {
+                    observed: Some(observed_identity),
+                },
+                metadata_now_unix_nanos(),
+            ));
+        }
+        self.shard_backend_mut(&request.identity.shard_id)?
+            .content_root_catalog_page(request)
     }
 
     fn compact_tombstones(

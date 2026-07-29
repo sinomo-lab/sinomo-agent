@@ -9,6 +9,7 @@
 mod advisory_lock;
 mod body_rpc;
 mod cluster_service;
+mod content_root_catalog;
 mod content_store;
 mod control_plane;
 mod default_cluster;
@@ -118,11 +119,25 @@ pub(crate) use cluster_service::{
     open_cluster_dfs_service_with_peer_transports_for_nodes,
     open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state,
 };
+pub use content_root_catalog::{
+    DEFAULT_DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRIES, DFS_CONTENT_ROOT_CATALOG_FORMAT_VERSION,
+    DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES, DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
+    DfsContentRootCatalog, DfsContentRootCatalogCollectionValidation,
+    DfsContentRootCatalogCoverage, DfsContentRootCatalogCursor, DfsContentRootCatalogEntry,
+    DfsContentRootCatalogFragment, DfsContentRootCatalogIncompleteReason,
+    DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest,
+    DfsContentRootCatalogShardIdentity, LocalDfsContentRootCatalogStore,
+    default_dfs_content_root_catalog_store, dfs_content_root_catalog_entries,
+    dfs_content_root_catalog_topology_digest,
+    dfs_content_root_catalog_topology_digest_with_file_systems,
+};
 pub(crate) use content_store::content_hash;
 pub use content_store::{
     BlobRangeReader, BlobReader, ContentManifest, ContentStoreError, ContentStoreGcOptions,
     ContentStoreGcReport, ContentStoreQuarantinedBlob, ContentStoreQuota,
-    ContentStoreQuotaResource, ContentStoreQuotaUsage, ContentStoreScrubIssue,
+    ContentStoreQuotaResource, ContentStoreQuotaUsage, ContentStoreReservationIdentity,
+    ContentStoreReservationReconciliationOptions, ContentStoreReservationReconciliationReport,
+    ContentStoreReservationRecord, ContentStoreReservationRoots, ContentStoreScrubIssue,
     ContentStoreScrubReport, ContentStoreStagingGcOptions, ContentStoreStagingGcReport,
     ContentStoreStats, ContentStoreVersionGcOptions, ContentStoreVersionGcReport,
     ContentVersionIdentity, LocalContentStore, ObjectVersionReader,
@@ -203,9 +218,11 @@ pub(crate) use intent::{
 pub use local_service::LocalOwnedDfsService;
 pub(crate) use local_state::dfs_path_safe_segment;
 pub use local_state::{
-    DFS_IMPORTS_NAMESPACE_ROOT, add_local_dfs_pin, cluster_dfs_metadata_shards,
-    default_dfs_metadata_root, default_dfs_metadata_shards_root, default_dfs_pin_root,
-    dfs_import_metadata_root, dfs_import_namespace_root, dfs_import_root,
+    DFS_IMPORTS_NAMESPACE_ROOT, add_local_dfs_pin, cluster_dfs_all_file_system_configs,
+    cluster_dfs_all_metadata_shard_head_watermarks,
+    cluster_dfs_all_metadata_shard_membership_handoffs, cluster_dfs_all_metadata_shards,
+    cluster_dfs_metadata_shards, default_dfs_metadata_root, default_dfs_metadata_shards_root,
+    default_dfs_pin_root, dfs_import_metadata_root, dfs_import_namespace_root, dfs_import_root,
     inspect_cluster_aware_dfs, inspect_cluster_aware_dfs_status, inspect_dfs_conflicts,
     inspect_dfs_file_system, inspect_dfs_object, inspect_dfs_path, inspect_dfs_repairs,
     inspect_dfs_status, list_local_dfs_pins, local_dfs_metadata_shard_path,
@@ -218,7 +235,11 @@ pub use local_state::{
 };
 pub(crate) use maintenance::record_anti_entropy_issue;
 pub use maintenance::{
-    DEFAULT_DFS_CONFLICT_MAINTENANCE_MAX_RECORDS, DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_ISSUES,
+    DEFAULT_DFS_CONFLICT_MAINTENANCE_MAX_RECORDS,
+    DEFAULT_DFS_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS,
+    DEFAULT_DFS_CONTENT_RESERVATION_REJECTION_GRACE, DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_AGE,
+    DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_PAGES_PER_SHARD,
+    DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_ISSUES,
     DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_OBJECTS,
     DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_JOBS,
     DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_STEPS_PER_JOB,
@@ -468,6 +489,7 @@ pub(crate) use repair::{
 pub use routes::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_BULK_READ_RESPONSE_ROUTE, DFS_DATA_BULK_READ_ROUTE,
     DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE, DFS_DATA_COMMIT_VERSION_ROUTE,
+    DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_RESPONSE_ROUTE, DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_ROUTE,
     DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE, DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
     DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE, DFS_DATA_FETCH_BLOB_ROUTE,
     DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE, DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,

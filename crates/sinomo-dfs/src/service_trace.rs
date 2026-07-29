@@ -91,6 +91,10 @@ pub(crate) fn dfs_network_message_trace_label(message: &DfsNetworkMessage) -> &'
         DfsNetworkMessage::MetadataSnapshotInstallResponse(_) => {
             "metadata-snapshot-install-response"
         }
+        DfsNetworkMessage::ContentRootCatalogPageRequest(_) => "content-root-catalog-page-request",
+        DfsNetworkMessage::ContentRootCatalogPageResponse(_) => {
+            "content-root-catalog-page-response"
+        }
     }
 }
 

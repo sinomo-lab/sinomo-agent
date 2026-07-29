@@ -12,6 +12,11 @@ use crate::advisory_lock::{
     DfsAdvisoryLockApplyResult, DfsAdvisoryLockCommand, DfsAdvisoryLockStateRecord,
     DfsAdvisoryLockTransitionContext, transition_advisory_lock_state,
 };
+use crate::content_root_catalog::{
+    DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION, DfsContentRootCatalogCoverage,
+    DfsContentRootCatalogCursor, DfsContentRootCatalogEntry, DfsContentRootCatalogIncompleteReason,
+    DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest, dfs_content_root_catalog_entries,
+};
 #[cfg(test)]
 use crate::control_plane::DfsMetadataShardConfig;
 use crate::metadata_api::{
@@ -1713,6 +1718,13 @@ pub(crate) enum DfsConditionalSourceEviction {
 }
 
 #[derive(Clone, Debug)]
+struct DfsContentRootCatalogSnapshotCache {
+    journal_sequence: u64,
+    state_fingerprint: String,
+    entries: Arc<Vec<DfsContentRootCatalogEntry>>,
+}
+
+#[derive(Clone, Debug)]
 pub struct LocalSobjMetadataBackend {
     shard_id: DfsMetadataShardId,
     root: PathBuf,
@@ -1728,8 +1740,11 @@ pub struct LocalSobjMetadataBackend {
     instance_authority_epoch: Option<u64>,
     table_snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
     read_snapshot_cache: Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
+    content_root_catalog_snapshot_cache: Option<Arc<DfsContentRootCatalogSnapshotCache>>,
     #[cfg(test)]
     receipt_scan_counters: Arc<MetadataReceiptScanCounters>,
+    #[cfg(test)]
+    content_root_catalog_snapshot_builds: Arc<AtomicUsize>,
 }
 
 impl LocalSobjMetadataBackend {
@@ -1760,8 +1775,11 @@ impl LocalSobjMetadataBackend {
             instance_authority_epoch: None,
             table_snapshot_fingerprint: None,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
+            content_root_catalog_snapshot_cache: None,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
+            #[cfg(test)]
+            content_root_catalog_snapshot_builds: Arc::new(AtomicUsize::new(0)),
         };
         let local_recovery_started = Instant::now();
         {
@@ -1877,8 +1895,11 @@ impl LocalSobjMetadataBackend {
             instance_authority_epoch: None,
             table_snapshot_fingerprint: state.snapshot_fingerprint,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
+            content_root_catalog_snapshot_cache: None,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
+            #[cfg(test)]
+            content_root_catalog_snapshot_builds: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -1926,8 +1947,11 @@ impl LocalSobjMetadataBackend {
             instance_authority_epoch: None,
             table_snapshot_fingerprint: state.snapshot_fingerprint,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
+            content_root_catalog_snapshot_cache: None,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
+            #[cfg(test)]
+            content_root_catalog_snapshot_builds: Arc::new(AtomicUsize::new(0)),
         };
         backend.ensure_local_materialization_cursor()?;
         backend.reconcile_local_materialization_cursor(materialized_through_sequence)?;
@@ -2256,8 +2280,11 @@ impl LocalSobjMetadataBackend {
             instance_authority_epoch: None,
             table_snapshot_fingerprint: None,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
+            content_root_catalog_snapshot_cache: None,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
+            #[cfg(test)]
+            content_root_catalog_snapshot_builds: Arc::new(AtomicUsize::new(0)),
         };
         let lock = backend.metadata_write_lock()?;
         if let Some(freeze) = backend.membership_handoff_write_freeze()? {
@@ -7527,6 +7554,144 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         self.gc_metadata_history_authoritative(options)
     }
 
+    fn content_root_catalog_page(
+        &mut self,
+        request: &DfsContentRootCatalogPageRequest,
+    ) -> Result<DfsContentRootCatalogPage> {
+        request.validate()?;
+        let generated_at_unix_nanos = request
+            .after
+            .as_ref()
+            .map(|cursor| cursor.generated_at_unix_nanos)
+            .unwrap_or_else(metadata_now_unix_nanos);
+        if request.identity.shard_id != self.shard_id {
+            return Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                request,
+                DfsContentRootCatalogIncompleteReason::UnknownShard,
+                generated_at_unix_nanos,
+            ));
+        }
+
+        // Hold the cross-process metadata writer fence through refresh, root
+        // derivation, and page construction. A continuation therefore names
+        // one exact durable cut rather than mixing roots across concurrent
+        // materialization.
+        let _lock = self.metadata_write_lock()?;
+        self.refresh_after_metadata_write_lock()?;
+        if let Some(freeze) = self.membership_handoff_write_freeze()?
+            && !freeze
+                .activated_epoch
+                .is_some_and(|epoch| self.instance_authority_epoch == Some(epoch))
+        {
+            return Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                request,
+                DfsContentRootCatalogIncompleteReason::MembershipHandoffFrozen {
+                    handoff_id: Some(freeze.handoff_id),
+                },
+                generated_at_unix_nanos,
+            ));
+        }
+
+        let journal_sequence = self.materialized_through_sequence;
+        if journal_sequence < request.minimum_journal_sequence {
+            return Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                request,
+                DfsContentRootCatalogIncompleteReason::DurableCutUnavailable {
+                    minimum_journal_sequence: request.minimum_journal_sequence,
+                    observed_journal_sequence: journal_sequence,
+                },
+                generated_at_unix_nanos,
+            ));
+        }
+
+        let prefix_proof = self.prefix_proof.as_ref().ok_or_else(|| {
+            MetadataBackendError::Serde(format!(
+                "metadata shard {} has no durable prefix proof for content-root catalog",
+                self.shard_id.0
+            ))
+        })?;
+        if !prefix_proof.is_well_formed() || prefix_proof.journal_sequence != journal_sequence {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata shard {} content-root catalog prefix proof does not match durable sequence {}",
+                self.shard_id.0, journal_sequence
+            )));
+        }
+        let state_fingerprint = prefix_proof.digest.clone();
+
+        let cache_matches = self
+            .content_root_catalog_snapshot_cache
+            .as_ref()
+            .is_some_and(|cache| {
+                cache.journal_sequence == journal_sequence
+                    && cache.state_fingerprint == state_fingerprint
+            });
+        if !cache_matches {
+            let protection = metadata_content_protection_from_tables(&self.tables);
+            let entries = dfs_content_root_catalog_entries(&protection);
+            self.content_root_catalog_snapshot_cache =
+                Some(Arc::new(DfsContentRootCatalogSnapshotCache {
+                    journal_sequence,
+                    state_fingerprint: state_fingerprint.clone(),
+                    entries: Arc::new(entries),
+                }));
+            #[cfg(test)]
+            self.content_root_catalog_snapshot_builds
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let snapshot = self
+            .content_root_catalog_snapshot_cache
+            .as_ref()
+            .cloned()
+            .expect("content-root catalog snapshot cache was populated");
+        let entries = snapshot.entries.as_ref();
+
+        let cut_changed = request.after.as_ref().is_some_and(|after| {
+            after.journal_sequence != journal_sequence
+                || after.state_fingerprint != state_fingerprint
+        }) || (request.after.is_none()
+            && journal_sequence == request.minimum_journal_sequence
+            && request
+                .minimum_state_fingerprint
+                .as_ref()
+                .is_some_and(|expected| expected != &state_fingerprint));
+        if cut_changed {
+            return Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                request,
+                DfsContentRootCatalogIncompleteReason::StateFingerprintChanged,
+                generated_at_unix_nanos,
+            ));
+        }
+
+        let start = request
+            .after
+            .as_ref()
+            .map(|after| entries.partition_point(|entry| entry <= &after.last_entry))
+            .unwrap_or(0);
+        let end = start.saturating_add(request.max_entries).min(entries.len());
+        let page_entries = entries[start..end].to_vec();
+        let next_cursor = (end < entries.len()).then(|| DfsContentRootCatalogCursor {
+            journal_sequence,
+            state_fingerprint: state_fingerprint.clone(),
+            generated_at_unix_nanos,
+            last_entry: page_entries
+                .last()
+                .cloned()
+                .expect("a continued content-root page contains an entry"),
+        });
+        Ok(DfsContentRootCatalogPage {
+            identity: request.identity.clone(),
+            topology_digest: request.expected_topology_digest.clone(),
+            generated_at_unix_nanos,
+            coverage: DfsContentRootCatalogCoverage::Complete {
+                prefix_proof_version: DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
+                journal_sequence,
+                state_fingerprint,
+            },
+            entries: page_entries,
+            next_cursor,
+        })
+    }
+
     fn metadata_content_protection(&self) -> Result<DfsMetadataContentProtection> {
         let tables = self.current_tables_snapshot()?;
         Ok(metadata_content_protection_from_tables(&tables))
@@ -8748,9 +8913,11 @@ mod tests {
         dentry_key, key_segment, normalize_path, path_hash, path_record_for_object,
     };
     use crate::{
-        ContentStoreGcOptions, ContentStoreVersionGcOptions, DfsAdvisoryLockMode,
-        DfsAdvisoryLockOutcome, DfsAdvisoryLockRequestId, DfsAdvisoryLockSessionId,
+        ContentStoreGcOptions, ContentStoreVersionGcOptions,
+        DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES, DfsAdvisoryLockMode, DfsAdvisoryLockOutcome,
+        DfsAdvisoryLockRequestId, DfsAdvisoryLockSessionId, DfsContentRootCatalogShardIdentity,
         DfsMetadataShardAssignment, DfsNamespaceOperation, DfsNamespaceResult, DfsObjectKind,
+        dfs_content_root_catalog_topology_digest,
     };
     use sinomo_core::DfsObjectPolicy;
     use std::time::Duration;
@@ -16294,6 +16461,140 @@ mod tests {
             3,
             "terminal requests remain available for exact retry replay"
         );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn content_root_catalog_multi_page_drain_builds_one_exact_snapshot() {
+        let root = temp_root("content-root-catalog-page-cache");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        let file = object(version("version_catalog_current"));
+        backend.put_object(&file).expect("object");
+        for index in 0..150 {
+            let mut record = object_version_record(
+                &file,
+                version(&format!("version_catalog_{index:03}")),
+                OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(index),
+            );
+            record.content_hash = Some(format!("blake3:catalog-{index:03}"));
+            backend.put_version(&record).expect("catalog version");
+        }
+
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file.file_system_id.clone(),
+            shard_id: shard_id.0.clone(),
+            primary_node_id: node("node_owner"),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut request = DfsContentRootCatalogPageRequest {
+            identity: DfsContentRootCatalogShardIdentity::from_config(&shard),
+            expected_topology_digest: dfs_content_root_catalog_topology_digest(&[shard])
+                .expect("topology digest"),
+            minimum_journal_sequence: 0,
+            minimum_state_fingerprint: None,
+            after: None,
+            max_entries: DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES,
+        };
+        let mut page_count = 0;
+        loop {
+            let page = backend
+                .content_root_catalog_page(&request)
+                .expect("content-root page");
+            page.validate_for_request(&request)
+                .expect("valid content-root page");
+            page_count += 1;
+            let Some(next) = page.next_cursor else {
+                break;
+            };
+            request.minimum_journal_sequence = next.journal_sequence;
+            request.minimum_state_fingerprint = Some(next.state_fingerprint.clone());
+            request.after = Some(next);
+        }
+        assert!(page_count >= 2, "fixture must drain multiple pages");
+        assert_eq!(
+            backend
+                .content_root_catalog_snapshot_builds
+                .load(Ordering::Relaxed),
+            1,
+            "continuation pages must reuse one exact sorted root snapshot"
+        );
+
+        let mut later = object_version_record(
+            &file,
+            version("version_catalog_later"),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(151),
+        );
+        later.content_hash = Some("blake3:catalog-later".to_string());
+        backend.put_version(&later).expect("later version");
+        request.minimum_journal_sequence = 0;
+        request.minimum_state_fingerprint = None;
+        request.after = None;
+        backend
+            .content_root_catalog_page(&request)
+            .expect("page after durable mutation");
+        assert_eq!(
+            backend
+                .content_root_catalog_snapshot_builds
+                .load(Ordering::Relaxed),
+            2,
+            "a new durable cut must rebuild the root snapshot"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_content_root_catalog_rejects_same_shard_id_from_different_filesystem() {
+        let root = temp_root("content-root-catalog-cross-filesystem-shard");
+        let shard_id = DfsMetadataShardId::new("root");
+        let configured_shard = shard_config(&shard_id.0, DfsMetadataShardAssignment::Root);
+        let mut backend = LocalShardedMetadataBackend::new(&root, vec![configured_shard.clone()])
+            .expect("sharded backend");
+        backend
+            .put_file_system(&file_system())
+            .expect("configured filesystem");
+        backend
+            .put_object(&object(version("version_catalog_configured")))
+            .expect("configured filesystem object");
+
+        let mut foreign_shard = configured_shard.clone();
+        foreign_shard.file_system_id =
+            DfsFileSystemId::from_legacy_named("foreign-filesystem").expect("foreign filesystem");
+        let request = DfsContentRootCatalogPageRequest {
+            identity: DfsContentRootCatalogShardIdentity::from_config(&foreign_shard),
+            expected_topology_digest: dfs_content_root_catalog_topology_digest(
+                std::slice::from_ref(&foreign_shard),
+            )
+            .expect("foreign topology digest"),
+            minimum_journal_sequence: 0,
+            minimum_state_fingerprint: None,
+            after: None,
+            max_entries: DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES,
+        };
+
+        let page = backend
+            .content_root_catalog_page(&request)
+            .expect("rootless cross-filesystem response");
+        page.validate_for_request(&request)
+            .expect("valid incomplete response");
+        assert!(page.entries.is_empty());
+        assert!(page.next_cursor.is_none());
+        assert!(matches!(
+            page.coverage,
+            DfsContentRootCatalogCoverage::Incomplete { ref reasons }
+                if matches!(
+                    reasons.as_slice(),
+                    [DfsContentRootCatalogIncompleteReason::AuthorityChanged {
+                        observed: Some(observed),
+                    }] if observed
+                        == &DfsContentRootCatalogShardIdentity::from_config(&configured_shard)
+                )
+        ));
 
         cleanup(&root);
     }

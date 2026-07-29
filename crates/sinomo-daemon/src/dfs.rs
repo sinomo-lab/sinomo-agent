@@ -19,23 +19,27 @@ use sinomo_core::node::NodeId;
 #[cfg(test)]
 use sinomo_dfs::DfsFileSystemConfig;
 use sinomo_dfs::{
-    ContentStoreError, ContentStoreStagingGcOptions, DfsCommittedWorkTracker, DfsConflictRecord,
-    DfsConflictStatus, DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture,
-    DfsDataPlaneResponse, DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions,
-    DfsFileSystemId, DfsInboundAttachment, DfsMaintenanceExecutionExclusions,
-    DfsMaintenanceRunOptions, DfsMaintenanceTickOptions, DfsMaintenanceTickReport,
-    DfsMessageCommand, DfsMessageCommittedWork, DfsMessageExecutionScope, DfsMessageProcessResult,
-    DfsMessageResponse, DfsMetadataBackend, DfsMetadataHistoryGcOptions,
-    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
-    DfsMetadataPublishScheduleOptions, DfsMetadataPublishScheduleStart, DfsMetadataShardId,
-    DfsMetadataShardMembershipHandoff, DfsMetadataShardStatus, DfsNodeDetachedSendState,
-    DfsNodeDetachedSendWorker, DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectMetadata,
-    DfsObjectRpcSendOptions, DfsOperatorInspector, DfsOperatorRepairView, DfsPeerTransport,
-    DfsPeerTransportError, DfsPlacementReconciliationJob, DfsPlacementReconciliationState,
-    DfsRepairAttemptRecord, DfsReplicaReceiptRecord, DfsTombstoneCompactionOptions,
-    DfsWriteIntentRecord, DfsWriteIntentStatus, LocalContentStore, NetworkedDfsService,
-    default_dfs_repair_attempt_snapshot_path, dfs_message_execution_scope,
-    read_dfs_repair_attempt_snapshot,
+    ContentStoreError, ContentStoreGcOptions, ContentStoreStagingGcOptions,
+    ContentStoreVersionGcOptions, DfsCommittedWorkTracker, DfsConflictRecord, DfsConflictStatus,
+    DfsContentRootCatalogCollectionValidation, DfsContentRootCatalogIncompleteReason,
+    DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture, DfsDataPlaneResponse,
+    DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions, DfsFileSystemId,
+    DfsInboundAttachment, DfsMaintenanceExecutionExclusions, DfsMaintenanceRunOptions,
+    DfsMaintenanceTickOptions, DfsMaintenanceTickReport, DfsMessageCommand,
+    DfsMessageCommittedWork, DfsMessageExecutionScope, DfsMessageProcessResult, DfsMessageResponse,
+    DfsMetadataBackend, DfsMetadataHistoryGcOptions, DfsMetadataJournalReplicationOptions,
+    DfsMetadataJournalReplicationReport, DfsMetadataPublishScheduleOptions,
+    DfsMetadataPublishScheduleStart, DfsMetadataShardId, DfsMetadataShardMembershipHandoff,
+    DfsMetadataShardStatus, DfsNodeDetachedSendState, DfsNodeDetachedSendWorker,
+    DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectMetadata, DfsObjectRpcSendOptions,
+    DfsOperatorInspector, DfsOperatorRepairView, DfsPeerTransport, DfsPeerTransportError,
+    DfsPlacementReconciliationJob, DfsPlacementReconciliationState, DfsRepairAttemptRecord,
+    DfsReplicaReceiptRecord, DfsTombstoneCompactionOptions, DfsWriteIntentRecord,
+    DfsWriteIntentStatus, LocalContentStore, NetworkedDfsService,
+    cluster_dfs_all_file_system_configs, cluster_dfs_all_metadata_shard_head_watermarks,
+    cluster_dfs_all_metadata_shard_membership_handoffs, cluster_dfs_all_metadata_shards,
+    default_dfs_content_root_catalog_store, default_dfs_repair_attempt_snapshot_path,
+    dfs_message_execution_scope, read_dfs_repair_attempt_snapshot,
 };
 #[cfg(test)]
 use sinomo_dfs::{
@@ -739,7 +743,7 @@ impl Drop for DaemonDfsSmokeInFlightGuard {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DaemonDfsPendingMaintenanceWork {
     pub pending_write_count: usize,
     pub pending_repair_count: usize,
@@ -755,11 +759,22 @@ pub(crate) struct DaemonDfsPendingMaintenanceWork {
     pub actionable_placement_reconciliation_count: usize,
     pub metadata_replica_lag_count: usize,
     pub pending_local_membership_handoff_count: usize,
+    pub content_gc_expected_shard_count: usize,
+    pub content_gc_covered_shard_count: usize,
+    pub content_gc_catalog_age_nanos: Option<u64>,
+    pub content_gc_catalog_journal_lag: u64,
+    pub content_gc_catalog_blocked_reason_count: usize,
+    pub content_gc_catalog_blocked_reasons: Vec<DfsContentRootCatalogIncompleteReason>,
+    pub content_gc_scrub_blocked_issue_count: usize,
+    pub content_gc_version_candidate_count: usize,
+    pub content_gc_orphan_candidate_count: usize,
+    pub content_gc_next_deadline_unix_nanos: Option<u64>,
+    pub durable_content_reservation_count: usize,
 }
 
 impl DaemonDfsPendingMaintenanceWork {
     #[cfg(test)]
-    pub(crate) fn has_work(self) -> bool {
+    pub(crate) fn has_work(&self) -> bool {
         self.pending_write_count > 0
             || self.pending_repair_count > 0
             || self.pending_namespace_job_count > 0
@@ -770,7 +785,7 @@ impl DaemonDfsPendingMaintenanceWork {
             || self.due_time_based_maintenance_count > 0
     }
 
-    pub(crate) fn should_trigger_background_maintenance(self) -> bool {
+    pub(crate) fn should_trigger_background_maintenance(&self) -> bool {
         // Pending repairs can represent unreachable replicas and are expensive
         // to rescan. Trigger the short loop only when a repair is due or has
         // never been attempted; repair backoff snapshots keep unreachable
@@ -787,14 +802,14 @@ impl DaemonDfsPendingMaintenanceWork {
             || self.due_time_based_maintenance_count > 0
     }
 
-    pub(crate) fn next_maintenance_deadline_unix_nanos(self) -> Option<u64> {
+    pub(crate) fn next_maintenance_deadline_unix_nanos(&self) -> Option<u64> {
         self.next_repair_retry_unix_nanos
             .into_iter()
             .chain(self.next_time_based_maintenance_unix_nanos)
             .min()
     }
 
-    pub(crate) fn has_deferred_work(self) -> bool {
+    pub(crate) fn has_deferred_work(&self) -> bool {
         self.deferred_work_count > 0
     }
 }
@@ -2237,7 +2252,279 @@ fn daemon_dfs_pending_work_from_records(
         actionable_placement_reconciliation_count,
         metadata_replica_lag_count,
         pending_local_membership_handoff_count,
+        content_gc_expected_shard_count: 0,
+        content_gc_covered_shard_count: 0,
+        content_gc_catalog_age_nanos: None,
+        content_gc_catalog_journal_lag: 0,
+        content_gc_catalog_blocked_reason_count: 0,
+        content_gc_catalog_blocked_reasons: Vec::new(),
+        content_gc_scrub_blocked_issue_count: 0,
+        content_gc_version_candidate_count: 0,
+        content_gc_orphan_candidate_count: 0,
+        content_gc_next_deadline_unix_nanos: None,
+        durable_content_reservation_count: 0,
     }
+}
+
+#[derive(Debug, Default)]
+struct DaemonDfsContentGcProjection {
+    expected_shard_count: usize,
+    covered_shard_count: usize,
+    catalog_age_nanos: Option<u64>,
+    catalog_journal_lag: u64,
+    blocked_reasons: Vec<DfsContentRootCatalogIncompleteReason>,
+    scrub_blocked_issue_count: usize,
+    version_candidate_count: usize,
+    orphan_candidate_count: usize,
+    due_maintenance_count: usize,
+    next_deadline_unix_nanos: Option<u64>,
+}
+
+fn daemon_dfs_version_gc_candidate_count(
+    report: &sinomo_dfs::ContentStoreVersionGcReport,
+) -> usize {
+    usize::try_from(
+        report
+            .newly_observed_absent_version_count
+            .saturating_add(report.deletion_ready_version_count)
+            .saturating_add(report.retained_same_or_stale_catalog_version_count),
+    )
+    .unwrap_or(usize::MAX)
+}
+
+fn daemon_dfs_orphan_gc_candidate_count(report: &sinomo_dfs::ContentStoreGcReport) -> usize {
+    usize::try_from(
+        report
+            .newly_observed_orphan_count
+            .saturating_add(report.eligible_orphan_count)
+            .saturating_add(report.stale_orphan_observation_count)
+            .saturating_add(report.retained_same_or_stale_catalog_orphan_count)
+            .saturating_add(report.eligible_packed_segment_count),
+    )
+    .unwrap_or(usize::MAX)
+}
+
+fn daemon_dfs_content_gc_blocked_reason_requires_refresh(
+    reason: &DfsContentRootCatalogIncompleteReason,
+) -> bool {
+    match reason {
+        // These describe topology which cannot produce complete coverage yet.
+        // Cluster/topology and handoff notifications re-probe them, while the
+        // catalog deadline below remains a bounded safety wake.
+        DfsContentRootCatalogIncompleteReason::NoFileSystemsConfigured
+        | DfsContentRootCatalogIncompleteReason::NoMetadataShardsConfigured
+        | DfsContentRootCatalogIncompleteReason::FileSystemWithoutMetadataShards { .. }
+        | DfsContentRootCatalogIncompleteReason::MembershipHandoffFrozen { .. }
+        | DfsContentRootCatalogIncompleteReason::MembershipHandoffInProgress { .. }
+        | DfsContentRootCatalogIncompleteReason::PageBudgetExceeded { .. }
+        | DfsContentRootCatalogIncompleteReason::UnsupportedCatalogFormat { .. } => false,
+        DfsContentRootCatalogIncompleteReason::ShardIncomplete { reasons, .. } => reasons
+            .iter()
+            .any(daemon_dfs_content_gc_blocked_reason_requires_refresh),
+        DfsContentRootCatalogIncompleteReason::NotAuthoritativePrimary { .. }
+        | DfsContentRootCatalogIncompleteReason::UnknownShard
+        | DfsContentRootCatalogIncompleteReason::AuthorityChanged { .. }
+        | DfsContentRootCatalogIncompleteReason::TopologyChanged { .. }
+        | DfsContentRootCatalogIncompleteReason::DurableCutUnavailable { .. }
+        | DfsContentRootCatalogIncompleteReason::StateFingerprintChanged
+        | DfsContentRootCatalogIncompleteReason::MetadataBackendUnavailable
+        | DfsContentRootCatalogIncompleteReason::TransportUnavailable { .. }
+        | DfsContentRootCatalogIncompleteReason::MissingFileSystem { .. }
+        | DfsContentRootCatalogIncompleteReason::UnexpectedFileSystem { .. }
+        | DfsContentRootCatalogIncompleteReason::CatalogRefreshFailed { .. }
+        | DfsContentRootCatalogIncompleteReason::CatalogNotDurablyInstalled
+        | DfsContentRootCatalogIncompleteReason::MissingShard { .. }
+        | DfsContentRootCatalogIncompleteReason::UnexpectedShard { .. }
+        | DfsContentRootCatalogIncompleteReason::DuplicateShard { .. }
+        | DfsContentRootCatalogIncompleteReason::CatalogExpired { .. }
+        | DfsContentRootCatalogIncompleteReason::CatalogTimestampInFuture { .. }
+        | DfsContentRootCatalogIncompleteReason::HeadWatermarkUnavailable { .. }
+        | DfsContentRootCatalogIncompleteReason::HeadWatermarkIdentityMismatch { .. }
+        | DfsContentRootCatalogIncompleteReason::CatalogBehindHeadWatermark { .. }
+        | DfsContentRootCatalogIncompleteReason::HeadWatermarkFingerprintChanged { .. }
+        | DfsContentRootCatalogIncompleteReason::MalformedCatalog { .. } => true,
+    }
+}
+
+fn daemon_dfs_content_gc_projection(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    content: &LocalContentStore,
+    reservations: &sinomo_dfs::ContentStoreReservationRoots,
+    lifecycle_options: DfsMaintenanceRunOptions,
+    now_unix_nanos: u64,
+) -> Result<DaemonDfsContentGcProjection, DaemonError> {
+    let expected_file_systems = cluster_dfs_all_file_system_configs(cluster_paths)?;
+    let expected_shards = cluster_dfs_all_metadata_shards(cluster_paths)?;
+    let pending_handoffs = cluster_dfs_all_metadata_shard_membership_handoffs(cluster_paths)?;
+    let head_watermarks = cluster_dfs_all_metadata_shard_head_watermarks(cluster_paths)?;
+    let catalog_work_expected = !expected_file_systems.is_empty()
+        || !expected_shards.is_empty()
+        || !pending_handoffs.is_empty();
+    let catalog_store = default_dfs_content_root_catalog_store(data_dir.dfs_dir().join("content"));
+    let catalog = match catalog_store.load() {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            return Ok(DaemonDfsContentGcProjection {
+                expected_shard_count: expected_shards.len(),
+                blocked_reasons: vec![
+                    DfsContentRootCatalogIncompleteReason::CatalogRefreshFailed {
+                        reason: format!("durable catalog is unreadable: {error}"),
+                    },
+                ],
+                due_maintenance_count: usize::from(catalog_work_expected),
+                ..DaemonDfsContentGcProjection::default()
+            });
+        }
+    };
+    let Some(catalog) = catalog else {
+        return Ok(DaemonDfsContentGcProjection {
+            expected_shard_count: expected_shards.len(),
+            blocked_reasons: vec![if expected_file_systems.is_empty() {
+                DfsContentRootCatalogIncompleteReason::NoFileSystemsConfigured
+            } else if expected_shards.is_empty() {
+                DfsContentRootCatalogIncompleteReason::NoMetadataShardsConfigured
+            } else {
+                DfsContentRootCatalogIncompleteReason::CatalogNotDurablyInstalled
+            }],
+            due_maintenance_count: usize::from(catalog_work_expected),
+            ..DaemonDfsContentGcProjection::default()
+        });
+    };
+
+    let validation = match catalog.validate_for_collection_with_head_watermark_policy(
+        &expected_file_systems,
+        &expected_shards,
+        &pending_handoffs,
+        &head_watermarks,
+        false,
+        now_unix_nanos,
+        lifecycle_options.content_root_catalog_max_age,
+    ) {
+        Ok(validation) => validation,
+        Err(error) => DfsContentRootCatalogCollectionValidation::incomplete_for_expected_shards(
+            vec![DfsContentRootCatalogIncompleteReason::MalformedCatalog {
+                reason: error.to_string(),
+            }],
+            expected_shards.len(),
+        ),
+    };
+    let max_age_nanos = daemon_dfs_duration_nanos(lifecycle_options.content_root_catalog_max_age);
+    let catalog_refresh_deadline = catalog
+        .generated_at_unix_nanos()
+        .saturating_add(max_age_nanos);
+    let mut projection = DaemonDfsContentGcProjection {
+        expected_shard_count: validation.expected_shard_count(),
+        covered_shard_count: validation.covered_shard_count(),
+        catalog_age_nanos: Some(validation.catalog_age_nanos()),
+        catalog_journal_lag: validation.max_journal_lag_entries(),
+        blocked_reasons: validation.reasons().to_vec(),
+        ..DaemonDfsContentGcProjection::default()
+    };
+    if !validation.is_collection_authorized() {
+        let repairable_block = validation
+            .reasons()
+            .iter()
+            .any(daemon_dfs_content_gc_blocked_reason_requires_refresh);
+        if repairable_block || catalog_refresh_deadline <= now_unix_nanos {
+            projection.due_maintenance_count = projection.due_maintenance_count.saturating_add(1);
+        } else {
+            // Structural coverage gaps and active handoffs remain parked on
+            // their state-change notifications, with catalog expiry as a
+            // bounded fallback wake.
+            projection.next_deadline_unix_nanos = Some(catalog_refresh_deadline);
+        }
+        return Ok(projection);
+    }
+    let protection = validation
+        .protection()
+        .expect("authorized content-root catalog validation has protection");
+    let catalog_generation = validation
+        .catalog_generation()
+        .expect("authorized content-root catalog validation has a generation");
+    let catalog_installed_at_unix_nanos = validation
+        .catalog_installed_at_unix_nanos()
+        .expect("authorized content-root catalog validation has a durable install observation");
+    let version_projection = content.collect_versions(
+        ContentStoreVersionGcOptions::dry_run(
+            lifecycle_options.content_version_gc_min_age,
+            lifecycle_options.content_version_gc_keep_latest_versions,
+        )
+        .with_max_deletions(lifecycle_options.content_version_gc_max_records)
+        .with_min_absence_age(lifecycle_options.content_version_gc_min_age)
+        .with_catalog_projection_observation(catalog_generation, catalog_installed_at_unix_nanos)
+        .with_protected_versions(
+            protection
+                .versions
+                .iter()
+                .map(|identity| (identity.object_id.as_str(), identity.version.as_str())),
+        ),
+    )?;
+    let orphan_projection = content.collect_garbage(
+        ContentStoreGcOptions::dry_run(lifecycle_options.content_orphan_gc_min_age)
+            .with_max_deletions(lifecycle_options.content_orphan_gc_max_records)
+            .with_catalog_projection_observation(
+                catalog_generation,
+                catalog_installed_at_unix_nanos,
+            )
+            .with_protected_content_hashes(protection.content_hashes.iter().map(String::as_str)),
+    )?;
+    projection.scrub_blocked_issue_count = usize::try_from(
+        version_projection
+            .blocked_by_scrub_issue_count
+            .max(orphan_projection.blocked_by_scrub_issue_count),
+    )
+    .unwrap_or(usize::MAX);
+    projection.version_candidate_count = daemon_dfs_version_gc_candidate_count(&version_projection);
+    projection.orphan_candidate_count = daemon_dfs_orphan_gc_candidate_count(&orphan_projection);
+    projection.due_maintenance_count = projection
+        .due_maintenance_count
+        .saturating_add(projection.version_candidate_count)
+        .saturating_add(projection.orphan_candidate_count);
+    projection.next_deadline_unix_nanos = projection
+        .next_deadline_unix_nanos
+        .into_iter()
+        .chain(std::iter::once(catalog_refresh_deadline))
+        .chain(version_projection.next_eligible_at_unix_nanos)
+        .chain(orphan_projection.next_eligible_at_unix_nanos)
+        .min();
+
+    let catalog_versions = protection
+        .versions
+        .iter()
+        .map(|identity| {
+            (
+                identity.object_id.as_str().to_string(),
+                identity.version.as_str().to_string(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    for reservation in &reservations.reservations {
+        let covered = catalog_versions.contains(&(
+            reservation.identity.object_id.clone(),
+            reservation.identity.version.clone(),
+        ));
+        let rejection_deadline =
+            reservation
+                .reserved_at_unix_nanos
+                .saturating_add(daemon_dfs_duration_nanos(
+                    lifecycle_options.content_reservation_rejection_grace,
+                ));
+        if covered
+            || catalog_installed_at_unix_nanos > rejection_deadline
+            || now_unix_nanos >= rejection_deadline
+        {
+            projection.due_maintenance_count = projection.due_maintenance_count.saturating_add(1);
+        } else {
+            projection.next_deadline_unix_nanos = projection
+                .next_deadline_unix_nanos
+                .into_iter()
+                .chain(std::iter::once(rejection_deadline))
+                .min();
+        }
+    }
+
+    Ok(projection)
 }
 
 pub(crate) fn daemon_dfs_pending_maintenance_work(
@@ -2282,6 +2569,17 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
     let content = LocalContentStore::open_for_inspection(data_dir.dfs_dir().join("content"));
     let staging_projection = content.collect_stale_staging(
         ContentStoreStagingGcOptions::dry_run(lifecycle_options.stale_staging_min_age),
+    )?;
+    let content_reservations = content.content_reservation_roots()?;
+    let durable_content_reservation_count =
+        usize::try_from(content_reservations.reservation_count).unwrap_or(usize::MAX);
+    let content_gc_projection = daemon_dfs_content_gc_projection(
+        &data_dir,
+        &cluster_paths,
+        &content,
+        &content_reservations,
+        lifecycle_options,
+        now_unix_nanos,
     )?;
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .map_err(DaemonError::from)?;
@@ -2390,14 +2688,42 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         .saturating_add(metadata_history_schedule.due_record_count)
         .saturating_add(
             usize::try_from(staging_projection.eligible_staging_count).unwrap_or(usize::MAX),
-        );
+        )
+        .saturating_add(content_gc_projection.due_maintenance_count);
     work.next_time_based_maintenance_unix_nanos = work
         .next_time_based_maintenance_unix_nanos
         .into_iter()
         .chain(tombstone_projection.next_eligible_at_unix_nanos)
         .chain(metadata_history_schedule.next_deadline_unix_nanos)
         .chain(staging_projection.next_eligible_at_unix_nanos)
+        .chain(content_gc_projection.next_deadline_unix_nanos)
         .min();
+    work.content_gc_expected_shard_count = content_gc_projection.expected_shard_count;
+    work.content_gc_covered_shard_count = content_gc_projection.covered_shard_count;
+    work.content_gc_catalog_age_nanos = content_gc_projection.catalog_age_nanos;
+    work.content_gc_catalog_journal_lag = content_gc_projection.catalog_journal_lag;
+    work.content_gc_catalog_blocked_reason_count = content_gc_projection.blocked_reasons.len();
+    work.content_gc_catalog_blocked_reasons = content_gc_projection.blocked_reasons;
+    work.content_gc_scrub_blocked_issue_count = content_gc_projection.scrub_blocked_issue_count;
+    work.content_gc_version_candidate_count = content_gc_projection.version_candidate_count;
+    work.content_gc_orphan_candidate_count = content_gc_projection.orphan_candidate_count;
+    work.content_gc_next_deadline_unix_nanos = content_gc_projection.next_deadline_unix_nanos;
+    work.durable_content_reservation_count = durable_content_reservation_count;
+    tracing::debug!(
+        target: "sinomo.dfs.maintenance",
+        content_gc_covered_shard_count = work.content_gc_covered_shard_count,
+        content_gc_expected_shard_count = work.content_gc_expected_shard_count,
+        content_gc_catalog_age_nanos = ?work.content_gc_catalog_age_nanos,
+        content_gc_catalog_journal_lag = work.content_gc_catalog_journal_lag,
+        content_gc_catalog_blocked_reason_count = work.content_gc_catalog_blocked_reason_count,
+        content_gc_catalog_blocked_reasons = ?work.content_gc_catalog_blocked_reasons,
+        content_gc_scrub_blocked_issue_count = work.content_gc_scrub_blocked_issue_count,
+        content_gc_version_candidate_count = work.content_gc_version_candidate_count,
+        content_gc_orphan_candidate_count = work.content_gc_orphan_candidate_count,
+        content_gc_next_deadline_unix_nanos = ?work.content_gc_next_deadline_unix_nanos,
+        durable_content_reservation_count = work.durable_content_reservation_count,
+        "projected daemon DFS content GC maintenance"
+    );
     Ok(work)
 }
 
@@ -5651,13 +5977,12 @@ fn daemon_dfs_maintenance_tick_options() -> DfsMaintenanceTickOptions {
     options.lifecycle.metadata_history_gc_keep_latest_versions =
         DAEMON_DFS_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS;
     options.lifecycle.metadata_history_gc_max_records = DAEMON_DFS_METADATA_HISTORY_GC_MAX_RECORDS;
-    // Configured local shard directories do not prove that every table image
-    // is fresh enough to be the reachability authority for node-local content.
-    // Keep automatic manifest/blob collection disabled until a durable,
-    // authoritative content-root catalog (or equivalent coverage proof) is
-    // available. Manual/acceptance lifecycle calls remain explicit opt-ins.
-    options.lifecycle.collect_content_versions = false;
-    options.lifecycle.collect_orphan_content = false;
+    // The lifecycle implementation refreshes and validates a durable
+    // all-filesystem root catalog after metadata GC. These requests are safe to
+    // leave enabled: missing, incomplete, stale, or mismatched coverage makes
+    // the destructive collectors fail closed while retaining projections.
+    options.lifecycle.collect_content_versions = true;
+    options.lifecycle.collect_orphan_content = true;
     // Metadata cursor ownership belongs exclusively to retained exact-shard
     // publisher lanes. A broad maintenance pass must not race those lanes or
     // duplicate their outbound RPCs.
@@ -7100,6 +7425,19 @@ mod tests {
             local_node_id,
             sinomo_core::kv::KvCommand::Op(
                 sinomo_core::kv::KvOp::put_serde(
+                    sinomo_dfs::file_system_config_key(&shard.file_system_id),
+                    &test_file_system_config_for_shard(shard),
+                    None,
+                )
+                .expect("filesystem config op"),
+            ),
+        )
+        .expect("write filesystem config");
+        append_cluster_raft_command(
+            cluster_paths,
+            local_node_id,
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
                     metadata_shard_key(&shard.file_system_id, &shard.shard_id),
                     shard,
                     None,
@@ -7108,6 +7446,15 @@ mod tests {
             ),
         )
         .expect("write metadata shard config");
+    }
+
+    fn test_file_system_config_for_shard(shard: &DfsMetadataShardConfig) -> DfsFileSystemConfig {
+        DfsFileSystemConfig {
+            file_system_id: shard.file_system_id.clone(),
+            display_name: format!("{} test filesystem", shard.file_system_id),
+            owner_node_id: shard.primary_node_id.clone(),
+            subtree_policies: Vec::new(),
+        }
     }
 
     fn daemon_test_runtime(name: &str) -> tokio::runtime::Runtime {
@@ -7592,14 +7939,8 @@ mod tests {
         assert!(DAEMON_DFS_METADATA_HISTORY_GC_MAX_AGE >= DAEMON_DFS_METADATA_HISTORY_GC_MIN_AGE);
         assert!(DAEMON_DFS_METADATA_HISTORY_GC_RECORD_TRIGGER > 0);
         assert!(DAEMON_DFS_METADATA_HISTORY_GC_BYTES_TRIGGER > 0);
-        assert!(
-            !lifecycle.collect_content_versions,
-            "daemon maintenance must not delete manifests without authoritative content-root coverage"
-        );
-        assert!(
-            !lifecycle.collect_orphan_content,
-            "daemon maintenance must not delete blobs without authoritative content-root coverage"
-        );
+        assert!(lifecycle.collect_content_versions);
+        assert!(lifecycle.collect_orphan_content);
         assert!(
             !daemon_dfs_maintenance_tick_options().publish_metadata,
             "broad maintenance must not race retained exact-shard publishers"
@@ -7677,6 +8018,308 @@ mod tests {
                 .has_blob(&orphan.content_hash)
                 .expect("content-only blob remains"),
             "the scheduling probe must remain read-only"
+        );
+    }
+
+    #[test]
+    fn daemon_dfs_content_gc_refresh_classifier_parks_only_structural_or_handoff_gaps() {
+        for reason in [
+            DfsContentRootCatalogIncompleteReason::NoFileSystemsConfigured,
+            DfsContentRootCatalogIncompleteReason::NoMetadataShardsConfigured,
+            DfsContentRootCatalogIncompleteReason::MembershipHandoffFrozen {
+                handoff_id: Some("handoff".to_string()),
+            },
+            DfsContentRootCatalogIncompleteReason::PageBudgetExceeded { max_pages: 1 },
+        ] {
+            assert!(
+                !daemon_dfs_content_gc_blocked_reason_requires_refresh(&reason),
+                "{reason:?} must remain parked on its state change and bounded deadline"
+            );
+        }
+        for reason in [
+            DfsContentRootCatalogIncompleteReason::MetadataBackendUnavailable,
+            DfsContentRootCatalogIncompleteReason::StateFingerprintChanged,
+            DfsContentRootCatalogIncompleteReason::CatalogNotDurablyInstalled,
+            DfsContentRootCatalogIncompleteReason::CatalogTimestampInFuture {
+                identity: None,
+                observed_unix_nanos: u64::MAX,
+                now_unix_nanos: 1,
+            },
+        ] {
+            assert!(
+                daemon_dfs_content_gc_blocked_reason_requires_refresh(&reason),
+                "{reason:?} must request a fresh authoritative catalog immediately"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_dfs_content_gc_stale_catalog_observations_request_a_new_generation() {
+        let version_report = sinomo_dfs::ContentStoreVersionGcReport {
+            retained_same_or_stale_catalog_version_count: 2,
+            ..sinomo_dfs::ContentStoreVersionGcReport::default()
+        };
+        assert_eq!(daemon_dfs_version_gc_candidate_count(&version_report), 2);
+
+        let orphan_report = sinomo_dfs::ContentStoreGcReport {
+            retained_same_or_stale_catalog_orphan_count: 3,
+            ..sinomo_dfs::ContentStoreGcReport::default()
+        };
+        assert_eq!(daemon_dfs_orphan_gc_candidate_count(&orphan_report), 3);
+    }
+
+    #[test]
+    fn daemon_dfs_content_gc_projection_requires_complete_catalog_coverage() {
+        let root = temp_root("pending-content-gc-catalog-coverage");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("root layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let local = NodeId::from_legacy_named("node_pending_content_catalog").expect("local node");
+        let file_system = distributed_sifs(local.clone());
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 3,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        install_test_metadata_replica_shard(
+            &cluster_paths,
+            "cluster_pending_content_catalog",
+            &local,
+            &shard,
+        );
+        let state_fingerprint = format!("dfs-metadata-prefix-v1:blake3:{}", "0".repeat(64));
+        let watermark = sinomo_dfs::DfsMetadataShardHeadWatermark {
+            file_system_id: shard.file_system_id.clone(),
+            shard_id: shard.shard_id.clone(),
+            primary_node_id: local.clone(),
+            epoch: shard.epoch,
+            journal_sequence: 7,
+            state_fingerprint: state_fingerprint.clone(),
+            acknowledged_node_ids: vec![local],
+        };
+        append_cluster_raft_command(
+            &cluster_paths,
+            &shard.primary_node_id,
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
+                    sinomo_dfs::metadata_shard_head_watermark_key(
+                        &shard.file_system_id,
+                        &shard.shard_id,
+                    ),
+                    &watermark,
+                    None,
+                )
+                .expect("head watermark op"),
+            ),
+        )
+        .expect("write head watermark");
+
+        let content_root = data_dir.dfs_dir().join("content");
+        let content = LocalContentStore::new(&content_root).expect("content store");
+        content
+            .put_object_version(
+                "pending-content-object",
+                "pending-content-version-1",
+                b"old manifest",
+            )
+            .expect("old manifest");
+        content
+            .put_object_version(
+                "pending-content-object",
+                "pending-content-version-2",
+                b"latest manifest",
+            )
+            .expect("latest manifest");
+        content
+            .put_object_version_blob_only(
+                "pending-orphan-object",
+                "pending-orphan-version",
+                b"orphan blob",
+            )
+            .expect("orphan blob");
+        for reservation in content
+            .content_reservation_roots()
+            .expect("reservation roots")
+            .reservations
+        {
+            content
+                .release_content_reservation_for_test(
+                    &reservation.identity.object_id,
+                    &reservation.identity.version,
+                    &reservation.identity.content_hash,
+                )
+                .expect("release fixture reservation");
+        }
+        let reservations = content
+            .content_reservation_roots()
+            .expect("empty reservation roots");
+        assert_eq!(reservations.reservation_count, 0);
+
+        let generated_at_unix_nanos = daemon_dfs_now_unix_nanos().saturating_sub(1);
+        let file_system_config = test_file_system_config_for_shard(&shard);
+        let topology_digest =
+            sinomo_dfs::dfs_content_root_catalog_topology_digest_with_file_systems(
+                std::slice::from_ref(&file_system_config),
+                std::slice::from_ref(&shard),
+            )
+            .expect("topology digest");
+        let identity = sinomo_dfs::DfsContentRootCatalogShardIdentity::from_config(&shard);
+        let complete_catalog = sinomo_dfs::DfsContentRootCatalog::from_fragments(
+            topology_digest.clone(),
+            vec![identity.clone()],
+            generated_at_unix_nanos,
+            vec![sinomo_dfs::DfsContentRootCatalogFragment {
+                identity: identity.clone(),
+                topology_digest: topology_digest.clone(),
+                generated_at_unix_nanos,
+                coverage: sinomo_dfs::DfsContentRootCatalogCoverage::Complete {
+                    prefix_proof_version: sinomo_dfs::DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
+                    journal_sequence: watermark.journal_sequence,
+                    state_fingerprint,
+                },
+                entries: Vec::new(),
+            }],
+        )
+        .expect("complete catalog");
+        default_dfs_content_root_catalog_store(&content_root)
+            .install_test_catalog_at(complete_catalog, generated_at_unix_nanos)
+            .expect("install complete catalog");
+        let mut lifecycle = DfsMaintenanceRunOptions::default();
+        lifecycle.content_version_gc_min_age = Duration::ZERO;
+        lifecycle.content_version_gc_keep_latest_versions = 1;
+        lifecycle.content_orphan_gc_min_age = Duration::ZERO;
+        lifecycle.content_root_catalog_max_age = Duration::from_secs(60);
+        let complete = daemon_dfs_content_gc_projection(
+            &data_dir,
+            &cluster_paths,
+            &content,
+            &reservations,
+            lifecycle,
+            daemon_dfs_now_unix_nanos(),
+        )
+        .expect("complete projection");
+        assert_eq!(complete.covered_shard_count, 1);
+        assert_eq!(complete.expected_shard_count, 1);
+        assert!(complete.blocked_reasons.is_empty());
+        assert_eq!(complete.scrub_blocked_issue_count, 0);
+        assert_eq!(complete.version_candidate_count, 1);
+        assert_eq!(complete.orphan_candidate_count, 1);
+        assert!(complete.due_maintenance_count >= 2);
+        assert!(complete.next_deadline_unix_nanos.is_some());
+
+        std::fs::write(
+            content_root
+                .join("objects")
+                .join("pending-content-object")
+                .join("pending-content-version-2")
+                .join("manifest.sobj"),
+            b"torn manifest",
+        )
+        .expect("corrupt fixture manifest");
+        let scrub_blocked = daemon_dfs_content_gc_projection(
+            &data_dir,
+            &cluster_paths,
+            &content,
+            &reservations,
+            lifecycle,
+            daemon_dfs_now_unix_nanos(),
+        )
+        .expect("scrub-blocked projection");
+        assert!(
+            scrub_blocked.scrub_blocked_issue_count > 0,
+            "local scrub failures must remain visible when catalog coverage is complete"
+        );
+
+        let incomplete_catalog = sinomo_dfs::DfsContentRootCatalog::from_fragments(
+            topology_digest.clone(),
+            vec![identity.clone()],
+            generated_at_unix_nanos,
+            vec![sinomo_dfs::DfsContentRootCatalogFragment {
+                identity: identity.clone(),
+                topology_digest: topology_digest.clone(),
+                generated_at_unix_nanos,
+                coverage: sinomo_dfs::DfsContentRootCatalogCoverage::Incomplete {
+                    reasons: vec![
+                        DfsContentRootCatalogIncompleteReason::MetadataBackendUnavailable,
+                    ],
+                },
+                entries: Vec::new(),
+            }],
+        )
+        .expect("incomplete catalog");
+        default_dfs_content_root_catalog_store(&content_root)
+            .install_test_catalog_at(incomplete_catalog, generated_at_unix_nanos)
+            .expect("install incomplete catalog");
+        let incomplete = daemon_dfs_content_gc_projection(
+            &data_dir,
+            &cluster_paths,
+            &content,
+            &reservations,
+            lifecycle,
+            daemon_dfs_now_unix_nanos(),
+        )
+        .expect("incomplete projection");
+        assert_eq!(incomplete.covered_shard_count, 0);
+        assert_eq!(incomplete.expected_shard_count, 1);
+        assert_eq!(incomplete.version_candidate_count, 0);
+        assert_eq!(incomplete.orphan_candidate_count, 0);
+        assert!(incomplete.due_maintenance_count > 0);
+        assert_eq!(incomplete.next_deadline_unix_nanos, None);
+        assert!(matches!(
+            incomplete.blocked_reasons.as_slice(),
+            [DfsContentRootCatalogIncompleteReason::ShardIncomplete { .. }]
+        ));
+
+        let parked_catalog = sinomo_dfs::DfsContentRootCatalog::from_fragments(
+            topology_digest.clone(),
+            vec![identity.clone()],
+            generated_at_unix_nanos,
+            vec![sinomo_dfs::DfsContentRootCatalogFragment {
+                identity,
+                topology_digest,
+                generated_at_unix_nanos,
+                coverage: sinomo_dfs::DfsContentRootCatalogCoverage::Incomplete {
+                    reasons: vec![
+                        DfsContentRootCatalogIncompleteReason::MembershipHandoffFrozen {
+                            handoff_id: Some("pending-catalog-handoff".to_string()),
+                        },
+                    ],
+                },
+                entries: Vec::new(),
+            }],
+        )
+        .expect("parked handoff catalog");
+        default_dfs_content_root_catalog_store(&content_root)
+            .install_test_catalog_at(parked_catalog, generated_at_unix_nanos)
+            .expect("install parked handoff catalog");
+        let parked = daemon_dfs_content_gc_projection(
+            &data_dir,
+            &cluster_paths,
+            &content,
+            &reservations,
+            DfsMaintenanceRunOptions::default(),
+            daemon_dfs_now_unix_nanos(),
+        )
+        .expect("parked handoff projection");
+        assert_eq!(parked.due_maintenance_count, 0);
+        assert_eq!(
+            parked.next_deadline_unix_nanos,
+            Some(
+                generated_at_unix_nanos.saturating_add(daemon_dfs_duration_nanos(
+                    DfsMaintenanceRunOptions::default().content_root_catalog_max_age,
+                ))
+            )
+        );
+
+        let paths = DaemonPaths::with_root(data_dir.root().join("daemon"));
+        let pending = daemon_dfs_pending_maintenance_work(&paths).expect("pending maintenance");
+        assert_eq!(
+            pending.content_gc_next_deadline_unix_nanos, parked.next_deadline_unix_nanos,
+            "the content-GC deadline must remain attributable after scheduler aggregation"
         );
     }
 

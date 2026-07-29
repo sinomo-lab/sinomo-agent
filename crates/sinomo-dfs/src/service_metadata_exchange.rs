@@ -5,11 +5,655 @@
 //! repairs after a replica or routed-response mirror falls behind. The
 //! background publish planner remains in `metadata_replication`.
 
+use std::path::Path;
+
 use sinomo_core::node::NodeId;
 
 use crate::*;
 
+fn content_root_catalog_file_system_config_key_is_exact(key: &str) -> bool {
+    let mut segments = key.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (
+            Some(""),
+            Some("dfs"),
+            Some("filesystems"),
+            Some(file_system_id),
+            Some("config"),
+            None,
+        ) if !file_system_id.is_empty()
+    )
+}
+
+fn content_root_catalog_metadata_shard_key_is_exact(key: &str) -> bool {
+    let mut segments = key.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (
+            Some(""),
+            Some("dfs"),
+            Some("filesystems"),
+            Some(file_system_id),
+            Some("metadata-shards"),
+            Some(shard_id),
+            None,
+        ) if !file_system_id.is_empty() && !shard_id.is_empty()
+    )
+}
+
+fn content_root_catalog_membership_handoff_key_is_exact(key: &str) -> bool {
+    let mut segments = key.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (
+            Some(""),
+            Some("dfs"),
+            Some("filesystems"),
+            Some(file_system_id),
+            Some("metadata-membership-handoffs"),
+            Some(shard_id),
+            None,
+        ) if !file_system_id.is_empty() && !shard_id.is_empty()
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DfsContentRootCatalogTopologySnapshot {
+    file_systems: Vec<DfsFileSystemConfig>,
+    shards: Vec<DfsMetadataShardConfig>,
+    pending_handoffs: Vec<DfsMetadataShardMembershipHandoff>,
+}
+
+impl DfsContentRootCatalogTopologySnapshot {
+    fn canonical(
+        mut file_systems: Vec<DfsFileSystemConfig>,
+        mut shards: Vec<DfsMetadataShardConfig>,
+        mut pending_handoffs: Vec<DfsMetadataShardMembershipHandoff>,
+    ) -> Self {
+        file_systems.sort_by(|left, right| left.file_system_id.cmp(&right.file_system_id));
+        for shard in &mut shards {
+            shard.replica_node_ids.sort();
+            shard.replica_node_ids.dedup();
+        }
+        shards.sort_by(|left, right| {
+            left.file_system_id
+                .cmp(&right.file_system_id)
+                .then_with(|| left.shard_id.cmp(&right.shard_id))
+        });
+        pending_handoffs.sort_by(|left, right| {
+            left.retiring_shard
+                .file_system_id
+                .cmp(&right.retiring_shard.file_system_id)
+                .then_with(|| {
+                    left.retiring_shard
+                        .shard_id
+                        .cmp(&right.retiring_shard.shard_id)
+                })
+                .then_with(|| left.handoff_id.cmp(&right.handoff_id))
+        });
+        Self {
+            file_systems,
+            shards,
+            pending_handoffs,
+        }
+    }
+
+    fn file_system_ids(&self) -> Vec<DfsFileSystemId> {
+        self.file_systems
+            .iter()
+            .map(|config| config.file_system_id.clone())
+            .collect()
+    }
+
+    fn has_duplicate_identities(&self) -> bool {
+        self.file_systems
+            .windows(2)
+            .any(|pair| pair[0].file_system_id == pair[1].file_system_id)
+            || self.shards.windows(2).any(|pair| {
+                pair[0].file_system_id == pair[1].file_system_id
+                    && pair[0].shard_id == pair[1].shard_id
+            })
+    }
+
+    fn deduplicated_identities(&self) -> Self {
+        let mut topology = self.clone();
+        topology
+            .file_systems
+            .dedup_by(|left, right| left.file_system_id == right.file_system_id);
+        topology.shards.dedup_by(|left, right| {
+            left.file_system_id == right.file_system_id && left.shard_id == right.shard_id
+        });
+        topology
+    }
+
+    fn topology_digest(&self) -> Result<String, DfsError> {
+        dfs_content_root_catalog_topology_digest_with_file_systems(&self.file_systems, &self.shards)
+            .map_err(DfsError::from)
+    }
+
+    fn incomplete_reasons(&self) -> Vec<DfsContentRootCatalogIncompleteReason> {
+        let mut reasons = Vec::new();
+        if self.file_systems.is_empty() {
+            reasons.push(DfsContentRootCatalogIncompleteReason::NoFileSystemsConfigured);
+        }
+        if self.shards.is_empty() {
+            reasons.push(DfsContentRootCatalogIncompleteReason::NoMetadataShardsConfigured);
+        }
+        for file_system in &self.file_systems {
+            if !self
+                .shards
+                .iter()
+                .any(|shard| shard.file_system_id == file_system.file_system_id)
+            {
+                reasons.push(
+                    DfsContentRootCatalogIncompleteReason::FileSystemWithoutMetadataShards {
+                        file_system_id: file_system.file_system_id.clone(),
+                    },
+                );
+            }
+        }
+        for handoff in &self.pending_handoffs {
+            reasons.push(
+                DfsContentRootCatalogIncompleteReason::MembershipHandoffInProgress {
+                    file_system_id: handoff.retiring_shard.file_system_id.clone(),
+                    shard_id: DfsMetadataShardId::new(handoff.retiring_shard.shard_id.clone()),
+                    handoff_id: handoff.handoff_id.clone(),
+                },
+            );
+        }
+        reasons
+    }
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    fn global_content_root_catalog_topology(
+        &mut self,
+    ) -> Result<Option<DfsContentRootCatalogTopologySnapshot>, DfsError> {
+        self.refresh_control_plane_latest()?;
+        let Some(control_plane) = self.control_plane.as_mut() else {
+            return Ok(None);
+        };
+        let mut file_systems = Vec::new();
+        let mut shards = Vec::new();
+        let mut pending_handoffs = Vec::new();
+        for entry in control_plane.range_prefix("/dfs/filesystems/")? {
+            if content_root_catalog_file_system_config_key_is_exact(&entry.key) {
+                file_systems.push(entry.decode::<DfsFileSystemConfig>()?);
+            } else if content_root_catalog_metadata_shard_key_is_exact(&entry.key) {
+                shards.push(entry.decode::<DfsMetadataShardConfig>()?);
+            } else if content_root_catalog_membership_handoff_key_is_exact(&entry.key) {
+                pending_handoffs.push(entry.decode::<DfsMetadataShardMembershipHandoff>()?);
+            }
+        }
+        Ok(Some(DfsContentRootCatalogTopologySnapshot::canonical(
+            file_systems,
+            shards,
+            pending_handoffs,
+        )))
+    }
+
+    fn install_incomplete_content_root_catalog(
+        &self,
+        expected_topology: &DfsContentRootCatalogTopologySnapshot,
+        mut reasons: Vec<DfsContentRootCatalogIncompleteReason>,
+        content_root: &Path,
+    ) -> Result<DfsContentRootCatalog, DfsError> {
+        for reason in expected_topology.incomplete_reasons() {
+            if !reasons.contains(&reason) {
+                reasons.push(reason);
+            }
+        }
+        let expected_topology_digest = expected_topology.topology_digest()?;
+        let identities = expected_topology
+            .shards
+            .iter()
+            .map(DfsContentRootCatalogShardIdentity::from_config)
+            .collect();
+        let generated_at_unix_nanos = crate::metadata_tombstone::metadata_now_unix_nanos();
+        let catalog = DfsContentRootCatalog::from_topology_fragments(
+            expected_topology_digest,
+            expected_topology.file_system_ids(),
+            identities,
+            generated_at_unix_nanos,
+            reasons,
+            Vec::new(),
+        )?;
+        LocalDfsContentRootCatalogStore::new(content_root)
+            .install(catalog)
+            .map_err(DfsError::from)
+    }
+
+    /// Persist a fail-closed refresh marker even when the supplied topology is
+    /// itself malformed and cannot be represented as an ordinary incomplete
+    /// catalog (for example, duplicate filesystem or shard identities).
+    fn install_content_root_catalog_refresh_failure(
+        &self,
+        expected_topology: &DfsContentRootCatalogTopologySnapshot,
+        error: &DfsError,
+        content_root: &Path,
+    ) -> Result<DfsContentRootCatalog, DfsError> {
+        let reason = DfsContentRootCatalogIncompleteReason::CatalogRefreshFailed {
+            reason: error.to_string(),
+        };
+        if expected_topology.has_duplicate_identities() {
+            let fallback_topology = expected_topology.deduplicated_identities();
+            return self.install_incomplete_content_root_catalog(
+                &fallback_topology,
+                vec![reason],
+                content_root,
+            );
+        }
+        match self.install_incomplete_content_root_catalog(
+            expected_topology,
+            vec![reason.clone()],
+            content_root,
+        ) {
+            Ok(catalog) => Ok(catalog),
+            Err(expected_topology_error) => {
+                let fallback_topology = expected_topology.deduplicated_identities();
+                self.install_incomplete_content_root_catalog(
+                    &fallback_topology,
+                    vec![DfsContentRootCatalogIncompleteReason::CatalogRefreshFailed {
+                        reason: format!(
+                            "{error}; expected topology could not be encoded in the failure marker: {expected_topology_error}"
+                        ),
+                    }],
+                    content_root,
+                )
+            }
+        }
+    }
+
+    /// Refresh the exact content-GC root catalog from every current metadata
+    /// shard primary and atomically install the result under `content_root`.
+    ///
+    /// The caller supplies the all-filesystem shard snapshot it just read from
+    /// cluster KV plus post-metadata-GC journal watermarks. Every page
+    /// is bound to that topology, primary epoch, durable sequence, and state
+    /// fingerprint. Any missing authority, handoff fence, transport gap, or
+    /// pagination budget exhaustion installs an incomplete fail-closed catalog.
+    pub fn refresh_content_root_catalog(
+        &mut self,
+        file_systems: &[DfsFileSystemConfig],
+        shards: &[DfsMetadataShardConfig],
+        pending_handoffs: &[DfsMetadataShardMembershipHandoff],
+        content_root: impl AsRef<Path>,
+        head_watermarks: &[DfsMetadataShardHeadWatermark],
+        max_pages_per_shard: usize,
+    ) -> Result<DfsContentRootCatalog, DfsError> {
+        let content_root = content_root.as_ref();
+        let result = self.refresh_content_root_catalog_inner(
+            file_systems,
+            shards,
+            pending_handoffs,
+            content_root,
+            head_watermarks,
+            max_pages_per_shard,
+        );
+        if let Err(error) = &result {
+            let expected_topology = DfsContentRootCatalogTopologySnapshot::canonical(
+                file_systems.to_vec(),
+                shards.to_vec(),
+                pending_handoffs.to_vec(),
+            );
+            if let Err(install_error) = self.install_content_root_catalog_refresh_failure(
+                &expected_topology,
+                error,
+                content_root,
+            ) {
+                return Err(DfsError::Metadata {
+                    message: format!(
+                        "content-root catalog refresh failed ({error}) and its durable failure marker could not be installed ({install_error})"
+                    ),
+                });
+            }
+        }
+        result
+    }
+
+    fn refresh_content_root_catalog_inner(
+        &mut self,
+        file_systems: &[DfsFileSystemConfig],
+        shards: &[DfsMetadataShardConfig],
+        pending_handoffs: &[DfsMetadataShardMembershipHandoff],
+        content_root: impl AsRef<Path>,
+        head_watermarks: &[DfsMetadataShardHeadWatermark],
+        max_pages_per_shard: usize,
+    ) -> Result<DfsContentRootCatalog, DfsError> {
+        let content_root = content_root.as_ref();
+        let expected_topology = DfsContentRootCatalogTopologySnapshot::canonical(
+            file_systems.to_vec(),
+            shards.to_vec(),
+            pending_handoffs.to_vec(),
+        );
+        if max_pages_per_shard == 0 {
+            return Err(DfsError::Metadata {
+                message: "content-root catalog page budget must be greater than zero".to_string(),
+            });
+        }
+        if expected_topology.has_duplicate_identities() {
+            return Err(DfsError::Metadata {
+                message: "content-root catalog topology contains duplicate identities".to_string(),
+            });
+        }
+        let expected_incomplete_reasons = expected_topology.incomplete_reasons();
+        if !expected_incomplete_reasons.is_empty() {
+            return self.install_incomplete_content_root_catalog(
+                &expected_topology,
+                expected_incomplete_reasons,
+                content_root,
+            );
+        }
+        let expected_topology_digest = expected_topology.topology_digest()?;
+        let identities = expected_topology
+            .shards
+            .iter()
+            .map(DfsContentRootCatalogShardIdentity::from_config)
+            .collect::<Vec<_>>();
+
+        let current_topology = self.global_content_root_catalog_topology()?;
+        if current_topology.as_ref() != Some(&expected_topology) {
+            let observed_topology_digest = current_topology
+                .as_ref()
+                .map(DfsContentRootCatalogTopologySnapshot::topology_digest)
+                .transpose()?;
+            return self.install_incomplete_content_root_catalog(
+                &expected_topology,
+                vec![DfsContentRootCatalogIncompleteReason::TopologyChanged {
+                    expected_topology_digest,
+                    observed_topology_digest,
+                }],
+                content_root,
+            );
+        }
+
+        let mut fragments = Vec::with_capacity(identities.len());
+        for identity in &identities {
+            let initial_request = DfsContentRootCatalogPageRequest {
+                identity: identity.clone(),
+                expected_topology_digest: expected_topology_digest.clone(),
+                minimum_journal_sequence: head_watermarks
+                    .iter()
+                    .find(|watermark| {
+                        watermark.file_system_id == identity.file_system_id
+                            && watermark.shard_id == identity.shard_id.0
+                            && watermark.primary_node_id == identity.primary_node_id
+                            && watermark.epoch == identity.epoch
+                    })
+                    .map(|watermark| watermark.journal_sequence)
+                    .unwrap_or(0),
+                minimum_state_fingerprint: head_watermarks
+                    .iter()
+                    .find(|watermark| {
+                        watermark.file_system_id == identity.file_system_id
+                            && watermark.shard_id == identity.shard_id.0
+                            && watermark.primary_node_id == identity.primary_node_id
+                            && watermark.epoch == identity.epoch
+                    })
+                    .map(|watermark| watermark.state_fingerprint.clone()),
+                after: None,
+                max_entries: DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES,
+            };
+            let mut request = initial_request.clone();
+            let mut pages = Vec::new();
+            loop {
+                let page = if identity.primary_node_id == self.node_id {
+                    self.authoritative_content_root_catalog_page(&request)?
+                } else {
+                    match self.transport.request_content_root_catalog_page_direct(
+                        &identity.primary_node_id,
+                        &request,
+                    ) {
+                        Ok(Some(page)) => page,
+                        Ok(None) => DfsContentRootCatalogPage::incomplete_for_request(
+                            &request,
+                            DfsContentRootCatalogIncompleteReason::TransportUnavailable {
+                                primary_node_id: identity.primary_node_id.clone(),
+                                reason:
+                                    "DFS transport does not support direct content-root catalog requests"
+                                        .to_string(),
+                            },
+                            crate::metadata_tombstone::metadata_now_unix_nanos(),
+                        ),
+                        Err(error) => DfsContentRootCatalogPage::incomplete_for_request(
+                            &request,
+                            DfsContentRootCatalogIncompleteReason::TransportUnavailable {
+                                primary_node_id: identity.primary_node_id.clone(),
+                                reason: error.to_string(),
+                            },
+                            crate::metadata_tombstone::metadata_now_unix_nanos(),
+                        ),
+                    }
+                };
+                page.validate_for_request(&request)?;
+                let next_cursor = page.next_cursor.clone();
+                let page_complete = page.is_complete();
+                pages.push(page);
+                if !page_complete || next_cursor.is_none() {
+                    break;
+                }
+                if pages.len() >= max_pages_per_shard {
+                    let next_cursor =
+                        next_cursor.expect("continued content-root page has a cursor");
+                    request.minimum_journal_sequence = next_cursor.journal_sequence;
+                    request.minimum_state_fingerprint = Some(next_cursor.state_fingerprint.clone());
+                    request.after = Some(next_cursor);
+                    pages.push(DfsContentRootCatalogPage::incomplete_for_request(
+                        &request,
+                        DfsContentRootCatalogIncompleteReason::PageBudgetExceeded {
+                            max_pages: max_pages_per_shard,
+                        },
+                        crate::metadata_tombstone::metadata_now_unix_nanos(),
+                    ));
+                    break;
+                }
+                let next_cursor = next_cursor.expect("continued content-root page has a cursor");
+                request.minimum_journal_sequence = next_cursor.journal_sequence;
+                request.minimum_state_fingerprint = Some(next_cursor.state_fingerprint.clone());
+                request.after = Some(next_cursor);
+            }
+            fragments.push(DfsContentRootCatalogFragment::from_pages(
+                &initial_request,
+                &pages,
+            )?);
+        }
+
+        let current_topology = self.global_content_root_catalog_topology()?;
+        if current_topology.as_ref() != Some(&expected_topology) {
+            let observed_topology_digest = current_topology
+                .as_ref()
+                .map(DfsContentRootCatalogTopologySnapshot::topology_digest)
+                .transpose()?;
+            return self.install_incomplete_content_root_catalog(
+                &expected_topology,
+                vec![DfsContentRootCatalogIncompleteReason::TopologyChanged {
+                    expected_topology_digest,
+                    observed_topology_digest,
+                }],
+                content_root,
+            );
+        }
+
+        let generated_at_unix_nanos = fragments
+            .iter()
+            .map(|fragment| fragment.generated_at_unix_nanos)
+            // Catalog freshness is only as recent as its oldest shard
+            // observation. Using the newest fragment would overstate
+            // cluster-wide coverage and could advance absence aging early.
+            .min()
+            .unwrap_or_else(crate::metadata_tombstone::metadata_now_unix_nanos);
+        let catalog = DfsContentRootCatalog::from_topology_fragments(
+            expected_topology_digest,
+            expected_topology.file_system_ids(),
+            identities,
+            generated_at_unix_nanos,
+            Vec::new(),
+            fragments,
+        )?;
+        LocalDfsContentRootCatalogStore::new(content_root)
+            .install(catalog)
+            .map_err(DfsError::from)
+    }
+
+    fn authoritative_content_root_catalog_page(
+        &mut self,
+        request: &DfsContentRootCatalogPageRequest,
+    ) -> Result<DfsContentRootCatalogPage, DfsError> {
+        request.validate()?;
+        let generated_at_unix_nanos = crate::metadata_tombstone::metadata_now_unix_nanos();
+        self.refresh_control_plane_latest()?;
+
+        let Some(control_plane) = self.control_plane.as_mut() else {
+            return Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                request,
+                DfsContentRootCatalogIncompleteReason::NotAuthoritativePrimary {
+                    local_node_id: Some(self.node_id.clone()),
+                    primary_node_id: request.identity.primary_node_id.clone(),
+                },
+                generated_at_unix_nanos,
+            ));
+        };
+        let store = DfsControlPlaneStore::new(control_plane.as_mut());
+        let current = store.get_metadata_shard(
+            &request.identity.file_system_id,
+            &request.identity.shard_id.0,
+        )?;
+        let Some(current) = current else {
+            return Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                request,
+                DfsContentRootCatalogIncompleteReason::UnknownShard,
+                generated_at_unix_nanos,
+            ));
+        };
+        let current_identity = DfsContentRootCatalogShardIdentity::from_config(&current);
+        if current_identity != request.identity {
+            return Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                request,
+                DfsContentRootCatalogIncompleteReason::AuthorityChanged {
+                    observed: Some(current_identity),
+                },
+                generated_at_unix_nanos,
+            ));
+        }
+        if current.primary_node_id != self.node_id {
+            return Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                request,
+                DfsContentRootCatalogIncompleteReason::NotAuthoritativePrimary {
+                    local_node_id: Some(self.node_id.clone()),
+                    primary_node_id: current.primary_node_id,
+                },
+                generated_at_unix_nanos,
+            ));
+        }
+        if let Some(handoff) = store.get_metadata_shard_membership_handoff(
+            &request.identity.file_system_id,
+            &request.identity.shard_id.0,
+        )? {
+            return Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                request,
+                DfsContentRootCatalogIncompleteReason::MembershipHandoffFrozen {
+                    handoff_id: Some(handoff.handoff_id),
+                },
+                generated_at_unix_nanos,
+            ));
+        }
+
+        let Some(backend) = self.metadata_backend.as_mut() else {
+            return Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                request,
+                DfsContentRootCatalogIncompleteReason::MetadataBackendUnavailable,
+                generated_at_unix_nanos,
+            ));
+        };
+        if backend.metadata_shard_authoritative_writes_frozen(&request.identity.shard_id)? {
+            let handoff_id = backend
+                .metadata_shard_write_freeze(&request.identity.shard_id)?
+                .map(|freeze| freeze.handoff_id);
+            return Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                request,
+                DfsContentRootCatalogIncompleteReason::MembershipHandoffFrozen { handoff_id },
+                generated_at_unix_nanos,
+            ));
+        }
+        match backend.content_root_catalog_page(request) {
+            Ok(page) => {
+                page.validate_for_request(request)?;
+                Ok(page)
+            }
+            Err(_) => Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                request,
+                DfsContentRootCatalogIncompleteReason::MetadataBackendUnavailable,
+                generated_at_unix_nanos,
+            )),
+        }
+    }
+
+    pub(crate) fn handle_content_root_catalog_page_request(
+        &mut self,
+        source_node_id: NodeId,
+        request: DfsContentRootCatalogPageRequest,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let page = self.authoritative_content_root_catalog_page(&request)?;
+        let event = NetworkedDfsServiceEvent::ContentRootCatalogPageServed {
+            requester_node_id: source_node_id.clone(),
+            file_system_id: page.identity.file_system_id.clone(),
+            shard_id: page.identity.shard_id.clone(),
+            entry_count: page.entries.len(),
+            complete: page.is_complete(),
+        };
+        self.send_dfs_message_if_routable(
+            &source_node_id,
+            DfsNetworkMessage::ContentRootCatalogPageResponse(page),
+        )?;
+        Ok(event)
+    }
+
+    pub(crate) fn handle_content_root_catalog_page_response(
+        &mut self,
+        source_node_id: NodeId,
+        page: DfsContentRootCatalogPage,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        if page.identity.primary_node_id != source_node_id {
+            return Err(DfsError::UnauthorizedReplicaCommand {
+                source_node_id,
+                reason: "content-root catalog response source does not match its primary authority"
+                    .to_string(),
+            });
+        }
+        let complete = page.is_complete();
+        Ok(NetworkedDfsServiceEvent::ContentRootCatalogPageReceived {
+            primary_node_id: source_node_id,
+            file_system_id: page.identity.file_system_id,
+            shard_id: page.identity.shard_id,
+            entry_count: page.entries.len(),
+            complete,
+        })
+    }
+
     pub(crate) fn handle_metadata_journal_batch_response(
         &mut self,
         source_node_id: NodeId,
