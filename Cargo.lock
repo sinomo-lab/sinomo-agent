@@ -9458,7 +9458,7 @@ version = "0.1.0"
 [[package]]
 name = "sinomo-ui"
 version = "0.2.0"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#e2ea20ac8d8761da6f1eaec25e65067a8abe8896"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#91b74b8c5979329db991c0f369f13b028cdd8d42"
 dependencies = [
  "sinomo-ui-core",
  "sinomo-ui-layout",
@@ -9474,7 +9474,7 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-animation"
 version = "0.2.0"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#e2ea20ac8d8761da6f1eaec25e65067a8abe8896"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#91b74b8c5979329db991c0f369f13b028cdd8d42"
 dependencies = [
  "sinomo-ui-core",
 ]
@@ -9482,7 +9482,7 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-avif"
 version = "0.2.0"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#e2ea20ac8d8761da6f1eaec25e65067a8abe8896"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#91b74b8c5979329db991c0f369f13b028cdd8d42"
 dependencies = [
  "avif-serialize",
  "rav1e",
@@ -9491,12 +9491,12 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-core"
 version = "0.2.0"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#e2ea20ac8d8761da6f1eaec25e65067a8abe8896"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#91b74b8c5979329db991c0f369f13b028cdd8d42"
 
 [[package]]
 name = "sinomo-ui-layout"
 version = "0.2.0"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#e2ea20ac8d8761da6f1eaec25e65067a8abe8896"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#91b74b8c5979329db991c0f369f13b028cdd8d42"
 dependencies = [
  "sinomo-ui-core",
  "sinomo-ui-scene",
@@ -9506,7 +9506,7 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-lucide"
 version = "1.17.1"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#e2ea20ac8d8761da6f1eaec25e65067a8abe8896"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#91b74b8c5979329db991c0f369f13b028cdd8d42"
 dependencies = [
  "roxmltree 0.21.1",
  "sinomo-ui-core",
@@ -9518,7 +9518,7 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-platform"
 version = "0.2.0"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#e2ea20ac8d8761da6f1eaec25e65067a8abe8896"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#91b74b8c5979329db991c0f369f13b028cdd8d42"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -9543,12 +9543,12 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-reactive"
 version = "0.2.0"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#e2ea20ac8d8761da6f1eaec25e65067a8abe8896"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#91b74b8c5979329db991c0f369f13b028cdd8d42"
 
 [[package]]
 name = "sinomo-ui-render-wgpu"
 version = "0.2.0"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#e2ea20ac8d8761da6f1eaec25e65067a8abe8896"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#91b74b8c5979329db991c0f369f13b028cdd8d42"
 dependencies = [
  "bytemuck",
  "fontdb",
@@ -9572,7 +9572,7 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-runtime"
 version = "0.2.0"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#e2ea20ac8d8761da6f1eaec25e65067a8abe8896"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#91b74b8c5979329db991c0f369f13b028cdd8d42"
 dependencies = [
  "sinomo-ui-core",
  "sinomo-ui-layout",
@@ -9585,7 +9585,7 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-scene"
 version = "0.2.0"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#e2ea20ac8d8761da6f1eaec25e65067a8abe8896"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#91b74b8c5979329db991c0f369f13b028cdd8d42"
 dependencies = [
  "resvg",
  "sinomo-ui-core",
@@ -9595,7 +9595,7 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-testing"
 version = "0.2.0"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#e2ea20ac8d8761da6f1eaec25e65067a8abe8896"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#91b74b8c5979329db991c0f369f13b028cdd8d42"
 dependencies = [
  "exr",
  "png",
@@ -9613,7 +9613,7 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-text"
 version = "0.2.0"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#e2ea20ac8d8761da6f1eaec25e65067a8abe8896"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#91b74b8c5979329db991c0f369f13b028cdd8d42"
 dependencies = [
  "cosmic-text",
  "fontdb",
@@ -9625,7 +9625,7 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-widgets"
 version = "0.2.0"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#e2ea20ac8d8761da6f1eaec25e65067a8abe8896"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#91b74b8c5979329db991c0f369f13b028cdd8d42"
 dependencies = [
  "palette",
  "pulldown-cmark 0.13.4",
