@@ -141,7 +141,11 @@
 #   SINOMO_TEST_NETWORK_PARTITION_SECONDS   seconds to keep node6 disconnected in network-heal leg (default 5)
 #   SINOMO_TEST_NETWORK_ONLY=1              stop after network/KV baselines and DFS readiness/mutation/convergence gates
 #   SINOMO_TEST_CLUSTER_KV_ONLY=1           run only the stabilized cluster-KV benchmark suite
+#   SINOMO_TEST_PJDFSTEST_ONLY=1            run only the external pjdfstest mounted-filesystem lane
 #   SINOMO_TEST_FORMATION_ONLY=1            stop after the ten-second formation gate and optional captures
+#   SINOMO_PJDFSTEST_PROFILE                pjdfstest selection: smoke or full (default full)
+#   SINOMO_PJDFSTEST_STRICT                 fail on discovered SIFS incompatibilities (default 0/report-only)
+#   SINOMO_PJDFSTEST_TIMEOUT_SECONDS        timeout for each native/SIFS prove run (default 3600)
 #   SINOMO_TEST_BUILD=0         reuse an existing host binary instead of rebuilding
 #   SINOMO_TEST_BINARY          host binary to validate/mount (default target/debug/sinomo)
 #   SINOMO_TEST_ARTIFACTS       artifact dir (default target/cluster-test-artifacts/<run>)
@@ -178,6 +182,12 @@ FORMATION_POLL_MILLIS=100
 FORMATION_OBSERVE="${SINOMO_TEST_FORMATION_OBSERVE:-0}"
 FORMATION_ONLY="${SINOMO_TEST_FORMATION_ONLY:-0}"
 CLUSTER_KV_ONLY="${SINOMO_TEST_CLUSTER_KV_ONLY:-0}"
+PJDFSTEST_ONLY="${SINOMO_TEST_PJDFSTEST_ONLY:-0}"
+PJDFSTEST_PROFILE="${SINOMO_PJDFSTEST_PROFILE:-full}"
+PJDFSTEST_STRICT="${SINOMO_PJDFSTEST_STRICT:-0}"
+PJDFSTEST_TIMEOUT_SECONDS="${SINOMO_PJDFSTEST_TIMEOUT_SECONDS:-3600}"
+PJDFSTEST_PATCHSET="sinomo-linux-portability-v1"
+PJDFSTEST_MOUNT_POINT="/mnt/sinomo-pjdfstest"
 FORMATION_OBSERVE_DURATION_SECONDS="${SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS:-12}"
 FORMATION_OBSERVE_FREQUENCY_HZ="${SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ:-49}"
 FORMATION_OBSERVE_CPU_NODES="${SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES:-node1}"
@@ -330,6 +340,9 @@ ARTIFACTS="${SINOMO_TEST_ARTIFACTS:-$SINOMO_ROOT/target/cluster-test-artifacts/$
 BINARY="${SINOMO_TEST_BINARY:-$SINOMO_ROOT/target/debug/sinomo}"
 export SINOMO_DOCKER_BINARY="${SINOMO_DOCKER_BINARY:-$BINARY}"
 COMPOSE_FILES=(-f "$COMPOSE_FILE")
+if [ "$PJDFSTEST_ONLY" = 1 ]; then
+  COMPOSE_FILES+=(-f "$SINOMO_DOCKER_DIR/docker-compose.pjdfstest.yml")
+fi
 if [ -n "$COMPOSE_OVERRIDE_FILE" ]; then
   COMPOSE_FILES+=(-f "$COMPOSE_OVERRIDE_FILE")
 fi
@@ -480,6 +493,39 @@ validate_formation_observation_config() {
       "$FORMATION_OBSERVE_FREQUENCY_HZ" 10 500 \
     && require_bounded_uint SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS \
       "$FORMATION_OBSERVE_MAX_EVENTS" 1 32768
+}
+
+validate_pjdfstest_config() {
+  case "$PJDFSTEST_ONLY" in
+    0) return 0 ;;
+    1) ;;
+    *)
+      log "SINOMO_TEST_PJDFSTEST_ONLY must be 0 or 1, got: $PJDFSTEST_ONLY"
+      return 1
+      ;;
+  esac
+  if [ "$CLUSTER_KV_ONLY" = 1 ] \
+    || [ "${SINOMO_TEST_NETWORK_ONLY:-0}" = 1 ] \
+    || [ "$FORMATION_ONLY" = 1 ]; then
+    log "SINOMO_TEST_PJDFSTEST_ONLY is mutually exclusive with the cluster-KV, network-only, and formation-only lanes"
+    return 1
+  fi
+  case "$PJDFSTEST_PROFILE" in
+    smoke|full) ;;
+    *)
+      log "SINOMO_PJDFSTEST_PROFILE must be smoke or full, got: $PJDFSTEST_PROFILE"
+      return 1
+      ;;
+  esac
+  case "$PJDFSTEST_STRICT" in
+    0|1) ;;
+    *)
+      log "SINOMO_PJDFSTEST_STRICT must be 0 or 1, got: $PJDFSTEST_STRICT"
+      return 1
+      ;;
+  esac
+  require_bounded_uint SINOMO_PJDFSTEST_TIMEOUT_SECONDS \
+    "$PJDFSTEST_TIMEOUT_SECONDS" 60 86400
 }
 
 compose() {
@@ -2493,6 +2539,555 @@ final_routed_status() {
     --param "timeout-seconds=$EXPECT_TIMEOUT"
 }
 
+PJDFSTEST_STARTED=0
+PJDFSTEST_ARTIFACTS_COLLECTED=0
+PJDFSTEST_COMPATIBILITY_STATUS="not_run"
+PJDFSTEST_SENTINEL_STATUS="not_run"
+PJDFSTEST_ZERO_BYTE_STATUS="not_run"
+PJDFSTEST_ZERO_BYTE_PREFIX=""
+PJDFSTEST_ZERO_BYTE_O_CREAT_PATH=""
+PJDFSTEST_ZERO_BYTE_O_EXCL_PATH=""
+PJDFSTEST_ZERO_BYTE_MOUNT_NODE_ID=""
+PJDFSTEST_ZERO_BYTE_METADATA_PRIMARY_NODE_ID=""
+PJDFSTEST_ZERO_BYTE_METADATA_SHARD_ID=""
+PJDFSTEST_ZERO_BYTE_METADATA_SHARD_EPOCH=""
+PJDFSTEST_CONTAINER_ARTIFACTS="/tmp/sinomo-pjdfstest-$RUN_ID"
+PJDFSTEST_HOST_ARTIFACTS="$ARTIFACTS/pjdfstest"
+
+pjdfstest_result_value() {
+  local result_file="$1" key="$2"
+  awk -F= -v key="$key" '
+    $1 == key {
+      if (found) {
+        exit 2
+      }
+      found = 1
+      sub(/^[^=]*=/, "")
+      value = $0
+    }
+    END {
+      if (!found) {
+        exit 1
+      }
+      print value
+    }
+  ' "$result_file"
+}
+
+collect_pjdfstest_artifacts() {
+  [ "$PJDFSTEST_STARTED" = 1 ] || return 0
+  [ "$PJDFSTEST_ARTIFACTS_COLLECTED" = 0 ] || return 0
+  mkdir -p "$PJDFSTEST_HOST_ARTIFACTS"
+  if ! compose_timeout "$ARTIFACT_COMMAND_TIMEOUT" cp \
+      "node5:$PJDFSTEST_CONTAINER_ARTIFACTS/." \
+      "$PJDFSTEST_HOST_ARTIFACTS/"; then
+    log "pjdfstest: failed to copy node5 artifacts from $PJDFSTEST_CONTAINER_ARTIFACTS"
+    return 1
+  fi
+  PJDFSTEST_ARTIFACTS_COLLECTED=1
+}
+
+cleanup_pjdfstest_mount() {
+  [ "$PJDFSTEST_STARTED" = 1 ] || return 0
+  if ! compose_exec_timeout 30 node5 env \
+      "SINOMO_PJDFSTEST_MOUNT_POINT=$PJDFSTEST_MOUNT_POINT" \
+      /usr/local/bin/sinomo-pjdfstest-runner --cleanup-only; then
+    log "pjdfstest: node5 mount cleanup failed for $PJDFSTEST_MOUNT_POINT"
+    return 1
+  fi
+}
+
+prepare_pjdfstest_zero_byte_placement() {
+  local source_file="$PJDFSTEST_HOST_ARTIFACTS/zero-byte-shard-layout.json"
+  local evidence_file="$PJDFSTEST_HOST_ARTIFACTS/zero-byte-placement.json"
+  local selected mount_node_id primary_node_id shard_id epoch lane prefix
+
+  mkdir -p "$PJDFSTEST_HOST_ARTIFACTS"
+  if ! compose_exec_timeout "$PROBE_COMMAND_TIMEOUT" node5 \
+      sinomo test run cluster.dfs.shard-layout \
+        --require-cluster --json \
+        --param expected-replica-count=5 \
+        --param expected-distinct-primary-count=3 \
+      >"$source_file" \
+      2>"$PJDFSTEST_HOST_ARTIFACTS/zero-byte-shard-layout.stderr.log"; then
+    log "pjdfstest: cannot resolve node5 metadata-shard layout for the mounted zero-byte probe"
+    return 1
+  fi
+
+  selected="$(
+    jq -er '
+      if .status != "passed" then
+        error("shard-layout probe did not pass")
+      else
+        .diagnostics as $diagnostics
+        | $diagnostics.shards
+        | map(select(.primary_node_id != $diagnostics.node))
+        | first as $shard
+        | if $shard == null then
+            error("node5 has no remote metadata primary")
+          elif ($shard.lane | IN("root", "services", "users") | not) then
+            error("unsupported metadata shard lane")
+          elif ($shard.replica_node_ids | index($diagnostics.node)) == null then
+            error("node5 is not a metadata replica for the selected remote-primary shard")
+          else
+            [
+              $diagnostics.node,
+              $shard.primary_node_id,
+              $shard.shard_id,
+              ($shard.epoch | tostring),
+              $shard.lane
+            ]
+            | @tsv
+          end
+      end
+    ' "$source_file"
+  )" || {
+    log "pjdfstest: node5 shard layout cannot prove a remote metadata-primary path"
+    return 1
+  }
+  IFS=$'\t' read -r \
+    mount_node_id primary_node_id shard_id epoch lane <<<"$selected"
+  case "$lane" in
+    root) prefix="/cluster-tests/pjdfstest-zero-byte" ;;
+    services) prefix="/services/cluster-tests/pjdfstest-zero-byte" ;;
+    users) prefix="/users/cluster-tests/pjdfstest-zero-byte" ;;
+    *)
+      log "pjdfstest: unsupported zero-byte metadata lane: $lane"
+      return 1
+      ;;
+  esac
+  if [ -z "$mount_node_id" ] \
+    || [ -z "$primary_node_id" ] \
+    || [ "$mount_node_id" = "$primary_node_id" ] \
+    || [[ ! "$epoch" =~ ^[1-9][0-9]*$ ]]; then
+    log "pjdfstest: invalid remote metadata-primary selection"
+    return 1
+  fi
+
+  jq -e \
+    --arg mount_node_id "$mount_node_id" \
+    --arg primary_node_id "$primary_node_id" \
+    --arg shard_id "$shard_id" \
+    --argjson epoch "$epoch" \
+    --arg lane "$lane" \
+    --arg prefix "$prefix" \
+    '{
+      schema_version: 1,
+      status: "verified",
+      remote_metadata_primary: true,
+      mount_node_is_metadata_replica: true,
+      selection: {
+        mount_node_id: $mount_node_id,
+        metadata_primary_node_id: $primary_node_id,
+        metadata_shard_id: $shard_id,
+        metadata_shard_epoch: $epoch,
+        lane: $lane,
+        dfs_prefix: $prefix
+      },
+      source: .
+    }' "$source_file" >"$evidence_file" || {
+      log "pjdfstest: cannot write zero-byte placement evidence"
+      return 1
+    }
+
+  PJDFSTEST_ZERO_BYTE_PREFIX="$prefix"
+  PJDFSTEST_ZERO_BYTE_MOUNT_NODE_ID="$mount_node_id"
+  PJDFSTEST_ZERO_BYTE_METADATA_PRIMARY_NODE_ID="$primary_node_id"
+  PJDFSTEST_ZERO_BYTE_METADATA_SHARD_ID="$shard_id"
+  PJDFSTEST_ZERO_BYTE_METADATA_SHARD_EPOCH="$epoch"
+}
+
+run_pjdfstest_compatibility_probe() {
+  local command_timeout runner_rc=0 result_file harness_status compatibility_status
+  local result_run_id result_profile result_mode cleanup_status sentinel_status
+  local result_schema result_patchset control_unresolved sifs_unresolved
+  local zero_byte_status zero_byte_o_creat_path zero_byte_o_excl_path
+  local zero_byte_mount_node_id zero_byte_primary_node_id zero_byte_shard_id
+  local zero_byte_shard_epoch zero_byte_remote_primary
+  command_timeout=$((10#$PJDFSTEST_TIMEOUT_SECONDS * 2 + 120))
+  mkdir -p "$PJDFSTEST_HOST_ARTIFACTS"
+  prepare_pjdfstest_zero_byte_placement || return 20
+  PJDFSTEST_STARTED=1
+  log "pjdfstest: running $PJDFSTEST_PROFILE profile on native storage and the node5 SIFS mount"
+  compose_exec_timeout "$command_timeout" node5 env \
+    "SINOMO_PJDFSTEST_RUN_ID=$RUN_ID" \
+    "SINOMO_PJDFSTEST_PROFILE=$PJDFSTEST_PROFILE" \
+    "SINOMO_PJDFSTEST_PATCHSET=$PJDFSTEST_PATCHSET" \
+    "SINOMO_PJDFSTEST_STRICT=$PJDFSTEST_STRICT" \
+    "SINOMO_PJDFSTEST_TIMEOUT_SECONDS=$PJDFSTEST_TIMEOUT_SECONDS" \
+    "SINOMO_PJDFSTEST_ARTIFACT_DIR=$PJDFSTEST_CONTAINER_ARTIFACTS" \
+    "SINOMO_PJDFSTEST_NATIVE_ROOT=/pjdfstest-control" \
+    "SINOMO_PJDFSTEST_MOUNT_POINT=$PJDFSTEST_MOUNT_POINT" \
+    "SINOMO_PJDFSTEST_ZERO_BYTE_PREFIX=$PJDFSTEST_ZERO_BYTE_PREFIX" \
+    "SINOMO_PJDFSTEST_ZERO_BYTE_MOUNT_NODE_ID=$PJDFSTEST_ZERO_BYTE_MOUNT_NODE_ID" \
+    "SINOMO_PJDFSTEST_ZERO_BYTE_METADATA_PRIMARY_NODE_ID=$PJDFSTEST_ZERO_BYTE_METADATA_PRIMARY_NODE_ID" \
+    "SINOMO_PJDFSTEST_ZERO_BYTE_METADATA_SHARD_ID=$PJDFSTEST_ZERO_BYTE_METADATA_SHARD_ID" \
+    "SINOMO_PJDFSTEST_ZERO_BYTE_METADATA_SHARD_EPOCH=$PJDFSTEST_ZERO_BYTE_METADATA_SHARD_EPOCH" \
+    /usr/local/bin/sinomo-pjdfstest-runner \
+    >"$PJDFSTEST_HOST_ARTIFACTS/runner.stdout.log" \
+    2>"$PJDFSTEST_HOST_ARTIFACTS/runner.stderr.log" \
+    || runner_rc=$?
+
+  if ! collect_pjdfstest_artifacts; then
+    cleanup_pjdfstest_mount || true
+    return 20
+  fi
+  if ! cleanup_pjdfstest_mount; then
+    return 20
+  fi
+
+  result_file="$PJDFSTEST_HOST_ARTIFACTS/result.env"
+  if [ ! -f "$result_file" ]; then
+    log "pjdfstest: runner produced no result.env (exit=$runner_rc)"
+    return 20
+  fi
+  harness_status="$(pjdfstest_result_value "$result_file" harness_status)" || {
+    log "pjdfstest: result.env has no unique harness_status"
+    return 20
+  }
+  compatibility_status="$(pjdfstest_result_value "$result_file" compatibility_status)" || {
+    log "pjdfstest: result.env has no unique compatibility_status"
+    return 20
+  }
+  result_run_id="$(pjdfstest_result_value "$result_file" run_id)" || {
+    log "pjdfstest: result.env has no unique run_id"
+    return 20
+  }
+  result_profile="$(pjdfstest_result_value "$result_file" profile)" || {
+    log "pjdfstest: result.env has no unique profile"
+    return 20
+  }
+  result_mode="$(pjdfstest_result_value "$result_file" mode)" || {
+    log "pjdfstest: result.env has no unique mode"
+    return 20
+  }
+  cleanup_status="$(pjdfstest_result_value "$result_file" cleanup_status)" || {
+    log "pjdfstest: result.env has no unique cleanup_status"
+    return 20
+  }
+  sentinel_status="$(pjdfstest_result_value "$result_file" sentinel_status)" || {
+    log "pjdfstest: result.env has no unique sentinel_status"
+    return 20
+  }
+  result_schema="$(pjdfstest_result_value "$result_file" schema_version)" || {
+    log "pjdfstest: result.env has no unique schema_version"
+    return 20
+  }
+  result_patchset="$(pjdfstest_result_value "$result_file" pjdfstest_patchset)" || {
+    log "pjdfstest: result.env has no unique pjdfstest_patchset"
+    return 20
+  }
+  control_unresolved="$(
+    pjdfstest_result_value "$result_file" control_assertions_unresolved_directives
+  )" || {
+    log "pjdfstest: result.env has no unique control unresolved-directive count"
+    return 20
+  }
+  sifs_unresolved="$(
+    pjdfstest_result_value "$result_file" sifs_assertions_unresolved_directives
+  )" || {
+    log "pjdfstest: result.env has no unique SIFS unresolved-directive count"
+    return 20
+  }
+  zero_byte_status="$(
+    pjdfstest_result_value "$result_file" zero_byte_routed_write_status
+  )" || {
+    log "pjdfstest: result.env has no unique zero-byte routed-write status"
+    return 20
+  }
+  zero_byte_o_creat_path="$(
+    pjdfstest_result_value "$result_file" zero_byte_o_creat_path
+  )" || {
+    log "pjdfstest: result.env has no unique zero-byte O_CREAT path"
+    return 20
+  }
+  zero_byte_o_excl_path="$(
+    pjdfstest_result_value "$result_file" zero_byte_o_excl_path
+  )" || {
+    log "pjdfstest: result.env has no unique zero-byte O_EXCL path"
+    return 20
+  }
+  zero_byte_mount_node_id="$(
+    pjdfstest_result_value "$result_file" zero_byte_mount_node_id
+  )" || return 20
+  zero_byte_primary_node_id="$(
+    pjdfstest_result_value "$result_file" zero_byte_metadata_primary_node_id
+  )" || return 20
+  zero_byte_shard_id="$(
+    pjdfstest_result_value "$result_file" zero_byte_metadata_shard_id
+  )" || return 20
+  zero_byte_shard_epoch="$(
+    pjdfstest_result_value "$result_file" zero_byte_metadata_shard_epoch
+  )" || return 20
+  zero_byte_remote_primary="$(
+    pjdfstest_result_value "$result_file" zero_byte_remote_metadata_primary
+  )" || return 20
+  PJDFSTEST_COMPATIBILITY_STATUS="$compatibility_status"
+  PJDFSTEST_SENTINEL_STATUS="$sentinel_status"
+  PJDFSTEST_ZERO_BYTE_STATUS="$zero_byte_status"
+  PJDFSTEST_ZERO_BYTE_O_CREAT_PATH="$zero_byte_o_creat_path"
+  PJDFSTEST_ZERO_BYTE_O_EXCL_PATH="$zero_byte_o_excl_path"
+
+  if [ "$result_run_id" != "$RUN_ID" ] \
+    || [ "$result_profile" != "$PJDFSTEST_PROFILE" ] \
+    || [ "$result_mode" != both ] \
+    || [ "$result_schema" != 2 ] \
+    || [ "$result_patchset" != "$PJDFSTEST_PATCHSET" ]; then
+    log "pjdfstest: result identity mismatch (run=$result_run_id profile=$result_profile mode=$result_mode schema=$result_schema patchset=$result_patchset)"
+    return 20
+  fi
+  if [ "$control_unresolved" != 0 ] || [ "$sifs_unresolved" != 0 ]; then
+    log "pjdfstest: unresolved platform directives remain (control=$control_unresolved sifs=$sifs_unresolved)"
+    return 20
+  fi
+  if [ "$zero_byte_status" != "$sentinel_status" ] \
+    || { [ "$zero_byte_status" != passed ] && [ "$zero_byte_status" != failed ]; } \
+    || [ "$zero_byte_o_creat_path" != "$PJDFSTEST_ZERO_BYTE_PREFIX/$RUN_ID/o-creat-empty" ] \
+    || [ "$zero_byte_o_excl_path" != "$PJDFSTEST_ZERO_BYTE_PREFIX/$RUN_ID/o-excl-empty" ] \
+    || [ "$zero_byte_mount_node_id" != "$PJDFSTEST_ZERO_BYTE_MOUNT_NODE_ID" ] \
+    || [ "$zero_byte_primary_node_id" != "$PJDFSTEST_ZERO_BYTE_METADATA_PRIMARY_NODE_ID" ] \
+    || [ "$zero_byte_shard_id" != "$PJDFSTEST_ZERO_BYTE_METADATA_SHARD_ID" ] \
+    || [ "$zero_byte_shard_epoch" != "$PJDFSTEST_ZERO_BYTE_METADATA_SHARD_EPOCH" ] \
+    || [ "$zero_byte_remote_primary" != 1 ]; then
+    log "pjdfstest: zero-byte routed-write identity or remote-primary proof mismatch"
+    return 20
+  fi
+  if [ "$cleanup_status" != passed ]; then
+    log "pjdfstest: kernel/native cleanup status is $cleanup_status"
+    return 20
+  fi
+  case "$sentinel_status" in
+    passed|failed) ;;
+    *)
+      log "pjdfstest: unusable sentinel status $sentinel_status"
+      return 20
+      ;;
+  esac
+  if [ "$harness_status" != passed ]; then
+    log "pjdfstest: harness failed (runner exit=$runner_rc, compatibility=$compatibility_status)"
+    return 20
+  fi
+  case "$compatibility_status" in
+    compatible)
+      if [ "$runner_rc" -ne 0 ]; then
+        log "pjdfstest: compatible result had unexpected runner exit $runner_rc"
+        return 20
+      fi
+      log "pjdfstest: executed profile is compatible"
+      return 0
+      ;;
+    incompatible|incomplete)
+      if [ "$PJDFSTEST_STRICT" = 1 ]; then
+        if [ "$runner_rc" -ne 10 ]; then
+          log "pjdfstest: strict $compatibility_status result had unexpected runner exit $runner_rc"
+          return 20
+        fi
+        log "pjdfstest: compatibility=$compatibility_status (strict gate)"
+        return 10
+      fi
+      if [ "$runner_rc" -ne 0 ]; then
+        log "pjdfstest: report-only $compatibility_status result had unexpected runner exit $runner_rc"
+        return 20
+      fi
+      log "pjdfstest: compatibility=$compatibility_status (recorded, report-only)"
+      return 0
+      ;;
+    not_run|*)
+      log "pjdfstest: unusable compatibility status $compatibility_status (runner exit=$runner_rc)"
+      return 20
+      ;;
+  esac
+}
+
+write_pjdfstest_zero_byte_postcheck() {
+  local status="$1" pre_restart_visibility="$2" restart_status="$3"
+  local post_restart_visibility="$4" cleanup_status="$5"
+  jq -n \
+    --arg status "$status" \
+    --arg pre_restart_visibility "$pre_restart_visibility" \
+    --arg restart_status "$restart_status" \
+    --arg post_restart_visibility "$post_restart_visibility" \
+    --arg cleanup_status "$cleanup_status" \
+    --arg o_creat_path "$PJDFSTEST_ZERO_BYTE_O_CREAT_PATH" \
+    --arg o_excl_path "$PJDFSTEST_ZERO_BYTE_O_EXCL_PATH" \
+    --arg mount_node_id "$PJDFSTEST_ZERO_BYTE_MOUNT_NODE_ID" \
+    --arg primary_node_id "$PJDFSTEST_ZERO_BYTE_METADATA_PRIMARY_NODE_ID" \
+    --arg shard_id "$PJDFSTEST_ZERO_BYTE_METADATA_SHARD_ID" \
+    --argjson shard_epoch "$PJDFSTEST_ZERO_BYTE_METADATA_SHARD_EPOCH" \
+    '{
+      schema_version: 1,
+      status: $status,
+      pre_restart_cross_node_visibility: $pre_restart_visibility,
+      node5_restart: $restart_status,
+      post_restart_cross_node_visibility: $post_restart_visibility,
+      cleanup: $cleanup_status,
+      paths: {
+        o_creat: $o_creat_path,
+        o_excl: $o_excl_path
+      },
+      placement: {
+        mount_node_id: $mount_node_id,
+        metadata_primary_node_id: $primary_node_id,
+        metadata_shard_id: $shard_id,
+        metadata_shard_epoch: $shard_epoch,
+        mount_node_is_metadata_replica: true,
+        remote_metadata_primary: ($mount_node_id != $primary_node_id)
+      }
+    }' >"$PJDFSTEST_HOST_ARTIFACTS/zero-byte-post-cluster.json"
+}
+
+pjdfstest_post_cluster_checks() {
+  local sentinel_root="$PJDFSTEST_ZERO_BYTE_PREFIX"
+  local sentinel_dir="$sentinel_root/$RUN_ID"
+  local sentinel_path="$PJDFSTEST_ZERO_BYTE_O_CREAT_PATH"
+  local o_excl_path="$PJDFSTEST_ZERO_BYTE_O_EXCL_PATH"
+  local sentinel_payload=""
+  local doctor_file="$PJDFSTEST_HOST_ARTIFACTS/post-cluster-doctor.txt"
+  local health_file="$PJDFSTEST_HOST_ARTIFACTS/post-cluster-health.txt"
+  local warnings online rc=0
+  local pre_restart_visibility="not_run"
+  local restart_status="not_run"
+  local post_restart_visibility="not_run"
+  local zero_byte_cleanup="not_run"
+  local zero_byte_postcheck_status="blocked"
+
+  if [ "$PJDFSTEST_SENTINEL_STATUS" = passed ]; then
+    pre_restart_visibility="passed"
+    run_probe node1 cluster.dfs.expect-file \
+      --param "path=$sentinel_path" \
+      --param "payload=$sentinel_payload" \
+      --param "timeout-seconds=$EXPECT_TIMEOUT" || {
+        pre_restart_visibility="failed"
+        rc=1
+      }
+    run_probe node6 cluster.dfs.expect-file \
+      --param "path=$o_excl_path" \
+      --param "payload=$sentinel_payload" \
+      --param "timeout-seconds=$EXPECT_TIMEOUT" || {
+        pre_restart_visibility="failed"
+        rc=1
+      }
+
+    log "pjdfstest: restarting node5 for mounted zero-byte durability"
+    if ! compose restart node5 >/dev/null 2>&1; then
+      log "pjdfstest: node5 restart failed"
+      restart_status="failed"
+      rc=1
+    elif ! wait_for_cluster_ready "pjdfstest-zero-byte-restart" \
+      || ! wait_for_dfs_ready \
+      || ! wait_for_dfs_converged; then
+      restart_status="failed"
+      rc=1
+    else
+      restart_status="passed"
+      post_restart_visibility="passed"
+      run_probe node5 cluster.dfs.expect-file \
+        --param "path=$sentinel_path" \
+        --param "payload=$sentinel_payload" \
+        --param "timeout-seconds=$EXPECT_TIMEOUT" || {
+          post_restart_visibility="failed"
+          rc=1
+        }
+      run_probe node2 cluster.dfs.expect-file \
+        --param "path=$o_excl_path" \
+        --param "payload=$sentinel_payload" \
+        --param "timeout-seconds=$EXPECT_TIMEOUT" || {
+          post_restart_visibility="failed"
+          rc=1
+        }
+    fi
+
+    zero_byte_cleanup="passed"
+    run_probe node4 cluster.dfs.remove --param "path=$sentinel_path" || {
+      zero_byte_cleanup="failed"
+      rc=1
+    }
+    run_probe node4 cluster.dfs.remove --param "path=$o_excl_path" || {
+      zero_byte_cleanup="failed"
+      rc=1
+    }
+    run_probe node2 cluster.dfs.expect-absent \
+      --param "path=$sentinel_path" \
+      --param "timeout-seconds=$EXPECT_TIMEOUT" || {
+        zero_byte_cleanup="failed"
+        rc=1
+      }
+    run_probe node6 cluster.dfs.expect-absent \
+      --param "path=$o_excl_path" \
+      --param "timeout-seconds=$EXPECT_TIMEOUT" || {
+        zero_byte_cleanup="failed"
+        rc=1
+      }
+    run_probe node4 cluster.dfs.remove --param "path=$sentinel_dir" || {
+      zero_byte_cleanup="failed"
+      rc=1
+    }
+    run_probe node4 cluster.dfs.remove --param "path=$sentinel_root" || {
+      zero_byte_cleanup="failed"
+      rc=1
+    }
+    if [ "$pre_restart_visibility" = passed ] \
+      && [ "$restart_status" = passed ] \
+      && [ "$post_restart_visibility" = passed ] \
+      && [ "$zero_byte_cleanup" = passed ]; then
+      zero_byte_postcheck_status="passed"
+    else
+      zero_byte_postcheck_status="failed"
+    fi
+  else
+    log "pjdfstest: mounted zero-byte probe is inside the reported compatibility boundary"
+    run_probe node4 cluster.dfs.remove --param "path=$sentinel_path" || true
+    run_probe node4 cluster.dfs.remove --param "path=$o_excl_path" || true
+    run_probe node4 cluster.dfs.remove --param "path=$sentinel_dir" || true
+    run_probe node4 cluster.dfs.remove --param "path=$sentinel_root" || true
+  fi
+  if ! write_pjdfstest_zero_byte_postcheck \
+      "$zero_byte_postcheck_status" \
+      "$pre_restart_visibility" \
+      "$restart_status" \
+      "$post_restart_visibility" \
+      "$zero_byte_cleanup"; then
+    log "pjdfstest: cannot write zero-byte post-cluster evidence"
+    rc=1
+  fi
+  wait_for_dfs_converged || rc=1
+  invariants_sweep || rc=1
+
+  if cluster_health_attempt "$READINESS_COMMAND_TIMEOUT" >"$health_file" 2>&1; then
+    online="$(grep -c "daemon-main.*online" "$health_file" || true)"
+    if [ "$online" -ne "$EXPECTED_MAINS" ]; then
+      log "pjdfstest: post-suite health has $online/$EXPECTED_MAINS main daemons online"
+      rc=1
+    fi
+  else
+    log "pjdfstest: post-suite cluster health failed"
+    rc=1
+  fi
+  warnings=""
+  if ! warnings="$(
+    doctor_connectivity_warnings "$READINESS_COMMAND_TIMEOUT" "$doctor_file"
+  )"; then
+    log "pjdfstest: post-suite cluster doctor failed"
+    rc=1
+  elif [ -n "$warnings" ]; then
+    log "pjdfstest: post-suite cluster doctor reported connectivity warnings"
+    printf '%s\n' "$warnings" | sed 's/^/[test-cluster]   /'
+    rc=1
+  fi
+  final_routed_status || rc=1
+  return "$rc"
+}
+
+pjdfstest_lane() {
+  local compatibility_rc=0
+  run_pjdfstest_compatibility_probe || compatibility_rc=$?
+  if [ "$compatibility_rc" -ne 0 ] && [ "$compatibility_rc" -ne 10 ]; then
+    return 1
+  fi
+  pjdfstest_post_cluster_checks || return 1
+  [ "$compatibility_rc" -eq 0 ]
+}
+
 dfs_protocol_codec_baseline() {
   run_probe node1 cluster.dfs.protocol-codec-baseline \
     --param "bytes=$DFS_PROTOCOL_CODEC_BYTES" \
@@ -3195,13 +3790,21 @@ teardown() {
   [ "$TEARDOWN_DONE" = 1 ] && return
   TEARDOWN_DONE=1
   network_quiet_stats_stream_stop
+  if [ "$PJDFSTEST_STARTED" = 1 ]; then
+    collect_pjdfstest_artifacts || true
+    cleanup_pjdfstest_mount || true
+  fi
   [ "$PROJECT_OWNED" = 1 ] || return
   if [ -n "$FAILED_SCENARIOS" ]; then
     capture_failure_context
   fi
   if [ "${SINOMO_TEST_KEEP:-0}" = 1 ] || [ "${SINOMO_TEST_REUSE:-0}" = 1 ]; then
     log "leaving cluster up (project $PROJECT); tear down with:"
-    if [ -n "$COMPOSE_OVERRIDE_FILE" ]; then
+    if [ "$PJDFSTEST_ONLY" = 1 ] && [ -n "$COMPOSE_OVERRIDE_FILE" ]; then
+      log "  docker compose -p $PROJECT -f $COMPOSE_FILE -f $SINOMO_DOCKER_DIR/docker-compose.pjdfstest.yml -f $COMPOSE_OVERRIDE_FILE down -v"
+    elif [ "$PJDFSTEST_ONLY" = 1 ]; then
+      log "  docker compose -p $PROJECT -f $COMPOSE_FILE -f $SINOMO_DOCKER_DIR/docker-compose.pjdfstest.yml down -v"
+    elif [ -n "$COMPOSE_OVERRIDE_FILE" ]; then
       log "  docker compose -p $PROJECT -f $COMPOSE_FILE -f $COMPOSE_OVERRIDE_FILE down -v"
     else
       log "  docker compose -p $PROJECT -f $COMPOSE_FILE down -v"
@@ -3232,6 +3835,7 @@ validate_network_realtime_gate_config || exit 1
 validate_network_saturation_config || exit 1
 validate_cluster_kv_benchmark_config || exit 1
 validate_formation_observation_config || exit 1
+validate_pjdfstest_config || exit 1
 require_no_other_compose_projects || exit 1
 trap teardown EXIT
 
@@ -3297,6 +3901,17 @@ fi
 if ! wait_for_dfs_converged; then
   FAILED_SCENARIOS="pre-benchmark-dfs-post-daemon-mutation-convergence"
   exit 1
+fi
+
+if [ "$PJDFSTEST_ONLY" = 1 ]; then
+  echo
+  log "--- external mounted-filesystem compatibility: pjdfstest ---"
+  if ! pjdfstest_lane; then
+    FAILED_SCENARIOS="pjdfstest-$PJDFSTEST_COMPATIBILITY_STATUS"
+    exit 1
+  fi
+  log "RESULT: PASS — pjdfstest harness and post-cluster gates green; compatibility=$PJDFSTEST_COMPATIBILITY_STATUS (evidence in $PJDFSTEST_HOST_ARTIFACTS)"
+  exit 0
 fi
 
 if [ "$CLUSTER_KV_ONLY" = 1 ]; then

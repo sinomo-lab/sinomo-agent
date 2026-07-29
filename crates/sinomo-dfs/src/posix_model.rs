@@ -41,6 +41,12 @@ pub enum DfsPosixError {
         durable_receipts: usize,
         required_receipts: usize,
     },
+    #[error("symlink content is temporarily unavailable at {path} during {stage}: {detail}")]
+    SymlinkContentPending {
+        path: String,
+        stage: String,
+        detail: String,
+    },
     #[error("write conflicted at {path}: {reason}")]
     Conflict { path: String, reason: String },
     #[error("directory is not empty: {path}")]
@@ -356,6 +362,15 @@ pub(crate) fn namespace_posix_error_for(error: &DfsPosixError) -> Option<DfsName
             path: path.clone(),
             reason: reason.clone(),
         }),
+        DfsPosixError::SymlinkContentPending {
+            path,
+            stage,
+            detail,
+        } => Some(DfsNamespacePosixError::SymlinkContentPending {
+            path: path.clone(),
+            stage: stage.clone(),
+            detail: detail.clone(),
+        }),
         DfsPosixError::Dfs(DfsError::Busy { path }) => {
             Some(DfsNamespacePosixError::Busy { path: path.clone() })
         }
@@ -388,6 +403,15 @@ pub(crate) fn posix_error_for_namespace_rejection(
         Some(DfsNamespacePosixError::Conflict { path, reason }) => {
             DfsPosixError::Conflict { path, reason }
         }
+        Some(DfsNamespacePosixError::SymlinkContentPending {
+            path,
+            stage,
+            detail,
+        }) => DfsPosixError::SymlinkContentPending {
+            path,
+            stage,
+            detail,
+        },
         Some(DfsNamespacePosixError::Busy { path }) => DfsPosixError::Dfs(DfsError::Busy { path }),
         None => DfsPosixError::Dfs(DfsError::Distributed { message: reason }),
     }

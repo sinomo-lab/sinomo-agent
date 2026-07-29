@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "id": "sinomo-linux-portability-v1",
+  "upstream_revision": "ededbeb2b44929972898afb87474b0937f78a877",
+  "scope": "Linux mounted-interface compatibility",
+  "rules": [
+    {
+      "id": "chown-non-regular-setid-bits",
+      "test": "tests/chown/00.t",
+      "classification": "posix-permitted-variant",
+      "contract": "Changing ownership of a directory may preserve or clear S_ISUID and S_ISGID; exact uid and gid results are still required.",
+      "accepted_observations": [
+        "setid-bits-preserved",
+        "setid-bits-cleared"
+      ]
+    },
+    {
+      "id": "chown-noop-ctime",
+      "test": "tests/chown/00.t",
+      "classification": "posix-permitted-variant",
+      "contract": "When uid and gid are both -1, ctime may be preserved or advanced but must not move backwards.",
+      "accepted_observations": [
+        "ctime-preserved",
+        "ctime-advanced"
+      ]
+    },
+    {
+      "id": "unlink-directory-linux-errno",
+      "test": "tests/unlink/08.t",
+      "classification": "linux-host-platform-deviation",
+      "contract": "The Linux native control may return EISDIR when unlink targets a directory; success and EPERM remain accepted POSIX outcomes.",
+      "accepted_observations": [
+        "success",
+        "EPERM",
+        "EISDIR"
+      ]
+    },
+    {
+      "id": "btrfs-directory-link-count",
+      "test": "tests/rename/24.t",
+      "classification": "linux-host-filesystem-deviation",
+      "contract": "Btrfs reports a fixed directory link count of one before and after a cross-directory rename; dot-dot inode and namespace behavior remain required.",
+      "accepted_observations": [
+        "directory-nlink-one"
+      ]
+    }
+  ]
+}

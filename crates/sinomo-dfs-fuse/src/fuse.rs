@@ -1505,9 +1505,10 @@ impl Filesystem for SifsFuseFileSystem {
             Ok(path) => path,
             Err(errno) => return reply.error_from_i32(errno),
         };
-        let result = self
-            .lock_dfs()
-            .and_then(|dfs| dfs.posix_readlink(&path).map_err(errno_for_posix_error));
+        let result = self.lock_dfs().and_then(|mut dfs| {
+            dfs.posix_readlink_distributed(&path)
+                .map_err(errno_for_posix_error)
+        });
         match result {
             Ok(target) => reply.data(target.as_bytes()),
             Err(errno) => reply.error_from_i32(errno),
@@ -3589,6 +3590,7 @@ fn errno_for_posix_error(error: DfsPosixError) -> libc::c_int {
         DfsPosixError::MissingParent { .. } => libc::ENOENT,
         DfsPosixError::InvalidPath { .. } => libc::EINVAL,
         DfsPosixError::PendingWrite { .. } => libc::EAGAIN,
+        DfsPosixError::SymlinkContentPending { .. } => libc::EAGAIN,
         DfsPosixError::Conflict { .. } => libc::ESTALE,
         DfsPosixError::DirectoryNotEmpty { .. } => libc::ENOTEMPTY,
         // In-flight cross-shard moves reject mutations transiently; tell the
@@ -3824,6 +3826,18 @@ mod errno_tests {
         assert_eq!(created_mode(libc::S_IFDIR | 0o777, 0o027), 0o750);
         assert_eq!(created_mode(0o700, 0), 0o700);
         assert_eq!(created_mode(0o6777, 0o7000), 0o6777);
+    }
+
+    #[test]
+    fn pending_symlink_content_is_retryable_at_the_mount_boundary() {
+        assert_eq!(
+            errno_for_posix_error(DfsPosixError::SymlinkContentPending {
+                path: "/services/link".to_string(),
+                stage: "fetch-link-body".to_string(),
+                detail: "replication is pending".to_string(),
+            }),
+            libc::EAGAIN
+        );
     }
 
     #[test]

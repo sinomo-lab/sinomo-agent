@@ -1197,6 +1197,35 @@ struct RecordingFailingSendTransport {
     targets: Arc<Mutex<Vec<NodeId>>>,
 }
 
+struct RecordingRoutedCallTransport {
+    local_node_id: NodeId,
+    calls: Arc<Mutex<Vec<(NodeId, DfsRoutedCall)>>>,
+}
+
+impl DfsTransportIdentity for RecordingRoutedCallTransport {
+    fn local_node_id(&self) -> &NodeId {
+        &self.local_node_id
+    }
+}
+
+impl DfsMessageTransport for RecordingRoutedCallTransport {
+    fn send_routed_call(
+        &mut self,
+        target_node_id: &NodeId,
+        call: DfsRoutedCall,
+    ) -> Result<(), NetworkError> {
+        self.calls
+            .lock()
+            .expect("recorded routed calls")
+            .push((target_node_id.clone(), call));
+        Ok(())
+    }
+
+    fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
+        Ok(Vec::new())
+    }
+}
+
 impl DfsTransportIdentity for RecordingFailingSendTransport {
     fn local_node_id(&self) -> &NodeId {
         &self.local_node_id
@@ -14068,6 +14097,80 @@ fn routed_write_replay_uses_existing_committed_intent_after_service_restart() {
             && version == target_version
             && replayed_content_hash == content_hash
     ));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn empty_routed_write_uses_an_ordinary_value_call() {
+    let requester =
+        NodeId::from_legacy_named("node_empty_routed_requester").expect("requester node");
+    let primary = NodeId::from_legacy_named("node_empty_routed_primary").expect("primary node");
+    let root = temp_root("empty-routed-value-call");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut service = NetworkedDfsService::new(
+        RecordingRoutedCallTransport {
+            local_node_id: requester.clone(),
+            calls: Arc::clone(&calls),
+        },
+        LocalContentStore::new(root.join("content")).expect("content store"),
+    );
+    let path = "/users/empty-routed-value";
+    let object =
+        crate::posix_object::new_posix_metadata_object(&requester, path, DfsObjectKind::File);
+    let target_version = crate::namespace::next_version(&object.version);
+    let shard = DfsMetadataShardConfig {
+        file_system_id: object.file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![requester.clone()],
+        epoch: 7,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+
+    let outcome = service
+        .route_distributed_write_to_metadata_primary(
+            DfsWriteRequest {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                target_version,
+                requesting_node_id: requester.clone(),
+            },
+            Some(object.version.clone()),
+            Vec::new(),
+            vec![requester],
+            DfsReplicationPolicy::new(1, 1).expect("replication policy"),
+            object,
+            shard,
+            true,
+            true,
+            true,
+            false,
+            false,
+        )
+        .expect("route empty write");
+    assert!(matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }));
+
+    let calls = calls.lock().expect("recorded routed calls");
+    assert_eq!(calls.len(), 1);
+    let (target_node_id, call) = &calls[0];
+    assert_eq!(target_node_id, &primary);
+    assert!(
+        call.attachment.is_none(),
+        "zero-byte content must not produce an attachment-shaped RPC head"
+    );
+    let DfsNetworkMessage::ExclusiveCreateRequest(command) = &call.message.message else {
+        panic!(
+            "expected routed exclusive create, got {:?}",
+            call.message.message
+        );
+    };
+    assert!(command.bytes.is_empty());
+    assert_eq!(command.content_hash, None);
+    assert_eq!(command.content_size_bytes, None);
+    assert!(!command.requester_blob_pre_staged);
+    assert!(command.exclusive_create);
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -36460,6 +36563,222 @@ fn sifs_cluster_posix_routed_write_survives_writer_restart() {
         "restarted writer must still list the committed path: {entries:?}"
     );
 
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_empty_create_routes_retries_replicates_and_survives_restart() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-empty-create");
+    let create_path = "/users/empty-create";
+    let exclusive_path = "/users/empty-exclusive-create";
+    let expected_hash = content_hash(&[]);
+    let attrs = DfsPosixCreateAttrs::new(0o640, 6101, 6102);
+
+    // O_CREAT without O_EXCL still routes a zero-byte creation to the remote
+    // metadata primary and returns the primary's canonical empty identity.
+    let writer_node = cluster.writer_node.clone();
+    let create_stat = sifs_cluster_writer_call_with_pump(
+        &mut cluster,
+        "blocking routed empty O_CREAT",
+        move |writer| {
+            writer.posix_write_file_with_create_attrs(
+                create_path,
+                &[],
+                DfsWriteOptions::replicated_eventual(vec![writer_node]),
+                attrs,
+            )
+        },
+    )
+    .expect("routed empty O_CREAT");
+    assert_eq!(create_stat.kind, DfsObjectKind::File);
+    assert_eq!(create_stat.size_bytes, Some(0));
+    assert_eq!(
+        create_stat.content_hash.as_deref(),
+        Some(expected_hash.as_str())
+    );
+    assert_eq!(
+        cluster
+            .primary
+            .posix_stat(create_path)
+            .expect("primary sees routed empty O_CREAT")
+            .content_hash
+            .as_deref(),
+        Some(expected_hash.as_str())
+    );
+
+    // Use all three replicas so the O_EXCL create normally remains pending
+    // while its exact routed command is captured. Whether it is still pending
+    // or has just committed, the primary must replay it instead of performing
+    // a second namespace create.
+    let options = DfsWriteOptions {
+        policy: DfsReplicationPolicy::new(3, 3).expect("three-replica policy"),
+        replica_candidates: vec![
+            cluster.writer_node.clone(),
+            cluster.observer_node.clone(),
+            cluster.primary_node.clone(),
+        ],
+        wait_for_commit: false,
+        foreground_replica_repair: true,
+    };
+    let first_create = sifs_cluster_writer_call_with_pump(
+        &mut cluster,
+        "initial routed empty O_EXCL",
+        move |writer| writer.posix_create_file_with_attrs(exclusive_path, options, attrs),
+    );
+    assert!(
+        matches!(
+            first_create,
+            Ok(_) | Err(DfsPosixError::PendingWrite { .. })
+        ),
+        "initial routed empty O_EXCL create failed: {first_create:?}"
+    );
+    let command = cluster
+        .writer
+        .pending_routed_writes
+        .values()
+        .find(|pending| {
+            pending.command.exclusive_create
+                && pending
+                    .command
+                    .object_metadata
+                    .as_ref()
+                    .is_some_and(|object| object.path == exclusive_path)
+        })
+        .expect("pending routed empty create")
+        .command
+        .clone();
+    assert!(command.exclusive_create);
+    assert!(command.bytes.is_empty());
+    assert_eq!(command.content_hash, None);
+    assert_eq!(command.content_size_bytes, None);
+    assert!(!command.requester_blob_pre_staged);
+
+    assert!(
+        cluster
+            .writer
+            .send_dfs_message_if_routable(
+                &cluster.primary_node,
+                DfsNetworkMessage::ExclusiveCreateRequest(command),
+            )
+            .expect("resend exact empty create")
+    );
+    cluster
+        .primary
+        .process_incoming()
+        .expect("primary handles exact empty-create retry");
+
+    sifs_posix_cluster_pump_until(&mut cluster, "empty O_EXCL create settles", |cluster| {
+        sifs_routed_writes_settled(&cluster.writer)
+            && cluster.writer.posix_stat(exclusive_path).is_ok_and(|stat| {
+                stat.size_bytes == Some(0)
+                    && stat.content_hash.as_deref() == Some(expected_hash.as_str())
+            })
+    });
+    sifs_cluster_publish_metadata_until(
+        &mut cluster,
+        "empty O_EXCL create reaches metadata replica",
+        |cluster| {
+            cluster
+                .observer
+                .posix_stat(exclusive_path)
+                .is_ok_and(|stat| {
+                    stat.size_bytes == Some(0)
+                        && stat.content_hash.as_deref() == Some(expected_hash.as_str())
+                })
+        },
+    );
+
+    for (label, service) in [
+        ("primary", &mut cluster.primary),
+        ("writer", &mut cluster.writer),
+        ("observer", &mut cluster.observer),
+    ] {
+        let stat = service
+            .posix_stat(exclusive_path)
+            .unwrap_or_else(|error| panic!("{label} stat failed: {error}"));
+        assert_eq!(stat.kind, DfsObjectKind::File, "{label} kind");
+        assert_eq!(stat.size_bytes, Some(0), "{label} size");
+        assert_eq!(
+            stat.content_hash.as_deref(),
+            Some(expected_hash.as_str()),
+            "{label} canonical empty hash"
+        );
+        assert_eq!(
+            service
+                .posix_read_file(exclusive_path)
+                .unwrap_or_else(|error| panic!("{label} empty read failed: {error}")),
+            Vec::<u8>::new(),
+            "{label} empty content"
+        );
+    }
+
+    let writer_node = cluster.writer_node.clone();
+    let duplicate_create = sifs_cluster_writer_call_with_pump(
+        &mut cluster,
+        "duplicate routed empty O_EXCL",
+        move |writer| {
+            writer.posix_create_file_with_attrs(
+                exclusive_path,
+                DfsWriteOptions::replicated_eventual(vec![writer_node]),
+                attrs,
+            )
+        },
+    );
+    assert!(matches!(
+        duplicate_create,
+        Err(DfsPosixError::AlreadyExists { .. })
+    ));
+
+    // Reopen the non-primary writer from only its durable metadata and content
+    // roots. The zero-byte manifest must remain readable after restart.
+    let writer_node = cluster.writer_node.clone();
+    let writer_root = cluster.root.join("writer");
+    let placeholder = NetworkedDfsService::new(
+        InProcessNetwork::new().add_node(writer_node.clone()),
+        LocalContentStore::new(cluster.root.join("unused-empty-content"))
+            .expect("placeholder content store"),
+    );
+    let writer = std::mem::replace(&mut cluster.writer, placeholder);
+    drop(writer);
+    let mut restarted = NetworkedDfsService::new(
+        ReceiveOnlyTransport::new(writer_node),
+        LocalContentStore::new(writer_root.join("content")).expect("reopened content store"),
+    )
+    .with_metadata_backend(
+        open_root_local_metadata_backend(writer_root.join("metadata"))
+            .expect("reopened metadata backend"),
+    )
+    .expect("restarted writer metadata");
+    restarted
+        .bootstrap_distributed_sifs()
+        .expect("restarted writer bootstrap");
+    let restarted_stat = restarted
+        .posix_stat(exclusive_path)
+        .expect("restarted empty stat");
+    assert_eq!(restarted_stat.size_bytes, Some(0));
+    assert_eq!(
+        restarted_stat.content_hash.as_deref(),
+        Some(expected_hash.as_str())
+    );
+    assert_eq!(
+        restarted
+            .posix_read_file(exclusive_path)
+            .expect("restarted empty read"),
+        Vec::<u8>::new()
+    );
+    assert!(
+        restarted
+            .posix_list_dir("/users")
+            .expect("restarted user listing")
+            .iter()
+            .any(|entry| entry.path == exclusive_path)
+    );
+
+    assert!(
+        cluster.rejections.is_empty(),
+        "empty routed create must not fork replica metadata: {:?}",
+        cluster.rejections
+    );
     std::fs::remove_dir_all(&cluster.root).ok();
 }
 

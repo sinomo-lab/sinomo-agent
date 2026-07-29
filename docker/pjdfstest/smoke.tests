@@ -1,0 +1,19 @@
+# One representative test from each upstream syscall family. Paths are relative
+# to /opt/pjdfstest and pinned to PJDFSTEST_REVISION in the runner/image.
+tests/chflags/00.t
+tests/chmod/00.t
+tests/chown/00.t
+tests/ftruncate/00.t
+tests/granular/00.t
+tests/link/00.t
+tests/mkdir/00.t
+tests/mkfifo/00.t
+tests/mknod/00.t
+tests/open/00.t
+tests/posix_fallocate/00.t
+tests/rename/00.t
+tests/rmdir/00.t
+tests/symlink/00.t
+tests/truncate/00.t
+tests/unlink/00.t
+tests/utimensat/00.t
