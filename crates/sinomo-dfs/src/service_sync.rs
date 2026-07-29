@@ -293,6 +293,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if !backend.has_any_metadata_shard_write_freeze()? {
             return Ok(0);
         }
+
+        // Retired-replica markers are intentionally durable so independently
+        // opened stale handles remain fenced. They cannot be rebound by this
+        // node, and using the coarse "any marker" check below as a refresh
+        // trigger made every later SIFS open perform an authoritative full-KV
+        // read forever. Use the daemon-projected control-plane view only to
+        // reject impossible local work. A stale negative is fail-closed: the
+        // marker remains fenced until the projection catches up and a later
+        // lane retries. A possible local-primary rebind still refreshes its
+        // control-plane client before checking the exact proof and changing
+        // the durable marker.
+        let projected_shards = {
+            let Some(control_plane) = self.control_plane.as_mut() else {
+                return Ok(0);
+            };
+            DfsControlPlaneStore::new(control_plane.as_mut())
+                .list_metadata_shards(file_system_id)?
+        };
+        let Some(backend) = self.metadata_backend.as_deref() else {
+            return Ok(0);
+        };
+        let mut has_projected_local_primary_freeze = false;
+        for shard in &projected_shards {
+            if shard.primary_node_id == self.node_id
+                && backend.metadata_shard_authoritative_writes_frozen(&DfsMetadataShardId::new(
+                    shard.shard_id.clone(),
+                ))?
+            {
+                has_projected_local_primary_freeze = true;
+                break;
+            }
+        }
+        if !has_projected_local_primary_freeze {
+            return Ok(0);
+        }
+
         self.refresh_control_plane_latest()?;
         let observed = {
             let Some(control_plane) = self.control_plane.as_mut() else {
@@ -2230,6 +2266,35 @@ mod tests {
         LocalShardedMetadataBackend, LocalSobjMetadataBackend, SharedDfsControlPlaneKvClient,
         build_dfs_routed_message, directory_object, sifs_file_system_id,
     };
+
+    #[derive(Debug)]
+    struct RefreshCountingControlPlane {
+        inner: InProcessKvStore,
+        refresh_calls: Arc<AtomicUsize>,
+    }
+
+    impl DfsControlPlaneKvClient for RefreshCountingControlPlane {
+        fn refresh_latest(&mut self) -> Result<(), KvError> {
+            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
+            DfsControlPlaneKvClient::get(&self.inner, key)
+        }
+
+        fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+            DfsControlPlaneKvClient::range_prefix(&self.inner, prefix)
+        }
+
+        fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
+            DfsControlPlaneKvClient::put(&mut self.inner, key, value)
+        }
+
+        fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+            DfsControlPlaneKvClient::txn(&mut self.inner, txn)
+        }
+    }
 
     #[derive(Debug)]
     struct MetadataAckTransport {
@@ -4547,6 +4612,84 @@ mod tests {
         assert_eq!(active, Some(retiring));
         assert_eq!(still_pending, Some(pending));
         assert!(proof.is_none());
+    }
+
+    #[test]
+    fn retired_replica_marker_does_not_refresh_control_plane_during_cold_open() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-retired-replica-cold-open");
+        let local = node("node_retired_replica_local");
+        let primary = node("node_retired_replica_primary");
+        let file_system_id = sifs_file_system_id();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "services".to_string(),
+            primary_node_id: primary,
+            replica_node_ids: vec![local.clone()],
+            epoch: 9,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/services".to_string(),
+            },
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut inner = InProcessKvStore::new();
+        DfsControlPlaneStore::new(&mut inner)
+            .put_metadata_shard(&shard)
+            .expect("active remote-primary shard");
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let control_plane = RefreshCountingControlPlane {
+            inner,
+            refresh_calls: Arc::clone(&refresh_calls),
+        };
+
+        let shard_id = DfsMetadataShardId::new(&shard.shard_id);
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), root.path())
+            .expect("retired replica backend");
+        backend
+            .put_file_system(&DfsFileSystem::sifs(local.clone()))
+            .expect("filesystem");
+        backend
+            .freeze_metadata_shard_for_membership_handoff(
+                &shard_id,
+                "completed-retired-replica-handoff",
+                shard.epoch - 1,
+            )
+            .expect("freeze retired replica")
+            .expect("matching local shard");
+        backend
+            .mark_metadata_shard_membership_handoff_activated(
+                &shard_id,
+                "completed-retired-replica-handoff",
+                shard.epoch,
+            )
+            .expect("activate retired replica marker");
+
+        let mut service = NetworkedDfsService::new(
+            MetadataAckTransport::new(local, []),
+            LocalContentStore::new(root.path().join("content")).expect("content store"),
+        )
+        .with_control_plane(control_plane)
+        .with_metadata_backend(backend)
+        .expect("retired replica service");
+
+        assert_eq!(
+            service
+                .rebind_completed_local_metadata_shard_membership_handoffs(&file_system_id)
+                .expect("retired marker cold-open check"),
+            0
+        );
+        assert_eq!(
+            refresh_calls.load(Ordering::SeqCst),
+            0,
+            "a durable marker on a remote-primary replica must not schedule an authoritative KV refresh"
+        );
+        assert!(
+            service
+                .metadata_backend()
+                .expect("metadata backend")
+                .metadata_shard_authoritative_writes_frozen(&shard_id)
+                .expect("retired replica marker"),
+            "the retired replica must remain fail-closed"
+        );
     }
 
     #[test]

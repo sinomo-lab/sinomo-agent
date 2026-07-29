@@ -27,8 +27,7 @@ use sinomo_runtime::dfs::{
     open_cluster_aware_dfs_metadata_backend_for_inspection,
     open_local_sharded_metadata_backend_for_replica_repair, open_root_local_metadata_backend,
     preview_placement_with_unavailable_nodes,
-    publish_cluster_dfs_metadata_journal_with_peer_transports_async,
-    refresh_cluster_dfs_kv_snapshot_with_peer_transport, sifs_file_system_id,
+    publish_cluster_dfs_metadata_journal_with_peer_transports_async, sifs_file_system_id,
 };
 use sinomo_runtime::kv::{KvError, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
@@ -56,6 +55,10 @@ pub(crate) struct SifsFileManagerBackend {
     data_dir: SinomoDataDir,
     rpc_runtime: SifsRpcRuntime,
     service: Mutex<NetworkedDfsService<DfsNodeTransport>>,
+    /// `None` marks a strict read-only backend. Writable backends defer
+    /// authority rebind/recovery until their first mutation so cold reads stay
+    /// observational.
+    mutation_bootstrapped: Mutex<Option<bool>>,
     peer_targets_refreshed_at: Mutex<Option<Instant>>,
     replica_candidates: Vec<NodeId>,
 }
@@ -241,7 +244,7 @@ impl SifsFileManagerBackend {
     pub(crate) fn open(data_dir: &SinomoDataDir) -> Result<Self, String> {
         let rpc_runtime = SifsRpcRuntime::new()?;
         let service = open_sifs_service_with_hydration(data_dir, &rpc_runtime, false)?;
-        Self::from_service(data_dir, rpc_runtime, service)
+        Self::from_service(data_dir, rpc_runtime, service, true, None)
     }
 
     pub(crate) fn open_with_deadline(
@@ -259,7 +262,7 @@ impl SifsFileManagerBackend {
             operation_deadline,
         )?;
         sifs_operation_remaining(operation_deadline, "opening the SIFS backend")?;
-        Self::from_service(data_dir, rpc_runtime, service)
+        Self::from_service(data_dir, rpc_runtime, service, true, operation_deadline)
     }
 
     pub(crate) fn open_read_only(data_dir: &SinomoDataDir) -> Result<Self, String> {
@@ -277,7 +280,7 @@ impl SifsFileManagerBackend {
         let service =
             open_sifs_service_read_only_until(data_dir, &rpc_runtime, operation_deadline)?;
         sifs_operation_remaining(operation_deadline, "opening the read-only SIFS backend")?;
-        Self::from_service(data_dir, rpc_runtime, service)
+        Self::from_service(data_dir, rpc_runtime, service, false, operation_deadline)
     }
 
     fn open_read_only_with_runtime(
@@ -285,19 +288,43 @@ impl SifsFileManagerBackend {
         rpc_runtime: SifsRpcRuntime,
     ) -> Result<Self, String> {
         let service = open_sifs_service_read_only(data_dir, &rpc_runtime)?;
-        Self::from_service(data_dir, rpc_runtime, service)
+        Self::from_service(data_dir, rpc_runtime, service, false, None)
     }
 
     fn from_service(
         data_dir: &SinomoDataDir,
         rpc_runtime: SifsRpcRuntime,
-        service: NetworkedDfsService<DfsNodeTransport>,
+        mut service: NetworkedDfsService<DfsNodeTransport>,
+        writable: bool,
+        operation_deadline: Option<Instant>,
     ) -> Result<Self, String> {
+        let clustered = ClusterPaths::new(data_dir).state.exists();
+        let mutation_bootstrapped = if writable && !clustered {
+            // A brand-new standalone SIFS has no daemon projection or remote
+            // authority to wait for, and its fixed namespace must exist before
+            // FileManagerState performs its initial stat/list. Keep this local
+            // initialization eager while clustered opens stay observational.
+            sifs_operation_remaining(operation_deadline, "initializing standalone SIFS")?;
+            let previous_deadline = operation_deadline
+                .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
+            let bootstrap = service
+                .bootstrap_distributed_sifs()
+                .map_err(|error| format!("cannot initialize standalone SIFS: {error}"));
+            if let Some(previous_deadline) = previous_deadline {
+                service.set_transport_operation_deadline(previous_deadline);
+            }
+            bootstrap?;
+            sifs_operation_remaining(operation_deadline, "initializing standalone SIFS")?;
+            Some(true)
+        } else {
+            writable.then_some(false)
+        };
         let replica_candidates = sifs_replica_candidates(data_dir, service.node_id());
         Ok(Self {
             data_dir: data_dir.clone(),
             rpc_runtime,
             service: Mutex::new(service),
+            mutation_bootstrapped: Mutex::new(mutation_bootstrapped),
             peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
             replica_candidates,
         })
@@ -334,6 +361,37 @@ impl SifsFileManagerBackend {
                 }
             }
         }
+    }
+
+    fn lock_service_for_mutation(
+        &self,
+        operation_deadline: Option<Instant>,
+    ) -> Result<std::sync::MutexGuard<'_, NetworkedDfsService<DfsNodeTransport>>, String> {
+        let mut service = self.lock_service_with_deadline(operation_deadline)?;
+        let mut mutation_bootstrapped = self
+            .mutation_bootstrapped
+            .lock()
+            .map_err(|_| "SIFS mutation bootstrap lock is poisoned".to_string())?;
+        let Some(bootstrapped) = mutation_bootstrapped.as_mut() else {
+            return Err("this SIFS backend is read-only".to_string());
+        };
+        if *bootstrapped {
+            return Ok(service);
+        }
+
+        sifs_operation_remaining(operation_deadline, "preparing SIFS mutation authority")?;
+        let previous_deadline = operation_deadline
+            .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
+        let bootstrap = service
+            .bootstrap_distributed_sifs()
+            .map_err(|error| format!("cannot prepare SIFS mutation authority: {error}"));
+        if let Some(previous_deadline) = previous_deadline {
+            service.set_transport_operation_deadline(previous_deadline);
+        }
+        bootstrap?;
+        sifs_operation_remaining(operation_deadline, "preparing SIFS mutation authority")?;
+        *bootstrapped = true;
+        Ok(service)
     }
 
     fn refresh_service_peer_targets(&self, service: &mut NetworkedDfsService<DfsNodeTransport>) {
@@ -1051,7 +1109,7 @@ impl SifsFileManagerBackend {
                 });
             }
         };
-        let mut service = self.lock_service()?;
+        let mut service = self.lock_service_for_mutation(None)?;
         self.refresh_service_peer_targets(&mut service);
         let options = match sifs_write_options(&mut service, &path, &self.replica_candidates) {
             Ok(options) => options,
@@ -1196,7 +1254,7 @@ impl SifsFileManagerBackend {
         mutation: impl FnOnce(&mut NetworkedDfsService<DfsNodeTransport>) -> Result<(), String>,
     ) -> Result<(), String> {
         sifs_operation_remaining(operation_deadline, operation)?;
-        let mut service = self.lock_service_with_deadline(operation_deadline)?;
+        let mut service = self.lock_service_for_mutation(operation_deadline)?;
         let previous_deadline = operation_deadline
             .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
         let result = (|| {
@@ -1254,7 +1312,7 @@ impl SifsFileManagerBackend {
         let path = normalize_sifs_path(path)?;
         let operation_deadline = Some(deadline);
         sifs_operation_remaining(operation_deadline, "SIFS directory create")?;
-        let mut service = self.lock_service_with_deadline(operation_deadline)?;
+        let mut service = self.lock_service_for_mutation(operation_deadline)?;
         let previous_deadline = service.set_transport_operation_deadline(Some(deadline));
         let result = (|| {
             self.refresh_service_peer_targets_with_deadline(&mut service, operation_deadline);
@@ -1280,7 +1338,7 @@ impl SifsFileManagerBackend {
     ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         sifs_operation_remaining(operation_deadline, "SIFS write")?;
-        let mut service = self.lock_service_with_deadline(operation_deadline)?;
+        let mut service = self.lock_service_for_mutation(operation_deadline)?;
         let previous_deadline = operation_deadline
             .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
         let result = (|| {
@@ -1358,7 +1416,7 @@ impl SifsFileManagerBackend {
             .map(|(path, bytes)| normalize_sifs_path(path).map(|path| (path, bytes.as_slice())))
             .collect::<Result<Vec<_>, _>>()?;
         sifs_operation_remaining(operation_deadline, "SIFS bulk write")?;
-        let mut service = self.lock_service_with_deadline(operation_deadline)?;
+        let mut service = self.lock_service_for_mutation(operation_deadline)?;
         let previous_deadline = operation_deadline
             .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
         let result = (|| {
@@ -1401,7 +1459,7 @@ impl SifsFileManagerBackend {
         let path = normalize_sifs_path(path)?;
         let operation_deadline = Some(deadline);
         sifs_operation_remaining(operation_deadline, "SIFS known-parent write")?;
-        let mut service = self.lock_service_with_deadline(operation_deadline)?;
+        let mut service = self.lock_service_for_mutation(operation_deadline)?;
         let previous_deadline = service.set_transport_operation_deadline(Some(deadline));
         let result = (|| {
             self.refresh_service_peer_targets_with_deadline(&mut service, operation_deadline);
@@ -1424,7 +1482,7 @@ impl SifsFileManagerBackend {
     ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         sifs_operation_remaining(operation_deadline, "SIFS deferred known-parent write")?;
-        let mut service = self.lock_service_with_deadline(operation_deadline)?;
+        let mut service = self.lock_service_for_mutation(operation_deadline)?;
         let previous_deadline = operation_deadline
             .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
         let result = (|| {
@@ -1581,7 +1639,7 @@ impl SifsFileManagerBackend {
 
     pub(crate) fn create_dir_all(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
-        let mut service = self.lock_service()?;
+        let mut service = self.lock_service_for_mutation(None)?;
         self.refresh_service_peer_targets(&mut service);
         service
             .posix_mkdir_all(&path)
@@ -1605,7 +1663,7 @@ impl SifsFileManagerBackend {
     ) -> Result<DfsStat, String> {
         let path = normalize_sifs_path(path)?;
         let mode = mode & 0o7777;
-        let mut service = self.lock_service()?;
+        let mut service = self.lock_service_for_mutation(None)?;
         self.refresh_service_peer_targets(&mut service);
         let existing = match service.posix_lstat_distributed(&path) {
             Ok(stat) => Some(stat),
@@ -1653,7 +1711,7 @@ impl SifsFileManagerBackend {
         operation_deadline: Option<Instant>,
     ) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
-        let mut service = self.lock_service()?;
+        let mut service = self.lock_service_for_mutation(operation_deadline)?;
         self.refresh_service_peer_targets(&mut service);
         let previous_deadline = operation_deadline
             .map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
@@ -1899,7 +1957,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
 
     fn create_file(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
-        let mut service = self.lock_service()?;
+        let mut service = self.lock_service_for_mutation(None)?;
         self.refresh_service_peer_targets(&mut service);
         let options =
             sifs_deferred_publish_write_options(&mut service, &path, &self.replica_candidates)?;
@@ -1914,7 +1972,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
 
     fn create_dir(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
-        let mut service = self.lock_service()?;
+        let mut service = self.lock_service_for_mutation(None)?;
         self.refresh_service_peer_targets(&mut service);
         service
             .posix_mkdir(&path)
@@ -1935,7 +1993,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
 
     fn delete_dir(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
-        let mut service = self.lock_service()?;
+        let mut service = self.lock_service_for_mutation(None)?;
         self.refresh_service_peer_targets(&mut service);
         service
             .posix_rmdir(&path)
@@ -2110,20 +2168,12 @@ fn open_sifs_service_with_hydration_until(
         .map_err(|error| format!("cannot prepare Sinomo data directory: {error}"))?;
     sifs_operation_remaining(operation_deadline, "preparing the Sinomo data directory")?;
     let cluster_paths = ClusterPaths::new(data_dir);
-    // This transport is scoped to backend opening. Its absolute deadline must
-    // not be retained by the service, otherwise a later read inherits the
-    // nearly-expired open budget instead of its own RPC timeout.
-    let bootstrap_peer_transport: Arc<dyn DfsPeerTransport> = Arc::new(
-        SifsDfsPeerTransport::new(rpc_runtime.clone(), data_dir.clone())
-            .with_operation_deadline(operation_deadline),
-    );
-    let _ = refresh_sifs_cluster_kv_snapshot(data_dir, &cluster_paths);
-    sifs_operation_remaining(operation_deadline, "refreshing the local cluster snapshot")?;
-    let _ = refresh_cluster_dfs_kv_snapshot_with_peer_transport(
-        &cluster_paths,
-        bootstrap_peer_transport,
-    );
-    sifs_operation_remaining(operation_deadline, "refreshing the DFS cluster snapshot")?;
+    // Opening a SIFS client is an observational operation. The long-lived
+    // daemon owns cluster-KV convergence and projects the latest observed
+    // snapshot locally; initiating authoritative quorum reads here made every
+    // cold open pay multiple network round trips for the same full snapshot.
+    // Explicit control-plane refreshes and mutations still use the daemon
+    // through `SifsControlPlaneKvClient::refresh_latest` and `txn`.
     let (local_node_id, peer_node_ids) = if cluster_paths.state.exists() {
         let state = cluster::read_cluster_state_without_kv(&cluster_paths)
             .map_err(|error| format!("cannot read local cluster state: {error}"))?;
@@ -2185,17 +2235,10 @@ fn open_sifs_service_with_hydration_until(
             }
         };
     sifs_operation_remaining(operation_deadline, "opening DFS metadata shards")?;
-    let mut service = service;
-    let previous_deadline =
-        operation_deadline.map(|deadline| service.set_transport_operation_deadline(Some(deadline)));
-    let bootstrap = service
-        .bootstrap_distributed_sifs()
-        .map_err(|error| format!("cannot bootstrap SIFS namespace: {error}"));
-    if let Some(previous_deadline) = previous_deadline {
-        service.set_transport_operation_deadline(previous_deadline);
-    }
-    bootstrap?;
-    sifs_operation_remaining(operation_deadline, "bootstrapping the SIFS namespace")?;
+    // Cold client hydration is observational. Authority rebind/recovery and
+    // fixed-namespace maintenance are deferred until a writable backend's
+    // first mutation; the daemon-owned service remains the recurring
+    // maintenance owner.
     Ok(service)
 }
 
@@ -2364,9 +2407,10 @@ impl SifsControlPlaneKvClient {
                 return Ok(cache.snapshot.clone());
             }
         }
-        // A CLI operation refreshes through the long-lived daemon once, then
-        // all of its DFS lookups share this immutable snapshot.
-        self.replace_cached_snapshot(true)?;
+        // The daemon owns cluster-KV convergence. Cold client hydration
+        // consumes its latest local projection without creating another
+        // authority-read scheduling edge.
+        self.replace_cached_snapshot(false)?;
         self.snapshot
             .lock()
             .map_err(|_| self.kv_error("SIFS snapshot cache lock is poisoned"))
@@ -3416,7 +3460,10 @@ mod tests {
     use crate::file_manager::FileManagerState;
     use sinomo_runtime::dfs::DfsMetadataBackend as _;
     use std::fs;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     #[derive(Clone, Debug)]
     struct CanonicalPeerTransport {
@@ -3657,6 +3704,148 @@ mod tests {
             !kv_snapshot.exists(),
             "observational peer refresh must not recreate the cluster KV materialization"
         );
+    }
+
+    #[test]
+    fn clustered_backend_cold_open_does_not_probe_kv_authority() {
+        let root = temp_sifs_data_dir("cold-open-local-projection");
+        let data_dir = SinomoDataDir::new(&root);
+        seed_observation_cluster(&data_dir);
+        let root_shard = sinomo_runtime::dfs::DfsMetadataShardId::new("root");
+        let mut metadata =
+            sinomo_runtime::dfs::open_local_metadata_shard_backend(&data_dir, root_shard.clone())
+                .expect("root metadata backend");
+        metadata
+            .freeze_metadata_shard_for_membership_handoff(
+                &root_shard,
+                "cold-open-activated-marker",
+                1,
+            )
+            .expect("install cold-open marker")
+            .expect("root shard");
+        assert!(
+            metadata
+                .mark_metadata_shard_membership_handoff_activated(
+                    &root_shard,
+                    "cold-open-activated-marker",
+                    2,
+                )
+                .expect("activate cold-open marker")
+        );
+        drop(metadata);
+
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let mut state =
+            cluster::read_cluster_state_without_kv(&cluster_paths).expect("cluster state");
+        let now = time::OffsetDateTime::now_utc();
+        let local_node_id = state.local_node_id.clone();
+        let remote_node_id =
+            NodeId::from_legacy_named("node_sifs_cold_open_remote").expect("remote node");
+        let local = sinomo_runtime::core::ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            local_node_id,
+            "local non-voter",
+            "local-public-key",
+            now,
+        );
+        let mut remote = sinomo_runtime::core::ClusterMemberRecord::local_voter(
+            state.cluster_id.clone(),
+            remote_node_id.clone(),
+            "remote voter",
+            "remote-public-key",
+            now,
+        );
+        remote.capabilities.push(
+            sinomo_runtime::core::CapabilityName::new(
+                sinomo_runtime::core::DAEMON_MAIN_RUN_CAPABILITY,
+            )
+            .expect("daemon capability"),
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("blackhole listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let mut endpoint = sinomo_runtime::core::ClusterEndpointRecord::loopback(
+            remote_node_id,
+            listener.local_addr().expect("listener address").to_string(),
+        );
+        endpoint.transport = sinomo_runtime::core::ClusterTransportKind::LanTcp;
+        endpoint.privacy = sinomo_runtime::core::ClusterEndpointPrivacy::Lan;
+        remote.endpoints.push(endpoint);
+        state.members = vec![local, remote];
+        cluster::write_cluster_state(&cluster_paths, &state).expect("non-voter cluster state");
+
+        let authority_probed = Arc::new(AtomicBool::new(false));
+        let authority_probed_from_listener = Arc::clone(&authority_probed);
+        std::thread::spawn(move || {
+            let accept_deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < accept_deadline {
+                match listener.accept() {
+                    Ok((_stream, _address)) => {
+                        authority_probed_from_listener.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let _backend = SifsFileManagerBackend::open_with_deadline(
+            &data_dir,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("cold SIFS open from the daemon-projected snapshot");
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !authority_probed.load(Ordering::SeqCst),
+            "cold SIFS hydration must not initiate an authoritative cluster-KV network read"
+        );
+    }
+
+    #[test]
+    fn writable_backend_defers_bootstrap_until_first_mutation() {
+        let root = temp_sifs_data_dir("deferred-mutation-bootstrap");
+        let data_dir = SinomoDataDir::new(&root);
+        seed_observation_cluster(&data_dir);
+        let backend = SifsFileManagerBackend::open(&data_dir).expect("writable backend");
+
+        assert_eq!(
+            *backend
+                .mutation_bootstrapped
+                .lock()
+                .expect("mutation bootstrap state"),
+            Some(false),
+            "opening a writable backend must stay observational"
+        );
+
+        backend
+            .create_dir_all("/services/deferred-bootstrap")
+            .expect("first mutation bootstraps SIFS authority");
+        assert_eq!(
+            *backend
+                .mutation_bootstrapped
+                .lock()
+                .expect("mutation bootstrap state"),
+            Some(true)
+        );
+
+        let read_only =
+            SifsFileManagerBackend::open_read_only(&data_dir).expect("read-only backend");
+        assert_eq!(
+            *read_only
+                .mutation_bootstrapped
+                .lock()
+                .expect("read-only mutation bootstrap state"),
+            None
+        );
+        let error = read_only
+            .create_dir_all("/services/read-only-mutation")
+            .expect_err("read-only backend must reject mutations");
+        assert!(error.contains("read-only"), "{error}");
     }
 
     #[test]

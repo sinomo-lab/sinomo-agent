@@ -85,6 +85,7 @@ const DEFAULT_BULK_FILE_BYTES: usize = 4 * 1024;
 const DEFAULT_LIGHTWEIGHT_LATENCY_ITERATIONS: usize = 128;
 const DEFAULT_LIGHTWEIGHT_LATENCY_WARMUP_ITERATIONS: usize = 16;
 const DEFAULT_LIGHTWEIGHT_LATENCY_PAYLOAD_BYTES: usize = 64;
+const DEFAULT_LIGHTWEIGHT_LATENCY_MAX_BACKEND_OPEN_MS: usize = 2_000;
 const MAX_LIGHTWEIGHT_LATENCY_ITERATIONS: usize = 10_000;
 const MAX_LIGHTWEIGHT_LATENCY_WARMUP_ITERATIONS: usize = 1_000;
 const MAX_LIGHTWEIGHT_LATENCY_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -249,7 +250,7 @@ sinomo_runtime::test::sinomo_test_case! {
 sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_lightweight_latency(ctx) {
         id: "cluster.dfs.lightweight-latency",
-        summary: "Measure warmed SIFS stat/list/read-prefix latency for lightweight file-browser operations",
+        summary: "Measure cold SIFS hydration and warmed stat/list/read-prefix latency for lightweight file-browser operations",
         tags: ["cluster-dfs", "probe", "performance", "cluster-network-dfs-acceptance"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
@@ -2780,6 +2781,11 @@ fn run_lightweight_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let max_p50_us = optional_usize_parameter(ctx, "max-p50-us", 0)? as u64;
     let max_p95_us = optional_usize_parameter(ctx, "max-p95-us", 0)? as u64;
     let max_max_us = optional_usize_parameter(ctx, "max-max-us", 0)? as u64;
+    let max_backend_open_ms = optional_usize_parameter(
+        ctx,
+        "max-backend-open-ms",
+        DEFAULT_LIGHTWEIGHT_LATENCY_MAX_BACKEND_OPEN_MS,
+    )? as u64;
     require_positive("iterations", iterations)?;
     require_positive("payload-bytes", requested_payload_bytes)?;
     if iterations > MAX_LIGHTWEIGHT_LATENCY_ITERATIONS {
@@ -2932,6 +2938,7 @@ fn run_lightweight_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("max_p50_us", max_p50_us);
     ctx.record("max_p95_us", max_p95_us);
     ctx.record("max_max_us", max_max_us);
+    ctx.record("max_backend_open_ms", max_backend_open_ms);
     ctx.record(
         "backend_open_elapsed_ms",
         backend_open_elapsed.as_millis() as u64,
@@ -2983,6 +2990,12 @@ fn run_lightweight_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("worst_max_operation", &worst_max.0);
     ctx.record("worst_max_us", worst_max.1);
 
+    if max_backend_open_ms > 0 && backend_open_elapsed.as_millis() as u64 > max_backend_open_ms {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "cold SIFS backend hydration took {}ms, above allowed {max_backend_open_ms}ms",
+            backend_open_elapsed.as_millis()
+        )));
+    }
     if max_p50_us > 0 && worst_p50.1 > max_p50_us {
         return Ok(SinomoTestOutcome::failed(format!(
             "DFS lightweight latency worst p50 {}={}us is above allowed {max_p50_us}us",
