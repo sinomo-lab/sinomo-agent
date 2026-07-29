@@ -155,18 +155,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if object.kind != DfsObjectKind::Symlink {
             return Err(DfsPosixError::NotSymlink { path });
         }
-        match self.read_object_metadata_or_fetch_remote_without_cache(&object)? {
-            NetworkedDfsReadOutcome::Found {
-                data: DfsReadData { bytes, .. },
-                ..
-            } => String::from_utf8(bytes).map_err(|_| DfsPosixError::InvalidPath { path }),
-            NetworkedDfsReadOutcome::PendingReplication { .. }
-            | NetworkedDfsReadOutcome::NotConfirmed { .. }
-            | NetworkedDfsReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
-            NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
-                Err(read_conflict_error(path, conflicts))
-            }
-        }
+        let outcome = self.read_object_metadata_or_fetch_remote_without_cache(&object)?;
+        self.symlink_target_from_distributed_read_outcome(&path, outcome)
     }
 
     pub fn posix_readlink_update_access(&mut self, path: &str) -> Result<String> {

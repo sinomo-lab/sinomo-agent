@@ -4484,6 +4484,380 @@ fn posix_stat_read_and_write_follow_symlink_targets() {
 }
 
 #[test]
+fn distributed_symlink_stat_and_owner_distinguish_follow_and_no_follow() {
+    let owner = NodeId::from_legacy_named("node_symlink_attr_owner").expect("node");
+    let reader = NodeId::from_legacy_named("node_symlink_attr_reader").expect("node");
+    let root = temp_root("distributed_symlink_attr_follow");
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
+    );
+    let mut reader_dfs = NetworkedDfsService::new(
+        network.add_node(reader.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("reader")).expect("reader store"),
+    );
+    owner_dfs
+        .bootstrap_distributed_sifs()
+        .expect("owner bootstrap");
+    reader_dfs
+        .bootstrap_distributed_sifs()
+        .expect("reader bootstrap");
+    owner_dfs
+        .posix_mkdir_all("/services/symlink-attrs")
+        .expect("owner parent");
+    reader_dfs
+        .posix_mkdir_all("/services/symlink-attrs")
+        .expect("reader parent");
+    let options = sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]);
+    let target = owner_dfs
+        .posix_write_file("/services/symlink-attrs/target", b"target", options.clone())
+        .expect("owner target");
+    let relative = owner_dfs
+        .posix_symlink(
+            "target",
+            "/services/symlink-attrs/relative",
+            options.clone(),
+        )
+        .expect("relative symlink");
+    let absolute = owner_dfs
+        .posix_symlink(
+            "/services/symlink-attrs/target",
+            "/services/symlink-attrs/absolute",
+            options,
+        )
+        .expect("absolute symlink");
+    for object_id in [&target.object_id, &relative.object_id, &absolute.object_id] {
+        reader_dfs
+            .add_object_metadata(
+                owner_dfs
+                    .metadata()
+                    .object(object_id)
+                    .expect("owner object metadata")
+                    .clone(),
+            )
+            .expect("reader object metadata");
+    }
+
+    let owner_dfs = Arc::new(Mutex::new(owner_dfs));
+    let serve_link = |object_id: DfsObjectId| {
+        let owner_dfs = Arc::clone(&owner_dfs);
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let events = owner_dfs
+                    .lock()
+                    .expect("owner lock")
+                    .process_incoming()
+                    .expect("owner serves symlink body");
+                if events.iter().any(|event| {
+                    matches!(
+                        event,
+                        NetworkedDfsServiceEvent::RemoteReadServed {
+                            object_id: served,
+                            result: DfsReadResult::Found(_),
+                            ..
+                        } if served == &object_id
+                    )
+                }) {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owner did not serve symlink body {object_id}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        })
+    };
+
+    for link in [&relative, &absolute] {
+        let worker = serve_link(link.object_id.clone());
+        let followed = reader_dfs
+            .posix_stat_distributed(&link.path)
+            .expect("distributed stat follows link");
+        worker.join().expect("stat worker");
+        assert_eq!(followed.object_id, target.object_id);
+        assert_eq!(
+            reader_dfs
+                .posix_lstat_distributed(&link.path)
+                .expect("distributed lstat does not follow")
+                .object_id,
+            link.object_id
+        );
+    }
+
+    let worker = serve_link(relative.object_id.clone());
+    let followed_owner = reader_dfs
+        .posix_set_owner(&relative.path, 1001, 1002)
+        .expect("chown follows relative link");
+    worker.join().expect("relative chown worker");
+    assert_eq!((followed_owner.uid, followed_owner.gid), (1001, 1002));
+    assert_eq!(
+        (
+            reader_dfs
+                .posix_lstat_distributed(&relative.path)
+                .expect("relative lstat after target chown")
+                .uid,
+            reader_dfs
+                .posix_lstat_distributed(&relative.path)
+                .expect("relative lstat after target chown")
+                .gid,
+        ),
+        (0, 0)
+    );
+
+    let worker = serve_link(absolute.object_id.clone());
+    let followed_owner = reader_dfs
+        .posix_set_owner(&absolute.path, 2001, 2002)
+        .expect("chown follows absolute link");
+    worker.join().expect("absolute chown worker");
+    assert_eq!((followed_owner.uid, followed_owner.gid), (2001, 2002));
+    let link_owner = reader_dfs
+        .posix_set_symlink_owner(&absolute.path, 3001, 3002)
+        .expect("lchown updates absolute link");
+    assert_eq!((link_owner.uid, link_owner.gid), (3001, 3002));
+    assert_eq!(
+        (
+            reader_dfs
+                .posix_stat_distributed(&target.path)
+                .expect("target owner after lchown")
+                .uid,
+            reader_dfs
+                .posix_stat_distributed(&target.path)
+                .expect("target owner after lchown")
+                .gid,
+        ),
+        (2001, 2002)
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn distributed_symlink_follow_routes_cross_prefix_stat_and_owner_to_target_primary() {
+    let reader = NodeId::from_legacy_named("node_cross_link_reader").expect("node");
+    let link_primary = NodeId::from_legacy_named("node_cross_link_primary").expect("node");
+    let target_primary = NodeId::from_legacy_named("node_cross_target_primary").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let root = temp_root("distributed_cross_prefix_symlink_follow");
+    let network = InProcessNetwork::new();
+    let mut link_dfs = NetworkedDfsService::new(
+        network.add_node(link_primary.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("link-content")).expect("link content"),
+    )
+    .with_metadata_backend(
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("links"), root.join("link-metadata"))
+            .expect("link metadata"),
+    )
+    .expect("install link metadata");
+    let mut target_dfs = NetworkedDfsService::new(
+        network.add_node(target_primary.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("target-content")).expect("target content"),
+    )
+    .with_metadata_backend(
+        LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("users"),
+            root.join("target-metadata"),
+        )
+        .expect("target metadata"),
+    )
+    .expect("install target metadata");
+    let mut reader_dfs = NetworkedDfsService::new(
+        network.add_node(reader.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("reader-content")).expect("reader content"),
+    );
+    link_dfs
+        .bootstrap_distributed_sifs()
+        .expect("link bootstrap");
+    target_dfs
+        .bootstrap_distributed_sifs()
+        .expect("target bootstrap");
+    reader_dfs
+        .bootstrap_distributed_sifs()
+        .expect("reader bootstrap");
+    link_dfs
+        .posix_mkdir_all("/services/links")
+        .expect("link parent");
+    target_dfs.posix_mkdir_all("/users").expect("target parent");
+    let target = target_dfs
+        .posix_write_file(
+            "/users/cross-target",
+            b"cross-prefix target",
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![target_primary.clone()]),
+        )
+        .expect("cross-prefix target");
+    let link_options = sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![link_primary.clone()]);
+    let relative = link_dfs
+        .posix_symlink(
+            "../../users/cross-target",
+            "/services/links/relative",
+            link_options.clone(),
+        )
+        .expect("relative cross-prefix link");
+    let absolute = link_dfs
+        .posix_symlink(
+            "/users/cross-target",
+            "/services/links/absolute",
+            link_options,
+        )
+        .expect("absolute cross-prefix link");
+    let link_parent = link_dfs
+        .posix_stat("/services/links")
+        .expect("link parent stat");
+    for object_id in [
+        &link_parent.object_id,
+        &relative.object_id,
+        &absolute.object_id,
+    ] {
+        reader_dfs
+            .add_object_metadata(
+                link_dfs
+                    .metadata()
+                    .object(object_id)
+                    .expect("link-side metadata")
+                    .clone(),
+            )
+            .expect("reader link-side metadata");
+    }
+    assert!(
+        reader_dfs.metadata().object(&target.object_id).is_none(),
+        "the cross-prefix target must still require authoritative target-shard resolution"
+    );
+
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        let mut store = DfsControlPlaneStore::new(kv);
+        store
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "links".to_string(),
+                primary_node_id: link_primary.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services/links".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("link shard");
+        store
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "users".to_string(),
+                primary_node_id: target_primary.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/users".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("target shard");
+    });
+    link_dfs = link_dfs.with_control_plane(control_plane.clone());
+    target_dfs = target_dfs.with_control_plane(control_plane.clone());
+    reader_dfs = reader_dfs.with_control_plane(control_plane);
+
+    let (link_stop_tx, link_stop_rx) = std::sync::mpsc::channel();
+    let link_worker = std::thread::spawn(move || {
+        loop {
+            link_dfs.process_incoming().expect("link primary pump");
+            if link_stop_rx.try_recv().is_ok() {
+                return link_dfs;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    });
+    let (target_stop_tx, target_stop_rx) = std::sync::mpsc::channel();
+    let target_worker = std::thread::spawn(move || {
+        loop {
+            target_dfs.process_incoming().expect("target primary pump");
+            if target_stop_rx.try_recv().is_ok() {
+                return target_dfs;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    });
+
+    for link in [&relative, &absolute] {
+        assert_eq!(
+            reader_dfs
+                .posix_lstat_distributed(&link.path)
+                .expect("cross-prefix lstat")
+                .object_id,
+            link.object_id
+        );
+        assert_eq!(
+            reader_dfs
+                .posix_stat_distributed(&link.path)
+                .expect("cross-prefix stat")
+                .object_id,
+            target.object_id
+        );
+    }
+    assert_eq!(
+        (
+            reader_dfs
+                .posix_set_owner(&relative.path, 4001, 4002)
+                .expect("relative cross-prefix chown")
+                .uid,
+            reader_dfs
+                .posix_set_owner(&absolute.path, 5001, 5002)
+                .expect("absolute cross-prefix chown")
+                .gid,
+        ),
+        (4001, 5002)
+    );
+    assert_eq!(
+        (
+            reader_dfs
+                .posix_set_symlink_owner(&relative.path, 6001, 6002)
+                .expect("relative cross-prefix lchown")
+                .uid,
+            reader_dfs
+                .posix_set_symlink_owner(&absolute.path, 7001, 7002)
+                .expect("absolute cross-prefix lchown")
+                .gid,
+        ),
+        (6001, 7002)
+    );
+
+    link_stop_tx.send(()).expect("stop link primary");
+    target_stop_tx.send(()).expect("stop target primary");
+    let link_dfs = link_worker.join().expect("link primary worker");
+    let target_dfs = target_worker.join().expect("target primary worker");
+    assert_eq!(
+        (
+            target_dfs
+                .posix_stat(&target.path)
+                .expect("target primary owner")
+                .uid,
+            target_dfs
+                .posix_stat(&target.path)
+                .expect("target primary owner")
+                .gid,
+        ),
+        (5001, 5002)
+    );
+    assert_eq!(
+        (
+            link_dfs
+                .posix_lstat(&relative.path)
+                .expect("relative link owner")
+                .uid,
+            link_dfs
+                .posix_lstat(&absolute.path)
+                .expect("absolute link owner")
+                .gid,
+        ),
+        (6001, 7002)
+    );
+
+    cleanup(&root);
+}
+
+#[test]
 fn posix_operations_follow_intermediate_parent_symlinks() {
     let owner = NodeId::from_legacy_named("node_posix_parent_symlink_owner").expect("node");
     let root = temp_root("posix_parent_symlink_operations");

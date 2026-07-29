@@ -1930,7 +1930,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             None
         };
         let primary_node_id = shard.primary_node_id.clone();
-        let attachment = DfsOutboundAttachment::from_bytes_with_transport_integrity(bytes);
+        // An empty object has a real canonical content identity, but it has no
+        // semantic attachment. Sending a zero-length `ObjectRpcBodySource`
+        // would clear the attachment body role at the network boundary while
+        // retaining an attachment-shaped request head. Route the command as an
+        // ordinary value instead; the metadata primary persists `bytes == []`
+        // through the normal content-store path and derives the canonical
+        // empty manifest/hash there.
+        let attachment = if bytes.is_empty() {
+            None
+        } else {
+            Some(DfsOutboundAttachment::from_bytes_with_transport_integrity(
+                bytes,
+            ))
+        };
         let command = DfsDistributedWriteCommand {
             request_id: request_id.clone(),
             request,
@@ -1954,14 +1967,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNetworkMessage::DistributedWriteRequest(command.clone())
         };
         let routed = self.next_dfs_routed_message(&primary_node_id, message);
+        let call = match attachment {
+            Some(attachment) => DfsRoutedCall::with_attachment(routed, attachment),
+            None => DfsRoutedCall::value(routed),
+        };
         // The primary-bound body owns the caller's only payload allocation.
         // Dispatch it before returning even for a logically detached metadata
         // request; queueing it would require persisting or cloning the complete
         // payload on the requester, defeating direct streamed ingest.
-        let sent = match self.transport.send_routed_call(
-            &primary_node_id,
-            DfsRoutedCall::with_attachment(routed, attachment),
-        ) {
+        let sent = match self.transport.send_routed_call(&primary_node_id, call) {
             Ok(()) => true,
             Err(NetworkError::UnknownNode { .. }) => false,
             Err(error) => return Err(DfsError::from_network(error)),

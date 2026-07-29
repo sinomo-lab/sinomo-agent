@@ -324,6 +324,93 @@ if the directions serialize), rather than reporting a short burst. The
 `_RESPONSE_BYTES` variables tune the profile while retaining the 64 MiB route cap.
 The ordinary all-node 8 MiB attachment leg remains the default acceptance smoke.
 
+## External pjdfstest compatibility suite
+
+`docker/test-pjdfstest.sh` mounts SIFS through the public FUSE interface on
+`node5` and runs the upstream pjdfstest syscall suite from that mount. This is
+an external, kernel-facing compatibility measurement; it does not call the
+in-binary DFS test registry. The selected tests run first on a separate native
+Docker volume as a control, so a broken image, Perl/TAP installation, or Docker
+runtime is not misreported as an SIFS compatibility boundary.
+
+The default is a complete report-only run. SIFS assertion failures are retained
+as compatibility evidence without failing the command, because SIFS currently
+implements a documented subset of POSIX. Harness failures always fail,
+including a failed native control, unavailable FUSE mount, malformed report,
+leaked kernel mount, or unhealthy post-suite cluster. A SIFS worktree that
+cannot be removed is retained as compatibility evidence; the default teardown
+still removes the run's isolated Docker volumes. Strict mode also turns an
+incompatible or incomplete SIFS result into a failing exit status.
+
+```bash
+# Discover and record the complete currently implemented boundary.
+docker/test-pjdfstest.sh
+docker/test-pjdfstest.sh --full --report
+
+# Faster iteration, or a zero-known-failure acceptance gate.
+docker/test-pjdfstest.sh --smoke --report
+docker/test-pjdfstest.sh --smoke --strict
+
+# Equivalent environment controls.
+SINOMO_PJDFSTEST_PROFILE=full \
+SINOMO_PJDFSTEST_MODE=report \
+SINOMO_PJDFSTEST_TIMEOUT_SECONDS=3600 \
+docker/test-pjdfstest.sh
+```
+
+The wrapper selects `docker/docker-compose.pjdfstest.yml` automatically. Its
+extra image and privileges apply only to `node5`: `/dev/fuse` is exposed and
+`SYS_ADMIN` is added without making the container fully privileged. The host
+must provide `/dev/fuse`. A named native-control volume is mounted separately
+from SIFS and node state.
+
+Raw TAP/prove output, normalized per-test/per-family assertion counts, upstream
+revision, portability patchset, mount evidence, cleanup evidence, cluster
+health, and wrapper environment land under
+`target/pjdfstest-results/<run>/` by default. The
+harness first selects a root, services, or users path whose metadata primary is
+provably remote from the `node5` mount while `node5` is a configured metadata
+replica. Through FUSE it then creates ordinary zero-byte `O_CREAT` and
+`O_CREAT|O_EXCL` files, repeats both calls, requires the second exclusive create
+to return `EEXIST`, and checks both sizes remain zero.
+After the suite, distant nodes read both files, `node5` is restarted, and the
+files are read again from the restarted node and another peer before a
+cross-node remove/absence check. The placement selection, syscall results,
+cross-node visibility, restart, and cleanup have separate JSON evidence files.
+
+Each repeated mounted syscall has a fresh kernel request identity; the harness
+records that fact explicitly and does not claim to inject an exact distributed
+operation replay. Stable-identity retry and response-loss replay remain DFS
+integration-test responsibilities. If the mounted interface cannot complete
+the zero-byte probe, the result records the limitation instead of hiding the
+rest of the syscall boundary. Missing or local-only metadata-primary coverage
+is a harness failure. In either case, the harness waits for metadata
+convergence and reruns every-node DFS invariants, cluster doctor, and routed
+status. Mount cleanup is attempted even when `SINOMO_TEST_KEEP=1` or
+`SINOMO_TEST_REUSE=1` leaves the cluster running.
+
+The image pins upstream revision
+`ededbeb2b44929972898afb87474b0937f78a877` and applies the reviewed
+`sinomo-linux-portability-v1` contract. That contract replaces active upstream
+TAP TODO directives with explicit expectations:
+
+- directory ownership changes may preserve or clear set-id bits, while uid and
+  gid must still match exactly;
+- `chown(-1, -1)` may preserve or advance ctime, but cannot move it backwards;
+- Linux `EISDIR` for `unlink(directory)` is recorded as a host-platform
+  deviation alongside the POSIX outcomes;
+- Btrfs's fixed directory link count of one is recorded as a host-filesystem
+  deviation while rename and dot-dot inode behavior remain mandatory.
+
+The machine-readable contract is embedded in `compatibility.json`. Any
+remaining TAP TODO directive is reported with its assertion number and reason
+and fails the harness as an unresolved test contract, even in report mode.
+
+Interpret the result as compatibility for the exact Linux mounted-interface
+profile that was executed, not as general POSIX certification. Internal tests
+remain necessary for distributed durability, replication, failover, repair,
+and authority contracts outside pjdfstest's syscall scope.
+
 ## Cluster KV benchmark suite
 
 `docker/benchmark-cluster-kv.sh` builds and forms the same segmented six-node

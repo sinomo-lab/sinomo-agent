@@ -122,6 +122,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_rmdir(&mut self, path: &str) -> Result<DfsStat> {
+        self.with_posix_commit_operation_deadline(|service| {
+            service.posix_rmdir_with_current_deadline(path)
+        })
+    }
+
+    fn posix_rmdir_with_current_deadline(&mut self, path: &str) -> Result<DfsStat> {
         let normalized = normalize_posix_path(path)?;
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
             self.route_namespace_operation(
@@ -155,15 +161,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(DfsPosixError::DirectoryNotEmpty { path });
         }
         object = self.tombstone_path_object(object);
+        let mut objects = vec![object.clone()];
+        if let Some(parent_path) = parent_posix_path(&path) {
+            objects.push(self.directory_modified_metadata(&parent_path)?);
+        }
+        let versions = objects
+            .iter()
+            .map(|object| object_version_record(object, object.content_size_bytes))
+            .collect::<Vec<_>>();
         self.apply_namespace_transaction(DfsNamespaceTransaction {
-            transaction_id: namespace_transaction_id_for_path("rmdir", &object.object_id, &path),
+            transaction_id: namespace_transaction_id_for_batch(
+                "rmdir",
+                &object.file_system_id,
+                &objects,
+                &versions,
+            ),
             file_system_id: object.file_system_id.clone(),
-            objects: vec![object.clone()],
-            versions: Vec::new(),
+            objects,
+            versions,
             advisory_lock_states: Vec::new(),
             created_at: time::OffsetDateTime::now_utc(),
         })?;
-        self.touch_parent_directory_modified(&path)?;
         self.stat_object(&object)
     }
 
@@ -558,6 +576,93 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 #[cfg(test)]
 mod atomic_namespace_tests {
     use super::*;
+    use crate::{
+        DfsControlPlaneStore, DfsFileSystemConfig, DfsMetadataMutation, DfsMetadataShardAssignment,
+        DfsMetadataShardConfig, DfsMetadataShardId, DfsNamespaceCommand, DfsNamespaceResult,
+        DfsRoutedCall, DfsRoutedMessage, DfsTransportIdentity, LocalContentStore,
+        LocalSobjMetadataBackend, NetworkedDfsServiceEvent, SharedDfsControlPlaneKvClient,
+        distributed_sifs, open_local_sharded_metadata_backend,
+    };
+    use sinomo_core::DfsObjectPolicy;
+    use sinomo_core::kv::InProcessKvStore;
+    use sinomo_core::network::{InProcessNetwork, NetworkError};
+    use sinomo_core::node::NodeId;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[derive(Debug)]
+    struct DeadlineTransport {
+        local_node_id: NodeId,
+        operation_deadline: Option<Instant>,
+        observed_deadlines: Arc<Mutex<Vec<Option<Instant>>>>,
+    }
+
+    impl DfsTransportIdentity for DeadlineTransport {
+        fn local_node_id(&self) -> &NodeId {
+            &self.local_node_id
+        }
+    }
+
+    impl DfsMessageTransport for DeadlineTransport {
+        fn send_routed_call(
+            &mut self,
+            _target_node_id: &NodeId,
+            _call: DfsRoutedCall,
+        ) -> std::result::Result<(), NetworkError> {
+            Ok(())
+        }
+
+        fn drain_incoming_messages(
+            &mut self,
+        ) -> std::result::Result<Vec<DfsRoutedMessage>, NetworkError> {
+            Ok(Vec::new())
+        }
+
+        fn pending_incoming_count(&self) -> std::result::Result<Option<usize>, NetworkError> {
+            Ok(Some(0))
+        }
+
+        fn set_operation_deadline(&mut self, deadline: Option<Instant>) -> Option<Instant> {
+            self.observed_deadlines
+                .lock()
+                .expect("deadline observations")
+                .push(deadline);
+            std::mem::replace(&mut self.operation_deadline, deadline)
+        }
+
+        fn operation_deadline(&self) -> Option<Instant> {
+            self.operation_deadline
+        }
+    }
+
+    fn single_primary_shards(primary_node_id: &NodeId) -> Vec<DfsMetadataShardConfig> {
+        [
+            ("root", DfsMetadataShardAssignment::Root),
+            (
+                "users",
+                DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/users".to_string(),
+                },
+            ),
+            (
+                "services",
+                DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(shard_id, assignment)| DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: shard_id.to_string(),
+            primary_node_id: primary_node_id.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        })
+        .collect()
+    }
 
     #[test]
     fn atomic_namespace_rename_accepts_the_same_metadata_shard() {
@@ -578,5 +683,287 @@ mod atomic_namespace_tests {
         let error = ensure_same_atomic_namespace_shard(Some("shard-a"), None, "/from", "/to")
             .expect_err("configured and fallback namespaces are distinct");
         assert!(matches!(error, DfsPosixError::InvalidPath { .. }));
+    }
+
+    #[test]
+    fn rmdir_delete_recreate_delete_uses_atomic_generation_transactions() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-rmdir-reincarnation");
+        let owner = NodeId::from_legacy_named("node_rmdir_reincarnation").expect("node");
+        let metadata_root = root.path().join("metadata");
+        let content_root = root.path().join("content");
+        let network = InProcessNetwork::new();
+        let backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &metadata_root)
+                .expect("metadata backend");
+        let mut service = NetworkedDfsService::new(
+            network.add_node(owner.clone()),
+            LocalContentStore::new(&content_root).expect("content store"),
+        )
+        .with_metadata_backend(backend)
+        .expect("metadata-backed service");
+        service
+            .bootstrap_distributed_sifs()
+            .expect("bootstrap distributed sifs");
+
+        let parent_path = "/services/rmdir-reincarnation";
+        let directory_path = "/services/rmdir-reincarnation/child";
+        service.posix_mkdir_all(parent_path).expect("parent");
+        let original = service.posix_mkdir(directory_path).expect("first mkdir");
+        let journal_after = service
+            .metadata_backend()
+            .expect("metadata backend")
+            .journal_since(0)
+            .expect("initial journal")
+            .last()
+            .map(|entry| entry.sequence)
+            .unwrap_or(0);
+
+        let first_tombstone = service.posix_rmdir(directory_path).expect("first rmdir");
+        let recreated = service.posix_mkdir(directory_path).expect("recreate");
+        assert_eq!(recreated.object_id, original.object_id);
+        let second_tombstone = service.posix_rmdir(directory_path).expect("second rmdir");
+        assert_eq!(second_tombstone.object_id, original.object_id);
+        assert_ne!(second_tombstone.version, first_tombstone.version);
+        assert!(matches!(
+            service.posix_stat(directory_path),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+
+        let journal = service
+            .metadata_backend()
+            .expect("metadata backend")
+            .journal_since(journal_after)
+            .expect("rmdir journal");
+        let rmdir_transactions = journal
+            .iter()
+            .filter_map(|entry| match &entry.mutation {
+                DfsMetadataMutation::ApplyNamespaceTransaction {
+                    transaction: Some(transaction),
+                    ..
+                } if transaction.transaction_id.starts_with("namespace_rmdir_") => {
+                    Some(transaction)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rmdir_transactions.len(), 2);
+        assert_ne!(
+            rmdir_transactions[0].transaction_id, rmdir_transactions[1].transaction_id,
+            "each pathname incarnation needs a distinct exact-retry identity"
+        );
+        for transaction in &rmdir_transactions {
+            assert_eq!(transaction.objects.len(), 2);
+            assert_eq!(transaction.versions.len(), 2);
+            let removed = transaction
+                .objects
+                .iter()
+                .find(|object| object.path == directory_path)
+                .expect("directory tombstone");
+            let parent = transaction
+                .objects
+                .iter()
+                .find(|object| object.path == parent_path)
+                .expect("parent touch");
+            assert_eq!(removed.kind, DfsObjectKind::Tombstone);
+            assert_eq!(parent.kind, DfsObjectKind::Directory);
+            assert!(transaction.versions.iter().any(|version| {
+                version.object_id == removed.object_id && version.version == removed.version
+            }));
+            assert!(transaction.versions.iter().any(|version| {
+                version.object_id == parent.object_id && version.version == parent.version
+            }));
+        }
+        let expected_parent = service.posix_stat(parent_path).expect("parent after rmdir");
+
+        drop(service);
+        let reopened_backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &metadata_root)
+                .expect("reopen metadata");
+        let reopened_network = InProcessNetwork::new();
+        let reopened = NetworkedDfsService::new(
+            reopened_network.add_node(owner),
+            LocalContentStore::new(content_root).expect("reopen content"),
+        )
+        .with_metadata_backend(reopened_backend)
+        .expect("reopened service");
+        assert!(matches!(
+            reopened.posix_stat(directory_path),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        assert_eq!(
+            reopened.posix_stat(parent_path).expect("reopened parent"),
+            expected_parent
+        );
+    }
+
+    #[test]
+    fn rmdir_installs_and_restores_the_commit_deadline() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-rmdir-deadline");
+        let owner = NodeId::from_legacy_named("node_rmdir_deadline").expect("node");
+        let observed_deadlines = Arc::new(Mutex::new(Vec::new()));
+        let backend = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            root.path().join("metadata"),
+        )
+        .expect("metadata backend");
+        let mut service = NetworkedDfsService::new(
+            DeadlineTransport {
+                local_node_id: owner,
+                operation_deadline: None,
+                observed_deadlines: Arc::clone(&observed_deadlines),
+            },
+            LocalContentStore::new(root.path().join("content")).expect("content store"),
+        )
+        .with_metadata_backend(backend)
+        .expect("metadata-backed service");
+        service
+            .bootstrap_distributed_sifs()
+            .expect("bootstrap distributed sifs");
+        service
+            .posix_mkdir("/services/rmdir-deadline")
+            .expect("mkdir");
+        observed_deadlines
+            .lock()
+            .expect("deadline observations")
+            .clear();
+
+        let started_at = Instant::now();
+        service
+            .posix_rmdir("/services/rmdir-deadline")
+            .expect("rmdir");
+
+        let observed = observed_deadlines.lock().expect("deadline observations");
+        assert_eq!(observed.len(), 2, "install then restore the deadline");
+        let installed = observed[0].expect("installed deadline");
+        assert!(installed > started_at + Duration::from_secs(40));
+        assert!(installed <= started_at + Duration::from_secs(46));
+        assert_eq!(observed[1], None);
+    }
+
+    #[test]
+    fn routed_rmdir_exact_retry_replays_after_restart_without_a_second_mutation() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-routed-rmdir-replay");
+        let primary = NodeId::from_legacy_named("node_routed_rmdir_primary").expect("primary");
+        let requester =
+            NodeId::from_legacy_named("node_routed_rmdir_requester").expect("requester");
+        let shards = single_primary_shards(&primary);
+        let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+        control_plane.with_client(|kv| {
+            let mut control = DfsControlPlaneStore::new(kv);
+            control
+                .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                    primary.clone(),
+                )))
+                .expect("filesystem config");
+            for shard in &shards {
+                control.put_metadata_shard(shard).expect("metadata shard");
+            }
+        });
+        let network = InProcessNetwork::new();
+        let _requester_transport = network.add_node(requester.clone());
+        let metadata_root = root.path().join("metadata");
+        let content_root = root.path().join("content");
+        let mut service = NetworkedDfsService::new(
+            network.add_node(primary.clone()),
+            LocalContentStore::new(&content_root).expect("content store"),
+        )
+        .with_control_plane(control_plane.clone())
+        .with_metadata_backend(
+            open_local_sharded_metadata_backend(&metadata_root, shards.clone())
+                .expect("sharded metadata"),
+        )
+        .expect("metadata-backed service");
+        service
+            .bootstrap_distributed_sifs()
+            .expect("bootstrap distributed sifs");
+        let path = "/services/routed-rmdir-replay";
+        service.posix_mkdir(path).expect("seed directory");
+        let command = DfsNamespaceCommand {
+            request_id: "dfs_net_req_routed_rmdir_replay".to_string(),
+            file_system_id: sifs_file_system_id(),
+            requesting_node_id: requester.clone(),
+            include_metadata_journal_batches: false,
+            metadata_journal_after_sequences: Vec::new(),
+            authority_shards: Vec::new(),
+            operation: DfsNamespaceOperation::Rmdir {
+                path: path.to_string(),
+            },
+        };
+
+        let first = service
+            .handle_namespace_request(requester.clone(), command.clone())
+            .expect("first rmdir request");
+        assert!(matches!(
+            first,
+            NetworkedDfsServiceEvent::RemoteNamespaceServed {
+                result: DfsNamespaceResult::Applied,
+                mutates_metadata: true,
+                ..
+            }
+        ));
+        let journal_len = service
+            .metadata_backend()
+            .expect("metadata backend")
+            .journal_since(0)
+            .expect("journal")
+            .len();
+        let primary_transport = service.transport.clone();
+        drop(service);
+
+        let mut restarted = NetworkedDfsService::new(
+            primary_transport,
+            LocalContentStore::new(content_root).expect("reopen content"),
+        )
+        .with_control_plane(control_plane)
+        .with_metadata_backend(
+            open_local_sharded_metadata_backend(metadata_root, shards)
+                .expect("reopen sharded metadata"),
+        )
+        .expect("restarted service");
+        let replay = restarted
+            .handle_namespace_request(requester.clone(), command.clone())
+            .expect("exact retry");
+        assert!(matches!(
+            replay,
+            NetworkedDfsServiceEvent::RemoteNamespaceServed {
+                result: DfsNamespaceResult::Applied,
+                mutates_metadata: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            restarted
+                .metadata_backend()
+                .expect("metadata backend")
+                .journal_since(0)
+                .expect("replayed journal")
+                .len(),
+            journal_len,
+            "a lost-response retry must not journal a second rmdir"
+        );
+        assert!(matches!(
+            restarted.posix_stat(path),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+
+        let reused = restarted
+            .handle_namespace_request(
+                requester,
+                DfsNamespaceCommand {
+                    operation: DfsNamespaceOperation::Rmdir {
+                        path: "/services/different-rmdir".to_string(),
+                    },
+                    ..command
+                },
+            )
+            .expect("request-id reuse response");
+        assert!(matches!(
+            reused,
+            NetworkedDfsServiceEvent::RemoteNamespaceServed {
+                result: DfsNamespaceResult::Rejected { ref reason, .. },
+                mutates_metadata: false,
+                ..
+            } if reason.contains("already used for a different command")
+        ));
     }
 }

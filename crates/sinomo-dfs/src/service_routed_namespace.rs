@@ -295,6 +295,7 @@ fn namespace_execution_error_is_retriable(error: &posix_model::DfsPosixError) ->
     matches!(
         error,
         posix_model::DfsPosixError::PendingWrite { .. }
+            | posix_model::DfsPosixError::SymlinkContentPending { .. }
             | posix_model::DfsPosixError::PartialBulkCommit { .. }
             | posix_model::DfsPosixError::Metadata(
                 MetadataBackendError::Io { .. }

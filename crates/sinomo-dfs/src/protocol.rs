@@ -816,6 +816,15 @@ pub enum DfsNamespacePosixError {
         path: String,
         reason: String,
     },
+    /// Retriable: authoritative symlink metadata exists, but its content is
+    /// not yet readable at the location needed to continue path resolution.
+    SymlinkContentPending {
+        path: String,
+        #[serde(default)]
+        stage: String,
+        #[serde(default)]
+        detail: String,
+    },
     /// Retriable: the path is part of an in-flight cross-shard move.
     Busy {
         path: String,

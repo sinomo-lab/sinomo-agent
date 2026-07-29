@@ -1,0 +1,98 @@
+# Dedicated runtime image for the opt-in pjdfstest compatibility lane.
+#
+# Keep this separate from Dockerfile.dev: the normal six-node cluster does not
+# need a compiler, Perl/TAP tooling, FUSE utilities, or the upstream test tree.
+
+FROM debian:trixie-slim AS pjdfstest-builder
+
+ARG PJDFSTEST_COMMIT=ededbeb2b44929972898afb87474b0937f78a877
+ARG PJDFSTEST_PATCHSET=sinomo-linux-portability-v1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        autoconf \
+        automake \
+        build-essential \
+        ca-certificates \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git init /src/pjdfstest \
+    && git -C /src/pjdfstest remote add origin https://github.com/pjd/pjdfstest.git \
+    && git -C /src/pjdfstest fetch --depth 1 origin "${PJDFSTEST_COMMIT}" \
+    && git -C /src/pjdfstest checkout --detach FETCH_HEAD \
+    && test "$(git -C /src/pjdfstest rev-parse HEAD)" = "${PJDFSTEST_COMMIT}"
+
+COPY pjdfstest/linux-portability.patch /tmp/pjdfstest-linux-portability.patch
+RUN git -C /src/pjdfstest apply --check /tmp/pjdfstest-linux-portability.patch \
+    && git -C /src/pjdfstest apply /tmp/pjdfstest-linux-portability.patch \
+    && ! grep -n 'todo Linux' /src/pjdfstest/tests/chown/00.t \
+    && ! grep -n 'todo Linux' /src/pjdfstest/tests/rename/24.t \
+    && ! grep -n 'todo Linux' /src/pjdfstest/tests/unlink/08.t \
+    && cd /src/pjdfstest \
+    && autoreconf -ifs \
+    && ./configure \
+    && make -j2 pjdfstest \
+    && test -x pjdfstest \
+    && printf '%s\n' "${PJDFSTEST_COMMIT}" > REVISION \
+    && printf '%s\n' "${PJDFSTEST_PATCHSET}" > SINOMO_PATCHSET
+
+FROM debian:trixie-slim
+
+ARG PJDFSTEST_COMMIT=ededbeb2b44929972898afb87474b0937f78a877
+ARG PJDFSTEST_PATCHSET=sinomo-linux-portability-v1
+
+LABEL org.opencontainers.image.source="https://github.com/pjd/pjdfstest" \
+      org.sinomo.pjdfstest.commit="${PJDFSTEST_COMMIT}" \
+      org.sinomo.pjdfstest.patchset="${PJDFSTEST_PATCHSET}"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        coreutils \
+        findutils \
+        fuse3 \
+        grep \
+        iproute2 \
+        libasound2t64 \
+        libtest-harness-perl \
+        mawk \
+        openssl \
+        perl \
+        procps \
+        sed \
+        util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upstream's test helpers walk up from tests/ until they find the pjdfstest
+# executable, so keep the executable and complete test tree together.
+COPY --from=pjdfstest-builder /src/pjdfstest/pjdfstest /opt/pjdfstest/pjdfstest
+COPY --from=pjdfstest-builder /src/pjdfstest/tests /opt/pjdfstest/tests
+COPY --from=pjdfstest-builder /src/pjdfstest/COPYING /opt/pjdfstest/COPYING
+COPY --from=pjdfstest-builder /src/pjdfstest/REVISION /opt/pjdfstest/REVISION
+COPY --from=pjdfstest-builder /src/pjdfstest/SINOMO_PATCHSET /opt/pjdfstest/SINOMO_PATCHSET
+COPY pjdfstest/linux-portability.json /opt/pjdfstest/SINOMO_PORTABILITY.json
+
+COPY entrypoint.sh /usr/local/bin/sinomo-node-entrypoint
+COPY run-pjdfstest-node.sh /usr/local/bin/sinomo-pjdfstest-runner
+COPY pjdfstest/smoke.tests /usr/local/share/sinomo/pjdfstest/smoke.tests
+RUN chmod +x \
+        /opt/pjdfstest/pjdfstest \
+        /usr/local/bin/sinomo-node-entrypoint \
+        /usr/local/bin/sinomo-pjdfstest-runner \
+    && test -f /opt/pjdfstest/tests/conf \
+    && test -r /usr/local/share/sinomo/pjdfstest/smoke.tests \
+    && test "$(cat /opt/pjdfstest/REVISION)" = "${PJDFSTEST_COMMIT}" \
+    && test "$(cat /opt/pjdfstest/SINOMO_PATCHSET)" = "${PJDFSTEST_PATCHSET}" \
+    && perl -MJSON::PP -e '\
+        local $/; \
+        open my $fh, "<", $ARGV[0] or die $!; \
+        my $doc = JSON::PP->new->decode(<$fh>); \
+        die "patchset mismatch" unless $doc->{id} eq $ARGV[1]; \
+        die "revision mismatch" unless $doc->{upstream_revision} eq $ARGV[2]; \
+      ' /opt/pjdfstest/SINOMO_PORTABILITY.json "${PJDFSTEST_PATCHSET}" "${PJDFSTEST_COMMIT}"
+
+ENV PJDFSTEST_ROOT=/opt/pjdfstest
+ENV SINOMO_DATA_DIR=/data
+
+ENTRYPOINT ["/usr/local/bin/sinomo-node-entrypoint"]

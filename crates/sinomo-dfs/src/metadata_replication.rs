@@ -9223,6 +9223,15 @@ pub(crate) fn metadata_journal_rejection_allows_snapshot_repair(reason: &str) ->
         || (reason.contains("metadata journal sequence")
             && reason.contains("within durable prefix")
             && reason.contains("is missing while replaying shard"))
+        // A routed response can materialize a newer authoritative namespace
+        // state on a replica before its incremental journal cursor reaches the
+        // prepare that produced it. Replaying that older prepare then fails
+        // its admission checks even though the primary history is valid. The
+        // replica cannot safely skip the entry; install the primary snapshot.
+        || (reason.contains("namespace prepare")
+            && (reason.contains("version expectation changed")
+                || reason.contains("occupant expectation changed")
+                || reason.contains("overlaps active prepare")))
         || reason.contains("failed to decode segmented journal entry")
         || (reason.contains("metadata journal prefix probe") && reason.contains("state mismatch"))
         || ((reason.contains("metadata journal batch")
@@ -11182,6 +11191,15 @@ mod cursor_update_tests {
         ));
         assert!(metadata_journal_rejection_allows_snapshot_repair(
             "metadata serialization error: DFS metadata table snapshot semantic checksum mismatch"
+        ));
+        assert!(metadata_journal_rejection_allows_snapshot_repair(
+            "metadata serialization error: namespace prepare namespace-request:req-8b5580d0b15098efd9c04e59:namespace_visible-object_bc9da30bdab53c8c0113a91e6134e70eff884c8d7f1a2f92191b9c8104da5c14 object 2tq07ndspq14s8dmf4qyj0wdwf version expectation changed: expected Some(Id(\"276sg6e4bewycnkwcpyas522qq\")), current Some(Id(\"01kyp850yvbxpymhj3tcsyran1\"))"
+        ));
+        assert!(metadata_journal_rejection_allows_snapshot_repair(
+            "metadata serialization error: namespace prepare namespace-request:req-diverged path /target occupant expectation changed: expected None, current Some(Id(\"object-newer\"))"
+        ));
+        assert!(metadata_journal_rejection_allows_snapshot_repair(
+            "metadata serialization error: namespace prepare namespace-request:req-diverged overlaps active prepare namespace-request:req-newer"
         ));
         assert!(!metadata_journal_rejection_allows_snapshot_repair(
             "metadata journal batch for shard services contains entry from shard root"

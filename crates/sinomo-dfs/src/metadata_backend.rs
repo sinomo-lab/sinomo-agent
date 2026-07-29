@@ -14233,6 +14233,254 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_rmdir_transaction_retries_after_journal_append_failure() {
+        let root = temp_root("local_backend_rmdir_journal_append_retry");
+        let mut backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = file_system();
+        let mut parent = object(version("version_1"));
+        parent.object_id =
+            DfsObjectId::from_legacy_named("obj_rmdir_append_parent").expect("parent object id");
+        parent.path = "/docs".to_string();
+        parent.kind = DfsObjectKind::Directory;
+        parent.content_hash = None;
+        parent.content_size_bytes = None;
+        let mut child = object(version("version_1"));
+        child.object_id =
+            DfsObjectId::from_legacy_named("obj_rmdir_append_child").expect("child object id");
+        child.path = "/docs/empty".to_string();
+        child.kind = DfsObjectKind::Directory;
+        child.content_hash = None;
+        child.content_size_bytes = None;
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&parent).expect("parent");
+        backend.put_object(&child).expect("child");
+
+        let mut tombstone = child.clone();
+        tombstone.kind = DfsObjectKind::Tombstone;
+        tombstone.version = version("version_2");
+        tombstone.changed_at_unix_nanos = child.changed_at_unix_nanos.saturating_add(1);
+        let mut touched_parent = parent.clone();
+        touched_parent.version = version("version_2");
+        touched_parent.modified_at_unix_nanos = parent.modified_at_unix_nanos.saturating_add(1);
+        touched_parent.changed_at_unix_nanos = parent.changed_at_unix_nanos.saturating_add(1);
+        let transaction = DfsNamespaceTransaction {
+            transaction_id: "namespace_rmdir_append_retry".to_string(),
+            file_system_id: file_system.file_system_id.clone(),
+            objects: vec![tombstone.clone(), touched_parent.clone()],
+            versions: vec![
+                object_version_record(
+                    &tombstone,
+                    tombstone.version.clone(),
+                    OffsetDateTime::UNIX_EPOCH,
+                ),
+                object_version_record(
+                    &touched_parent,
+                    touched_parent.version.clone(),
+                    OffsetDateTime::UNIX_EPOCH,
+                ),
+            ],
+            advisory_lock_states: Vec::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+
+        fs::remove_dir_all(root.join("journal").join("segments")).expect("remove journal segments");
+        fs::write(root.join("journal").join("segments"), b"not a directory")
+            .expect("block journal segment append");
+        let error = backend
+            .apply_namespace_transaction(&transaction)
+            .expect_err("journal append failure");
+        assert!(matches!(error, MetadataBackendError::Io { .. }));
+        assert_eq!(
+            backend.get_object(&child.object_id).expect("child lookup"),
+            Some(child),
+            "a failed journal append must not expose the tombstone"
+        );
+        assert_eq!(
+            backend
+                .get_object(&parent.object_id)
+                .expect("parent lookup"),
+            Some(parent),
+            "a failed journal append must not expose the parent touch"
+        );
+
+        fs::remove_file(root.join("journal").join("segments")).expect("remove journal blocker");
+        fs::create_dir_all(root.join("journal").join("segments"))
+            .expect("restore journal segments");
+        backend
+            .apply_namespace_transaction(&transaction)
+            .expect("retry exact rmdir transaction");
+        assert_eq!(
+            backend.get_object(&tombstone.object_id).expect("tombstone"),
+            Some(tombstone)
+        );
+        assert_eq!(
+            backend
+                .get_object(&touched_parent.object_id)
+                .expect("touched parent"),
+            Some(touched_parent)
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_rmdir_transaction_recovers_after_table_apply_crash_and_exact_retry() {
+        let root = temp_root("local_backend_rmdir_table_apply_crash");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        let file_system = file_system();
+        let mut parent = object(version("version_1"));
+        parent.object_id =
+            DfsObjectId::from_legacy_named("obj_rmdir_apply_parent").expect("parent object id");
+        parent.path = "/docs".to_string();
+        parent.kind = DfsObjectKind::Directory;
+        parent.content_hash = None;
+        parent.content_size_bytes = None;
+        let mut child = object(version("version_1"));
+        child.object_id =
+            DfsObjectId::from_legacy_named("obj_rmdir_apply_child").expect("child object id");
+        child.path = "/docs/empty".to_string();
+        child.kind = DfsObjectKind::Directory;
+        child.content_hash = None;
+        child.content_size_bytes = None;
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&parent).expect("parent");
+        backend.put_object(&child).expect("child");
+        backend
+            .persist_current_metadata_checkpoint_unlocked()
+            .expect("checkpoint before injected table failure");
+
+        let mut tombstone = child.clone();
+        tombstone.kind = DfsObjectKind::Tombstone;
+        tombstone.version = version("version_2");
+        tombstone.changed_at_unix_nanos = child.changed_at_unix_nanos.saturating_add(1);
+        let mut touched_parent = parent.clone();
+        touched_parent.version = version("version_2");
+        touched_parent.modified_at_unix_nanos = parent.modified_at_unix_nanos.saturating_add(1);
+        touched_parent.changed_at_unix_nanos = parent.changed_at_unix_nanos.saturating_add(1);
+        let transaction = DfsNamespaceTransaction {
+            transaction_id: "namespace_rmdir_apply_crash".to_string(),
+            file_system_id: file_system.file_system_id.clone(),
+            objects: vec![tombstone.clone(), touched_parent.clone()],
+            versions: vec![
+                object_version_record(
+                    &tombstone,
+                    tombstone.version.clone(),
+                    OffsetDateTime::UNIX_EPOCH,
+                ),
+                object_version_record(
+                    &touched_parent,
+                    touched_parent.version.clone(),
+                    OffsetDateTime::UNIX_EPOCH,
+                ),
+            ],
+            advisory_lock_states: Vec::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+
+        let table_path = metadata_table_path(&root);
+        let error = {
+            let _lock = backend.begin_metadata_write().expect("metadata write lock");
+            let durable_transaction = normalized_namespace_transaction(&transaction);
+            validate_namespace_transaction_preconditions(&backend.tables, &durable_transaction)
+                .expect("rmdir transaction preconditions");
+            let entry = backend
+                .write_journal_unlocked(DfsMetadataMutation::ApplyNamespaceTransaction {
+                    file_system_id: durable_transaction.file_system_id.clone(),
+                    transaction_id: durable_transaction.transaction_id.clone(),
+                    object_count: durable_transaction.objects.len(),
+                    transaction: Some(durable_transaction.clone()),
+                })
+                .expect("durable namespace transaction append");
+            let mut table_ops = Vec::new();
+            let mut rollback = DfsMetadataTableRollback::default();
+            backend
+                .plan_namespace_transaction_table_ops(
+                    &durable_transaction,
+                    &mut table_ops,
+                    &mut rollback,
+                )
+                .expect("preapply rmdir table plan");
+            assert_eq!(
+                backend.tables.objects.get(&tombstone.object_id),
+                Some(&tombstone),
+                "the injected failure starts after the tombstone preapply"
+            );
+            assert_eq!(
+                backend.tables.objects.get(&touched_parent.object_id),
+                Some(&touched_parent),
+                "the injected failure starts after the parent-touch preapply"
+            );
+            fs::remove_file(&table_path).expect("remove empty materialized table log");
+            fs::create_dir(&table_path).expect("block table apply");
+            backend
+                .append_preapplied_table_ops(entry.sequence, table_ops, rollback)
+                .expect_err("table apply failure after durable journal append")
+        };
+        assert!(matches!(error, MetadataBackendError::Io { .. }));
+        assert_eq!(
+            backend.tables.objects.get(&child.object_id),
+            Some(&child),
+            "failed table apply must roll back the in-memory tombstone"
+        );
+        assert_eq!(
+            backend.tables.objects.get(&parent.object_id),
+            Some(&parent),
+            "failed table apply must roll back the in-memory parent touch"
+        );
+        assert!(
+            backend
+                .journal_since(0)
+                .expect("durable journal")
+                .iter()
+                .any(|entry| matches!(
+                    &entry.mutation,
+                    DfsMetadataMutation::ApplyNamespaceTransaction {
+                        transaction_id,
+                        ..
+                    } if transaction_id == &transaction.transaction_id
+                ))
+        );
+
+        fs::remove_dir(&table_path).expect("restore table log path");
+        drop(backend);
+        let mut reopened =
+            LocalSobjMetadataBackend::new(shard_id, &root).expect("recover durable transaction");
+        assert_eq!(
+            reopened
+                .get_object(&tombstone.object_id)
+                .expect("recovered tombstone"),
+            Some(tombstone.clone())
+        );
+        assert_eq!(
+            reopened
+                .get_object(&touched_parent.object_id)
+                .expect("recovered parent"),
+            Some(touched_parent.clone())
+        );
+
+        reopened
+            .apply_namespace_transaction(&transaction)
+            .expect("exact retry after recovery");
+        assert_eq!(
+            reopened
+                .get_object(&tombstone.object_id)
+                .expect("retried tombstone"),
+            Some(tombstone)
+        );
+        assert_eq!(
+            reopened
+                .get_object(&touched_parent.object_id)
+                .expect("retried parent"),
+            Some(touched_parent)
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn local_backend_recovers_durable_journal_tail_before_same_instance_retry() {
         let root = temp_root("local_backend_same_instance_journal_tail_recovery");
         let shard_id = DfsMetadataShardId::new("shard-root");

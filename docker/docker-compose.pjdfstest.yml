@@ -1,0 +1,25 @@
+# Opt-in overlay for the kernel-facing pjdfstest compatibility lane:
+#
+#   docker compose \
+#     -f docker/docker-compose.dev.yml \
+#     -f docker/docker-compose.pjdfstest.yml \
+#     up --build -d
+#
+# Only node5 receives FUSE access and the test tooling. The separate named
+# volume provides a native-filesystem control target for the same test runner.
+
+services:
+  node5:
+    image: sinomo-dev-pjdfstest-runtime
+    build:
+      context: .
+      dockerfile: Dockerfile.pjdfstest
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse:/dev/fuse
+    volumes:
+      - pjdfstest-control:/pjdfstest-control
+
+volumes:
+  pjdfstest-control:

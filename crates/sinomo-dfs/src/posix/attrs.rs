@@ -42,19 +42,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_set_owner(&mut self, path: &str, uid: u32, gid: u32) -> Result<DfsStat> {
-        let normalized = normalize_posix_path(path)?;
-        if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
+        let resolved = self.resolve_existing_posix_path_distributed(path, true)?;
+        if let Some(primary) = self.routed_namespace_primary_for_path(&resolved)? {
             self.route_namespace_operation(
                 primary,
                 DfsNamespaceOperation::SetOwner {
-                    path: path.to_string(),
+                    path: resolved.clone(),
                     uid,
                     gid,
                 },
             )?;
-            return self.posix_stat(&normalized);
+            return self.posix_stat_distributed(&resolved);
         }
-        self.posix_set_owner_local(path, uid, gid)
+        self.posix_set_owner_local(&resolved, uid, gid)
     }
 
     pub fn posix_set_symlink_owner(&mut self, path: &str, uid: u32, gid: u32) -> Result<DfsStat> {
@@ -68,7 +68,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     gid,
                 },
             )?;
-            return self.posix_lstat(&normalized);
+            return self.posix_lstat_distributed(&normalized);
         }
         self.posix_set_symlink_owner_local(path, uid, gid)
     }

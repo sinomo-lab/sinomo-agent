@@ -638,7 +638,8 @@ mod tests {
     use crate::{
         DfsContentRootCatalogPageRequest, DfsContentRootCatalogShardIdentity,
         DfsDistributedWriteCommand, DfsMetadataJournalBatch, DfsMetadataShardAssignment,
-        DfsMetadataTableSnapshot, DfsNamespaceCommand, DfsNamespaceOperation, DfsObjectId,
+        DfsMetadataTableSnapshot, DfsNamespaceCommand, DfsNamespaceOperation,
+        DfsNamespacePosixError, DfsNamespaceResponse, DfsNamespaceResult, DfsObjectId,
         DfsReadRequest, DfsReplicationPolicy, DfsStageBlobCommand, DfsVersion,
         dfs_content_root_catalog_topology_digest,
     };
@@ -720,6 +721,50 @@ mod tests {
         assert_eq!(
             dfs_message_execution_scope(&command),
             DfsMessageExecutionScope::ReadOnly
+        );
+    }
+
+    #[test]
+    fn symlink_content_pending_survives_namespace_wire_round_trip() {
+        let command = message_command(DfsNetworkMessage::NamespaceResponse(DfsNamespaceResponse {
+            request_id: "symlink-pending-response".to_string(),
+            result: DfsNamespaceResult::Rejected {
+                reason: "symlink content is still converging".to_string(),
+                posix_error: Some(DfsNamespacePosixError::SymlinkContentPending {
+                    path: "/services/link".to_string(),
+                    stage: "fetch-link-body".to_string(),
+                    detail: "version v2 is pending at node-b".to_string(),
+                }),
+                current_primary_node_id: None,
+            },
+            synced_path_object: None,
+            synced_path_objects: Vec::new(),
+            metadata_journal_batches: Vec::new(),
+            metadata_journal_has_more: None,
+            posix_coordination_result: None,
+        }));
+
+        let request = dfs_message_rpc_request(&command).expect("namespace response request");
+        assert_eq!(request.route, DFS_DATA_NAMESPACE_RESPONSE_ROUTE);
+        assert_eq!(
+            decode_dfs_message_rpc_request(&request).expect("namespace response round trip"),
+            command
+        );
+
+        let legacy_without_diagnostics: DfsNamespacePosixError =
+            serde_json::from_value(serde_json::json!({
+                "symlink-content-pending": {
+                    "path": "/services/link"
+                }
+            }))
+            .expect("diagnostic fields are additive");
+        assert_eq!(
+            legacy_without_diagnostics,
+            DfsNamespacePosixError::SymlinkContentPending {
+                path: "/services/link".to_string(),
+                stage: String::new(),
+                detail: String::new(),
+            }
         );
     }
 
