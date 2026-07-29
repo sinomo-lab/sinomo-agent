@@ -12,14 +12,12 @@ use accounting::{ContentStoreQuotaDelta, ContentStoreStatsDelta, ContentStoreSta
 use blake3::hazmat::{
     ChainingValue, HasherExt, Mode, left_subtree_len, merge_subtrees_non_root, merge_subtrees_root,
 };
-#[cfg(test)]
-use fs_ops::write_file_atomic;
 use fs_ops::{
     content_durable_file_error, create_dir_all, duration_nanos_saturating, file_age_nanos,
     file_len_if_exists, projected_file_growth, read_dir, read_file, recursive_file_count_and_bytes,
     remove_file_if_exists, remove_file_if_exists_and_sync_parent, sync_dir,
-    system_time_nanos_since_epoch_saturating, temporary_path_for, write_file_create_new_atomic,
-    write_files_create_new_relaxed, write_reader_to_file,
+    system_time_nanos_since_epoch_saturating, temporary_path_for, write_file_atomic,
+    write_file_create_new_atomic, write_files_create_new_relaxed, write_reader_to_file,
 };
 #[cfg(test)]
 use packed::PACKED_BLOB_LOCK_FILE;
@@ -53,8 +51,15 @@ const STREAMED_BLOB_ONLY_MIN_BYTES: usize = 1024 * 1024;
 const CONTENT_HASH_TREE_VERSION: u32 = 1;
 const CONTENT_HASH_TREE_LEAF_BYTES: u64 = 1024 * 1024;
 const STREAM_MANIFEST_CACHE_MAX_ENTRIES: usize = 1024;
-const ORPHAN_OBSERVATION_FORMAT_VERSION: u32 = 1;
+const ORPHAN_OBSERVATION_FORMAT_VERSION: u32 = 2;
 const ORPHAN_OBSERVATION_DIR: &str = "orphan-observations";
+const CONTENT_RESERVATION_FORMAT_VERSION: u32 = 1;
+const CONTENT_RESERVATION_DIR: &str = "content-reservations";
+const CONTENT_RESERVATION_RECONCILIATION_CURSOR_FORMAT_VERSION: u32 = 1;
+const CONTENT_RESERVATION_RECONCILIATION_CURSOR_FILE: &str =
+    "content-reservation-reconciliation-cursor.sobj";
+const MANIFEST_ABSENCE_OBSERVATION_FORMAT_VERSION: u32 = 1;
+const MANIFEST_ABSENCE_OBSERVATION_DIR: &str = "manifest-absence-observations";
 const VERSION_GC_DELETE_BATCH_SIZE: usize = 1024;
 const ORPHAN_GC_PACKED_TOMBSTONE_BATCH_SIZE: usize = 1024;
 
@@ -367,10 +372,23 @@ pub enum ContentStoreScrubIssue {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContentStoreDestructiveCatalogSeal;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentStoreGcOptions {
     pub dry_run: bool,
     pub min_orphan_age_nanos: u64,
+    /// Stable generation and local observation time of the complete
+    /// authoritative catalog used for this pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_observed_at_unix_nanos: Option<u64>,
+    /// In-process capability proving that the observation was copied from a
+    /// successfully validated, durably installed authoritative catalog.
+    #[serde(skip)]
+    destructive_catalog_seal: Option<ContentStoreDestructiveCatalogSeal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_deletions: Option<u64>,
     /// Content identities that remain reachable through metadata or another
@@ -384,6 +402,9 @@ impl ContentStoreGcOptions {
         Self {
             dry_run: true,
             min_orphan_age_nanos: duration_nanos_saturating(min_orphan_age),
+            catalog_generation: None,
+            catalog_observed_at_unix_nanos: None,
+            destructive_catalog_seal: None,
             max_deletions: None,
             protected_content_hashes: BTreeSet::new(),
         }
@@ -393,6 +414,9 @@ impl ContentStoreGcOptions {
         Self {
             dry_run: false,
             min_orphan_age_nanos: duration_nanos_saturating(min_orphan_age),
+            catalog_generation: None,
+            catalog_observed_at_unix_nanos: None,
+            destructive_catalog_seal: None,
             max_deletions: None,
             protected_content_hashes: BTreeSet::new(),
         }
@@ -400,6 +424,31 @@ impl ContentStoreGcOptions {
 
     pub fn with_max_deletions(mut self, max_deletions: u64) -> Self {
         self.max_deletions = Some(max_deletions);
+        self
+    }
+
+    /// Attach catalog identity to a non-mutating projection.
+    ///
+    /// This deliberately does not grant the in-process capability required by
+    /// destructive collection.
+    pub fn with_catalog_projection_observation(
+        mut self,
+        generation: impl Into<String>,
+        observed_at_unix_nanos: u64,
+    ) -> Self {
+        self.catalog_generation = Some(generation.into());
+        self.catalog_observed_at_unix_nanos = Some(observed_at_unix_nanos);
+        self
+    }
+
+    pub(crate) fn with_catalog_observation(
+        mut self,
+        generation: impl Into<String>,
+        observed_at_unix_nanos: u64,
+    ) -> Self {
+        self.catalog_generation = Some(generation.into());
+        self.catalog_observed_at_unix_nanos = Some(observed_at_unix_nanos);
+        self.destructive_catalog_seal = Some(ContentStoreDestructiveCatalogSeal);
         self
     }
 
@@ -425,6 +474,10 @@ pub struct ContentStoreGcReport {
     pub dry_run: bool,
     pub min_orphan_age_nanos: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_observed_at_unix_nanos: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_deletions: Option<u64>,
     pub blocked_by_scrub_issue_count: u64,
     pub eligible_orphan_count: u64,
@@ -433,6 +486,18 @@ pub struct ContentStoreGcReport {
     pub deleted_orphan_bytes: u64,
     pub retained_young_orphan_count: u64,
     pub retained_young_orphan_bytes: u64,
+    /// Orphans retained because no complete local catalog observation was
+    /// supplied to this pass.
+    #[serde(default)]
+    pub retained_missing_catalog_observation_orphan_count: u64,
+    #[serde(default)]
+    pub retained_missing_catalog_observation_orphan_bytes: u64,
+    /// Orphans retained until a catalog generation observed after their
+    /// first-absence marker is available.
+    #[serde(default)]
+    pub retained_same_or_stale_catalog_orphan_count: u64,
+    #[serde(default)]
+    pub retained_same_or_stale_catalog_orphan_bytes: u64,
     /// Orphans that had no durable first-observation marker at the start of
     /// this pass. A non-zero dry-run value tells reactive scheduling to run a
     /// write pass now instead of sleeping until `next_eligible_at_unix_nanos`.
@@ -563,6 +628,20 @@ pub struct ContentStoreStagingGcReport {
 pub struct ContentStoreVersionGcOptions {
     pub dry_run: bool,
     pub min_version_age_nanos: u64,
+    /// Additional durable absence grace after a manifest first becomes both
+    /// old enough and absent from the caller's complete root set.
+    #[serde(default)]
+    pub min_absence_age_nanos: u64,
+    /// Stable fingerprint and wall-clock generation time of the complete
+    /// authoritative catalog used for this pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_generated_at_unix_nanos: Option<u64>,
+    /// In-process capability proving that the observation was copied from a
+    /// successfully validated, durably installed authoritative catalog.
+    #[serde(skip)]
+    destructive_catalog_seal: Option<ContentStoreDestructiveCatalogSeal>,
     pub keep_latest_versions_per_object: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_deletions: Option<u64>,
@@ -577,6 +656,10 @@ impl ContentStoreVersionGcOptions {
         Self {
             dry_run: true,
             min_version_age_nanos: duration_nanos_saturating(min_version_age),
+            min_absence_age_nanos: duration_nanos_saturating(min_version_age),
+            catalog_generation: None,
+            catalog_generated_at_unix_nanos: None,
+            destructive_catalog_seal: None,
             keep_latest_versions_per_object: keep_latest_versions_per_object.max(1),
             max_deletions: None,
             protected_versions: BTreeSet::new(),
@@ -590,6 +673,10 @@ impl ContentStoreVersionGcOptions {
         Self {
             dry_run: false,
             min_version_age_nanos: duration_nanos_saturating(min_version_age),
+            min_absence_age_nanos: duration_nanos_saturating(min_version_age),
+            catalog_generation: None,
+            catalog_generated_at_unix_nanos: None,
+            destructive_catalog_seal: None,
             keep_latest_versions_per_object: keep_latest_versions_per_object.max(1),
             max_deletions: None,
             protected_versions: BTreeSet::new(),
@@ -598,6 +685,36 @@ impl ContentStoreVersionGcOptions {
 
     pub fn with_max_deletions(mut self, max_deletions: u64) -> Self {
         self.max_deletions = Some(max_deletions);
+        self
+    }
+
+    pub fn with_min_absence_age(mut self, min_absence_age: Duration) -> Self {
+        self.min_absence_age_nanos = duration_nanos_saturating(min_absence_age);
+        self
+    }
+
+    /// Attach catalog identity to a non-mutating projection.
+    ///
+    /// This deliberately does not grant the in-process capability required by
+    /// destructive collection.
+    pub fn with_catalog_projection_observation(
+        mut self,
+        generation: impl Into<String>,
+        generated_at_unix_nanos: u64,
+    ) -> Self {
+        self.catalog_generation = Some(generation.into());
+        self.catalog_generated_at_unix_nanos = Some(generated_at_unix_nanos);
+        self
+    }
+
+    pub(crate) fn with_catalog_observation(
+        mut self,
+        generation: impl Into<String>,
+        generated_at_unix_nanos: u64,
+    ) -> Self {
+        self.catalog_generation = Some(generation.into());
+        self.catalog_generated_at_unix_nanos = Some(generated_at_unix_nanos);
+        self.destructive_catalog_seal = Some(ContentStoreDestructiveCatalogSeal);
         self
     }
 
@@ -631,6 +748,11 @@ pub struct ContentStoreVersionGcReport {
     pub scrub: ContentStoreScrubReport,
     pub dry_run: bool,
     pub min_version_age_nanos: u64,
+    pub min_absence_age_nanos: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_generated_at_unix_nanos: Option<u64>,
     pub keep_latest_versions_per_object: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_deletions: Option<u64>,
@@ -641,6 +763,26 @@ pub struct ContentStoreVersionGcReport {
     pub retained_latest_logical_bytes: u64,
     pub retained_young_version_count: u64,
     pub retained_young_logical_bytes: u64,
+    /// Manifests retained because their durable first-absence grace has not
+    /// elapsed, including first observations made by this pass.
+    #[serde(default)]
+    pub retained_absence_grace_version_count: u64,
+    #[serde(default)]
+    pub retained_absence_grace_logical_bytes: u64,
+    #[serde(default)]
+    pub newly_observed_absent_version_count: u64,
+    #[serde(default)]
+    pub newly_observed_absent_logical_bytes: u64,
+    #[serde(default)]
+    pub persisted_absence_observation_count: u64,
+    #[serde(default)]
+    pub retained_missing_catalog_observation_version_count: u64,
+    #[serde(default)]
+    pub retained_missing_catalog_observation_logical_bytes: u64,
+    #[serde(default)]
+    pub retained_same_or_stale_catalog_version_count: u64,
+    #[serde(default)]
+    pub retained_same_or_stale_catalog_logical_bytes: u64,
     /// Earliest wall-clock instant at which an unprotected, non-latest
     /// manifest reaches the configured recovery age.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -654,6 +796,12 @@ pub struct ContentStoreVersionGcReport {
     pub eligible_version_count: u64,
     pub eligible_logical_bytes: u64,
     pub eligible_manifest_bytes: u64,
+    /// Old, unrooted manifests whose durable absence grace and later-catalog
+    /// proof have both passed.
+    #[serde(default)]
+    pub deletion_ready_version_count: u64,
+    #[serde(default)]
+    pub deletion_ready_logical_bytes: u64,
     pub deleted_version_count: u64,
     pub deleted_logical_bytes: u64,
     pub deleted_manifest_bytes: u64,
@@ -674,6 +822,115 @@ pub struct ContentStoreVersionGcReport {
     #[serde(default)]
     pub stats_delta_persist_count: u64,
     pub max_deletions_reached: bool,
+}
+
+/// Exact pre-catalog ownership of one content identity.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ContentStoreReservationIdentity {
+    pub object_id: String,
+    pub version: String,
+    pub content_hash: String,
+}
+
+/// One durable pre-catalog reservation and the time at which it became a root.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ContentStoreReservationRecord {
+    pub identity: ContentStoreReservationIdentity,
+    pub reserved_at_unix_nanos: u64,
+}
+
+/// Durable roots retained by local content reservations.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ContentStoreReservationRoots {
+    pub reservation_count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reservations: Vec<ContentStoreReservationRecord>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub versions: BTreeSet<(String, String)>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub content_hashes: BTreeSet<String>,
+}
+
+/// One bounded page of complete-catalog reservation reconciliation.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ContentStoreReservationReconciliationOptions {
+    /// Stable fingerprint of the complete catalog used for this pass.
+    ///
+    /// Reconciliation progress is durable only within one catalog generation.
+    /// A new generation restarts scanning from the beginning.
+    #[serde(default)]
+    pub catalog_generation: String,
+    pub catalog_generated_at_unix_nanos: u64,
+    pub rejection_grace_nanos: u64,
+    pub max_reservations: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<ContentStoreReservationIdentity>,
+}
+
+impl ContentStoreReservationReconciliationOptions {
+    pub fn bounded(
+        catalog_generated_at_unix_nanos: u64,
+        rejection_grace: Duration,
+        max_reservations: u64,
+    ) -> Self {
+        Self {
+            catalog_generation: String::new(),
+            catalog_generated_at_unix_nanos,
+            rejection_grace_nanos: duration_nanos_saturating(rejection_grace),
+            max_reservations: max_reservations.max(1),
+            after: None,
+        }
+    }
+
+    pub fn with_catalog_generation(mut self, generation: impl Into<String>) -> Self {
+        self.catalog_generation = generation.into();
+        self
+    }
+
+    pub fn after(mut self, identity: ContentStoreReservationIdentity) -> Self {
+        self.after = Some(identity);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ContentStoreReservationReconciliationReport {
+    pub reservation_count: u64,
+    pub examined_reservation_count: u64,
+    pub released_catalog_covered_count: u64,
+    pub released_rejected_count: u64,
+    pub retained_catalog_too_old_count: u64,
+    pub retained_rejection_grace_count: u64,
+    pub remaining_after_batch_count: u64,
+    pub has_more: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<ContentStoreReservationIdentity>,
+}
+
+/// Authoritative reason for releasing a pre-catalog reservation.
+///
+/// Ordinary write and stage paths deliberately never call this API. A catalog
+/// reconciler may release a reservation only after proving it is represented
+/// by a complete authoritative root set, or after proving the operation was
+/// durably rejected.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ContentStoreReservationResolution {
+    CatalogCovered,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+struct ContentStoreReservation {
+    format_version: u32,
+    identity: ContentStoreReservationIdentity,
+    reserved_at_unix_nanos: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+struct ContentStoreReservationReconciliationCursor {
+    format_version: u32,
+    catalog_generation: String,
+    after: ContentStoreReservationIdentity,
 }
 
 #[derive(Debug, Clone)]
@@ -747,6 +1004,21 @@ struct OrphanObservation {
     format_version: u32,
     content_hash: String,
     first_observed_at_unix_nanos: u64,
+    #[serde(default)]
+    catalog_generation: String,
+    #[serde(default)]
+    catalog_observed_at_unix_nanos: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ManifestAbsenceObservation {
+    format_version: u32,
+    object_id: String,
+    version: String,
+    content_hash: String,
+    first_observed_at_unix_nanos: u64,
+    catalog_generation: String,
+    catalog_generated_at_unix_nanos: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -819,7 +1091,7 @@ struct PendingPackedOrphanDeletion {
 
 #[derive(Debug)]
 struct RelaxedOrphanObservationWrite {
-    first_observed_at_unix_nanos: u64,
+    observation: OrphanObservation,
     created: bool,
     size_bytes: u64,
     parent: PathBuf,
@@ -900,6 +1172,219 @@ impl LocalContentStore {
 
     pub fn quota(&self) -> Option<&ContentStoreQuota> {
         self.quota.as_ref()
+    }
+
+    /// Durably reserves an exact content identity before any blob or manifest
+    /// becomes visible outside a quarantine file.
+    pub fn ensure_content_reservation(
+        &self,
+        object_id: &str,
+        version: &str,
+        content_hash: &str,
+    ) -> Result<()> {
+        hash_hex(content_hash)?;
+        let identity = ContentStoreReservationIdentity {
+            object_id: object_id.to_owned(),
+            version: version.to_owned(),
+            content_hash: content_hash.to_owned(),
+        };
+        // Reset a previous absence epoch before publishing the new local root.
+        // A crash between these operations only extends later retention.
+        self.remove_manifest_absence_observation(&identity)?;
+        self.persist_content_reservation(&identity)
+    }
+
+    /// Returns every durable pre-catalog root in deterministic order.
+    pub fn content_reservation_roots(&self) -> Result<ContentStoreReservationRoots> {
+        let reservations = self.read_content_reservations()?;
+        let versions = reservations
+            .iter()
+            .map(|reservation| {
+                (
+                    reservation.identity.object_id.clone(),
+                    reservation.identity.version.clone(),
+                )
+            })
+            .collect();
+        let content_hashes = reservations
+            .iter()
+            .map(|reservation| reservation.identity.content_hash.clone())
+            .collect();
+        Ok(ContentStoreReservationRoots {
+            reservation_count: reservations.len() as u64,
+            reservations,
+            versions,
+            content_hashes,
+        })
+    }
+
+    /// Releases one exact reservation after an external authoritative
+    /// reconciler proves either catalog coverage or durable rejection.
+    fn reconcile_content_reservation(
+        &self,
+        object_id: &str,
+        version: &str,
+        content_hash: &str,
+        resolution: ContentStoreReservationResolution,
+    ) -> Result<bool> {
+        let _authoritative_resolution = resolution;
+        let identity = ContentStoreReservationIdentity {
+            object_id: object_id.to_owned(),
+            version: version.to_owned(),
+            content_hash: content_hash.to_owned(),
+        };
+        let path = self.content_reservation_path(&identity);
+        let bytes = match read_file(&path) {
+            Ok(bytes) => bytes,
+            Err(ContentStoreError::Io { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        let reservation = decode_content_reservation(&bytes)?;
+        validate_content_reservation(&reservation, &identity)?;
+        remove_file_if_exists_and_sync_parent(&path)
+    }
+
+    /// Test-support hook for releasing a fixture reservation.
+    ///
+    /// Production callers cannot assert catalog coverage directly; only the
+    /// crate-internal sealed catalog lifecycle may reconcile reservations.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn release_content_reservation_for_test(
+        &self,
+        object_id: &str,
+        version: &str,
+        content_hash: &str,
+    ) -> Result<bool> {
+        self.reconcile_content_reservation(
+            object_id,
+            version,
+            content_hash,
+            ContentStoreReservationResolution::CatalogCovered,
+        )
+    }
+
+    /// Reconciles a bounded page of reservations against one complete,
+    /// authoritative catalog view.
+    ///
+    /// Exact object-version coverage releases a reservation immediately. A
+    /// matching content hash owned by another version protects the deduplicated
+    /// blob, but is not success evidence for this reserved publication. An
+    /// absent version is rejected only when the catalog was generated after
+    /// its abandonment grace elapsed. Progress is persisted by catalog
+    /// generation so retained reservations at the front of the identity order
+    /// cannot starve later reservations.
+    pub(crate) fn reconcile_content_reservations_with_catalog(
+        &self,
+        catalog_versions: &BTreeSet<(String, String)>,
+        _catalog_content_hashes: &BTreeSet<String>,
+        options: ContentStoreReservationReconciliationOptions,
+    ) -> Result<ContentStoreReservationReconciliationReport> {
+        if options.catalog_generation.is_empty() {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: "content reservation reconciliation requires a catalog generation"
+                    .to_owned(),
+            });
+        }
+        if options.max_reservations == 0 {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: "content reservation reconciliation requires a positive batch size"
+                    .to_owned(),
+            });
+        }
+
+        let persisted_cursor = self.read_content_reservation_reconciliation_cursor()?;
+        let durable_after = match persisted_cursor {
+            Some(cursor) if cursor.catalog_generation == options.catalog_generation => {
+                Some(cursor.after)
+            }
+            Some(_) => {
+                self.clear_content_reservation_reconciliation_cursor()?;
+                None
+            }
+            None => None,
+        };
+        let reservations = self.read_content_reservations()?;
+        let reservation_count = reservations.len() as u64;
+        let start_after = durable_after.as_ref().or(options.after.as_ref());
+        let start_index = start_after
+            .map(|after| reservations.partition_point(|reservation| reservation.identity <= *after))
+            .unwrap_or(0);
+        let max_reservations = usize::try_from(options.max_reservations).unwrap_or(usize::MAX);
+        let end_index = start_index
+            .saturating_add(max_reservations)
+            .min(reservations.len());
+        let mut report = ContentStoreReservationReconciliationReport {
+            reservation_count,
+            remaining_after_batch_count: reservations.len().saturating_sub(end_index) as u64,
+            has_more: end_index < reservations.len(),
+            ..ContentStoreReservationReconciliationReport::default()
+        };
+
+        for reservation in &reservations[start_index..end_index] {
+            report.examined_reservation_count = report.examined_reservation_count.saturating_add(1);
+            let identity = &reservation.identity;
+            let version_covered =
+                catalog_versions.contains(&(identity.object_id.clone(), identity.version.clone()));
+            let resolution = match version_covered {
+                true => Some(ContentStoreReservationResolution::CatalogCovered),
+                false
+                    if options.catalog_generated_at_unix_nanos
+                        <= reservation.reserved_at_unix_nanos =>
+                {
+                    report.retained_catalog_too_old_count =
+                        report.retained_catalog_too_old_count.saturating_add(1);
+                    None
+                }
+                false
+                    if options.catalog_generated_at_unix_nanos
+                        <= reservation
+                            .reserved_at_unix_nanos
+                            .saturating_add(options.rejection_grace_nanos) =>
+                {
+                    report.retained_rejection_grace_count =
+                        report.retained_rejection_grace_count.saturating_add(1);
+                    None
+                }
+                false => Some(ContentStoreReservationResolution::Rejected),
+            };
+            if let Some(resolution) = resolution {
+                self.reconcile_content_reservation(
+                    &identity.object_id,
+                    &identity.version,
+                    &identity.content_hash,
+                    resolution,
+                )?;
+                match resolution {
+                    ContentStoreReservationResolution::CatalogCovered => {
+                        report.released_catalog_covered_count =
+                            report.released_catalog_covered_count.saturating_add(1);
+                    }
+                    ContentStoreReservationResolution::Rejected => {
+                        report.released_rejected_count =
+                            report.released_rejected_count.saturating_add(1);
+                    }
+                }
+            }
+            report.next_cursor = Some(identity.clone());
+        }
+
+        if report.has_more {
+            if let Some(next_cursor) = report.next_cursor.as_ref() {
+                self.persist_content_reservation_reconciliation_cursor(
+                    &options.catalog_generation,
+                    next_cursor,
+                )?;
+            }
+        } else {
+            self.clear_content_reservation_reconciliation_cursor()?;
+            report.next_cursor = None;
+        }
+        Ok(report)
     }
 
     pub fn stage_bytes(&self, intent_id: &str, bytes: &[u8]) -> Result<String> {
@@ -1016,6 +1501,7 @@ impl LocalContentStore {
                 ),
             });
         }
+        self.ensure_content_reservation(object_id, version, &blob.content_hash)?;
         self.publish_prehashed_object_version_file(
             object_id,
             version,
@@ -1113,6 +1599,11 @@ impl LocalContentStore {
                             new_hash: hash.clone(),
                         });
                     }
+                    self.ensure_content_reservation(
+                        &existing.object_id,
+                        &existing.version,
+                        &existing.content_hash,
+                    )?;
                     self.clear_orphan_observations_before_manifest_publish(std::iter::once(
                         &existing,
                     ))?;
@@ -1129,6 +1620,11 @@ impl LocalContentStore {
                     size_bytes: bytes.len() as u64,
                     extents: Vec::new(),
                 };
+                self.ensure_content_reservation(
+                    &manifest.object_id,
+                    &manifest.version,
+                    &manifest.content_hash,
+                )?;
                 let loose_readable = blob_path.is_file()
                     && file_content_hash(&blob_path)
                         .is_ok_and(|actual| actual == manifest.content_hash);
@@ -1803,7 +2299,28 @@ impl LocalContentStore {
     }
 
     pub fn collect_garbage(&self, options: ContentStoreGcOptions) -> Result<ContentStoreGcReport> {
+        let catalog_observation = options
+            .catalog_generation
+            .as_deref()
+            .filter(|generation| !generation.is_empty())
+            .zip(
+                options
+                    .catalog_observed_at_unix_nanos
+                    .filter(|observed_at| *observed_at > 0),
+            );
+        if !options.dry_run
+            && (catalog_observation.is_none() || options.destructive_catalog_seal.is_none())
+        {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message:
+                    "destructive orphan GC requires an authorized complete local catalog observation"
+                        .to_owned(),
+            });
+        }
         let scrub = self.scrub_with_stats_snapshot(!options.dry_run)?;
+        let reservation_roots = self.content_reservation_roots()?;
+        let mut protected_content_hashes = options.protected_content_hashes.clone();
+        protected_content_hashes.extend(reservation_roots.content_hashes);
         let blocked_by_scrub_issue_count = scrub
             .issues
             .iter()
@@ -1819,6 +2336,8 @@ impl LocalContentStore {
             scrub,
             dry_run: options.dry_run,
             min_orphan_age_nanos: options.min_orphan_age_nanos,
+            catalog_generation: options.catalog_generation.clone(),
+            catalog_observed_at_unix_nanos: options.catalog_observed_at_unix_nanos,
             max_deletions: options.max_deletions,
             blocked_by_scrub_issue_count,
             ..ContentStoreGcReport::default()
@@ -1856,11 +2375,7 @@ impl LocalContentStore {
             .collect::<Vec<_>>();
         let observed_orphan_hashes = orphan_blobs
             .iter()
-            .filter(|orphan| {
-                !options
-                    .protected_content_hashes
-                    .contains(orphan.content_hash())
-            })
+            .filter(|orphan| !protected_content_hashes.contains(orphan.content_hash()))
             .map(|orphan| orphan.content_hash().to_owned())
             .collect::<BTreeSet<_>>();
         let max_durable_work = options.max_deletions.unwrap_or(u64::MAX);
@@ -1909,10 +2424,7 @@ impl LocalContentStore {
         }
         for orphan in orphan_blobs {
             let size_bytes = orphan.size_bytes();
-            if options
-                .protected_content_hashes
-                .contains(orphan.content_hash())
-            {
+            if protected_content_hashes.contains(orphan.content_hash()) {
                 report.retained_protected_orphan_count =
                     report.retained_protected_orphan_count.saturating_add(1);
                 report.retained_protected_orphan_bytes = report
@@ -1920,12 +2432,16 @@ impl LocalContentStore {
                     .saturating_add(size_bytes);
                 continue;
             }
-            let (mut first_observed_at_unix_nanos, newly_observed) = self
-                .read_orphan_observation_or_fresh(orphan.content_hash(), observed_at_unix_nanos)?;
+            let (mut observation, newly_observed) = self.read_orphan_observation_or_fresh(
+                orphan.content_hash(),
+                observed_at_unix_nanos,
+                catalog_observation,
+            )?;
             if newly_observed {
                 let observation_size_bytes = self.encoded_orphan_observation_size(
                     orphan.content_hash(),
                     observed_at_unix_nanos,
+                    catalog_observation,
                 )?;
                 report.newly_observed_orphan_count =
                     report.newly_observed_orphan_count.saturating_add(1);
@@ -1945,11 +2461,15 @@ impl LocalContentStore {
                 } else if options.dry_run {
                     durable_work_count = durable_work_count.saturating_add(1);
                 } else {
+                    let (catalog_generation, catalog_observed_at_unix_nanos) =
+                        catalog_observation.expect("destructive GC validated catalog observation");
                     let persisted = self.persist_orphan_observation_without_sync(
                         orphan.content_hash(),
                         observed_at_unix_nanos,
+                        catalog_generation,
+                        catalog_observed_at_unix_nanos,
                     )?;
-                    first_observed_at_unix_nanos = persisted.first_observed_at_unix_nanos;
+                    observation = persisted.observation;
                     if persisted.created {
                         dirty_orphan_observation_directories.insert(persisted.parent);
                         orphan_observation_root_created |= persisted.root_created;
@@ -1962,8 +2482,9 @@ impl LocalContentStore {
                     }
                 }
             }
-            let eligible_at_unix_nanos =
-                first_observed_at_unix_nanos.saturating_add(options.min_orphan_age_nanos);
+            let eligible_at_unix_nanos = observation
+                .first_observed_at_unix_nanos
+                .saturating_add(options.min_orphan_age_nanos);
             if newly_observed || observed_at_unix_nanos < eligible_at_unix_nanos {
                 report.retained_young_orphan_count =
                     report.retained_young_orphan_count.saturating_add(1);
@@ -1976,6 +2497,28 @@ impl LocalContentStore {
                         .map(|current| current.min(eligible_at_unix_nanos))
                         .unwrap_or(eligible_at_unix_nanos),
                 );
+                continue;
+            }
+            let Some((catalog_generation, catalog_observed_at_unix_nanos)) = catalog_observation
+            else {
+                report.retained_missing_catalog_observation_orphan_count = report
+                    .retained_missing_catalog_observation_orphan_count
+                    .saturating_add(1);
+                report.retained_missing_catalog_observation_orphan_bytes = report
+                    .retained_missing_catalog_observation_orphan_bytes
+                    .saturating_add(size_bytes);
+                continue;
+            };
+            if catalog_generation == observation.catalog_generation
+                || catalog_observed_at_unix_nanos <= observation.catalog_observed_at_unix_nanos
+                || catalog_observed_at_unix_nanos <= observation.first_observed_at_unix_nanos
+            {
+                report.retained_same_or_stale_catalog_orphan_count = report
+                    .retained_same_or_stale_catalog_orphan_count
+                    .saturating_add(1);
+                report.retained_same_or_stale_catalog_orphan_bytes = report
+                    .retained_same_or_stale_catalog_orphan_bytes
+                    .saturating_add(size_bytes);
                 continue;
             }
 
@@ -2156,6 +2699,23 @@ impl LocalContentStore {
         &self,
         options: ContentStoreVersionGcOptions,
     ) -> Result<ContentStoreVersionGcReport> {
+        let destructive_catalog_observation_is_valid = options
+            .catalog_generation
+            .as_deref()
+            .is_some_and(|generation| !generation.is_empty())
+            && options
+                .catalog_generated_at_unix_nanos
+                .is_some_and(|observed_at| observed_at > 0);
+        if !options.dry_run
+            && (!destructive_catalog_observation_is_valid
+                || options.destructive_catalog_seal.is_none())
+        {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message:
+                    "destructive version GC requires an authorized complete local catalog observation"
+                        .to_owned(),
+            });
+        }
         let mut versions_by_object = BTreeMap::<String, Vec<VersionManifestEntry>>::new();
         let scrub = self.scrub_with_stats_snapshot_and_version_entries(
             !options.dry_run,
@@ -2177,6 +2737,9 @@ impl LocalContentStore {
             scrub,
             dry_run: options.dry_run,
             min_version_age_nanos: options.min_version_age_nanos,
+            min_absence_age_nanos: options.min_absence_age_nanos,
+            catalog_generation: options.catalog_generation.clone(),
+            catalog_generated_at_unix_nanos: options.catalog_generated_at_unix_nanos,
             keep_latest_versions_per_object,
             max_deletions: options.max_deletions,
             blocked_by_scrub_issue_count,
@@ -2192,16 +2755,31 @@ impl LocalContentStore {
             .map(|entries| entries.len() as u64)
             .fold(0_u64, |total, len| total.saturating_add(len));
 
-        let mut protected_versions_by_object = BTreeMap::<&str, BTreeSet<&str>>::new();
-        for (object_id, version) in &options.protected_versions {
+        let reservation_roots = self.content_reservation_roots()?;
+        let mut protected_versions = options.protected_versions.clone();
+        protected_versions.extend(reservation_roots.versions);
+        let mut protected_versions_by_object = BTreeMap::<String, BTreeSet<String>>::new();
+        for (object_id, version) in protected_versions {
             protected_versions_by_object
-                .entry(object_id.as_str())
+                .entry(object_id)
                 .or_default()
-                .insert(version.as_str());
+                .insert(version);
         }
         let now = SystemTime::now();
+        let observed_at_unix_nanos = system_time_nanos_since_epoch_saturating(now);
+        let catalog_observation = options
+            .catalog_generation
+            .as_deref()
+            .filter(|generation| !generation.is_empty())
+            .zip(
+                options
+                    .catalog_generated_at_unix_nanos
+                    .filter(|generated_at| *generated_at > 0),
+            );
         let keep_latest_limit =
             usize::try_from(keep_latest_versions_per_object).unwrap_or(usize::MAX);
+        let max_durable_work = options.max_deletions.unwrap_or(u64::MAX);
+        let mut durable_work_count = 0_u64;
         let mut deletion_batch = Vec::with_capacity(VERSION_GC_DELETE_BATCH_SIZE);
         let mut dirty_deletion_directories = BTreeSet::new();
         let mut stats_delta = ContentStoreStatsDelta::default();
@@ -2218,6 +2796,11 @@ impl LocalContentStore {
                     .get(entry.object_id.as_str())
                     .is_some_and(|versions| versions.contains(entry.version.as_str()))
                 {
+                    if !options.dry_run {
+                        self.remove_manifest_absence_observation(
+                            &content_reservation_identity_for_entry(entry),
+                        )?;
+                    }
                     report.retained_protected_version_count =
                         report.retained_protected_version_count.saturating_add(1);
                     report.retained_protected_logical_bytes = report
@@ -2260,20 +2843,110 @@ impl LocalContentStore {
                 report.eligible_manifest_bytes = report
                     .eligible_manifest_bytes
                     .saturating_add(entry.manifest_bytes);
-                if options.dry_run {
-                    if report
-                        .max_deletions
-                        .is_some_and(|max_deletions| report.deleted_version_count >= max_deletions)
-                    {
+                let absence_observation = self.read_manifest_absence_observation(entry)?;
+                if absence_observation.is_none() {
+                    report.newly_observed_absent_version_count =
+                        report.newly_observed_absent_version_count.saturating_add(1);
+                    report.newly_observed_absent_logical_bytes = report
+                        .newly_observed_absent_logical_bytes
+                        .saturating_add(entry.logical_bytes);
+                    report.retained_absence_grace_version_count = report
+                        .retained_absence_grace_version_count
+                        .saturating_add(1);
+                    report.retained_absence_grace_logical_bytes = report
+                        .retained_absence_grace_logical_bytes
+                        .saturating_add(entry.logical_bytes);
+                    let Some((catalog_generation, catalog_generated_at_unix_nanos)) =
+                        catalog_observation
+                    else {
+                        report.retained_missing_catalog_observation_version_count = report
+                            .retained_missing_catalog_observation_version_count
+                            .saturating_add(1);
+                        report.retained_missing_catalog_observation_logical_bytes = report
+                            .retained_missing_catalog_observation_logical_bytes
+                            .saturating_add(entry.logical_bytes);
+                        continue;
+                    };
+                    let absence_eligible_at_unix_nanos =
+                        observed_at_unix_nanos.saturating_add(options.min_absence_age_nanos);
+                    report.next_eligible_at_unix_nanos = Some(
+                        report
+                            .next_eligible_at_unix_nanos
+                            .map(|current| current.min(absence_eligible_at_unix_nanos))
+                            .unwrap_or(absence_eligible_at_unix_nanos),
+                    );
+                    if durable_work_count >= max_durable_work {
                         report.max_deletions_reached = true;
                         report.retained_limit_version_count =
                             report.retained_limit_version_count.saturating_add(1);
                         report.retained_limit_logical_bytes = report
                             .retained_limit_logical_bytes
                             .saturating_add(entry.logical_bytes);
+                    } else if options.dry_run {
+                        durable_work_count = durable_work_count.saturating_add(1);
+                    } else {
+                        self.persist_manifest_absence_observation(
+                            entry,
+                            observed_at_unix_nanos,
+                            catalog_generation,
+                            catalog_generated_at_unix_nanos,
+                        )?;
+                        durable_work_count = durable_work_count.saturating_add(1);
+                        report.persisted_absence_observation_count =
+                            report.persisted_absence_observation_count.saturating_add(1);
                     }
                     continue;
                 }
+                let absence_observation =
+                    absence_observation.expect("checked manifest absence observation");
+                let Some((catalog_generation, catalog_generated_at_unix_nanos)) =
+                    catalog_observation
+                else {
+                    report.retained_missing_catalog_observation_version_count = report
+                        .retained_missing_catalog_observation_version_count
+                        .saturating_add(1);
+                    report.retained_missing_catalog_observation_logical_bytes = report
+                        .retained_missing_catalog_observation_logical_bytes
+                        .saturating_add(entry.logical_bytes);
+                    continue;
+                };
+                if catalog_generation == absence_observation.catalog_generation
+                    || catalog_generated_at_unix_nanos
+                        <= absence_observation.first_observed_at_unix_nanos
+                    || catalog_generated_at_unix_nanos
+                        <= absence_observation.catalog_generated_at_unix_nanos
+                {
+                    report.retained_same_or_stale_catalog_version_count = report
+                        .retained_same_or_stale_catalog_version_count
+                        .saturating_add(1);
+                    report.retained_same_or_stale_catalog_logical_bytes = report
+                        .retained_same_or_stale_catalog_logical_bytes
+                        .saturating_add(entry.logical_bytes);
+                    continue;
+                }
+                let absence_eligible_at_unix_nanos = absence_observation
+                    .first_observed_at_unix_nanos
+                    .saturating_add(options.min_absence_age_nanos);
+                if observed_at_unix_nanos < absence_eligible_at_unix_nanos {
+                    report.retained_absence_grace_version_count = report
+                        .retained_absence_grace_version_count
+                        .saturating_add(1);
+                    report.retained_absence_grace_logical_bytes = report
+                        .retained_absence_grace_logical_bytes
+                        .saturating_add(entry.logical_bytes);
+                    report.next_eligible_at_unix_nanos = Some(
+                        report
+                            .next_eligible_at_unix_nanos
+                            .map(|current| current.min(absence_eligible_at_unix_nanos))
+                            .unwrap_or(absence_eligible_at_unix_nanos),
+                    );
+                    continue;
+                }
+                report.deletion_ready_version_count =
+                    report.deletion_ready_version_count.saturating_add(1);
+                report.deletion_ready_logical_bytes = report
+                    .deletion_ready_logical_bytes
+                    .saturating_add(entry.logical_bytes);
 
                 if deletion_batch.len() >= VERSION_GC_DELETE_BATCH_SIZE {
                     self.flush_version_manifest_deletion_batch(
@@ -2283,29 +2956,17 @@ impl LocalContentStore {
                         &mut stats_delta,
                     )?;
                 }
-                if report.max_deletions.is_some_and(|max_deletions| {
-                    report
-                        .deleted_version_count
-                        .saturating_add(deletion_batch.len() as u64)
-                        >= max_deletions
-                }) {
-                    self.flush_version_manifest_deletion_batch(
-                        &mut deletion_batch,
-                        &mut dirty_deletion_directories,
-                        &mut report,
-                        &mut stats_delta,
-                    )?;
-                }
-                if report
-                    .max_deletions
-                    .is_some_and(|max_deletions| report.deleted_version_count >= max_deletions)
-                {
+                if durable_work_count >= max_durable_work {
                     report.max_deletions_reached = true;
                     report.retained_limit_version_count =
                         report.retained_limit_version_count.saturating_add(1);
                     report.retained_limit_logical_bytes = report
                         .retained_limit_logical_bytes
                         .saturating_add(entry.logical_bytes);
+                    continue;
+                }
+                durable_work_count = durable_work_count.saturating_add(1);
+                if options.dry_run {
                     continue;
                 }
                 deletion_batch.push(entry.clone());
@@ -2506,7 +3167,7 @@ impl LocalContentStore {
         let (patch_hash, patch_size) = if bytes.is_empty() {
             (None, 0)
         } else {
-            let (hash, size) = self.write_bytes_as_blob(bytes)?;
+            let (hash, size) = self.write_bytes_as_blob(object_id, target_version, bytes)?;
             (Some(hash), size)
         };
         self.put_object_version_patch_from_blob(
@@ -2541,7 +3202,7 @@ impl LocalContentStore {
         let (patch_hash, patch_size) = if bytes.is_empty() {
             (None, 0)
         } else {
-            let (hash, size) = self.write_bytes_as_blob(bytes)?;
+            let (hash, size) = self.write_bytes_as_blob(object_id, target_version, bytes)?;
             (Some(hash), size)
         };
         self.put_object_version_patch_from_blob_with_trusted_content_hash(
@@ -2725,6 +3386,7 @@ impl LocalContentStore {
                 base_identity,
             );
         }
+        self.ensure_content_reservation(object_id, target_version, &patch_hash)?;
         let blob_path = self.blob_path(&patch_hash)?;
         if !self.has_blob(&patch_hash)? {
             self.ensure_quota_delta(ContentStoreQuotaDelta {
@@ -2913,6 +3575,13 @@ impl LocalContentStore {
         });
         let target_extents = coalesce_extents(target_extents)?;
         validate_extents_cover_size(&target_extents, target_size, object_id, target_version)?;
+        for content_hash in target_extents
+            .iter()
+            .map(|extent| extent.content_hash.as_str())
+            .collect::<BTreeSet<_>>()
+        {
+            self.ensure_content_reservation(object_id, target_version, content_hash)?;
+        }
         let placeholder_content_hash = trusted_content_hash.unwrap_or(&base_manifest.content_hash);
         let target_manifest_for_hash = ContentManifest {
             object_id: object_id.to_owned(),
@@ -2972,6 +3641,11 @@ impl LocalContentStore {
                     new_hash: hash,
                 });
             }
+            self.ensure_content_reservation(
+                &existing.object_id,
+                &existing.version,
+                &existing.content_hash,
+            )?;
             let blob_path = self.blob_path(&hash)?;
             if !self.has_blob(&hash)? {
                 self.ensure_quota_delta(ContentStoreQuotaDelta {
@@ -2994,6 +3668,11 @@ impl LocalContentStore {
             size_bytes: bytes.len() as u64,
             extents: Vec::new(),
         };
+        self.ensure_content_reservation(
+            &manifest.object_id,
+            &manifest.version,
+            &manifest.content_hash,
+        )?;
         let manifest_bytes = encode_manifest(&manifest)?;
         self.ensure_quota_delta(ContentStoreQuotaDelta {
             blob_bytes: if blob_needs_write {
@@ -3187,6 +3866,11 @@ impl LocalContentStore {
                     new_hash: hash,
                 });
             }
+            self.ensure_content_reservation(
+                &existing.object_id,
+                &existing.version,
+                &existing.content_hash,
+            )?;
             content_store_perf_trace(format_args!(
                 "blob-only-write object={} version={} bytes={} existing_manifest=true hash_ms={} manifest_check_ms={} total_ms={}",
                 object_id,
@@ -3223,6 +3907,11 @@ impl LocalContentStore {
             size_bytes: bytes.len() as u64,
             extents: Vec::new(),
         };
+        self.ensure_content_reservation(
+            &manifest.object_id,
+            &manifest.version,
+            &manifest.content_hash,
+        )?;
 
         let has_blob_started = Instant::now();
         let blob_exists = self.has_blob(&manifest.content_hash)?;
@@ -3303,6 +3992,11 @@ impl LocalContentStore {
                 size_bytes: bytes.len() as u64,
                 extents: Vec::new(),
             };
+            self.ensure_content_reservation(
+                &manifest.object_id,
+                &manifest.version,
+                &manifest.content_hash,
+            )?;
 
             let create_dir_started = Instant::now();
             if let Some(parent) = blob_path.parent() {
@@ -3414,6 +4108,13 @@ impl LocalContentStore {
                 manifest_bytes,
                 manifest_path,
             });
+        }
+        for prepared in &prepared {
+            self.ensure_content_reservation(
+                &prepared.manifest.object_id,
+                &prepared.manifest.version,
+                &prepared.manifest.content_hash,
+            )?;
         }
 
         let mut blob_writes = Vec::new();
@@ -3586,6 +4287,11 @@ impl LocalContentStore {
                     new_hash: hash,
                 });
             }
+            self.ensure_content_reservation(
+                &existing.object_id,
+                &existing.version,
+                &existing.content_hash,
+            )?;
             let blob_path = self.blob_path(&hash)?;
             if !self.has_blob(&hash)? {
                 self.ensure_quota_delta(ContentStoreQuotaDelta {
@@ -3608,6 +4314,11 @@ impl LocalContentStore {
             size_bytes,
             extents: Vec::new(),
         };
+        self.ensure_content_reservation(
+            &manifest.object_id,
+            &manifest.version,
+            &manifest.content_hash,
+        )?;
         let manifest_bytes = encode_manifest(&manifest)?;
         self.ensure_quota_delta(ContentStoreQuotaDelta {
             blob_bytes: if blob_needs_publish {
@@ -4506,8 +5217,14 @@ impl LocalContentStore {
         }))
     }
 
-    fn write_bytes_as_blob(&self, bytes: &[u8]) -> Result<(String, u64)> {
+    fn write_bytes_as_blob(
+        &self,
+        object_id: &str,
+        version: &str,
+        bytes: &[u8],
+    ) -> Result<(String, u64)> {
         let hash = content_hash(bytes);
+        self.ensure_content_reservation(object_id, version, &hash)?;
         let blob_path = self.blob_path(&hash)?;
         let blob_needs_write = !self.has_blob(&hash)?;
         if blob_needs_write {
@@ -4578,10 +5295,20 @@ impl LocalContentStore {
                     new_hash: manifest.content_hash,
                 });
             }
+            self.ensure_content_reservation(
+                &existing.object_id,
+                &existing.version,
+                &existing.content_hash,
+            )?;
             self.clear_orphan_observations_before_manifest_publish(std::iter::once(&existing))?;
             self.ensure_content_manifest_index_best_effort(&existing);
             return Ok(existing);
         }
+        self.ensure_content_reservation(
+            &manifest.object_id,
+            &manifest.version,
+            &manifest.content_hash,
+        )?;
         let manifest_bytes = encode_manifest(&manifest)?;
         self.ensure_quota_delta(ContentStoreQuotaDelta {
             logical_object_bytes: manifest.size_bytes,
@@ -4684,6 +5411,12 @@ impl LocalContentStore {
         let mut touched_object_directories = BTreeSet::<PathBuf>::new();
 
         for entry in entries {
+            // Forget the observation epoch before unlinking the manifest. A
+            // crash between these operations only forces another complete
+            // absence observation and grace period.
+            self.remove_manifest_absence_observation(&content_reservation_identity_for_entry(
+                entry,
+            ))?;
             if let Some(parent) =
                 self.remove_content_manifest_index_for_version_if_current_without_sync(entry)?
             {
@@ -4817,18 +5550,272 @@ impl LocalContentStore {
         Ok(removed_count)
     }
 
+    fn persist_content_reservation(
+        &self,
+        identity: &ContentStoreReservationIdentity,
+    ) -> Result<()> {
+        let path = self.content_reservation_path(identity);
+        if path.is_file() {
+            let reservation = decode_content_reservation(&read_file(&path)?)?;
+            validate_content_reservation(&reservation, identity)?;
+            return Ok(());
+        }
+        let reservation_root = self.root.join(CONTENT_RESERVATION_DIR);
+        let root_existed = reservation_root.is_dir();
+        let shard_existed = path.parent().is_some_and(Path::is_dir);
+        let reservation = ContentStoreReservation {
+            format_version: CONTENT_RESERVATION_FORMAT_VERSION,
+            identity: identity.clone(),
+            reserved_at_unix_nanos: system_time_nanos_since_epoch_saturating(SystemTime::now()),
+        };
+        let bytes = encode_content_reservation(&reservation)?;
+        match write_file_create_new_atomic(&path, &bytes) {
+            Ok(()) => {}
+            Err(ContentStoreError::Io { source, .. })
+                if source.kind() == io::ErrorKind::AlreadyExists =>
+            {
+                let existing = decode_content_reservation(&read_file(&path)?)?;
+                validate_content_reservation(&existing, identity)?;
+            }
+            Err(error) => return Err(error),
+        }
+        self.sync_new_sharded_record_parents(
+            &reservation_root,
+            path.parent(),
+            root_existed,
+            shard_existed,
+        )
+    }
+
+    fn read_content_reservations(&self) -> Result<Vec<ContentStoreReservationRecord>> {
+        let root = self.root.join(CONTENT_RESERVATION_DIR);
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut reservations = Vec::new();
+        let mut shard_entries = read_dir(&root)?;
+        shard_entries.sort_by_key(|entry| entry.path());
+        for shard_entry in shard_entries {
+            let shard_path = shard_entry.path();
+            if !shard_path.is_dir() {
+                continue;
+            }
+            let mut entries = read_dir(&shard_path)?;
+            entries.sort_by_key(|entry| entry.path());
+            for entry in entries {
+                let path = entry.path();
+                if !path.is_file()
+                    || path.extension().and_then(|extension| extension.to_str()) != Some("sobj")
+                {
+                    continue;
+                }
+                let reservation = decode_content_reservation(&read_file(&path)?)?;
+                validate_content_reservation(&reservation, &reservation.identity)?;
+                let expected_path = self.content_reservation_path(&reservation.identity);
+                if path != expected_path {
+                    return Err(ContentStoreError::InvalidContentLayout {
+                        message: format!(
+                            "content reservation path mismatch: expected={}, actual={}",
+                            expected_path.display(),
+                            path.display()
+                        ),
+                    });
+                }
+                reservations.push(ContentStoreReservationRecord {
+                    identity: reservation.identity,
+                    reserved_at_unix_nanos: reservation.reserved_at_unix_nanos,
+                });
+            }
+        }
+        reservations.sort_by(|left, right| left.identity.cmp(&right.identity));
+        reservations.dedup_by(|left, right| left.identity == right.identity);
+        Ok(reservations)
+    }
+
+    fn read_content_reservation_reconciliation_cursor(
+        &self,
+    ) -> Result<Option<ContentStoreReservationReconciliationCursor>> {
+        let path = self.content_reservation_reconciliation_cursor_path();
+        let bytes = match read_file(&path) {
+            Ok(bytes) => bytes,
+            Err(ContentStoreError::Io { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let cursor = decode_content_reservation_reconciliation_cursor(&bytes)?;
+        validate_content_reservation_reconciliation_cursor(&cursor)?;
+        Ok(Some(cursor))
+    }
+
+    fn persist_content_reservation_reconciliation_cursor(
+        &self,
+        catalog_generation: &str,
+        after: &ContentStoreReservationIdentity,
+    ) -> Result<()> {
+        let cursor = ContentStoreReservationReconciliationCursor {
+            format_version: CONTENT_RESERVATION_RECONCILIATION_CURSOR_FORMAT_VERSION,
+            catalog_generation: catalog_generation.to_owned(),
+            after: after.clone(),
+        };
+        let bytes = encode_content_reservation_reconciliation_cursor(&cursor)?;
+        write_file_atomic(
+            &self.content_reservation_reconciliation_cursor_path(),
+            &bytes,
+        )
+    }
+
+    fn clear_content_reservation_reconciliation_cursor(&self) -> Result<bool> {
+        remove_file_if_exists_and_sync_parent(
+            &self.content_reservation_reconciliation_cursor_path(),
+        )
+    }
+
+    fn read_manifest_absence_observation(
+        &self,
+        entry: &VersionManifestEntry,
+    ) -> Result<Option<ManifestAbsenceObservation>> {
+        let identity = content_reservation_identity_for_entry(entry);
+        let path = self.manifest_absence_observation_path(&identity);
+        let bytes = match read_file(&path) {
+            Ok(bytes) => bytes,
+            Err(ContentStoreError::Io { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        match decode_manifest_absence_observation(&bytes).and_then(|observation| {
+            validate_manifest_absence_observation(&observation, &identity)?;
+            Ok(observation)
+        }) {
+            Ok(observation) => Ok(Some(observation)),
+            Err(error) => {
+                // Invalid absence state must never accelerate deletion. Reset
+                // its epoch on the next write pass instead.
+                content_store_perf_trace(format_args!(
+                    "reset invalid manifest absence observation object={} version={} path={} error={error}",
+                    entry.object_id,
+                    entry.version,
+                    path.display()
+                ));
+                Ok(None)
+            }
+        }
+    }
+
+    fn persist_manifest_absence_observation(
+        &self,
+        entry: &VersionManifestEntry,
+        observed_at_unix_nanos: u64,
+        catalog_generation: &str,
+        catalog_generated_at_unix_nanos: u64,
+    ) -> Result<ManifestAbsenceObservation> {
+        let identity = content_reservation_identity_for_entry(entry);
+        let path = self.manifest_absence_observation_path(&identity);
+        if let Some(existing) = self.read_manifest_absence_observation(entry)? {
+            return Ok(existing);
+        }
+        let observation = ManifestAbsenceObservation {
+            format_version: MANIFEST_ABSENCE_OBSERVATION_FORMAT_VERSION,
+            object_id: identity.object_id,
+            version: identity.version,
+            content_hash: identity.content_hash,
+            first_observed_at_unix_nanos: observed_at_unix_nanos,
+            catalog_generation: catalog_generation.to_owned(),
+            catalog_generated_at_unix_nanos,
+        };
+        let bytes = encode_manifest_absence_observation(&observation)?;
+        let observation_root = self.root.join(MANIFEST_ABSENCE_OBSERVATION_DIR);
+        let root_existed = observation_root.is_dir();
+        let shard_existed = path.parent().is_some_and(Path::is_dir);
+        if path.is_file() {
+            // Replacing corrupt state with a fresh epoch can only retain data
+            // longer, and the atomic write makes the reset durable.
+            write_file_atomic(&path, &bytes)?;
+        } else {
+            match write_file_create_new_atomic(&path, &bytes) {
+                Ok(()) => {}
+                Err(ContentStoreError::Io { source, .. })
+                    if source.kind() == io::ErrorKind::AlreadyExists =>
+                {
+                    let existing = decode_manifest_absence_observation(&read_file(&path)?)?;
+                    validate_manifest_absence_observation(
+                        &existing,
+                        &content_reservation_identity_for_entry(entry),
+                    )?;
+                    return Ok(existing);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.sync_new_sharded_record_parents(
+            &observation_root,
+            path.parent(),
+            root_existed,
+            shard_existed,
+        )?;
+        Ok(observation)
+    }
+
+    fn sync_new_sharded_record_parents(
+        &self,
+        record_root: &Path,
+        shard: Option<&Path>,
+        root_existed: bool,
+        shard_existed: bool,
+    ) -> Result<()> {
+        if !shard_existed {
+            sync_dir(record_root)?;
+        }
+        if !root_existed {
+            sync_dir(&self.root)?;
+        }
+        if shard.is_none() {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: format!(
+                    "sharded content record has no parent under {}",
+                    record_root.display()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn remove_manifest_absence_observation(
+        &self,
+        identity: &ContentStoreReservationIdentity,
+    ) -> Result<bool> {
+        remove_file_if_exists_and_sync_parent(&self.manifest_absence_observation_path(identity))
+    }
+
     fn read_orphan_observation_or_fresh(
         &self,
         content_hash: &str,
         observed_at_unix_nanos: u64,
-    ) -> Result<(u64, bool)> {
+        catalog_observation: Option<(&str, u64)>,
+    ) -> Result<(OrphanObservation, bool)> {
+        let fresh_observation = || OrphanObservation {
+            format_version: ORPHAN_OBSERVATION_FORMAT_VERSION,
+            content_hash: content_hash.to_owned(),
+            first_observed_at_unix_nanos: observed_at_unix_nanos,
+            catalog_generation: catalog_observation
+                .map(|(generation, _)| generation.to_owned())
+                .unwrap_or_default(),
+            catalog_observed_at_unix_nanos: catalog_observation
+                .map(|(_, observed_at)| observed_at)
+                .unwrap_or(0),
+        };
         let path = self.orphan_observation_path(content_hash)?;
         let bytes = match read_file(&path) {
             Ok(bytes) => bytes,
             Err(ContentStoreError::Io { source, .. })
                 if source.kind() == io::ErrorKind::NotFound =>
             {
-                return Ok((observed_at_unix_nanos, true));
+                return Ok((fresh_observation(), true));
             }
             Err(error) => return Err(error),
         };
@@ -4836,7 +5823,7 @@ impl LocalContentStore {
             validate_orphan_observation(&observation, content_hash)?;
             Ok(observation)
         }) {
-            Ok(observation) => Ok((observation.first_observed_at_unix_nanos, false)),
+            Ok(observation) => Ok((observation, false)),
             Err(error) => {
                 // Observation state only delays deletion. Treating a torn or
                 // corrupt marker as a fresh observation resets the grace
@@ -4846,7 +5833,7 @@ impl LocalContentStore {
                     "reset invalid orphan observation hash={content_hash} path={} error={error}",
                     path.display()
                 ));
-                Ok((observed_at_unix_nanos, true))
+                Ok((fresh_observation(), true))
             }
         }
     }
@@ -4855,6 +5842,8 @@ impl LocalContentStore {
         &self,
         content_hash: &str,
         observed_at_unix_nanos: u64,
+        catalog_generation: &str,
+        catalog_observed_at_unix_nanos: u64,
     ) -> Result<RelaxedOrphanObservationWrite> {
         let path = self.orphan_observation_path(content_hash)?;
         let parent = path
@@ -4863,11 +5852,14 @@ impl LocalContentStore {
             .to_owned();
         let root = self.root.join(ORPHAN_OBSERVATION_DIR);
         let root_created = !root.is_dir();
-        let (existing_at, existing_is_fresh) =
-            self.read_orphan_observation_or_fresh(content_hash, observed_at_unix_nanos)?;
+        let (observation, existing_is_fresh) = self.read_orphan_observation_or_fresh(
+            content_hash,
+            observed_at_unix_nanos,
+            Some((catalog_generation, catalog_observed_at_unix_nanos)),
+        )?;
         if !existing_is_fresh {
             return Ok(RelaxedOrphanObservationWrite {
-                first_observed_at_unix_nanos: existing_at,
+                observation,
                 created: false,
                 size_bytes: file_len_if_exists(&path)?.unwrap_or(0),
                 parent,
@@ -4875,11 +5867,6 @@ impl LocalContentStore {
             });
         }
 
-        let observation = OrphanObservation {
-            format_version: ORPHAN_OBSERVATION_FORMAT_VERSION,
-            content_hash: content_hash.to_owned(),
-            first_observed_at_unix_nanos: observed_at_unix_nanos,
-        };
         let bytes = encode_orphan_observation(&observation)?;
         if path.is_file() {
             // A corrupt marker is not useful recovery evidence. Removing it
@@ -4889,7 +5876,7 @@ impl LocalContentStore {
         create_dir_all(parent.clone())?;
         write_files_create_new_relaxed([(path, bytes.as_slice())])?;
         Ok(RelaxedOrphanObservationWrite {
-            first_observed_at_unix_nanos: observed_at_unix_nanos,
+            observation,
             created: true,
             size_bytes: bytes.len() as u64,
             parent,
@@ -4901,11 +5888,18 @@ impl LocalContentStore {
         &self,
         content_hash: &str,
         observed_at_unix_nanos: u64,
+        catalog_observation: Option<(&str, u64)>,
     ) -> Result<u64> {
         let observation = OrphanObservation {
             format_version: ORPHAN_OBSERVATION_FORMAT_VERSION,
             content_hash: content_hash.to_owned(),
             first_observed_at_unix_nanos: observed_at_unix_nanos,
+            catalog_generation: catalog_observation
+                .map(|(generation, _)| generation.to_owned())
+                .unwrap_or_default(),
+            catalog_observed_at_unix_nanos: catalog_observation
+                .map(|(_, observed_at)| observed_at)
+                .unwrap_or(0),
         };
         Ok(u64::try_from(encode_orphan_observation(&observation)?.len()).unwrap_or(u64::MAX))
     }
@@ -5064,6 +6058,30 @@ impl LocalContentStore {
             .join(format!("{hex}.sobj")))
     }
 
+    fn content_reservation_path(&self, identity: &ContentStoreReservationIdentity) -> PathBuf {
+        let digest = content_identity_digest(identity);
+        self.root
+            .join(CONTENT_RESERVATION_DIR)
+            .join(&digest[..2])
+            .join(format!("{digest}.sobj"))
+    }
+
+    fn content_reservation_reconciliation_cursor_path(&self) -> PathBuf {
+        self.root
+            .join(CONTENT_RESERVATION_RECONCILIATION_CURSOR_FILE)
+    }
+
+    fn manifest_absence_observation_path(
+        &self,
+        identity: &ContentStoreReservationIdentity,
+    ) -> PathBuf {
+        let digest = content_identity_digest(identity);
+        self.root
+            .join(MANIFEST_ABSENCE_OBSERVATION_DIR)
+            .join(&digest[..2])
+            .join(format!("{digest}.sobj"))
+    }
+
     fn blob_path(&self, hash: &str) -> Result<PathBuf> {
         let hex = hash_hex(hash)?;
         Ok(self.root.join("blobs").join(&hex[..2]).join(hex))
@@ -5136,6 +6154,155 @@ fn decode_manifest(bytes: &[u8]) -> Result<ContentManifest> {
         .map_err(|source| ContentStoreError::Serde(source.to_string()))
 }
 
+fn encode_content_reservation(reservation: &ContentStoreReservation) -> Result<Vec<u8>> {
+    sinomo_object_serde::to_bytes(reservation, 1, LengthMode::U32)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn decode_content_reservation(bytes: &[u8]) -> Result<ContentStoreReservation> {
+    sinomo_object_serde::from_bytes(bytes)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn encode_content_reservation_reconciliation_cursor(
+    cursor: &ContentStoreReservationReconciliationCursor,
+) -> Result<Vec<u8>> {
+    sinomo_object_serde::to_bytes(cursor, 1, LengthMode::U32)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn decode_content_reservation_reconciliation_cursor(
+    bytes: &[u8],
+) -> Result<ContentStoreReservationReconciliationCursor> {
+    sinomo_object_serde::from_bytes(bytes)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn validate_content_reservation_reconciliation_cursor(
+    cursor: &ContentStoreReservationReconciliationCursor,
+) -> Result<()> {
+    if cursor.format_version != CONTENT_RESERVATION_RECONCILIATION_CURSOR_FORMAT_VERSION {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: format!(
+                "unsupported content reservation reconciliation cursor format version {}",
+                cursor.format_version
+            ),
+        });
+    }
+    if cursor.catalog_generation.is_empty() {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: "content reservation reconciliation cursor has an empty catalog generation"
+                .to_owned(),
+        });
+    }
+    hash_hex(&cursor.after.content_hash)?;
+    Ok(())
+}
+
+fn validate_content_reservation(
+    reservation: &ContentStoreReservation,
+    expected: &ContentStoreReservationIdentity,
+) -> Result<()> {
+    if reservation.format_version != CONTENT_RESERVATION_FORMAT_VERSION {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: format!(
+                "unsupported content reservation format version {}",
+                reservation.format_version
+            ),
+        });
+    }
+    if reservation.reserved_at_unix_nanos == 0 {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: "content reservation has an invalid zero reservation timestamp".to_owned(),
+        });
+    }
+    hash_hex(&reservation.identity.content_hash)?;
+    if &reservation.identity != expected {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: format!(
+                "content reservation identity mismatch: expected={expected:?}, actual={:?}",
+                reservation.identity
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn content_identity_digest(identity: &ContentStoreReservationIdentity) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo-content-identity-v1");
+    for field in [
+        identity.object_id.as_bytes(),
+        identity.version.as_bytes(),
+        identity.content_hash.as_bytes(),
+    ] {
+        hasher.update(&(field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn content_reservation_identity_for_entry(
+    entry: &VersionManifestEntry,
+) -> ContentStoreReservationIdentity {
+    ContentStoreReservationIdentity {
+        object_id: entry.object_id.clone(),
+        version: entry.version.clone(),
+        content_hash: entry.content_hash.clone(),
+    }
+}
+
+fn encode_manifest_absence_observation(
+    observation: &ManifestAbsenceObservation,
+) -> Result<Vec<u8>> {
+    sinomo_object_serde::to_bytes(observation, 1, LengthMode::U32)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn decode_manifest_absence_observation(bytes: &[u8]) -> Result<ManifestAbsenceObservation> {
+    sinomo_object_serde::from_bytes(bytes)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn validate_manifest_absence_observation(
+    observation: &ManifestAbsenceObservation,
+    expected: &ContentStoreReservationIdentity,
+) -> Result<()> {
+    if observation.format_version != MANIFEST_ABSENCE_OBSERVATION_FORMAT_VERSION {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: format!(
+                "unsupported manifest absence observation format version {}",
+                observation.format_version
+            ),
+        });
+    }
+    if observation.first_observed_at_unix_nanos == 0 {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: "manifest absence observation has an invalid zero timestamp".to_owned(),
+        });
+    }
+    if observation.catalog_generation.is_empty() || observation.catalog_generated_at_unix_nanos == 0
+    {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: "manifest absence observation has an invalid catalog proof".to_owned(),
+        });
+    }
+    let actual = ContentStoreReservationIdentity {
+        object_id: observation.object_id.clone(),
+        version: observation.version.clone(),
+        content_hash: observation.content_hash.clone(),
+    };
+    hash_hex(&actual.content_hash)?;
+    if &actual != expected {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: format!(
+                "manifest absence observation identity mismatch: expected={expected:?}, actual={actual:?}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn encode_orphan_observation(observation: &OrphanObservation) -> Result<Vec<u8>> {
     sinomo_object_serde::to_bytes(observation, 1, LengthMode::U32)
         .map_err(|source| ContentStoreError::Serde(source.to_string()))
@@ -5156,6 +6323,17 @@ fn validate_orphan_observation(
                 "unsupported orphan observation format version {}",
                 observation.format_version
             ),
+        });
+    }
+    if observation.first_observed_at_unix_nanos == 0 {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: "orphan observation has an invalid zero timestamp".to_owned(),
+        });
+    }
+    if observation.catalog_generation.is_empty() || observation.catalog_observed_at_unix_nanos == 0
+    {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: "orphan observation has an invalid catalog proof".to_owned(),
         });
     }
     if observation.content_hash != expected_content_hash {
@@ -5756,6 +6934,29 @@ fn write_content_addressed_blob_bytes_prehashed_defer_dir_sync_inner(
 mod tests {
     use super::*;
 
+    static TEST_ORPHAN_CATALOG_OBSERVATION: AtomicU64 = AtomicU64::new(1);
+
+    fn orphan_catalog_observation() -> (String, u64) {
+        let sequence = TEST_ORPHAN_CATALOG_OBSERVATION.fetch_add(1, Ordering::SeqCst);
+        (
+            format!("test-orphan-catalog-generation-{sequence}"),
+            system_time_nanos_since_epoch_saturating(SystemTime::now())
+                .saturating_add(sequence.saturating_mul(1_000_000_000)),
+        )
+    }
+
+    fn delete_eligible_orphan_gc_options(min_orphan_age: Duration) -> ContentStoreGcOptions {
+        let (generation, observed_at_unix_nanos) = orphan_catalog_observation();
+        ContentStoreGcOptions::delete_eligible(min_orphan_age)
+            .with_catalog_observation(generation, observed_at_unix_nanos)
+    }
+
+    fn dry_run_orphan_gc_options(min_orphan_age: Duration) -> ContentStoreGcOptions {
+        let (generation, observed_at_unix_nanos) = orphan_catalog_observation();
+        ContentStoreGcOptions::dry_run(min_orphan_age)
+            .with_catalog_observation(generation, observed_at_unix_nanos)
+    }
+
     #[test]
     fn streamed_object_ingest_hashes_and_publishes_incremental_chunks() {
         let root = temp_root("streamed_object_ingest_incremental");
@@ -5810,10 +7011,665 @@ mod tests {
             .bind_quarantined_blob("stream-object", "v1", blob)
             .expect("bind validated blob");
         assert_eq!(manifest.content_hash, expected_hash);
+        let roots = store
+            .content_reservation_roots()
+            .expect("read bound reservation");
+        assert_eq!(roots.reservation_count, 1);
+        assert_eq!(roots.reservations[0].identity.object_id, "stream-object");
+        assert_eq!(roots.reservations[0].identity.version, "v1");
+        assert_eq!(roots.reservations[0].identity.content_hash, expected_hash);
         let (_, stored_bytes) = store
             .read_object_version("stream-object", "v1")
             .expect("read bound object");
         assert_eq!(stored_bytes, bytes);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn durable_content_reservations_survive_restart_and_protect_gc_roots() {
+        let root = temp_root("durable_content_reservations_survive_restart");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let old = store
+            .put_object_version("reserved-object", "version_1", b"reserved old bytes")
+            .expect("put reserved old version");
+        store
+            .put_object_version("reserved-object", "version_2", b"reserved latest bytes")
+            .expect("put reserved latest version");
+        let blob_only = store
+            .put_object_version_blob_only(
+                "reserved-blob-only-object",
+                "version_1",
+                b"reserved blob-only bytes",
+            )
+            .expect("put reserved blob-only version");
+
+        let roots = store
+            .content_reservation_roots()
+            .expect("read initial reservation roots");
+        assert_eq!(roots.reservation_count, 3);
+        assert!(
+            roots
+                .reservations
+                .iter()
+                .all(|reservation| reservation.reserved_at_unix_nanos > 0)
+        );
+        assert!(
+            roots
+                .versions
+                .contains(&("reserved-object".to_owned(), "version_1".to_owned()))
+        );
+        assert!(roots.content_hashes.contains(&old.content_hash));
+        assert!(roots.content_hashes.contains(&blob_only.content_hash));
+        drop(store);
+
+        let reopened = LocalContentStore::new(&root).expect("reopen store");
+        let reopened_roots = reopened
+            .content_reservation_roots()
+            .expect("read reopened reservation roots");
+        assert_eq!(reopened_roots, roots);
+
+        for catalog_index in 0..2 {
+            let versions = reopened
+                .collect_versions(
+                    ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
+                        .with_min_absence_age(Duration::ZERO)
+                        .with_catalog_observation(
+                            format!("reserved-catalog-generation-{catalog_index}"),
+                            catalog_index + 1,
+                        ),
+                )
+                .expect("reserved version GC");
+            assert_eq!(versions.deleted_version_count, 0);
+            assert_eq!(versions.newly_observed_absent_version_count, 0);
+
+            let blobs = reopened
+                .collect_garbage(delete_eligible_orphan_gc_options(Duration::ZERO))
+                .expect("reserved blob GC");
+            assert_eq!(blobs.deleted_orphan_count, 0);
+            assert_eq!(blobs.newly_observed_orphan_count, 0);
+            assert_eq!(blobs.retained_protected_orphan_count, 1);
+        }
+        assert!(
+            reopened
+                .read_manifest("reserved-object", "version_1")
+                .is_ok()
+        );
+        assert!(
+            reopened
+                .has_blob(&blob_only.content_hash)
+                .expect("reserved blob-only content remains")
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn reservation_only_crash_state_is_reconciled_after_restart() {
+        let root = temp_root("reservation_only_crash_recovery");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let content_hash = content_hash(b"never published");
+        store
+            .ensure_content_reservation("abandoned-object", "v1", &content_hash)
+            .expect("persist reservation before simulated crash");
+        let reserved_at_unix_nanos = store
+            .content_reservation_roots()
+            .expect("read reservation before restart")
+            .reservations[0]
+            .reserved_at_unix_nanos;
+        drop(store);
+
+        let reopened = LocalContentStore::new(&root).expect("reopen after simulated crash");
+        assert_eq!(
+            reopened
+                .content_reservation_roots()
+                .expect("read recovered reservation")
+                .reservation_count,
+            1
+        );
+        let reconciled = reopened
+            .reconcile_content_reservations_with_catalog(
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                ContentStoreReservationReconciliationOptions::bounded(
+                    reserved_at_unix_nanos.saturating_add(1),
+                    Duration::ZERO,
+                    8,
+                )
+                .with_catalog_generation("catalog-generation-after-crash"),
+            )
+            .expect("reject abandoned reservation from complete catalog");
+        assert_eq!(reconciled.examined_reservation_count, 1);
+        assert_eq!(reconciled.released_rejected_count, 1);
+        assert_eq!(
+            reopened
+                .content_reservation_roots()
+                .expect("reservation removed")
+                .reservation_count,
+            0
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn bounded_catalog_reconciliation_covers_rejects_and_honors_grace() {
+        let root = temp_root("bounded_catalog_reconciliation");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let covered = store
+            .put_object_version_blob_only("a-covered", "v1", b"covered")
+            .expect("put covered reservation");
+        store
+            .put_object_version_blob_only("b-partial", "v1", b"partial")
+            .expect("put partial reservation");
+        store
+            .put_object_version_blob_only("c-absent", "v1", b"absent")
+            .expect("put absent reservation");
+        let roots = store
+            .content_reservation_roots()
+            .expect("read reservations");
+        let catalog_generated_at_unix_nanos = roots
+            .reservations
+            .iter()
+            .map(|reservation| reservation.reserved_at_unix_nanos)
+            .max()
+            .expect("reservation timestamp")
+            .saturating_add(1);
+        let catalog_versions = BTreeSet::from([
+            ("a-covered".to_owned(), "v1".to_owned()),
+            ("b-partial".to_owned(), "v1".to_owned()),
+        ]);
+        let catalog_hashes = BTreeSet::from([covered.content_hash]);
+
+        let first = store
+            .reconcile_content_reservations_with_catalog(
+                &catalog_versions,
+                &catalog_hashes,
+                ContentStoreReservationReconciliationOptions::bounded(
+                    catalog_generated_at_unix_nanos,
+                    Duration::from_nanos(1),
+                    2,
+                )
+                .with_catalog_generation("catalog-generation-1"),
+            )
+            .expect("reconcile first bounded page");
+        assert_eq!(first.examined_reservation_count, 2);
+        assert_eq!(first.released_catalog_covered_count, 2);
+        assert!(first.has_more);
+        assert!(first.next_cursor.is_some());
+        assert!(
+            store
+                .content_reservation_reconciliation_cursor_path()
+                .is_file()
+        );
+
+        let second = store
+            .reconcile_content_reservations_with_catalog(
+                &catalog_versions,
+                &catalog_hashes,
+                ContentStoreReservationReconciliationOptions::bounded(
+                    catalog_generated_at_unix_nanos,
+                    Duration::from_nanos(1),
+                    2,
+                )
+                .with_catalog_generation("catalog-generation-1"),
+            )
+            .expect("reconcile second bounded page");
+        assert_eq!(second.examined_reservation_count, 1);
+        assert_eq!(second.retained_rejection_grace_count, 1);
+        assert!(!second.has_more);
+        assert!(
+            !store
+                .content_reservation_reconciliation_cursor_path()
+                .exists()
+        );
+
+        let final_pass = store
+            .reconcile_content_reservations_with_catalog(
+                &catalog_versions,
+                &catalog_hashes,
+                ContentStoreReservationReconciliationOptions::bounded(
+                    u64::MAX,
+                    Duration::from_nanos(1),
+                    8,
+                )
+                .with_catalog_generation("catalog-generation-1"),
+            )
+            .expect("reject abandoned reservation");
+        assert_eq!(final_pass.released_rejected_count, 1);
+        let remaining = store
+            .content_reservation_roots()
+            .expect("read remaining reservations");
+        assert_eq!(remaining.reservation_count, 0);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn catalog_hash_coverage_does_not_release_an_uncovered_version_reservation() {
+        let root = temp_root("catalog_hash_does_not_cover_reserved_version");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let reserved = store
+            .put_object_version_blob_only("reserved-object", "v1", b"deduplicated bytes")
+            .expect("put reserved content");
+        let roots = store.content_reservation_roots().expect("read reservation");
+        let reserved_at_unix_nanos = roots.reservations[0].reserved_at_unix_nanos;
+        let unrelated_catalog_versions =
+            BTreeSet::from([("other-object".to_owned(), "v1".to_owned())]);
+        let catalog_hashes = BTreeSet::from([reserved.content_hash.clone()]);
+
+        let hash_only = store
+            .reconcile_content_reservations_with_catalog(
+                &unrelated_catalog_versions,
+                &catalog_hashes,
+                ContentStoreReservationReconciliationOptions::bounded(
+                    reserved_at_unix_nanos.saturating_add(1),
+                    Duration::from_secs(60),
+                    8,
+                )
+                .with_catalog_generation("catalog-generation-hash-only"),
+            )
+            .expect("reconcile hash-only catalog coverage");
+        assert_eq!(hash_only.examined_reservation_count, 1);
+        assert_eq!(hash_only.released_catalog_covered_count, 0);
+        assert_eq!(hash_only.retained_rejection_grace_count, 1);
+        assert_eq!(
+            store
+                .content_reservation_roots()
+                .expect("reservation remains")
+                .reservation_count,
+            1
+        );
+
+        let exact_catalog_versions =
+            BTreeSet::from([("reserved-object".to_owned(), "v1".to_owned())]);
+        let exact = store
+            .reconcile_content_reservations_with_catalog(
+                &exact_catalog_versions,
+                &catalog_hashes,
+                ContentStoreReservationReconciliationOptions::bounded(
+                    reserved_at_unix_nanos,
+                    Duration::from_secs(60),
+                    8,
+                )
+                .with_catalog_generation("catalog-generation-exact-version"),
+            )
+            .expect("reconcile exact version coverage");
+        assert_eq!(exact.released_catalog_covered_count, 1);
+        assert_eq!(
+            store
+                .content_reservation_roots()
+                .expect("reservation released")
+                .reservation_count,
+            0
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn existing_manifest_publication_retries_reestablish_a_reservation() {
+        let root = temp_root("existing_manifest_retry_reservation");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let bytes = b"idempotent publication";
+        let manifest = store
+            .put_object_version("retry-object", "v1", bytes)
+            .expect("publish initial manifest");
+
+        for retry in 0..4 {
+            release_all_content_reservations(&store);
+            assert_eq!(
+                store
+                    .content_reservation_roots()
+                    .expect("reservation released before retry")
+                    .reservation_count,
+                0
+            );
+            let retried = match retry {
+                0 => store
+                    .put_object_version("retry-object", "v1", bytes)
+                    .expect("retry ordinary publication"),
+                1 => store
+                    .put_object_version_blob_only("retry-object", "v1", bytes)
+                    .expect("retry blob-only publication"),
+                2 => {
+                    store
+                        .stage_bytes("retry-intent", bytes)
+                        .expect("stage retry bytes");
+                    store
+                        .commit_staged("retry-intent", "retry-object", "v1")
+                        .expect("retry staged publication")
+                }
+                3 => store
+                    .put_blob_only_manifest(
+                        "retry-object",
+                        "v1",
+                        &manifest.content_hash,
+                        manifest.size_bytes,
+                    )
+                    .expect("retry blob-only manifest publication"),
+                _ => unreachable!(),
+            };
+            assert_eq!(retried, manifest);
+            let roots = store
+                .content_reservation_roots()
+                .expect("read retry reservation");
+            assert_eq!(roots.reservation_count, 1);
+            assert_eq!(roots.reservations[0].identity.object_id, "retry-object");
+            assert_eq!(roots.reservations[0].identity.version, "v1");
+            assert_eq!(
+                roots.reservations[0].identity.content_hash,
+                manifest.content_hash
+            );
+        }
+
+        release_all_content_reservations(&store);
+        let batch = store
+            .put_object_version_blobs_only([("retry-object", "v1", bytes.as_slice())])
+            .expect("retry batched blob-only publication");
+        assert_eq!(batch, vec![manifest]);
+        assert_eq!(
+            store
+                .content_reservation_roots()
+                .expect("read batched retry reservation")
+                .reservation_count,
+            1
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn reservation_reconciliation_cursor_survives_restart_and_prevents_starvation() {
+        let root = temp_root("reservation_reconciliation_cursor_restart");
+        let store = LocalContentStore::new(&root).expect("create store");
+        for (object_id, bytes) in [
+            ("a-retained", b"retained-a".as_slice()),
+            ("b-retained", b"retained-b".as_slice()),
+            ("y-covered", b"covered-y".as_slice()),
+            ("z-covered", b"covered-z".as_slice()),
+        ] {
+            store
+                .put_object_version_blob_only(object_id, "v1", bytes)
+                .expect("put reserved content");
+        }
+        let roots = store
+            .content_reservation_roots()
+            .expect("read reservations");
+        let catalog_generated_at_unix_nanos = roots
+            .reservations
+            .iter()
+            .map(|reservation| reservation.reserved_at_unix_nanos)
+            .max()
+            .expect("reservation timestamp");
+        let catalog_versions = BTreeSet::from([
+            ("y-covered".to_owned(), "v1".to_owned()),
+            ("z-covered".to_owned(), "v1".to_owned()),
+        ]);
+        let generation = "catalog-generation-starvation";
+
+        let first = store
+            .reconcile_content_reservations_with_catalog(
+                &catalog_versions,
+                &BTreeSet::new(),
+                ContentStoreReservationReconciliationOptions::bounded(
+                    catalog_generated_at_unix_nanos,
+                    Duration::from_secs(60),
+                    2,
+                )
+                .with_catalog_generation(generation),
+            )
+            .expect("reconcile retained prefix");
+        assert_eq!(first.examined_reservation_count, 2);
+        assert_eq!(first.retained_rejection_grace_count, 2);
+        assert_eq!(first.released_catalog_covered_count, 0);
+        assert_eq!(first.remaining_after_batch_count, 2);
+        assert!(first.has_more);
+        assert_eq!(
+            first
+                .next_cursor
+                .as_ref()
+                .map(|identity| identity.object_id.as_str()),
+            Some("b-retained")
+        );
+        assert!(
+            store
+                .content_reservation_reconciliation_cursor_path()
+                .is_file()
+        );
+        drop(store);
+
+        let reopened = LocalContentStore::new(&root).expect("reopen store");
+        let second = reopened
+            .reconcile_content_reservations_with_catalog(
+                &catalog_versions,
+                &BTreeSet::new(),
+                ContentStoreReservationReconciliationOptions::bounded(
+                    catalog_generated_at_unix_nanos,
+                    Duration::from_secs(60),
+                    2,
+                )
+                .with_catalog_generation(generation),
+            )
+            .expect("reconcile suffix after restart");
+        assert_eq!(second.examined_reservation_count, 2);
+        assert_eq!(second.released_catalog_covered_count, 2);
+        assert_eq!(second.remaining_after_batch_count, 0);
+        assert!(!second.has_more);
+        assert!(second.next_cursor.is_none());
+        assert!(
+            !reopened
+                .content_reservation_reconciliation_cursor_path()
+                .exists()
+        );
+
+        let after_completion = reopened
+            .reconcile_content_reservations_with_catalog(
+                &catalog_versions,
+                &BTreeSet::new(),
+                ContentStoreReservationReconciliationOptions::bounded(
+                    catalog_generated_at_unix_nanos,
+                    Duration::from_secs(60),
+                    1,
+                )
+                .with_catalog_generation(generation),
+            )
+            .expect("restart completed scan from beginning");
+        assert_eq!(after_completion.examined_reservation_count, 1);
+        assert_eq!(after_completion.retained_rejection_grace_count, 1);
+        assert_eq!(
+            after_completion
+                .next_cursor
+                .as_ref()
+                .map(|identity| identity.object_id.as_str()),
+            Some("a-retained")
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn reservation_reconciliation_cursor_resets_for_new_catalog_generation() {
+        let root = temp_root("reservation_reconciliation_cursor_generation");
+        let store = LocalContentStore::new(&root).expect("create store");
+        store
+            .put_object_version_blob_only("a-retained", "v1", b"retained")
+            .expect("put retained reservation");
+        store
+            .put_object_version_blob_only("b-covered", "v1", b"covered")
+            .expect("put covered reservation");
+        let roots = store
+            .content_reservation_roots()
+            .expect("read reservations");
+        let catalog_generated_at_unix_nanos = roots
+            .reservations
+            .iter()
+            .map(|reservation| reservation.reserved_at_unix_nanos)
+            .max()
+            .expect("reservation timestamp");
+
+        let first = store
+            .reconcile_content_reservations_with_catalog(
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                ContentStoreReservationReconciliationOptions::bounded(
+                    catalog_generated_at_unix_nanos,
+                    Duration::from_secs(60),
+                    1,
+                )
+                .with_catalog_generation("catalog-generation-1"),
+            )
+            .expect("start first catalog generation");
+        assert_eq!(first.retained_rejection_grace_count, 1);
+        assert_eq!(
+            first
+                .next_cursor
+                .as_ref()
+                .map(|identity| identity.object_id.as_str()),
+            Some("a-retained")
+        );
+
+        let catalog_versions = BTreeSet::from([("b-covered".to_owned(), "v1".to_owned())]);
+        let reset = store
+            .reconcile_content_reservations_with_catalog(
+                &catalog_versions,
+                &BTreeSet::new(),
+                ContentStoreReservationReconciliationOptions::bounded(
+                    catalog_generated_at_unix_nanos,
+                    Duration::from_secs(60),
+                    1,
+                )
+                .with_catalog_generation("catalog-generation-2"),
+            )
+            .expect("restart for new catalog generation");
+        assert_eq!(reset.examined_reservation_count, 1);
+        assert_eq!(reset.retained_rejection_grace_count, 1);
+        assert_eq!(reset.released_catalog_covered_count, 0);
+        assert_eq!(
+            reset
+                .next_cursor
+                .as_ref()
+                .map(|identity| identity.object_id.as_str()),
+            Some("a-retained")
+        );
+        let persisted = store
+            .read_content_reservation_reconciliation_cursor()
+            .expect("read cursor")
+            .expect("cursor remains");
+        assert_eq!(persisted.catalog_generation, "catalog-generation-2");
+
+        let suffix = store
+            .reconcile_content_reservations_with_catalog(
+                &catalog_versions,
+                &BTreeSet::new(),
+                ContentStoreReservationReconciliationOptions::bounded(
+                    catalog_generated_at_unix_nanos,
+                    Duration::from_secs(60),
+                    1,
+                )
+                .with_catalog_generation("catalog-generation-2"),
+            )
+            .expect("continue new catalog generation");
+        assert_eq!(suffix.examined_reservation_count, 1);
+        assert_eq!(suffix.released_catalog_covered_count, 1);
+        assert!(!suffix.has_more);
+        assert!(
+            !store
+                .content_reservation_reconciliation_cursor_path()
+                .exists()
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn manifest_first_absence_survives_restart_before_collection() {
+        let root = temp_root("manifest_first_absence_survives_restart");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let old = store
+            .put_object_version("absence-object", "version_1", b"old")
+            .expect("put old version");
+        store
+            .put_object_version("absence-object", "version_2", b"latest")
+            .expect("put latest version");
+        release_all_content_reservations(&store);
+
+        store
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_min_absence_age(Duration::ZERO),
+            )
+            .expect_err("destructive collection without catalog authority must fail");
+        assert!(
+            !store
+                .manifest_absence_observation_path(&ContentStoreReservationIdentity {
+                    object_id: "absence-object".to_string(),
+                    version: "version_1".to_string(),
+                    content_hash: old.content_hash.clone(),
+                })
+                .exists()
+        );
+
+        let first = store
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_min_absence_age(Duration::ZERO)
+                    .with_catalog_observation("catalog-generation-1", 1),
+            )
+            .expect("persist first manifest absence");
+        assert_eq!(first.newly_observed_absent_version_count, 1);
+        assert_eq!(first.persisted_absence_observation_count, 1);
+        assert_eq!(first.retained_absence_grace_version_count, 1);
+        assert_eq!(first.deletion_ready_version_count, 0);
+        assert_eq!(first.deleted_version_count, 0);
+        assert!(store.read_manifest("absence-object", "version_1").is_ok());
+        drop(store);
+
+        let reopened = LocalContentStore::new(&root).expect("reopen store");
+        let stale_catalog = reopened
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_min_absence_age(Duration::ZERO)
+                    .with_catalog_observation("catalog-generation-1", u64::MAX),
+            )
+            .expect("retain under the same catalog generation");
+        assert_eq!(stale_catalog.deleted_version_count, 0);
+        assert_eq!(
+            stale_catalog.retained_same_or_stale_catalog_version_count,
+            1
+        );
+        assert_eq!(stale_catalog.deletion_ready_version_count, 0);
+        let second = reopened
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_min_absence_age(Duration::ZERO)
+                    .with_catalog_observation("catalog-generation-2", u64::MAX),
+            )
+            .expect("collect after durable absence");
+        assert_eq!(second.newly_observed_absent_version_count, 0);
+        assert_eq!(second.deletion_ready_version_count, 1);
+        assert_eq!(second.deleted_version_count, 1);
+        assert!(
+            reopened
+                .read_manifest("absence-object", "version_1")
+                .is_err()
+        );
+        assert!(
+            reopened
+                .has_blob(&old.content_hash)
+                .expect("old blob remains")
+        );
+
+        let first_blob_gc = reopened
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::ZERO))
+            .expect("observe newly orphaned blob");
+        assert_eq!(first_blob_gc.newly_observed_orphan_count, 1);
+        assert_eq!(first_blob_gc.deleted_orphan_count, 0);
+        let second_blob_gc = reopened
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::ZERO))
+            .expect("collect observed blob");
+        assert_eq!(second_blob_gc.deleted_orphan_count, 1);
+        assert!(!reopened.has_blob(&old.content_hash).expect("old blob gone"));
 
         cleanup(&root);
     }
@@ -7098,6 +8954,12 @@ mod tests {
             serde_json::to_value(ContentStoreGcOptions::dry_run(Duration::from_nanos(17)))
                 .expect("serialize default content gc options");
         assert!(serialized_gc.get("protected_content_hashes").is_none());
+        assert!(serialized_gc.get("catalog_generation").is_none());
+        assert!(
+            serialized_gc
+                .get("catalog_observed_at_unix_nanos")
+                .is_none()
+        );
         let serialized_versions = serde_json::to_value(ContentStoreVersionGcOptions::dry_run(
             Duration::from_nanos(23),
             2,
@@ -7137,12 +8999,14 @@ mod tests {
                 }),
             )
             .expect("write packed version churn fixture");
+        release_all_content_reservations(&store);
+        observe_collectible_versions(&store, 1);
 
         let version_gc = store
-            .collect_versions(ContentStoreVersionGcOptions::delete_eligible(
-                Duration::ZERO,
-                1,
-            ))
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_catalog_observation("test-catalog-generation-2", u64::MAX),
+            )
             .expect("batch version GC");
         assert_eq!(version_gc.deleted_version_count, (VERSION_COUNT - 1) as u64);
         assert_eq!(version_gc.durable_delete_batch_count, 2);
@@ -7153,7 +9017,7 @@ mod tests {
         assert_eq!(version_gc.stats_delta_persist_count, 1);
 
         let observed = store
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::ZERO))
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::ZERO))
             .expect("batch orphan observations");
         assert_eq!(
             observed.persisted_orphan_observation_count,
@@ -7165,7 +9029,7 @@ mod tests {
         );
 
         let collected = store
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::ZERO))
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::ZERO))
             .expect("batch packed orphan collection");
         assert_eq!(collected.deleted_orphan_count, (VERSION_COUNT - 1) as u64);
         assert_eq!(collected.packed_tombstone_batch_count, 2);
@@ -7236,6 +9100,7 @@ mod tests {
                 .expect("write throughput fixture");
         }
         let write_elapsed = write_started.elapsed();
+        release_all_content_reservations(&store);
 
         let projection_started = Instant::now();
         let projection = store
@@ -7246,13 +9111,14 @@ mod tests {
             projection.eligible_version_count,
             (VERSION_COUNT - 1) as u64
         );
+        observe_collectible_versions(&store, 1);
 
         let gc_started = Instant::now();
         let report = store
-            .collect_versions(ContentStoreVersionGcOptions::delete_eligible(
-                Duration::ZERO,
-                1,
-            ))
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_catalog_observation("test-catalog-generation-2", u64::MAX),
+            )
             .expect("collect throughput fixture");
         let gc_elapsed = gc_started.elapsed();
         eprintln!(
@@ -7315,7 +9181,7 @@ mod tests {
         .expect("write orphan b");
 
         let retained = store
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::from_secs(
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::from_secs(
                 24 * 60 * 60,
             )))
             .expect("retention gc");
@@ -7337,8 +9203,7 @@ mod tests {
 
         let limited = store
             .collect_garbage(
-                ContentStoreGcOptions::delete_eligible(Duration::from_nanos(0))
-                    .with_max_deletions(1),
+                delete_eligible_orphan_gc_options(Duration::from_nanos(0)).with_max_deletions(1),
             )
             .expect("limited gc");
         assert_eq!(limited.blocked_by_scrub_issue_count, 0);
@@ -7355,9 +9220,7 @@ mod tests {
         assert_eq!(remaining_orphans, 1);
 
         let final_gc = store
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(
-                Duration::from_nanos(0),
-            ))
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::from_nanos(0)))
             .expect("final gc");
         assert_eq!(final_gc.deleted_orphan_count, 1);
         assert!(
@@ -7390,11 +9253,13 @@ mod tests {
         store
             .put_object_version("object-protected-packed", "version_2", b"live packed")
             .expect("put live packed version");
+        release_all_content_reservations(&store);
+        observe_collectible_versions(&store, 1);
         let version_gc = store
-            .collect_versions(ContentStoreVersionGcOptions::delete_eligible(
-                Duration::from_nanos(0),
-                1,
-            ))
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::from_nanos(0), 1)
+                    .with_catalog_observation("test-catalog-generation-2", u64::MAX),
+            )
             .expect("make old packed blob orphaned");
         assert_eq!(version_gc.deleted_version_count, 1);
 
@@ -7417,7 +9282,7 @@ mod tests {
         )
         .expect("write unprotected loose orphan");
 
-        let options = ContentStoreGcOptions::delete_eligible(Duration::from_nanos(0))
+        let options = delete_eligible_orphan_gc_options(Duration::from_nanos(0))
             .with_protected_content_hash(protected_packed.content_hash.clone())
             .with_protected_content_hashes([protected_loose_hash.clone()]);
         let observed = store
@@ -7458,7 +9323,11 @@ mod tests {
         );
 
         let report = store
-            .collect_garbage(options)
+            .collect_garbage(
+                delete_eligible_orphan_gc_options(Duration::from_nanos(0))
+                    .with_protected_content_hash(protected_packed.content_hash.clone())
+                    .with_protected_content_hashes([protected_loose_hash.clone()]),
+            )
             .expect("collect observed unprotected orphan");
         assert_eq!(report.retained_protected_orphan_count, 2);
         assert_eq!(report.newly_observed_orphan_count, 0);
@@ -7497,7 +9366,7 @@ mod tests {
         let min_age = Duration::from_secs(60 * 60);
 
         let projection = store
-            .collect_garbage(ContentStoreGcOptions::dry_run(min_age))
+            .collect_garbage(dry_run_orphan_gc_options(min_age))
             .expect("project missing observation");
         assert_eq!(projection.newly_observed_orphan_count, 1);
         assert_eq!(
@@ -7512,7 +9381,7 @@ mod tests {
         );
 
         let observation = store
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(min_age))
+            .collect_garbage(delete_eligible_orphan_gc_options(min_age))
             .expect("persist observation");
         assert_eq!(observation.newly_observed_orphan_count, 1);
         assert_eq!(observation.retained_young_orphan_count, 1);
@@ -7524,7 +9393,7 @@ mod tests {
         );
 
         let clocked = store
-            .collect_garbage(ContentStoreGcOptions::dry_run(min_age))
+            .collect_garbage(dry_run_orphan_gc_options(min_age))
             .expect("project persisted grace clock");
         assert_eq!(clocked.newly_observed_orphan_count, 0);
         assert_eq!(clocked.retained_young_orphan_count, 1);
@@ -7554,8 +9423,8 @@ mod tests {
                 hash
             })
             .collect::<Vec<_>>();
-        let options = ContentStoreGcOptions::delete_eligible(Duration::from_secs(60 * 60))
-            .with_max_deletions(1);
+        let options =
+            delete_eligible_orphan_gc_options(Duration::from_secs(60 * 60)).with_max_deletions(1);
 
         let first = store
             .collect_garbage(options.clone())
@@ -7617,17 +9486,17 @@ mod tests {
                 .is_some(),
             "fixture must exercise packed-orphan observations"
         );
+        release_all_content_reservations(&store);
+        observe_collectible_versions(&store, 1);
         store
-            .collect_versions(ContentStoreVersionGcOptions::delete_eligible(
-                Duration::from_nanos(0),
-                1,
-            ))
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::from_nanos(0), 1)
+                    .with_catalog_observation("test-catalog-generation-2", u64::MAX),
+            )
             .expect("orphan old packed version");
 
         let first_pass = store
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(
-                Duration::from_nanos(0),
-            ))
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::from_nanos(0)))
             .expect("persist first observation");
         assert_eq!(first_pass.retained_young_orphan_count, 1);
         assert_eq!(first_pass.newly_observed_orphan_count, 1);
@@ -7642,9 +9511,7 @@ mod tests {
 
         let reopened = LocalContentStore::new(&root).expect("reopen store");
         let second_pass = reopened
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(
-                Duration::from_nanos(0),
-            ))
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::from_nanos(0)))
             .expect("collect after restart");
         assert_eq!(second_pass.retained_young_orphan_count, 0);
         assert_eq!(second_pass.newly_observed_orphan_count, 0);
@@ -7672,6 +9539,202 @@ mod tests {
     }
 
     #[test]
+    fn orphan_collection_requires_a_later_catalog_generation_after_restart() {
+        let root = temp_root("orphan_collection_later_catalog_after_restart");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let bytes = b"orphan behind catalog barrier";
+        let hash = content_hash(bytes);
+        write_file_atomic(&store.blob_path(&hash).expect("orphan path"), bytes)
+            .expect("write orphan");
+
+        let first = store
+            .collect_garbage(
+                ContentStoreGcOptions::delete_eligible(Duration::ZERO)
+                    .with_catalog_observation("catalog-generation-1", u64::MAX - 2),
+            )
+            .expect("persist first catalog-bound observation");
+        assert_eq!(first.persisted_orphan_observation_count, 1);
+        assert_eq!(first.deleted_orphan_count, 0);
+        drop(store);
+
+        let reopened = LocalContentStore::new(&root).expect("reopen store");
+        let same_generation = reopened
+            .collect_garbage(
+                ContentStoreGcOptions::delete_eligible(Duration::ZERO)
+                    .with_catalog_observation("catalog-generation-1", u64::MAX - 1),
+            )
+            .expect("retain under same catalog generation");
+        assert_eq!(
+            same_generation.retained_same_or_stale_catalog_orphan_count,
+            1
+        );
+        assert_eq!(same_generation.deleted_orphan_count, 0);
+        assert!(reopened.has_blob(&hash).expect("orphan retained"));
+
+        let later_generation = reopened
+            .collect_garbage(
+                ContentStoreGcOptions::delete_eligible(Duration::ZERO)
+                    .with_catalog_observation("catalog-generation-2", u64::MAX),
+            )
+            .expect("collect under later catalog generation");
+        assert_eq!(later_generation.eligible_orphan_count, 1);
+        assert_eq!(later_generation.deleted_orphan_count, 1);
+        assert!(!reopened.has_blob(&hash).expect("orphan collected"));
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn legacy_orphan_observation_resets_to_a_catalog_bound_first_observation() {
+        let root = temp_root("legacy_orphan_observation_catalog_reset");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let bytes = b"legacy observed orphan";
+        let hash = content_hash(bytes);
+        write_file_atomic(&store.blob_path(&hash).expect("orphan path"), bytes)
+            .expect("write orphan");
+        let marker_path = store
+            .orphan_observation_path(&hash)
+            .expect("observation path");
+        let legacy = OrphanObservation {
+            format_version: 1,
+            content_hash: hash.clone(),
+            first_observed_at_unix_nanos: 1,
+            catalog_generation: String::new(),
+            catalog_observed_at_unix_nanos: 0,
+        };
+        write_file_atomic(
+            &marker_path,
+            &encode_orphan_observation(&legacy).expect("encode legacy observation"),
+        )
+        .expect("write legacy observation");
+
+        let reset = store
+            .collect_garbage(
+                ContentStoreGcOptions::delete_eligible(Duration::ZERO)
+                    .with_catalog_observation("catalog-generation-reset", u64::MAX - 1),
+            )
+            .expect("reset legacy observation");
+        assert_eq!(reset.newly_observed_orphan_count, 1);
+        assert_eq!(reset.persisted_orphan_observation_count, 1);
+        assert_eq!(reset.deleted_orphan_count, 0);
+        let rebound =
+            decode_orphan_observation(&read_file(&marker_path).expect("read rebound observation"))
+                .expect("decode rebound observation");
+        assert_eq!(rebound.format_version, ORPHAN_OBSERVATION_FORMAT_VERSION);
+        assert_eq!(rebound.catalog_generation, "catalog-generation-reset");
+
+        let collected = store
+            .collect_garbage(
+                ContentStoreGcOptions::delete_eligible(Duration::ZERO)
+                    .with_catalog_observation("catalog-generation-later", u64::MAX),
+            )
+            .expect("collect after later observation");
+        assert_eq!(collected.deleted_orphan_count, 1);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn destructive_orphan_gc_without_catalog_observation_fails_before_mutation() {
+        let root = temp_root("orphan_gc_missing_catalog_fails_closed");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let bytes = b"unproven orphan";
+        let hash = content_hash(bytes);
+        write_file_atomic(&store.blob_path(&hash).expect("orphan path"), bytes)
+            .expect("write orphan");
+        let marker_path = store
+            .orphan_observation_path(&hash)
+            .expect("observation path");
+
+        let error = store
+            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::ZERO))
+            .expect_err("destructive GC without a catalog must fail");
+        assert!(matches!(
+            error,
+            ContentStoreError::InvalidContentLayout { .. }
+        ));
+        assert!(store.has_blob(&hash).expect("orphan retained"));
+        assert!(!marker_path.exists());
+
+        let projection = store
+            .collect_garbage(ContentStoreGcOptions::dry_run(Duration::ZERO))
+            .expect("dry run without catalog remains non-mutating");
+        assert_eq!(projection.newly_observed_orphan_count, 1);
+        assert_eq!(projection.deleted_orphan_count, 0);
+        assert!(store.has_blob(&hash).expect("dry-run retained orphan"));
+        assert!(!marker_path.exists());
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn serialized_catalog_observations_cannot_authorize_destructive_collectors() {
+        let root = temp_root("content_gc_serialized_catalog_observation");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let orphan_bytes = b"unproven serialized orphan";
+        let orphan_hash = content_hash(orphan_bytes);
+        write_file_atomic(
+            &store.blob_path(&orphan_hash).expect("orphan path"),
+            orphan_bytes,
+        )
+        .expect("write orphan");
+        store
+            .collect_garbage(
+                ContentStoreGcOptions::delete_eligible(Duration::ZERO)
+                    .with_catalog_projection_observation("public-projection-generation", u64::MAX),
+            )
+            .expect_err("public projection fields must not authorize orphan deletion");
+        let forged_orphan_options: ContentStoreGcOptions = serde_json::from_value(
+            serde_json::to_value(
+                ContentStoreGcOptions::delete_eligible(Duration::ZERO)
+                    .with_catalog_observation("forged-catalog-generation", u64::MAX),
+            )
+            .expect("serialize orphan options"),
+        )
+        .expect("deserialize orphan options");
+        store
+            .collect_garbage(forged_orphan_options)
+            .expect_err("serialized catalog fields must not authorize orphan deletion");
+        assert!(store.has_blob(&orphan_hash).expect("orphan retained"));
+
+        store
+            .put_object_version("serialized-version-object", "v1", b"old version")
+            .expect("put old version");
+        store
+            .put_object_version("serialized-version-object", "v2", b"latest version")
+            .expect("put latest version");
+        release_all_content_reservations(&store);
+        store
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_catalog_projection_observation("public-projection-generation", u64::MAX),
+            )
+            .expect_err("public projection fields must not authorize manifest deletion");
+        let forged_version_options: ContentStoreVersionGcOptions = serde_json::from_value(
+            serde_json::to_value(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_catalog_observation("forged-catalog-generation", u64::MAX),
+            )
+            .expect("serialize version options"),
+        )
+        .expect("deserialize version options");
+        store
+            .collect_versions(forged_version_options)
+            .expect_err("serialized catalog fields must not authorize manifest deletion");
+        assert!(
+            store
+                .manifest_path("serialized-version-object", "v1")
+                .is_file()
+        );
+        assert!(
+            !store.stats_snapshot_path().exists(),
+            "authorization must fail before collectors persist derived state"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn torn_orphan_observation_resets_grace_before_collection() {
         let root = temp_root("torn_orphan_observation_resets_grace");
         let store = LocalContentStore::new(&root).expect("create store");
@@ -7681,7 +9744,7 @@ mod tests {
             .expect("write orphan");
 
         let first = store
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::ZERO))
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::ZERO))
             .expect("persist first observation");
         assert_eq!(first.persisted_orphan_observation_count, 1);
         let marker = store
@@ -7690,7 +9753,7 @@ mod tests {
         fs::write(&marker, b"torn").expect("corrupt observation");
 
         let repaired = store
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::ZERO))
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::ZERO))
             .expect("repair torn observation conservatively");
         assert_eq!(repaired.newly_observed_orphan_count, 1);
         assert_eq!(repaired.persisted_orphan_observation_count, 1);
@@ -7704,7 +9767,7 @@ mod tests {
 
         let reopened = LocalContentStore::new(&root).expect("reopen repaired store");
         let collected = reopened
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::ZERO))
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::ZERO))
             .expect("collect after repaired observation restart");
         assert_eq!(collected.deleted_orphan_count, 1);
         assert!(!reopened.has_blob(&hash).expect("orphan collected"));
@@ -7722,9 +9785,7 @@ mod tests {
             .expect("write loose orphan");
 
         let observed = store
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::from_secs(
-                60,
-            )))
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::from_secs(60)))
             .expect("observe loose orphan");
         assert_eq!(observed.retained_young_orphan_count, 1);
         let marker_path = store
@@ -7741,14 +9802,12 @@ mod tests {
             "manifest publication must durably reset any older orphan grace epoch"
         );
         let projection = store
-            .collect_garbage(ContentStoreGcOptions::dry_run(Duration::from_nanos(0)))
+            .collect_garbage(dry_run_orphan_gc_options(Duration::from_nanos(0)))
             .expect("project resolved orphan observation");
         assert_eq!(projection.stale_orphan_observation_count, 0);
         assert_eq!(projection.deleted_stale_orphan_observation_count, 0);
         let report = store
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(
-                Duration::from_nanos(0),
-            ))
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::from_nanos(0)))
             .expect("prune resolved orphan observation");
         assert_eq!(report.deleted_orphan_count, 0);
         assert_eq!(report.stale_orphan_observation_count, 0);
@@ -7768,7 +9827,7 @@ mod tests {
             .expect("write loose orphan");
 
         let first_observation = store
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::ZERO))
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::ZERO))
             .expect("persist old orphan observation");
         assert_eq!(first_observation.newly_observed_orphan_count, 1);
         assert_eq!(first_observation.deleted_orphan_count, 0);
@@ -7787,16 +9846,18 @@ mod tests {
         store
             .put_object_version("object-rereferenced", "version_2", b"replacement")
             .expect("publish replacement version");
+        release_all_content_reservations(&store);
+        observe_collectible_versions(&store, 1);
         let version_gc = store
-            .collect_versions(ContentStoreVersionGcOptions::delete_eligible(
-                Duration::ZERO,
-                1,
-            ))
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_catalog_observation("test-catalog-generation-2", u64::MAX),
+            )
             .expect("remove the last manifest referencing old content");
         assert_eq!(version_gc.deleted_version_count, 1);
 
         let fresh_observation = store
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::ZERO))
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::ZERO))
             .expect("observe content after reference removal");
         assert_eq!(fresh_observation.newly_observed_orphan_count, 1);
         assert_eq!(fresh_observation.persisted_orphan_observation_count, 1);
@@ -7809,7 +9870,7 @@ mod tests {
         );
 
         let collected = store
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(Duration::ZERO))
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::ZERO))
             .expect("collect after fresh grace pass");
         assert_eq!(collected.deleted_orphan_count, 1);
         assert!(!store.has_blob(&hash).expect("orphan collected"));
@@ -7848,7 +9909,12 @@ mod tests {
         let mut root_created = false;
         for hash in &hashes {
             let persisted = store
-                .persist_orphan_observation_without_sync(hash, observed_at_unix_nanos)
+                .persist_orphan_observation_without_sync(
+                    hash,
+                    observed_at_unix_nanos,
+                    "test-stale-observation-catalog",
+                    observed_at_unix_nanos,
+                )
                 .expect("persist stale observation fixture");
             assert!(persisted.created);
             dirty_directories.insert(persisted.parent);
@@ -7860,7 +9926,7 @@ mod tests {
 
         let projection = store
             .collect_garbage(
-                ContentStoreGcOptions::dry_run(Duration::from_nanos(0)).with_max_deletions(1),
+                dry_run_orphan_gc_options(Duration::from_nanos(0)).with_max_deletions(1),
             )
             .expect("project bounded stale-marker cleanup");
         assert_eq!(projection.stale_orphan_observation_count, 3);
@@ -7876,8 +9942,7 @@ mod tests {
 
         let limited = store
             .collect_garbage(
-                ContentStoreGcOptions::delete_eligible(Duration::from_nanos(0))
-                    .with_max_deletions(1),
+                delete_eligible_orphan_gc_options(Duration::from_nanos(0)).with_max_deletions(1),
             )
             .expect("bounded stale-marker cleanup");
         assert_eq!(limited.stale_orphan_observation_count, 3);
@@ -7897,9 +9962,7 @@ mod tests {
         );
 
         let final_pass = store
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(
-                Duration::from_nanos(0),
-            ))
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::from_nanos(0)))
             .expect("finish stale-marker cleanup");
         assert_eq!(final_pass.deleted_stale_orphan_observation_count, 2);
         assert!(hashes.iter().all(|hash| {
@@ -7928,7 +9991,7 @@ mod tests {
         .expect("write orphan");
 
         let dry_run = store
-            .collect_garbage(ContentStoreGcOptions::dry_run(Duration::from_nanos(0)))
+            .collect_garbage(dry_run_orphan_gc_options(Duration::from_nanos(0)))
             .expect("dry-run gc");
         assert_eq!(dry_run.blocked_by_scrub_issue_count, 0);
         assert!(dry_run.dry_run);
@@ -7960,9 +10023,7 @@ mod tests {
         )
         .expect("corrupt referenced blob");
         let blocked = store
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(
-                Duration::from_nanos(0),
-            ))
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::from_nanos(0)))
             .expect("blocked gc");
         assert_eq!(blocked.blocked_by_scrub_issue_count, 1);
         assert_eq!(blocked.eligible_orphan_count, 0);
@@ -8000,10 +10061,19 @@ mod tests {
 
         let options = ContentStoreVersionGcOptions::delete_eligible(Duration::from_nanos(0), 1)
             .with_protected_version("object-protected-history", "version_1")
-            .with_protected_versions([("object-protected-history", "version_1")]);
+            .with_protected_versions([("object-protected-history", "version_1")])
+            .with_catalog_observation("test-catalog-generation-1", 1);
         assert_eq!(options.protected_versions.len(), 1);
+        release_all_content_reservations(&store);
+        let observed = store
+            .collect_versions(options.clone())
+            .expect("observe unprotected old version");
+        assert_eq!(observed.deleted_version_count, 0);
+        assert_eq!(observed.newly_observed_absent_version_count, 1);
         let report = store
-            .collect_versions(options)
+            .collect_versions(
+                options.with_catalog_observation("test-catalog-generation-2", u64::MAX),
+            )
             .expect("collect unprotected old version");
 
         assert_eq!(report.scanned_version_count, 3);
@@ -8055,6 +10125,7 @@ mod tests {
         store
             .put_object_version("object-deadline", "version_3", b"latest history")
             .expect("put latest version");
+        release_all_content_reservations(&store);
 
         let min_age = Duration::from_secs(60 * 60);
         let young_modified = store
@@ -8094,6 +10165,7 @@ mod tests {
         let version_3 = store
             .put_object_version("object-history", "version_3", b"history bytes v3")
             .expect("put version 3");
+        release_all_content_reservations(&store);
         let stats_before_dry_run = fs::read(store.stats_snapshot_path()).ok();
 
         let dry_run = store
@@ -8122,10 +10194,10 @@ mod tests {
         );
 
         let retained = store
-            .collect_versions(ContentStoreVersionGcOptions::delete_eligible(
-                Duration::from_secs(24 * 60 * 60),
-                1,
-            ))
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::from_secs(24 * 60 * 60), 1)
+                    .with_catalog_observation("retention-catalog-generation", 1),
+            )
             .expect("retention version gc");
         assert_eq!(retained.eligible_version_count, 0);
         assert_eq!(retained.deleted_version_count, 0);
@@ -8133,10 +10205,21 @@ mod tests {
         assert_eq!(retained.retained_young_version_count, 2);
         assert!(retained.next_eligible_at_unix_nanos.is_some());
 
+        let observed = store
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_min_absence_age(Duration::ZERO)
+                    .with_catalog_observation("test-catalog-generation-1", 1),
+            )
+            .expect("persist old-version absence observations");
+        assert_eq!(observed.deleted_version_count, 0);
+        assert_eq!(observed.newly_observed_absent_version_count, 2);
+
         let limited = store
             .collect_versions(
                 ContentStoreVersionGcOptions::delete_eligible(Duration::from_nanos(0), 1)
-                    .with_max_deletions(1),
+                    .with_max_deletions(1)
+                    .with_catalog_observation("test-catalog-generation-2", u64::MAX),
             )
             .expect("limited version gc");
         assert_eq!(limited.blocked_by_scrub_issue_count, 0);
@@ -8153,10 +10236,10 @@ mod tests {
         );
 
         let final_version_gc = store
-            .collect_versions(ContentStoreVersionGcOptions::delete_eligible(
-                Duration::from_nanos(0),
-                1,
-            ))
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::from_nanos(0), 1)
+                    .with_catalog_observation("test-catalog-generation-2", u64::MAX),
+            )
             .expect("final version gc");
         assert_eq!(final_version_gc.deleted_version_count, 1);
         let manifests = store
@@ -8179,18 +10262,14 @@ mod tests {
         assert!(store.has_blob(&version_3.content_hash).expect("v3 live"));
 
         let observation = store
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(
-                Duration::from_nanos(0),
-            ))
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::from_nanos(0)))
             .expect("observe orphans after version gc");
         assert_eq!(observation.retained_young_orphan_count, 2);
         assert_eq!(observation.newly_observed_orphan_count, 2);
         assert_eq!(observation.deleted_orphan_count, 0);
         assert!(observation.next_eligible_at_unix_nanos.is_some());
         let blob_gc = store
-            .collect_garbage(ContentStoreGcOptions::delete_eligible(
-                Duration::from_nanos(0),
-            ))
+            .collect_garbage(delete_eligible_orphan_gc_options(Duration::from_nanos(0)))
             .expect("blob gc after observation");
         assert_eq!(blob_gc.deleted_orphan_count, 2);
         assert!(
@@ -8235,12 +10314,14 @@ mod tests {
             .read_to_end(&mut old_bytes)
             .expect("read old version");
         assert_eq!(old_bytes, b"old bytes");
+        release_all_content_reservations(&store);
+        observe_collectible_versions(&store, 1);
 
         let report = store
-            .collect_versions(ContentStoreVersionGcOptions::delete_eligible(
-                Duration::from_nanos(0),
-                1,
-            ))
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::from_nanos(0), 1)
+                    .with_catalog_observation("test-catalog-generation-2", u64::MAX),
+            )
             .expect("collect old version");
         assert_eq!(report.deleted_version_count, 1);
         assert!(
@@ -8271,12 +10352,14 @@ mod tests {
         let indexed = decode_manifest(&read_file(&index_path).expect("read initial index"))
             .expect("decode initial index");
         assert_eq!(indexed.version, version_1.version);
+        release_all_content_reservations(&store);
+        observe_collectible_versions(&store, 1);
 
         let report = store
-            .collect_versions(ContentStoreVersionGcOptions::delete_eligible(
-                Duration::from_nanos(0),
-                1,
-            ))
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::from_nanos(0), 1)
+                    .with_catalog_observation("test-catalog-generation-2", u64::MAX),
+            )
             .expect("collect old version");
         assert_eq!(report.deleted_version_count, 1);
         assert!(
@@ -8326,10 +10409,10 @@ mod tests {
         .expect("corrupt referenced old version");
 
         let blocked = store
-            .collect_versions(ContentStoreVersionGcOptions::delete_eligible(
-                Duration::from_nanos(0),
-                1,
-            ))
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::from_nanos(0), 1)
+                    .with_catalog_observation("blocked-scrub-catalog-generation", 1),
+            )
             .expect("blocked version gc");
 
         assert_eq!(blocked.blocked_by_scrub_issue_count, 1);
@@ -8870,6 +10953,44 @@ mod tests {
             "the stored blob must match the written content"
         );
         cleanup(&root);
+    }
+
+    fn release_all_content_reservations(store: &LocalContentStore) {
+        let roots = store
+            .content_reservation_roots()
+            .expect("read content reservations");
+        for reservation in roots.reservations {
+            store
+                .reconcile_content_reservation(
+                    &reservation.identity.object_id,
+                    &reservation.identity.version,
+                    &reservation.identity.content_hash,
+                    ContentStoreReservationResolution::CatalogCovered,
+                )
+                .expect("release catalog-covered reservation");
+        }
+        assert_eq!(
+            store
+                .content_reservation_roots()
+                .expect("read reconciled content reservations")
+                .reservation_count,
+            0
+        );
+    }
+
+    fn observe_collectible_versions(store: &LocalContentStore, keep_latest: u64) {
+        let observed = store
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, keep_latest)
+                    .with_min_absence_age(Duration::ZERO)
+                    .with_catalog_observation("test-catalog-generation-1", 1),
+            )
+            .expect("persist manifest absence observations");
+        assert_eq!(observed.deleted_version_count, 0);
+        assert_eq!(
+            observed.persisted_absence_observation_count,
+            observed.newly_observed_absent_version_count
+        );
     }
 
     fn temp_root(name: &str) -> sinomo_testdir::TestDir {

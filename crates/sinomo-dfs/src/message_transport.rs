@@ -16,8 +16,8 @@ use sinomo_core::node::NodeId;
 use crate::protocol::DfsRoutedMessage;
 use crate::routes::{dfs_routed_message_from_object_rpc_request, dfs_routed_message_rpc_request};
 use crate::{
-    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsRpcAttachmentDescriptor,
-    ObjectVersionReader,
+    DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest, DfsMetadataJournalBatchCommand,
+    DfsMetadataJournalBatchResponse, DfsRpcAttachmentDescriptor, ObjectVersionReader,
 };
 
 #[derive(Debug)]
@@ -192,6 +192,20 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         _target_node_id: &NodeId,
         _command: &DfsMetadataJournalBatchCommand,
     ) -> Result<Option<DfsMetadataJournalBatchResponse>, NetworkError> {
+        Ok(None)
+    }
+
+    /// Fetch one bounded, authority-stamped content-root catalog page.
+    ///
+    /// Production node transports override this with an authenticated DFS
+    /// object-RPC call. Message-only and rolling-upgrade transports return
+    /// `None`; callers must treat that as incomplete catalog coverage and must
+    /// not run destructive content collection.
+    fn request_content_root_catalog_page_direct(
+        &mut self,
+        _target_node_id: &NodeId,
+        _request: &DfsContentRootCatalogPageRequest,
+    ) -> Result<Option<DfsContentRootCatalogPage>, NetworkError> {
         Ok(None)
     }
 

@@ -17,22 +17,27 @@ use std::time::Duration;
 use crate::{
     AsyncDfsMessageTransport, AsyncDfsMetadataJournalReplicationTransport,
     AsyncDfsMetadataNodeTransport, AsyncDfsPeerTransport, ContentStoreGcOptions,
-    ContentStoreGcReport, ContentStoreScrubReport, ContentStoreStagingGcOptions,
-    ContentStoreStagingGcReport, ContentStoreVersionGcOptions, ContentStoreVersionGcReport,
-    DFS_PENDING_TRANSFER_STALE_AFTER, DfsCommittedWorkTracker, DfsControlPlaneKvClient,
-    DfsDistributedWriteResult, DfsError, DfsFileSystemId, DfsMessageSender, DfsMessageTransport,
-    DfsMetadataBackend, DfsMetadataHistoryGcOptions, DfsMetadataHistoryGcReport,
-    DfsMetadataJournalBatchSender, DfsMetadataJournalPublisherHost,
-    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
-    DfsMetadataJournalReplicationTransport, DfsMetadataNodeTransport, DfsMetadataShardConfig,
-    DfsMetadataShardId, DfsMetadataSnapshotInstallSender, DfsNamespaceJobMaintenanceReport,
-    DfsNodeDetachedSendState, DfsObjectId, DfsObjectPageCursor, DfsPeerTransport,
-    DfsPlacementReconciliationJob, DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport,
-    DfsTransportIdentity, DfsVersion, DistributedRepairJob, LocalDfsMetadataJournalPublisherHost,
-    NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
-    async_dfs_metadata_journal_batch_sender_from_peer_transport,
-    async_dfs_metadata_snapshot_install_sender_from_peer_transport, cluster_dfs_metadata_shards,
-    cluster_dfs_peer_node_ids, dfs_message_sender_from_peer_transport,
+    ContentStoreGcReport, ContentStoreReservationReconciliationOptions,
+    ContentStoreReservationReconciliationReport, ContentStoreScrubReport,
+    ContentStoreStagingGcOptions, ContentStoreStagingGcReport, ContentStoreVersionGcOptions,
+    ContentStoreVersionGcReport, DFS_PENDING_TRANSFER_STALE_AFTER, DfsCommittedWorkTracker,
+    DfsContentRootCatalogCollectionValidation, DfsContentRootCatalogIncompleteReason,
+    DfsControlPlaneKvClient, DfsDistributedWriteResult, DfsError, DfsFileSystemConfig,
+    DfsFileSystemId, DfsMessageSender, DfsMessageTransport, DfsMetadataBackend,
+    DfsMetadataHistoryGcOptions, DfsMetadataHistoryGcReport, DfsMetadataJournalBatchSender,
+    DfsMetadataJournalPublisherHost, DfsMetadataJournalReplicationOptions,
+    DfsMetadataJournalReplicationReport, DfsMetadataJournalReplicationTransport,
+    DfsMetadataNodeTransport, DfsMetadataShardConfig, DfsMetadataShardHeadWatermark,
+    DfsMetadataShardId, DfsMetadataShardMembershipHandoff, DfsMetadataSnapshotInstallSender,
+    DfsNamespaceJobMaintenanceReport, DfsNodeDetachedSendState, DfsObjectId, DfsObjectPageCursor,
+    DfsPeerTransport, DfsPlacementReconciliationJob, DfsTombstoneCompactionOptions,
+    DfsTombstoneCompactionReport, DfsTransportIdentity, DfsVersion, DistributedRepairJob,
+    LocalDfsMetadataJournalPublisherHost, NetworkedDfsService, NetworkedDfsServiceEvent,
+    NetworkedDfsWriteOutcome, async_dfs_metadata_journal_batch_sender_from_peer_transport,
+    async_dfs_metadata_snapshot_install_sender_from_peer_transport,
+    cluster_dfs_all_file_system_configs, cluster_dfs_all_metadata_shard_head_watermarks,
+    cluster_dfs_all_metadata_shard_membership_handoffs, cluster_dfs_all_metadata_shards,
+    cluster_dfs_metadata_shards, cluster_dfs_peer_node_ids, dfs_message_sender_from_peer_transport,
     dfs_metadata_journal_batch_sender_from_peer_transport, dfs_metadata_replication_notice_lines,
     dfs_metadata_replication_sent_count, dfs_metadata_snapshot_install_sender_from_peer_transport,
     dfs_now_unix_nanos, dfs_path_safe_segment, distributed_sifs,
@@ -126,7 +131,10 @@ pub(crate) fn run_cluster_dfs_maintenance_tick_with_message_sender(
     let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     let mut metadata_transport =
         DfsMetadataNodeTransport::new(peer_node_ids, metadata_sender, snapshot_sender);
-    run_dfs_maintenance_tick_with_host(
+    let content_lifecycle = options.lifecycle;
+    let mut metadata_options = options;
+    metadata_options.lifecycle = dfs_metadata_lifecycle_options(metadata_options.lifecycle);
+    let mut report = run_dfs_maintenance_tick_with_host(
         &mut service,
         &mut maintenance_host,
         file_system.file_system_id,
@@ -134,9 +142,26 @@ pub(crate) fn run_cluster_dfs_maintenance_tick_with_message_sender(
         metadata_shards,
         &mut metadata_publisher_host,
         &mut metadata_transport,
-        options,
-    )
-    .map(Some)
+        metadata_options,
+    )?;
+    if dfs_content_gc_requested(content_lifecycle) {
+        let expected_file_systems = cluster_dfs_all_file_system_configs(cluster_paths)?;
+        let expected_shards = cluster_dfs_all_metadata_shards(cluster_paths)?;
+        let pending_handoffs = cluster_dfs_all_metadata_shard_membership_handoffs(cluster_paths)?;
+        let head_watermarks = cluster_dfs_all_metadata_shard_head_watermarks(cluster_paths)?;
+        if let Some(content_gc) = run_dfs_content_gc_with_catalog(
+            &mut service,
+            &data_dir.dfs_dir().join("content"),
+            &expected_file_systems,
+            &expected_shards,
+            &pending_handoffs,
+            &head_watermarks,
+            content_lifecycle,
+        )? {
+            report.lifecycle_reports.push(content_gc);
+        }
+    }
+    Ok(Some(report))
 }
 
 pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport(
@@ -495,6 +520,14 @@ pub struct DfsLifecycleMaintenanceOptions {
     pub version_gc: Option<ContentStoreVersionGcOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orphan_gc: Option<ContentStoreGcOptions>,
+    /// Exact, current catalog validation produced after metadata maintenance.
+    ///
+    /// Destructive content collectors require `collection_authorized`; a
+    /// configured metadata backend by itself is never a reachability proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_root_catalog_validation: Option<DfsContentRootCatalogCollectionValidation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_reservation_reconciliation: Option<ContentStoreReservationReconciliationOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_history_gc: Option<DfsMetadataHistoryGcOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -515,10 +548,16 @@ pub struct DfsLifecycleMaintenanceReport {
     pub orphan_gc: Option<ContentStoreGcReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_history_gc: Option<DfsMetadataHistoryGcReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_root_catalog_validation: Option<DfsContentRootCatalogCollectionValidation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_reservation_reconciliation: Option<ContentStoreReservationReconciliationReport>,
+    #[serde(default)]
+    pub durable_content_reservation_count: u64,
     /// Content GC was requested but no metadata backend could provide the
-    /// reachability roots needed to make deletion safe. Destructive content GC
-    /// is skipped in this state; any returned dry-run report is an explicitly
-    /// unprotected upper-bound projection.
+    /// complete, current catalog needed to make deletion safe. Destructive
+    /// content GC is skipped in this state; any returned dry-run report is an
+    /// explicitly unprotected upper-bound projection.
     #[serde(default)]
     pub content_gc_metadata_protection_unavailable: bool,
     pub metadata_backend_configured: bool,
@@ -545,6 +584,11 @@ pub const DEFAULT_DFS_CONTENT_VERSION_GC_MIN_AGE: Duration = Duration::from_secs
 pub const DEFAULT_DFS_CONTENT_VERSION_GC_MAX_RECORDS: u64 = 256;
 pub const DEFAULT_DFS_CONTENT_ORPHAN_GC_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub const DEFAULT_DFS_CONTENT_ORPHAN_GC_MAX_RECORDS: u64 = 256;
+pub const DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_AGE: Duration = Duration::from_secs(5 * 60);
+pub const DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_PAGES_PER_SHARD: usize = 4096;
+pub const DEFAULT_DFS_CONTENT_RESERVATION_REJECTION_GRACE: Duration =
+    Duration::from_secs(7 * 24 * 60 * 60);
+pub const DEFAULT_DFS_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS: u64 = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsAntiEntropyCursorRecord {
@@ -1041,6 +1085,10 @@ pub struct DfsMaintenanceRunOptions {
     pub collect_orphan_content: bool,
     pub content_orphan_gc_min_age: Duration,
     pub content_orphan_gc_max_records: u64,
+    pub content_root_catalog_max_age: Duration,
+    pub content_root_catalog_max_pages_per_shard: usize,
+    pub content_reservation_rejection_grace: Duration,
+    pub content_reservation_reconciliation_max_records: u64,
 }
 
 impl Default for DfsMaintenanceRunOptions {
@@ -1067,6 +1115,12 @@ impl Default for DfsMaintenanceRunOptions {
             collect_orphan_content: false,
             content_orphan_gc_min_age: DEFAULT_DFS_CONTENT_ORPHAN_GC_MIN_AGE,
             content_orphan_gc_max_records: DEFAULT_DFS_CONTENT_ORPHAN_GC_MAX_RECORDS,
+            content_root_catalog_max_age: DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_AGE,
+            content_root_catalog_max_pages_per_shard:
+                DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_PAGES_PER_SHARD,
+            content_reservation_rejection_grace: DEFAULT_DFS_CONTENT_RESERVATION_REJECTION_GRACE,
+            content_reservation_reconciliation_max_records:
+                DEFAULT_DFS_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS,
         }
     }
 }
@@ -1199,6 +1253,153 @@ pub fn run_dfs_lifecycle_maintenance_with_host<T: DfsMessageTransport>(
     }
 
     Ok(reports)
+}
+
+fn dfs_content_gc_requested(options: DfsMaintenanceRunOptions) -> bool {
+    options.collect_content_versions || options.collect_orphan_content
+}
+
+fn dfs_metadata_lifecycle_options(
+    mut options: DfsMaintenanceRunOptions,
+) -> DfsMaintenanceRunOptions {
+    options.collect_content_versions = false;
+    options.collect_orphan_content = false;
+    options
+}
+
+fn dfs_content_gc_lifecycle_options(
+    options: DfsMaintenanceRunOptions,
+    validation: DfsContentRootCatalogCollectionValidation,
+) -> DfsLifecycleMaintenanceOptions {
+    let catalog_observation = validation
+        .is_collection_authorized()
+        .then(|| {
+            validation
+                .catalog_generation()
+                .map(str::to_string)
+                .zip(validation.catalog_generated_at_unix_nanos())
+                .zip(validation.catalog_installed_at_unix_nanos())
+                .map(
+                    |((generation, generated_at_unix_nanos), installed_at_unix_nanos)| {
+                        (generation, generated_at_unix_nanos, installed_at_unix_nanos)
+                    },
+                )
+        })
+        .flatten();
+    let version_gc = options.collect_content_versions.then(|| {
+        let version_gc = ContentStoreVersionGcOptions::delete_eligible(
+            options.content_version_gc_min_age,
+            options.content_version_gc_keep_latest_versions,
+        )
+        .with_max_deletions(options.content_version_gc_max_records)
+        .with_min_absence_age(options.content_version_gc_min_age);
+        match catalog_observation.as_ref() {
+            Some((generation, _, installed_at_unix_nanos)) => {
+                // First-absence state is local and durable. Use the sealed
+                // local installation time so comparisons do not depend on a
+                // remote primary's wall clock.
+                version_gc.with_catalog_observation(generation.clone(), *installed_at_unix_nanos)
+            }
+            None => version_gc,
+        }
+    });
+    let orphan_gc = options.collect_orphan_content.then(|| {
+        let orphan_gc = ContentStoreGcOptions::delete_eligible(options.content_orphan_gc_min_age)
+            .with_max_deletions(options.content_orphan_gc_max_records);
+        match catalog_observation.as_ref() {
+            Some((generation, _, installed_at_unix_nanos)) => {
+                orphan_gc.with_catalog_observation(generation.clone(), *installed_at_unix_nanos)
+            }
+            None => orphan_gc,
+        }
+    });
+    let content_reservation_reconciliation =
+        catalog_observation
+            .as_ref()
+            .map(|(generation, _, installed_at_unix_nanos)| {
+                // The reconciliation option predates the distinction between
+                // remote generation time and local installation time. Its
+                // timestamp is causal evidence, so pass the sealed local
+                // installation observation.
+                ContentStoreReservationReconciliationOptions::bounded(
+                    *installed_at_unix_nanos,
+                    options.content_reservation_rejection_grace,
+                    options.content_reservation_reconciliation_max_records,
+                )
+                .with_catalog_generation(generation.clone())
+            });
+
+    DfsLifecycleMaintenanceOptions {
+        version_gc,
+        orphan_gc,
+        content_root_catalog_validation: Some(validation),
+        content_reservation_reconciliation,
+        ..DfsLifecycleMaintenanceOptions::default()
+    }
+}
+
+fn run_dfs_content_gc_with_catalog<T: DfsMessageTransport>(
+    service: &mut NetworkedDfsService<T>,
+    content_root: &Path,
+    expected_file_systems: &[DfsFileSystemConfig],
+    expected_shards: &[DfsMetadataShardConfig],
+    pending_handoffs: &[DfsMetadataShardMembershipHandoff],
+    head_watermarks: &[DfsMetadataShardHeadWatermark],
+    options: DfsMaintenanceRunOptions,
+) -> Result<Option<DfsLifecycleMaintenanceReport>, DfsError> {
+    if !dfs_content_gc_requested(options) {
+        return Ok(None);
+    }
+
+    let validation = match service.refresh_content_root_catalog(
+        expected_file_systems,
+        expected_shards,
+        pending_handoffs,
+        content_root,
+        head_watermarks,
+        options.content_root_catalog_max_pages_per_shard,
+    ) {
+        // The authenticated current-primary fragment is the authority
+        // proof. A quorum head watermark strengthens that proof when one
+        // exists, but a quiet shard or offline replica must not block
+        // content GC indefinitely merely because no operation-bound
+        // watermark has yet been published.
+        Ok(catalog) => catalog.validate_for_collection_with_head_watermark_policy(
+            expected_file_systems,
+            expected_shards,
+            pending_handoffs,
+            head_watermarks,
+            false,
+            dfs_now_unix_nanos(),
+            options.content_root_catalog_max_age,
+        )?,
+        Err(error) => DfsContentRootCatalogCollectionValidation::incomplete_for_expected_shards(
+            vec![
+                DfsContentRootCatalogIncompleteReason::CatalogRefreshFailed {
+                    reason: format!("content-root catalog refresh failed: {error}"),
+                },
+            ],
+            expected_shards.len(),
+        ),
+    };
+    service
+        .run_lifecycle_maintenance(dfs_content_gc_lifecycle_options(options, validation))
+        .map(Some)
+}
+
+fn run_dfs_content_gc_without_catalog<T: DfsMessageTransport>(
+    service: &mut NetworkedDfsService<T>,
+    options: DfsMaintenanceRunOptions,
+) -> Result<Option<DfsLifecycleMaintenanceReport>, DfsError> {
+    if !dfs_content_gc_requested(options) {
+        return Ok(None);
+    }
+    let validation = DfsContentRootCatalogCollectionValidation::incomplete(vec![
+        DfsContentRootCatalogIncompleteReason::CatalogNotDurablyInstalled,
+    ]);
+    service
+        .run_lifecycle_maintenance(dfs_content_gc_lifecycle_options(options, validation))
+        .map(Some)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1407,10 +1608,39 @@ pub fn dfs_lifecycle_maintenance_notice_lines(
     let mut lines = Vec::new();
     for report in reports {
         if report.content_gc_metadata_protection_unavailable {
-            lines.push(
-                "DFS content GC metadata protection unavailable: destructive manifest/blob collection skipped; dry-run projections are unprotected"
-                    .to_string(),
-            );
+            if let Some(catalog) = report.content_root_catalog_validation.as_ref() {
+                lines.push(format!(
+                    "DFS content GC catalog blocked: covered_shards={}/{} age_nanos={:?} journal_lag={} reservations={} reasons={:?}; destructive manifest/blob collection skipped",
+                    catalog.covered_shard_count(),
+                    catalog.expected_shard_count(),
+                    catalog.catalog_age_nanos(),
+                    catalog.max_journal_lag_entries(),
+                    report.durable_content_reservation_count,
+                    catalog.reasons(),
+                ));
+            } else {
+                lines.push(format!(
+                    "DFS content GC catalog unavailable: covered_shards=0/0 reservations={}; destructive manifest/blob collection skipped; explicit dry-run projections remain unprotected",
+                    report.durable_content_reservation_count,
+                ));
+            }
+        }
+        if let Some(reconciliation) = report.content_reservation_reconciliation.as_ref()
+            && (reconciliation.released_catalog_covered_count > 0
+                || reconciliation.released_rejected_count > 0
+                || reconciliation.has_more)
+        {
+            lines.push(format!(
+                "DFS content reservations: total={} examined={} released_covered={} released_rejected={} retained_catalog_too_old={} retained_grace={} remaining={} has_more={}",
+                reconciliation.reservation_count,
+                reconciliation.examined_reservation_count,
+                reconciliation.released_catalog_covered_count,
+                reconciliation.released_rejected_count,
+                reconciliation.retained_catalog_too_old_count,
+                reconciliation.retained_rejection_grace_count,
+                reconciliation.remaining_after_batch_count,
+                reconciliation.has_more,
+            ));
         }
         if let Some(staging_gc) = report.stale_staging_gc.as_ref()
             && (staging_gc.deleted_staging_count > 0 || staging_gc.max_deletions_reached)
@@ -1690,8 +1920,14 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
     )?;
     let placement_reconciliation = service
         .run_placement_reconciliation_bounded(options.placement_reconciliation_max_objects)?;
-    let lifecycle_reports =
-        run_dfs_lifecycle_maintenance_with_host(service, maintenance_host, options.lifecycle)?;
+    let mut lifecycle_reports = run_dfs_lifecycle_maintenance_with_host(
+        service,
+        maintenance_host,
+        dfs_metadata_lifecycle_options(options.lifecycle),
+    )?;
+    if let Some(content_gc) = run_dfs_content_gc_without_catalog(service, options.lifecycle)? {
+        lifecycle_reports.push(content_gc);
+    }
     let repair_attempts_before = maintenance_host.load_repair_attempt_records()?;
     let scheduled_repairs = service.retry_pending_repairs_bounded_with_attempts(
         options.repair_max_jobs,
@@ -1727,6 +1963,118 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
         repair_attempts_after,
         metadata_replication,
     })
+}
+
+#[cfg(test)]
+mod causal_time_tests {
+    use super::*;
+    use crate::{
+        DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION, DfsContentRootCatalog,
+        DfsContentRootCatalogCoverage, DfsContentRootCatalogFragment,
+        DfsContentRootCatalogShardIdentity, DfsMetadataShardAssignment,
+        LocalDfsContentRootCatalogStore,
+        dfs_content_root_catalog_topology_digest_with_file_systems,
+    };
+    use sinomo_core::DfsObjectPolicy;
+
+    #[test]
+    fn content_gc_uses_local_install_time_for_durable_content_observations() {
+        let file_system_id =
+            DfsFileSystemId::from_legacy_named("causal-time-fs").expect("filesystem");
+        let primary_node_id =
+            NodeId::from_legacy_named("causal-time-primary").expect("primary node");
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "causal-time-shard".to_string(),
+            primary_node_id: primary_node_id.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 4,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedConfirmed,
+        };
+        let file_system = DfsFileSystemConfig {
+            file_system_id,
+            display_name: "Causal time filesystem".to_string(),
+            owner_node_id: primary_node_id,
+            subtree_policies: Vec::new(),
+        };
+        let topology_digest = dfs_content_root_catalog_topology_digest_with_file_systems(
+            std::slice::from_ref(&file_system),
+            std::slice::from_ref(&shard),
+        )
+        .expect("topology digest");
+        let identity = DfsContentRootCatalogShardIdentity::from_config(&shard);
+        let generated_at_unix_nanos = 10;
+        let installed_at_unix_nanos = 100;
+        let state_fingerprint = format!(
+            "dfs-metadata-prefix-v1:blake3:{}",
+            blake3::hash(b"causal-time-state").to_hex()
+        );
+        let catalog = DfsContentRootCatalog::from_fragments(
+            topology_digest.clone(),
+            vec![identity.clone()],
+            generated_at_unix_nanos,
+            vec![DfsContentRootCatalogFragment {
+                identity,
+                topology_digest,
+                generated_at_unix_nanos,
+                coverage: DfsContentRootCatalogCoverage::Complete {
+                    prefix_proof_version: DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
+                    journal_sequence: 1,
+                    state_fingerprint,
+                },
+                entries: Vec::new(),
+            }],
+        )
+        .expect("catalog");
+        let root = sinomo_testdir::TestDir::new("dfs-content-root-catalog-causal-time");
+        let validation = LocalDfsContentRootCatalogStore::new(&root)
+            .install_test_catalog_at(catalog, installed_at_unix_nanos)
+            .expect("install catalog")
+            .validate_for_collection_with_head_watermark_policy(
+                std::slice::from_ref(&file_system),
+                std::slice::from_ref(&shard),
+                &[],
+                &[],
+                false,
+                installed_at_unix_nanos + 1,
+                Duration::from_nanos(100),
+            )
+            .expect("validate catalog");
+        assert!(validation.is_collection_authorized());
+        assert_eq!(
+            validation.catalog_generated_at_unix_nanos(),
+            Some(generated_at_unix_nanos)
+        );
+        assert_eq!(
+            validation.catalog_installed_at_unix_nanos(),
+            Some(installed_at_unix_nanos)
+        );
+
+        let options = dfs_content_gc_lifecycle_options(
+            DfsMaintenanceRunOptions {
+                collect_content_versions: true,
+                ..DfsMaintenanceRunOptions::default()
+            },
+            validation,
+        );
+        assert_eq!(
+            options
+                .version_gc
+                .expect("version GC")
+                .catalog_generated_at_unix_nanos,
+            Some(installed_at_unix_nanos),
+            "manifest first-absence observations use the causally ordered local installation time"
+        );
+        assert_eq!(
+            options
+                .content_reservation_reconciliation
+                .expect("reservation reconciliation")
+                .catalog_generated_at_unix_nanos,
+            installed_at_unix_nanos,
+            "reservation release uses the causally ordered local installation time"
+        );
+    }
 }
 
 pub async fn run_dfs_maintenance_tick_with_async_host<T>(
@@ -1806,8 +2154,32 @@ where
     )?;
     let placement_reconciliation = service
         .run_placement_reconciliation_bounded(options.placement_reconciliation_max_objects)?;
-    let lifecycle_reports =
-        run_dfs_lifecycle_maintenance_with_host(service, maintenance_host, options.lifecycle)?;
+    let mut lifecycle_reports = run_dfs_lifecycle_maintenance_with_host(
+        service,
+        maintenance_host,
+        dfs_metadata_lifecycle_options(options.lifecycle),
+    )?;
+    if dfs_content_gc_requested(options.lifecycle) {
+        // Metadata history removal is authoritative and journaled above. Build
+        // the node-wide content-root catalog only after that durable cut, and
+        // cover every filesystem whose manifests share this content store.
+        let cluster_paths = ClusterPaths::new(data_dir);
+        let expected_file_systems = cluster_dfs_all_file_system_configs(&cluster_paths)?;
+        let expected_shards = cluster_dfs_all_metadata_shards(&cluster_paths)?;
+        let pending_handoffs = cluster_dfs_all_metadata_shard_membership_handoffs(&cluster_paths)?;
+        let head_watermarks = cluster_dfs_all_metadata_shard_head_watermarks(&cluster_paths)?;
+        if let Some(content_gc) = run_dfs_content_gc_with_catalog(
+            service,
+            &data_dir.dfs_dir().join("content"),
+            &expected_file_systems,
+            &expected_shards,
+            &pending_handoffs,
+            &head_watermarks,
+            options.lifecycle,
+        )? {
+            lifecycle_reports.push(content_gc);
+        }
+    }
     let repair_attempts_before = maintenance_host.load_repair_attempt_records()?;
     let (parked_repair_attempts, eligible_repair_attempts): (Vec<_>, Vec<_>) =
         repair_attempts_before

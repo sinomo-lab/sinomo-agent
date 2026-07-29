@@ -9389,7 +9389,7 @@ mod tests {
         let preserved = daemon_dfs_maintenance_revalidation_decision(
             observed_at,
             1_000_000_000,
-            actionable,
+            actionable.clone(),
             true,
         );
         assert!(preserved.trigger_maintenance);

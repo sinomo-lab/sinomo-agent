@@ -42,6 +42,10 @@ pub const DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE: &str =
 pub const DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE: &str = "/dfs/data/metadata/snapshot-install";
 pub const DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE: &str =
     "/dfs/data/metadata/snapshot-install/response";
+pub const DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_ROUTE: &str =
+    "/dfs/data/metadata/content-root-catalog/page";
+pub const DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_RESPONSE_ROUTE: &str =
+    "/dfs/data/metadata/content-root-catalog/page/response";
 pub const DFS_MESSAGE_DATA_PLANE_ROUTES: &[&str] = &[
     DFS_DATA_READ_ROUTE,
     DFS_DATA_READ_RESPONSE_ROUTE,
@@ -66,6 +70,8 @@ pub const DFS_MESSAGE_DATA_PLANE_ROUTES: &[&str] = &[
     DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
     DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
     DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE,
+    DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_ROUTE,
+    DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_RESPONSE_ROUTE,
 ];
 pub const DFS_CONTROL_PLANE_ROUTES: &[&str] = &[
     DFS_STATUS_ROUTE,
@@ -100,6 +106,8 @@ pub const DFS_DATA_PLANE_ROUTES: &[&str] = &[
     DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
     DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
     DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE,
+    DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_ROUTE,
+    DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_RESPONSE_ROUTE,
 ];
 /// Routes registered by the DFS data-plane service.
 pub const DFS_DATA_PLANE_SERVICE_ROUTES: &[&str] = DFS_DATA_PLANE_ROUTES;
@@ -133,6 +141,8 @@ pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
     DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
     DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE,
     DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE,
+    DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_ROUTE,
+    DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_RESPONSE_ROUTE,
 ];
 
 pub(crate) fn build_dfs_routed_message(
@@ -226,6 +236,12 @@ fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'stati
         DfsNetworkMessage::MetadataSnapshotInstallResponse(_) => {
             DFS_DATA_METADATA_SNAPSHOT_INSTALL_RESPONSE_ROUTE
         }
+        DfsNetworkMessage::ContentRootCatalogPageRequest(_) => {
+            DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_ROUTE
+        }
+        DfsNetworkMessage::ContentRootCatalogPageResponse(_) => {
+            DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_RESPONSE_ROUTE
+        }
     }
 }
 
@@ -310,9 +326,9 @@ pub fn dfs_metadata_snapshot_install_execution_scope(
 
 fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessageExecutionScope {
     match message {
-        DfsNetworkMessage::ReadRequest(_) | DfsNetworkMessage::BulkReadRequest(_) => {
-            DfsMessageExecutionScope::ReadOnly
-        }
+        DfsNetworkMessage::ReadRequest(_)
+        | DfsNetworkMessage::BulkReadRequest(_)
+        | DfsNetworkMessage::ContentRootCatalogPageRequest(_) => DfsMessageExecutionScope::ReadOnly,
         DfsNetworkMessage::NamespaceRequest(command)
             if matches!(
                 command.operation,
@@ -382,7 +398,8 @@ fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessag
         | DfsNetworkMessage::RepairReplicaResponse(_)
         | DfsNetworkMessage::FetchBlobResponse(_)
         | DfsNetworkMessage::MetadataJournalBatchResponse(_)
-        | DfsNetworkMessage::MetadataSnapshotInstallResponse(_) => {
+        | DfsNetworkMessage::MetadataSnapshotInstallResponse(_)
+        | DfsNetworkMessage::ContentRootCatalogPageResponse(_) => {
             DfsMessageExecutionScope::GlobalExclusive
         }
     }
@@ -399,6 +416,7 @@ fn dfs_network_message_is_read_only_request(message: &DfsNetworkMessage) -> bool
         message,
         DfsNetworkMessage::ReadRequest(_)
             | DfsNetworkMessage::BulkReadRequest(_)
+            | DfsNetworkMessage::ContentRootCatalogPageRequest(_)
             | DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
                 operation: DfsNamespaceOperation::LookupPath { .. }
                     | DfsNamespaceOperation::LookupPaths { .. },
@@ -418,6 +436,7 @@ pub(crate) fn dfs_network_message_response_retry_safe(message: &DfsNetworkMessag
             | DfsNetworkMessage::DistributedWriteResponse(_)
             | DfsNetworkMessage::CommitVersion(_)
             | DfsNetworkMessage::RepairReplica(_)
+            | DfsNetworkMessage::ContentRootCatalogPageRequest(_)
     ) || matches!(
         message,
         DfsNetworkMessage::NamespaceRequest(command)
@@ -617,9 +636,11 @@ pub fn decode_dfs_message_rpc_response(
 mod tests {
     use super::*;
     use crate::{
+        DfsContentRootCatalogPageRequest, DfsContentRootCatalogShardIdentity,
         DfsDistributedWriteCommand, DfsMetadataJournalBatch, DfsMetadataShardAssignment,
         DfsMetadataTableSnapshot, DfsNamespaceCommand, DfsNamespaceOperation, DfsObjectId,
         DfsReadRequest, DfsReplicationPolicy, DfsStageBlobCommand, DfsVersion,
+        dfs_content_root_catalog_topology_digest,
     };
     use sinomo_core::node::NodeId;
     use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
@@ -700,6 +721,38 @@ mod tests {
             dfs_message_execution_scope(&command),
             DfsMessageExecutionScope::ReadOnly
         );
+    }
+
+    #[test]
+    fn content_root_catalog_pages_use_authenticated_read_only_retry_safe_routes() {
+        let file_system_id = fs_id("scope-content-root-fs");
+        let shard = authority_shard(&file_system_id, "scope-content-root-shard");
+        let request = DfsContentRootCatalogPageRequest {
+            identity: DfsContentRootCatalogShardIdentity::from_config(&shard),
+            expected_topology_digest: dfs_content_root_catalog_topology_digest(&[shard])
+                .expect("topology digest"),
+            minimum_journal_sequence: 0,
+            minimum_state_fingerprint: None,
+            after: None,
+            max_entries: 16,
+        };
+        let command = message_command(DfsNetworkMessage::ContentRootCatalogPageRequest(request));
+
+        assert_eq!(
+            dfs_message_route(&command),
+            DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_ROUTE
+        );
+        assert!(dfs_route_is_message_data_plane(
+            DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_ROUTE
+        ));
+        assert!(dfs_message_is_read_only_request(&command));
+        assert_eq!(
+            dfs_message_execution_scope(&command),
+            DfsMessageExecutionScope::ReadOnly
+        );
+        assert!(dfs_network_message_response_retry_safe(
+            &command.routed_message.message
+        ));
     }
 
     #[test]

@@ -250,6 +250,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     events.push(event);
                 }
             }
+            DfsNetworkMessage::ContentRootCatalogPageRequest(request) => {
+                events
+                    .push(self.handle_content_root_catalog_page_request(source_node_id, request)?);
+            }
+            DfsNetworkMessage::ContentRootCatalogPageResponse(page) => {
+                events.push(self.handle_content_root_catalog_page_response(source_node_id, page)?);
+            }
             DfsNetworkMessage::CommitVersionResponse(_)
             | DfsNetworkMessage::WriteRequest(_)
             | DfsNetworkMessage::WriteResponse(_) => {}

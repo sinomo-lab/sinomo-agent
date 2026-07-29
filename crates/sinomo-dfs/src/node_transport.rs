@@ -24,19 +24,19 @@ use sinomo_core::node::NodeId;
 
 use crate::{
     AsyncDfsMessageTransport, ContentStoreQuarantinedBlob, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES,
-    DfsBlobTransferResult, DfsDirectReadClientResponse, DfsDirectReadRequest, DfsError,
-    DfsMessageCommand, DfsMessageProcessReport, DfsMessageProcessResult, DfsMessageResponse,
-    DfsMessageTransport, DfsMessageTransportFuture, DfsMetadataJournalBatchCommand,
-    DfsMetadataJournalBatchResponse, DfsNetworkMessage, DfsOutboundAttachment, DfsReadResponse,
-    DfsRoutedCall, DfsRoutedMessage, DfsRoutedSend, DfsRoutedSendOutcome, DfsTransportIdentity,
-    DistributedRepairJob, NetworkedDfsService, NetworkedDfsServiceEvent,
-    decode_dfs_message_rpc_response, decode_dfs_metadata_journal_batch_rpc_response,
-    dfs_direct_read_request_from_read_request, dfs_direct_read_response_from_rpc_result,
-    dfs_direct_read_rpc_call, dfs_message_is_read_only_request, dfs_message_rpc_call,
-    dfs_message_rpc_request, dfs_metadata_journal_batch_rpc_call,
-    dfs_network_message_allows_write_repair_progress, dfs_perf_trace, dfs_perf_trace_enabled,
-    dfs_rejection_is_commit_content_repair_pending, dfs_rejection_is_replica_not_desired,
-    retained_networked_dfs_service_events,
+    DfsBlobTransferResult, DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest,
+    DfsDirectReadClientResponse, DfsDirectReadRequest, DfsError, DfsMessageCommand,
+    DfsMessageProcessReport, DfsMessageProcessResult, DfsMessageResponse, DfsMessageTransport,
+    DfsMessageTransportFuture, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
+    DfsNetworkMessage, DfsOutboundAttachment, DfsReadResponse, DfsRoutedCall, DfsRoutedMessage,
+    DfsRoutedSend, DfsRoutedSendOutcome, DfsTransportIdentity, DistributedRepairJob,
+    NetworkedDfsService, NetworkedDfsServiceEvent, decode_dfs_message_rpc_response,
+    decode_dfs_metadata_journal_batch_rpc_response, dfs_direct_read_request_from_read_request,
+    dfs_direct_read_response_from_rpc_result, dfs_direct_read_rpc_call,
+    dfs_message_is_read_only_request, dfs_message_rpc_call, dfs_message_rpc_request,
+    dfs_metadata_journal_batch_rpc_call, dfs_network_message_allows_write_repair_progress,
+    dfs_perf_trace, dfs_perf_trace_enabled, dfs_rejection_is_commit_content_repair_pending,
+    dfs_rejection_is_replica_not_desired, retained_networked_dfs_service_events,
 };
 #[cfg(test)]
 use crate::{
@@ -827,6 +827,7 @@ pub struct DfsNodeTransport {
     peer_transport: Option<Arc<dyn DfsPeerTransport>>,
     async_peer_transport: Option<Arc<dyn AsyncDfsPeerTransport>>,
     blocking_metadata_fanout_workers: Arc<StdAtomicUsize>,
+    next_content_root_catalog_frame_id: Arc<AtomicU64>,
     operation_deadline: Option<Instant>,
 }
 
@@ -1296,6 +1297,10 @@ impl DfsNodeTransport {
             peer_transport,
             async_peer_transport,
             blocking_metadata_fanout_workers: Arc::new(StdAtomicUsize::new(0)),
+            // Keep transport-owned catalog requests disjoint from the
+            // service-owned low frame-id sequence while sharing one monotonic
+            // source across read-only transport forks.
+            next_content_root_catalog_frame_id: Arc::new(AtomicU64::new(1_u64 << 63)),
             operation_deadline: None,
         }
     }
@@ -1306,6 +1311,111 @@ impl DfsNodeTransport {
 
     pub fn operation_deadline(&self) -> Option<Instant> {
         self.operation_deadline
+    }
+
+    /// Fetch one bounded content-root page from the exact metadata primary
+    /// named by `request`.
+    ///
+    /// The RPC is an ordinary authenticated DFS message call. The returned
+    /// routed response is accepted only from `target_node_id`, and the page
+    /// must validate against the request's filesystem, shard, primary, epoch,
+    /// topology digest, cursor, and minimum durable-cut proof.
+    pub fn request_content_root_catalog_page(
+        &self,
+        target_node_id: &NodeId,
+        request: &DfsContentRootCatalogPageRequest,
+    ) -> Result<DfsContentRootCatalogPage, NetworkError> {
+        request
+            .validate()
+            .map_err(|source| NetworkError::Serialization {
+                detail: format!("invalid DFS content-root catalog request: {source}"),
+            })?;
+        if target_node_id == &self.local_node_id
+            || !self.known_remote_nodes.contains(target_node_id)
+        {
+            return Err(NetworkError::UnknownNode {
+                node_id: target_node_id.clone(),
+            });
+        }
+        if &request.identity.primary_node_id != target_node_id {
+            return Err(NetworkError::Serialization {
+                detail: format!(
+                    "DFS content-root catalog target {target_node_id} does not match requested primary {}",
+                    request.identity.primary_node_id
+                ),
+            });
+        }
+        let Some(sender) = self.sender.as_ref().cloned() else {
+            return Err(NetworkError::Io {
+                operation: format!("fetch DFS content-root catalog page from {target_node_id}"),
+                detail: "DFS peer transport was constructed without a sync sender".to_string(),
+            });
+        };
+        let frame_id = self
+            .next_content_root_catalog_frame_id
+            .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| NetworkError::ResourceExhausted {
+                operation: "allocate DFS content-root catalog frame".to_string(),
+                requested_bytes: std::mem::size_of::<u64>(),
+            })?;
+        let routed_message = DfsRoutedMessage {
+            source_node_id: self.local_node_id.clone(),
+            target_node_id: target_node_id.clone(),
+            frame_id,
+            message_id: frame_id,
+            message: DfsNetworkMessage::ContentRootCatalogPageRequest(request.clone()),
+        };
+        let options = self.current_send_options(format!(
+            "fetch DFS content-root catalog page from {target_node_id}"
+        ))?;
+        let returned_messages = send_dfs_routed_message_to_peer(
+            sender,
+            options,
+            target_node_id.clone(),
+            routed_message,
+        )?;
+        let mut page = None;
+        for returned in returned_messages {
+            if returned.source_node_id != *target_node_id
+                || returned.target_node_id != self.local_node_id
+            {
+                return Err(NetworkError::Serialization {
+                    detail: format!(
+                        "DFS content-root catalog response route mismatch: expected {target_node_id} -> {}, got {} -> {}",
+                        self.local_node_id, returned.source_node_id, returned.target_node_id
+                    ),
+                });
+            }
+            let DfsNetworkMessage::ContentRootCatalogPageResponse(candidate) = returned.message
+            else {
+                return Err(NetworkError::Serialization {
+                    detail: format!(
+                        "DFS content-root catalog request to {target_node_id} returned an unexpected message"
+                    ),
+                });
+            };
+            if page.replace(candidate).is_some() {
+                return Err(NetworkError::Serialization {
+                    detail: format!(
+                        "DFS content-root catalog request to {target_node_id} returned multiple pages"
+                    ),
+                });
+            }
+        }
+        let page = page.ok_or_else(|| NetworkError::Serialization {
+            detail: format!(
+                "DFS content-root catalog request to {target_node_id} returned no page"
+            ),
+        })?;
+        page.validate_for_request(request)
+            .map_err(|source| NetworkError::Serialization {
+                detail: format!(
+                    "invalid DFS content-root catalog response from {target_node_id}: {source}"
+                ),
+            })?;
+        Ok(page)
     }
 
     #[cfg(test)]
@@ -3190,6 +3300,15 @@ impl DfsMessageTransport for DfsNodeTransport {
         Ok(Some(response))
     }
 
+    fn request_content_root_catalog_page_direct(
+        &mut self,
+        target_node_id: &NodeId,
+        request: &DfsContentRootCatalogPageRequest,
+    ) -> Result<Option<DfsContentRootCatalogPage>, NetworkError> {
+        self.request_content_root_catalog_page(target_node_id, request)
+            .map(Some)
+    }
+
     fn send_metadata_journal_batches_direct(
         &mut self,
         requests: &[(NodeId, DfsMetadataJournalBatchCommand)],
@@ -3312,10 +3431,13 @@ impl NetworkedDfsService<DfsNodeTransport> {
 mod tests {
     use super::*;
     use crate::{
-        DfsDistributedWriteCommand, DfsMetadataAuthorityOperation, DfsMetadataAuthorityProbe,
-        DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsNamespaceCommand,
-        DfsNamespaceOperation, DfsObjectId, DfsReadResult, DfsReplicationPolicy,
-        DfsStageBlobCommand, DfsVersion, sifs_file_system_id,
+        DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION, DfsContentRootCatalogCoverage,
+        DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest,
+        DfsContentRootCatalogShardIdentity, DfsDistributedWriteCommand,
+        DfsMetadataAuthorityOperation, DfsMetadataAuthorityProbe, DfsMetadataShardAssignment,
+        DfsMetadataShardConfig, DfsNamespaceCommand, DfsNamespaceOperation, DfsObjectId,
+        DfsReadResult, DfsReplicationPolicy, DfsStageBlobCommand, DfsVersion,
+        dfs_content_root_catalog_topology_digest, sifs_file_system_id,
     };
     use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -4199,6 +4321,81 @@ mod tests {
             sinomo_core::network::DEFAULT_NETWORK_TIMEOUT
         );
         assert_eq!(DfsObjectRpcSendOptions::default().overall_timeout, None);
+    }
+
+    #[test]
+    fn direct_content_root_catalog_request_validates_authenticated_response_route() {
+        let local = node_id("node_content_root_local");
+        let primary = node_id("node_content_root_primary");
+        let rogue = node_id("node_content_root_rogue");
+        let shard = DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: primary.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 7,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let request = DfsContentRootCatalogPageRequest {
+            identity: DfsContentRootCatalogShardIdentity::from_config(&shard),
+            expected_topology_digest: dfs_content_root_catalog_topology_digest(&[shard])
+                .expect("topology digest"),
+            minimum_journal_sequence: 3,
+            minimum_state_fingerprint: None,
+            after: None,
+            max_entries: 16,
+        };
+
+        let response_source = Arc::new(Mutex::new(primary.clone()));
+        let sender_response_source = Arc::clone(&response_source);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            let DfsNetworkMessage::ContentRootCatalogPageRequest(request) =
+                &command.routed_message.message
+            else {
+                panic!("expected content-root catalog request")
+            };
+            let page = DfsContentRootCatalogPage {
+                identity: request.identity.clone(),
+                topology_digest: request.expected_topology_digest.clone(),
+                generated_at_unix_nanos: 10,
+                coverage: DfsContentRootCatalogCoverage::Complete {
+                    prefix_proof_version: DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
+                    journal_sequence: 3,
+                    state_fingerprint: format!("dfs-metadata-prefix-v1:blake3:{}", "a".repeat(64)),
+                },
+                entries: Vec::new(),
+                next_cursor: None,
+            };
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: vec![DfsRoutedMessage {
+                    source_node_id: sender_response_source
+                        .lock()
+                        .expect("response source")
+                        .clone(),
+                    target_node_id: command.routed_message.source_node_id.clone(),
+                    frame_id: command.routed_message.frame_id,
+                    message_id: command.routed_message.message_id,
+                    message: DfsNetworkMessage::ContentRootCatalogPageResponse(page),
+                }],
+            })
+        });
+        let transport = DfsNodeTransport::new(local, vec![primary.clone(), rogue.clone()], sender);
+
+        let page = transport
+            .request_content_root_catalog_page(&primary, &request)
+            .expect("valid primary page");
+        assert_eq!(page.identity.primary_node_id, primary);
+
+        *response_source.lock().expect("response source") = rogue;
+        let error = transport
+            .request_content_root_catalog_page(&request.identity.primary_node_id, &request)
+            .expect_err("rogue response source must be rejected");
+        assert!(
+            error.to_string().contains("response route mismatch"),
+            "unexpected rejection: {error}"
+        );
     }
 
     #[test]
@@ -6885,6 +7082,15 @@ impl DfsMessageTransport for DfsNodeServedMessageTransport {
             .send_metadata_journal_batches_direct(requests)
     }
 
+    fn request_content_root_catalog_page_direct(
+        &mut self,
+        target_node_id: &NodeId,
+        request: &DfsContentRootCatalogPageRequest,
+    ) -> Result<Option<DfsContentRootCatalogPage>, NetworkError> {
+        self.node_transport
+            .request_content_root_catalog_page_direct(target_node_id, request)
+    }
+
     fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
         let mut messages = self.inbound_messages.drain(..).collect::<Vec<_>>();
         messages.extend(self.node_transport.drain_incoming_messages()?);
@@ -6936,6 +7142,7 @@ fn dfs_network_message_is_served_call_response(message: &DfsNetworkMessage) -> b
             | DfsNetworkMessage::FetchBlobResponse(_)
             | DfsNetworkMessage::MetadataJournalBatchResponse(_)
             | DfsNetworkMessage::MetadataSnapshotInstallResponse(_)
+            | DfsNetworkMessage::ContentRootCatalogPageResponse(_)
     )
 }
 

@@ -865,6 +865,12 @@ fn dfs_message_trace_label(message: &DfsNetworkMessage) -> String {
         DfsNetworkMessage::MetadataSnapshotInstallResponse(_) => {
             "metadata-snapshot-install-response".to_string()
         }
+        DfsNetworkMessage::ContentRootCatalogPageRequest(_) => {
+            "content-root-catalog-page-request".to_string()
+        }
+        DfsNetworkMessage::ContentRootCatalogPageResponse(_) => {
+            "content-root-catalog-page-response".to_string()
+        }
     }
 }
 
@@ -6741,6 +6747,111 @@ fn networked_sifs_with_backend(
     dfs
 }
 
+#[test]
+fn content_root_catalog_refresh_failure_durably_invalidates_previous_catalog() {
+    let root = temp_root("content-root-catalog-refresh-failure");
+    let node_id = NodeId::from_legacy_named("node_catalog_refresh_failure").expect("node");
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let shard = DfsMetadataShardConfig {
+        file_system_id: sifs_file_system_id(),
+        shard_id: "root".to_string(),
+        primary_node_id: node_id.clone(),
+        replica_node_ids: Vec::new(),
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let file_system = DfsFileSystemConfig {
+        file_system_id: shard.file_system_id.clone(),
+        display_name: "Catalog refresh failure filesystem".to_string(),
+        owner_node_id: node_id,
+        subtree_policies: Vec::new(),
+    };
+    let topology_digest = dfs_content_root_catalog_topology_digest_with_file_systems(
+        std::slice::from_ref(&file_system),
+        std::slice::from_ref(&shard),
+    )
+    .expect("topology digest");
+    let identity = DfsContentRootCatalogShardIdentity::from_config(&shard);
+    let catalog = DfsContentRootCatalog::from_topology_fragments(
+        topology_digest.clone(),
+        vec![file_system.file_system_id.clone()],
+        vec![identity.clone()],
+        1,
+        Vec::new(),
+        vec![DfsContentRootCatalogFragment {
+            identity,
+            topology_digest,
+            generated_at_unix_nanos: 1,
+            coverage: DfsContentRootCatalogCoverage::Complete {
+                prefix_proof_version: DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
+                journal_sequence: 1,
+                state_fingerprint: format!(
+                    "dfs-metadata-prefix-v1:blake3:{}",
+                    blake3::hash(b"catalog-before-refresh-failure").to_hex()
+                ),
+            },
+            entries: Vec::new(),
+        }],
+    )
+    .expect("complete catalog");
+    let store = default_dfs_content_root_catalog_store(root.join("content"));
+    store
+        .install_test_catalog_at(catalog, 1)
+        .expect("install previous complete catalog");
+
+    let error = dfs
+        .refresh_content_root_catalog(
+            std::slice::from_ref(&file_system),
+            std::slice::from_ref(&shard),
+            &[],
+            root.join("content"),
+            &[],
+            0,
+        )
+        .expect_err("zero page budget must fail refresh");
+    assert!(error.to_string().contains("page budget"));
+
+    let installed = store
+        .load()
+        .expect("load failure catalog")
+        .expect("failure catalog installed");
+    assert!(
+        !installed.is_complete(),
+        "a stale complete catalog must not survive a hard refresh failure"
+    );
+    assert!(installed.incomplete_reasons().iter().any(|reason| matches!(
+        reason,
+        DfsContentRootCatalogIncompleteReason::CatalogRefreshFailed { .. }
+    )));
+
+    let duplicate_error = dfs
+        .refresh_content_root_catalog(
+            &[file_system.clone(), file_system],
+            std::slice::from_ref(&shard),
+            &[],
+            root.join("content"),
+            &[],
+            1,
+        )
+        .expect_err("duplicate topology must fail refresh");
+    assert!(duplicate_error.to_string().contains("duplicate identities"));
+    let fallback = store
+        .load()
+        .expect("load fallback failure catalog")
+        .expect("fallback failure catalog installed");
+    assert!(!fallback.is_complete());
+    assert!(fallback.incomplete_reasons().iter().any(|reason| {
+        matches!(
+            reason,
+            DfsContentRootCatalogIncompleteReason::CatalogRefreshFailed { reason }
+                if reason.contains("duplicate identities")
+        )
+    }));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
 fn drain_dfs_messages(
     transport: &mut sinomo_core::network::InProcessTransport,
 ) -> Vec<DfsNetworkMessage> {
@@ -6811,7 +6922,7 @@ fn lifecycle_maintenance_runs_version_blob_and_tombstone_collection() {
         .put_object_version("object-lifecycle", "version_2", b"history bytes v2")
         .expect("put version 2");
 
-    let mut tombstone = file_metadata(node_id);
+    let mut tombstone = file_metadata(node_id.clone());
     tombstone.object_id = object_id.clone();
     tombstone.kind = DfsObjectKind::Tombstone;
     tombstone.path = "/services/lifecycle/deleted.txt".to_string();
@@ -6824,12 +6935,105 @@ fn lifecycle_maintenance_runs_version_blob_and_tombstone_collection() {
         .put_object(&tombstone)
         .expect("tombstone metadata");
 
+    let catalog_shard = DfsMetadataShardConfig {
+        file_system_id: sifs_file_system_id(),
+        shard_id: "root".to_string(),
+        primary_node_id: node_id,
+        replica_node_ids: Vec::new(),
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let catalog_file_system = DfsFileSystemConfig {
+        file_system_id: catalog_shard.file_system_id.clone(),
+        display_name: "Lifecycle catalog filesystem".to_string(),
+        owner_node_id: catalog_shard.primary_node_id.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let catalog_validation = |generation: &str, generated_at_unix_nanos: u64| {
+        let topology_digest = dfs_content_root_catalog_topology_digest_with_file_systems(
+            std::slice::from_ref(&catalog_file_system),
+            std::slice::from_ref(&catalog_shard),
+        )
+        .expect("catalog topology");
+        let state_fingerprint = format!(
+            "dfs-metadata-prefix-v1:blake3:{}",
+            blake3::hash(generation.as_bytes()).to_hex()
+        );
+        let identity = DfsContentRootCatalogShardIdentity::from_config(&catalog_shard);
+        let catalog = DfsContentRootCatalog::from_fragments(
+            topology_digest.clone(),
+            vec![identity.clone()],
+            generated_at_unix_nanos,
+            vec![DfsContentRootCatalogFragment {
+                identity,
+                topology_digest,
+                generated_at_unix_nanos,
+                coverage: DfsContentRootCatalogCoverage::Complete {
+                    prefix_proof_version: DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
+                    journal_sequence: 1,
+                    state_fingerprint,
+                },
+                entries: Vec::new(),
+            }],
+        )
+        .expect("content-root catalog");
+        let installed = default_dfs_content_root_catalog_store(root.join("content"))
+            .install_test_catalog_at(catalog, generated_at_unix_nanos)
+            .expect("install content-root catalog");
+        installed
+            .validate_for_collection_with_head_watermark_policy(
+                std::slice::from_ref(&catalog_file_system),
+                std::slice::from_ref(&catalog_shard),
+                &[],
+                &[],
+                false,
+                u64::MAX,
+                Duration::MAX,
+            )
+            .expect("validate content-root catalog")
+    };
+    let serialized_validation = serde_json::to_value(catalog_validation(
+        "serialized-lifecycle-catalog",
+        u64::MAX - 3,
+    ))
+    .expect("serialize lifecycle catalog validation");
+    let replayed_validation: DfsContentRootCatalogCollectionValidation =
+        serde_json::from_value(serialized_validation)
+            .expect("deserialize lifecycle catalog validation");
+    assert!(
+        !replayed_validation.is_collection_authorized(),
+        "a serialized validation report must not recreate destructive-GC authority"
+    );
+    let replayed_report = dfs
+        .run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
+            content_root_catalog_validation: Some(replayed_validation),
+            version_gc: Some(ContentStoreVersionGcOptions::delete_eligible(
+                Duration::ZERO,
+                1,
+            )),
+            orphan_gc: Some(ContentStoreGcOptions::delete_eligible(Duration::ZERO)),
+            ..DfsLifecycleMaintenanceOptions::default()
+        })
+        .expect("lifecycle maintenance with replayed validation report");
+    assert!(replayed_report.content_gc_metadata_protection_unavailable);
+    assert!(replayed_report.version_gc.is_none());
+    assert!(replayed_report.orphan_gc.is_none());
+
     let report = dfs
         .run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
             scrub_content: true,
             stale_staging_gc: None,
             anti_entropy: None,
             metadata_history_gc: None,
+            content_root_catalog_validation: Some(catalog_validation(
+                "lifecycle-catalog-1",
+                u64::MAX - 2,
+            )),
+            content_reservation_reconciliation: Some(
+                ContentStoreReservationReconciliationOptions::bounded(0, Duration::ZERO, u64::MAX)
+                    .with_catalog_generation("caller-catalog-generation-is-overridden"),
+            ),
             version_gc: Some(ContentStoreVersionGcOptions::delete_eligible(
                 std::time::Duration::from_nanos(0),
                 1,
@@ -6854,11 +7058,12 @@ fn lifecycle_maintenance_runs_version_blob_and_tombstone_collection() {
             .is_healthy()
     );
     let version_gc = report.version_gc.expect("version gc");
-    assert_eq!(version_gc.deleted_version_count, 1);
+    assert_eq!(version_gc.deleted_version_count, 0);
+    assert_eq!(version_gc.newly_observed_absent_version_count, 1);
     assert_eq!(version_gc.retained_latest_version_count, 1);
     let orphan_gc = report.orphan_gc.expect("orphan gc");
     assert_eq!(orphan_gc.deleted_orphan_count, 0);
-    assert_eq!(orphan_gc.newly_observed_orphan_count, 1);
+    assert_eq!(orphan_gc.newly_observed_orphan_count, 0);
     assert!(
         dfs.content
             .has_blob(&version_1.content_hash)
@@ -6875,8 +7080,40 @@ fn lifecycle_maintenance_runs_version_blob_and_tombstone_collection() {
     let tombstone_report = report.tombstone_compaction.expect("tombstone compaction");
     assert_eq!(tombstone_report.compacted_tombstone_count, 1);
 
+    let second_observation = dfs
+        .run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
+            content_root_catalog_validation: Some(catalog_validation(
+                "lifecycle-catalog-2",
+                u64::MAX - 1,
+            )),
+            version_gc: Some(ContentStoreVersionGcOptions::delete_eligible(
+                Duration::ZERO,
+                1,
+            )),
+            orphan_gc: Some(ContentStoreGcOptions::delete_eligible(Duration::ZERO)),
+            ..DfsLifecycleMaintenanceOptions::default()
+        })
+        .expect("second catalog lifecycle maintenance");
+    assert_eq!(
+        second_observation
+            .version_gc
+            .expect("second-observation version gc")
+            .deleted_version_count,
+        1
+    );
+    assert_eq!(
+        second_observation
+            .orphan_gc
+            .expect("first orphan observation")
+            .newly_observed_orphan_count,
+        1
+    );
     let follow_up = dfs
         .run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
+            content_root_catalog_validation: Some(catalog_validation(
+                "lifecycle-catalog-3",
+                u64::MAX,
+            )),
             orphan_gc: Some(ContentStoreGcOptions::delete_eligible(
                 std::time::Duration::ZERO,
             )),
@@ -6989,7 +7226,7 @@ fn lifecycle_maintenance_content_only_node_preserves_manifests_and_blobs_without
     assert!(
         dfs_lifecycle_maintenance_notice_lines(std::slice::from_ref(&report))
             .iter()
-            .any(|line| line.contains("metadata protection unavailable")),
+            .any(|line| line.contains("content GC catalog unavailable")),
         "operators must see why destructive content GC was skipped"
     );
     assert!(
@@ -7073,7 +7310,8 @@ fn lifecycle_maintenance_content_only_dry_run_marks_projection_unprotected() {
     let version_gc = report.version_gc.expect("unprotected version projection");
     assert!(version_gc.dry_run);
     assert_eq!(version_gc.scanned_version_count, 2);
-    assert_eq!(version_gc.eligible_version_count, 1);
+    assert_eq!(version_gc.eligible_version_count, 0);
+    assert_eq!(version_gc.retained_protected_version_count, 2);
     assert!(
         report
             .orphan_gc
@@ -7228,8 +7466,9 @@ fn lifecycle_shared_gc_runs_once_without_file_system_records() {
     let report = &reports[0];
     assert!(report.stale_staging_gc.is_some());
     assert!(report.metadata_history_gc.is_some());
-    assert!(report.version_gc.is_some());
-    assert!(report.orphan_gc.is_some());
+    assert!(report.version_gc.is_none());
+    assert!(report.orphan_gc.is_none());
+    assert!(report.content_gc_metadata_protection_unavailable);
     assert!(report.tombstone_compaction.is_some());
     assert!(report.anti_entropy.is_none());
     assert!(host.stored.is_empty());
