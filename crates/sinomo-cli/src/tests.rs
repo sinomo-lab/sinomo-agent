@@ -13050,6 +13050,51 @@ fn rollout_cluster_targets_keep_one_route_per_main_node() {
 }
 
 #[test]
+fn cluster_rollout_submits_remotes_before_local_activation() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-local-last");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let cluster_id = ClusterId::from_legacy_named("cluster_rollout_local_last").expect("cluster");
+    let local_node_id =
+        NodeId::from_legacy_named("node_rollout_local_last_local").expect("local node");
+    let remote_node_id =
+        NodeId::from_legacy_named("node_rollout_local_last_remote").expect("remote node");
+    let now = OffsetDateTime::now_utc();
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "rollout local last",
+        local_node_id,
+        "local",
+        "local-key",
+        now,
+    );
+    let mut remote = ClusterMemberRecord::local_voter(
+        cluster_id,
+        remote_node_id.clone(),
+        "remote",
+        "remote-key",
+        now,
+    );
+    remote.capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
+    remote.allowed_capabilities = remote.capabilities.clone();
+    remote.endpoints.push(invite_introducer_endpoint(
+        &remote_node_id,
+        "192.0.2.44:21353".to_string(),
+    ));
+    state.members.push(remote);
+
+    let local = RolloutTarget::address("127.0.0.1:21353".to_string());
+    let targets = rollout_cluster_targets_from_state(&paths, &state, Some(local));
+
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0].rollout_node_id(), Some(&remote_node_id));
+    assert_eq!(targets[1].address, "127.0.0.1:21353");
+    assert_eq!(targets[1].rollout_node_id(), None);
+}
+
+#[test]
 fn rollout_endpoint_candidates_include_remote_shadow_members() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-endpoint-candidates");
     let data_dir = SinomoDataDir::new(&root);

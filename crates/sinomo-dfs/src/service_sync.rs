@@ -4129,7 +4129,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_legacy_handoff_rebinds_after_checkpoint_pruned_its_prefix_history() {
+    fn legacy_handoff_rebinds_after_process_restart_and_compaction() {
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-legacy-handoff-pruned-prefix");
         let local = node("node_legacy_handoff_pruned_prefix");
         let replica = node("node_legacy_handoff_pruned_prefix_replica");
@@ -4233,6 +4233,24 @@ mod tests {
                 .expect("fresh lane authority"),
             "the exact completed legacy handoff must restore authoritative writes"
         );
+        drop(reopened);
+
+        let mut after_process_restart =
+            LocalSobjMetadataBackend::new(shard_id, &metadata_root).expect("second process reopen");
+        assert!(
+            rebind_completed_metadata_shard_membership_handoff(
+                &mut after_process_restart,
+                &local,
+                &active,
+                None,
+                Some(&proof),
+            )
+            .expect("repeat exact rebind after process restart"),
+            "a restarted process must be able to rebind from the compacted completion proof"
+        );
+        after_process_restart
+            .put_object(&directory_object("/services/after-process-restart", local))
+            .expect("authoritative write after compacted legacy handoff rebind");
     }
 
     #[test]

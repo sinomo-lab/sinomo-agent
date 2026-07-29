@@ -20644,6 +20644,45 @@ fn recovery_hydration_can_cancel_between_synchronous_backend_phases() {
 }
 
 #[test]
+fn cold_sifs_scale_fixture_stays_preemptible() {
+    let root = temp_root("cold-sifs-scale-preemptible");
+    let node = NodeId::from_legacy_named("node_cold_sifs_scale").expect("node");
+    let mut backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+            .expect("metadata backend");
+    backend
+        .put_file_system(&DfsFileSystem::sifs(node.clone()))
+        .expect("filesystem");
+    for index in 0..2_048 {
+        backend
+            .put_object(&directory_object(
+                &format!("/services/scale-fixture-{index:04}"),
+                node.clone(),
+            ))
+            .expect("scale fixture object");
+    }
+
+    let mut service = NetworkedDfsService::new(
+        InProcessNetwork::new().add_node(node),
+        LocalContentStore::new(root.join("content")).expect("content store"),
+    );
+    service.metadata_backend = Some(Box::new(backend));
+    let cancellation_checks = AtomicUsize::new(0);
+    let completed = service
+        .hydrate_from_metadata_backend_for_commit_promotion_recovery_until_cancelled(&|| {
+            cancellation_checks.fetch_add(1, Ordering::SeqCst) >= 1
+        })
+        .expect("cancellable scale hydration");
+
+    assert!(!completed);
+    assert!(
+        cancellation_checks.load(Ordering::SeqCst) >= 2,
+        "a cold hydration must yield to foreground cancellation between durable phases even at scale"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn recovery_hydration_skips_fully_repaired_committed_pending_write() {
     let root = temp_root("hydrate-skips-fully-repaired-committed");
     let owner = NodeId::from_legacy_named("node_hydrate_full_owner").expect("node");
@@ -35724,6 +35763,122 @@ fn sifs_cluster_posix_replica_catches_up_after_journal_publish() {
         cluster.rejections
     );
 
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn canonical_catalog_visible_without_local_payload() {
+    let mut cluster = sifs_posix_cluster("sifs-canonical-catalog-remote-payload");
+    let catalog_dir = "/services/catalog";
+    let catalog_path = "/services/catalog/catalog.sobj";
+    let catalog = br#"{"skills":["remote-only"],"revision":7}"#;
+    cluster
+        .primary
+        .posix_mkdir_all(catalog_dir)
+        .expect("catalog directory");
+    sifs_cluster_primary_posix_write(&mut cluster, catalog_path, catalog);
+    let expected_hash = content_hash(catalog);
+
+    sifs_cluster_publish_metadata_until(&mut cluster, "catalog metadata catch-up", |cluster| {
+        cluster
+            .observer
+            .posix_stat(catalog_path)
+            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
+    });
+    assert!(
+        !cluster
+            .observer
+            .content()
+            .has_blob(&expected_hash)
+            .expect("inspect observer content mirror"),
+        "the fixture must keep catalog bytes exclusively on another online node"
+    );
+
+    let visible =
+        sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.observer, catalog_path);
+    assert_eq!(visible, catalog);
+    assert!(
+        cluster
+            .observer
+            .content()
+            .has_blob(&expected_hash)
+            .expect("inspect fetched catalog"),
+        "a canonical SIFS read should fetch the payload instead of treating the local mirror as authoritative"
+    );
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn restart_catchup_accepts_foreground_attachment() {
+    let mut cluster = sifs_posix_cluster("sifs-restart-catchup-foreground-attachment");
+    let missed_path = "/users/missed-while-offline.txt";
+    let foreground_path = "/users/foreground-after-restart.txt";
+    let missed_bytes = b"metadata committed while the replica was offline";
+    let foreground_bytes = b"foreground attachment submitted during catch-up";
+
+    let writer_node = cluster.writer_node.clone();
+    let writer_transport = cluster.writer.transport.clone();
+    let writer_root = cluster.root.join("writer");
+    let placeholder = NetworkedDfsService::new(
+        InProcessNetwork::new()
+            .add_node(NodeId::from_legacy_named("node_restart_catchup_placeholder").expect("node")),
+        LocalContentStore::new(cluster.root.join("unused-restart-catchup-content"))
+            .expect("placeholder content"),
+    );
+    drop(std::mem::replace(&mut cluster.writer, placeholder));
+
+    sifs_cluster_primary_posix_write(&mut cluster, missed_path, missed_bytes);
+
+    let catchup_control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    catchup_control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                cluster.primary_node.clone(),
+            )))
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: sifs_file_system_id(),
+                shard_id: "root".to_string(),
+                primary_node_id: cluster.primary_node.clone(),
+                replica_node_ids: vec![writer_node.clone(), cluster.observer_node.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("root shard config");
+    });
+    cluster.writer = NetworkedDfsService::new(
+        writer_transport,
+        LocalContentStore::new(writer_root.join("content")).expect("reopened content"),
+    )
+    .with_control_plane(catchup_control_plane)
+    .with_metadata_backend(
+        open_root_local_metadata_backend(writer_root.join("metadata")).expect("reopened metadata"),
+    )
+    .expect("restarted writer");
+
+    sifs_cluster_routed_posix_write(&mut cluster, foreground_path, foreground_bytes);
+    assert_eq!(
+        cluster
+            .writer
+            .posix_read_file(foreground_path)
+            .expect("foreground attachment after catch-up"),
+        foreground_bytes
+    );
+    sifs_cluster_publish_metadata_until(&mut cluster, "offline metadata catch-up", |cluster| {
+        cluster.writer.posix_stat(missed_path).is_ok()
+    });
+    assert_eq!(
+        sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.writer, missed_path),
+        missed_bytes
+    );
+    assert!(
+        cluster.rejections.is_empty(),
+        "restart catch-up and foreground attachment must share one consistent journal: {:?}",
+        cluster.rejections
+    );
     std::fs::remove_dir_all(&cluster.root).ok();
 }
 

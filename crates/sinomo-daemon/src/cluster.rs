@@ -18390,7 +18390,7 @@ mod tests {
     }
 
     #[test]
-    fn connectivity_sync_deletes_stale_kv_records_even_when_current_records_are_cached() {
+    fn endpoint_rotation_removes_obsolete_connectivity_generation() {
         let root = unique_cluster_test_root("sinomo-daemon-connectivity-cached-delete");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
@@ -18501,6 +18501,14 @@ mod tests {
             seeded.get(&stale_key).is_some(),
             "stale connectivity should be seeded"
         );
+        state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == remote_node)
+            .expect("remote member")
+            .endpoints = vec![current_endpoint.clone()];
+        sinomo_core::cluster::write_cluster_state(&paths, &state)
+            .expect("publish rotated endpoint topology");
         sync_cluster_connectivity_records_to_kv(&paths, &local_node, vec![current_record.clone()])
             .expect("sync should delete stale connectivity");
 

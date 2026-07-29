@@ -13207,6 +13207,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn windows_kv_snapshot_cross_process_read_write() {
+        let root = temp_raft_root("sinomo-kv-windows-cross-process-snapshot");
+        let executable = std::env::current_exe().expect("current test executable");
+        let spawn_worker = |role: &str| {
+            std::process::Command::new(&executable)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "tests::windows_kv_snapshot_subprocess_worker",
+                    "--test-threads=1",
+                ])
+                .env("SINOMO_KV_CROSS_PROCESS_ROOT", root.as_os_str())
+                .env("SINOMO_KV_CROSS_PROCESS_ROLE", role)
+                .spawn()
+                .unwrap_or_else(|error| panic!("spawn {role} snapshot worker: {error}"))
+        };
+
+        let mut reader = spawn_worker("reader");
+        let mut writer = spawn_worker("writer");
+        let writer_status = writer.wait().expect("wait for writer process");
+        let reader_status = reader.wait().expect("wait for reader process");
+        assert!(writer_status.success(), "writer failed: {writer_status}");
+        assert!(reader_status.success(), "reader failed: {reader_status}");
+
+        let snapshot = read_cluster_kv_cached_snapshot(&ClusterKvPaths::new(&root))
+            .expect("read final cross-process snapshot");
+        assert_eq!(
+            snapshot
+                .get("/cross-process/value")
+                .expect("final cross-process value")
+                .value,
+            63_u64.to_le_bytes()
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for windows_kv_snapshot_cross_process_read_write"]
+    fn windows_kv_snapshot_subprocess_worker() {
+        let Some(root) = std::env::var_os("SINOMO_KV_CROSS_PROCESS_ROOT") else {
+            return;
+        };
+        let role = std::env::var("SINOMO_KV_CROSS_PROCESS_ROLE").expect("worker role");
+        let paths = ClusterKvPaths::new(PathBuf::from(root));
+        match role.as_str() {
+            "writer" => {
+                let mut store = InProcessKvStore::new();
+                for revision in 0_u64..64 {
+                    store
+                        .put(
+                            "/cross-process/value",
+                            revision.to_le_bytes().to_vec(),
+                            None,
+                        )
+                        .expect("advance snapshot value");
+                    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
+                        .expect("publish snapshot from writer process");
+                    std::thread::yield_now();
+                }
+            }
+            "reader" => {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let mut observed_revision = KvRevision::ZERO;
+                loop {
+                    match read_cluster_kv_cached_snapshot(&paths) {
+                        Ok(snapshot) => {
+                            assert!(
+                                snapshot.revision >= observed_revision,
+                                "cross-process reads must not move backwards"
+                            );
+                            observed_revision = snapshot.revision;
+                            if snapshot
+                                .get("/cross-process/value")
+                                .is_some_and(|entry| entry.value == 63_u64.to_le_bytes())
+                            {
+                                break;
+                            }
+                        }
+                        Err(KvError::Io { .. }) => {}
+                        Err(error) => panic!("cross-process snapshot read failed: {error}"),
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "reader did not observe the writer's final snapshot"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+            other => panic!("unknown cross-process worker role {other}"),
+        }
+    }
+
     fn temp_raft_root(prefix: &str) -> sinomo_testdir::TestDir {
         sinomo_testdir::TestDir::new(prefix)
     }

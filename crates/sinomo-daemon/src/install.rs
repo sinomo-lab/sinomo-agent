@@ -622,21 +622,11 @@ pub fn start_installed_sinomo_daemon(
     }
     terminate_matching_installed_daemon_process(binary, args, ready_timeout)?;
 
-    let mut command = Command::new(binary);
-    command.args(args).env("SINOMO_DATA_DIR", data_dir);
-    for (key, value) in extra_env {
-        command.env(key, value);
-    }
-    crate::prepare_background_command(&mut command);
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|source| DaemonError::Io {
-            path: binary.display().to_string(),
-            detail: source.to_string(),
-        })?;
+    let mut command = installed_daemon_command(binary, data_dir, args, extra_env);
+    let mut child = command.spawn().map_err(|source| DaemonError::Io {
+        path: binary.display().to_string(),
+        detail: source.to_string(),
+    })?;
 
     let deadline = Instant::now() + ready_timeout;
     let mut exited_before_ready: Option<(String, i32)> = None;
@@ -667,6 +657,31 @@ pub fn start_installed_sinomo_daemon(
         status_path: paths.status.clone(),
         child_id: child.id(),
     })
+}
+
+fn installed_daemon_command(
+    binary: &Path,
+    data_dir: &Path,
+    args: &[String],
+    extra_env: &[(&str, String)],
+) -> Command {
+    let mut command = Command::new(binary);
+    command
+        .args(args)
+        .env("SINOMO_DATA_DIR", data_dir)
+        // Installed daemons must not retain the CLI invoker's working
+        // directory. On Windows that inheritance keeps removable checkout
+        // directories busy for the lifetime of the daemon process.
+        .current_dir(data_dir);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    crate::prepare_background_command(&mut command);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
 }
 
 #[cfg(target_os = "linux")]
@@ -1055,6 +1070,18 @@ mod tests {
                 (SHADOW_MAIN_PORT_ENV, "21400".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn windows_installed_daemon_does_not_inherit_invoker_cwd() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-installed-stable-cwd");
+        let data_dir = root.join("data");
+        let binary = root.join("bin").join("sinomo");
+        let args = vec!["daemon".to_string(), "run".to_string()];
+
+        let command = installed_daemon_command(&binary, &data_dir, &args, &[]);
+
+        assert_eq!(command.get_current_dir(), Some(data_dir.as_path()));
     }
 
     #[test]

@@ -3447,7 +3447,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollout_binary_loopback_session_pins_the_local_daemon_identity() {
+    async fn rollout_owned_stream_survives_backpressure() {
         let root = sinomo_testdir::TestDir::new("sinomo-rollout-binary-loopback-session");
         let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("data directory");
@@ -3456,7 +3456,9 @@ mod tests {
         let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
         cluster_paths.ensure().expect("cluster paths");
 
-        let bytes = b"loopback rollout body".to_vec();
+        let bytes = (0..16 * 1024 * 1024)
+            .map(|offset| (offset % 251) as u8)
+            .collect::<Vec<_>>();
         let attachment_path = root.join("candidate");
         std::fs::write(&attachment_path, &bytes).expect("candidate body");
         let artifact_id = "loopback-binary".to_string();
@@ -3484,7 +3486,6 @@ mod tests {
             .await
             .expect("listener");
         let address = listener.local_addr_string().expect("listener address");
-        let server_data_dir = data_dir.clone();
         let expected = bytes.clone();
         let server = tokio::spawn(async move {
             let mut carrier = listener
@@ -3519,18 +3520,27 @@ mod tests {
                         peer.identity,
                         sinomo_core::network::RpcPeerIdentity::UnauthenticatedLocal
                     ));
-                    let authenticated = crate::authenticate_daemon_control_request(
-                        &crate::DaemonPaths::new(&server_data_dir),
-                        &incoming.request,
-                    )
-                    .expect("local rollout signer");
-                    assert_eq!(authenticated.signer, crate::DaemonSignerAuthority::Local);
-                    let mut received = Vec::new();
-                    incoming
-                        .body
-                        .read_to_end(&mut received)
-                        .await
-                        .expect("read rollout body");
+                    assert!(
+                        incoming.request.auth.is_none(),
+                        "the local carrier identity is the authority; request-head auth must not be duplicated"
+                    );
+                    let mut received = Vec::with_capacity(expected.len());
+                    let mut chunk = [0_u8; 8 * 1024];
+                    loop {
+                        let read = incoming
+                            .body
+                            .read(&mut chunk)
+                            .await
+                            .expect("read rollout body");
+                        if read == 0 {
+                            break;
+                        }
+                        received.extend_from_slice(&chunk[..read]);
+                        // Make the receiver visibly slower than the sender so
+                        // the owned logical stream must propagate carrier
+                        // backpressure rather than buffering the whole body.
+                        tokio::task::yield_now().await;
+                    }
                     assert_eq!(received, expected);
                     let response = sinomo_core::network::ObjectRpcResponse::encode_body(
                         sinomo_rollout::ROLLOUT_BINARY_ROUTE,
@@ -3552,15 +3562,22 @@ mod tests {
             .expect("serve stream-native rollout RPC");
         });
 
-        let response = super::send_daemon_rollout_binary_to_address_async(
-            data_dir,
-            address,
-            request,
-            attachment_path,
+        let response = tokio::time::timeout(
+            Duration::from_secs(60),
+            super::send_daemon_rollout_binary_to_address_async(
+                data_dir,
+                address,
+                request,
+                attachment_path,
+            ),
         )
         .await
+        .expect("owned rollout stream must not hang under backpressure")
         .expect("loopback binary rollout");
-        server.await.expect("server task");
+        tokio::time::timeout(Duration::from_secs(60), server)
+            .await
+            .expect("server must finish consuming the rollout stream")
+            .expect("server task");
 
         assert_eq!(response.status, "staged");
         assert_eq!(response.detail, "received loopback body");

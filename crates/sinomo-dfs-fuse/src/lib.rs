@@ -314,4 +314,28 @@ mod tests {
         assert!(prepare_background_mount_point(&file).is_err());
         assert!(prepare_background_mount_point(Path::new("")).is_err());
     }
+
+    #[cfg(all(unix, feature = "fuse"))]
+    #[test]
+    #[ignore = "requires an executable FUSE helper and a usable /dev/fuse"]
+    fn dead_fuse_worker_is_unmounted_and_removed() {
+        let root = sinomo_testdir::TestDir::new("sinomo-fuse-dead-worker-cleanup");
+        let mount_point = root.join("mount");
+        let data_dir = root.join("data");
+        let mut handle =
+            mount_sifs_background(DfsFuseMountOptions::new(&mount_point).with_data_dir(data_dir))
+                .expect("background SIFS mount");
+        assert!(handle.is_active(), "fixture must start a live FUSE worker");
+
+        // Model the worker exiting before its owning application handle. The
+        // BackgroundSession drop is the same lifecycle edge reached when the
+        // worker terminates or the owner is torn down.
+        drop(handle.session.take());
+        assert!(!handle.is_active());
+        drop(handle);
+
+        std::fs::remove_dir(&mount_point)
+            .expect("an exited worker must leave an unmounted, removable mount point");
+        assert!(!mount_point.exists());
+    }
 }

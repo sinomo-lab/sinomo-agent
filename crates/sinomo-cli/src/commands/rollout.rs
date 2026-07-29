@@ -3059,10 +3059,6 @@ pub(crate) fn rollout_cluster_targets_from_state(
     local_target: Option<RolloutTarget>,
 ) -> Vec<RolloutTarget> {
     let mut targets = Vec::new();
-    if let Some(local_target) = local_target {
-        push_unique_rollout_target(&mut targets, local_target);
-    }
-
     let selector = network::ClusterEndpointSelector::new(paths, state);
     let command_endpoints =
         selector.select(network::ClusterEndpointSelectionPurpose::MainDaemonCommand);
@@ -3109,6 +3105,14 @@ pub(crate) fn rollout_cluster_targets_from_state(
                 RolloutTarget::endpoint_for_node(rollout_endpoint, main_node_id.clone()),
             );
         }
+    }
+
+    // Keep the currently running local daemon available as the rollout
+    // coordinator until every discovered remote target has accepted the new
+    // version. Activating it earlier can tear down the only healthy submission
+    // path while remote uploads are still in flight.
+    if let Some(local_target) = local_target {
+        push_unique_rollout_target(&mut targets, local_target);
     }
 
     targets
