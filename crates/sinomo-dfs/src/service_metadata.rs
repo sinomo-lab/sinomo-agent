@@ -679,6 +679,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "local-eventual batch requires exactly one visible version per object".to_string(),
             ));
         }
+        let (batch_expected_object_versions, batch_expected_path_occupants) =
+            match (self.metadata_backend.as_ref(), shard_id.as_ref()) {
+                (Some(backend), Some(shard_id)) => {
+                    let (expected_object_versions, expected_path_occupants, _) =
+                        namespace_prepare_expectations(backend.as_ref(), shard_id, transaction)?;
+                    (
+                        expected_object_versions
+                            .into_iter()
+                            .map(|expectation| {
+                                (expectation.object_id, expectation.expected_version)
+                            })
+                            .collect::<BTreeMap<_, _>>(),
+                        expected_path_occupants
+                            .into_iter()
+                            .map(|expectation| (expectation.path, expectation.expected_object_id))
+                            .collect::<BTreeMap<_, _>>(),
+                    )
+                }
+                _ => (BTreeMap::new(), BTreeMap::new()),
+            };
 
         let mut writes_by_object = BTreeMap::new();
         for write in writes {
@@ -736,7 +756,43 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )));
             }
 
-            let current = current_object(object_id)?;
+            let current = match (
+                write.expected_base_version.as_ref(),
+                batch_expected_object_versions.get(object_id),
+            ) {
+                // The exact shard snapshot already proves that a create's
+                // deterministic object id is absent. Avoid reopening the same
+                // immutable table generation once per file.
+                (None, Some(None)) => None,
+                _ => current_object(object_id)?,
+            };
+            let create_path_is_occupied = if write.expected_base_version.is_none() {
+                match batch_expected_path_occupants.get(&object.path) {
+                    Some(None) => false,
+                    Some(Some(occupant_id)) => {
+                        if current
+                            .as_ref()
+                            .is_some_and(|current| &current.object_id == occupant_id)
+                        {
+                            current
+                                .as_ref()
+                                .is_some_and(|current| current.kind != DfsObjectKind::Tombstone)
+                        } else {
+                            current_object(occupant_id)?
+                                .is_some_and(|occupant| occupant.kind != DfsObjectKind::Tombstone)
+                        }
+                    }
+                    None => current_path(&object.path)?
+                        .is_some_and(|occupant| occupant.kind != DfsObjectKind::Tombstone),
+                }
+            } else {
+                false
+            };
+            if write.expected_base_version.is_none() && create_path_is_occupied {
+                return Err(DfsError::AlreadyExists {
+                    path: object.path.clone(),
+                });
+            }
             match (&write.expected_base_version, current) {
                 (Some(expected_base), Some(current))
                     if current.kind != DfsObjectKind::Tombstone
@@ -765,16 +821,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         kind: DfsObjectKind::Tombstone,
                         ..
                     }),
-                ) => {
-                    if current_path(&object.path)?
-                        .is_some_and(|occupant| occupant.kind != DfsObjectKind::Tombstone)
-                    {
-                        return Err(reject(format!(
-                            "local-eventual batch create path {} is already occupied",
-                            object.path
-                        )));
-                    }
-                }
+                ) => {}
                 _ => {
                     return Err(reject(format!(
                         "local-eventual batch base version changed for object {object_id}"
@@ -1189,7 +1236,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &transaction,
                 &prepare_shard_id,
             );
+            let completed_request_completion = self
+                .compact_durable_namespace_request_completion_for_transaction(
+                    &transaction,
+                    &prepare_shard_id,
+                );
             if completed_request.is_none()
+                && completed_request_completion.is_none()
                 && let Some(active_request) = self.active_durable_namespace_request.clone()
                 && self
                     .metadata_backend
@@ -1210,10 +1263,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .expect("clustered metadata backend checked above")
                     .put_namespace_request_on_shard(&prepare_shard_id, &active_request)?;
             }
-            let operation_id = if let Some(request) = &completed_request {
+            let completed_operation_id = completed_request
+                .as_ref()
+                .map(|request| &request.operation_id)
+                .or_else(|| {
+                    completed_request_completion
+                        .as_ref()
+                        .map(|completion| &completion.operation_id)
+                });
+            let operation_id = if let Some(completed_operation_id) = completed_operation_id {
                 format!(
                     "namespace-request:{}:{}",
-                    request.operation_id, transaction.transaction_id
+                    completed_operation_id, transaction.transaction_id
                 )
             } else if transaction.transaction_id.is_empty() {
                 format!("namespace:{}", sinomo_core::Id::generate())
@@ -1231,6 +1292,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 content_receipts,
                 transaction: transaction.clone(),
                 completed_request,
+                completed_request_completion,
                 status: DfsNamespacePrepareStatus::Prepared,
             };
             prepare.operation_digest =
@@ -1240,7 +1302,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .as_mut()
                 .expect("clustered metadata backend checked above")
                 .prepare_namespace_transaction(&prepare)?;
-            if prepare.completed_request.is_some() {
+            if prepare.completed_request.is_some() || prepare.completed_request_completion.is_some()
+            {
                 self.active_durable_namespace_prepare_recorded = true;
             }
             if prepare_entry.shard_id != prepare.shard_id {

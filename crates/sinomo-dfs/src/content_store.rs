@@ -19,6 +19,7 @@ use fs_ops::{
     system_time_nanos_since_epoch_saturating, temporary_path_for, write_file_atomic,
     write_file_create_new_atomic, write_files_create_new_relaxed, write_reader_to_file,
 };
+use fs2::FileExt;
 #[cfg(test)]
 use packed::PACKED_BLOB_LOCK_FILE;
 use packed::{
@@ -55,6 +56,14 @@ const ORPHAN_OBSERVATION_FORMAT_VERSION: u32 = 2;
 const ORPHAN_OBSERVATION_DIR: &str = "orphan-observations";
 const CONTENT_RESERVATION_FORMAT_VERSION: u32 = 1;
 const CONTENT_RESERVATION_DIR: &str = "content-reservations";
+const CONTENT_RESERVATION_BATCH_FORMAT_VERSION: u32 = 1;
+const CONTENT_RESERVATION_BATCH_SUBDIR: &str = "batches";
+const CONTENT_RESERVATION_BATCH_MAX_IDENTITIES: usize = 256;
+const CONTENT_RESERVATION_LOCK_FILE: &str = "write.lock";
+const CONTENT_RESERVATION_BATCH_SENTINEL_FORMAT_VERSION: u32 = 1;
+const CONTENT_RESERVATION_BATCH_SENTINEL_MARKER: &str = "sinomo-dfs-content-reservation-batches-v1";
+const CONTENT_RESERVATION_BATCH_SENTINEL_SHARD: &str = "00";
+const CONTENT_RESERVATION_BATCH_SENTINEL_FILE: &str = "batch-format-v1.sobj";
 const CONTENT_RESERVATION_RECONCILIATION_CURSOR_FORMAT_VERSION: u32 = 1;
 const CONTENT_RESERVATION_RECONCILIATION_CURSOR_FILE: &str =
     "content-reservation-reconciliation-cursor.sobj";
@@ -927,6 +936,38 @@ struct ContentStoreReservation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+struct ContentStoreReservationBatchSentinel {
+    format_version: u32,
+    marker: String,
+}
+
+/// One bounded reservation publication.
+///
+/// `original_identity_digests` is immutable. Reconciliation may remove
+/// entries from `reservations`, but every retained identity must remain a
+/// member of the original digest set and `batch_id` must continue to verify
+/// against that complete set.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+struct ContentStoreReservationBatch {
+    format_version: u32,
+    batch_id: String,
+    original_identity_digests: Vec<String>,
+    reservations: Vec<ContentStoreReservationRecord>,
+}
+
+#[derive(Debug)]
+struct LoadedContentStoreReservationBatch {
+    path: PathBuf,
+    batch: ContentStoreReservationBatch,
+}
+
+#[derive(Debug, Default)]
+struct ContentStoreReservationInventory {
+    reservations: Vec<ContentStoreReservationRecord>,
+    batches: Vec<LoadedContentStoreReservationBatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 struct ContentStoreReservationReconciliationCursor {
     format_version: u32,
     catalog_generation: String,
@@ -936,6 +977,7 @@ struct ContentStoreReservationReconciliationCursor {
 #[derive(Debug, Clone)]
 pub struct LocalContentStore {
     root: PathBuf,
+    content_reservation_writer_initialized: bool,
     quota: Option<ContentStoreQuota>,
     quota_stats_initialized: Arc<AtomicBool>,
     packed_index_cache: Arc<Mutex<PackedBlobIndexCache>>,
@@ -1109,7 +1151,7 @@ struct PreparedSmallObjectVersion<'a> {
     bytes: &'a [u8],
     blob_path: PathBuf,
     manifest: ContentManifest,
-    manifest_bytes: Vec<u8>,
+    manifest_bytes: Option<Vec<u8>>,
     manifest_path: PathBuf,
 }
 
@@ -1131,7 +1173,9 @@ impl LocalContentStore {
         create_dir_all(root.join(PACKED_BLOB_DIR).join(PACKED_BLOB_SEGMENT_DIR))?;
         create_dir_all(root.join("objects"))?;
         create_dir_all(root.join("staging"))?;
-        Ok(Self::open_for_inspection(root))
+        let mut store = Self::open_for_inspection(root);
+        store.initialize_content_reservation_writer_state()?;
+        Ok(store)
     }
 
     /// Opens a read-only view without initializing the content-store layout.
@@ -1141,6 +1185,7 @@ impl LocalContentStore {
     pub fn open_for_inspection(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            content_reservation_writer_initialized: false,
             quota: None,
             // A persisted stats snapshot is derived observability state. It is
             // not trusted for quota admission until this process has rebuilt
@@ -1174,6 +1219,115 @@ impl LocalContentStore {
         self.quota.as_ref()
     }
 
+    fn initialize_content_reservation_writer_state(&mut self) -> Result<()> {
+        let reservation_root = self.root.join(CONTENT_RESERVATION_DIR);
+        let root_existed = reservation_root.is_dir();
+        create_dir_all(reservation_root.clone())?;
+
+        let lock_path = self.content_reservation_lock_path();
+        let lock_existed = lock_path.is_file();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+            .map_err(|source| ContentStoreError::Io {
+                path: lock_path.clone(),
+                source,
+            })?;
+        FileExt::lock_exclusive(&lock).map_err(|source| ContentStoreError::Io {
+            path: lock_path,
+            source,
+        })?;
+        if !lock_existed {
+            sync_dir(&reservation_root)?;
+            if !root_existed {
+                sync_dir(&self.root)?;
+            }
+        }
+
+        let sentinel_path = self.content_reservation_batch_sentinel_path();
+        let shard_existed = sentinel_path.parent().is_some_and(Path::is_dir);
+        let sentinel = ContentStoreReservationBatchSentinel {
+            format_version: CONTENT_RESERVATION_BATCH_SENTINEL_FORMAT_VERSION,
+            marker: CONTENT_RESERVATION_BATCH_SENTINEL_MARKER.to_owned(),
+        };
+        let bytes = encode_content_reservation_batch_sentinel(&sentinel)?;
+        match write_file_create_new_atomic(&sentinel_path, &bytes) {
+            Ok(()) => {
+                self.sync_new_sharded_record_parents(
+                    &reservation_root,
+                    sentinel_path.parent(),
+                    root_existed,
+                    shard_existed,
+                )?;
+            }
+            Err(ContentStoreError::Io { source, .. })
+                if source.kind() == io::ErrorKind::AlreadyExists =>
+            {
+                let existing =
+                    decode_content_reservation_batch_sentinel(&read_file(&sentinel_path)?)?;
+                validate_content_reservation_batch_sentinel(&existing)?;
+            }
+            Err(error) => return Err(error),
+        }
+        fs::File::open(&sentinel_path)
+            .and_then(|file| file.sync_all())
+            .map_err(|source| ContentStoreError::Io {
+                path: sentinel_path.clone(),
+                source,
+            })?;
+        let sentinel_shard =
+            sentinel_path
+                .parent()
+                .ok_or_else(|| ContentStoreError::InvalidContentLayout {
+                    message: format!(
+                        "content reservation batch sentinel has no parent: {}",
+                        sentinel_path.display()
+                    ),
+                })?;
+        // This explicit chain is the downgrade-safety publication fence:
+        // sentinel bytes, sentinel shard, reservation root, then content root.
+        sync_dir(sentinel_shard)?;
+        sync_dir(&reservation_root)?;
+        sync_dir(&self.root)?;
+        self.content_reservation_writer_initialized = true;
+        Ok(())
+    }
+
+    fn lock_content_reservations_for_write(&self) -> Result<fs::File> {
+        if !self.content_reservation_writer_initialized {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: "content reservation writes require LocalContentStore::new".to_owned(),
+            });
+        }
+        let path = self.content_reservation_lock_path();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        FileExt::lock_exclusive(&file).map_err(|source| ContentStoreError::Io { path, source })?;
+        let sentinel_path = self.content_reservation_batch_sentinel_path();
+        let sentinel = decode_content_reservation_batch_sentinel(&read_file(&sentinel_path)?)?;
+        validate_content_reservation_batch_sentinel(&sentinel)?;
+        Ok(file)
+    }
+
+    fn lock_content_reservations_for_read_if_present(&self) -> Result<Option<fs::File>> {
+        let path = self.content_reservation_lock_path();
+        let file = match fs::OpenOptions::new().read(true).open(&path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(ContentStoreError::Io { path, source }),
+        };
+        FileExt::lock_shared(&file).map_err(|source| ContentStoreError::Io { path, source })?;
+        Ok(Some(file))
+    }
+
     /// Durably reserves an exact content identity before any blob or manifest
     /// becomes visible outside a quarantine file.
     pub fn ensure_content_reservation(
@@ -1192,6 +1346,27 @@ impl LocalContentStore {
         // A crash between these operations only extends later retention.
         self.remove_manifest_absence_observation(&identity)?;
         self.persist_content_reservation(&identity)
+    }
+
+    fn ensure_content_reservations_batch(
+        &self,
+        identities: &[ContentStoreReservationIdentity],
+    ) -> Result<()> {
+        if identities.is_empty() {
+            return Ok(());
+        }
+        let mut identities = identities.to_vec();
+        identities.sort();
+        identities.dedup();
+        for identity in &identities {
+            hash_hex(&identity.content_hash)?;
+            self.remove_manifest_absence_observation(identity)?;
+        }
+        let _lock = self.lock_content_reservations_for_write()?;
+        for identities in identities.chunks(CONTENT_RESERVATION_BATCH_MAX_IDENTITIES) {
+            self.persist_content_reservation_batch_unlocked(identities)?;
+        }
+        Ok(())
     }
 
     /// Returns every durable pre-catalog root in deterministic order.
@@ -1220,6 +1395,7 @@ impl LocalContentStore {
 
     /// Releases one exact reservation after an external authoritative
     /// reconciler proves either catalog coverage or durable rejection.
+    #[cfg(any(test, feature = "test-support"))]
     fn reconcile_content_reservation(
         &self,
         object_id: &str,
@@ -1233,19 +1409,20 @@ impl LocalContentStore {
             version: version.to_owned(),
             content_hash: content_hash.to_owned(),
         };
-        let path = self.content_reservation_path(&identity);
-        let bytes = match read_file(&path) {
-            Ok(bytes) => bytes,
-            Err(ContentStoreError::Io { source, .. })
-                if source.kind() == io::ErrorKind::NotFound =>
-            {
-                return Ok(false);
-            }
-            Err(error) => return Err(error),
-        };
-        let reservation = decode_content_reservation(&bytes)?;
-        validate_content_reservation(&reservation, &identity)?;
-        remove_file_if_exists_and_sync_parent(&path)
+        let _lock = self.lock_content_reservations_for_write()?;
+        let inventory = self.read_content_reservation_inventory_unlocked()?;
+        if inventory
+            .reservations
+            .binary_search_by(|reservation| reservation.identity.cmp(&identity))
+            .is_err()
+        {
+            return Ok(false);
+        }
+        self.apply_content_reservation_resolutions_unlocked(
+            &inventory,
+            &BTreeSet::from([identity]),
+        )?;
+        Ok(true)
     }
 
     /// Test-support hook for releasing a fixture reservation.
@@ -1297,6 +1474,7 @@ impl LocalContentStore {
             });
         }
 
+        let _lock = self.lock_content_reservations_for_write()?;
         let persisted_cursor = self.read_content_reservation_reconciliation_cursor()?;
         let durable_after = match persisted_cursor {
             Some(cursor) if cursor.catalog_generation == options.catalog_generation => {
@@ -1308,7 +1486,8 @@ impl LocalContentStore {
             }
             None => None,
         };
-        let reservations = self.read_content_reservations()?;
+        let inventory = self.read_content_reservation_inventory_unlocked()?;
+        let reservations = &inventory.reservations;
         let reservation_count = reservations.len() as u64;
         let start_after = durable_after.as_ref().or(options.after.as_ref());
         let start_index = start_after
@@ -1324,6 +1503,7 @@ impl LocalContentStore {
             has_more: end_index < reservations.len(),
             ..ContentStoreReservationReconciliationReport::default()
         };
+        let mut resolved_identities = BTreeSet::new();
 
         for reservation in &reservations[start_index..end_index] {
             report.examined_reservation_count = report.examined_reservation_count.saturating_add(1);
@@ -1353,12 +1533,7 @@ impl LocalContentStore {
                 false => Some(ContentStoreReservationResolution::Rejected),
             };
             if let Some(resolution) = resolution {
-                self.reconcile_content_reservation(
-                    &identity.object_id,
-                    &identity.version,
-                    &identity.content_hash,
-                    resolution,
-                )?;
+                resolved_identities.insert(identity.clone());
                 match resolution {
                     ContentStoreReservationResolution::CatalogCovered => {
                         report.released_catalog_covered_count =
@@ -1373,6 +1548,9 @@ impl LocalContentStore {
             report.next_cursor = Some(identity.clone());
         }
 
+        // Resolution files are durable before publishing the continuation
+        // cursor. A crash can therefore only repeat work, never skip roots.
+        self.apply_content_reservation_resolutions_unlocked(&inventory, &resolved_identities)?;
         if report.has_more {
             if let Some(next_cursor) = report.next_cursor.as_ref() {
                 self.persist_content_reservation_reconciliation_cursor(
@@ -1581,29 +1759,54 @@ impl LocalContentStore {
             .iter()
             .map(|(_, _, bytes)| content_hash(bytes))
             .collect::<Vec<_>>();
+        let mut existing_manifests = Vec::with_capacity(versions.len());
+        let mut reservation_identities = Vec::with_capacity(versions.len());
+        for ((object_id, version, _), hash) in versions.iter().zip(&hashes) {
+            let manifest_path = self.manifest_path(object_id, version);
+            let existing = if manifest_path.is_file() {
+                let existing = decode_manifest(&read_file(&manifest_path)?)?;
+                if existing.content_hash != *hash {
+                    return Err(ContentStoreError::VersionHashConflict {
+                        object_id: (*object_id).to_owned(),
+                        version: (*version).to_owned(),
+                        existing_hash: existing.content_hash,
+                        new_hash: hash.clone(),
+                    });
+                }
+                Some(existing)
+            } else {
+                None
+            };
+            reservation_identities.push(
+                existing
+                    .as_ref()
+                    .map(|manifest| ContentStoreReservationIdentity {
+                        object_id: manifest.object_id.clone(),
+                        version: manifest.version.clone(),
+                        content_hash: manifest.content_hash.clone(),
+                    })
+                    .unwrap_or_else(|| ContentStoreReservationIdentity {
+                        object_id: (*object_id).to_owned(),
+                        version: (*version).to_owned(),
+                        content_hash: hash.clone(),
+                    }),
+            );
+            existing_manifests.push(existing);
+        }
+        self.ensure_content_reservations_batch(&reservation_identities)?;
+
         let mut manifests = Vec::with_capacity(versions.len());
         let mut blob_writes = Vec::new();
         let mut quota_delta = ContentStoreQuotaDelta::default();
         {
             let _locks =
                 self.lock_packed_blob_lanes_for_hashes(hashes.iter().map(String::as_str))?;
-            for ((object_id, version, bytes), hash) in versions.iter().zip(&hashes) {
-                let manifest_path = self.manifest_path(object_id, version);
-                if manifest_path.is_file() {
-                    let existing = decode_manifest(&read_file(&manifest_path)?)?;
-                    if existing.content_hash != *hash {
-                        return Err(ContentStoreError::VersionHashConflict {
-                            object_id: (*object_id).to_owned(),
-                            version: (*version).to_owned(),
-                            existing_hash: existing.content_hash,
-                            new_hash: hash.clone(),
-                        });
-                    }
-                    self.ensure_content_reservation(
-                        &existing.object_id,
-                        &existing.version,
-                        &existing.content_hash,
-                    )?;
+            for (((object_id, version, bytes), hash), existing) in versions
+                .iter()
+                .zip(&hashes)
+                .zip(existing_manifests.into_iter())
+            {
+                if let Some(existing) = existing {
                     self.clear_orphan_observations_before_manifest_publish(std::iter::once(
                         &existing,
                     ))?;
@@ -1620,11 +1823,6 @@ impl LocalContentStore {
                     size_bytes: bytes.len() as u64,
                     extents: Vec::new(),
                 };
-                self.ensure_content_reservation(
-                    &manifest.object_id,
-                    &manifest.version,
-                    &manifest.content_hash,
-                )?;
                 let loose_readable = blob_path.is_file()
                     && file_content_hash(&blob_path)
                         .is_ok_and(|actual| actual == manifest.content_hash);
@@ -4079,12 +4277,23 @@ impl LocalContentStore {
             let hash = content_hash(bytes);
             let manifest_path = self.manifest_path(object_id, version);
             if manifest_path.is_file() {
-                return versions
-                    .iter()
-                    .map(|(object_id, version, bytes)| {
-                        self.write_object_version(object_id, version, bytes)
-                    })
-                    .collect();
+                let existing = decode_manifest(&read_file(&manifest_path)?)?;
+                if existing.content_hash != hash {
+                    return Err(ContentStoreError::VersionHashConflict {
+                        object_id: (*object_id).to_owned(),
+                        version: (*version).to_owned(),
+                        existing_hash: existing.content_hash,
+                        new_hash: hash,
+                    });
+                }
+                prepared.push(PreparedSmallObjectVersion {
+                    bytes,
+                    blob_path: self.blob_path(&existing.content_hash)?,
+                    manifest: existing,
+                    manifest_bytes: None,
+                    manifest_path,
+                });
+                continue;
             }
             let blob_path = self.blob_path(&hash)?;
             let manifest = ContentManifest {
@@ -4105,17 +4314,19 @@ impl LocalContentStore {
                 bytes,
                 blob_path,
                 manifest,
-                manifest_bytes,
+                manifest_bytes: Some(manifest_bytes),
                 manifest_path,
             });
         }
-        for prepared in &prepared {
-            self.ensure_content_reservation(
-                &prepared.manifest.object_id,
-                &prepared.manifest.version,
-                &prepared.manifest.content_hash,
-            )?;
-        }
+        let reservation_identities = prepared
+            .iter()
+            .map(|prepared| ContentStoreReservationIdentity {
+                object_id: prepared.manifest.object_id.clone(),
+                version: prepared.manifest.version.clone(),
+                content_hash: prepared.manifest.content_hash.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.ensure_content_reservations_batch(&reservation_identities)?;
 
         let mut blob_writes = Vec::new();
         let mut invalid_loose_blobs = Vec::new();
@@ -4158,17 +4369,19 @@ impl LocalContentStore {
         self.clear_orphan_observations_before_manifest_publish(
             prepared.iter().map(|prepared| &prepared.manifest),
         )?;
-        write_files_create_new_relaxed(prepared.iter().map(|prepared| {
-            (
-                prepared.manifest_path.clone(),
-                prepared.manifest_bytes.as_slice(),
-            )
+        write_files_create_new_relaxed(prepared.iter().filter_map(|prepared| {
+            prepared
+                .manifest_bytes
+                .as_ref()
+                .map(|manifest_bytes| (prepared.manifest_path.clone(), manifest_bytes.as_slice()))
         }))?;
         for prepared in &prepared {
-            manifest_delta.add(ContentStoreStatsDelta::manifest_created(
-                &prepared.manifest,
-                prepared.manifest_bytes.len() as u64,
-            ));
+            if let Some(manifest_bytes) = prepared.manifest_bytes.as_ref() {
+                manifest_delta.add(ContentStoreStatsDelta::manifest_created(
+                    &prepared.manifest,
+                    manifest_bytes.len() as u64,
+                ));
+            }
             self.ensure_content_manifest_index_best_effort(&prepared.manifest);
         }
         self.apply_stats_delta(manifest_delta)?;
@@ -5554,20 +5767,43 @@ impl LocalContentStore {
         &self,
         identity: &ContentStoreReservationIdentity,
     ) -> Result<()> {
+        let _lock = self.lock_content_reservations_for_write()?;
+        self.persist_content_reservation_unlocked(identity)
+    }
+
+    fn persist_content_reservation_unlocked(
+        &self,
+        identity: &ContentStoreReservationIdentity,
+    ) -> Result<()> {
         let path = self.content_reservation_path(identity);
-        if path.is_file() {
-            let reservation = decode_content_reservation(&read_file(&path)?)?;
-            validate_content_reservation(&reservation, identity)?;
-            return Ok(());
-        }
+        let existing = match read_file(&path) {
+            Ok(bytes) => {
+                let reservation = decode_content_reservation(&bytes)?;
+                validate_content_reservation(&reservation, identity)?;
+                Some(reservation)
+            }
+            Err(ContentStoreError::Io { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
         let reservation_root = self.root.join(CONTENT_RESERVATION_DIR);
         let root_existed = reservation_root.is_dir();
         let shard_existed = path.parent().is_some_and(Path::is_dir);
         let reservation = ContentStoreReservation {
             format_version: CONTENT_RESERVATION_FORMAT_VERSION,
             identity: identity.clone(),
-            reserved_at_unix_nanos: system_time_nanos_since_epoch_saturating(SystemTime::now()),
+            reserved_at_unix_nanos: refreshed_reservation_timestamp(
+                existing
+                    .as_ref()
+                    .map(|reservation| reservation.reserved_at_unix_nanos),
+            ),
         };
+        if existing.is_some() {
+            return write_file_atomic(&path, &encode_content_reservation(&reservation)?);
+        }
         let bytes = encode_content_reservation(&reservation)?;
         match write_file_create_new_atomic(&path, &bytes) {
             Ok(()) => {}
@@ -5587,17 +5823,138 @@ impl LocalContentStore {
         )
     }
 
+    fn persist_content_reservation_batch_unlocked(
+        &self,
+        identities: &[ContentStoreReservationIdentity],
+    ) -> Result<()> {
+        if identities.is_empty() || identities.len() > CONTENT_RESERVATION_BATCH_MAX_IDENTITIES {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: format!(
+                    "content reservation batch size must be between 1 and {}: actual={}",
+                    CONTENT_RESERVATION_BATCH_MAX_IDENTITIES,
+                    identities.len()
+                ),
+            });
+        }
+        if !identities.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: "content reservation batch identities must be sorted and unique"
+                    .to_owned(),
+            });
+        }
+        let original_identity_digests = identities
+            .iter()
+            .map(content_identity_digest)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if original_identity_digests.len() != identities.len() {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: "content reservation identity digest collision".to_owned(),
+            });
+        }
+        let batch_id = content_reservation_batch_id(&original_identity_digests);
+        let path = self.content_reservation_batch_path(&batch_id);
+        let existing = match read_file(&path) {
+            Ok(bytes) => {
+                let batch = decode_content_reservation_batch(&bytes)?;
+                validate_content_reservation_batch(&batch, Some(&batch_id))?;
+                if batch.original_identity_digests != original_identity_digests {
+                    return Err(ContentStoreError::InvalidContentLayout {
+                        message: format!(
+                            "content reservation batch immutable membership mismatch: batch={batch_id}"
+                        ),
+                    });
+                }
+                Some(batch)
+            }
+            Err(ContentStoreError::Io { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let refreshed_at = refreshed_reservation_timestamp(existing.as_ref().and_then(|batch| {
+            batch
+                .reservations
+                .iter()
+                .map(|reservation| reservation.reserved_at_unix_nanos)
+                .max()
+        }));
+        let batch = ContentStoreReservationBatch {
+            format_version: CONTENT_RESERVATION_BATCH_FORMAT_VERSION,
+            batch_id,
+            original_identity_digests,
+            reservations: identities
+                .iter()
+                .map(|identity| ContentStoreReservationRecord {
+                    identity: identity.clone(),
+                    reserved_at_unix_nanos: refreshed_at,
+                })
+                .collect(),
+        };
+        validate_content_reservation_batch(&batch, Some(&batch.batch_id))?;
+        let bytes = encode_content_reservation_batch(&batch)?;
+        if existing.is_some() {
+            return write_file_atomic(&path, &bytes);
+        }
+
+        let batch_root = self.content_reservation_batch_root();
+        let batch_root_existed = batch_root.is_dir();
+        let shard_existed = path.parent().is_some_and(Path::is_dir);
+        match write_file_create_new_atomic(&path, &bytes) {
+            Ok(()) => {}
+            Err(ContentStoreError::Io { source, .. })
+                if source.kind() == io::ErrorKind::AlreadyExists =>
+            {
+                let existing = decode_content_reservation_batch(&read_file(&path)?)?;
+                validate_content_reservation_batch(&existing, Some(&batch.batch_id))?;
+                if existing.original_identity_digests != batch.original_identity_digests {
+                    return Err(ContentStoreError::InvalidContentLayout {
+                        message: format!(
+                            "content reservation batch immutable membership mismatch after create race: batch={}",
+                            batch.batch_id
+                        ),
+                    });
+                }
+                write_file_atomic(&path, &bytes)?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+        if !shard_existed {
+            sync_dir(&batch_root)?;
+        }
+        if !batch_root_existed {
+            sync_dir(&self.root.join(CONTENT_RESERVATION_DIR))?;
+        }
+        Ok(())
+    }
+
     fn read_content_reservations(&self) -> Result<Vec<ContentStoreReservationRecord>> {
+        let _lock = self.lock_content_reservations_for_read_if_present()?;
+        Ok(self
+            .read_content_reservation_inventory_unlocked()?
+            .reservations)
+    }
+
+    fn read_content_reservation_inventory_unlocked(
+        &self,
+    ) -> Result<ContentStoreReservationInventory> {
         let root = self.root.join(CONTENT_RESERVATION_DIR);
         if !root.exists() {
-            return Ok(Vec::new());
+            return Ok(ContentStoreReservationInventory::default());
         }
         let mut reservations = Vec::new();
+        let sentinel_path = self.content_reservation_batch_sentinel_path();
+        let batch_root = self.content_reservation_batch_root();
+        let mut sentinel_present = false;
         let mut shard_entries = read_dir(&root)?;
         shard_entries.sort_by_key(|entry| entry.path());
         for shard_entry in shard_entries {
             let shard_path = shard_entry.path();
-            if !shard_path.is_dir() {
+            if !shard_path.is_dir() || shard_path == batch_root {
                 continue;
             }
             let mut entries = read_dir(&shard_path)?;
@@ -5607,6 +5964,12 @@ impl LocalContentStore {
                 if !path.is_file()
                     || path.extension().and_then(|extension| extension.to_str()) != Some("sobj")
                 {
+                    continue;
+                }
+                if path == sentinel_path {
+                    let sentinel = decode_content_reservation_batch_sentinel(&read_file(&path)?)?;
+                    validate_content_reservation_batch_sentinel(&sentinel)?;
+                    sentinel_present = true;
                     continue;
                 }
                 let reservation = decode_content_reservation(&read_file(&path)?)?;
@@ -5627,9 +5990,121 @@ impl LocalContentStore {
                 });
             }
         }
-        reservations.sort_by(|left, right| left.identity.cmp(&right.identity));
-        reservations.dedup_by(|left, right| left.identity == right.identity);
-        Ok(reservations)
+
+        let mut batches = Vec::new();
+        let mut batch_file_seen = false;
+        if batch_root.exists() {
+            let mut shard_entries = read_dir(&batch_root)?;
+            shard_entries.sort_by_key(|entry| entry.path());
+            for shard_entry in shard_entries {
+                let shard_path = shard_entry.path();
+                if !shard_path.is_dir() {
+                    continue;
+                }
+                let mut entries = read_dir(&shard_path)?;
+                entries.sort_by_key(|entry| entry.path());
+                for entry in entries {
+                    let path = entry.path();
+                    if !path.is_file()
+                        || path.extension().and_then(|extension| extension.to_str()) != Some("sobj")
+                    {
+                        continue;
+                    }
+                    batch_file_seen = true;
+                    let batch = decode_content_reservation_batch(&read_file(&path)?)?;
+                    validate_content_reservation_batch(&batch, None)?;
+                    let expected_path = self.content_reservation_batch_path(&batch.batch_id);
+                    if path != expected_path {
+                        return Err(ContentStoreError::InvalidContentLayout {
+                            message: format!(
+                                "content reservation batch path mismatch: expected={}, actual={}",
+                                expected_path.display(),
+                                path.display()
+                            ),
+                        });
+                    }
+                    reservations.extend(batch.reservations.iter().cloned());
+                    batches.push(LoadedContentStoreReservationBatch { path, batch });
+                }
+            }
+        }
+        if batch_file_seen && !sentinel_present {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: "content reservation batches exist without the downgrade-safety sentinel"
+                    .to_owned(),
+            });
+        }
+
+        let mut flattened = BTreeMap::new();
+        for reservation in reservations {
+            flattened
+                .entry(reservation.identity)
+                .and_modify(|reserved_at: &mut u64| {
+                    *reserved_at = (*reserved_at).max(reservation.reserved_at_unix_nanos);
+                })
+                .or_insert(reservation.reserved_at_unix_nanos);
+        }
+        Ok(ContentStoreReservationInventory {
+            reservations: flattened
+                .into_iter()
+                .map(
+                    |(identity, reserved_at_unix_nanos)| ContentStoreReservationRecord {
+                        identity,
+                        reserved_at_unix_nanos,
+                    },
+                )
+                .collect(),
+            batches,
+        })
+    }
+
+    fn apply_content_reservation_resolutions_unlocked(
+        &self,
+        inventory: &ContentStoreReservationInventory,
+        resolved_identities: &BTreeSet<ContentStoreReservationIdentity>,
+    ) -> Result<()> {
+        if resolved_identities.is_empty() {
+            return Ok(());
+        }
+        for identity in resolved_identities {
+            let path = self.content_reservation_path(identity);
+            let bytes = match read_file(&path) {
+                Ok(bytes) => bytes,
+                Err(ContentStoreError::Io { source, .. })
+                    if source.kind() == io::ErrorKind::NotFound =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let reservation = decode_content_reservation(&bytes)?;
+            validate_content_reservation(&reservation, identity)?;
+            remove_file_if_exists_and_sync_parent(&path)?;
+        }
+
+        for loaded in &inventory.batches {
+            let retained = loaded
+                .batch
+                .reservations
+                .iter()
+                .filter(|reservation| !resolved_identities.contains(&reservation.identity))
+                .cloned()
+                .collect::<Vec<_>>();
+            if retained.len() == loaded.batch.reservations.len() {
+                continue;
+            }
+            if retained.is_empty() {
+                remove_file_if_exists_and_sync_parent(&loaded.path)?;
+                continue;
+            }
+            let batch = ContentStoreReservationBatch {
+                reservations: retained,
+                ..loaded.batch.clone()
+            };
+            validate_content_reservation_batch(&batch, Some(&batch.batch_id))?;
+            write_file_atomic(&loaded.path, &encode_content_reservation_batch(&batch)?)?;
+        }
+        Ok(())
     }
 
     fn read_content_reservation_reconciliation_cursor(
@@ -6066,6 +6541,31 @@ impl LocalContentStore {
             .join(format!("{digest}.sobj"))
     }
 
+    fn content_reservation_lock_path(&self) -> PathBuf {
+        self.root
+            .join(CONTENT_RESERVATION_DIR)
+            .join(CONTENT_RESERVATION_LOCK_FILE)
+    }
+
+    fn content_reservation_batch_sentinel_path(&self) -> PathBuf {
+        self.root
+            .join(CONTENT_RESERVATION_DIR)
+            .join(CONTENT_RESERVATION_BATCH_SENTINEL_SHARD)
+            .join(CONTENT_RESERVATION_BATCH_SENTINEL_FILE)
+    }
+
+    fn content_reservation_batch_root(&self) -> PathBuf {
+        self.root
+            .join(CONTENT_RESERVATION_DIR)
+            .join(CONTENT_RESERVATION_BATCH_SUBDIR)
+    }
+
+    fn content_reservation_batch_path(&self, batch_id: &str) -> PathBuf {
+        self.content_reservation_batch_root()
+            .join(&batch_id[..2])
+            .join(format!("{batch_id}.sobj"))
+    }
+
     fn content_reservation_reconciliation_cursor_path(&self) -> PathBuf {
         self.root
             .join(CONTENT_RESERVATION_RECONCILIATION_CURSOR_FILE)
@@ -6164,6 +6664,30 @@ fn decode_content_reservation(bytes: &[u8]) -> Result<ContentStoreReservation> {
         .map_err(|source| ContentStoreError::Serde(source.to_string()))
 }
 
+fn encode_content_reservation_batch_sentinel(
+    sentinel: &ContentStoreReservationBatchSentinel,
+) -> Result<Vec<u8>> {
+    sinomo_object_serde::to_bytes(sentinel, 1, LengthMode::U32)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn decode_content_reservation_batch_sentinel(
+    bytes: &[u8],
+) -> Result<ContentStoreReservationBatchSentinel> {
+    sinomo_object_serde::from_bytes(bytes)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn encode_content_reservation_batch(batch: &ContentStoreReservationBatch) -> Result<Vec<u8>> {
+    sinomo_object_serde::to_bytes(batch, 1, LengthMode::U32)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
+fn decode_content_reservation_batch(bytes: &[u8]) -> Result<ContentStoreReservationBatch> {
+    sinomo_object_serde::from_bytes(bytes)
+        .map_err(|source| ContentStoreError::Serde(source.to_string()))
+}
+
 fn encode_content_reservation_reconciliation_cursor(
     cursor: &ContentStoreReservationReconciliationCursor,
 ) -> Result<Vec<u8>> {
@@ -6228,6 +6752,119 @@ fn validate_content_reservation(
     Ok(())
 }
 
+fn validate_content_reservation_batch_sentinel(
+    sentinel: &ContentStoreReservationBatchSentinel,
+) -> Result<()> {
+    if sentinel.format_version != CONTENT_RESERVATION_BATCH_SENTINEL_FORMAT_VERSION
+        || sentinel.marker != CONTENT_RESERVATION_BATCH_SENTINEL_MARKER
+    {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: format!(
+                "invalid content reservation batch sentinel: version={}, marker={:?}",
+                sentinel.format_version, sentinel.marker
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_content_reservation_batch(
+    batch: &ContentStoreReservationBatch,
+    expected_batch_id: Option<&str>,
+) -> Result<()> {
+    if batch.format_version != CONTENT_RESERVATION_BATCH_FORMAT_VERSION {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: format!(
+                "unsupported content reservation batch format version {}",
+                batch.format_version
+            ),
+        });
+    }
+    if !valid_content_identity_digest(&batch.batch_id) {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: format!(
+                "content reservation batch has an invalid batch id: {}",
+                batch.batch_id
+            ),
+        });
+    }
+    if let Some(expected_batch_id) = expected_batch_id
+        && batch.batch_id != expected_batch_id
+    {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: format!(
+                "content reservation batch id mismatch: expected={expected_batch_id}, actual={}",
+                batch.batch_id
+            ),
+        });
+    }
+    if batch.original_identity_digests.is_empty()
+        || batch.original_identity_digests.len() > CONTENT_RESERVATION_BATCH_MAX_IDENTITIES
+        || !batch
+            .original_identity_digests
+            .iter()
+            .all(|digest| valid_content_identity_digest(digest))
+        || !batch
+            .original_identity_digests
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+    {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: "content reservation batch has invalid immutable identity digests".to_owned(),
+        });
+    }
+    let computed_batch_id = content_reservation_batch_id(&batch.original_identity_digests);
+    if batch.batch_id != computed_batch_id {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: format!(
+                "content reservation batch id does not match immutable membership: expected={computed_batch_id}, actual={}",
+                batch.batch_id
+            ),
+        });
+    }
+    if batch.reservations.is_empty()
+        || batch.reservations.len() > batch.original_identity_digests.len()
+        || !batch
+            .reservations
+            .windows(2)
+            .all(|pair| pair[0].identity < pair[1].identity)
+    {
+        return Err(ContentStoreError::InvalidContentLayout {
+            message: "content reservation batch has invalid retained reservations".to_owned(),
+        });
+    }
+    for reservation in &batch.reservations {
+        if reservation.reserved_at_unix_nanos == 0 {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: "content reservation batch has an invalid zero reservation timestamp"
+                    .to_owned(),
+            });
+        }
+        hash_hex(&reservation.identity.content_hash)?;
+        let digest = content_identity_digest(&reservation.identity);
+        if batch
+            .original_identity_digests
+            .binary_search(&digest)
+            .is_err()
+        {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: format!(
+                    "retained content reservation is not a member of batch {}: identity={:?}",
+                    batch.batch_id, reservation.identity
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn valid_content_identity_digest(digest: &str) -> bool {
+    digest.len() == BLAKE3_HEX_LEN
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 fn content_identity_digest(identity: &ContentStoreReservationIdentity) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"sinomo-content-identity-v1");
@@ -6240,6 +6877,22 @@ fn content_identity_digest(identity: &ContentStoreReservationIdentity) -> String
         hasher.update(field);
     }
     hasher.finalize().to_hex().to_string()
+}
+
+fn content_reservation_batch_id(original_identity_digests: &[String]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo-content-reservation-batch-v1");
+    hasher.update(&(original_identity_digests.len() as u64).to_le_bytes());
+    for digest in original_identity_digests {
+        hasher.update(digest.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn refreshed_reservation_timestamp(previous: Option<u64>) -> u64 {
+    system_time_nanos_since_epoch_saturating(SystemTime::now())
+        .max(previous.unwrap_or(0).saturating_add(1))
+        .max(1)
 }
 
 fn content_reservation_identity_for_entry(
@@ -7023,6 +7676,285 @@ mod tests {
             .expect("read bound object");
         assert_eq!(stored_bytes, bytes);
 
+        cleanup(&root);
+    }
+
+    #[test]
+    fn batch_sentinel_rejects_legacy_decoder_and_blocks_destructive_gc_when_malformed() {
+        let root = temp_root("content_reservation_batch_sentinel");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let sentinel_path = store.content_reservation_batch_sentinel_path();
+        let sentinel_bytes = read_file(&sentinel_path).expect("read sentinel");
+        assert!(
+            decode_content_reservation(&sentinel_bytes).is_err(),
+            "the legacy single-reservation decoder must fail closed on the sentinel"
+        );
+
+        let manifests = store
+            .put_object_versions([
+                ("sentinel-object", "v1", b"old manifest".as_slice()),
+                ("sentinel-object", "v2", b"latest manifest".as_slice()),
+            ])
+            .expect("publish manifest batch");
+        let blob_only = store
+            .put_object_version_blobs_only([(
+                "sentinel-blob-only",
+                "v1",
+                b"unpublished blob".as_slice(),
+            )])
+            .expect("publish blob-only batch")
+            .remove(0);
+        release_all_content_reservations(&store);
+        let first_versions = store
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_min_absence_age(Duration::ZERO)
+                    .with_catalog_observation("sentinel-version-catalog-1", u64::MAX),
+            )
+            .expect("observe old manifest absence");
+        assert_eq!(first_versions.newly_observed_absent_version_count, 1);
+        let first_orphans = store
+            .collect_garbage(
+                ContentStoreGcOptions::delete_eligible(Duration::ZERO)
+                    .with_catalog_observation("sentinel-orphan-catalog-1", u64::MAX),
+            )
+            .expect("observe orphan blob");
+        assert_eq!(first_orphans.newly_observed_orphan_count, 1);
+        let old_identity = ContentStoreReservationIdentity {
+            object_id: manifests[0].object_id.clone(),
+            version: manifests[0].version.clone(),
+            content_hash: manifests[0].content_hash.clone(),
+        };
+        let manifest_observation = store.manifest_absence_observation_path(&old_identity);
+        let orphan_observation = store
+            .orphan_observation_path(&blob_only.content_hash)
+            .expect("orphan observation path");
+        assert!(manifest_observation.is_file());
+        assert!(orphan_observation.is_file());
+
+        let malformed = ContentStoreReservationBatchSentinel {
+            format_version: CONTENT_RESERVATION_BATCH_SENTINEL_FORMAT_VERSION,
+            marker: "wrong-marker".to_owned(),
+        };
+        write_file_atomic(
+            &sentinel_path,
+            &encode_content_reservation_batch_sentinel(&malformed)
+                .expect("encode malformed sentinel"),
+        )
+        .expect("install malformed sentinel");
+
+        store
+            .content_reservation_roots()
+            .expect_err("new reader must reject a malformed exact-path sentinel");
+        store
+            .collect_versions(
+                ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_min_absence_age(Duration::ZERO)
+                    .with_catalog_observation("sentinel-version-catalog-2", u64::MAX),
+            )
+            .expect_err("version GC must fail before deleting with a malformed sentinel");
+        store
+            .collect_garbage(
+                ContentStoreGcOptions::delete_eligible(Duration::ZERO)
+                    .with_catalog_observation("sentinel-orphan-catalog-2", u64::MAX),
+            )
+            .expect_err("orphan GC must fail before deleting with a malformed sentinel");
+        assert!(store.manifest_path("sentinel-object", "v1").is_file());
+        assert!(
+            store
+                .has_blob(&blob_only.content_hash)
+                .expect("blob lookup after rejected GC")
+        );
+        assert!(manifest_observation.is_file());
+        assert!(orphan_observation.is_file());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn inspection_open_is_non_creating_and_reads_sentinel_less_legacy_records() {
+        let root = temp_root("content_reservation_inspection");
+        let missing = root.join("missing-content-root");
+        let missing_inspection = LocalContentStore::open_for_inspection(&missing);
+        assert_eq!(
+            missing_inspection
+                .content_reservation_roots()
+                .expect("inspect missing root")
+                .reservation_count,
+            0
+        );
+        assert!(
+            !missing.exists(),
+            "inspection of a missing content root must not create it"
+        );
+
+        let legacy_root = root.join("legacy-content-root");
+        fs::create_dir_all(&legacy_root).expect("create legacy fixture root");
+        let legacy = LocalContentStore::open_for_inspection(&legacy_root);
+        let identity = ContentStoreReservationIdentity {
+            object_id: "legacy-object".to_owned(),
+            version: "v1".to_owned(),
+            content_hash: content_hash(b"legacy content"),
+        };
+        let reservation = ContentStoreReservation {
+            format_version: CONTENT_RESERVATION_FORMAT_VERSION,
+            identity: identity.clone(),
+            reserved_at_unix_nanos: 1,
+        };
+        write_file_create_new_atomic(
+            &legacy.content_reservation_path(&identity),
+            &encode_content_reservation(&reservation).expect("encode legacy reservation"),
+        )
+        .expect("write legacy reservation fixture");
+
+        let roots = legacy
+            .content_reservation_roots()
+            .expect("read sentinel-less legacy reservation");
+        assert_eq!(roots.reservation_count, 1);
+        assert_eq!(
+            roots.reservations[0],
+            ContentStoreReservationRecord {
+                identity,
+                reserved_at_unix_nanos: 1,
+            }
+        );
+        assert!(!legacy.content_reservation_lock_path().exists());
+        assert!(!legacy.content_reservation_batch_sentinel_path().exists());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn batch_reconciliation_preserves_immutable_membership_then_deletes() {
+        let root = temp_root("content_reservation_batch_membership");
+        let store = LocalContentStore::new(&root).expect("create store");
+        store
+            .put_object_version_blobs_only([
+                ("a-covered", "v1", b"covered-a".as_slice()),
+                ("b-covered", "v1", b"covered-b".as_slice()),
+                ("c-rejected", "v1", b"rejected-c".as_slice()),
+            ])
+            .expect("publish reservation batch");
+        let roots = store.content_reservation_roots().expect("read roots");
+        let original_identity_digests = roots
+            .reservations
+            .iter()
+            .map(|reservation| content_identity_digest(&reservation.identity))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let batch_id = content_reservation_batch_id(&original_identity_digests);
+        let batch_path = store.content_reservation_batch_path(&batch_id);
+        let catalog_time = roots
+            .reservations
+            .iter()
+            .map(|reservation| reservation.reserved_at_unix_nanos)
+            .max()
+            .expect("reservation time");
+        let covered = BTreeSet::from([
+            ("a-covered".to_owned(), "v1".to_owned()),
+            ("b-covered".to_owned(), "v1".to_owned()),
+        ]);
+
+        let partial = store
+            .reconcile_content_reservations_with_catalog(
+                &covered,
+                &BTreeSet::new(),
+                ContentStoreReservationReconciliationOptions::bounded(
+                    catalog_time,
+                    Duration::from_secs(60),
+                    2,
+                )
+                .with_catalog_generation("membership-catalog"),
+            )
+            .expect("partially reconcile batch");
+        assert_eq!(partial.released_catalog_covered_count, 2);
+        let rewritten = decode_content_reservation_batch(
+            &read_file(&batch_path).expect("read rewritten batch"),
+        )
+        .expect("decode rewritten batch");
+        assert_eq!(
+            rewritten.original_identity_digests,
+            original_identity_digests
+        );
+        assert_eq!(rewritten.reservations.len(), 1);
+        validate_content_reservation_batch(&rewritten, Some(&batch_id))
+            .expect("validate retained membership");
+
+        let full = store
+            .reconcile_content_reservations_with_catalog(
+                &covered,
+                &BTreeSet::new(),
+                ContentStoreReservationReconciliationOptions::bounded(u64::MAX, Duration::ZERO, 2)
+                    .with_catalog_generation("membership-catalog"),
+            )
+            .expect("release remaining reservation");
+        assert_eq!(full.released_rejected_count, 1);
+        assert!(!batch_path.exists());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn batch_retry_refreshes_roots_against_a_stale_catalog() {
+        let root = temp_root("content_reservation_batch_retry");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let inputs = [
+            ("retry-object-a", "v1", b"retry-a".as_slice()),
+            ("retry-object-b", "v1", b"retry-b".as_slice()),
+            ("retry-object-c", "v1", b"retry-c".as_slice()),
+        ];
+        store
+            .put_object_versions(inputs)
+            .expect("publish initial batch");
+        let initial = store
+            .content_reservation_roots()
+            .expect("read initial roots");
+        let stale_catalog_time = initial
+            .reservations
+            .iter()
+            .map(|reservation| reservation.reserved_at_unix_nanos)
+            .max()
+            .expect("initial reservation time")
+            .saturating_add(1);
+
+        store
+            .put_object_versions(inputs)
+            .expect("retry batch publication");
+        let refreshed = store
+            .content_reservation_roots()
+            .expect("read refreshed roots");
+        assert_eq!(refreshed.reservation_count, inputs.len() as u64);
+        assert!(
+            refreshed
+                .reservations
+                .iter()
+                .all(|reservation| reservation.reserved_at_unix_nanos >= stale_catalog_time)
+        );
+        assert!(refreshed.reservations.iter().all(|reservation| {
+            !store
+                .content_reservation_path(&reservation.identity)
+                .exists()
+        }));
+
+        let stale = store
+            .reconcile_content_reservations_with_catalog(
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                ContentStoreReservationReconciliationOptions::bounded(
+                    stale_catalog_time,
+                    Duration::ZERO,
+                    8,
+                )
+                .with_catalog_generation("pre-retry-catalog"),
+            )
+            .expect("apply stale catalog");
+        assert_eq!(stale.released_rejected_count, 0);
+        assert_eq!(stale.retained_catalog_too_old_count, inputs.len() as u64);
+        assert_eq!(
+            store
+                .content_reservation_roots()
+                .expect("retry roots retained")
+                .reservation_count,
+            inputs.len() as u64
+        );
         cleanup(&root);
     }
 

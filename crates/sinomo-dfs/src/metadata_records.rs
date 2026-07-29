@@ -835,6 +835,21 @@ pub enum DfsMetadataMutation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prepare: Option<DfsNamespacePrepareRecord>,
     },
+    /// Fenced commit of the complete Prepared body already durable earlier in
+    /// this shard's journal. Replayers must resolve the referenced prepare and
+    /// reject a missing, mismatched, or aborted dependency.
+    CommitNamespacePrepare {
+        file_system_id: DfsFileSystemId,
+        operation_id: String,
+        operation_digest: String,
+        owner_epoch: u64,
+        /// Sorted, deduplicated object identities needed by replica service
+        /// caches and sharded placement indexes after the referenced
+        /// transaction becomes visible. This remains much smaller than the
+        /// prepared transaction body while making post-apply reconciliation
+        /// self-contained.
+        object_ids: Vec<DfsObjectId>,
+    },
     /// Compact terminal prepare evidence. Prepared records never use this
     /// mutation because recovery still needs their complete transaction.
     PutNamespacePrepareReceipt {
@@ -950,6 +965,11 @@ impl DfsMetadataMutation {
                 }
             }
             Self::PutNamespacePrepare { prepare: None, .. } => {}
+            Self::CommitNamespacePrepare { object_ids, .. } => {
+                for object_id in object_ids {
+                    visit(object_id);
+                }
+            }
         }
     }
 
@@ -1223,6 +1243,50 @@ impl DfsMetadataMutation {
         }
     }
 
+    pub(crate) fn commit_namespace_prepare(prepare: &DfsNamespacePrepareRecord) -> Self {
+        let object_ids = prepare
+            .expected_object_versions
+            .iter()
+            .map(|expected| expected.object_id.clone())
+            .chain(
+                prepare
+                    .transaction
+                    .objects
+                    .iter()
+                    .map(|object| object.object_id.clone()),
+            )
+            .chain(
+                prepare
+                    .transaction
+                    .versions
+                    .iter()
+                    .map(|version| version.object_id.clone()),
+            )
+            .chain(
+                prepare
+                    .transaction
+                    .advisory_lock_states
+                    .iter()
+                    .map(|state| state.object_id.clone()),
+            )
+            .chain(
+                prepare
+                    .content_receipts
+                    .iter()
+                    .map(|receipt| receipt.receipt.object_id.clone()),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Self::CommitNamespacePrepare {
+            file_system_id: prepare.file_system_id.clone(),
+            operation_id: prepare.operation_id.clone(),
+            operation_digest: prepare.operation_digest.clone(),
+            owner_epoch: prepare.owner_epoch,
+            object_ids,
+        }
+    }
+
     pub(crate) fn put_namespace_prepare_receipt(receipt: &DfsNamespacePrepareReceipt) -> Self {
         Self::PutNamespacePrepareReceipt {
             file_system_id: receipt.file_system_id.clone(),
@@ -1392,6 +1456,15 @@ pub struct DfsNamespacePrepareRecord {
     /// validation still rejects new request-owned prepares without a result.
     #[serde(default)]
     pub completed_request: Option<DfsNamespaceRequestRecord>,
+    /// Compact terminal routed-request evidence for operations whose semantic
+    /// body is already fully represented by this prepare's transaction and
+    /// content receipts. New fused local-eventual batches use this attachment
+    /// instead of repeating the full operation in `completed_request`.
+    ///
+    /// Legacy prepares omit this field. A request-owned prepare may carry one
+    /// completion representation, never both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_request_completion: Option<DfsNamespaceRequestCompletion>,
     pub status: DfsNamespacePrepareStatus,
 }
 
@@ -1476,6 +1549,65 @@ pub struct DfsNamespaceRequestRecord {
     pub updated_at: OffsetDateTime,
 }
 
+/// Compact terminal result attached to a request-owned namespace prepare.
+///
+/// The prepare's transaction and content receipts already contain the full
+/// durable mutation. This record retains only the identity and canonical
+/// response needed to index a hidden prepare, validate exact retries, and
+/// materialize a bounded request receipt when the prepare commits.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceRequestCompletion {
+    pub file_system_id: DfsFileSystemId,
+    pub requester_node_id: NodeId,
+    pub request_id: String,
+    pub operation_id: String,
+    pub authority_shard_id: DfsMetadataShardId,
+    pub command_digest: String,
+    /// Exact local-eventual transaction whose full body is carried by the
+    /// owning namespace prepare.
+    pub transaction_id: String,
+    pub result: DfsNamespaceResult,
+    pub posix_coordination_result: Option<DfsPosixCoordinationResult>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub completed_at: OffsetDateTime,
+}
+
+impl DfsNamespaceRequestCompletion {
+    pub(crate) fn from_completed_request(request: &DfsNamespaceRequestRecord) -> Option<Self> {
+        if request.status != DfsNamespaceRequestStatus::Completed {
+            return None;
+        }
+        Some(Self {
+            file_system_id: request.file_system_id.clone(),
+            requester_node_id: request.requester_node_id.clone(),
+            request_id: request.request_id.clone(),
+            operation_id: request.operation_id.clone(),
+            authority_shard_id: request.authority_shard_id.clone(),
+            command_digest: request.command_digest.clone(),
+            transaction_id: match &request.operation {
+                DfsNamespaceOperation::CommitLocalEventualBatch { transaction, .. } => {
+                    transaction.transaction_id.clone()
+                }
+                _ => return None,
+            },
+            result: request.result.clone()?,
+            posix_coordination_result: request.posix_coordination_result.clone(),
+            created_at: request.created_at,
+            completed_at: request.updated_at,
+        })
+    }
+
+    pub(crate) fn request_key(&self) -> (NodeId, String) {
+        (self.requester_node_id.clone(), self.request_id.clone())
+    }
+
+    pub(crate) fn matches_completed_request(&self, request: &DfsNamespaceRequestRecord) -> bool {
+        Self::from_completed_request(request).as_ref() == Some(self)
+    }
+}
+
 /// Compact, canonical response retained for exact retries after a completed
 /// namespace request's operation and recovery bookkeeping have been folded
 /// into an authoritative materialized snapshot.
@@ -1520,6 +1652,25 @@ impl DfsNamespaceRequestReceipt {
 
     pub(crate) fn matches_completed_request(&self, request: &DfsNamespaceRequestRecord) -> bool {
         Self::from_request(request, self.retained_at).as_ref() == Some(self)
+    }
+
+    pub(crate) fn from_completion(completion: &DfsNamespaceRequestCompletion) -> Self {
+        Self {
+            file_system_id: completion.file_system_id.clone(),
+            requester_node_id: completion.requester_node_id.clone(),
+            request_id: completion.request_id.clone(),
+            operation_id: completion.operation_id.clone(),
+            authority_shard_id: completion.authority_shard_id.clone(),
+            command_digest: completion.command_digest.clone(),
+            result: completion.result.clone(),
+            posix_coordination_result: completion.posix_coordination_result.clone(),
+            created_at: completion.created_at,
+            retained_at: completion.completed_at,
+        }
+    }
+
+    pub(crate) fn matches_completion(&self, completion: &DfsNamespaceRequestCompletion) -> bool {
+        &Self::from_completion(completion) == self
     }
 }
 
@@ -2449,6 +2600,15 @@ pub(crate) enum DfsMetadataTableOp {
     PutNamespacePrepare {
         prepare: DfsNamespacePrepareRecord,
     },
+    /// Compact materialized-table transition for a prepare whose full semantic
+    /// body is already present in the preceding table state. Replaying this
+    /// marker expands the transaction and terminal request evidence directly
+    /// into the in-memory indexes without serializing thousands of derived ops.
+    CommitNamespacePrepare {
+        operation_id: String,
+        operation_digest: String,
+        owner_epoch: u64,
+    },
     PutNamespacePrepareReceipt {
         receipt: DfsNamespacePrepareReceipt,
     },
@@ -2566,6 +2726,7 @@ pub(crate) fn metadata_journal_batch_file_system_id(
             | DfsMetadataMutation::PutNamespaceTransactionReceipt { file_system_id, .. }
             | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { file_system_id, .. }
             | DfsMetadataMutation::PutNamespacePrepare { file_system_id, .. }
+            | DfsMetadataMutation::CommitNamespacePrepare { file_system_id, .. }
             | DfsMetadataMutation::PutNamespacePrepareReceipt { file_system_id, .. }
             | DfsMetadataMutation::RemoveNamespacePrepareReceipt { file_system_id, .. }
             | DfsMetadataMutation::PutNamespaceJob { file_system_id, .. }
@@ -2883,6 +3044,7 @@ mod tests {
                 created_at: OffsetDateTime::UNIX_EPOCH,
             },
             completed_request: None,
+            completed_request_completion: None,
             status: DfsNamespacePrepareStatus::Prepared,
         };
         let mut encoded = serde_json::to_value(&prepare).expect("serialize namespace prepare");
@@ -2895,16 +3057,22 @@ mod tests {
             encoded.get("completed_request"),
             Some(&serde_json::Value::Null)
         );
+        assert!(
+            encoded.get("completed_request_completion").is_none(),
+            "an absent compact completion should not expand legacy prepare payloads"
+        );
 
         let mut legacy = encoded.clone();
         legacy.remove("content_receipts");
         legacy.remove("completed_request");
+        legacy.remove("completed_request_completion");
         let decoded = serde_json::from_value::<DfsNamespacePrepareRecord>(
             serde_json::Value::Object(legacy.clone()),
         )
         .expect("deserialize legacy namespace prepare");
         assert!(decoded.content_receipts.is_empty());
         assert!(decoded.completed_request.is_none());
+        assert!(decoded.completed_request_completion.is_none());
 
         let mut legacy_entry = serde_json::to_value(DfsMetadataJournalEntry {
             shard_id: prepare.shard_id.clone(),
@@ -2920,6 +3088,7 @@ mod tests {
             .expect("namespace prepare journal payload");
         legacy_entry_prepare.remove("content_receipts");
         legacy_entry_prepare.remove("completed_request");
+        legacy_entry_prepare.remove("completed_request_completion");
         let legacy_bytes = sinomo_core::object::serde_ext::to_bytes(
             &legacy_entry,
             1,
@@ -2938,6 +3107,7 @@ mod tests {
         };
         assert!(decoded.content_receipts.is_empty());
         assert!(decoded.completed_request.is_none());
+        assert!(decoded.completed_request_completion.is_none());
     }
 
     #[test]

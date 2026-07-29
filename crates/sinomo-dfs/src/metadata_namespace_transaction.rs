@@ -309,11 +309,12 @@ fn validate_directory_tombstones_with_clone_replay(
 ) -> Result<()> {
     let mut scratch = tables.clone();
     let mut table_ops = Vec::new();
+    let mut table_op_sink = Some(&mut table_ops);
     let mut rollback = None;
     plan_namespace_transaction_table_ops_in_place(
         &mut scratch,
         transaction,
-        &mut table_ops,
+        &mut table_op_sink,
         &mut rollback,
     );
     for object in &transaction.objects {
@@ -366,11 +367,12 @@ pub(crate) fn plan_namespace_transaction_table_ops(
     }
     let mut scratch = tables.clone();
     let mut table_ops = Vec::new();
+    let mut table_op_sink = Some(&mut table_ops);
     let mut rollback = None;
     plan_namespace_transaction_table_ops_in_place(
         &mut scratch,
         transaction,
-        &mut table_ops,
+        &mut table_op_sink,
         &mut rollback,
     );
     table_ops
@@ -389,14 +391,97 @@ pub(crate) fn preapply_namespace_transaction_table_ops(
     table_ops: &mut Vec<DfsMetadataTableOp>,
     rollback: &mut DfsMetadataTableRollback,
 ) {
+    let mut table_op_sink = Some(table_ops);
     let mut rollback = Some(rollback);
-    plan_namespace_transaction_table_ops_in_place(tables, transaction, table_ops, &mut rollback);
+    plan_namespace_transaction_table_ops_in_place(
+        tables,
+        transaction,
+        &mut table_op_sink,
+        &mut rollback,
+    );
+}
+
+/// Preapply a transaction while retaining rollback state but not its derived
+/// operation list.
+///
+/// Compact semantic table commits persist only their fenced commit marker. The
+/// derived operations are needed to update the table image and rollback maps,
+/// but collecting a second copy can contain tens of thousands of operations
+/// for a bulk transaction.
+pub(crate) fn preapply_namespace_transaction_table_state_with_rollback(
+    tables: &mut DfsMetadataTables,
+    transaction: &DfsNamespaceTransaction,
+    rollback: &mut DfsMetadataTableRollback,
+) {
+    let mut table_op_sink = None;
+    let mut rollback = Some(rollback);
+    plan_namespace_transaction_table_ops_in_place(
+        tables,
+        transaction,
+        &mut table_op_sink,
+        &mut rollback,
+    );
+}
+
+/// Materialize a transaction directly into an already-authorized table image.
+///
+/// A committed namespace prepare is itself the durable semantic body. Its
+/// materialized table log therefore records one compact commit marker instead
+/// of serializing every derived object/path/inode/version operation again.
+/// Table replay resolves that marker against the preceding durable prepare and
+/// calls this function. The decisions intentionally mirror the normal planner,
+/// but no derived operation vector or rollback clone is needed because the
+/// compact table marker is durable before it is applied to the in-memory view.
+pub(crate) fn materialize_namespace_transaction_table_state(
+    tables: &mut DfsMetadataTables,
+    transaction: &DfsNamespaceTransaction,
+) {
+    if transaction.objects.len() == 1 {
+        for op in plan_single_object_namespace_transaction_table_ops(tables, transaction) {
+            tables.apply(op);
+        }
+        return;
+    }
+
+    tables.apply(DfsMetadataTableOp::PutNamespaceTransaction {
+        transaction: transaction.clone(),
+    });
+    for object in transaction
+        .objects
+        .iter()
+        .filter(|object| object.kind == DfsObjectKind::Tombstone)
+    {
+        if tables.compacted_tombstone_matches(object) {
+            continue;
+        }
+        materialize_object_index_state(tables, object);
+    }
+    for object in transaction
+        .objects
+        .iter()
+        .filter(|object| object.kind != DfsObjectKind::Tombstone)
+    {
+        if tables.compacted_tombstone_matches(object) {
+            continue;
+        }
+        materialize_object_index_state(tables, object);
+    }
+    for version in &transaction.versions {
+        tables.apply(DfsMetadataTableOp::PutVersion {
+            version: normalized_version_record(version),
+        });
+    }
+    for state in &transaction.advisory_lock_states {
+        tables.apply(DfsMetadataTableOp::PutAdvisoryLockState {
+            state: state.clone(),
+        });
+    }
 }
 
 fn plan_namespace_transaction_table_ops_in_place(
     tables: &mut DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
-    table_ops: &mut Vec<DfsMetadataTableOp>,
+    table_ops: &mut Option<&mut Vec<DfsMetadataTableOp>>,
     rollback: &mut Option<&mut DfsMetadataTableRollback>,
 ) {
     if transaction.objects.len() == 1 {
@@ -416,7 +501,7 @@ fn plan_namespace_transaction_table_ops_in_place(
 fn plan_multi_object_namespace_transaction_table_ops_in_place(
     scratch: &mut DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
-    table_ops: &mut Vec<DfsMetadataTableOp>,
+    table_ops: &mut Option<&mut Vec<DfsMetadataTableOp>>,
     rollback: &mut Option<&mut DfsMetadataTableRollback>,
 ) {
     apply_namespace_transaction_planned_op(
@@ -789,12 +874,18 @@ fn validate_directory_tombstone_has_no_children(
 
 fn plan_object_index_ops(
     scratch: &mut DfsMetadataTables,
-    table_ops: &mut Vec<DfsMetadataTableOp>,
+    table_ops: &mut Option<&mut Vec<DfsMetadataTableOp>>,
     rollback: &mut Option<&mut DfsMetadataTableRollback>,
     object: &DfsObjectMetadata,
 ) {
     for op in object_index_table_ops_with_previous(scratch, object, None) {
         apply_namespace_transaction_planned_op(scratch, table_ops, rollback, op);
+    }
+}
+
+fn materialize_object_index_state(tables: &mut DfsMetadataTables, object: &DfsObjectMetadata) {
+    for op in object_index_table_ops_with_previous(tables, object, None) {
+        tables.apply(op);
     }
 }
 
@@ -875,16 +966,27 @@ fn apply_planned_op(
 
 fn apply_namespace_transaction_planned_op(
     tables: &mut DfsMetadataTables,
-    table_ops: &mut Vec<DfsMetadataTableOp>,
+    table_ops: &mut Option<&mut Vec<DfsMetadataTableOp>>,
     rollback: &mut Option<&mut DfsMetadataTableRollback>,
     op: DfsMetadataTableOp,
 ) {
+    if table_ops.is_none() {
+        if let Some(rollback) = rollback.as_deref_mut() {
+            tables.apply_with_rollback(op, rollback);
+        } else {
+            tables.apply(op);
+        }
+        return;
+    }
     if let Some(rollback) = rollback.as_deref_mut() {
         tables.apply_with_rollback(op.clone(), rollback);
     } else {
         tables.apply(op.clone());
     }
-    table_ops.push(op);
+    table_ops
+        .as_mut()
+        .expect("checked table-operation sink")
+        .push(op);
 }
 
 #[cfg(test)]
@@ -1063,11 +1165,12 @@ mod tests {
         }
         let mut scratch = tables.clone();
         let mut table_ops = Vec::new();
+        let mut table_op_sink = Some(&mut table_ops);
         let mut rollback = None;
         plan_namespace_transaction_table_ops_in_place(
             &mut scratch,
             transaction,
-            &mut table_ops,
+            &mut table_op_sink,
             &mut rollback,
         );
         for object in &transaction.objects {
@@ -1116,6 +1219,13 @@ mod tests {
         assert_eq!(preapplied_tables, expected_tables);
         rollback.rollback(&mut preapplied_tables);
         assert_eq!(&preapplied_tables, before);
+
+        let mut directly_materialized = before.clone();
+        materialize_namespace_transaction_table_state(&mut directly_materialized, transaction);
+        assert_eq!(
+            directly_materialized, expected_tables,
+            "compact semantic commit materialization must match the expanded reference plan"
+        );
         expected_tables
     }
 

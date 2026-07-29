@@ -1052,6 +1052,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // failover guard and must update it on every replayed transition.
             DfsMetadataMutation::PutAdvisoryLockState { .. }
             | DfsMetadataMutation::PutNamespacePrepare { .. }
+            | DfsMetadataMutation::CommitNamespacePrepare { .. }
             | DfsMetadataMutation::PutNamespaceRequest { .. }
             | DfsMetadataMutation::PutNamespaceTransactionReceipt { .. }
             | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { .. }
@@ -1205,6 +1206,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             DfsMetadataMutation::PutAdvisoryLockState { .. }
             | DfsMetadataMutation::PutNamespacePrepare { .. }
+            | DfsMetadataMutation::CommitNamespacePrepare { .. }
             | DfsMetadataMutation::PutNamespaceRequest { .. }
             | DfsMetadataMutation::PutNamespaceTransactionReceipt { .. }
             | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { .. }

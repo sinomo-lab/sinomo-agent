@@ -1696,6 +1696,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     content_receipts: Vec::new(),
                     transaction: transaction.clone(),
                     completed_request: None,
+                    completed_request_completion: None,
                     status: DfsNamespacePrepareStatus::Prepared,
                 };
                 prepare.operation_digest =

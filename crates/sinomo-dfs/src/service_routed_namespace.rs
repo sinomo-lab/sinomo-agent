@@ -127,9 +127,9 @@ fn namespace_operation_uses_durable_request_admission(operation: &DfsNamespaceOp
         )
 }
 
-/// `mkdir_all` publishes all missing components in one request-owned namespace
-/// prepare. Its admission can therefore share the prepare's durable table
-/// batch instead of forcing a standalone Pending journal write first.
+/// Operations whose complete mutation is carried by one request-owned
+/// namespace prepare can share that prepare's durable table batch instead of
+/// forcing a standalone Pending journal write first.
 ///
 /// The transaction planner still verifies that the exact operation is proven
 /// complete. Symlink-resolved or otherwise non-proving transactions fall back
@@ -137,7 +137,45 @@ fn namespace_operation_uses_durable_request_admission(operation: &DfsNamespaceOp
 fn namespace_operation_can_fuse_durable_request_admission(
     operation: &DfsNamespaceOperation,
 ) -> bool {
-    matches!(operation, DfsNamespaceOperation::MkdirAll { .. })
+    matches!(
+        operation,
+        DfsNamespaceOperation::MkdirAll { .. }
+            | DfsNamespaceOperation::CommitLocalEventualBatch { .. }
+    )
+}
+
+fn namespace_prepare_matches_routed_command(
+    prepare: &DfsNamespacePrepareRecord,
+    requester_node_id: &NodeId,
+    command: &DfsNamespaceCommand,
+    shard_id: &DfsMetadataShardId,
+    command_digest: &str,
+) -> bool {
+    let expected_operation_id =
+        namespace_request_operation_id(requester_node_id, &command.request_id);
+    let attachment_matches = prepare.completed_request.as_ref().is_some_and(|request| {
+        request.file_system_id == command.file_system_id
+            && request.requester_node_id == *requester_node_id
+            && request.request_id == command.request_id
+            && request.operation_id == expected_operation_id
+            && request.authority_shard_id == *shard_id
+            && request.command_digest == command_digest
+    }) || prepare.completed_request_completion.as_ref().is_some_and(
+        |completion| {
+            completion.file_system_id == command.file_system_id
+                && completion.requester_node_id == *requester_node_id
+                && completion.request_id == command.request_id
+                && completion.operation_id == expected_operation_id
+                && completion.authority_shard_id == *shard_id
+                && completion.command_digest == command_digest
+        },
+    );
+    attachment_matches
+        && prepare.file_system_id == command.file_system_id
+        && prepare.shard_id == *shard_id
+        && prepare
+            .operation_id
+            .starts_with(&format!("namespace-request:{expected_operation_id}:"))
 }
 
 pub(crate) fn namespace_operation_response_retry_safe(operation: &DfsNamespaceOperation) -> bool {
@@ -640,6 +678,41 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             };
         }
+        if let Some(prepare) = backend
+            .get_prepared_namespace_prepare_for_request(requester_node_id, &command.request_id)?
+        {
+            if !namespace_prepare_matches_routed_command(
+                &prepare,
+                requester_node_id,
+                command,
+                &shard_id,
+                &digest,
+            ) {
+                return Ok(DurableNamespaceRequestAdmission::Reject {
+                    reason: format!(
+                        "namespace request id {}/{} was already used for a different command",
+                        requester_node_id, command.request_id
+                    ),
+                });
+            }
+            if !recovering {
+                let request_key =
+                    BTreeSet::from([(requester_node_id.clone(), command.request_id.clone())]);
+                self.recover_durable_namespace_prepares_for_requests(&request_key, 1)?;
+                return self.admit_durable_namespace_request(
+                    requester_node_id,
+                    command,
+                    shard_id,
+                    true,
+                );
+            }
+            return Ok(DurableNamespaceRequestAdmission::Reject {
+                reason: format!(
+                    "namespace request {}/{} has a durable hidden prepare awaiting recovery",
+                    requester_node_id, command.request_id
+                ),
+            });
+        }
         if backend.namespace_request_history_expired_on_shard(
             &shard_id,
             requester_node_id,
@@ -750,6 +823,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Option<DfsNamespaceRequestRecord> {
         let active = self.active_durable_namespace_request.as_ref()?;
         if &active.authority_shard_id != shard_id
+            || matches!(
+                active.operation,
+                DfsNamespaceOperation::CommitLocalEventualBatch { .. }
+            )
             || !namespace_transaction_proves_operation_completed(&active.operation, transaction)
         {
             return None;
@@ -761,6 +838,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         completed.last_recovery_error = None;
         completed.updated_at = time::OffsetDateTime::now_utc();
         Some(completed)
+    }
+
+    pub(crate) fn compact_durable_namespace_request_completion_for_transaction(
+        &self,
+        transaction: &DfsNamespaceTransaction,
+        shard_id: &DfsMetadataShardId,
+    ) -> Option<DfsNamespaceRequestCompletion> {
+        let active = self.active_durable_namespace_request.as_ref()?;
+        if &active.authority_shard_id != shard_id
+            || !matches!(
+                active.operation,
+                DfsNamespaceOperation::CommitLocalEventualBatch { .. }
+            )
+            || !namespace_transaction_proves_operation_completed(&active.operation, transaction)
+        {
+            return None;
+        }
+        Some(DfsNamespaceRequestCompletion {
+            file_system_id: active.file_system_id.clone(),
+            requester_node_id: active.requester_node_id.clone(),
+            request_id: active.request_id.clone(),
+            operation_id: active.operation_id.clone(),
+            authority_shard_id: active.authority_shard_id.clone(),
+            command_digest: active.command_digest.clone(),
+            transaction_id: transaction.transaction_id.clone(),
+            result: DfsNamespaceResult::Applied,
+            posix_coordination_result: None,
+            created_at: active.created_at,
+            completed_at: time::OffsetDateTime::now_utc(),
+        })
     }
 
     fn synced_namespace_object_for_operation(

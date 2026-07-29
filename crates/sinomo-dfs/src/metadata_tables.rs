@@ -12,8 +12,13 @@ use sinomo_core::{Id, node::NodeId};
 use time::OffsetDateTime;
 
 use crate::advisory_lock::DfsAdvisoryLockStateRecord;
+use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_keys::{
     dentry_key, intent_key, normalize_path, write_intent_scan_key, write_intent_target_key,
+};
+use crate::metadata_namespace_transaction::{
+    materialize_namespace_transaction_table_state,
+    preapply_namespace_transaction_table_state_with_rollback,
 };
 use crate::metadata_object_index::object_index_table_ops_with_previous;
 use crate::metadata_records::{
@@ -30,6 +35,24 @@ use crate::metadata_records::{
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
 };
+
+fn completed_namespace_request_outcome_matches(
+    left: &DfsNamespaceRequestRecord,
+    right: &DfsNamespaceRequestRecord,
+) -> bool {
+    left.file_system_id == right.file_system_id
+        && left.requester_node_id == right.requester_node_id
+        && left.request_id == right.request_id
+        && left.operation_id == right.operation_id
+        && left.authority_shard_id == right.authority_shard_id
+        && left.operation == right.operation
+        && left.command_digest == right.command_digest
+        && left.created_at == right.created_at
+        && left.status == DfsNamespaceRequestStatus::Completed
+        && right.status == DfsNamespaceRequestStatus::Completed
+        && left.result == right.result
+        && left.posix_coordination_result == right.posix_coordination_result
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DfsMetadataTables {
@@ -96,6 +119,7 @@ pub(crate) struct MetadataTableSnapshotFingerprint {
 #[derive(Clone, Debug)]
 pub(crate) struct MetadataTableReadSnapshotCache {
     pub(crate) snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
+    pub(crate) checkpoint_fingerprint: Option<MetadataTableSnapshotFingerprint>,
     pub(crate) table_log_offset: u64,
     pub(crate) tables: Arc<DfsMetadataTables>,
 }
@@ -244,6 +268,210 @@ pub(crate) fn namespace_request_receipt_eviction_delta(
 }
 
 impl DfsMetadataTables {
+    /// Apply one table operation while preserving fail-closed validation for
+    /// compact semantic transitions.
+    ///
+    /// Ordinary operations are self-contained and retain the historical
+    /// infallible apply path. A committed-prepare marker intentionally refers
+    /// to the full prepared body in the preceding table state, so durable-log
+    /// replay uses this checked entry point and rejects a missing or mismatched
+    /// dependency instead of silently publishing partial metadata.
+    pub(crate) fn apply_checked(&mut self, op: DfsMetadataTableOp) -> Result<()> {
+        match op {
+            DfsMetadataTableOp::CommitNamespacePrepare {
+                operation_id,
+                operation_digest,
+                owner_epoch,
+            } => self.materialize_committed_namespace_prepare(
+                &operation_id,
+                &operation_digest,
+                owner_epoch,
+            ),
+            op => {
+                self.apply(op);
+                Ok(())
+            }
+        }
+    }
+
+    /// Validate any dependency referenced by a compact semantic operation
+    /// without cloning or mutating its full prepared body.
+    pub(crate) fn validate_checked(&self, op: &DfsMetadataTableOp) -> Result<()> {
+        if let DfsMetadataTableOp::CommitNamespacePrepare {
+            operation_id,
+            operation_digest,
+            owner_epoch,
+        } = op
+        {
+            self.validated_committed_namespace_prepare(
+                operation_id,
+                operation_digest,
+                *owner_epoch,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_checked_with_rollback(
+        &mut self,
+        op: DfsMetadataTableOp,
+        rollback: &mut DfsMetadataTableRollback,
+    ) -> Result<()> {
+        let DfsMetadataTableOp::CommitNamespacePrepare {
+            operation_id,
+            operation_digest,
+            owner_epoch,
+        } = op
+        else {
+            self.apply_with_rollback(op, rollback);
+            return Ok(());
+        };
+        let mut prepare =
+            self.committed_namespace_prepare(&operation_id, &operation_digest, owner_epoch)?;
+        for receipt in &prepare.content_receipts {
+            self.apply_with_rollback(
+                DfsMetadataTableOp::PutReceipt {
+                    receipt: receipt.clone(),
+                },
+                rollback,
+            );
+        }
+        preapply_namespace_transaction_table_state_with_rollback(
+            self,
+            &prepare.transaction,
+            rollback,
+        );
+        prepare.status = DfsNamespacePrepareStatus::Committed;
+        self.apply_with_rollback(
+            DfsMetadataTableOp::PutNamespacePrepare {
+                prepare: prepare.clone(),
+            },
+            rollback,
+        );
+        if let Some(request) = prepare.completed_request {
+            let key = (
+                request.requester_node_id.clone(),
+                request.request_id.clone(),
+            );
+            let materialized = self.namespace_requests.get(&key).is_some_and(|existing| {
+                completed_namespace_request_outcome_matches(existing, &request)
+            }) || self
+                .namespace_request_receipts
+                .get(&key)
+                .is_some_and(|receipt| receipt.matches_completed_request(&request));
+            if !materialized {
+                self.apply_with_rollback(
+                    DfsMetadataTableOp::PutNamespaceRequest { request },
+                    rollback,
+                );
+            }
+        } else if let Some(completion) = prepare.completed_request_completion {
+            let key = completion.request_key();
+            let materialized = self
+                .namespace_requests
+                .get(&key)
+                .is_some_and(|request| completion.matches_completed_request(request))
+                || self
+                    .namespace_request_receipts
+                    .get(&key)
+                    .is_some_and(|receipt| receipt.matches_completion(&completion));
+            if !materialized {
+                self.apply_with_rollback(
+                    DfsMetadataTableOp::PutNamespaceRequestReceipt {
+                        receipt: DfsNamespaceRequestReceipt::from_completion(&completion),
+                    },
+                    rollback,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn committed_namespace_prepare(
+        &self,
+        operation_id: &str,
+        operation_digest: &str,
+        owner_epoch: u64,
+    ) -> Result<DfsNamespacePrepareRecord> {
+        self.validated_committed_namespace_prepare(operation_id, operation_digest, owner_epoch)
+            .cloned()
+    }
+
+    fn validated_committed_namespace_prepare(
+        &self,
+        operation_id: &str,
+        operation_digest: &str,
+        owner_epoch: u64,
+    ) -> Result<&DfsNamespacePrepareRecord> {
+        let prepare = self.namespace_prepares.get(operation_id).ok_or_else(|| {
+            MetadataBackendError::Serde(format!(
+                "compact namespace commit {operation_id} has no preceding durable prepare"
+            ))
+        })?;
+        if prepare.operation_digest != operation_digest || prepare.owner_epoch != owner_epoch {
+            return Err(MetadataBackendError::Serde(format!(
+                "compact namespace commit {operation_id} digest/epoch fence mismatch"
+            )));
+        }
+        if prepare.status == DfsNamespacePrepareStatus::Aborted {
+            return Err(MetadataBackendError::Serde(format!(
+                "compact namespace commit {operation_id} refers to an aborted prepare"
+            )));
+        }
+        Ok(prepare)
+    }
+
+    fn materialize_committed_namespace_prepare(
+        &mut self,
+        operation_id: &str,
+        operation_digest: &str,
+        owner_epoch: u64,
+    ) -> Result<()> {
+        let mut prepare =
+            self.committed_namespace_prepare(operation_id, operation_digest, owner_epoch)?;
+        for receipt in &prepare.content_receipts {
+            self.apply(DfsMetadataTableOp::PutReceipt {
+                receipt: receipt.clone(),
+            });
+        }
+        materialize_namespace_transaction_table_state(self, &prepare.transaction);
+        prepare.status = DfsNamespacePrepareStatus::Committed;
+        self.apply(DfsMetadataTableOp::PutNamespacePrepare {
+            prepare: prepare.clone(),
+        });
+        if let Some(request) = prepare.completed_request {
+            let key = (
+                request.requester_node_id.clone(),
+                request.request_id.clone(),
+            );
+            let materialized = self.namespace_requests.get(&key).is_some_and(|existing| {
+                completed_namespace_request_outcome_matches(existing, &request)
+            }) || self
+                .namespace_request_receipts
+                .get(&key)
+                .is_some_and(|receipt| receipt.matches_completed_request(&request));
+            if !materialized {
+                self.apply(DfsMetadataTableOp::PutNamespaceRequest { request });
+            }
+        } else if let Some(completion) = prepare.completed_request_completion {
+            let key = completion.request_key();
+            let materialized = self
+                .namespace_requests
+                .get(&key)
+                .is_some_and(|request| completion.matches_completed_request(request))
+                || self
+                    .namespace_request_receipts
+                    .get(&key)
+                    .is_some_and(|receipt| receipt.matches_completion(&completion));
+            if !materialized {
+                self.apply(DfsMetadataTableOp::PutNamespaceRequestReceipt {
+                    receipt: DfsNamespaceRequestReceipt::from_completion(&completion),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn cross_shard_pin_transfer_owner(
         &self,
         object_id: &DfsObjectId,
@@ -424,18 +652,35 @@ impl DfsMetadataTables {
         self.namespace_prepare_path_owners = path_owners;
     }
 
+    fn namespace_prepare_request_key(
+        prepare: &DfsNamespacePrepareRecord,
+    ) -> Option<(NodeId, String)> {
+        prepare
+            .completed_request
+            .as_ref()
+            .map(|request| {
+                (
+                    request.requester_node_id.clone(),
+                    request.request_id.clone(),
+                )
+            })
+            .or_else(|| {
+                prepare
+                    .completed_request_completion
+                    .as_ref()
+                    .map(|completion| completion.request_key())
+            })
+    }
+
     fn index_namespace_prepare_request(&mut self, prepare: &DfsNamespacePrepareRecord) {
         if prepare.status != DfsNamespacePrepareStatus::Prepared {
             return;
         }
-        let Some(request) = prepare.completed_request.as_ref() else {
+        let Some(request_key) = Self::namespace_prepare_request_key(prepare) else {
             return;
         };
         self.namespace_prepare_request_owners
-            .entry((
-                request.requester_node_id.clone(),
-                request.request_id.clone(),
-            ))
+            .entry(request_key)
             .or_default()
             .insert(prepare.operation_id.clone());
     }
@@ -448,14 +693,11 @@ impl DfsMetadataTables {
             .values()
             .filter(|prepare| prepare.status == DfsNamespacePrepareStatus::Prepared)
         {
-            let Some(request) = prepare.completed_request.as_ref() else {
+            let Some(request_key) = Self::namespace_prepare_request_key(prepare) else {
                 continue;
             };
             request_owners
-                .entry((
-                    request.requester_node_id.clone(),
-                    request.request_id.clone(),
-                ))
+                .entry(request_key)
                 .or_default()
                 .insert(prepare.operation_id.clone());
         }
@@ -466,13 +708,9 @@ impl DfsMetadataTables {
         if prepare.status != DfsNamespacePrepareStatus::Prepared {
             return;
         }
-        let Some(request) = prepare.completed_request.as_ref() else {
+        let Some(request_key) = Self::namespace_prepare_request_key(prepare) else {
             return;
         };
-        let request_key = (
-            request.requester_node_id.clone(),
-            request.request_id.clone(),
-        );
         let remove_request = self
             .namespace_prepare_request_owners
             .get_mut(&request_key)
@@ -922,6 +1160,18 @@ impl DfsMetadataTables {
                 self.namespace_prepare_receipts
                     .remove(&prepare.operation_id);
                 self.put_namespace_prepare_indexed(prepare);
+            }
+            DfsMetadataTableOp::CommitNamespacePrepare {
+                operation_id,
+                operation_digest,
+                owner_epoch,
+            } => {
+                self.materialize_committed_namespace_prepare(
+                    &operation_id,
+                    &operation_digest,
+                    owner_epoch,
+                )
+                .expect("compact namespace commit must reference its exact durable prepare");
             }
             DfsMetadataTableOp::PutNamespacePrepareReceipt { receipt } => {
                 if let Some(previous) = self.namespace_prepares.remove(&receipt.operation_id) {
@@ -1486,6 +1736,11 @@ impl DfsMetadataTableRollback {
                     &mut self.namespace_prepare_receipts,
                     &tables.namespace_prepare_receipts,
                     prepare.operation_id.clone(),
+                );
+            }
+            DfsMetadataTableOp::CommitNamespacePrepare { operation_id, .. } => {
+                panic!(
+                    "compact namespace commit {operation_id} must be applied after its durable table marker, never preapplied with rollback"
                 );
             }
             DfsMetadataTableOp::PutNamespacePrepareReceipt { receipt } => {

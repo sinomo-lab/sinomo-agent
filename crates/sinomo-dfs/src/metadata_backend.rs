@@ -5,7 +5,6 @@
 //! packed table batches, and every mutation is mirrored into an append-only
 //! journal that can later be replicated or replayed by metadata shard peers.
 
-use crate::DfsNamespaceResult;
 #[cfg(test)]
 use crate::DfsReplicationPolicy;
 use crate::advisory_lock::{
@@ -105,6 +104,7 @@ use crate::metadata_visible_commit::{
 };
 use crate::{DfsFileSystem, DfsObjectKind, DfsObjectMetadata, namespace_transaction_id_for_batch};
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
+use crate::{DfsNamespaceOperation, DfsNamespaceResult};
 #[cfg(test)]
 use sinomo_core::DfsWriteReceipt;
 #[cfg(test)]
@@ -265,6 +265,7 @@ fn namespace_prepare_payload_matches(
         && left.content_receipts == right.content_receipts
         && left.transaction == right.transaction
         && left.completed_request == right.completed_request
+        && left.completed_request_completion == right.completed_request_completion
 }
 
 fn namespace_prepare_rebind_payload_matches(
@@ -279,6 +280,7 @@ fn namespace_prepare_rebind_payload_matches(
         && left.content_receipts == right.content_receipts
         && left.transaction == right.transaction
         && left.completed_request == right.completed_request
+        && left.completed_request_completion == right.completed_request_completion
         && left.status == DfsNamespacePrepareStatus::Prepared
         && right.status == DfsNamespacePrepareStatus::Prepared
 }
@@ -737,6 +739,50 @@ fn validate_namespace_request_shape(request: &DfsNamespaceRequestRecord) -> Resu
     Ok(())
 }
 
+fn validate_namespace_request_completion_shape(
+    completion: &DfsNamespaceRequestCompletion,
+) -> Result<()> {
+    if completion.request_id.trim().is_empty()
+        || completion.operation_id.trim().is_empty()
+        || completion.command_digest.trim().is_empty()
+        || completion.authority_shard_id.0.trim().is_empty()
+        || completion.transaction_id.trim().is_empty()
+    {
+        return Err(MetadataBackendError::Serde(
+            "compact namespace request completion requires non-empty request, operation, digest, authority shard, and transaction ids"
+                .to_string(),
+        ));
+    }
+    if completion.result != DfsNamespaceResult::Applied
+        || completion.posix_coordination_result.is_some()
+        || completion.completed_at < completion.created_at
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "compact namespace request completion {}/{} has an invalid terminal payload",
+            completion.requester_node_id, completion.request_id
+        )));
+    }
+    Ok(())
+}
+
+fn namespace_request_identity_matches_completion(
+    request: &DfsNamespaceRequestRecord,
+    completion: &DfsNamespaceRequestCompletion,
+) -> bool {
+    request.file_system_id == completion.file_system_id
+        && request.requester_node_id == completion.requester_node_id
+        && request.request_id == completion.request_id
+        && request.operation_id == completion.operation_id
+        && request.authority_shard_id == completion.authority_shard_id
+        && request.command_digest == completion.command_digest
+        && request.created_at == completion.created_at
+        && matches!(
+            &request.operation,
+            DfsNamespaceOperation::CommitLocalEventualBatch { transaction, .. }
+                if transaction.transaction_id == completion.transaction_id
+        )
+}
+
 fn namespace_request_transition_is_valid(
     existing: &DfsNamespaceRequestRecord,
     request: &DfsNamespaceRequestRecord,
@@ -1026,8 +1072,15 @@ fn validate_namespace_prepare_shape(
             prepare.operation_id, prepare.transaction.transaction_id
         )));
     }
-    if prepare.operation_id.starts_with("namespace-request:") && prepare.completed_request.is_none()
-    {
+    let completion_attachment_count = usize::from(prepare.completed_request.is_some())
+        + usize::from(prepare.completed_request_completion.is_some());
+    if completion_attachment_count > 1 {
+        return Err(MetadataBackendError::Serde(format!(
+            "namespace prepare {} carries both full and compact completed request attachments",
+            prepare.operation_id
+        )));
+    }
+    if prepare.operation_id.starts_with("namespace-request:") && completion_attachment_count == 0 {
         return Err(MetadataBackendError::Serde(format!(
             "namespace prepare {} is request-owned but has no completed request attachment",
             prepare.operation_id
@@ -1106,6 +1159,66 @@ fn validate_namespace_prepare_shape(
             }
         }
     }
+    if let Some(completion) = &prepare.completed_request_completion {
+        validate_namespace_request_completion_shape(completion)?;
+        if completion.file_system_id != prepare.file_system_id
+            || completion.authority_shard_id != prepare.shard_id
+            || completion.transaction_id != prepare.transaction.transaction_id
+            || !prepare
+                .operation_id
+                .starts_with(&format!("namespace-request:{}:", completion.operation_id))
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {} has an invalid compact completed request attachment",
+                prepare.operation_id
+            )));
+        }
+        let request_key = completion.request_key();
+        if let Some(receipt) = tables.namespace_request_receipts.get(&request_key) {
+            if !receipt.matches_completion(completion) {
+                return Err(MetadataBackendError::Serde(format!(
+                    "namespace prepare {} compact completion conflicts with receipt {}/{}",
+                    prepare.operation_id, completion.requester_node_id, completion.request_id
+                )));
+            }
+        } else {
+            match tables.namespace_requests.get(&request_key) {
+                Some(existing)
+                    if namespace_request_identity_matches_completion(existing, completion)
+                        && (existing.status == DfsNamespaceRequestStatus::Pending
+                            || completion.matches_completed_request(existing)) => {}
+                Some(_) => {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "namespace prepare {} compact completion conflicts with {}/{}",
+                        prepare.operation_id, completion.requester_node_id, completion.request_id
+                    )));
+                }
+                None if prepare.status == DfsNamespacePrepareStatus::Prepared => {
+                    // The compact attachment and hidden prepare are the first
+                    // durable boundary. Unlike the legacy full attachment, no
+                    // duplicate Pending request body is materialized.
+                }
+                None if tables
+                    .namespace_prepares
+                    .get(&prepare.operation_id)
+                    .is_some_and(|existing_prepare| {
+                        existing_prepare.status != DfsNamespacePrepareStatus::Aborted
+                            && namespace_prepare_payload_matches(existing_prepare, prepare)
+                    }) =>
+                {
+                    // Commit/abort validation may run against the durable
+                    // Prepared record before the compact terminal receipt is
+                    // atomically materialized.
+                }
+                None => {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "namespace prepare {} has no durable owner for compact completion {}/{}",
+                        prepare.operation_id, completion.requester_node_id, completion.request_id
+                    )));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1113,18 +1226,35 @@ fn namespace_prepare_request_completion_is_materialized(
     tables: &DfsMetadataTables,
     prepare: &DfsNamespacePrepareRecord,
 ) -> bool {
-    prepare.completed_request.as_ref().is_none_or(|completion| {
-        let key = (
-            completion.requester_node_id.clone(),
-            completion.request_id.clone(),
-        );
-        tables.namespace_requests.get(&key).is_some_and(|existing| {
-            completed_namespace_request_outcome_matches(existing, completion)
-        }) || tables
-            .namespace_request_receipts
-            .get(&key)
-            .is_some_and(|receipt| receipt.matches_completed_request(completion))
-    })
+    let full_completion_materialized =
+        prepare.completed_request.as_ref().is_none_or(|completion| {
+            let key = (
+                completion.requester_node_id.clone(),
+                completion.request_id.clone(),
+            );
+            tables.namespace_requests.get(&key).is_some_and(|existing| {
+                completed_namespace_request_outcome_matches(existing, completion)
+            }) || tables
+                .namespace_request_receipts
+                .get(&key)
+                .is_some_and(|receipt| receipt.matches_completed_request(completion))
+        });
+    let compact_completion_materialized =
+        prepare
+            .completed_request_completion
+            .as_ref()
+            .is_none_or(|completion| {
+                let key = completion.request_key();
+                tables
+                    .namespace_requests
+                    .get(&key)
+                    .is_some_and(|request| completion.matches_completed_request(request))
+                    || tables
+                        .namespace_request_receipts
+                        .get(&key)
+                        .is_some_and(|receipt| receipt.matches_completion(completion))
+            });
+    full_completion_materialized && compact_completion_materialized
 }
 
 fn namespace_prepare_content_receipts_are_complete(
@@ -1322,27 +1452,21 @@ fn namespace_prepare_table_ops_for_record(
             {
                 return Ok(Vec::new());
             }
-            let mut ops = missing_namespace_prepare_content_receipt_ops(tables, prepare);
-            if existing.status == DfsNamespacePrepareStatus::Committed {
-                ops.extend(plan_namespace_transaction_recovery_table_ops(
-                    tables,
-                    &prepare.transaction,
-                ));
-            } else {
+            if existing.status != DfsNamespacePrepareStatus::Committed {
                 validate_namespace_prepare_expectations(tables, prepare)?;
                 validate_namespace_prepare_does_not_overlap(tables, prepare)?;
                 validate_namespace_transaction_preconditions(tables, &prepare.transaction)?;
-                #[cfg(test)]
-                NAMESPACE_PREPARED_COMMIT_REFERENCE_PLANNER_CALLS.set(
-                    NAMESPACE_PREPARED_COMMIT_REFERENCE_PLANNER_CALLS
-                        .get()
-                        .saturating_add(1),
-                );
-                ops.extend(namespace_transaction_table_ops(
-                    tables,
-                    &prepare.transaction,
-                ));
+                return Ok(vec![DfsMetadataTableOp::CommitNamespacePrepare {
+                    operation_id: prepare.operation_id.clone(),
+                    operation_digest: prepare.operation_digest.clone(),
+                    owner_epoch: prepare.owner_epoch,
+                }]);
             }
+            let mut ops = missing_namespace_prepare_content_receipt_ops(tables, prepare);
+            ops.extend(plan_namespace_transaction_recovery_table_ops(
+                tables,
+                &prepare.transaction,
+            ));
             ops.push(DfsMetadataTableOp::PutNamespacePrepare {
                 prepare: prepare.clone(),
             });
@@ -1360,6 +1484,22 @@ fn namespace_prepare_table_ops_for_record(
                 if !materialized {
                     ops.push(DfsMetadataTableOp::PutNamespaceRequest {
                         request: request.clone(),
+                    });
+                }
+            }
+            if let Some(completion) = &prepare.completed_request_completion {
+                let key = completion.request_key();
+                let materialized = tables
+                    .namespace_requests
+                    .get(&key)
+                    .is_some_and(|request| completion.matches_completed_request(request))
+                    || tables
+                        .namespace_request_receipts
+                        .get(&key)
+                        .is_some_and(|receipt| receipt.matches_completion(completion));
+                if !materialized {
+                    ops.push(DfsMetadataTableOp::PutNamespaceRequestReceipt {
+                        receipt: DfsNamespaceRequestReceipt::from_completion(completion),
                     });
                 }
             }
@@ -1392,6 +1532,83 @@ fn namespace_prepare_table_ops_for_record(
             }])
         }
     }
+}
+
+fn namespace_prepare_commit_table_ops_for_reference(
+    tables: &DfsMetadataTables,
+    shard_id: &DfsMetadataShardId,
+    file_system_id: &DfsFileSystemId,
+    operation_id: &str,
+    operation_digest: &str,
+    owner_epoch: u64,
+    object_ids: &[DfsObjectId],
+) -> Result<Vec<DfsMetadataTableOp>> {
+    if object_ids.windows(2).any(|ids| ids[0] >= ids[1]) {
+        return Err(MetadataBackendError::Serde(format!(
+            "compact namespace commit {operation_id} object ids are not sorted and unique"
+        )));
+    }
+    if let Some(receipt) = tables.namespace_prepare_receipts.get(operation_id) {
+        if receipt.file_system_id != *file_system_id
+            || receipt.operation_id != operation_id
+            || receipt.operation_digest != operation_digest
+            || receipt.owner_epoch != owner_epoch
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "compact namespace commit {operation_id} conflicts with its terminal receipt"
+            )));
+        }
+        if receipt.status == DfsNamespacePrepareStatus::Aborted {
+            return Err(MetadataBackendError::Serde(format!(
+                "compact namespace commit {operation_id} refers to an aborted prepare"
+            )));
+        }
+        if receipt.status != DfsNamespacePrepareStatus::Committed {
+            return Err(MetadataBackendError::Serde(format!(
+                "compact namespace commit {operation_id} has a non-terminal prepare receipt"
+            )));
+        }
+        return Ok(Vec::new());
+    }
+
+    let mut prepare = tables
+        .namespace_prepares
+        .get(operation_id)
+        .cloned()
+        .ok_or_else(|| {
+            MetadataBackendError::Serde(format!(
+                "compact namespace commit {operation_id} has no preceding durable prepare"
+            ))
+        })?;
+    if prepare.file_system_id != *file_system_id
+        || prepare.operation_id != operation_id
+        || prepare.shard_id != *shard_id
+        || prepare.operation_digest != operation_digest
+        || prepare.owner_epoch != owner_epoch
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "compact namespace commit {operation_id} scope/digest/epoch fence mismatch"
+        )));
+    }
+    let DfsMetadataMutation::CommitNamespacePrepare {
+        object_ids: expected_object_ids,
+        ..
+    } = DfsMetadataMutation::commit_namespace_prepare(&prepare)
+    else {
+        unreachable!("namespace prepare commit constructor returned another mutation");
+    };
+    if object_ids != expected_object_ids {
+        return Err(MetadataBackendError::Serde(format!(
+            "compact namespace commit {operation_id} affected-object fence mismatch"
+        )));
+    }
+    if prepare.status == DfsNamespacePrepareStatus::Aborted {
+        return Err(MetadataBackendError::Serde(format!(
+            "compact namespace commit {operation_id} refers to an aborted prepare"
+        )));
+    }
+    prepare.status = DfsNamespacePrepareStatus::Committed;
+    namespace_prepare_table_ops_for_record(tables, shard_id, &prepare)
 }
 
 fn require_replica_snapshot_record_file_system(
@@ -3318,7 +3535,43 @@ impl LocalSobjMetadataBackend {
                     return Ok(false);
                 }
                 for op in ops {
-                    self.plan_preapplied_table_op(op, table_ops, rollback);
+                    if matches!(op, DfsMetadataTableOp::CommitNamespacePrepare { .. }) {
+                        self.tables
+                            .apply_checked_with_rollback(op.clone(), rollback)?;
+                        table_ops.push(op);
+                    } else {
+                        self.plan_preapplied_table_op(op, table_ops, rollback);
+                    }
+                }
+                Ok(true)
+            }
+            DfsMetadataMutation::CommitNamespacePrepare {
+                file_system_id,
+                operation_id,
+                operation_digest,
+                owner_epoch,
+                object_ids,
+            } => {
+                let ops = namespace_prepare_commit_table_ops_for_reference(
+                    &self.tables,
+                    &self.shard_id,
+                    file_system_id,
+                    operation_id,
+                    operation_digest,
+                    *owner_epoch,
+                    object_ids,
+                )?;
+                if ops.is_empty() {
+                    return Ok(false);
+                }
+                for op in ops {
+                    if matches!(op, DfsMetadataTableOp::CommitNamespacePrepare { .. }) {
+                        self.tables
+                            .apply_checked_with_rollback(op.clone(), rollback)?;
+                        table_ops.push(op);
+                    } else {
+                        self.plan_preapplied_table_op(op, table_ops, rollback);
+                    }
                 }
                 Ok(true)
             }
@@ -4219,6 +4472,21 @@ impl LocalSobjMetadataBackend {
                 let prepare = normalized_namespace_prepare(prepare);
                 namespace_prepare_table_ops_for_record(&self.tables, &self.shard_id, &prepare)?
             }
+            DfsMetadataMutation::CommitNamespacePrepare {
+                file_system_id,
+                operation_id,
+                operation_digest,
+                owner_epoch,
+                object_ids,
+            } => namespace_prepare_commit_table_ops_for_reference(
+                &self.tables,
+                &self.shard_id,
+                file_system_id,
+                operation_id,
+                operation_digest,
+                *owner_epoch,
+                object_ids,
+            )?,
             DfsMetadataMutation::PutNamespacePrepareReceipt { receipt, .. } => {
                 vec![DfsMetadataTableOp::PutNamespacePrepareReceipt {
                     receipt: receipt.clone(),
@@ -7447,78 +7715,32 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
 
         if transitions_from_prepared {
             // Validate against the still-hidden namespace before making the
-            // committed marker durable. Once the journal append succeeds,
-            // materialize the transaction directly into the live tables and
-            // capture rollback state for the table-batch append. This keeps
-            // the normal Prepared -> Committed path off the full-table clone
-            // used by replay/recovery while preserving the durable journal as
-            // the source of truth across an append failure or crash.
+            // committed marker durable. The materialized log can then refer to
+            // that exact prepared body instead of encoding every derived table
+            // operation again. The journal remains the source of truth across
+            // a table append failure or crash.
             validate_namespace_prepare_shape(&self.tables, &self.shard_id, &prepare)?;
             validate_namespace_prepare_expectations(&self.tables, &prepare)?;
             validate_namespace_prepare_does_not_overlap(&self.tables, &prepare)?;
             validate_namespace_transaction_preconditions(&self.tables, &prepare.transaction)?;
 
-            let entry =
-                self.write_journal_unlocked(DfsMetadataMutation::put_namespace_prepare(&prepare))?;
-            let mut table_ops = Vec::new();
-            let mut rollback = DfsMetadataTableRollback::default();
-            for receipt in &prepare.content_receipts {
-                self.plan_preapplied_table_op(
-                    DfsMetadataTableOp::PutReceipt {
-                        receipt: receipt.clone(),
-                    },
-                    &mut table_ops,
-                    &mut rollback,
-                );
-            }
-            if let Err(error) = self.plan_namespace_transaction_table_ops(
-                &prepare.transaction,
-                &mut table_ops,
-                &mut rollback,
-            ) {
-                rollback.rollback(&mut self.tables);
-                return Err(error);
-            }
-            self.plan_preapplied_table_op(
-                DfsMetadataTableOp::PutNamespacePrepare {
-                    prepare: prepare.clone(),
-                },
-                &mut table_ops,
-                &mut rollback,
-            );
-            if let Some(request) = prepare.completed_request.as_ref() {
-                let key = (
-                    request.requester_node_id.clone(),
-                    request.request_id.clone(),
-                );
-                let materialized =
-                    self.tables
-                        .namespace_requests
-                        .get(&key)
-                        .is_some_and(|existing| {
-                            completed_namespace_request_outcome_matches(existing, request)
-                        })
-                        || self
-                            .tables
-                            .namespace_request_receipts
-                            .get(&key)
-                            .is_some_and(|receipt| receipt.matches_completed_request(request));
-                if !materialized {
-                    self.plan_preapplied_table_op(
-                        DfsMetadataTableOp::PutNamespaceRequest {
-                            request: request.clone(),
-                        },
-                        &mut table_ops,
-                        &mut rollback,
-                    );
-                }
-            }
-            self.append_preapplied_table_ops_for_written_entries(
-                std::slice::from_ref(&entry),
+            let entry = self
+                .write_journal_unlocked(DfsMetadataMutation::commit_namespace_prepare(&prepare))?;
+            // The preceding Prepared table record already owns the complete
+            // transaction, receipt set, and routed-request evidence. Persist
+            // one semantic commit marker, then expand it directly into the
+            // in-memory indexes. This avoids encoding the same 4k-file batch
+            // as tens of thousands of derived table operations while keeping
+            // the authoritative journal and crash replay exact.
+            self.append_and_apply_table_ops(
                 entry.sequence,
-                table_ops,
-                rollback,
+                vec![DfsMetadataTableOp::CommitNamespacePrepare {
+                    operation_id: prepare.operation_id.clone(),
+                    operation_digest: prepare.operation_digest.clone(),
+                    owner_epoch: prepare.owner_epoch,
+                }],
             )?;
+            self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
             return Ok(entry);
         }
 
@@ -7533,7 +7755,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             });
         }
         self.write_journal_entry_and_apply_table_ops_unlocked(
-            DfsMetadataMutation::put_namespace_prepare(&prepare),
+            DfsMetadataMutation::commit_namespace_prepare(&prepare),
             table_ops,
         )
     }
@@ -9197,6 +9419,7 @@ mod tests {
                 created_at: OffsetDateTime::UNIX_EPOCH,
             },
             completed_request: None,
+            completed_request_completion: None,
             status: DfsNamespacePrepareStatus::Prepared,
         };
         prepare.operation_digest =
@@ -9764,6 +9987,340 @@ mod tests {
     }
 
     #[test]
+    fn compact_request_owned_prepare_survives_replay_and_closes_exact_retry_with_receipt() {
+        let root = temp_root("local_backend_compact_request_prepare_replay");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let current = object(version("version_compact_request_prepare_1"));
+        let mut committed = current.clone();
+        committed.version = version("version_compact_request_prepare_2");
+        committed.mode = 0o600;
+        let request_operation_id = "req-compact-request-prepare";
+        let mut prepare = namespace_prepare(
+            &format!(
+                "namespace-request:{request_operation_id}:transaction-compact-request-prepare"
+            ),
+            &shard_id.0,
+            &current,
+            committed.clone(),
+        );
+        let completed_request = DfsNamespaceRequestRecord {
+            file_system_id: current.file_system_id.clone(),
+            requester_node_id: node("node_compact_request_prepare_requester"),
+            request_id: "compact-request-prepare".to_string(),
+            operation_id: request_operation_id.to_string(),
+            authority_shard_id: shard_id.clone(),
+            operation: DfsNamespaceOperation::CommitLocalEventualBatch {
+                transaction: prepare.transaction.clone(),
+                writes: Vec::new(),
+            },
+            command_digest: "blake3:compact-request-prepare".to_string(),
+            status: DfsNamespaceRequestStatus::Completed,
+            result: Some(DfsNamespaceResult::Applied),
+            posix_coordination_result: None,
+            recovery_attempts: 0,
+            last_recovery_error: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::from_unix_timestamp(1).expect("completion timestamp"),
+        };
+        let completion = DfsNamespaceRequestCompletion::from_completed_request(&completed_request)
+            .expect("compact completion");
+        let expected_receipt = DfsNamespaceRequestReceipt::from_completion(&completion);
+        prepare.completed_request_completion = Some(completion.clone());
+        prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+                .expect("compact request-owned prepare digest");
+
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        let prepared_entry = backend
+            .prepare_namespace_transaction(&prepare)
+            .expect("compact request-owned prepare");
+
+        assert!(
+            backend
+                .get_namespace_request(&completion.requester_node_id, &completion.request_id,)
+                .expect("full request lookup")
+                .is_none(),
+            "compact fused admission must not materialize the repeated operation body"
+        );
+        assert_eq!(
+            backend
+                .get_prepared_namespace_prepare_for_request(
+                    &completion.requester_node_id,
+                    &completion.request_id,
+                )
+                .expect("prepared owner lookup"),
+            Some(prepare.clone())
+        );
+
+        force_table_replay_from_journal(&backend, &root, 0);
+        drop(backend);
+        let mut reopened =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("reopened backend");
+        assert!(
+            reopened
+                .get_namespace_request(&completion.requester_node_id, &completion.request_id,)
+                .expect("reopened full request lookup")
+                .is_none()
+        );
+        assert_eq!(
+            reopened
+                .get_prepared_namespace_prepare_for_request(
+                    &completion.requester_node_id,
+                    &completion.request_id,
+                )
+                .expect("reopened prepared owner lookup"),
+            Some(prepare.clone())
+        );
+
+        let commit_entry = reopened
+            .commit_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect("commit compact request-owned prepare");
+        assert_eq!(
+            commit_entry.mutation,
+            DfsMetadataMutation::commit_namespace_prepare(&prepare)
+        );
+        let prepared_bytes =
+            serde_json::to_vec(&prepared_entry.mutation).expect("encode prepared mutation");
+        let commit_bytes =
+            serde_json::to_vec(&commit_entry.mutation).expect("encode compact commit mutation");
+        assert!(
+            commit_bytes.len().saturating_mul(2) < prepared_bytes.len(),
+            "compact journal commit should not repeat the prepared body: prepared={} commit={}",
+            prepared_bytes.len(),
+            commit_bytes.len()
+        );
+        assert_eq!(
+            reopened
+                .get_namespace_request_receipt(
+                    &completion.requester_node_id,
+                    &completion.request_id,
+                )
+                .expect("compact terminal receipt"),
+            Some(expected_receipt.clone())
+        );
+        assert_eq!(
+            reopened
+                .get_prepared_namespace_prepare_for_request(
+                    &completion.requester_node_id,
+                    &completion.request_id,
+                )
+                .expect("committed owner lookup"),
+            None
+        );
+        assert_eq!(
+            reopened
+                .get_object(&current.object_id)
+                .expect("committed object"),
+            Some(committed)
+        );
+
+        force_table_replay_from_journal(&reopened, &root, 0);
+        drop(reopened);
+        let mut recovered =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("recovered backend");
+        assert_eq!(
+            recovered
+                .get_namespace_request_receipt(
+                    &completion.requester_node_id,
+                    &completion.request_id,
+                )
+                .expect("replayed compact terminal receipt"),
+            Some(expected_receipt)
+        );
+        recovered
+            .put_namespace_request_on_shard(&shard_id, &completed_request)
+            .expect("exact retry replays compact receipt");
+        assert!(
+            recovered
+                .get_namespace_request(&completion.requester_node_id, &completion.request_id,)
+                .expect("request remains compact after exact retry")
+                .is_none()
+        );
+        let mut conflicting_retry = completed_request;
+        conflicting_retry.command_digest = "blake3:different-compact-request".to_string();
+        let error = recovered
+            .put_namespace_request_on_shard(&shard_id, &conflicting_retry)
+            .expect_err("request-id reuse with a different digest must fail");
+        assert!(
+            error.to_string().contains("reused after compaction"),
+            "unexpected exact-retry rejection: {error}"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn compact_namespace_commit_incremental_replica_replay_is_exact() {
+        let root = temp_root("local_backend_compact_commit_incremental_replica");
+        let source_root = root.join("source");
+        let replica_root = root.join("replica");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let current = object(version("version_compact_commit_replica_1"));
+        let mut committed = current.clone();
+        committed.version = version("version_compact_commit_replica_2");
+        committed.mode = 0o600;
+        let prepare = namespace_prepare(
+            "operation-compact-commit-replica",
+            &shard_id.0,
+            &current,
+            committed.clone(),
+        );
+
+        let mut source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &source_root).expect("source");
+        source.put_file_system(&file_system()).expect("filesystem");
+        source.put_object(&current).expect("current object");
+        source
+            .prepare_namespace_transaction(&prepare)
+            .expect("prepared transaction");
+        let commit_entry = source
+            .commit_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect("compact commit");
+        assert_eq!(
+            commit_entry.mutation,
+            DfsMetadataMutation::commit_namespace_prepare(&prepare)
+        );
+
+        let entries = source.journal_since(0).expect("source journal");
+        let mut corrupt = LocalSobjMetadataBackend::new(
+            shard_id.clone(),
+            root.join("corrupt-affected-object-replica"),
+        )
+        .expect("corrupt replica");
+        for entry in &entries[..entries.len().saturating_sub(1)] {
+            corrupt
+                .apply_journal_entry(entry)
+                .expect("replay dependency prefix");
+        }
+        let mut corrupt_commit = entries.last().expect("commit journal entry").clone();
+        let DfsMetadataMutation::CommitNamespacePrepare { object_ids, .. } =
+            &mut corrupt_commit.mutation
+        else {
+            panic!("last entry must be a compact namespace commit");
+        };
+        object_ids.clear();
+        let error = corrupt
+            .apply_journal_entry(&corrupt_commit)
+            .expect_err("affected-object fence mismatch must fail replay");
+        assert!(
+            error.to_string().contains("affected-object fence mismatch"),
+            "unexpected corrupt compact commit error: {error}"
+        );
+
+        let config = shard_config(&shard_id.0, DfsMetadataShardAssignment::Root);
+        let mut replica = LocalShardedMetadataBackend::new(&replica_root, vec![config.clone()])
+            .expect("sharded replica");
+        replica
+            .apply_journal_batch(&DfsMetadataJournalBatch {
+                shard_id: shard_id.clone(),
+                next_after_sequence: entries.last().expect("source journal entry").sequence,
+                entries,
+            })
+            .expect("incremental sharded replica replay");
+        assert_eq!(
+            replica
+                .get_object(&current.object_id)
+                .expect("replica object"),
+            Some(committed.clone())
+        );
+        assert_eq!(
+            replica
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("replica prepare")
+                .map(|record| record.status),
+            Some(DfsNamespacePrepareStatus::Committed)
+        );
+        assert_eq!(
+            replica
+                .get_namespace_transaction(&prepare.transaction.transaction_id)
+                .expect("replica transaction"),
+            Some(prepare.transaction.clone())
+        );
+        assert_eq!(
+            replica
+                .read_object_shard_index(&current.object_id)
+                .expect("replica object shard index")
+                .map(|index| (index.shard_id, index.path)),
+            Some((shard_id.clone(), committed.path.clone())),
+            "compact commit affected IDs must reconcile sharded placement indexes"
+        );
+
+        drop(replica);
+        let replica = LocalShardedMetadataBackend::new(&replica_root, vec![config])
+            .expect("reopened replica");
+        assert_eq!(
+            replica
+                .get_object(&current.object_id)
+                .expect("reopened replica object"),
+            Some(committed)
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn compact_namespace_commit_mutation_stays_bounded_for_4096_objects() {
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let current = object(version("version_compact_commit_size_base"));
+        let mut prepare = namespace_prepare(
+            "operation-compact-commit-size",
+            &shard_id.0,
+            &current,
+            current.clone(),
+        );
+        prepare.expected_object_versions.clear();
+        prepare.expected_path_occupants.clear();
+        prepare.transaction.objects.clear();
+        for index in 0..4096 {
+            let mut object = current.clone();
+            object.object_id =
+                DfsObjectId::from_legacy_named(format!("obj_compact_commit_size_{index}"))
+                    .expect("object id");
+            object.version =
+                DfsVersion::from_legacy_named(format!("version_compact_commit_size_{index}"))
+                    .expect("version");
+            object.path = format!("/services/compact-commit-size/{index}");
+            prepare
+                .expected_object_versions
+                .push(DfsNamespaceObjectVersionExpectation {
+                    object_id: object.object_id.clone(),
+                    expected_version: Some(current.version.clone()),
+                });
+            prepare.transaction.objects.push(object);
+        }
+
+        let full = DfsMetadataMutation::put_namespace_prepare(&prepare);
+        let compact = DfsMetadataMutation::commit_namespace_prepare(&prepare);
+        assert_eq!(compact.affected_object_ids().len(), 4096);
+        let full_bytes = serde_json::to_vec(&full).expect("encode full prepare");
+        let compact_bytes = serde_json::to_vec(&compact).expect("encode compact commit");
+        assert!(
+            compact_bytes.len() < 512 * 1024,
+            "4096-object compact marker unexpectedly exceeds 512 KiB: {}",
+            compact_bytes.len()
+        );
+        assert!(
+            compact_bytes.len().saturating_mul(4) < full_bytes.len(),
+            "compact marker should be at least 4x smaller: full={} compact={}",
+            full_bytes.len(),
+            compact_bytes.len()
+        );
+        assert_eq!(
+            serde_json::from_slice::<DfsMetadataMutation>(&compact_bytes)
+                .expect("round-trip compact commit"),
+            compact
+        );
+    }
+
+    #[test]
     fn request_owned_prepare_fused_admission_rejects_different_request_digest() {
         let root = temp_root("local_backend_request_prepare_fused_digest_conflict");
         let shard_id = DfsMetadataShardId::new("shard-root");
@@ -10059,7 +10616,7 @@ mod tests {
                     &prepared_completion.request_id,
                 )
                 .expect("completed request"),
-            Some(prepared_completion),
+            Some(prepared_completion.clone()),
             "the durable prepare attachment is the canonical terminal result"
         );
         assert_eq!(
@@ -10067,6 +10624,21 @@ mod tests {
                 .get_object(&current.object_id)
                 .expect("committed object"),
             Some(committed)
+        );
+
+        force_table_replay_from_journal(&backend, &root, 0);
+        drop(backend);
+        let reopened =
+            LocalSobjMetadataBackend::new(shard_id, &root).expect("reopen repaired request");
+        assert_eq!(
+            reopened
+                .get_namespace_request(
+                    &prepared_completion.requester_node_id,
+                    &prepared_completion.request_id,
+                )
+                .expect("replayed completed request"),
+            Some(prepared_completion),
+            "journal-only semantic commit replay must retain the prepared canonical outcome"
         );
         cleanup(&root);
     }
@@ -10170,10 +10742,7 @@ mod tests {
         );
         assert!(matches!(
             commit_entry.mutation,
-            DfsMetadataMutation::PutNamespacePrepare {
-                status: DfsNamespacePrepareStatus::Committed,
-                ..
-            }
+            DfsMetadataMutation::CommitNamespacePrepare { .. }
         ));
         assert_eq!(
             reopened
@@ -21108,7 +21677,7 @@ mod tests {
             .expect("exact committed prepare retry");
         assert!(matches!(
             commit_retry.mutation,
-            DfsMetadataMutation::PutNamespacePrepare { .. }
+            DfsMetadataMutation::CommitNamespacePrepare { .. }
         ));
         let request_retry = reopened
             .put_namespace_request_on_shard(&shard_id, &completed_request)

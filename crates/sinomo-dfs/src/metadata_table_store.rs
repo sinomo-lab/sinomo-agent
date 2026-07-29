@@ -339,7 +339,7 @@ pub(crate) fn metadata_tables_from_table_snapshot(
         LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION => {
             let mut tables = DfsMetadataTables::default();
             for op in snapshot.ops {
-                tables.apply(op);
+                tables.apply_checked(op)?;
             }
             Ok(tables)
         }
@@ -454,7 +454,7 @@ fn replay_metadata_table_batches(
         }
         if checkpoint_sequence.is_none_or(|checkpoint| batch.sequence > checkpoint) {
             for op in batch.ops {
-                tables.apply(op);
+                tables.apply_checked(op)?;
             }
         }
         // Only advance past fully decoded records: a torn record at the tail

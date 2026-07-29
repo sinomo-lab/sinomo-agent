@@ -53,6 +53,7 @@ pub(crate) fn journal_entry_has_replay_payloads(entry: &DfsMetadataJournalEntry)
         DfsMetadataMutation::PutAdvisoryLockState { state, .. } => state.is_some(),
         DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => transaction.is_some(),
         DfsMetadataMutation::PutNamespacePrepare { prepare, .. } => prepare.is_some(),
+        DfsMetadataMutation::CommitNamespacePrepare { .. } => true,
         DfsMetadataMutation::PutNamespaceJob { job, .. } => job.is_some(),
         DfsMetadataMutation::PutNamespaceRequest { .. }
         | DfsMetadataMutation::PutNamespaceTransactionReceipt { .. }
@@ -99,6 +100,7 @@ pub(crate) fn require_journal_entry_replay_payloads(entry: &DfsMetadataJournalEn
         | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { .. }
         | DfsMetadataMutation::RemoveNamespacePrepareReceipt { .. }
         | DfsMetadataMutation::RemoveNamespaceRequestReceipt { .. }
+        | DfsMetadataMutation::CommitNamespacePrepare { .. }
         | DfsMetadataMutation::PutConflict { .. } => {}
         DfsMetadataMutation::PutIntent { intent, .. } => {
             required_replay_payload(entry, "put-intent", intent.as_ref())?;
@@ -223,6 +225,7 @@ pub(crate) fn require_replica_journal_entry_file_system(
         | DfsMetadataMutation::PutNamespaceTransactionReceipt { file_system_id, .. }
         | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { file_system_id, .. }
         | DfsMetadataMutation::PutNamespacePrepare { file_system_id, .. }
+        | DfsMetadataMutation::CommitNamespacePrepare { file_system_id, .. }
         | DfsMetadataMutation::PutNamespacePrepareReceipt { file_system_id, .. }
         | DfsMetadataMutation::RemoveNamespacePrepareReceipt { file_system_id, .. }
         | DfsMetadataMutation::PutNamespaceJob { file_system_id, .. }
@@ -484,6 +487,7 @@ pub(crate) fn require_replica_journal_entry_file_system(
         | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { .. }
         | DfsMetadataMutation::RemoveNamespacePrepareReceipt { .. }
         | DfsMetadataMutation::RemoveNamespaceRequestReceipt { .. }
+        | DfsMetadataMutation::CommitNamespacePrepare { .. }
         | DfsMetadataMutation::PutConflict { conflict: None, .. } => Ok(()),
         // Payload completeness was checked above. These arms only keep this
         // match exhaustive without re-unwrapping every option.
