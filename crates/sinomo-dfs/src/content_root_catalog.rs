@@ -1840,6 +1840,7 @@ mod tests {
             replica_node_ids: vec![node("catalog-replica")],
             epoch: 7,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedConfirmed,
         }
     }

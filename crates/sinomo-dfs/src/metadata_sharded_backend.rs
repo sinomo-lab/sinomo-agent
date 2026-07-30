@@ -19,7 +19,8 @@ use crate::content_root_catalog::{
     DfsContentRootCatalogPageRequest, DfsContentRootCatalogShardIdentity,
 };
 use crate::control_plane::{
-    DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardRoutingIndex,
+    DfsMetadataNamespacePrepareCodec, DfsMetadataShardAssignment, DfsMetadataShardConfig,
+    DfsMetadataShardRoutingIndex,
 };
 use crate::intent::write_intent_status_is_active;
 use crate::metadata_api::{
@@ -283,7 +284,7 @@ impl LocalShardedMetadataBackend {
                 .map(|(shard, shard_id, shard_root)| {
                     let replica_repair_local_node_id = replica_repair_local_node_id.as_ref();
                     scope.spawn(move || {
-                        let backend = if initialize_layout {
+                        let mut backend = if initialize_layout {
                             match LocalSobjMetadataBackend::new(
                                 shard_id.clone(),
                                 shard_root.clone(),
@@ -313,6 +314,7 @@ impl LocalShardedMetadataBackend {
                                 shard_root,
                             )?
                         };
+                        backend.set_namespace_prepare_codec(shard.namespace_prepare_codec);
                         Ok((shard_id, backend))
                     })
                 })
@@ -3187,6 +3189,24 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 prepare.operation_id, prepare.shard_id.0
             )));
         }
+        let (configured_epoch, configured_codec) = self
+            .shard_configs
+            .get(&prepare.shard_id.0)
+            .map(|shard| (shard.epoch, shard.namespace_prepare_codec))
+            .ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "namespace prepare {} targets unconfigured local shard {}",
+                    prepare.operation_id, prepare.shard_id.0
+                ))
+            })?;
+        if configured_codec == DfsMetadataNamespacePrepareCodec::PackedV1
+            && prepare.owner_epoch != configured_epoch
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {} owner epoch {} does not match configured shard {} epoch {}",
+                prepare.operation_id, prepare.owner_epoch, prepare.shard_id.0, configured_epoch
+            )));
+        }
         for path in prepare
             .transaction
             .objects
@@ -4197,10 +4217,55 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         &mut self,
         shard_id: &DfsMetadataShardId,
         handoff_id: &str,
-        activated_epoch: u64,
+        active_shard: &DfsMetadataShardConfig,
     ) -> Result<bool> {
-        self.shard_backend_mut(shard_id)?
-            .clear_metadata_shard_membership_handoff_freeze(shard_id, handoff_id, activated_epoch)
+        if active_shard.shard_id != shard_id.0 {
+            return Err(MetadataBackendError::Serde(format!(
+                "active metadata shard config {} does not match rebound shard {}",
+                active_shard.shard_id, shard_id.0
+            )));
+        }
+        let previous = self
+            .shard_configs
+            .get(&shard_id.0)
+            .cloned()
+            .ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "cannot rebind unconfigured metadata shard {}",
+                    shard_id.0
+                ))
+            })?;
+        if previous.file_system_id != active_shard.file_system_id
+            || previous.assignment != active_shard.assignment
+            || previous.default_policy != active_shard.default_policy
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata shard {} rebind changes immutable routing or policy configuration",
+                shard_id.0
+            )));
+        }
+
+        self.shard_configs
+            .insert(shard_id.0.clone(), active_shard.clone());
+        let rebound = match self.shard_backend_mut(shard_id) {
+            Ok(backend) => backend.clear_metadata_shard_membership_handoff_freeze(
+                shard_id,
+                handoff_id,
+                active_shard,
+            ),
+            Err(error) => Err(error),
+        };
+        match rebound {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                self.shard_configs.insert(shard_id.0.clone(), previous);
+                Ok(false)
+            }
+            Err(error) => {
+                self.shard_configs.insert(shard_id.0.clone(), previous);
+                Err(error)
+            }
+        }
     }
 
     fn export_table_snapshot(&self) -> Result<DfsMetadataTableSnapshot> {

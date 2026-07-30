@@ -15,6 +15,7 @@ use crate::content_root_catalog::{
     DfsContentRootCatalogIncompleteReason, DfsContentRootCatalogPage,
     DfsContentRootCatalogPageRequest,
 };
+use crate::control_plane::DfsMetadataShardConfig;
 use crate::intent::write_intent_status_is_active;
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_hardlink::{object_is_hardlink_to_target, sort_hardlinks_by_path};
@@ -1943,14 +1944,16 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     }
 
     /// Advance the exact matching freeze to a durable active generation after
-    /// the desired assignment is active. The calling backend instance is
-    /// rebound to `activated_epoch`; independently opened stale instances stay
-    /// fenced until they separately prove and observe that generation.
+    /// the desired assignment is active. Implementations must install the
+    /// complete active shard configuration before clearing the pending freeze
+    /// or running append-producing recovery. The calling backend instance is
+    /// rebound to that exact generation; independently opened stale instances
+    /// stay fenced until they separately prove and observe it.
     fn clear_metadata_shard_membership_handoff_freeze(
         &mut self,
         _shard_id: &DfsMetadataShardId,
         _handoff_id: &str,
-        _activated_epoch: u64,
+        _active_shard: &DfsMetadataShardConfig,
     ) -> Result<bool> {
         Ok(false)
     }

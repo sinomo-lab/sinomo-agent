@@ -15,7 +15,8 @@
 //!   not this node, then write through that routed mutation path.
 //! - `cluster.dfs.shard-layout` — resolve representative paths for the default
 //!   root, services, and users lanes through live cluster KV and report their
-//!   current shard primaries for external performance orchestration.
+//!   current shard primaries and namespace-prepare codecs for external
+//!   performance orchestration.
 //! - `cluster.dfs.service-advertisements` — verify DFS service discovery
 //!   records advertise node identities instead of concrete network routes.
 //! - `cluster.dfs.placement-management` — exercise Files-compatible placement
@@ -58,10 +59,10 @@ use sinomo_runtime::core::DfsObjectPolicy;
 use sinomo_runtime::dfs::{
     self, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsAttachmentMessageCommand,
     DfsFetchBlobResponse, DfsFetchBlobResult, DfsFileSystemId, DfsMessageCommand,
-    DfsNetworkMessage, DfsObjectId, DfsOperatorRepairView, DfsOperatorStatus, DfsPlacementPolicy,
-    DfsPlacementReconciliationState, DfsPlacementScope, DfsReadData, DfsReadResponse,
-    DfsReadResult, DfsRoutedMessage, DfsRpcAttachmentDescriptor, DfsStageBlobCommand, DfsVersion,
-    SIFS_FILE_SYSTEM_ID,
+    DfsMetadataNamespacePrepareCodec, DfsNetworkMessage, DfsObjectId, DfsOperatorRepairView,
+    DfsOperatorStatus, DfsPlacementPolicy, DfsPlacementReconciliationState, DfsPlacementScope,
+    DfsReadData, DfsReadResponse, DfsReadResult, DfsRoutedMessage, DfsRpcAttachmentDescriptor,
+    DfsStageBlobCommand, DfsVersion, SIFS_FILE_SYSTEM_ID,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths, ObjectRpcRequest};
@@ -165,7 +166,7 @@ sinomo_runtime::test::sinomo_test_case! {
 sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_shard_layout(ctx) {
         id: "cluster.dfs.shard-layout",
-        summary: "Resolve the live root, services, and users metadata-shard primaries",
+        summary: "Resolve the live root, services, and users metadata-shard primaries and prepare codecs",
         tags: ["cluster-dfs", "probe", "performance"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
@@ -1119,6 +1120,7 @@ struct DfsShardLayoutProbe {
     primary_node_id: String,
     replica_node_ids: Vec<String>,
     epoch: u64,
+    namespace_prepare_codec: DfsMetadataNamespacePrepareCodec,
 }
 
 fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
@@ -1143,6 +1145,8 @@ fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let expected_replica_count = optional_usize_parameter(ctx, "expected-replica-count", 0)?;
     let expected_distinct_primary_count =
         optional_usize_parameter(ctx, "expected-distinct-primary-count", 0)?;
+    let expected_namespace_prepare_codec =
+        optional_namespace_prepare_codec_parameter(ctx, "expected-namespace-prepare-codec")?;
     let backend = open_observation(ctx)?;
     let node = backend.node_label();
     let mut layouts = Vec::with_capacity(PROBES.len());
@@ -1167,6 +1171,7 @@ fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 .map(ToString::to_string)
                 .collect(),
             epoch: shard.epoch,
+            namespace_prepare_codec: shard.namespace_prepare_codec,
         });
     }
 
@@ -1214,11 +1219,62 @@ fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             distinct_primary_node_ids.len()
         )));
     }
+    if let Some(expected) = expected_namespace_prepare_codec {
+        if let Some(mismatch) = namespace_prepare_codec_mismatch_detail(&layouts, expected) {
+            return Ok(SinomoTestOutcome::failed(format!(
+                "live SIFS metadata-shard layout expected namespace prepare codec {} on every lane, but observed {mismatch}",
+                namespace_prepare_codec_label(expected),
+            )));
+        }
+    }
 
     Ok(SinomoTestOutcome::passed(format!(
         "resolved {} live SIFS metadata-shard performance lanes from node {node}",
         layouts.len()
     )))
+}
+
+fn optional_namespace_prepare_codec_parameter(
+    ctx: &SinomoTestContext,
+    key: &str,
+) -> Result<Option<DfsMetadataNamespacePrepareCodec>, SinomoTestError> {
+    match ctx.parameter(key) {
+        Some(raw) => match raw.trim() {
+            "legacy" => Ok(Some(DfsMetadataNamespacePrepareCodec::Legacy)),
+            "packed-v1" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV1)),
+            other => Err(SinomoTestError::InvalidParameter {
+                name: key.to_string(),
+                detail: format!("expected `legacy` or `packed-v1`, got `{other}`"),
+            }),
+        },
+        None => Ok(None),
+    }
+}
+
+fn namespace_prepare_codec_label(codec: DfsMetadataNamespacePrepareCodec) -> &'static str {
+    match codec {
+        DfsMetadataNamespacePrepareCodec::Legacy => "legacy",
+        DfsMetadataNamespacePrepareCodec::PackedV1 => "packed-v1",
+    }
+}
+
+fn namespace_prepare_codec_mismatch_detail(
+    layouts: &[DfsShardLayoutProbe],
+    expected: DfsMetadataNamespacePrepareCodec,
+) -> Option<String> {
+    let mismatches = layouts
+        .iter()
+        .filter(|layout| layout.namespace_prepare_codec != expected)
+        .map(|layout| {
+            format!(
+                "{}={} ({})",
+                layout.lane,
+                namespace_prepare_codec_label(layout.namespace_prepare_codec),
+                layout.shard_id
+            )
+        })
+        .collect::<Vec<_>>();
+    (!mismatches.is_empty()).then(|| mismatches.join(", "))
 }
 
 fn remote_shard_write_probe_prefix(shard_id: &str) -> Option<&'static str> {
@@ -5346,6 +5402,94 @@ mod tests {
         ClusterEndpointSource, ClusterMemberRecord, ClusterTransportKind,
     };
     use sinomo_runtime::node::ClusterId;
+
+    fn shard_layout_probe(
+        lane: &'static str,
+        codec: DfsMetadataNamespacePrepareCodec,
+    ) -> DfsShardLayoutProbe {
+        DfsShardLayoutProbe {
+            lane,
+            base_prefix: "/cluster-tests/dfs-perf",
+            shard_id: lane.to_string(),
+            file_system_id: SIFS_FILE_SYSTEM_ID.to_string(),
+            primary_node_id: "node-primary".to_string(),
+            replica_node_ids: vec!["node-replica".to_string()],
+            epoch: 7,
+            namespace_prepare_codec: codec,
+        }
+    }
+
+    #[test]
+    fn shard_layout_expected_namespace_prepare_codec_accepts_known_values_and_rejects_unknown() {
+        let omitted = SinomoTestContext::new("unused");
+        assert_eq!(
+            optional_namespace_prepare_codec_parameter(
+                &omitted,
+                "expected-namespace-prepare-codec"
+            )
+            .expect("omitted codec expectation"),
+            None
+        );
+
+        for (raw, expected) in [
+            ("legacy", DfsMetadataNamespacePrepareCodec::Legacy),
+            ("packed-v1", DfsMetadataNamespacePrepareCodec::PackedV1),
+        ] {
+            let ctx = SinomoTestContext::new("unused")
+                .with_parameter("expected-namespace-prepare-codec", raw);
+            assert_eq!(
+                optional_namespace_prepare_codec_parameter(
+                    &ctx,
+                    "expected-namespace-prepare-codec"
+                )
+                .expect("known codec expectation"),
+                Some(expected)
+            );
+        }
+
+        let invalid = SinomoTestContext::new("unused")
+            .with_parameter("expected-namespace-prepare-codec", "packed-v2");
+        assert!(matches!(
+            optional_namespace_prepare_codec_parameter(
+                &invalid,
+                "expected-namespace-prepare-codec"
+            ),
+            Err(SinomoTestError::InvalidParameter { ref name, ref detail })
+                if name == "expected-namespace-prepare-codec"
+                    && detail.contains("legacy")
+                    && detail.contains("packed-v1")
+        ));
+    }
+
+    #[test]
+    fn shard_layout_serializes_codec_and_reports_lane_mismatches() {
+        let legacy = shard_layout_probe("root", DfsMetadataNamespacePrepareCodec::Legacy);
+        let packed = shard_layout_probe("services", DfsMetadataNamespacePrepareCodec::PackedV1);
+        assert_eq!(
+            serde_json::to_value(&packed)
+                .expect("serialize shard layout")
+                .get("namespace_prepare_codec"),
+            Some(&serde_json::Value::String("packed-v1".to_string()))
+        );
+        assert_eq!(
+            namespace_prepare_codec_mismatch_detail(
+                &[legacy, packed],
+                DfsMetadataNamespacePrepareCodec::PackedV1,
+            )
+            .as_deref(),
+            Some("root=legacy (root)")
+        );
+        assert_eq!(
+            namespace_prepare_codec_mismatch_detail(
+                &[shard_layout_probe(
+                    "users",
+                    DfsMetadataNamespacePrepareCodec::PackedV1,
+                )],
+                DfsMetadataNamespacePrepareCodec::PackedV1,
+            ),
+            None
+        );
+    }
 
     #[test]
     fn bulk_write_syscw_affine_budget_accepts_boundary_and_rejects_excess() {

@@ -2016,6 +2016,7 @@ mod causal_time_tests {
             replica_node_ids: Vec::new(),
             epoch: 4,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedConfirmed,
         };
         let file_system = DfsFileSystemConfig {

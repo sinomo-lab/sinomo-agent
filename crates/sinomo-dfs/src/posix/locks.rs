@@ -559,6 +559,7 @@ mod tests {
             replica_node_ids,
             epoch: 7,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
         };
         let mut inner = InProcessKvStore::new();

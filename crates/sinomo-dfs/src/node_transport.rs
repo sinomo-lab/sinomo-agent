@@ -4066,6 +4066,7 @@ mod tests {
             replica_node_ids: targets.to_vec(),
             epoch: 7,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         test_metadata_fanout_requests(local_node_id, targets)
@@ -4335,6 +4336,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 7,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let request = DfsContentRootCatalogPageRequest {

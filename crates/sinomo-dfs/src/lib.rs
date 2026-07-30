@@ -37,7 +37,6 @@ mod metadata_lock;
 mod metadata_namespace_transaction;
 mod metadata_object_index;
 mod metadata_pages;
-#[allow(dead_code)]
 mod metadata_prepare_codec;
 mod metadata_read_snapshot;
 mod metadata_receipt;
@@ -150,17 +149,17 @@ pub use content_store::{
 pub use control_plane::{
     AsyncDfsControlPlaneKvClient, DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT,
     DfsControlPlaneAsyncStore, DfsControlPlaneKvClient, DfsControlPlaneKvFuture,
-    DfsControlPlaneStore, DfsFileSystemConfig, DfsMetadataShardAssignment, DfsMetadataShardConfig,
-    DfsMetadataShardHeadWatermark, DfsMetadataShardMembershipHandoff,
-    DfsMetadataShardMembershipHandoffFence, DfsMetadataShardMembershipHandoffProof,
-    DfsPlacementAuthorityPermitHolderKind, DfsPlacementAuthorityPermitStatus,
-    DfsPlacementAuthorityProcessIdentity, DfsPlacementAuthorityRecoveryOutcome,
-    DfsPlacementAuthorityRecoveryRefusal, SharedDfsControlPlaneKvClient, file_system_config_key,
-    metadata_shard_authority_barrier_key, metadata_shard_head_watermark_key, metadata_shard_key,
-    metadata_shard_membership_handoff_key, metadata_shard_membership_handoff_proof_key,
-    metadata_shards_prefix, placement_authority_permit_key,
-    placement_reconciliation_activity_index_key, placement_reconciliation_key,
-    placement_reconciliations_prefix,
+    DfsControlPlaneStore, DfsFileSystemConfig, DfsMetadataNamespacePrepareCodec,
+    DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardHeadWatermark,
+    DfsMetadataShardMembershipHandoff, DfsMetadataShardMembershipHandoffFence,
+    DfsMetadataShardMembershipHandoffProof, DfsPlacementAuthorityPermitHolderKind,
+    DfsPlacementAuthorityPermitStatus, DfsPlacementAuthorityProcessIdentity,
+    DfsPlacementAuthorityRecoveryOutcome, DfsPlacementAuthorityRecoveryRefusal,
+    SharedDfsControlPlaneKvClient, file_system_config_key, metadata_shard_authority_barrier_key,
+    metadata_shard_head_watermark_key, metadata_shard_key, metadata_shard_membership_handoff_key,
+    metadata_shard_membership_handoff_proof_key, metadata_shards_prefix,
+    placement_authority_permit_key, placement_reconciliation_activity_index_key,
+    placement_reconciliation_key, placement_reconciliations_prefix,
 };
 #[cfg(test)]
 pub(crate) use default_cluster::run_default_cluster_dfs_smoke;
@@ -299,6 +298,7 @@ pub use metadata_history_gc::{
 pub use metadata_limits::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
 };
+pub use metadata_prepare_codec::DfsPackedNamespacePrepareV1;
 pub use metadata_records::{
     DfsConflictPage, DfsConflictPageCursor, DfsConflictRecord, DfsConflictScanCursor,
     DfsConflictScanPage, DfsConflictStatus, DfsCrossShardPinTransferRecord,

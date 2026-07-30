@@ -894,6 +894,7 @@ mod tests {
                 replica_node_ids: vec![local_node_id],
                 epoch: 64,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             pending_membership_handoff: None,
@@ -1159,6 +1160,7 @@ mod tests {
             replica_node_ids: vec![local.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut cluster_kv = sinomo_core::kv::InProcessKvStore::restore(

@@ -21,7 +21,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_core::kv::{
     InProcessKvStore, KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse,
 };
-use sinomo_core::node::{NodeId, cluster_member_key};
+use sinomo_core::node::{
+    ClusterCapabilityPolicyRecord, DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY, NodeId,
+    cluster_capability_policy_key, cluster_member_key,
+};
 use sinomo_core::{ClusterMemberRecord, ClusterMemberState, DfsObjectPolicy};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -773,6 +776,23 @@ impl From<DfsFileSystemConfig> for DfsFileSystem {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsMetadataNamespacePrepareCodec {
+    /// Canonical full [`crate::DfsNamespacePrepareRecord`] journal payload.
+    #[default]
+    Legacy,
+    /// Packed-v1 authoritative journal payload. This may be selected only
+    /// after every assigned metadata member advertises decoder support.
+    /// Activation is one-way until a future rollback protocol proves a
+    /// legacy-readable snapshot and replay floor beyond all packed records.
+    PackedV1,
+}
+
+fn metadata_namespace_prepare_codec_is_legacy(codec: &DfsMetadataNamespacePrepareCodec) -> bool {
+    *codec == DfsMetadataNamespacePrepareCodec::Legacy
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataShardConfig {
     pub file_system_id: DfsFileSystemId,
@@ -782,6 +802,11 @@ pub struct DfsMetadataShardConfig {
     pub replica_node_ids: Vec<NodeId>,
     pub epoch: u64,
     pub assignment: DfsMetadataShardAssignment,
+    #[serde(
+        default,
+        skip_serializing_if = "metadata_namespace_prepare_codec_is_legacy"
+    )]
+    pub namespace_prepare_codec: DfsMetadataNamespacePrepareCodec,
     pub default_policy: DfsObjectPolicy,
 }
 
@@ -2244,10 +2269,41 @@ impl<'a> DfsControlPlaneStore<'a> {
     }
 
     pub fn put_metadata_shard(&mut self, shard: &DfsMetadataShardConfig) -> Result<(), KvError> {
-        self.put_serde(
-            &metadata_shard_key(&shard.file_system_id, &shard.shard_id),
-            shard,
-        )
+        let key = metadata_shard_key(&shard.file_system_id, &shard.shard_id);
+        for _ in 0..METADATA_MEMBERSHIP_HANDOFF_RETRIES {
+            let current_entry = self.kv.get(&key)?;
+            if let Some(entry) = current_entry.as_ref() {
+                let current = entry.decode::<DfsMetadataShardConfig>()?;
+                validate_raw_metadata_namespace_prepare_codec_write(&current, shard)?;
+                if current == *shard {
+                    return Ok(());
+                }
+            }
+            let mut compares = vec![match current_entry.as_ref() {
+                Some(entry) => KvCompare::ValueEquals {
+                    key: key.clone(),
+                    value: entry.value.clone(),
+                },
+                None => KvCompare::Missing { key: key.clone() },
+            }];
+            if current_entry.is_none() {
+                compares.extend(metadata_namespace_prepare_codec_admission_compares(
+                    self.kv, shard,
+                )?);
+            }
+            if self
+                .kv
+                .txn(KvTxn {
+                    compares,
+                    success: vec![KvOp::put_serde(key.clone(), shard, None)?],
+                    failure: Vec::new(),
+                })?
+                .succeeded
+            {
+                return Ok(());
+            }
+        }
+        Err(KvError::Busy { path: key })
     }
 
     /// Create an absent shard or idempotently replace the exact same value.
@@ -2276,12 +2332,17 @@ impl<'a> DfsControlPlaneStore<'a> {
             }
             _ => return Ok(false),
         };
-        let compares = vec![shard_compare];
+        let mut compares = vec![shard_compare];
         if let Some(expected) = expected
             && expected != desired
         {
             validate_metadata_shard_cas_reconfiguration(expected, desired)?;
             return Ok(false);
+        }
+        if expected.is_none() {
+            compares.extend(metadata_namespace_prepare_codec_admission_compares(
+                self.kv, desired,
+            )?);
         }
         Ok(self
             .kv
@@ -2390,18 +2451,22 @@ impl<'a> DfsControlPlaneStore<'a> {
                     key: watermark_key.clone(),
                 },
             };
+            let mut compares = vec![
+                KvCompare::ValueEquals {
+                    key: shard_key.clone(),
+                    value: shard_entry.value,
+                },
+                floor_compare,
+                watermark_compare,
+                KvCompare::Missing {
+                    key: handoff_key.clone(),
+                },
+            ];
+            compares.extend(metadata_namespace_prepare_codec_admission_compares(
+                self.kv, desired,
+            )?);
             let response = self.kv.txn(KvTxn {
-                compares: vec![
-                    KvCompare::ValueEquals {
-                        key: shard_key.clone(),
-                        value: shard_entry.value,
-                    },
-                    floor_compare,
-                    watermark_compare,
-                    KvCompare::Missing {
-                        key: handoff_key.clone(),
-                    },
-                ],
+                compares,
                 success: vec![KvOp::put_serde(handoff_key.clone(), &handoff, None)?],
                 failure: Vec::new(),
             })?;
@@ -2620,21 +2685,25 @@ impl<'a> DfsControlPlaneStore<'a> {
                 key: watermark_key.clone(),
             },
         };
+        let mut compares = vec![
+            KvCompare::ValueEquals {
+                key: shard_key.clone(),
+                value: shard_entry.value,
+            },
+            KvCompare::ValueEquals {
+                key: handoff_key.clone(),
+                value: handoff_entry.value,
+            },
+            floor_compare,
+            watermark_compare,
+        ];
+        compares.extend(metadata_namespace_prepare_codec_admission_compares(
+            self.kv, desired,
+        )?);
         Ok(self
             .kv
             .txn(KvTxn {
-                compares: vec![
-                    KvCompare::ValueEquals {
-                        key: shard_key.clone(),
-                        value: shard_entry.value,
-                    },
-                    KvCompare::ValueEquals {
-                        key: handoff_key.clone(),
-                        value: handoff_entry.value,
-                    },
-                    floor_compare,
-                    watermark_compare,
-                ],
+                compares,
                 success: vec![
                     KvOp::put_serde(shard_key, desired, None)?,
                     KvOp::put_serde(watermark_key, &activated_watermark, None)?,
@@ -2988,6 +3057,7 @@ impl<'a> DfsControlPlaneStore<'a> {
         reject_kv_only_metadata_shard_primary_transfer(&current, &new_primary_node_id)
     }
 
+    #[cfg(test)]
     fn put_serde<T>(&mut self, key: &str, value: &T) -> Result<(), KvError>
     where
         T: Serialize,
@@ -3179,11 +3249,43 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         &mut self,
         shard: &DfsMetadataShardConfig,
     ) -> Result<(), KvError> {
-        self.put_serde(
-            &metadata_shard_key(&shard.file_system_id, &shard.shard_id),
-            shard,
-        )
-        .await
+        let key = metadata_shard_key(&shard.file_system_id, &shard.shard_id);
+        for _ in 0..METADATA_MEMBERSHIP_HANDOFF_RETRIES {
+            let current_entry = self.kv.get_async(&key).await?;
+            if let Some(entry) = current_entry.as_ref() {
+                let current = entry.decode::<DfsMetadataShardConfig>()?;
+                validate_raw_metadata_namespace_prepare_codec_write(&current, shard)?;
+                if current == *shard {
+                    return Ok(());
+                }
+            }
+            let mut compares = vec![match current_entry.as_ref() {
+                Some(entry) => KvCompare::ValueEquals {
+                    key: key.clone(),
+                    value: entry.value.clone(),
+                },
+                None => KvCompare::Missing { key: key.clone() },
+            }];
+            if current_entry.is_none() {
+                compares.extend(
+                    metadata_namespace_prepare_codec_admission_compares_async(self.kv, shard)
+                        .await?,
+                );
+            }
+            if self
+                .kv
+                .txn_async(KvTxn {
+                    compares,
+                    success: vec![KvOp::put_serde(key.clone(), shard, None)?],
+                    failure: Vec::new(),
+                })
+                .await?
+                .succeeded
+            {
+                return Ok(());
+            }
+        }
+        Err(KvError::Busy { path: key })
     }
 
     /// Async create/idempotent compare-and-put. Changed assignments or primary
@@ -3208,12 +3310,17 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
             }
             _ => return Ok(false),
         };
-        let compares = vec![shard_compare];
+        let mut compares = vec![shard_compare];
         if let Some(expected) = expected
             && expected != desired
         {
             validate_metadata_shard_cas_reconfiguration(expected, desired)?;
             return Ok(false);
+        }
+        if expected.is_none() {
+            compares.extend(
+                metadata_namespace_prepare_codec_admission_compares_async(self.kv, desired).await?,
+            );
         }
         Ok(self
             .kv
@@ -3314,20 +3421,24 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                     key: watermark_key.clone(),
                 },
             };
+            let mut compares = vec![
+                KvCompare::ValueEquals {
+                    key: shard_key.clone(),
+                    value: shard_entry.value,
+                },
+                floor_compare,
+                watermark_compare,
+                KvCompare::Missing {
+                    key: handoff_key.clone(),
+                },
+            ];
+            compares.extend(
+                metadata_namespace_prepare_codec_admission_compares_async(self.kv, desired).await?,
+            );
             let response = self
                 .kv
                 .txn_async(KvTxn {
-                    compares: vec![
-                        KvCompare::ValueEquals {
-                            key: shard_key.clone(),
-                            value: shard_entry.value,
-                        },
-                        floor_compare,
-                        watermark_compare,
-                        KvCompare::Missing {
-                            key: handoff_key.clone(),
-                        },
-                    ],
+                    compares,
                     success: vec![KvOp::put_serde(handoff_key.clone(), &handoff, None)?],
                     failure: Vec::new(),
                 })
@@ -3494,21 +3605,25 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
                 key: watermark_key.clone(),
             },
         };
+        let mut compares = vec![
+            KvCompare::ValueEquals {
+                key: shard_key.clone(),
+                value: shard_entry.value,
+            },
+            KvCompare::ValueEquals {
+                key: handoff_key.clone(),
+                value: handoff_entry.value,
+            },
+            floor_compare,
+            watermark_compare,
+        ];
+        compares.extend(
+            metadata_namespace_prepare_codec_admission_compares_async(self.kv, desired).await?,
+        );
         Ok(self
             .kv
             .txn_async(KvTxn {
-                compares: vec![
-                    KvCompare::ValueEquals {
-                        key: shard_key.clone(),
-                        value: shard_entry.value,
-                    },
-                    KvCompare::ValueEquals {
-                        key: handoff_key.clone(),
-                        value: handoff_entry.value,
-                    },
-                    floor_compare,
-                    watermark_compare,
-                ],
+                compares,
                 success: vec![
                     KvOp::put_serde(shard_key, desired, None)?,
                     KvOp::put_serde(watermark_key, &activated_watermark, None)?,
@@ -3778,16 +3893,6 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         reject_kv_only_metadata_shard_primary_transfer(&current, &new_primary_node_id)
     }
 
-    async fn put_serde<T>(&mut self, key: &str, value: &T) -> Result<(), KvError>
-    where
-        T: Serialize,
-    {
-        self.kv
-            .put_async(key.to_string(), sinomo_core::kv::encode_kv_value(value)?)
-            .await?;
-        Ok(())
-    }
-
     async fn get_serde<T>(&self, key: &str) -> Result<Option<T>, KvError>
     where
         T: DeserializeOwned,
@@ -3815,10 +3920,17 @@ fn validate_metadata_shard_cas_identity(
 
 /// Validate a proof-carrying metadata handoff configuration delta.
 ///
-/// A handoff is either a same-primary membership change or a pure role rotation
-/// over the exact existing member ring. Assignment and policy changes are
-/// separate administrative decisions. Mixing a primary move with a membership
-/// change would make the promoted-prefix proof ambiguous, so it is rejected.
+/// A handoff is either a same-primary membership or persisted-codec upgrade, or
+/// a pure role rotation over the exact existing member ring. Assignment and
+/// policy changes are separate administrative decisions. Mixing a primary move
+/// with a membership change would make the promoted-prefix proof ambiguous, so
+/// it is rejected.
+///
+/// Packed-v1 activation is intentionally one-way for now. A rollback also
+/// needs a canonical snapshot/replay floor beyond every packed record before an
+/// older binary may reopen the shard. The current handoff proof does not carry
+/// that stronger evidence, so accepting a packed-to-legacy transition would
+/// advertise a downgrade that is not actually restart-safe.
 fn validate_metadata_shard_cas_reconfiguration(
     expected: &DfsMetadataShardConfig,
     desired: &DfsMetadataShardConfig,
@@ -3849,14 +3961,16 @@ fn validate_metadata_shard_cas_reconfiguration(
             ),
         });
     }
+    validate_metadata_namespace_prepare_codec_transition(expected, desired)?;
 
     if expected.primary_node_id == desired.primary_node_id {
-        if metadata_shard_configured_node_ids(expected)
-            == metadata_shard_configured_node_ids(desired)
-        {
+        let membership_changed = metadata_shard_configured_node_ids(expected)
+            != metadata_shard_configured_node_ids(desired);
+        let codec_changed = expected.namespace_prepare_codec != desired.namespace_prepare_codec;
+        if !membership_changed && !codec_changed {
             return Err(KvError::Serialization {
                 detail: format!(
-                    "metadata shard {} membership handoff must change the configured replica set",
+                    "metadata shard {} handoff must change the configured replica set or namespace prepare codec",
                     expected.shard_id
                 ),
             });
@@ -3883,6 +3997,185 @@ fn validate_metadata_shard_cas_reconfiguration(
         });
     }
     Ok(())
+}
+
+fn validate_metadata_namespace_prepare_codec_transition(
+    expected: &DfsMetadataShardConfig,
+    desired: &DfsMetadataShardConfig,
+) -> Result<(), KvError> {
+    if expected.namespace_prepare_codec == DfsMetadataNamespacePrepareCodec::PackedV1
+        && desired.namespace_prepare_codec == DfsMetadataNamespacePrepareCodec::Legacy
+    {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "metadata shard {} cannot downgrade packed-v1 namespace prepares without a legacy-readable snapshot and replay-floor proof",
+                expected.shard_id
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_raw_metadata_namespace_prepare_codec_write(
+    current: &DfsMetadataShardConfig,
+    desired: &DfsMetadataShardConfig,
+) -> Result<(), KvError> {
+    validate_metadata_namespace_prepare_codec_transition(current, desired)?;
+    if current.namespace_prepare_codec != desired.namespace_prepare_codec
+        || (current.namespace_prepare_codec == DfsMetadataNamespacePrepareCodec::PackedV1
+            && current != desired)
+    {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "metadata shard {} cannot activate or reconfigure packed-v1 namespace prepares through a raw put; use the capability-validated metadata membership handoff",
+                current.shard_id
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn metadata_namespace_prepare_codec_admission_compares(
+    kv: &(impl DfsControlPlaneKvClient + ?Sized),
+    desired: &DfsMetadataShardConfig,
+) -> Result<Vec<KvCompare>, KvError> {
+    if desired.namespace_prepare_codec != DfsMetadataNamespacePrepareCodec::PackedV1 {
+        return Ok(Vec::new());
+    }
+    let mut cluster_id = None;
+    let mut compares = Vec::new();
+    for node_id in metadata_shard_configured_node_ids(desired) {
+        let member_key = cluster_member_key(&node_id);
+        let member_entry =
+            kv.get(&member_key)?
+                .ok_or_else(|| KvError::Serialization {
+                    detail: format!(
+                        "metadata shard {} cannot activate packed-v1 namespace prepares: assigned node {} has no authoritative cluster member capability record",
+                        desired.shard_id, node_id
+                    ),
+                })?;
+        let policy_key = cluster_capability_policy_key(&node_id);
+        let policy_entry = kv.get(&policy_key)?;
+        compares.extend(metadata_namespace_prepare_codec_member_compares(
+            desired,
+            &node_id,
+            member_key,
+            member_entry,
+            policy_key,
+            policy_entry,
+            &mut cluster_id,
+        )?);
+    }
+    Ok(compares)
+}
+
+async fn metadata_namespace_prepare_codec_admission_compares_async(
+    kv: &mut (impl AsyncDfsControlPlaneKvClient + ?Sized),
+    desired: &DfsMetadataShardConfig,
+) -> Result<Vec<KvCompare>, KvError> {
+    if desired.namespace_prepare_codec != DfsMetadataNamespacePrepareCodec::PackedV1 {
+        return Ok(Vec::new());
+    }
+    let mut cluster_id = None;
+    let mut compares = Vec::new();
+    for node_id in metadata_shard_configured_node_ids(desired) {
+        let member_key = cluster_member_key(&node_id);
+        let member_entry = kv
+            .get_async(&member_key)
+            .await?
+            .ok_or_else(|| KvError::Serialization {
+                detail: format!(
+                    "metadata shard {} cannot activate packed-v1 namespace prepares: assigned node {} has no authoritative cluster member capability record",
+                    desired.shard_id, node_id
+                ),
+            })?;
+        let policy_key = cluster_capability_policy_key(&node_id);
+        let policy_entry = kv.get_async(&policy_key).await?;
+        compares.extend(metadata_namespace_prepare_codec_member_compares(
+            desired,
+            &node_id,
+            member_key,
+            member_entry,
+            policy_key,
+            policy_entry,
+            &mut cluster_id,
+        )?);
+    }
+    Ok(compares)
+}
+
+fn metadata_namespace_prepare_codec_member_compares(
+    desired: &DfsMetadataShardConfig,
+    node_id: &NodeId,
+    member_key: String,
+    member_entry: KvEntry,
+    policy_key: String,
+    policy_entry: Option<KvEntry>,
+    cluster_id: &mut Option<sinomo_core::Id>,
+) -> Result<Vec<KvCompare>, KvError> {
+    let member = member_entry.decode::<ClusterMemberRecord>()?;
+    if member.node_id != *node_id || !member.state.is_authorized() {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "metadata shard {} cannot activate packed-v1 namespace prepares: assigned node {} is not an authorized cluster member",
+                desired.shard_id, node_id
+            ),
+        });
+    }
+    let policy = policy_entry
+        .as_ref()
+        .map(|entry| entry.decode::<ClusterCapabilityPolicyRecord>())
+        .transpose()?;
+    if policy
+        .as_ref()
+        .is_some_and(|policy| policy.node_id != *node_id || policy.cluster_id != member.cluster_id)
+    {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "metadata shard {} cannot activate packed-v1 namespace prepares: assigned node {} has an inconsistent authoritative capability policy",
+                desired.shard_id, node_id
+            ),
+        });
+    }
+    let effective_capabilities = policy
+        .as_ref()
+        .map(|policy| policy.capabilities.as_slice())
+        .unwrap_or(member.capabilities.as_slice());
+    if !effective_capabilities.iter().any(|capability| {
+        capability.as_str() == DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY
+    }) {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "metadata shard {} cannot activate packed-v1 namespace prepares: assigned node {} effective capability policy does not advertise {}",
+                desired.shard_id, node_id, DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY
+            ),
+        });
+    }
+    if cluster_id
+        .as_ref()
+        .is_some_and(|cluster_id| *cluster_id != member.cluster_id)
+    {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "metadata shard {} cannot activate packed-v1 namespace prepares across inconsistent cluster member records",
+                desired.shard_id
+            ),
+        });
+    }
+    *cluster_id = Some(member.cluster_id);
+    Ok(vec![
+        KvCompare::ValueEquals {
+            key: member_key,
+            value: member_entry.value,
+        },
+        match policy_entry {
+            Some(entry) => KvCompare::ValueEquals {
+                key: policy_key,
+                value: entry.value,
+            },
+            None => KvCompare::Missing { key: policy_key },
+        },
+    ])
 }
 
 fn metadata_shard_configured_node_ids(shard: &DfsMetadataShardConfig) -> BTreeSet<NodeId> {
@@ -4745,6 +5038,73 @@ mod tests {
     }
 
     #[derive(Debug)]
+    enum PackedCapabilityRecordKind {
+        Member,
+        Policy,
+    }
+
+    #[derive(Debug)]
+    struct DropPackedCapabilityBeforeTxnKv {
+        inner: InProcessKvStore,
+        record_key: String,
+        record_kind: PackedCapabilityRecordKind,
+        drop_before_next_txn: bool,
+    }
+
+    impl DfsControlPlaneKvClient for DropPackedCapabilityBeforeTxnKv {
+        fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
+            Ok(self.inner.get(key).cloned())
+        }
+
+        fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+            self.inner.range_prefix(prefix)
+        }
+
+        fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
+            self.inner.put(key, value, None)
+        }
+
+        fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+            if self.drop_before_next_txn {
+                match self.record_kind {
+                    PackedCapabilityRecordKind::Member => {
+                        let mut member = self
+                            .inner
+                            .get(&self.record_key)
+                            .expect("member capability record")
+                            .decode::<ClusterMemberRecord>()
+                            .expect("decode member capability record");
+                        member.capabilities.retain(|capability| {
+                            capability.as_str()
+                                != DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY
+                        });
+                        self.inner
+                            .put_serde(self.record_key.clone(), &member, None)
+                            .expect("drop packed prepare member capability");
+                    }
+                    PackedCapabilityRecordKind::Policy => {
+                        let mut policy = self
+                            .inner
+                            .get(&self.record_key)
+                            .expect("capability policy record")
+                            .decode::<ClusterCapabilityPolicyRecord>()
+                            .expect("decode capability policy record");
+                        policy.capabilities.retain(|capability| {
+                            capability.as_str()
+                                != DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY
+                        });
+                        self.inner
+                            .put_serde(self.record_key.clone(), &policy, None)
+                            .expect("drop packed prepare policy capability");
+                    }
+                }
+                self.drop_before_next_txn = false;
+            }
+            self.inner.txn(txn)
+        }
+    }
+
+    #[derive(Debug)]
     struct StaleObservedAuthoritativeTxnKv {
         observed: InProcessKvStore,
         authoritative: InProcessKvStore,
@@ -4936,6 +5296,50 @@ mod tests {
         );
         member.state = state;
         member
+    }
+
+    fn put_packed_namespace_prepare_capable_members<'a>(
+        kv: &mut InProcessKvStore,
+        node_ids: impl IntoIterator<Item = &'a NodeId>,
+    ) {
+        let cluster_id = sinomo_core::Id::from_legacy_named("packed-prepare-capability-cluster")
+            .expect("cluster id");
+        let capability =
+            sinomo_core::CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY)
+                .expect("static capability");
+        for node_id in node_ids {
+            let mut member = ClusterMemberRecord::local_non_voting(
+                cluster_id.clone(),
+                node_id.clone(),
+                "packed prepare capable member",
+                format!("{node_id}-public-key"),
+                time::OffsetDateTime::UNIX_EPOCH,
+            );
+            member.state = ClusterMemberState::Active;
+            member.capabilities.push(capability.clone());
+            kv.put_serde(cluster_member_key(node_id), &member, None)
+                .expect("put packed prepare capability member");
+        }
+    }
+
+    fn put_packed_namespace_prepare_capability_policy(
+        kv: &mut InProcessKvStore,
+        node_id: &NodeId,
+        capable: bool,
+    ) {
+        let member = kv
+            .get(&cluster_member_key(node_id))
+            .expect("cluster member")
+            .decode::<ClusterMemberRecord>()
+            .expect("decode cluster member");
+        let mut policy = ClusterCapabilityPolicyRecord::from(&member);
+        if !capable {
+            policy.capabilities.retain(|capability| {
+                capability.as_str() != DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY
+            });
+        }
+        kv.put_serde(cluster_capability_policy_key(node_id), &policy, None)
+            .expect("put packed prepare capability policy");
     }
 
     #[test]
@@ -6804,6 +7208,7 @@ mod tests {
             replica_node_ids: vec![node_replica],
             epoch: 7,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
 
@@ -6830,6 +7235,419 @@ mod tests {
     }
 
     #[test]
+    fn raw_metadata_shard_put_rejects_unproven_packed_downgrade() {
+        let file_system_id = file_system_id();
+        let packed = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: node("node_raw_codec_owner"),
+            replica_node_ids: vec![node("node_raw_codec_replica")],
+            epoch: 7,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let legacy = DfsMetadataShardConfig {
+            epoch: packed.epoch + 1,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
+            ..packed.clone()
+        };
+        let mut kv = InProcessKvStore::new();
+        put_packed_namespace_prepare_capable_members(
+            &mut kv,
+            std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
+        );
+        DfsControlPlaneStore::new(&mut kv)
+            .put_metadata_shard(&packed)
+            .expect("put packed shard");
+
+        let changed_packed = DfsMetadataShardConfig {
+            replica_node_ids: vec![node("node_raw_codec_uncapable_replica")],
+            epoch: packed.epoch + 1,
+            ..packed.clone()
+        };
+        assert!(matches!(
+            DfsControlPlaneStore::new(&mut kv).put_metadata_shard(&changed_packed),
+            Err(KvError::Serialization { detail })
+                if detail.contains("capability-validated")
+                    && detail.contains("membership handoff")
+        ));
+        assert!(matches!(
+            DfsControlPlaneStore::new(&mut kv).put_metadata_shard(&legacy),
+            Err(KvError::Serialization { detail })
+                if detail.contains("legacy-readable snapshot")
+                    && detail.contains("replay-floor proof")
+        ));
+        assert_eq!(
+            DfsControlPlaneStore::new(&mut kv)
+                .get_metadata_shard(&file_system_id, "root")
+                .expect("read retained packed shard"),
+            Some(packed)
+        );
+    }
+
+    #[test]
+    fn raw_metadata_shard_put_rejects_unproven_packed_activation() {
+        let file_system_id = file_system_id();
+        let legacy = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: node("node_raw_activation_owner"),
+            replica_node_ids: vec![node("node_raw_activation_replica")],
+            epoch: 7,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let packed = DfsMetadataShardConfig {
+            epoch: legacy.epoch + 1,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
+            ..legacy.clone()
+        };
+        let mut kv = InProcessKvStore::new();
+        DfsControlPlaneStore::new(&mut kv)
+            .put_metadata_shard(&legacy)
+            .expect("put legacy shard");
+
+        assert!(matches!(
+            DfsControlPlaneStore::new(&mut kv).put_metadata_shard(&packed),
+            Err(KvError::Serialization { detail })
+                if detail.contains("capability-validated")
+                    && detail.contains("membership handoff")
+        ));
+        assert!(matches!(
+            DfsControlPlaneStore::new(&mut kv)
+                .begin_metadata_shard_membership_handoff(&legacy, &packed),
+            Err(KvError::Serialization { detail })
+                if detail.contains("authoritative cluster member capability record")
+        ));
+        put_packed_namespace_prepare_capable_members(
+            &mut kv,
+            std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
+        );
+        assert!(
+            DfsControlPlaneStore::new(&mut kv)
+                .begin_metadata_shard_membership_handoff(&legacy, &packed)
+                .expect("capability-proved packed handoff")
+                .is_some()
+        );
+        assert_eq!(
+            DfsControlPlaneStore::new(&mut kv)
+                .get_metadata_shard(&file_system_id, "root")
+                .expect("read retained legacy shard"),
+            Some(legacy)
+        );
+    }
+
+    #[test]
+    fn initial_packed_metadata_shard_requires_authoritative_member_capabilities() {
+        let packed = DfsMetadataShardConfig {
+            file_system_id: file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: node("node_initial_packed_owner"),
+            replica_node_ids: vec![node("node_initial_packed_replica")],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut raw_kv = InProcessKvStore::new();
+        assert!(matches!(
+            DfsControlPlaneStore::new(&mut raw_kv).put_metadata_shard(&packed),
+            Err(KvError::Serialization { detail })
+                if detail.contains("authoritative cluster member capability record")
+        ));
+        put_packed_namespace_prepare_capable_members(
+            &mut raw_kv,
+            std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
+        );
+        put_packed_namespace_prepare_capability_policy(
+            &mut raw_kv,
+            &packed.replica_node_ids[0],
+            false,
+        );
+        assert!(matches!(
+            DfsControlPlaneStore::new(&mut raw_kv).put_metadata_shard(&packed),
+            Err(KvError::Serialization { detail })
+                if detail.contains("effective capability policy")
+        ));
+        put_packed_namespace_prepare_capability_policy(
+            &mut raw_kv,
+            &packed.replica_node_ids[0],
+            true,
+        );
+        DfsControlPlaneStore::new(&mut raw_kv)
+            .put_metadata_shard(&packed)
+            .expect("capability-proved raw create");
+
+        let mut cas_kv = InProcessKvStore::new();
+        assert!(matches!(
+            DfsControlPlaneStore::new(&mut cas_kv)
+                .compare_and_put_metadata_shard(None, &packed),
+            Err(KvError::Serialization { detail })
+                if detail.contains("authoritative cluster member capability record")
+        ));
+        put_packed_namespace_prepare_capable_members(
+            &mut cas_kv,
+            std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
+        );
+        assert!(
+            DfsControlPlaneStore::new(&mut cas_kv)
+                .compare_and_put_metadata_shard(None, &packed)
+                .expect("capability-proved CAS create")
+        );
+    }
+
+    #[test]
+    fn initial_packed_metadata_shard_fences_concurrent_capability_loss() {
+        let packed = DfsMetadataShardConfig {
+            file_system_id: file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: node("node_racing_packed_owner"),
+            replica_node_ids: vec![node("node_racing_packed_replica")],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut inner = InProcessKvStore::new();
+        put_packed_namespace_prepare_capable_members(
+            &mut inner,
+            std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
+        );
+        let replica_member_key = cluster_member_key(&packed.replica_node_ids[0]);
+        let mut kv = DropPackedCapabilityBeforeTxnKv {
+            inner,
+            record_key: replica_member_key,
+            record_kind: PackedCapabilityRecordKind::Member,
+            drop_before_next_txn: true,
+        };
+
+        assert!(matches!(
+            DfsControlPlaneStore::new(&mut kv).put_metadata_shard(&packed),
+            Err(KvError::Serialization { detail })
+                if detail.contains(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY)
+        ));
+        assert!(
+            DfsControlPlaneStore::new(&mut kv)
+                .get_metadata_shard(&packed.file_system_id, &packed.shard_id)
+                .expect("read fenced shard")
+                .is_none(),
+            "the member capability compare must fence the shard create transaction"
+        );
+    }
+
+    #[test]
+    fn initial_packed_metadata_shard_fences_concurrent_policy_capability_loss() {
+        let packed = DfsMetadataShardConfig {
+            file_system_id: file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: node("node_racing_packed_policy_owner"),
+            replica_node_ids: vec![node("node_racing_packed_policy_replica")],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut inner = InProcessKvStore::new();
+        put_packed_namespace_prepare_capable_members(
+            &mut inner,
+            std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
+        );
+        put_packed_namespace_prepare_capability_policy(
+            &mut inner,
+            &packed.replica_node_ids[0],
+            true,
+        );
+        let replica_policy_key = cluster_capability_policy_key(&packed.replica_node_ids[0]);
+        let mut kv = DropPackedCapabilityBeforeTxnKv {
+            inner,
+            record_key: replica_policy_key,
+            record_kind: PackedCapabilityRecordKind::Policy,
+            drop_before_next_txn: true,
+        };
+
+        assert!(matches!(
+            DfsControlPlaneStore::new(&mut kv).put_metadata_shard(&packed),
+            Err(KvError::Serialization { detail })
+                if detail.contains("effective capability policy")
+        ));
+        assert!(
+            DfsControlPlaneStore::new(&mut kv)
+                .get_metadata_shard(&packed.file_system_id, &packed.shard_id)
+                .expect("read policy-fenced shard")
+                .is_none(),
+            "the capability-policy compare must fence the shard create transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_raw_metadata_shard_put_rejects_unproven_packed_downgrade() {
+        let file_system_id = file_system_id();
+        let packed = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: node("node_async_raw_codec_owner"),
+            replica_node_ids: vec![node("node_async_raw_codec_replica")],
+            epoch: 7,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let legacy = DfsMetadataShardConfig {
+            epoch: packed.epoch + 1,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
+            ..packed.clone()
+        };
+        let mut kv = InProcessKvStore::new();
+        put_packed_namespace_prepare_capable_members(
+            &mut kv,
+            std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
+        );
+        DfsControlPlaneAsyncStore::new(&mut kv)
+            .put_metadata_shard(&packed)
+            .await
+            .expect("put packed shard");
+
+        let changed_packed = DfsMetadataShardConfig {
+            replica_node_ids: vec![node("node_async_raw_codec_uncapable_replica")],
+            epoch: packed.epoch + 1,
+            ..packed.clone()
+        };
+        assert!(matches!(
+            DfsControlPlaneAsyncStore::new(&mut kv)
+                .put_metadata_shard(&changed_packed)
+                .await,
+            Err(KvError::Serialization { detail })
+                if detail.contains("capability-validated")
+                    && detail.contains("membership handoff")
+        ));
+        assert!(matches!(
+            DfsControlPlaneAsyncStore::new(&mut kv)
+                .put_metadata_shard(&legacy)
+                .await,
+            Err(KvError::Serialization { detail })
+                if detail.contains("legacy-readable snapshot")
+                    && detail.contains("replay-floor proof")
+        ));
+        assert_eq!(
+            DfsControlPlaneAsyncStore::new(&mut kv)
+                .get_metadata_shard(&file_system_id, "root")
+                .await
+                .expect("read retained packed shard"),
+            Some(packed)
+        );
+    }
+
+    #[tokio::test]
+    async fn async_raw_metadata_shard_put_rejects_unproven_packed_activation() {
+        let file_system_id = file_system_id();
+        let legacy = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: node("node_async_raw_activation_owner"),
+            replica_node_ids: vec![node("node_async_raw_activation_replica")],
+            epoch: 7,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let packed = DfsMetadataShardConfig {
+            epoch: legacy.epoch + 1,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
+            ..legacy.clone()
+        };
+        let mut kv = InProcessKvStore::new();
+        DfsControlPlaneAsyncStore::new(&mut kv)
+            .put_metadata_shard(&legacy)
+            .await
+            .expect("put legacy shard");
+
+        assert!(matches!(
+            DfsControlPlaneAsyncStore::new(&mut kv)
+                .put_metadata_shard(&packed)
+                .await,
+            Err(KvError::Serialization { detail })
+                if detail.contains("capability-validated")
+                    && detail.contains("membership handoff")
+        ));
+        assert!(matches!(
+            DfsControlPlaneAsyncStore::new(&mut kv)
+                .begin_metadata_shard_membership_handoff(&legacy, &packed)
+                .await,
+            Err(KvError::Serialization { detail })
+                if detail.contains("authoritative cluster member capability record")
+        ));
+        put_packed_namespace_prepare_capable_members(
+            &mut kv,
+            std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
+        );
+        assert!(
+            DfsControlPlaneAsyncStore::new(&mut kv)
+                .begin_metadata_shard_membership_handoff(&legacy, &packed)
+                .await
+                .expect("capability-proved async packed handoff")
+                .is_some()
+        );
+        assert_eq!(
+            DfsControlPlaneAsyncStore::new(&mut kv)
+                .get_metadata_shard(&file_system_id, "root")
+                .await
+                .expect("read retained legacy shard"),
+            Some(legacy)
+        );
+    }
+
+    #[tokio::test]
+    async fn async_initial_packed_metadata_shard_requires_authoritative_member_capabilities() {
+        let packed = DfsMetadataShardConfig {
+            file_system_id: file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: node("node_async_initial_packed_owner"),
+            replica_node_ids: vec![node("node_async_initial_packed_replica")],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut raw_kv = InProcessKvStore::new();
+        assert!(matches!(
+            DfsControlPlaneAsyncStore::new(&mut raw_kv)
+                .put_metadata_shard(&packed)
+                .await,
+            Err(KvError::Serialization { detail })
+                if detail.contains("authoritative cluster member capability record")
+        ));
+        put_packed_namespace_prepare_capable_members(
+            &mut raw_kv,
+            std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
+        );
+        DfsControlPlaneAsyncStore::new(&mut raw_kv)
+            .put_metadata_shard(&packed)
+            .await
+            .expect("capability-proved async raw create");
+
+        let mut cas_kv = InProcessKvStore::new();
+        assert!(matches!(
+            DfsControlPlaneAsyncStore::new(&mut cas_kv)
+                .compare_and_put_metadata_shard(None, &packed)
+                .await,
+            Err(KvError::Serialization { detail })
+                if detail.contains("authoritative cluster member capability record")
+        ));
+        put_packed_namespace_prepare_capable_members(
+            &mut cas_kv,
+            std::iter::once(&packed.primary_node_id).chain(packed.replica_node_ids.iter()),
+        );
+        assert!(
+            DfsControlPlaneAsyncStore::new(&mut cas_kv)
+                .compare_and_put_metadata_shard(None, &packed)
+                .await
+                .expect("capability-proved async CAS create")
+        );
+    }
+
+    #[test]
     fn metadata_shard_primary_transfer_preserves_epoch_compare_and_idempotence() {
         let node_owner = node("node_owner");
         let node_replica = node("node_replica");
@@ -6842,6 +7660,7 @@ mod tests {
             replica_node_ids: vec![node_replica.clone()],
             epoch: 7,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut control = DfsControlPlaneStore::new(&mut kv);
@@ -6888,6 +7707,7 @@ mod tests {
             replica_node_ids: vec![replica.clone()],
             epoch: u64::MAX,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut kv = InProcessKvStore::new();
@@ -6918,6 +7738,7 @@ mod tests {
             replica_node_ids: vec![replica.clone()],
             epoch: 12,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut kv = InProcessKvStore::new();
@@ -6958,6 +7779,7 @@ mod tests {
             replica_node_ids: vec![replacement.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let desired = DfsMetadataShardConfig {
@@ -7005,6 +7827,7 @@ mod tests {
             replica_node_ids: vec![replacement.clone()],
             epoch: 40,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let desired = DfsMetadataShardConfig {
@@ -7045,6 +7868,7 @@ mod tests {
             replica_node_ids: vec![promoted.clone(), other_replica.clone()],
             epoch: 44,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let desired = DfsMetadataShardConfig {
@@ -7105,6 +7929,7 @@ mod tests {
             replica_node_ids: vec![promoted.clone(), retained.clone(), offline.clone()],
             epoch: 46,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let desired = DfsMetadataShardConfig {
@@ -7171,6 +7996,7 @@ mod tests {
             replica_node_ids: vec![promoted.clone()],
             epoch: 45,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let desired = DfsMetadataShardConfig {
@@ -7206,6 +8032,7 @@ mod tests {
             replica_node_ids: vec![replacement.clone()],
             epoch: 4,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut kv = InProcessKvStore::new();
@@ -7243,6 +8070,7 @@ mod tests {
             replica_node_ids: vec![retained.clone()],
             epoch: 9,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let desired = DfsMetadataShardConfig {
@@ -7316,6 +8144,7 @@ mod tests {
             replica_node_ids: vec![replica.clone()],
             epoch: 4,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut kv = InProcessKvStore::new();
@@ -7378,6 +8207,7 @@ mod tests {
                 replica_node_ids: vec![node_replica.clone()],
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -7389,6 +8219,7 @@ mod tests {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -7400,6 +8231,7 @@ mod tests {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services/sandbox".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
         ] {
@@ -7444,6 +8276,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         control
@@ -7466,6 +8299,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: SIFS_USERS_PATH.to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         control
@@ -7505,6 +8339,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: SIFS_SERVICES_PATH.to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         control
@@ -7541,6 +8376,7 @@ mod tests {
                 replica_node_ids: vec![node_replica.clone()],
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -7553,6 +8389,7 @@ mod tests {
                     start_inclusive,
                     end_exclusive,
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
         ] {
@@ -7587,6 +8424,7 @@ mod tests {
                     start_inclusive: hash.wrapping_sub(100),
                     end_exclusive: hash.wrapping_add(101),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -7599,6 +8437,7 @@ mod tests {
                     start_inclusive: hash,
                     end_exclusive: hash.wrapping_add(1),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
         ] {
@@ -7628,6 +8467,7 @@ mod tests {
                 replica_node_ids: Vec::new(),
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -7639,6 +8479,7 @@ mod tests {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -7650,6 +8491,7 @@ mod tests {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services/deep".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -7662,6 +8504,7 @@ mod tests {
                     start_inclusive: selected_hash.wrapping_sub(100),
                     end_exclusive: selected_hash.wrapping_add(101),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -7674,6 +8517,7 @@ mod tests {
                     start_inclusive: selected_hash,
                     end_exclusive: selected_hash.wrapping_add(1),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
         ];
@@ -7713,6 +8557,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut control = DfsControlPlaneStore::new(&mut kv);

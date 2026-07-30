@@ -12,6 +12,11 @@ pub const CLUSTER_CONTROL_ADMIN_CAPABILITY: &str = "cluster.control.admin";
 /// Advertised only by main daemons that understand snapshot-bound placement
 /// reconciliation jobs and their v1 control-plane namespace.
 pub const DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY: &str = "dfs.placement.reconciliation.v1";
+/// Advertised by main daemons that can replay packed-v1 namespace prepare
+/// journal bodies. A shard may select that persisted format only when every
+/// assigned metadata member advertises this capability.
+pub const DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY: &str =
+    "dfs.metadata.namespace-prepare.packed.v1";
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 
@@ -27,6 +32,8 @@ pub fn main_daemon_capabilities(role: &ClusterMemberRole) -> Vec<CapabilityName>
         CapabilityName::new("cluster.kv.write").expect("static capability"),
         CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("static capability"),
         CapabilityName::new(DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY).expect("static capability"),
+        CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY)
+            .expect("static capability"),
     ];
     if matches!(role, ClusterMemberRole::Voter) {
         capabilities.push(CapabilityName::new("cluster.kv.vote").expect("static capability"));

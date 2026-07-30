@@ -3023,6 +3023,7 @@ mod metadata_publish_membership_tests {
             replica_node_ids: vec![receiver_node_id.clone()],
             epoch: 9,
             assignment: crate::DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
         };
         let mut accepted = sinomo_core::kv::InProcessKvStore::restore(initial_snapshot)
@@ -9659,6 +9660,7 @@ mod cursor_update_tests {
                 replica_node_ids: Vec::new(),
                 epoch: 1,
                 assignment: crate::DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -9670,6 +9672,7 @@ mod cursor_update_tests {
                 assignment: crate::DfsMetadataShardAssignment::PathPrefix {
                     prefix: crate::SIFS_SERVICES_PATH.to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -9681,6 +9684,7 @@ mod cursor_update_tests {
                 assignment: crate::DfsMetadataShardAssignment::PathPrefix {
                     prefix: crate::SIFS_USERS_PATH.to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
             },
         ];
@@ -9755,6 +9759,7 @@ mod cursor_update_tests {
                 replica_node_ids: Vec::new(),
                 epoch: 1,
                 assignment: crate::DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -9766,6 +9771,7 @@ mod cursor_update_tests {
                 assignment: crate::DfsMetadataShardAssignment::PathPrefix {
                     prefix: crate::SIFS_SERVICES_PATH.to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -9777,6 +9783,7 @@ mod cursor_update_tests {
                 assignment: crate::DfsMetadataShardAssignment::PathPrefix {
                     prefix: crate::SIFS_USERS_PATH.to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
             },
         ]
@@ -11255,6 +11262,7 @@ mod cursor_update_tests {
             replica_node_ids: vec![receiver_node_id.clone()],
             epoch: 1,
             assignment: crate::DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
         };
         configure_replica_shard(&receiver_data_dir, &receiver_node_id, &shard);
@@ -11446,6 +11454,7 @@ mod cursor_update_tests {
             replica_node_ids: vec![receiver_node_id.clone()],
             epoch: 1,
             assignment: crate::DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
         };
         configure_replica_shard(&receiver_data_dir, &receiver_node_id, &shard);
@@ -11540,6 +11549,7 @@ mod cursor_update_tests {
             replica_node_ids: vec![receiver_node_id.clone()],
             epoch: 1,
             assignment: crate::DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
         };
         configure_replica_shard(&data_dir, &receiver_node_id, &shard);
@@ -11747,6 +11757,7 @@ mod cursor_update_tests {
             replica_node_ids: vec![promoted_node_id.clone(), other_node_id.clone()],
             epoch: 7,
             assignment: crate::DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
         };
         let desired = DfsMetadataShardConfig {
@@ -11756,6 +11767,7 @@ mod cursor_update_tests {
             replica_node_ids: vec![other_node_id, source_node_id.clone()],
             epoch: 8,
             assignment: retiring.assignment.clone(),
+            namespace_prepare_codec: Default::default(),
             default_policy: retiring.default_policy.clone(),
         };
         let handoff_id = "handoff-snapshot-repair".to_string();
@@ -12001,6 +12013,7 @@ mod cursor_update_tests {
             replica_node_ids: vec![promoted_node_id.clone(), other_node_id.clone()],
             epoch: 7,
             assignment: crate::DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
         };
         let desired = DfsMetadataShardConfig {
@@ -12010,6 +12023,7 @@ mod cursor_update_tests {
             replica_node_ids: vec![other_node_id, source_node_id.clone()],
             epoch: 8,
             assignment: retiring.assignment.clone(),
+            namespace_prepare_codec: Default::default(),
             default_policy: retiring.default_policy.clone(),
         };
         let handoff_id = "handoff-snapshot-gc".to_string();
@@ -12093,11 +12107,7 @@ mod cursor_update_tests {
 
         assert!(
             receiver
-                .clear_metadata_shard_membership_handoff_freeze(
-                    &shard_id,
-                    &handoff_id,
-                    desired.epoch,
-                )
+                .clear_metadata_shard_membership_handoff_freeze(&shard_id, &handoff_id, &desired,)
                 .expect("activate promoted metadata authority")
         );
         assert!(

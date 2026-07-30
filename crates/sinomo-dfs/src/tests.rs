@@ -1518,6 +1518,7 @@ fn test_routed_authority_shard(primary_node_id: &NodeId, epoch: u64) -> DfsMetad
         replica_node_ids: Vec::new(),
         epoch,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     }
 }
@@ -2010,6 +2011,7 @@ fn routed_namespace_complete_single_response_batch_avoids_follow_up_sync() {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -2496,6 +2498,7 @@ fn direct_authority_probe_uses_canonical_route_and_old_peer_fails_closed() {
         replica_node_ids: vec![remote.clone()],
         epoch: 7,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let source_root = temp_root("direct-authority-route-source");
@@ -4268,6 +4271,7 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
                 replica_node_ids: Vec::new(),
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -6201,6 +6205,7 @@ fn mkdir_all_cross_shard_error_names_the_actual_child_parent_pair() {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
         DfsMetadataShardConfig {
@@ -6213,6 +6218,7 @@ fn mkdir_all_cross_shard_error_names_the_actual_child_parent_pair() {
                 start_inclusive: path_hash,
                 end_exclusive: path_hash.wrapping_add(1),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
     ];
@@ -6788,6 +6794,7 @@ fn content_root_catalog_refresh_failure_durably_invalidates_previous_catalog() {
         replica_node_ids: Vec::new(),
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let file_system = DfsFileSystemConfig {
@@ -6971,6 +6978,7 @@ fn lifecycle_maintenance_runs_version_blob_and_tombstone_collection() {
         replica_node_ids: Vec::new(),
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let catalog_file_system = DfsFileSystemConfig {
@@ -7626,6 +7634,7 @@ fn maintenance_tick_runs_lifecycle_and_metadata_journal_publish() {
             replica_node_ids: vec![replica.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         }],
         &mut publisher_host,
@@ -7706,6 +7715,7 @@ fn maintenance_tick_rebinds_activated_handoff_before_namespace_job_mutation() {
         replica_node_ids: vec![removed_replica.clone()],
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let active = DfsMetadataShardConfig {
@@ -8008,6 +8018,7 @@ fn cluster_maintenance_tick_opens_service_and_publishes_metadata() {
         replica_node_ids: vec![replica.clone()],
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     append_cluster_kv_command(
@@ -8130,6 +8141,7 @@ fn cluster_smoke_opens_service_and_publishes_metadata() {
         replica_node_ids: vec![replica.clone()],
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     append_cluster_kv_command(
@@ -8694,6 +8706,7 @@ fn smoke_driver_commits_local_candidate_and_publishes_metadata() {
             replica_node_ids: vec![replica.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         }],
         &mut publisher_host,
@@ -9258,6 +9271,7 @@ fn metadata_replication_cursor_advances_only_after_replica_ack() {
                 replica_node_ids: vec![primary.clone(), replica.clone()],
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -9436,6 +9450,7 @@ fn metadata_shard_primary_transfer_ready_requires_durable_replica_cursor() {
         replica_node_ids: vec![replica.clone()],
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
 
@@ -10338,6 +10353,7 @@ fn metadata_journal_publisher_routes_primary_shards_and_reports_non_primary() {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: "/services".to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
         DfsMetadataShardConfig {
@@ -10347,6 +10363,7 @@ fn metadata_journal_publisher_routes_primary_shards_and_reports_non_primary() {
             replica_node_ids: vec![local.clone(), replica.clone()],
             epoch: 3,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
     ];
@@ -10408,6 +10425,7 @@ fn metadata_journal_publish_suppresses_proven_topology_mismatch_for_epoch() {
         replica_node_ids: vec![replica.clone()],
         epoch: 7,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let suppression = DfsMetadataReplicationSuppressionRecord {
@@ -10505,6 +10523,7 @@ fn metadata_execution_exclusions_park_offline_before_planning_healthy_target() {
         replica_node_ids: vec![offline.clone(), healthy.clone()],
         epoch: 3,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let mut host = RecordingMetadataJournalPublisherHost::new(root.path().to_path_buf());
@@ -10564,6 +10583,7 @@ fn metadata_publish_reuses_one_journal_payload_for_equal_replica_cursors() {
         replica_node_ids: vec![replica_a, replica_b],
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let mut host = RecordingMetadataJournalPublisherHost::new(root.path().to_path_buf());
@@ -10643,6 +10663,7 @@ fn cluster_metadata_journal_publish_reads_cluster_state_and_shards() {
         replica_node_ids: vec![replica.clone()],
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     append_cluster_kv_command(
@@ -10764,6 +10785,7 @@ fn scheduled_cluster_metadata_publish_uses_async_peer_transport() {
         replica_node_ids: vec![replica.clone()],
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     append_cluster_kv_command(
@@ -10915,6 +10937,7 @@ fn async_cluster_metadata_publish_repairs_sequence_conflict_with_snapshot() {
             replica_node_ids: vec![replica.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_kv_command(
@@ -11318,6 +11341,7 @@ fn sifs_bootstrap_repairs_partial_sharded_filesystem_records() {
         replica_node_ids: Vec::new(),
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let services_shard = DfsMetadataShardConfig {
@@ -11329,6 +11353,7 @@ fn sifs_bootstrap_repairs_partial_sharded_filesystem_records() {
         assignment: DfsMetadataShardAssignment::PathPrefix {
             prefix: SIFS_SERVICES_PATH.to_string(),
         },
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
 
@@ -11391,6 +11416,7 @@ fn metadata_journal_batch_processor_rejects_non_primary_source() {
             replica_node_ids: vec![primary.clone(), replica],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
     };
@@ -11438,6 +11464,7 @@ fn clustered_metadata_journal_batch_requires_exact_authority_identity() {
             replica_node_ids: vec![replica],
             epoch: 9,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
     };
@@ -11498,6 +11525,7 @@ fn networked_metadata_journal_batch_requires_exact_authority_identity() {
         replica_node_ids: vec![replica.clone()],
         epoch: 12,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
@@ -11570,6 +11598,7 @@ fn networked_metadata_journal_batch_refreshes_stale_receiver_authority() {
         replica_node_ids: vec![replica.clone()],
         epoch,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let current = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
@@ -11646,6 +11675,7 @@ fn replica_command_refreshes_stale_receiver_authority_before_cache_decisions() {
         assignment: DfsMetadataShardAssignment::PathPrefix {
             prefix: "/services".to_string(),
         },
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let stale_shard = shard(replica.clone(), 16);
@@ -11821,6 +11851,7 @@ fn metadata_authority_probe_requires_exact_cluster_context() {
         replica_node_ids: vec![replica.clone()],
         epoch: 3,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let mut source = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source"))
@@ -11915,6 +11946,7 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
         replica_node_ids: vec![replica.clone()],
         epoch: 4,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let context = DfsMetadataReplicaShardContext {
@@ -12113,6 +12145,7 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
         replica_node_ids: vec![replica.clone()],
         epoch: 5,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let context = DfsMetadataReplicaShardContext {
@@ -12362,6 +12395,7 @@ fn metadata_prefix_probe_accepts_only_the_exact_materialized_checkpoint() {
             replica_node_ids: vec![replica],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
     };
@@ -12414,6 +12448,7 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
         replica_node_ids: vec![replica.clone()],
         epoch: 11,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
 
@@ -12658,6 +12693,7 @@ fn promoted_replica_auto_rebinds_cached_lane_before_stamped_routed_write() {
         replica_node_ids: vec![promoted.clone()],
         epoch: 17,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let desired = DfsMetadataShardConfig {
@@ -12898,6 +12934,7 @@ fn pending_membership_handoff_authorizes_exact_suffix_and_prefix_for_new_replica
         replica_node_ids: vec![retiring_replica],
         epoch: 8,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let desired_shard = DfsMetadataShardConfig {
@@ -12907,6 +12944,7 @@ fn pending_membership_handoff_authorizes_exact_suffix_and_prefix_for_new_replica
         replica_node_ids: vec![desired_replica.clone()],
         epoch: 9,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let context = DfsMetadataReplicaShardContext {
@@ -13041,6 +13079,7 @@ fn metadata_prefix_probe_rejects_same_head_with_different_state_and_is_legacy_sa
             replica_node_ids: vec![replica],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
     };
@@ -13107,6 +13146,7 @@ fn metadata_snapshot_install_processor_replaces_backend_snapshot() {
             replica_node_ids: vec![primary.clone(), replica],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
     };
@@ -13489,6 +13529,7 @@ fn sharded_backend_updates_active_intent_on_original_shard_after_object_moves() 
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
         DfsMetadataShardConfig {
@@ -13500,6 +13541,7 @@ fn sharded_backend_updates_active_intent_on_original_shard_after_object_moves() 
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: "/services".to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
         DfsMetadataShardConfig {
@@ -13511,6 +13553,7 @@ fn sharded_backend_updates_active_intent_on_original_shard_after_object_moves() 
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: "/users".to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
     ];
@@ -13609,6 +13652,7 @@ fn distributed_write_uses_path_selected_metadata_shard_epoch() {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
         DfsMetadataShardConfig {
@@ -13620,6 +13664,7 @@ fn distributed_write_uses_path_selected_metadata_shard_epoch() {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: "/services".to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
     ];
@@ -14224,6 +14269,7 @@ fn empty_routed_write_uses_an_ordinary_value_call() {
         replica_node_ids: vec![requester.clone()],
         epoch: 7,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
 
@@ -14287,6 +14333,7 @@ fn routed_exclusive_create_replays_only_the_exact_request_and_rolls_back_rejecti
         replica_node_ids: vec![requester.clone()],
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     control_plane.with_client(|kv| {
@@ -15741,6 +15788,7 @@ fn stateless_node_route_reader_write_commits_after_primary_fetch_receipt() {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -15889,6 +15937,7 @@ fn posix_routed_strict_write_prefers_metadata_primary_replica() {
         replica_node_ids: vec![writer.clone()],
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     control_plane.with_client(|kv| {
@@ -15967,6 +16016,7 @@ fn posix_routed_write_sends_attachment_without_local_persistence() {
         replica_node_ids: vec![writer.clone()],
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     control_plane.with_client(|kv| {
@@ -16057,6 +16107,7 @@ fn posix_routed_multimegabyte_write_uses_same_attachment_path() {
         replica_node_ids: vec![writer.clone()],
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     control_plane.with_client(|kv| {
@@ -16148,6 +16199,7 @@ fn posix_remote_primary_deferred_write_carries_streamed_payload() {
         replica_node_ids: vec![writer.clone()],
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
@@ -16257,6 +16309,7 @@ fn posix_remote_primary_nonforeground_wait_write_requests_bounded_response_journ
         replica_node_ids: vec![writer.clone()],
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
@@ -16368,6 +16421,7 @@ fn posix_local_primary_detached_manifest_write_persists_visible_metadata_without
         replica_node_ids: vec![peer.clone()],
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
@@ -16480,6 +16534,7 @@ fn routed_manifest_write_controls_response_journal_replay() {
         replica_node_ids: vec![writer.clone()],
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
@@ -16627,6 +16682,7 @@ fn routed_streamed_write_preserves_nonforeground_repair_mode() {
         replica_node_ids: vec![writer.clone()],
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
@@ -16792,6 +16848,7 @@ fn routed_write_nonforeground_response_replay_is_one_batch() {
         replica_node_ids: vec![requester.clone()],
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
@@ -17348,6 +17405,7 @@ fn posix_transient_create_routes_precommit_records_to_path_shard() {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
         DfsMetadataShardConfig {
@@ -17359,6 +17417,7 @@ fn posix_transient_create_routes_precommit_records_to_path_shard() {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: "/services".to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
     ];
@@ -18773,6 +18832,7 @@ fn retry_pending_repairs_skips_sender_that_lost_metadata_primary_authority() {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -18836,6 +18896,7 @@ fn retry_pending_repairs_skips_sender_that_lost_metadata_primary_authority() {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata primary move");
@@ -20139,6 +20200,7 @@ fn missing_local_commit_content_on_non_authority_keeps_receipt_retryable() {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("services shard");
@@ -20230,6 +20292,7 @@ fn missing_local_commit_content_on_retiring_primary_with_pending_handoff_stays_r
         assignment: DfsMetadataShardAssignment::PathPrefix {
             prefix: "/services".to_string(),
         },
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let desired = DfsMetadataShardConfig {
@@ -20393,6 +20456,7 @@ fn missing_local_commit_content_reselects_guard_when_object_moves_shards_before_
         assignment: DfsMetadataShardAssignment::PathPrefix {
             prefix: "/services".to_string(),
         },
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let (range_started_tx, range_started_rx) = std::sync::mpsc::sync_channel(1);
@@ -20439,6 +20503,7 @@ fn missing_local_commit_content_reselects_guard_when_object_moves_shards_before_
         assignment: DfsMetadataShardAssignment::PathPrefix {
             prefix: object_path,
         },
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
 
@@ -20689,6 +20754,7 @@ fn recovery_hydration_does_not_promote_from_non_authoritative_object_owner() {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("services shard");
@@ -21613,6 +21679,7 @@ fn hydrate_from_metadata_backend_reuses_older_compacted_tombstone_path() {
                 replica_node_ids: vec![requester.clone(), replica.clone()],
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -21809,6 +21876,7 @@ fn recovered_new_object_parent_metadata(
                 replica_node_ids: vec![requester.clone(), replica.clone()],
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -22383,6 +22451,7 @@ fn sharded_hydration_omits_ambiguous_historical_intent_provenance() {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
         DfsMetadataShardConfig {
@@ -22394,6 +22463,7 @@ fn sharded_hydration_omits_ambiguous_historical_intent_provenance() {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: "/services".to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
     ];
@@ -26064,6 +26134,7 @@ fn repair_command_accepts_current_replica_after_metadata_primary_moves() {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -26166,6 +26237,7 @@ fn repair_command_accepts_metadata_primary_for_stored_intent() {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -26275,6 +26347,7 @@ fn repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale() {
                 replica_node_ids: vec![target.clone()],
                 epoch: 3,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("stale metadata shard");
@@ -26288,6 +26361,7 @@ fn repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale() {
         assignment: DfsMetadataShardAssignment::PathPrefix {
             prefix: "/services".to_string(),
         },
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let current_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
@@ -26398,6 +26472,7 @@ fn fetch_blob_accepts_metadata_primary_for_stored_intent() {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -26509,6 +26584,7 @@ fn fetch_blob_accepts_newer_authority_shard_when_receiver_view_is_stale() {
                 replica_node_ids: vec![source.clone(), target.clone()],
                 epoch: 3,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("stale metadata shard");
@@ -26522,6 +26598,7 @@ fn fetch_blob_accepts_newer_authority_shard_when_receiver_view_is_stale() {
         assignment: DfsMetadataShardAssignment::PathPrefix {
             prefix: "/services".to_string(),
         },
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let mut object = file_metadata(coordinator.clone());
@@ -26627,6 +26704,7 @@ fn repair_command_rejects_unknown_object_from_non_primary_metadata_source() {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -26975,6 +27053,7 @@ fn stage_command_accepts_metadata_shard_primary_for_transient_object() {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -27213,6 +27292,7 @@ fn replica_stage_and_commit_do_not_append_authoritative_metadata() {
                 replica_node_ids: vec![owner.clone(), replica.clone()],
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -27347,6 +27427,7 @@ fn replica_remote_read_cache_and_prune_do_not_append_authoritative_metadata() {
                 replica_node_ids: vec![owner.clone(), replica.clone()],
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -32909,6 +32990,7 @@ fn atomic_namespace_rename_rejects_shard_epoch_change_before_commit() {
         replica_node_ids: Vec::new(),
         epoch,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     shared_kv.with_client(|kv| {
@@ -32990,6 +33072,7 @@ fn sifs_posix_cluster(name: &str) -> SifsPosixCluster {
                 replica_node_ids: vec![writer_node.clone(), observer_node.clone()],
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("sifs root metadata shard config");
@@ -34887,6 +34970,7 @@ fn sifs_cluster_posix_contract_metadata_primary_redirect_during_write() {
         replica_node_ids: vec![old_primary_node.clone(), new_primary_node.clone()],
         epoch,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let kv_current = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
@@ -35018,6 +35102,7 @@ fn sifs_cluster_posix_contract_partitioned_concurrent_writers_are_fenced() {
                 replica_node_ids: vec![old_primary_node.clone()],
                 epoch: 2,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("current shard");
@@ -36282,6 +36367,7 @@ fn restart_catchup_accepts_foreground_attachment() {
                 replica_node_ids: vec![writer_node.clone(), cluster.observer_node.clone()],
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("root shard config");
@@ -38091,6 +38177,7 @@ fn sifs_two_primary_shard_configs(
             replica_node_ids: others_for_users.clone(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
         DfsMetadataShardConfig {
@@ -38102,6 +38189,7 @@ fn sifs_two_primary_shard_configs(
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: "/users".to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
         DfsMetadataShardConfig {
@@ -38113,6 +38201,7 @@ fn sifs_two_primary_shard_configs(
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: "/services".to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
     ]
@@ -40013,6 +40102,7 @@ fn clustered_bootstrap_ensures_filesystem_only_on_authoritative_shard_and_probe_
         replica_node_ids: vec![local.clone()],
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let services_shard = DfsMetadataShardConfig {
@@ -40024,6 +40114,7 @@ fn clustered_bootstrap_ensures_filesystem_only_on_authoritative_shard_and_probe_
         assignment: DfsMetadataShardAssignment::PathPrefix {
             prefix: SIFS_SERVICES_PATH.to_string(),
         },
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let shards = vec![root_shard, services_shard];
@@ -43008,6 +43099,7 @@ fn sifs_cluster_authority_local_follower_bootstrap_stays_on_incremental_stream()
                 replica_node_ids: vec![follower_node.clone()],
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("shard config");
@@ -43155,6 +43247,7 @@ fn sifs_outsider_cluster(name: &str) -> SifsPosixCluster {
                 replica_node_ids: vec![writer_node.clone()],
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("sifs root metadata shard config");
@@ -43747,6 +43840,7 @@ fn sifs_routed_namespace_op_follows_authority_redirect() {
         replica_node_ids: vec![primary_node.clone(), writer_node.clone()],
         epoch,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
 
@@ -43858,6 +43952,7 @@ fn sifs_routed_write_follows_authority_redirect() {
         replica_node_ids: vec![primary_node.clone(), writer_node.clone()],
         epoch,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
 
@@ -43983,6 +44078,7 @@ fn sifs_routed_write_refreshes_stale_receiver_control_plane() {
         replica_node_ids: vec![old_primary_node.clone(), current_primary_node.clone()],
         epoch,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let put_control_plane = |kv_client: &SharedDfsControlPlaneKvClient<InProcessKvStore>,
@@ -44151,6 +44247,7 @@ fn sifs_routed_lookup_follows_authority_redirect() {
         replica_node_ids: vec![primary_node.clone(), writer_node.clone()],
         epoch,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
 
@@ -44280,6 +44377,7 @@ fn sifs_routed_lookup_rejects_uncorroborated_redirect_chain() {
         ],
         epoch,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let put_control_plane = |kv_client: &SharedDfsControlPlaneKvClient<InProcessKvStore>,
@@ -44421,6 +44519,7 @@ fn sifs_routed_lookup_uses_local_replica_after_authority_redirect_cycle() {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: SIFS_SERVICES_PATH.to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         }
     };
@@ -44559,6 +44658,7 @@ fn placement_reconciliation_resumes_durable_cursor_and_updates_existing_file() {
                 replica_node_ids: Vec::new(),
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("root metadata shard");

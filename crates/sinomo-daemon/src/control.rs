@@ -8707,6 +8707,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: sinomo_dfs::DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
         };
         let services_shard = sinomo_dfs::DfsMetadataShardConfig {
@@ -8718,6 +8719,7 @@ mod tests {
             assignment: sinomo_dfs::DfsMetadataShardAssignment::PathPrefix {
                 prefix: "/services".to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(

@@ -6909,6 +6909,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: "/services".to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -7047,6 +7048,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -8092,6 +8094,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 3,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         install_test_metadata_replica_shard(
@@ -8628,6 +8631,7 @@ mod tests {
             replica_node_ids: vec![local_node_id.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         install_test_metadata_replica_shard(
@@ -8716,6 +8720,7 @@ mod tests {
             replica_node_ids: vec![local_node_id.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         install_test_metadata_replica_shard(
@@ -8802,6 +8807,7 @@ mod tests {
             replica_node_ids: vec![local.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -9015,6 +9021,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -10539,6 +10546,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: "/services".to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
         };
         let handoff = DfsMetadataShardMembershipHandoff {
@@ -10726,6 +10734,7 @@ mod tests {
             replica_node_ids: vec![remote_node_id.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let services_shard = DfsMetadataShardConfig {
@@ -10737,6 +10746,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: "/services".to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -10894,6 +10904,7 @@ mod tests {
             replica_node_ids: vec![local.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -10969,6 +10980,7 @@ mod tests {
             replica_node_ids: vec![remote.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -11135,6 +11147,7 @@ mod tests {
                         prefix: "/services".to_string(),
                     }
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             };
             append_cluster_raft_command(
@@ -11266,6 +11279,7 @@ mod tests {
             replica_node_ids: vec![remote.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -11422,6 +11436,7 @@ mod tests {
             replica_node_ids: vec![remote.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -11528,6 +11543,7 @@ mod tests {
             replica_node_ids: vec![remote.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -11644,6 +11660,7 @@ mod tests {
             replica_node_ids: vec![remote.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -11801,6 +11818,7 @@ mod tests {
             replica_node_ids: vec![remote.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -11896,6 +11914,7 @@ mod tests {
             replica_node_ids: vec![remote.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -12046,6 +12065,7 @@ mod tests {
             replica_node_ids: vec![replica.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         install_test_metadata_replica_shard(
@@ -12167,6 +12187,7 @@ mod tests {
             replica_node_ids: vec![owner.clone(), replica.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -12342,6 +12363,7 @@ mod tests {
             replica_node_ids: vec![remote.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -12813,6 +12835,7 @@ mod tests {
             replica_node_ids: vec![local.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -12926,6 +12949,7 @@ mod tests {
             replica_node_ids: vec![local.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -13284,6 +13308,7 @@ mod tests {
             replica_node_ids: vec![replica.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let desired = DfsMetadataShardConfig {
@@ -13952,6 +13977,7 @@ mod tests {
             replica_node_ids: vec![remote.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -14334,6 +14360,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 9,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -14534,6 +14561,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: sinomo_dfs::SIFS_SERVICES_PATH.to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(
@@ -14618,6 +14646,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: sinomo_dfs::SIFS_SERVICES_PATH.to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         append_cluster_raft_command(

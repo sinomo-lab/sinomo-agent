@@ -4,14 +4,45 @@
 //! materialized tables. This module owns the small validation helpers used by
 //! replay paths so backend code can focus on applying mutations.
 
+use std::borrow::Cow;
+
 use crate::DfsFileSystemId;
 use crate::metadata_api::DfsMetadataBackend;
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_receipt::receipt_for_replica_from_backend;
 use crate::metadata_records::{
-    DfsMetadataJournalEntry, DfsMetadataMutation, DfsNamespaceTransaction,
+    DfsMetadataJournalEntry, DfsMetadataMutation, DfsNamespacePreparePayloadRef,
+    DfsNamespaceTransaction,
 };
 use crate::metadata_tables::DfsMetadataTables;
+
+pub(crate) fn borrowed_namespace_prepare_payload(
+    entry: &DfsMetadataJournalEntry,
+) -> Result<Option<DfsNamespacePreparePayloadRef<'_>>> {
+    entry
+        .mutation
+        .namespace_prepare_payload_ref()
+        .map_err(|source| {
+            MetadataBackendError::Serde(format!(
+                "metadata journal entry {}:{} has invalid namespace prepare payload: {source}",
+                entry.shard_id.0, entry.sequence
+            ))
+        })
+}
+
+pub(crate) fn decoded_namespace_prepare_payload(
+    entry: &DfsMetadataJournalEntry,
+) -> Result<Option<Cow<'_, crate::DfsNamespacePrepareRecord>>> {
+    borrowed_namespace_prepare_payload(entry)?
+        .map(DfsNamespacePreparePayloadRef::into_canonical)
+        .transpose()
+        .map_err(|source| {
+            MetadataBackendError::Serde(format!(
+                "metadata journal entry {}:{} has invalid namespace prepare payload: {source}",
+                entry.shard_id.0, entry.sequence
+            ))
+        })
+}
 
 pub(crate) fn required_replay_payload<'a, T>(
     entry: &DfsMetadataJournalEntry,
@@ -52,7 +83,9 @@ pub(crate) fn journal_entry_has_replay_payloads(entry: &DfsMetadataJournalEntry)
         DfsMetadataMutation::PutConflict { conflict, .. } => conflict.is_some(),
         DfsMetadataMutation::PutAdvisoryLockState { state, .. } => state.is_some(),
         DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => transaction.is_some(),
-        DfsMetadataMutation::PutNamespacePrepare { prepare, .. } => prepare.is_some(),
+        DfsMetadataMutation::PutNamespacePrepare { .. } => {
+            borrowed_namespace_prepare_payload(entry).is_ok_and(|prepare| prepare.is_some())
+        }
         DfsMetadataMutation::CommitNamespacePrepare { .. } => true,
         DfsMetadataMutation::PutNamespaceJob { job, .. } => job.is_some(),
         DfsMetadataMutation::PutNamespaceRequest { .. }
@@ -127,8 +160,13 @@ pub(crate) fn require_journal_entry_replay_payloads(entry: &DfsMetadataJournalEn
         DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => {
             required_replay_payload(entry, "apply-namespace-transaction", transaction.as_ref())?;
         }
-        DfsMetadataMutation::PutNamespacePrepare { prepare, .. } => {
-            required_replay_payload(entry, "put-namespace-prepare", prepare.as_ref())?;
+        DfsMetadataMutation::PutNamespacePrepare { .. } => {
+            if borrowed_namespace_prepare_payload(entry)?.is_none() {
+                return Err(MetadataBackendError::Serde(format!(
+                    "metadata journal entry {}:{} cannot replay put-namespace-prepare without its record payload",
+                    entry.shard_id.0, entry.sequence
+                )));
+            }
         }
         DfsMetadataMutation::PutNamespaceJob { job, .. } => {
             required_replay_payload(entry, "put-namespace-job", job.as_ref())?;
@@ -201,6 +239,7 @@ pub(crate) fn require_replica_journal_entry_file_system(
     expected: &DfsFileSystemId,
 ) -> Result<()> {
     require_journal_entry_replay_payloads(entry)?;
+    let namespace_prepare = borrowed_namespace_prepare_payload(entry)?;
     let outer_file_system_id = match &entry.mutation {
         DfsMetadataMutation::PutFileSystem { file_system_id, .. }
         | DfsMetadataMutation::PutObject { file_system_id, .. }
@@ -419,22 +458,16 @@ pub(crate) fn require_replica_journal_entry_file_system(
                 expected,
             )
         }
-        DfsMetadataMutation::PutNamespacePrepare {
-            prepare: Some(prepare),
-            ..
-        } => {
-            require_replica_record_file_system(
-                entry,
-                "namespace prepare",
-                &prepare.file_system_id,
-                expected,
-            )?;
-            require_replica_namespace_transaction_file_system(
-                entry,
-                "namespace prepare transaction",
-                &prepare.transaction,
-                expected,
-            )
+        DfsMetadataMutation::PutNamespacePrepare { .. } if namespace_prepare.is_some() => {
+            let prepare = namespace_prepare
+                .as_ref()
+                .expect("namespace prepare presence checked");
+            prepare.validate_file_system_scope(expected).map_err(|source| {
+                MetadataBackendError::Serde(format!(
+                    "metadata replica journal entry {}:{} has invalid namespace prepare filesystem scope: {source}",
+                    entry.shard_id.0, entry.sequence
+                ))
+            })
         }
         DfsMetadataMutation::PutNamespacePrepareReceipt { receipt, .. } => {
             require_replica_record_file_system(
@@ -506,7 +539,7 @@ pub(crate) fn require_replica_journal_entry_file_system(
         | DfsMetadataMutation::ApplyNamespaceTransaction {
             transaction: None, ..
         }
-        | DfsMetadataMutation::PutNamespacePrepare { prepare: None, .. }
+        | DfsMetadataMutation::PutNamespacePrepare { .. }
         | DfsMetadataMutation::PutNamespaceJob { job: None, .. } => Ok(()),
     }
 }
@@ -612,8 +645,9 @@ pub(crate) fn hydrate_journal_entry_payload<B: DfsMetadataBackend + ?Sized>(
         DfsMetadataMutation::PutNamespacePrepare {
             operation_id,
             prepare,
+            packed_prepare_v1,
             ..
-        } if prepare.is_none() => {
+        } if prepare.is_none() && packed_prepare_v1.is_none() => {
             *prepare = backend.get_namespace_prepare(operation_id)?;
         }
         DfsMetadataMutation::PutNamespaceJob { job_id, job, .. } if job.is_none() => {
@@ -639,7 +673,12 @@ pub(crate) fn hydrate_journal_entry_payloads<B: DfsMetadataBackend + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DfsFileSystemId, DfsMetadataShardId, DfsObjectId, DfsVersion};
+    use crate::{
+        DfsFileSystemId, DfsMetadataShardId, DfsNamespacePrepareRecord, DfsNamespacePrepareStatus,
+        DfsNamespaceTransaction, DfsObjectId, DfsVersion,
+    };
+    use serde::Deserialize;
+    use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
     use time::OffsetDateTime;
 
     fn file_system_id() -> DfsFileSystemId {
@@ -652,6 +691,30 @@ mod tests {
 
     fn version() -> DfsVersion {
         DfsVersion::from_legacy_named("version_replay_1").expect("valid version")
+    }
+
+    fn namespace_prepare() -> DfsNamespacePrepareRecord {
+        DfsNamespacePrepareRecord {
+            operation_id: "operation-replay-packed".to_string(),
+            file_system_id: file_system_id(),
+            shard_id: DfsMetadataShardId::new("shard-replay"),
+            owner_epoch: 7,
+            operation_digest: format!("blake3:{}", "a".repeat(64)),
+            expected_object_versions: Vec::new(),
+            expected_path_occupants: Vec::new(),
+            content_receipts: Vec::new(),
+            transaction: DfsNamespaceTransaction {
+                transaction_id: "transaction-replay-packed".to_string(),
+                file_system_id: file_system_id(),
+                objects: Vec::new(),
+                versions: Vec::new(),
+                advisory_lock_states: Vec::new(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            },
+            completed_request: None,
+            completed_request_completion: None,
+            status: DfsNamespacePrepareStatus::Prepared,
+        }
     }
 
     fn entry(mutation: DfsMetadataMutation) -> DfsMetadataJournalEntry {
@@ -691,5 +754,110 @@ mod tests {
         });
 
         assert!(journal_entry_has_replay_payloads(&entry));
+    }
+
+    #[test]
+    fn replay_payload_check_accepts_packed_namespace_prepare() {
+        let prepare = namespace_prepare();
+        let entry = entry(
+            DfsMetadataMutation::put_namespace_prepare_packed_v1(&prepare)
+                .expect("pack namespace prepare"),
+        );
+
+        assert!(matches!(
+            borrowed_namespace_prepare_payload(&entry).expect("validate borrowed payload"),
+            Some(DfsNamespacePreparePayloadRef::PackedV1 { .. })
+        ));
+        assert!(journal_entry_has_replay_payloads(&entry));
+        require_journal_entry_replay_payloads(&entry).expect("packed payload is replay complete");
+        assert_eq!(
+            decoded_namespace_prepare_payload(&entry)
+                .expect("decode packed payload")
+                .as_deref(),
+            Some(&prepare)
+        );
+    }
+
+    #[test]
+    fn replay_payload_check_rejects_ambiguous_namespace_prepare() {
+        let prepare = namespace_prepare();
+        let mut mutation = DfsMetadataMutation::put_namespace_prepare_packed_v1(&prepare)
+            .expect("pack namespace prepare");
+        let DfsMetadataMutation::PutNamespacePrepare {
+            prepare: canonical, ..
+        } = &mut mutation
+        else {
+            unreachable!("packed constructor returns put-namespace-prepare");
+        };
+        *canonical = Some(prepare);
+        let entry = entry(mutation);
+
+        assert!(!journal_entry_has_replay_payloads(&entry));
+        let error = require_journal_entry_replay_payloads(&entry)
+            .expect_err("dual payloads must fail replay")
+            .to_string();
+        assert!(
+            error.contains("both canonical and packed payloads"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn replay_payload_check_rejects_unsupported_packed_namespace_prepare() {
+        let prepare = namespace_prepare();
+        let mutation = DfsMetadataMutation::put_namespace_prepare_packed_v1(&prepare)
+            .expect("pack namespace prepare");
+        let mut encoded = serde_json::to_value(mutation).expect("serialize packed mutation");
+        *encoded
+            .get_mut("packed_prepare_v1")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|packed| packed.get_mut("f"))
+            .expect("packed format version") = serde_json::json!(2);
+        let entry = entry(
+            serde_json::from_value(encoded).expect("deserialize unsupported packed mutation"),
+        );
+
+        assert!(!journal_entry_has_replay_payloads(&entry));
+        let error = require_journal_entry_replay_payloads(&entry)
+            .expect_err("unsupported packed format must fail replay")
+            .to_string();
+        assert!(error.contains("unsupported packed namespace prepare version 2"));
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "type", rename_all = "kebab-case")]
+    enum LegacyNamespacePrepareMutation {
+        PutNamespacePrepare {
+            file_system_id: DfsFileSystemId,
+            operation_id: String,
+            status: DfsNamespacePrepareStatus,
+            #[serde(default)]
+            prepare: Option<DfsNamespacePrepareRecord>,
+        },
+    }
+
+    #[test]
+    fn legacy_reader_ignores_packed_field_but_observes_missing_canonical_payload() {
+        let prepare = namespace_prepare();
+        let mutation = DfsMetadataMutation::put_namespace_prepare_packed_v1(&prepare)
+            .expect("pack namespace prepare");
+        let bytes = sinomo_object_serde::to_bytes(&mutation, 1, LengthMode::U32)
+            .expect("encode packed mutation");
+        let legacy: LegacyNamespacePrepareMutation =
+            sinomo_object_serde::from_bytes(&bytes).expect("legacy reader decodes additive field");
+
+        let LegacyNamespacePrepareMutation::PutNamespacePrepare {
+            file_system_id,
+            operation_id,
+            status,
+            prepare: legacy_prepare,
+        } = legacy;
+        assert_eq!(file_system_id, prepare.file_system_id);
+        assert_eq!(operation_id, prepare.operation_id);
+        assert_eq!(status, prepare.status);
+        assert!(
+            legacy_prepare.is_none(),
+            "an older reader must not mistake a packed body for a canonical payload"
+        );
     }
 }

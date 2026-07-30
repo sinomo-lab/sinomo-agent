@@ -3892,6 +3892,7 @@ mod tests {
                     replica_node_ids: Vec::new(),
                     epoch: 1,
                     assignment: DfsMetadataShardAssignment::Root,
+                    namespace_prepare_codec: Default::default(),
                     default_policy: DfsObjectPolicy::ReplicatedEventual,
                 })
                 .expect("root metadata shard");

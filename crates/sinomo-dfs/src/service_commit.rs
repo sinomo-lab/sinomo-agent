@@ -1958,6 +1958,7 @@ mod atomic_create_parent_touch_tests {
             replica_node_ids: Vec::new(),
             epoch,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         }
     }

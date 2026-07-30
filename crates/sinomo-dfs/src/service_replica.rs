@@ -48,33 +48,37 @@ fn oversized_namespace_prepare_record_count(
         file_system_id: mutation_file_system_id,
         operation_id: mutation_operation_id,
         status,
-        prepare: Some(prepare),
+        ..
     } = &entry.mutation
     else {
         return None;
     };
-    if file_system_id != &shard.file_system_id
+    if entry.shard_id.0 != shard.shard_id
+        || file_system_id != &shard.file_system_id
         || mutation_file_system_id != file_system_id
         || mutation_operation_id != operation_id
         || status != &DfsNamespacePrepareStatus::Prepared
-        || prepare.status != DfsNamespacePrepareStatus::Prepared
-        || prepare.file_system_id != *file_system_id
-        || prepare.shard_id.0 != shard.shard_id
-        || prepare.owner_epoch != shard.epoch
-        || prepare.operation_id != *operation_id
-        || prepare.operation_digest != *payload_digest
     {
         return None;
     }
-    let record_count = prepare
-        .transaction
-        .objects
-        .len()
-        .saturating_add(prepare.transaction.versions.len())
-        .saturating_add(prepare.transaction.advisory_lock_states.len())
-        .saturating_add(prepare.expected_object_versions.len())
-        .saturating_add(prepare.expected_path_occupants.len())
-        .saturating_add(prepare.content_receipts.len());
+    let prepare = entry
+        .mutation
+        .namespace_prepare_payload_ref()
+        .ok()
+        .flatten()?;
+    if prepare.validate_file_system_scope(file_system_id).is_err()
+        || !prepare.matches_authority(
+            file_system_id,
+            operation_id,
+            &DfsNamespacePrepareStatus::Prepared,
+            &entry.shard_id,
+            shard.epoch,
+            payload_digest,
+        )
+    {
+        return None;
+    }
+    let record_count = prepare.record_count();
     (record_count > DFS_METADATA_AUTHORITY_PROBE_NAMESPACE_RECORD_LIMIT).then_some(record_count)
 }
 
@@ -1808,6 +1812,7 @@ mod authority_probe_tests {
             replica_node_ids,
             epoch: 7,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut inner = InProcessKvStore::new();
@@ -2335,6 +2340,60 @@ mod authority_probe_tests {
             service
                 .validate_canonical_authorization(&authorization, &operation)
                 .expect("direct certification remains subject to canonical revalidation"),
+        );
+    }
+
+    #[test]
+    fn packed_oversized_namespace_authority_uses_kv_without_data_plane_probe() {
+        let replicas = vec![
+            node("node_packed_oversized_namespace_authority_replica_a"),
+            node("node_packed_oversized_namespace_authority_replica_b"),
+        ];
+        let (mut service, object, _, shard, txn_calls, _) =
+            authority_fixture(ProbeBehavior::Accept, replicas);
+        let sent = Arc::clone(&service.transport.sent);
+        let (operation, mut prepared_batch) = prepared_namespace_authority_fixture(
+            &object,
+            &shard,
+            DFS_METADATA_AUTHORITY_PROBE_NAMESPACE_RECORD_LIMIT + 1,
+        );
+        let entry = prepared_batch
+            .entries
+            .iter_mut()
+            .find(|entry| {
+                entry.sequence == metadata_authority_operation_prepare_sequence(&operation)
+            })
+            .expect("namespace prepare entry");
+        let prepare = match &entry.mutation {
+            DfsMetadataMutation::PutNamespacePrepare {
+                prepare: Some(prepare),
+                packed_prepare_v1: None,
+                ..
+            } => prepare.clone(),
+            _ => panic!("fixture should contain one canonical namespace prepare"),
+        };
+        entry.mutation = DfsMetadataMutation::put_namespace_prepare_packed_v1(&prepare)
+            .expect("pack namespace prepare");
+
+        let authorization = service
+            .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
+            .expect("packed oversized namespace prepare uses exact KV certification");
+        assert!(
+            matches!(
+                authorization,
+                DfsCanonicalAuthorization::ClusterQuorum { .. }
+            ),
+            "packed oversized namespace prepares must bypass the full-member data-plane probe"
+        );
+        assert_eq!(txn_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            sent.lock().expect("sent messages").is_empty(),
+            "the direct certification path must not copy, unpack, or send the packed prepare"
+        );
+        drop(
+            service
+                .validate_canonical_authorization(&authorization, &operation)
+                .expect("packed direct certification remains subject to canonical revalidation"),
         );
     }
 
