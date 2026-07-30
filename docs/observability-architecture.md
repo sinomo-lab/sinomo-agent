@@ -272,6 +272,95 @@ durable POSIX syscalls. Override `SINOMO_DFS_PERF_MIN_FILES_PER_SECOND` only
 when intentionally measuring a different storage regime, and retain the
 configured floors with the artifacts.
 
+The default `SINOMO_DFS_PERF_MODE=debug-gate` contract is unchanged by the
+optional profiling modes:
+
+- `release-ceiling` raises the default bulk call to 16,384 files and requires
+  `SINOMO_DFS_PERF_BINARY_PROFILE=release`. The profile value is an operator
+  assertion recorded in `config.tsv`; the script cannot prove how the
+  already-running container binary was compiled. Form the cluster with an
+  absolute `target/release/sinomo` path and retain the formation artifacts
+  before describing the result as a release ceiling.
+- `sustained-churn` keeps the normal isolated and concurrent gates, then runs
+  eight back-to-back concurrent three-shard rounds by default. It applies the
+  same command, retry, idle, throttle, health, memory, and OOM checks across
+  the longer window and adds a conservative 1,000 aggregate publications/s
+  sustained floor. `SINOMO_DFS_PERF_SUSTAINED_ROUNDS` and
+  `SINOMO_DFS_PERF_MIN_SUSTAINED_AGGREGATE_FILES_PER_SECOND` are explicit
+  overrides. The first sustained round creates one stable file set per shard
+  lane; subsequent rounds pass `overwrite-existing=true` to overwrite those
+  exact paths. The probe records that mode and the harness verifies it. This
+  keeps the live namespace bounded while exercising version/history retention,
+  metadata GC, retries, and replay across a high operation count.
+
+For example:
+
+```sh
+# Form a fresh retained project with the exact release binary being measured.
+cargo build --release -p sinomo
+SINOMO_TEST_BUILD=0 SINOMO_TEST_FORMATION_OBSERVE=0 \
+  SINOMO_TEST_BINARY="$PWD/target/release/sinomo" \
+  SINOMO_TEST_COMPOSE_OVERRIDE=docker/docker-compose.dfs-tmpfs.yml \
+  SINOMO_TEST_NETWORK_ONLY=1 SINOMO_TEST_KEEP=1 SINOMO_DFS_PERF_TRACE=1 \
+  docker/test-cluster.sh
+
+SINOMO_DFS_PERF_MODE=release-ceiling \
+  SINOMO_DFS_PERF_BINARY_PROFILE=release \
+  SINOMO_DFS_PERF_FILES=16384 \
+  SINOMO_DFS_PERF_COMPOSE_OVERRIDE=docker/docker-compose.dfs-tmpfs.yml \
+  docker/measure-dfs-shards.sh
+
+SINOMO_DFS_PERF_MODE=sustained-churn \
+  SINOMO_DFS_PERF_SUSTAINED_ROUNDS=12 \
+  SINOMO_DFS_PERF_FILES=4096 \
+  SINOMO_DFS_PERF_COMPOSE_OVERRIDE=docker/docker-compose.dfs-tmpfs.yml \
+  docker/measure-dfs-shards.sh
+```
+
+`SINOMO_DFS_PERF_BATCH_SIZE_SWEEP=1024,4096,16384` runs the complete configured
+gate once per files-per-bulk-call value and writes one child artifact directory
+plus `batch-sweep-summary.tsv`. It stops on the first failed child. The sweep
+uses the same live cluster without resetting its volumes, so order sizes from
+small to large, start from a fresh project, and interpret later children as
+higher-history measurements. Every child retains the configured 1,000 floors
+and minimum measurement window; a very small batch that is too short to
+measure is a failed gate, not silently accepted sweep data.
+
+When DFS performance tracing was enabled when the daemons started, the shard
+script captures the exact appended byte range of both
+`/data/daemon/main.stdout.log` and `main.stderr.log`. It extracts only existing
+`sinomo.dfs.perf` numeric records into `dfs-perf-timing-records.tsv` and writes
+cluster percentiles to `dfs-perf-timing-summary.tsv`. The companion
+`dfs-perf-timing-coverage.tsv` is explicit about the instrumentation boundary:
+
+- `metadata-journal-segment` exposes authoritative journal encode, durable
+  file append/sync, first-segment directory sync, bytes, and entry counts;
+- `metadata-table-batch` exposes materialized replay-cache encode and unsynced
+  append duration;
+- `posix-bulk-local-write` and `posix-bulk-authority-commit` split content
+  publication, prepare construction, per-authority commit, and final stat
+  projection;
+- `metadata-authority-confirmation` distinguishes replica-probe, assignment
+  revalidation, and cluster-quorum permit time;
+- `content-root-catalog-shard-refresh` and `content-root-catalog-refresh`
+  expose exact-cut page/entry counts and shard/installed-generation latency;
+- `packed-blob-lock` exposes packed-content lock wait and hold duration, while
+  content ingest records expose loose/streamed write timing when those paths
+  run;
+- `metadata-publish-plan` exposes replication planning only.
+
+There is currently no successful packed-blob append/sync duration record and no
+successful metadata-journal transport latency record. The coverage artifact
+marks those as `not-instrumented`; it never turns an absent record into a zero
+duration. A supported record with no samples is `not-observed`, which can also
+mean the workload missed that path or `SINOMO_DFS_PERF_TRACE` was not active in
+the already-running daemon. Raw captured logs remain authoritative. Timing
+summaries can be rebuilt without contacting Docker:
+
+```sh
+docker/measure-dfs-shards.sh --summarize-traces target/dfs-shard-perf/<run>
+```
+
 The crate-level `network-blob` benchmark is a complementary tmpfs-backed,
 in-process measurement when its root is under `/dev/shm`:
 
@@ -330,12 +419,16 @@ the algorithm evidence under `target/dfs-shard-perf/<run>/`, especially
 `sample-classification-summary.csv`, `workloads.tsv`,
 `memory-summary.csv`, `memory-phase-summary.csv`, `host-memory.csv`,
 `host-memory-summary.tsv`,
-`main-daemon-stderr-workload.tsv`, the per-node
-`main-daemon-<node>.workload.stderr.log` files, and the before/after health,
-doctor, DFS-status, and shard-layout files. The daemon-stderr manifest records
-the exact appended byte range or a best-effort full-log fallback when the file
-was reset or an offset was unavailable. The timeline gate fails a runnable
-low-CPU streak with no resource wait or progress; sleeping samples with no
-observed external progress remain diagnostic, so inspect that class alongside
-the preserved `sinomo.dfs.perf` traces before concluding that the hot path has
-no unnecessary wait.
+`sustained-summary.tsv`, `sustained-rounds.tsv`,
+`main-daemon-stderr-workload.tsv`, `main-daemon-stdout-workload.tsv`, the
+per-node `main-daemon-<node>.workload.stderr.log` and
+`main-daemon-<node>.workload.stdout.log` files,
+`dfs-perf-timing-records.tsv`, `dfs-perf-timing-summary.tsv`,
+`dfs-perf-timing-coverage.tsv`, and the before/after health, doctor, DFS-status,
+and shard-layout files. The daemon-log manifests record the exact appended byte
+range or a best-effort full-log fallback when a file was reset or an offset was
+unavailable. The timeline gate fails a runnable low-CPU streak with no resource
+wait or progress; sleeping samples with no observed external progress remain
+diagnostic, so inspect that class alongside the preserved
+`sinomo.dfs.perf` traces before concluding that the hot path has no unnecessary
+wait.

@@ -2600,6 +2600,22 @@ pub(crate) enum DfsMetadataTableOp {
     PutNamespacePrepare {
         prepare: DfsNamespacePrepareRecord,
     },
+    /// Rebuildable materialized-table reference to the authoritative
+    /// `PutNamespacePrepare` journal entry at `journal_sequence`.
+    ///
+    /// The full prepare body remains in the journal and in structured table
+    /// snapshots. Table-log replay must resolve and validate this reference
+    /// before applying it; it is never meaningful as a standalone table
+    /// mutation.
+    PutNamespacePrepareJournalReference {
+        shard_id: DfsMetadataShardId,
+        journal_sequence: u64,
+        file_system_id: DfsFileSystemId,
+        operation_id: String,
+        operation_digest: String,
+        owner_epoch: u64,
+        status: DfsNamespacePrepareStatus,
+    },
     /// Compact materialized-table transition for a prepare whose full semantic
     /// body is already present in the preceding table state. Replaying this
     /// marker expands the transaction and terminal request evidence directly

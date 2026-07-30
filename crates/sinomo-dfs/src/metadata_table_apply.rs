@@ -50,7 +50,32 @@ pub(crate) fn append_and_apply_table_ops(
     ops: Vec<DfsMetadataTableOp>,
     max_log_bytes: u64,
 ) -> Result<()> {
-    append_table_batch(root, state, sequence, ops, max_log_bytes, None)
+    append_table_batch(root, state, sequence, ops, None, max_log_bytes, None)
+}
+
+/// Append compact rebuildable operations while applying their already
+/// validated, self-contained equivalents to the live tables.
+///
+/// This is used only after the authoritative journal entry is durable. A
+/// crash before the live apply is recovered by resolving the persisted
+/// journal reference during table-log replay.
+pub(crate) fn append_and_apply_table_ops_with_persisted_ops(
+    root: &Path,
+    state: TableMaterializationState<'_>,
+    sequence: u64,
+    persisted_ops: Vec<DfsMetadataTableOp>,
+    apply_ops: Vec<DfsMetadataTableOp>,
+    max_log_bytes: u64,
+) -> Result<()> {
+    append_table_batch(
+        root,
+        state,
+        sequence,
+        persisted_ops,
+        Some(apply_ops),
+        max_log_bytes,
+        None,
+    )
 }
 
 pub(crate) fn append_preapplied_table_ops(
@@ -61,7 +86,15 @@ pub(crate) fn append_preapplied_table_ops(
     max_log_bytes: u64,
     rollback: DfsMetadataTableRollback,
 ) -> Result<()> {
-    append_table_batch(root, state, sequence, ops, max_log_bytes, Some(rollback))
+    append_table_batch(
+        root,
+        state,
+        sequence,
+        ops,
+        None,
+        max_log_bytes,
+        Some(rollback),
+    )
 }
 
 pub(crate) fn compact_metadata_table_log_if_needed(
@@ -377,17 +410,26 @@ fn append_table_batch(
     root: &Path,
     state: TableMaterializationState<'_>,
     sequence: u64,
-    ops: Vec<DfsMetadataTableOp>,
+    persisted_ops: Vec<DfsMetadataTableOp>,
+    apply_ops: Option<Vec<DfsMetadataTableOp>>,
     max_log_bytes: u64,
     mut rollback: Option<DfsMetadataTableRollback>,
 ) -> Result<()> {
-    if let Err(error) = validate_version_pin_removal_order(state.tables, &ops, rollback.is_some()) {
+    if rollback.is_some() && apply_ops.is_some() {
+        return Err(MetadataBackendError::Serde(format!(
+            "metadata table batch {sequence} cannot combine preapplied rollback with separate apply operations"
+        )));
+    }
+    let validation_ops = apply_ops.as_deref().unwrap_or(&persisted_ops);
+    if let Err(error) =
+        validate_version_pin_removal_order(state.tables, validation_ops, rollback.is_some())
+    {
         if let Some(rollback) = rollback.take() {
             rollback.rollback(state.tables);
         }
         return Err(error);
     }
-    let semantic_op_count = ops
+    let semantic_op_count = validation_ops
         .iter()
         .filter(|op| matches!(op, DfsMetadataTableOp::CommitNamespacePrepare { .. }))
         .count();
@@ -397,7 +439,10 @@ fn append_table_batch(
     // then append one table batch containing Prepared plus Commit (or multiple
     // independent commits); its rollback proves that ordered validation has
     // already succeeded.
-    if rollback.is_none() && semantic_op_count > 0 && (semantic_op_count != 1 || ops.len() != 1) {
+    if rollback.is_none()
+        && semantic_op_count > 0
+        && (semantic_op_count != 1 || validation_ops.len() != 1)
+    {
         if let Some(rollback) = rollback.take() {
             rollback.rollback(state.tables);
         }
@@ -406,7 +451,7 @@ fn append_table_batch(
         )));
     }
     if rollback.is_none() {
-        for op in &ops {
+        for op in validation_ops {
             if let Err(error) = state.tables.validate_checked(op) {
                 return Err(error);
             }
@@ -432,7 +477,7 @@ fn append_table_batch(
     let apply_after_append = rollback.is_none();
     let batch = DfsMetadataTableBatch {
         sequence,
-        ops,
+        ops: persisted_ops,
         prefix_proof: Some(prefix_proof.clone()),
     };
     let written = match append_metadata_table_batch(root, &batch) {
@@ -446,7 +491,7 @@ fn append_table_batch(
     };
     *state.table_log_offset = state.table_log_offset.saturating_add(written);
     if apply_after_append {
-        for op in batch.ops {
+        for op in apply_ops.unwrap_or(batch.ops) {
             state.tables.apply_checked(op)?;
         }
     }

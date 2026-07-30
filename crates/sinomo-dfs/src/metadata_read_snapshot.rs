@@ -98,7 +98,7 @@ pub(crate) fn refresh_metadata_tables(
     if len == *table_log_offset {
         return Ok(());
     }
-    let replay = replay_metadata_table_batches_from(&path, *table_log_offset, tables)?;
+    let replay = replay_metadata_table_batches_from(root, &path, *table_log_offset, tables)?;
     *table_log_offset = replay.offset;
     if let Some(sequence) = replay.materialized_through_sequence {
         *materialized_through_sequence = (*materialized_through_sequence).max(sequence);
@@ -126,6 +126,7 @@ pub(crate) fn current_tables_snapshot<'a>(
         let table_log_offset = metadata_table_log_len(&path)?;
         if let Some(tables) = cached_or_advanced_read_snapshot(
             read_snapshot_cache,
+            root,
             &path,
             &current_snapshot_fingerprint,
             &checkpoint_fingerprint,
@@ -160,6 +161,7 @@ pub(crate) fn current_tables_snapshot<'a>(
             Some(len) => {
                 if let Some(tables) = cached_or_advanced_read_snapshot(
                     read_snapshot_cache,
+                    root,
                     &path,
                     &current_snapshot_fingerprint,
                     &None,
@@ -173,7 +175,7 @@ pub(crate) fn current_tables_snapshot<'a>(
                 }
                 let mut tables = live_tables.clone();
                 let replay =
-                    replay_metadata_table_batches_from(&path, table_log_offset, &mut tables)?;
+                    replay_metadata_table_batches_from(root, &path, table_log_offset, &mut tables)?;
                 let state = DfsMetadataTableState {
                     tables,
                     table_log_offset: replay.offset,
@@ -192,6 +194,7 @@ pub(crate) fn current_tables_snapshot<'a>(
     let table_log_offset = metadata.as_ref().map(fs::Metadata::len).unwrap_or(0);
     if let Some(tables) = cached_or_advanced_read_snapshot(
         read_snapshot_cache,
+        root,
         &path,
         &current_snapshot_fingerprint,
         &None,
@@ -205,6 +208,7 @@ pub(crate) fn current_tables_snapshot<'a>(
 
 fn cached_or_advanced_read_snapshot(
     read_snapshot_cache: &Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
+    root: &Path,
     path: &Path,
     snapshot_fingerprint: &Option<MetadataTableSnapshotFingerprint>,
     checkpoint_fingerprint: &Option<MetadataTableSnapshotFingerprint>,
@@ -229,7 +233,8 @@ fn cached_or_advanced_read_snapshot(
         // snapshot isolation for any concurrent reader that still holds the
         // previous view, while the common sequential path reuses allocations.
         let tables = Arc::make_mut(&mut cache.tables);
-        let replay = replay_metadata_table_batches_from(path, cache.table_log_offset, tables)?;
+        let replay =
+            replay_metadata_table_batches_from(root, path, cache.table_log_offset, tables)?;
         cache.table_log_offset = replay.offset;
     }
     Ok(Some(Arc::clone(&cache.tables)))

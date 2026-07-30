@@ -23,9 +23,19 @@ use crate::{
 
 pub const DFS_CONTENT_ROOT_CATALOG_FORMAT_VERSION: u32 = 2;
 pub const DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION: u32 = 1;
+/// Historical conservative page size retained for callers that deliberately
+/// prefer the old, smaller transfer unit.
 pub const DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES: usize = 256;
+/// Preferred encoded size for ordinary catalog pages.
+///
+/// Current version/content-hash roots fit roughly 1,024 entries inside this
+/// target. The hard encoded ceiling below remains authoritative when unusually
+/// long roots make the entry-count estimate inaccurate.
+pub const DFS_CONTENT_ROOT_CATALOG_TARGET_PAGE_BYTES: usize = 128 * 1024;
+pub const DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES: usize = 256 * 1024;
+pub const DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT: usize = 1024;
 pub const DEFAULT_DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRIES: usize =
-    DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES;
+    DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT;
 const DFS_METADATA_PREFIX_PROOF_DIGEST_PREFIX: &str = "dfs-metadata-prefix-v1:blake3:";
 const DFS_CONTENT_ROOT_CATALOG_JSON_TOPOLOGY_PREFIX: &[u8] =
     b"sinomo-dfs-content-root-catalog-topology-json-v1\0";
@@ -149,9 +159,9 @@ impl DfsContentRootCatalogPageRequest {
                 "DFS content-root catalog request has an invalid topology digest",
             ));
         }
-        if self.max_entries == 0 || self.max_entries > DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES {
+        if self.max_entries == 0 || self.max_entries > DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT {
             return Err(catalog_error(format!(
-                "DFS content-root catalog page limit must be 1..={DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES}"
+                "DFS content-root catalog page limit must be 1..={DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT}"
             )));
         }
         if let Some(fingerprint) = self.minimum_state_fingerprint.as_deref()
@@ -374,6 +384,10 @@ impl DfsContentRootCatalogPage {
         self.coverage.is_complete()
     }
 
+    pub fn encoded_size_bytes(&self) -> Result<usize, MetadataBackendError> {
+        encode_sobj(self).map(|bytes| bytes.len())
+    }
+
     pub fn validate_for_request(
         &self,
         request: &DfsContentRootCatalogPageRequest,
@@ -466,6 +480,13 @@ impl DfsContentRootCatalogPage {
                 }
             }
         }
+        let encoded_size_bytes = self.encoded_size_bytes()?;
+        if encoded_size_bytes > DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES {
+            return Err(catalog_error(format!(
+                "DFS content-root catalog page encodes to {encoded_size_bytes} bytes, exceeding the {}-byte transport budget",
+                DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES
+            )));
+        }
         Ok(())
     }
 }
@@ -480,71 +501,125 @@ pub struct DfsContentRootCatalogFragment {
     pub entries: Vec<DfsContentRootCatalogEntry>,
 }
 
+/// Incrementally validates and merges one shard's catalog pages.
+///
+/// The builder consumes each page as it arrives, so refresh callers retain
+/// only the final root vector plus the current transport page. It also owns the
+/// expected continuation request, preventing callers from accidentally
+/// weakening the durable-cut or pagination-cursor checks between pages.
+pub(crate) struct DfsContentRootCatalogFragmentBuilder {
+    initial_request: DfsContentRootCatalogPageRequest,
+    request: DfsContentRootCatalogPageRequest,
+    generated_at_unix_nanos: u64,
+    coverage: Option<DfsContentRootCatalogCoverage>,
+    entries: Vec<DfsContentRootCatalogEntry>,
+    page_count: usize,
+    terminated: bool,
+}
+
+impl DfsContentRootCatalogFragmentBuilder {
+    pub(crate) fn new(
+        initial_request: &DfsContentRootCatalogPageRequest,
+    ) -> Result<Self, MetadataBackendError> {
+        initial_request.validate()?;
+        if initial_request.after.is_some() {
+            return Err(catalog_error(
+                "DFS content-root catalog fragment must start at the first page",
+            ));
+        }
+        Ok(Self {
+            initial_request: initial_request.clone(),
+            request: initial_request.clone(),
+            generated_at_unix_nanos: 0,
+            coverage: None,
+            entries: Vec::new(),
+            page_count: 0,
+            terminated: false,
+        })
+    }
+
+    /// Consume one page and return its exact continuation request, if any.
+    pub(crate) fn push_page(
+        &mut self,
+        page: DfsContentRootCatalogPage,
+    ) -> Result<Option<DfsContentRootCatalogPageRequest>, MetadataBackendError> {
+        if self.terminated {
+            return Err(catalog_error(
+                "DFS content-root catalog fragment contains pages after completion",
+            ));
+        }
+        page.validate_for_request(&self.request)?;
+        self.page_count = self.page_count.saturating_add(1);
+        self.generated_at_unix_nanos = self
+            .generated_at_unix_nanos
+            .max(page.generated_at_unix_nanos);
+
+        let DfsContentRootCatalogPage {
+            coverage,
+            entries,
+            next_cursor,
+            ..
+        } = page;
+        let page_complete = coverage.is_complete();
+        self.coverage = Some(coverage);
+        if !page_complete {
+            self.entries.clear();
+            self.terminated = true;
+            return Ok(None);
+        }
+        if self
+            .entries
+            .last()
+            .zip(entries.first())
+            .is_some_and(|(previous, next)| previous >= next)
+        {
+            return Err(catalog_error(
+                "DFS content-root catalog pages are not globally ordered",
+            ));
+        }
+        self.entries.extend(entries);
+
+        let Some(next) = next_cursor else {
+            self.terminated = true;
+            return Ok(None);
+        };
+        self.request.minimum_journal_sequence = next.journal_sequence;
+        self.request.minimum_state_fingerprint = Some(next.state_fingerprint.clone());
+        self.request.after = Some(next);
+        Ok(Some(self.request.clone()))
+    }
+
+    pub(crate) fn finish(self) -> Result<DfsContentRootCatalogFragment, MetadataBackendError> {
+        if self.page_count == 0 {
+            return Err(catalog_error(
+                "DFS content-root catalog fragment must contain at least one page",
+            ));
+        }
+        if !self.terminated {
+            return Err(catalog_error(
+                "DFS content-root catalog fragment ended before its continuation",
+            ));
+        }
+        Ok(DfsContentRootCatalogFragment {
+            identity: self.initial_request.identity,
+            topology_digest: self.initial_request.expected_topology_digest,
+            generated_at_unix_nanos: self.generated_at_unix_nanos,
+            coverage: self.coverage.expect("a consumed page has coverage"),
+            entries: self.entries,
+        })
+    }
+}
+
 impl DfsContentRootCatalogFragment {
     pub fn from_pages(
         initial_request: &DfsContentRootCatalogPageRequest,
         pages: &[DfsContentRootCatalogPage],
     ) -> Result<Self, MetadataBackendError> {
-        initial_request.validate()?;
-        if initial_request.after.is_some() || pages.is_empty() {
-            return Err(catalog_error(
-                "DFS content-root catalog fragment must start at the first page",
-            ));
+        let mut builder = DfsContentRootCatalogFragmentBuilder::new(initial_request)?;
+        for page in pages {
+            builder.push_page(page.clone())?;
         }
-        let mut request = initial_request.clone();
-        let mut entries = Vec::new();
-        let mut generated_at_unix_nanos = 0;
-        let mut final_coverage = None;
-        for (index, page) in pages.iter().enumerate() {
-            page.validate_for_request(&request)?;
-            generated_at_unix_nanos = generated_at_unix_nanos.max(page.generated_at_unix_nanos);
-            final_coverage = Some(page.coverage.clone());
-            if !page.is_complete() {
-                if index + 1 != pages.len() {
-                    return Err(catalog_error(
-                        "an incomplete DFS content-root catalog page must terminate its fragment",
-                    ));
-                }
-                entries.clear();
-                break;
-            }
-            if entries
-                .last()
-                .zip(page.entries.first())
-                .is_some_and(|(previous, next)| previous >= next)
-            {
-                return Err(catalog_error(
-                    "DFS content-root catalog pages are not globally ordered",
-                ));
-            }
-            entries.extend(page.entries.iter().cloned());
-            match page.next_cursor.clone() {
-                Some(next) => {
-                    if index + 1 == pages.len() {
-                        return Err(catalog_error(
-                            "DFS content-root catalog fragment ended before its continuation",
-                        ));
-                    }
-                    request.minimum_journal_sequence = next.journal_sequence;
-                    request.minimum_state_fingerprint = Some(next.state_fingerprint.clone());
-                    request.after = Some(next);
-                }
-                None => {
-                    if index + 1 != pages.len() {
-                        return Err(catalog_error(
-                            "DFS content-root catalog fragment contains pages after completion",
-                        ));
-                    }
-                }
-            }
-        }
-        Ok(Self {
-            identity: initial_request.identity.clone(),
-            topology_digest: initial_request.expected_topology_digest.clone(),
-            generated_at_unix_nanos,
-            coverage: final_coverage.expect("non-empty pages have coverage"),
-            entries,
-        })
+        builder.finish()
     }
 
     pub fn is_complete(&self) -> bool {
@@ -1804,6 +1879,15 @@ mod tests {
         ))
     }
 
+    fn content_hash_entry(index: usize, length: usize) -> DfsContentRootCatalogEntry {
+        let prefix = format!("{index:08x}");
+        assert!(length >= prefix.len());
+        DfsContentRootCatalogEntry::ContentHash(format!(
+            "{prefix}{}",
+            "a".repeat(length - prefix.len())
+        ))
+    }
+
     fn state_fingerprint(value: &str) -> String {
         format!(
             "{DFS_METADATA_PREFIX_PROOF_DIGEST_PREFIX}{}",
@@ -1929,6 +2013,141 @@ mod tests {
             .expect("cursor")
             .generated_at_unix_nanos = 10;
         assert!(timestamp_drifted.validate_for_request(&request).is_err());
+    }
+
+    #[test]
+    fn page_contract_accepts_legacy_and_byte_bounded_target_batches() {
+        let mut legacy_request = request();
+        legacy_request.max_entries = DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES;
+        let legacy_page = complete_page(
+            &legacy_request,
+            9,
+            (0..DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES)
+                .map(|index| content_hash_entry(index, 71))
+                .collect(),
+        );
+        legacy_page
+            .validate_for_request(&legacy_request)
+            .expect("legacy 256-entry page remains valid");
+
+        let mut target_request = request();
+        target_request.max_entries = DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT;
+        let target_page = complete_page(
+            &target_request,
+            10,
+            (0..DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT)
+                .map(|index| content_hash_entry(index, 71))
+                .collect(),
+        );
+        let encoded_size_bytes = target_page.encoded_size_bytes().expect("encoded page size");
+        assert!(
+            encoded_size_bytes <= DFS_CONTENT_ROOT_CATALOG_TARGET_PAGE_BYTES,
+            "current blake3-sized roots should fit the preferred page target, observed {encoded_size_bytes} bytes"
+        );
+        target_page
+            .validate_for_request(&target_request)
+            .expect("target page remains inside the hard transport budget");
+        assert_eq!(
+            DEFAULT_DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRIES,
+            DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT
+        );
+        let mut over_limit_request = target_request;
+        over_limit_request.max_entries = DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT + 1;
+        assert!(
+            over_limit_request.validate().is_err(),
+            "the count limit bounds work even before encoded-size validation"
+        );
+    }
+
+    #[test]
+    fn page_contract_rejects_oversized_long_root_batches() {
+        let mut request = request();
+        request.max_entries = DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT;
+        let page = complete_page(
+            &request,
+            10,
+            (0..DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT)
+                .map(|index| content_hash_entry(index, 256))
+                .collect(),
+        );
+        assert!(
+            page.encoded_size_bytes().expect("encoded page size")
+                > DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES,
+            "the fixture must cross the hard encoded page budget"
+        );
+        assert!(
+            page.validate_for_request(&request).is_err(),
+            "oversized pages fail closed even when they satisfy the entry-count limit"
+        );
+    }
+
+    #[test]
+    fn fragment_builder_merges_pages_without_retaining_page_vectors() {
+        let request = request();
+        let fingerprint = state_fingerprint("catalog-state");
+        let first_entries = vec![content_hash_entry(0, 71), content_hash_entry(1, 71)];
+        let mut first = complete_page(&request, 100, first_entries.clone());
+        first.next_cursor = Some(DfsContentRootCatalogCursor {
+            journal_sequence: request.minimum_journal_sequence,
+            state_fingerprint: fingerprint,
+            generated_at_unix_nanos: 100,
+            last_entry: first_entries.last().cloned().expect("last entry"),
+        });
+
+        let mut builder =
+            DfsContentRootCatalogFragmentBuilder::new(&request).expect("fragment builder");
+        let continuation = builder
+            .push_page(first)
+            .expect("first page")
+            .expect("continuation");
+        let second_entries = vec![content_hash_entry(2, 71), content_hash_entry(3, 71)];
+        builder
+            .push_page(complete_page(&continuation, 100, second_entries.clone()))
+            .expect("second page");
+        let fragment = builder.finish().expect("complete fragment");
+
+        assert!(fragment.is_complete());
+        assert_eq!(
+            fragment.entries,
+            first_entries
+                .into_iter()
+                .chain(second_entries)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(fragment.generated_at_unix_nanos, 100);
+    }
+
+    #[test]
+    fn fragment_builder_discards_accumulated_roots_on_incomplete_continuation() {
+        let request = request();
+        let first_entry = entry("a");
+        let mut first = complete_page(&request, 100, vec![first_entry.clone()]);
+        first.next_cursor = Some(DfsContentRootCatalogCursor {
+            journal_sequence: request.minimum_journal_sequence,
+            state_fingerprint: state_fingerprint("catalog-state"),
+            generated_at_unix_nanos: 100,
+            last_entry: first_entry,
+        });
+        let mut builder =
+            DfsContentRootCatalogFragmentBuilder::new(&request).expect("fragment builder");
+        let continuation = builder
+            .push_page(first)
+            .expect("first page")
+            .expect("continuation");
+        builder
+            .push_page(DfsContentRootCatalogPage::incomplete_for_request(
+                &continuation,
+                DfsContentRootCatalogIncompleteReason::StateFingerprintChanged,
+                101,
+            ))
+            .expect("incomplete continuation");
+        let fragment = builder.finish().expect("incomplete fragment");
+
+        assert!(!fragment.is_complete());
+        assert!(
+            fragment.entries.is_empty(),
+            "an incomplete shard can never retain partially observed roots"
+        );
     }
 
     #[test]

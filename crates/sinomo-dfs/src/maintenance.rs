@@ -20,7 +20,8 @@ use crate::{
     ContentStoreGcReport, ContentStoreReservationReconciliationOptions,
     ContentStoreReservationReconciliationReport, ContentStoreScrubReport,
     ContentStoreStagingGcOptions, ContentStoreStagingGcReport, ContentStoreVersionGcOptions,
-    ContentStoreVersionGcReport, DFS_PENDING_TRANSFER_STALE_AFTER, DfsCommittedWorkTracker,
+    ContentStoreVersionGcReport, DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES,
+    DFS_PENDING_TRANSFER_STALE_AFTER, DfsCommittedWorkTracker,
     DfsContentRootCatalogCollectionValidation, DfsContentRootCatalogIncompleteReason,
     DfsControlPlaneKvClient, DfsDistributedWriteResult, DfsError, DfsFileSystemConfig,
     DfsFileSystemId, DfsMessageSender, DfsMessageTransport, DfsMetadataBackend,
@@ -585,7 +586,15 @@ pub const DEFAULT_DFS_CONTENT_VERSION_GC_MAX_RECORDS: u64 = 256;
 pub const DEFAULT_DFS_CONTENT_ORPHAN_GC_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub const DEFAULT_DFS_CONTENT_ORPHAN_GC_MAX_RECORDS: u64 = 256;
 pub const DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_AGE: Duration = Duration::from_secs(5 * 60);
-pub const DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_PAGES_PER_SHARD: usize = 4096;
+pub const DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_ROOTS_PER_SHARD: usize = 1024 * 1024;
+// Keep the historical 256-entry pagination bound when sizing this safety
+// limit. The adaptive byte budget can make a page smaller than the preferred
+// 1,024 entries, so using the preferred size here would reduce the catalog's
+// usable coverage and leave destructive content GC permanently fail-closed on
+// otherwise supported large shards.
+pub const DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_PAGES_PER_SHARD: usize =
+    DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_ROOTS_PER_SHARD
+        .div_ceil(DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES);
 pub const DEFAULT_DFS_CONTENT_RESERVATION_REJECTION_GRACE: Duration =
     Duration::from_secs(7 * 24 * 60 * 60);
 pub const DEFAULT_DFS_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS: u64 = 256;
@@ -1976,6 +1985,23 @@ mod causal_time_tests {
         dfs_content_root_catalog_topology_digest_with_file_systems,
     };
     use sinomo_core::DfsObjectPolicy;
+
+    #[test]
+    fn default_catalog_page_budget_preserves_the_bounded_root_capacity() {
+        assert_eq!(DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_PAGES_PER_SHARD, 4096);
+        let root_capacity = DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_PAGES_PER_SHARD
+            * DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES;
+        assert!(root_capacity >= DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_ROOTS_PER_SHARD);
+        assert!(
+            root_capacity - DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_ROOTS_PER_SHARD
+                < DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES
+        );
+        assert!(
+            crate::DEFAULT_DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRIES
+                > DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES,
+            "the request target may grow without silently reducing the safety page budget"
+        );
+    }
 
     #[test]
     fn content_gc_uses_local_install_time_for_durable_content_observations() {

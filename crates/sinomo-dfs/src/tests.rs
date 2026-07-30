@@ -30858,6 +30858,189 @@ fn sifs_posix_bulk_local_eventual_writes_visible_files() {
 }
 
 #[test]
+fn sifs_posix_bulk_overwrite_pins_metadata_generation_during_preparation() {
+    let root = temp_root("sifs-posix-bulk-overwrite-pinned-metadata");
+    let node_id =
+        NodeId::from_legacy_named("node_sifs_bulk_overwrite_pinned_metadata").expect("node");
+    let work = "/services/sandbox/instances/sandbox_bulk_overwrite_pinned_metadata/work";
+    let mut dfs = networked_sifs_with_backend(&root, node_id);
+    dfs.posix_mkdir_all(work).expect("mkdir");
+    let owned_files = (0..64)
+        .map(|index| {
+            (
+                format!("{work}/file-{index:03}.txt"),
+                format!("initial-{index:03}").into_bytes(),
+                format!("overwritten-{index:03}").into_bytes(),
+            )
+        })
+        .collect::<Vec<_>>();
+    dfs.posix_create_files_local_eventual_with_known_parents(
+        owned_files
+            .iter()
+            .map(|(path, initial, _)| (path.as_str(), initial.as_slice())),
+    )
+    .expect("initial bulk create");
+    let versions_before = owned_files
+        .iter()
+        .map(|(path, _, _)| dfs.posix_stat(path).expect("stat initial").version)
+        .collect::<Vec<_>>();
+
+    crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+    crate::posix::reset_posix_bulk_prep_durable_table_probes();
+    crate::posix::reset_posix_metadata_raw_lookup_count();
+    let stats = dfs
+        .posix_write_files_local_eventual_with_known_parents(
+            owned_files
+                .iter()
+                .map(|(path, _, overwritten)| (path.as_str(), overwritten.as_slice())),
+        )
+        .expect("bulk overwrite");
+
+    assert_eq!(stats.len(), owned_files.len());
+    assert_eq!(
+        crate::posix::posix_bulk_prep_durable_table_probes(),
+        0,
+        "bulk overwrite child discovery must reuse the pinned metadata generation \
+         instead of polling checkpoint, snapshot, and table-log files per object"
+    );
+    let parent_component_count = work.trim_matches('/').split('/').count();
+    assert!(
+        crate::posix::posix_bulk_prep_table_snapshot_calls()
+            <= owned_files.len() + parent_component_count + 1,
+        "bulk overwrite performed {} metadata table reads for {} child objects; \
+         expected one pinned ancestor/parent revalidation plus one read per \
+         child, without hydrating receipt-derived locations that the publisher \
+         replaces",
+        crate::posix::posix_bulk_prep_table_snapshot_calls(),
+        owned_files.len(),
+    );
+    let raw_lookup_bound = owned_files.len() + parent_component_count * 2 + 3;
+    assert!(
+        crate::posix::posix_metadata_raw_lookup_count() <= raw_lookup_bound,
+        "bulk overwrite performed {} raw path lookups for {} children below one \
+         already-resolved parent; expected no more than {raw_lookup_bound}",
+        crate::posix::posix_metadata_raw_lookup_count(),
+        owned_files.len(),
+    );
+    for (((path, _, overwritten), version_before), stat) in
+        owned_files.iter().zip(versions_before).zip(stats)
+    {
+        assert_eq!(stat.path, *path);
+        assert_ne!(stat.version, version_before);
+        assert_eq!(
+            dfs.posix_read_file(path).expect("read overwritten file"),
+            *overwritten
+        );
+    }
+
+    crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+    dfs.posix_stat(&owned_files[0].0)
+        .expect("stat after bulk overwrite");
+    assert!(
+        crate::metadata_read_snapshot::metadata_durable_table_probes() > 0,
+        "bulk overwrite must release its consistent-read scope before returning"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_posix_bulk_overwrite_preserves_hardlink_and_symlink_fallback_semantics() {
+    let root = temp_root("sifs-posix-bulk-overwrite-links");
+    let node_id = NodeId::from_legacy_named("node_sifs_bulk_overwrite_links").expect("node");
+    let work = "/services/sandbox/instances/sandbox_bulk_overwrite_links/work";
+    let target = "/services/sandbox/instances/sandbox_bulk_overwrite_links/work/target.txt";
+    let hardlink = "/services/sandbox/instances/sandbox_bulk_overwrite_links/work/hard.txt";
+    let symlink = "/services/sandbox/instances/sandbox_bulk_overwrite_links/work/sym.txt";
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all(work).expect("mkdir");
+    dfs.posix_write_file(
+        target,
+        b"initial",
+        DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+    )
+    .expect("write target");
+    dfs.posix_hardlink(target, hardlink).expect("hardlink");
+    dfs.posix_symlink(
+        "target.txt",
+        symlink,
+        DfsWriteOptions::replicated_eventual(vec![node_id]),
+    )
+    .expect("symlink");
+
+    crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+    crate::posix::reset_posix_bulk_prep_durable_table_probes();
+    dfs.posix_write_files_local_eventual_with_known_parents([(
+        hardlink,
+        b"through hardlink".as_slice(),
+    )])
+    .expect("bulk write through hardlink");
+    assert_eq!(
+        crate::posix::posix_bulk_prep_durable_table_probes(),
+        0,
+        "hardlink target discovery must remain inside the pinned metadata generation"
+    );
+    assert_eq!(
+        dfs.posix_read_file(target).expect("read hardlink target"),
+        b"through hardlink"
+    );
+
+    crate::posix::reset_posix_bulk_prep_durable_table_probes();
+    dfs.posix_write_files_local_eventual_with_known_parents([(
+        symlink,
+        b"through symlink".as_slice(),
+    )])
+    .expect("bulk write through symlink fallback");
+    assert_eq!(
+        crate::posix::posix_bulk_prep_durable_table_probes(),
+        0,
+        "symlink classification must not resume per-record durable table polling"
+    );
+    assert_eq!(
+        dfs.posix_read_file(target).expect("read symlink target"),
+        b"through symlink"
+    );
+
+    crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+    dfs.posix_stat(target).expect("stat after symlink fallback");
+    assert!(
+        crate::metadata_read_snapshot::metadata_durable_table_probes() > 0,
+        "symlink fallback must run after and leave behind no pinned metadata generation"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_posix_bulk_overwrite_rejects_tombstoned_parent() {
+    let root = temp_root("sifs-posix-bulk-overwrite-tombstoned-parent");
+    let node_id =
+        NodeId::from_legacy_named("node_sifs_bulk_overwrite_tombstoned_parent").expect("node");
+    let work = "/services/sandbox/instances/sandbox_bulk_overwrite_tombstoned_parent/work";
+    let path = "/services/sandbox/instances/sandbox_bulk_overwrite_tombstoned_parent/work/file.txt";
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all(work).expect("mkdir");
+    dfs.posix_write_file(
+        path,
+        b"initial",
+        DfsWriteOptions::replicated_eventual(vec![node_id]),
+    )
+    .expect("write initial");
+    dfs.posix_unlink(path).expect("unlink child");
+    dfs.posix_rmdir(work).expect("tombstone parent");
+
+    assert!(
+        matches!(
+            dfs.posix_write_files_local_eventual_with_known_parents([(
+                path,
+                b"must not recreate below tombstone".as_slice(),
+            )]),
+            Err(DfsPosixError::MissingParent { path: missing }) if missing == work
+        ),
+        "bulk overwrite must not create a child below a tombstoned parent"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn sifs_posix_create_bulk_local_eventual_rejects_existing_paths() {
     let root = temp_root("sifs-posix-create-bulk-local-eventual");
     let node_id = NodeId::from_legacy_named("node_sifs_create_bulk_local").expect("node");

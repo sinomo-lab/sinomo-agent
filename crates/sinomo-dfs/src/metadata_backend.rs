@@ -12,7 +12,8 @@ use crate::advisory_lock::{
     DfsAdvisoryLockTransitionContext, transition_advisory_lock_state,
 };
 use crate::content_root_catalog::{
-    DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION, DfsContentRootCatalogCoverage,
+    DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES, DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
+    DFS_CONTENT_ROOT_CATALOG_TARGET_PAGE_BYTES, DfsContentRootCatalogCoverage,
     DfsContentRootCatalogCursor, DfsContentRootCatalogEntry, DfsContentRootCatalogIncompleteReason,
     DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest, dfs_content_root_catalog_entries,
 };
@@ -87,7 +88,8 @@ use crate::metadata_table_store::{
     METADATA_TABLE_SNAPSHOT_FORMAT_VERSION, archive_metadata_backend_state,
     load_or_migrate_metadata_tables, metadata_table_snapshot_fingerprint,
     metadata_table_snapshot_path, metadata_tables_from_table_snapshot, metadata_tables_snapshot,
-    persist_metadata_table_snapshot, read_metadata_table_state_lenient,
+    persist_metadata_table_snapshot, read_metadata_table_snapshot_for_replica_repair,
+    read_metadata_table_state_lenient,
 };
 use crate::metadata_tables::{
     DfsMetadataTableRollback, DfsMetadataTables, DfsMetadataTablesSnapshot,
@@ -1534,6 +1536,74 @@ fn namespace_prepare_table_ops_for_record(
     }
 }
 
+fn namespace_prepare_journal_reference(
+    entry: &DfsMetadataJournalEntry,
+    prepare: &DfsNamespacePrepareRecord,
+) -> Result<DfsMetadataTableOp> {
+    let DfsMetadataMutation::PutNamespacePrepare {
+        file_system_id,
+        operation_id,
+        status,
+        prepare: Some(journal_prepare),
+    } = &entry.mutation
+    else {
+        return Err(MetadataBackendError::Serde(format!(
+            "journal entry {} cannot back namespace prepare {} table materialization",
+            entry.sequence, prepare.operation_id
+        )));
+    };
+    if entry.sequence == 0
+        || entry.shard_id != prepare.shard_id
+        || file_system_id != &prepare.file_system_id
+        || operation_id != &prepare.operation_id
+        || status != &prepare.status
+        || journal_prepare.file_system_id != prepare.file_system_id
+        || journal_prepare.shard_id != prepare.shard_id
+        || journal_prepare.operation_id != prepare.operation_id
+        || journal_prepare.operation_digest != prepare.operation_digest
+        || journal_prepare.owner_epoch != prepare.owner_epoch
+        || journal_prepare.status != prepare.status
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "journal entry {} does not match namespace prepare {} table reference fences",
+            entry.sequence, prepare.operation_id
+        )));
+    }
+    Ok(DfsMetadataTableOp::PutNamespacePrepareJournalReference {
+        shard_id: prepare.shard_id.clone(),
+        journal_sequence: entry.sequence,
+        file_system_id: prepare.file_system_id.clone(),
+        operation_id: prepare.operation_id.clone(),
+        operation_digest: prepare.operation_digest.clone(),
+        owner_epoch: prepare.owner_epoch,
+        status: prepare.status.clone(),
+    })
+}
+
+fn namespace_prepare_persisted_table_ops(
+    entry: &DfsMetadataJournalEntry,
+    apply_ops: &[DfsMetadataTableOp],
+) -> Result<Vec<DfsMetadataTableOp>> {
+    let mut prepare_references = 0usize;
+    let mut persisted_ops = Vec::with_capacity(apply_ops.len());
+    for op in apply_ops {
+        match op {
+            DfsMetadataTableOp::PutNamespacePrepare { prepare } => {
+                persisted_ops.push(namespace_prepare_journal_reference(entry, prepare)?);
+                prepare_references = prepare_references.saturating_add(1);
+            }
+            op => persisted_ops.push(op.clone()),
+        }
+    }
+    if prepare_references != 1 {
+        return Err(MetadataBackendError::Serde(format!(
+            "journal entry {} namespace prepare table materialization produced {prepare_references} prepare references",
+            entry.sequence
+        )));
+    }
+    Ok(persisted_ops)
+}
+
 fn namespace_prepare_commit_table_ops_for_reference(
     tables: &DfsMetadataTables,
     shard_id: &DfsMetadataShardId,
@@ -1979,6 +2049,10 @@ pub struct LocalSobjMetadataBackend {
     read_snapshot_cache: Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
     content_root_catalog_snapshot_cache: Option<Arc<DfsContentRootCatalogSnapshotCache>>,
     consistent_read_snapshot_depth: usize,
+    /// This non-primary handle intentionally ignored an unreadable rebuildable
+    /// table-log suffix. It may serve only its last self-contained snapshot
+    /// until authenticated replica repair installs a new authoritative image.
+    replica_repair_only: bool,
     #[cfg(test)]
     receipt_scan_counters: Arc<MetadataReceiptScanCounters>,
     #[cfg(test)]
@@ -2015,6 +2089,7 @@ impl LocalSobjMetadataBackend {
             read_snapshot_cache: Arc::new(Mutex::new(None)),
             content_root_catalog_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
+            replica_repair_only: false,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
             #[cfg(test)]
@@ -2136,6 +2211,7 @@ impl LocalSobjMetadataBackend {
             read_snapshot_cache: Arc::new(Mutex::new(None)),
             content_root_catalog_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
+            replica_repair_only: false,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
             #[cfg(test)]
@@ -2172,7 +2248,20 @@ impl LocalSobjMetadataBackend {
             root.clone(),
             metadata_cursor::journal_write_lock_path(&root),
         )?;
-        let state = read_metadata_table_state_lenient(&root)?;
+        let state = match read_metadata_table_state_lenient(&root) {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(
+                    target: "sinomo.dfs",
+                    shard = %shard_id.0,
+                    root = %root.display(),
+                    error = %error,
+                    "opening non-primary metadata replica from its last self-contained snapshot; authenticated snapshot repair is required"
+                );
+                read_metadata_table_snapshot_for_replica_repair(&root)?
+            }
+        };
+        require_version_pin_table_invariants(&state.tables)?;
         let materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
         let mut backend = Self {
             shard_id,
@@ -2189,6 +2278,7 @@ impl LocalSobjMetadataBackend {
             read_snapshot_cache: Arc::new(Mutex::new(None)),
             content_root_catalog_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
+            replica_repair_only: true,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
             #[cfg(test)]
@@ -2526,6 +2616,7 @@ impl LocalSobjMetadataBackend {
             read_snapshot_cache: Arc::new(Mutex::new(None)),
             content_root_catalog_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
+            replica_repair_only: false,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
             #[cfg(test)]
@@ -2641,6 +2732,7 @@ impl LocalSobjMetadataBackend {
         }
         create_dir_all(self.root.join("journal").join("segments"))?;
         self.tables = tables;
+        self.replica_repair_only = false;
         self.table_log_offset = 0;
         self.next_sequence = replayed_through_sequence.saturating_add(1).max(1);
         self.materialized_through_sequence = replayed_through_sequence;
@@ -3534,14 +3626,30 @@ impl LocalSobjMetadataBackend {
                 if ops.is_empty() {
                     return Ok(false);
                 }
+                let prepare_reference = namespace_prepare_journal_reference(entry, &prepare)?;
+                let mut persisted_prepare_reference = false;
                 for op in ops {
-                    if matches!(op, DfsMetadataTableOp::CommitNamespacePrepare { .. }) {
+                    if matches!(&op, DfsMetadataTableOp::PutNamespacePrepare { .. }) {
+                        self.plan_preapplied_table_op(op, table_ops, rollback);
+                        let persisted = table_ops.last_mut().ok_or_else(|| {
+                            MetadataBackendError::Serde(format!(
+                                "journal namespace prepare {operation_id} did not append its preapplied table operation"
+                            ))
+                        })?;
+                        *persisted = prepare_reference.clone();
+                        persisted_prepare_reference = true;
+                    } else if matches!(&op, DfsMetadataTableOp::CommitNamespacePrepare { .. }) {
                         self.tables
                             .apply_checked_with_rollback(op.clone(), rollback)?;
                         table_ops.push(op);
                     } else {
                         self.plan_preapplied_table_op(op, table_ops, rollback);
                     }
+                }
+                if !persisted_prepare_reference {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "journal namespace prepare {operation_id} did not materialize a journal-referenced prepare"
+                    )));
                 }
                 Ok(true)
             }
@@ -4003,6 +4111,23 @@ impl LocalSobjMetadataBackend {
         let entry = self.write_journal_unlocked(mutation)?;
         let table_ops = table_ops(self)?;
         self.append_and_apply_table_ops(entry.sequence, table_ops)?;
+        self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
+        Ok(entry)
+    }
+
+    fn write_namespace_prepare_and_materialize_unlocked(
+        &mut self,
+        prepare: &DfsNamespacePrepareRecord,
+        apply_ops: Vec<DfsMetadataTableOp>,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let entry =
+            self.write_journal_unlocked(DfsMetadataMutation::put_namespace_prepare(prepare))?;
+        let persisted_ops = namespace_prepare_persisted_table_ops(&entry, &apply_ops)?;
+        self.append_and_apply_table_ops_with_persisted_ops(
+            entry.sequence,
+            persisted_ops,
+            apply_ops,
+        )?;
         self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
         Ok(entry)
     }
@@ -4915,6 +5040,23 @@ impl LocalSobjMetadataBackend {
         )
     }
 
+    fn append_and_apply_table_ops_with_persisted_ops(
+        &mut self,
+        sequence: u64,
+        persisted_ops: Vec<DfsMetadataTableOp>,
+        apply_ops: Vec<DfsMetadataTableOp>,
+    ) -> Result<()> {
+        let root = self.root.clone();
+        metadata_table_apply::append_and_apply_table_ops_with_persisted_ops(
+            &root,
+            self.table_materialization_state(),
+            sequence,
+            persisted_ops,
+            apply_ops,
+            DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES,
+        )
+    }
+
     fn append_preapplied_table_ops(
         &mut self,
         sequence: u64,
@@ -4952,6 +5094,9 @@ impl LocalSobjMetadataBackend {
     }
 
     fn refresh_metadata_tables(&mut self) -> Result<()> {
+        if self.replica_repair_only {
+            return Ok(());
+        }
         metadata_read_snapshot::refresh_metadata_tables(
             &self.root,
             &mut self.tables,
@@ -4969,7 +5114,7 @@ impl LocalSobjMetadataBackend {
                 .get()
                 .saturating_add(1),
         );
-        if self.consistent_read_snapshot_depth > 0 {
+        if self.consistent_read_snapshot_depth > 0 || self.replica_repair_only {
             return Ok(DfsMetadataTablesSnapshot::Borrowed(&self.tables));
         }
         metadata_read_snapshot::current_tables_snapshot(
@@ -7563,9 +7708,11 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             // visible transaction already committed. Replicate the durable
             // committed marker again instead of attempting the forbidden
             // Committed -> Prepared transition.
-            return self.write_journal_entry_and_apply_table_ops_unlocked(
-                DfsMetadataMutation::put_namespace_prepare(&existing),
-                vec![DfsMetadataTableOp::PutNamespacePrepare { prepare: existing }],
+            return self.write_namespace_prepare_and_materialize_unlocked(
+                &existing,
+                vec![DfsMetadataTableOp::PutNamespacePrepare {
+                    prepare: existing.clone(),
+                }],
             );
         }
         let mut table_ops =
@@ -7575,10 +7722,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 prepare: prepare.clone(),
             });
         }
-        self.write_journal_entry_and_apply_table_ops_unlocked(
-            DfsMetadataMutation::put_namespace_prepare(&prepare),
-            table_ops,
-        )
+        self.write_namespace_prepare_and_materialize_unlocked(&prepare, table_ops)
     }
 
     fn rebind_prepared_namespace_transaction(
@@ -7618,9 +7762,11 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         // entry became durable. Re-journal the same prepared record without
         // weakening the old-fence compare for any different replacement.
         if current == rebound {
-            return self.write_journal_entry_and_apply_table_ops_unlocked(
-                DfsMetadataMutation::put_namespace_prepare(&rebound),
-                vec![DfsMetadataTableOp::PutNamespacePrepare { prepare: rebound }],
+            return self.write_namespace_prepare_and_materialize_unlocked(
+                &rebound,
+                vec![DfsMetadataTableOp::PutNamespacePrepare {
+                    prepare: rebound.clone(),
+                }],
             );
         }
         if current.status != DfsNamespacePrepareStatus::Prepared
@@ -7646,9 +7792,11 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         validate_namespace_prepare_expectations(&self.tables, &rebound)?;
         validate_namespace_prepare_does_not_overlap(&self.tables, &rebound)?;
         validate_namespace_transaction_preconditions(&self.tables, &rebound.transaction)?;
-        self.write_journal_entry_and_apply_table_ops_unlocked(
-            DfsMetadataMutation::put_namespace_prepare(&rebound),
-            vec![DfsMetadataTableOp::PutNamespacePrepare { prepare: rebound }],
+        self.write_namespace_prepare_and_materialize_unlocked(
+            &rebound,
+            vec![DfsMetadataTableOp::PutNamespacePrepare {
+                prepare: rebound.clone(),
+            }],
         )
     }
 
@@ -7826,10 +7974,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 prepare: prepare.clone(),
             });
         }
-        self.write_journal_entry_and_apply_table_ops_unlocked(
-            DfsMetadataMutation::put_namespace_prepare(&prepare),
-            table_ops,
-        )
+        self.write_namespace_prepare_and_materialize_unlocked(&prepare, table_ops)
     }
 
     fn get_namespace_prepare(
@@ -8000,29 +8145,60 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             .as_ref()
             .map(|after| entries.partition_point(|entry| entry <= &after.last_entry))
             .unwrap_or(0);
-        let end = start.saturating_add(request.max_entries).min(entries.len());
-        let page_entries = entries[start..end].to_vec();
-        let next_cursor = (end < entries.len()).then(|| DfsContentRootCatalogCursor {
-            journal_sequence,
-            state_fingerprint: state_fingerprint.clone(),
-            generated_at_unix_nanos,
-            last_entry: page_entries
-                .last()
-                .cloned()
-                .expect("a continued content-root page contains an entry"),
-        });
-        Ok(DfsContentRootCatalogPage {
-            identity: request.identity.clone(),
-            topology_digest: request.expected_topology_digest.clone(),
-            generated_at_unix_nanos,
-            coverage: DfsContentRootCatalogCoverage::Complete {
-                prefix_proof_version: DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
+        let maximum_end = start.saturating_add(request.max_entries).min(entries.len());
+        let page_for_end = |end: usize| {
+            let page_entries = entries[start..end].to_vec();
+            let next_cursor = (end < entries.len()).then(|| DfsContentRootCatalogCursor {
                 journal_sequence,
-                state_fingerprint,
-            },
-            entries: page_entries,
-            next_cursor,
-        })
+                state_fingerprint: state_fingerprint.clone(),
+                generated_at_unix_nanos,
+                last_entry: page_entries
+                    .last()
+                    .cloned()
+                    .expect("a continued content-root page contains an entry"),
+            });
+            DfsContentRootCatalogPage {
+                identity: request.identity.clone(),
+                topology_digest: request.expected_topology_digest.clone(),
+                generated_at_unix_nanos,
+                coverage: DfsContentRootCatalogCoverage::Complete {
+                    prefix_proof_version: DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
+                    journal_sequence,
+                    state_fingerprint: state_fingerprint.clone(),
+                },
+                entries: page_entries,
+                next_cursor,
+            }
+        };
+        let mut end = maximum_end;
+        let mut page = page_for_end(end);
+        let mut encoded_page_bytes = None;
+        while end > start.saturating_add(1) {
+            let encoded_bytes = page.encoded_size_bytes()?;
+            if encoded_bytes <= DFS_CONTENT_ROOT_CATALOG_TARGET_PAGE_BYTES {
+                encoded_page_bytes = Some(encoded_bytes);
+                break;
+            }
+            let current_entries = end.saturating_sub(start);
+            let scaled_entries = DFS_CONTENT_ROOT_CATALOG_TARGET_PAGE_BYTES
+                .saturating_mul(current_entries)
+                .checked_div(encoded_bytes)
+                .unwrap_or(1)
+                .clamp(1, current_entries.saturating_sub(1));
+            end = start.saturating_add(scaled_entries);
+            page = page_for_end(end);
+        }
+        let encoded_page_bytes = match encoded_page_bytes {
+            Some(encoded_page_bytes) => encoded_page_bytes,
+            None => page.encoded_size_bytes()?,
+        };
+        if encoded_page_bytes > DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES {
+            return Err(MetadataBackendError::Serde(format!(
+                "DFS content-root catalog page encodes to {encoded_page_bytes} bytes, exceeding the {}-byte transport budget",
+                DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES
+            )));
+        }
+        Ok(page)
     }
 
     fn metadata_content_protection(&self) -> Result<DfsMetadataContentProtection> {
@@ -9561,15 +9737,19 @@ mod tests {
     }
 
     fn metadata_table_batch_count(root: &Path) -> usize {
+        metadata_table_batches(root).len()
+    }
+
+    fn metadata_table_batches(root: &Path) -> Vec<DfsMetadataTableBatch> {
         use std::io::Read as _;
 
         let path = metadata_table_path(root);
         let mut file = match fs::File::open(&path) {
             Ok(file) => file,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => return 0,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Vec::new(),
             Err(source) => panic!("open metadata table log {}: {source}", path.display()),
         };
-        let mut count = 0usize;
+        let mut batches = Vec::new();
         loop {
             let mut length_bytes = [0_u8; 4];
             match file.read_exact(&mut length_bytes) {
@@ -9582,13 +9762,13 @@ mod tests {
             file.read_exact(&mut bytes).unwrap_or_else(|source| {
                 panic!("read metadata table batch {}: {source}", path.display())
             });
-            let _: DfsMetadataTableBatch =
+            batches.push(
                 sinomo_object_serde::from_bytes(&bytes).unwrap_or_else(|source| {
                     panic!("decode metadata table batch {}: {source}", path.display())
-                });
-            count = count.saturating_add(1);
+                }),
+            );
         }
-        count
+        batches
     }
 
     fn block_shard_journal_writes(root: &Path, shard_id: &str) {
@@ -9987,6 +10167,139 @@ mod tests {
     }
 
     #[test]
+    fn namespace_prepare_table_log_references_authoritative_journal_and_reopens() {
+        let root = temp_root("local_backend_prepare_table_journal_reference");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let current = object(version("version_prepare_table_reference_1"));
+        let mut committed = current.clone();
+        committed.version = version("version_prepare_table_reference_2");
+        committed.mode = 0o600;
+        let prepare = namespace_prepare(
+            "operation-prepare-table-reference",
+            &shard_id.0,
+            &current,
+            committed,
+        );
+
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        let entry = backend
+            .prepare_namespace_transaction(&prepare)
+            .expect("durable hidden prepare");
+        let authoritative_sequence = backend.journal_last_sequence();
+        let authoritative_snapshot = backend.export_table_snapshot();
+
+        let prepare_batch = metadata_table_batches(&root)
+            .into_iter()
+            .find(|batch| batch.sequence == entry.sequence)
+            .expect("prepare table batch");
+        assert!(
+            prepare_batch.ops.iter().any(|op| matches!(
+                op,
+                DfsMetadataTableOp::PutNamespacePrepareJournalReference {
+                    shard_id: referenced_shard_id,
+                    journal_sequence,
+                    operation_id,
+                    operation_digest,
+                    owner_epoch,
+                    status: DfsNamespacePrepareStatus::Prepared,
+                    ..
+                } if referenced_shard_id == &shard_id
+                    && *journal_sequence == entry.sequence
+                    && operation_id == &prepare.operation_id
+                    && operation_digest == &prepare.operation_digest
+                    && *owner_epoch == prepare.owner_epoch
+            )),
+            "the rebuildable table batch must retain a fenced journal reference"
+        );
+        assert!(
+            !prepare_batch
+                .ops
+                .iter()
+                .any(|op| matches!(op, DfsMetadataTableOp::PutNamespacePrepare { .. })),
+            "the table log must not encode the full prepared transaction a second time"
+        );
+
+        drop(backend);
+        let reopened =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("reopened backend");
+        assert_eq!(
+            reopened
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("reopened prepare"),
+            Some(prepare.clone()),
+            "table replay must resolve the complete prepare from the journal"
+        );
+        drop(reopened);
+
+        let segment_id = crate::metadata_journal::journal_segment_id(entry.sequence);
+        fs::remove_file(
+            root.join("journal")
+                .join("segments")
+                .join(format!("{segment_id:020}.slog")),
+        )
+        .expect("remove referenced journal segment");
+        let error = match LocalSobjMetadataBackend::new(shard_id.clone(), &root) {
+            Ok(_) => panic!("missing referenced journal entry must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("cannot resolve namespace prepare"),
+            "unexpected missing journal reference error: {error}"
+        );
+
+        let repair_only =
+            LocalSobjMetadataBackend::open_for_replica_repair(shard_id.clone(), &root)
+                .expect("non-primary repair-only open must ignore the unresolved table-log suffix");
+        assert_eq!(
+            repair_only
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("repair-only snapshot read"),
+            None,
+            "repair-only reads must expose only the last self-contained snapshot"
+        );
+        drop(repair_only);
+
+        let permit = DfsMetadataReplicaIngestPermit::new_validated(
+            prepare.file_system_id.clone(),
+            shard_id.clone(),
+            node("node_prepare_table_repair_source"),
+            1,
+        );
+        let (repaired, archived) =
+            LocalSobjMetadataBackend::replace_unreadable_with_replicated_snapshot(
+                &permit,
+                shard_id.clone(),
+                &root,
+                shard_id.clone(),
+                authoritative_sequence,
+                authoritative_snapshot,
+            )
+            .expect("install authoritative snapshot over unresolved table reference");
+        assert!(archived);
+        assert_eq!(
+            repaired
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("repaired prepare"),
+            Some(prepare.clone())
+        );
+        drop(repaired);
+
+        let reopened =
+            LocalSobjMetadataBackend::new(shard_id, &root).expect("reopen repaired backend");
+        assert_eq!(
+            reopened
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("reopened repaired prepare"),
+            Some(prepare)
+        );
+        cleanup(&root);
+    }
+
+    #[test]
     fn compact_request_owned_prepare_survives_replay_and_closes_exact_retry_with_receipt() {
         let root = temp_root("local_backend_compact_request_prepare_replay");
         let shard_id = DfsMetadataShardId::new("shard-root");
@@ -10296,6 +10609,9 @@ mod tests {
                 });
             prepare.transaction.objects.push(object);
         }
+        prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+                .expect("4096-object prepare digest");
 
         let full = DfsMetadataMutation::put_namespace_prepare(&prepare);
         let compact = DfsMetadataMutation::commit_namespace_prepare(&prepare);
@@ -10317,6 +10633,48 @@ mod tests {
             serde_json::from_slice::<DfsMetadataMutation>(&compact_bytes)
                 .expect("round-trip compact commit"),
             compact
+        );
+
+        let entry = DfsMetadataJournalEntry {
+            shard_id,
+            sequence: 1,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            mutation: full,
+        };
+        let full_table_batch = DfsMetadataTableBatch {
+            sequence: entry.sequence,
+            ops: vec![DfsMetadataTableOp::PutNamespacePrepare {
+                prepare: prepare.clone(),
+            }],
+            prefix_proof: None,
+        };
+        let referenced_table_batch = DfsMetadataTableBatch {
+            sequence: entry.sequence,
+            ops: namespace_prepare_persisted_table_ops(&entry, &full_table_batch.ops)
+                .expect("journal-referenced prepare table operation"),
+            prefix_proof: None,
+        };
+        assert!(matches!(
+            referenced_table_batch.ops.as_slice(),
+            [DfsMetadataTableOp::PutNamespacePrepareJournalReference { .. }]
+        ));
+        let full_table_bytes = sinomo_object_serde::to_bytes(
+            &full_table_batch,
+            1,
+            sinomo_core::object::LengthMode::U32,
+        )
+        .expect("encode full prepare table batch");
+        let referenced_table_bytes = sinomo_object_serde::to_bytes(
+            &referenced_table_batch,
+            1,
+            sinomo_core::object::LengthMode::U32,
+        )
+        .expect("encode referenced prepare table batch");
+        assert!(
+            referenced_table_bytes.len().saturating_mul(100) < full_table_bytes.len(),
+            "journal-referenced prepare table batch should be at least 100x smaller: full={} referenced={}",
+            full_table_bytes.len(),
+            referenced_table_bytes.len()
         );
     }
 
@@ -17528,6 +17886,64 @@ mod tests {
                 .load(Ordering::Relaxed),
             2,
             "a new durable cut must rebuild the root snapshot"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn content_root_catalog_page_adapts_to_encoded_byte_budget() {
+        let root = temp_root("content-root-catalog-byte-budget");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        let file = object(version("version_catalog_budget_current"));
+        backend.put_object(&file).expect("object");
+        for index in 0..700 {
+            let version_suffix = format!("{index:03}{}", "v".repeat(180));
+            let mut record = object_version_record(
+                &file,
+                version(&format!("version_catalog_budget_{version_suffix}")),
+                OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(index),
+            );
+            record.content_hash = Some(format!("blake3:{index:03}{}", "a".repeat(220)));
+            backend.put_version(&record).expect("catalog version");
+        }
+
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file.file_system_id.clone(),
+            shard_id: shard_id.0.clone(),
+            primary_node_id: node("node_owner"),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let request = DfsContentRootCatalogPageRequest {
+            identity: DfsContentRootCatalogShardIdentity::from_config(&shard),
+            expected_topology_digest: dfs_content_root_catalog_topology_digest(&[shard])
+                .expect("topology digest"),
+            minimum_journal_sequence: 0,
+            minimum_state_fingerprint: None,
+            after: None,
+            max_entries: crate::DEFAULT_DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRIES,
+        };
+        let page = backend
+            .content_root_catalog_page(&request)
+            .expect("byte-bounded content-root page");
+        page.validate_for_request(&request)
+            .expect("valid byte-bounded page");
+        assert!(
+            page.next_cursor.is_some(),
+            "a byte-bounded first page must expose a continuation"
+        );
+        assert!(
+            page.entries.len() < request.max_entries,
+            "the encoded byte budget, not only the entry ceiling, must bound this fixture"
+        );
+        assert!(
+            page.encoded_size_bytes().expect("encoded page size")
+                <= DFS_CONTENT_ROOT_CATALOG_TARGET_PAGE_BYTES,
+            "ordinary multi-entry pages should stay inside the target byte budget"
         );
         cleanup(&root);
     }

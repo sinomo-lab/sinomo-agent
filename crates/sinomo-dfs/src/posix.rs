@@ -23,6 +23,30 @@ pub(crate) mod sync;
 #[cfg(test)]
 pub(crate) use metadata::{posix_metadata_raw_lookup_count, reset_posix_metadata_raw_lookup_count};
 
+#[cfg(test)]
+thread_local! {
+    static POSIX_BULK_PREP_DURABLE_TABLE_PROBES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static POSIX_BULK_PREP_TABLE_SNAPSHOT_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_posix_bulk_prep_durable_table_probes() {
+    POSIX_BULK_PREP_DURABLE_TABLE_PROBES.set(0);
+    POSIX_BULK_PREP_TABLE_SNAPSHOT_CALLS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn posix_bulk_prep_durable_table_probes() -> usize {
+    POSIX_BULK_PREP_DURABLE_TABLE_PROBES.get()
+}
+
+#[cfg(test)]
+pub(crate) fn posix_bulk_prep_table_snapshot_calls() -> usize {
+    POSIX_BULK_PREP_TABLE_SNAPSHOT_CALLS.get()
+}
+
 use crate::dfs_now_unix_nanos as now_unix_nanos;
 use crate::metadata_records::object_version_record;
 use crate::namespace::{
@@ -1456,11 +1480,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(Vec::new());
         }
 
-        let mut prepared = Vec::with_capacity(files.len());
-        let mut seen_objects = BTreeSet::new();
+        // Resolve parents before pinning the local metadata generation. Parent
+        // resolution may need a remote freshness pull, which can ingest newer
+        // metadata locally; no backend mutation may happen inside the bounded
+        // consistent-read scope below.
+        let mut normalized_files = Vec::with_capacity(files.len());
         let mut resolved_parents = BTreeMap::<String, (String, DfsObjectMetadata)>::new();
-        let metadata_shard_snapshot = self.refresh_sifs_metadata_shards()?;
-        for (path, bytes) in files {
+        for &(path, bytes) in files {
             let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
             if requires_directory {
                 return match self.ensure_resolved_path_is_directory(&path) {
@@ -1477,96 +1503,171 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let Some(parent) = parent_posix_path(&path) else {
                 return Err(DfsPosixError::IsDirectory { path });
             };
-            let (resolved_parent, parent_object) = match resolved_parents.get(&parent) {
-                Some(resolved) => resolved.clone(),
-                None => {
-                    let resolved =
-                        self.resolve_posix_bulk_parent(&parent, require_authoritative_parents)?;
-                    resolved_parents.insert(parent.clone(), resolved.clone());
-                    resolved
-                }
-            };
+            if !resolved_parents.contains_key(&parent) {
+                let resolved =
+                    self.resolve_posix_bulk_parent(&parent, require_authoritative_parents)?;
+                resolved_parents.insert(parent.clone(), resolved);
+            }
             let Some((_, child_name)) = path.rsplit_once('/') else {
                 return Err(DfsPosixError::InvalidPath { path });
             };
-            let path = join_posix_path(&resolved_parent, child_name);
-            let mut link_count_hint = None;
-            let (object, expected_base_version, touch_parent_on_create) = match self
-                .lookup_sifs_path(&path)?
-            {
-                Some(object) if object.kind == DfsObjectKind::Directory => {
-                    return Err(DfsPosixError::IsDirectory { path });
-                }
-                Some(object) if object.kind == DfsObjectKind::Symlink => {
-                    return self.posix_write_files_local_eventual_fallback(files);
-                }
-                Some(object) if object.kind == DfsObjectKind::Hardlink => {
-                    let object = self.resolve_hardlink_target(&object)?;
-                    let base = Some(object.version.clone());
-                    (object, base, false)
-                }
-                Some(object) if object.kind == DfsObjectKind::Tombstone => {
-                    let object =
-                        recreated_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
-                    link_count_hint = Some(1);
-                    (object, None, true)
-                }
-                Some(object) => {
-                    let base = Some(object.version.clone());
-                    (object, base, false)
-                }
-                None => {
-                    link_count_hint = Some(1);
-                    (
-                        new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File),
-                        None,
-                        true,
-                    )
-                }
-            };
-            if !seen_objects.insert(object.object_id.clone()) {
-                return self.posix_write_files_local_eventual_fallback(files);
-            }
-            if object.policy != DfsObjectPolicy::ReplicatedEventual
-                || object.owner_node_id != self.node_id
-            {
-                return self.posix_write_files_local_eventual_fallback(files);
-            }
-            let metadata_shard = match metadata_shard_snapshot.as_deref() {
-                Some(shards) => {
-                    self.select_sifs_metadata_shard_for_path_from_snapshot(&path, shards)?
-                }
-                None => None,
-            };
-            let parent_touch = if touch_parent_on_create {
-                Some(PosixBulkParentTouch {
-                    path: resolved_parent.clone(),
-                    object: parent_object.clone(),
-                    metadata_shard: match metadata_shard_snapshot.as_deref() {
-                        Some(shards) => self.select_sifs_metadata_shard_for_path_from_snapshot(
-                            &resolved_parent,
-                            shards,
-                        )?,
-                        None => None,
-                    },
-                })
-            } else {
-                None
-            };
-            let target_version = next_version(&object.version);
-            prepared.push(PosixBulkLocalWrite {
-                path,
-                object,
-                target_version,
-                expected_base_version,
-                bytes: *bytes,
-                metadata_shard,
-                parent_touch,
-                link_count_hint,
-            });
+            normalized_files.push((parent, child_name.to_string(), bytes));
         }
 
-        self.commit_posix_bulk_local_writes(prepared)
+        let metadata_shard_snapshot = self.refresh_sifs_metadata_shards()?;
+        let pinned_metadata_snapshot = if let Some(backend) = self.metadata_backend.as_mut() {
+            backend
+                .begin_consistent_read_snapshot()
+                .map_err(DfsPosixError::from)?;
+            true
+        } else {
+            false
+        };
+        #[cfg(test)]
+        let durable_table_probes_before =
+            crate::metadata_read_snapshot::metadata_durable_table_probes();
+        #[cfg(test)]
+        let table_snapshot_calls_before =
+            crate::metadata_backend::metadata_current_tables_snapshot_calls();
+        let file_system_id = sifs_file_system_id();
+        let preparation = (|| {
+            // The pre-pin walk may have synchronized a remote parent, but it
+            // cannot prove that parent is still live in the generation used
+            // for child discovery. Revalidate every unique resolved parent
+            // once, then use that exact pinned object for parent touches.
+            let mut pinned_parents = BTreeMap::<String, (String, DfsObjectMetadata)>::new();
+            for (parent, (resolved_parent, _)) in &resolved_parents {
+                let Some(parent_object) = self.lookup_metadata_path_for_local_overwrite(
+                    &file_system_id,
+                    resolved_parent,
+                    false,
+                )?
+                else {
+                    return Err(DfsPosixError::MissingParent {
+                        path: resolved_parent.clone(),
+                    });
+                };
+                if parent_object.kind == DfsObjectKind::Tombstone {
+                    return Err(DfsPosixError::MissingParent {
+                        path: resolved_parent.clone(),
+                    });
+                }
+                let parent_object = self.resolve_hardlink_target(&parent_object)?;
+                if parent_object.kind != DfsObjectKind::Directory {
+                    return Err(DfsPosixError::NotDirectory {
+                        path: resolved_parent.clone(),
+                    });
+                }
+                pinned_parents.insert(parent.clone(), (resolved_parent.clone(), parent_object));
+            }
+
+            let mut prepared = Vec::with_capacity(files.len());
+            let mut seen_objects = BTreeSet::new();
+            for (parent, child_name, bytes) in &normalized_files {
+                let (resolved_parent, parent_object) = pinned_parents
+                    .get(parent)
+                    .expect("bulk parent was revalidated in pinned metadata generation");
+                let path = join_posix_path(resolved_parent, child_name);
+                let mut link_count_hint = None;
+                let (object, expected_base_version, touch_parent_on_create) = match self
+                    .lookup_metadata_path_for_local_overwrite(&file_system_id, &path, true)?
+                {
+                    Some(object) if object.kind == DfsObjectKind::Directory => {
+                        return Err(DfsPosixError::IsDirectory { path });
+                    }
+                    Some(object) if object.kind == DfsObjectKind::Symlink => return Ok(None),
+                    Some(object) if object.kind == DfsObjectKind::Hardlink => {
+                        let object = self.resolve_hardlink_target(&object)?;
+                        let base = Some(object.version.clone());
+                        (object, base, false)
+                    }
+                    Some(object) if object.kind == DfsObjectKind::Tombstone => {
+                        let object = recreated_posix_metadata_object(
+                            &self.node_id,
+                            &path,
+                            DfsObjectKind::File,
+                        );
+                        link_count_hint = Some(1);
+                        (object, None, true)
+                    }
+                    Some(object) => {
+                        let base = Some(object.version.clone());
+                        (object, base, false)
+                    }
+                    None => {
+                        link_count_hint = Some(1);
+                        (
+                            new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File),
+                            None,
+                            true,
+                        )
+                    }
+                };
+                if !seen_objects.insert(object.object_id.clone()) {
+                    return Ok(None);
+                }
+                if object.policy != DfsObjectPolicy::ReplicatedEventual
+                    || object.owner_node_id != self.node_id
+                {
+                    return Ok(None);
+                }
+                let metadata_shard = match metadata_shard_snapshot.as_deref() {
+                    Some(shards) => {
+                        self.select_sifs_metadata_shard_for_path_from_snapshot(&path, shards)?
+                    }
+                    None => None,
+                };
+                let parent_touch = if touch_parent_on_create {
+                    Some(PosixBulkParentTouch {
+                        path: resolved_parent.clone(),
+                        object: parent_object.clone(),
+                        metadata_shard: match metadata_shard_snapshot.as_deref() {
+                            Some(shards) => self
+                                .select_sifs_metadata_shard_for_path_from_snapshot(
+                                    resolved_parent,
+                                    shards,
+                                )?,
+                            None => None,
+                        },
+                    })
+                } else {
+                    None
+                };
+                let target_version = next_version(&object.version);
+                prepared.push(PosixBulkLocalWrite {
+                    path,
+                    object,
+                    target_version,
+                    expected_base_version,
+                    bytes: *bytes,
+                    metadata_shard,
+                    parent_touch,
+                    link_count_hint,
+                });
+            }
+            Ok(Some(prepared))
+        })();
+        #[cfg(test)]
+        POSIX_BULK_PREP_DURABLE_TABLE_PROBES.set(
+            crate::metadata_read_snapshot::metadata_durable_table_probes()
+                .saturating_sub(durable_table_probes_before),
+        );
+        #[cfg(test)]
+        POSIX_BULK_PREP_TABLE_SNAPSHOT_CALLS.set(
+            crate::metadata_backend::metadata_current_tables_snapshot_calls()
+                .saturating_sub(table_snapshot_calls_before),
+        );
+        if pinned_metadata_snapshot {
+            self.metadata_backend
+                .as_mut()
+                .expect("pinned metadata backend remains installed")
+                .end_consistent_read_snapshot();
+        }
+
+        match preparation? {
+            Some(prepared) => self.commit_posix_bulk_local_writes(prepared),
+            None => self.posix_write_files_local_eventual_fallback(files),
+        }
     }
 
     pub fn posix_create_files_local_eventual_with_known_parents<'a, I>(
@@ -1671,6 +1772,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         prepared: Vec<PosixBulkLocalWrite<'a>>,
     ) -> Result<Vec<DfsStat>> {
+        let trace_started = Instant::now();
+        let trace_object_count = prepared.len();
+        let trace_content_bytes = prepared.iter().fold(0usize, |bytes, write| {
+            bytes.saturating_add(write.bytes.len())
+        });
+        let content_started = Instant::now();
         let content_versions = prepared.iter().map(|write| {
             (
                 write.object.object_id.as_str(),
@@ -1682,6 +1789,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .content
             .put_object_version_blobs_only(content_versions)
             .map_err(DfsError::from)?;
+        let content_elapsed = content_started.elapsed();
+        let prepare_setup_started = Instant::now();
         let write_time = now_unix_nanos();
         let mut committed_objects = Vec::with_capacity(prepared.len());
         for (write, manifest) in prepared.iter().zip(manifests.iter()) {
@@ -1765,8 +1874,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .flatten()
             .map(|object| object.path.clone())
             .collect::<BTreeSet<_>>();
+        let prepare_setup_elapsed = prepare_setup_started.elapsed();
+        let authority_group_count = objects_by_metadata_authority.len();
+        let mut group_prepare_elapsed = Duration::ZERO;
+        let mut authority_commit_elapsed = Duration::ZERO;
         let mut committed_metadata_paths = BTreeSet::new();
         for (metadata_authority, objects) in objects_by_metadata_authority {
+            let group_prepare_started = Instant::now();
             let group_metadata_paths = objects
                 .iter()
                 .map(|object| object.path.clone())
@@ -1826,6 +1940,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     },
                 })
                 .collect::<Vec<_>>();
+            let trace_write_count = writes.len();
+            let group_prepare_duration = group_prepare_started.elapsed();
+            group_prepare_elapsed = group_prepare_elapsed.saturating_add(group_prepare_duration);
+            let trace_shard_id = selected_shard
+                .as_ref()
+                .map(|shard| shard.shard_id.clone())
+                .unwrap_or_else(|| "local-unsharded".to_string());
+            let trace_remote = authority_node_id != self.node_id;
+            let authority_commit_started = Instant::now();
             let result = if authority_node_id != self.node_id {
                 self.route_namespace_operation_without_local_replay(
                     authority_node_id,
@@ -1845,6 +1968,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map(drop)
                 .map_err(DfsPosixError::from)
             };
+            let authority_commit_duration = authority_commit_started.elapsed();
+            authority_commit_elapsed =
+                authority_commit_elapsed.saturating_add(authority_commit_duration);
+            crate::dfs_perf_trace(format_args!(
+                "posix-bulk-authority-commit node={} shard={} remote={} objects={} writes={} prepare_us={} commit_ms={} success={}",
+                self.node_id,
+                trace_shard_id,
+                trace_remote,
+                objects.len(),
+                trace_write_count,
+                group_prepare_duration.as_micros(),
+                authority_commit_duration.as_millis(),
+                result.is_ok()
+            ));
             if let Err(source) = result {
                 // An authoritative create-only rejection proves that this
                 // shard group committed nothing. Preserve O_EXCL/EEXIST when
@@ -1873,7 +2010,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             committed_metadata_paths.extend(group_metadata_paths);
         }
-        committed_objects
+        let stat_started = Instant::now();
+        let stats = committed_objects
             .iter()
             .zip(prepared.iter())
             .map(|(object, write)| {
@@ -1883,7 +2021,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     write.link_count_hint,
                 )
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        let stat_elapsed = stat_started.elapsed();
+        crate::dfs_perf_trace(format_args!(
+            "posix-bulk-local-write node={} objects={} content_bytes={} authority_groups={} content_ms={} prepare_setup_ms={} group_prepare_ms={} authority_commit_ms={} stat_ms={} total_ms={}",
+            self.node_id,
+            trace_object_count,
+            trace_content_bytes,
+            authority_group_count,
+            content_elapsed.as_millis(),
+            prepare_setup_elapsed.as_millis(),
+            group_prepare_elapsed.as_millis(),
+            authority_commit_elapsed.as_millis(),
+            stat_elapsed.as_millis(),
+            trace_started.elapsed().as_millis()
+        ));
+        Ok(stats)
     }
 
     fn posix_write_files_local_eventual_fallback<'a>(
