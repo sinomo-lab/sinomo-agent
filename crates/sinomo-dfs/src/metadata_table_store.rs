@@ -23,13 +23,15 @@ use crate::metadata_io::{
     read_sobj_optional, read_sobj_tree, remove_file_if_exists, sync_dir, write_file_atomic,
     write_sobj_atomic,
 };
+use crate::metadata_journal::segmented_journal_entry_at_sequence;
 use crate::metadata_keys::path_record_for_object;
 use crate::metadata_records::{
     DfsConflictRecord, DfsDirFragmentRecord, DfsHardlinkIndexSnapshotRecord, DfsInodeRecord,
-    DfsMetadataPrefixProof, DfsMetadataTableBatch, DfsMetadataTableOp, DfsMetadataTableSnapshot,
-    DfsMetadataTableSnapshotTables, DfsNamespaceTransaction, DfsObjectVersionRecord, DfsPathRecord,
-    DfsReplicaReceiptRecord, DfsVisibleCommitSnapshotRecord, DfsVisibleVersionCommitRecord,
-    DfsWriteIntentRecord, dfs_metadata_table_snapshot_state_fingerprint,
+    DfsMetadataMutation, DfsMetadataPrefixProof, DfsMetadataTableBatch, DfsMetadataTableOp,
+    DfsMetadataTableSnapshot, DfsMetadataTableSnapshotTables, DfsNamespaceTransaction,
+    DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord, DfsVisibleCommitSnapshotRecord,
+    DfsVisibleVersionCommitRecord, DfsWriteIntentRecord,
+    dfs_metadata_table_snapshot_state_fingerprint, normalized_namespace_prepare,
     normalized_object_metadata, normalized_version_record,
 };
 use crate::metadata_tables::{
@@ -109,6 +111,20 @@ pub(crate) fn read_metadata_table_state_lenient(root: &Path) -> Result<DfsMetada
     read_metadata_table_state_with_tail_policy(root, false)
 }
 
+/// Read only the last self-contained table snapshot for a non-primary replica
+/// that could not replay its rebuildable table logs.
+///
+/// The caller must remain repair-only until an authenticated authoritative
+/// snapshot replaces this state. In particular, this intentionally ignores
+/// both the rotated checkpoint log and active `materialized.slog`, which may
+/// contain journal references that cannot be resolved from a damaged or
+/// missing local journal suffix.
+pub(crate) fn read_metadata_table_snapshot_for_replica_repair(
+    root: &Path,
+) -> Result<DfsMetadataTableState> {
+    read_metadata_table_snapshot(root, false)
+}
+
 fn read_metadata_table_state_with_tail_policy(
     root: &Path,
     truncate_torn_tail: bool,
@@ -117,6 +133,7 @@ fn read_metadata_table_state_with_tail_policy(
     let checkpoint_path = metadata_table_checkpoint_log_path(root);
     if checkpoint_path.is_file() {
         let replay = replay_metadata_table_batches_after_checkpoint_from(
+            root,
             &checkpoint_path,
             0,
             state.materialized_through_sequence,
@@ -136,6 +153,7 @@ fn read_metadata_table_state_with_tail_policy(
     let table_path = metadata_table_path(root);
     if table_path.is_file() {
         let replay = replay_metadata_table_batches_after_checkpoint_from(
+            root,
             &table_path,
             0,
             state.materialized_through_sequence,
@@ -165,6 +183,7 @@ pub(crate) fn read_metadata_table_checkpoint_state(root: &Path) -> Result<DfsMet
         return Ok(state);
     }
     let replay = replay_metadata_table_batches_after_checkpoint_from(
+        root,
         &checkpoint_path,
         0,
         state.materialized_through_sequence,
@@ -359,14 +378,16 @@ pub(crate) fn metadata_tables_from_table_snapshot(
 }
 
 pub(crate) fn replay_metadata_table_batches_from(
+    root: &Path,
     path: &Path,
     offset: u64,
     tables: &mut DfsMetadataTables,
 ) -> Result<MetadataTableReplay> {
-    replay_metadata_table_batches_after_checkpoint_from(path, offset, None, tables)
+    replay_metadata_table_batches_after_checkpoint_from(root, path, offset, None, tables)
 }
 
 fn replay_metadata_table_batches_after_checkpoint_from(
+    root: &Path,
     path: &Path,
     offset: u64,
     checkpoint_sequence: Option<u64>,
@@ -396,11 +417,12 @@ fn replay_metadata_table_batches_after_checkpoint_from(
             path: path.to_owned(),
             source,
         })?;
-    replay_metadata_table_batches(&mut file, path, checkpoint_sequence, tables)
+    replay_metadata_table_batches(&mut file, root, path, checkpoint_sequence, tables)
 }
 
 fn replay_metadata_table_batches(
     file: &mut fs::File,
+    root: &Path,
     path: &Path,
     checkpoint_sequence: Option<u64>,
     tables: &mut DfsMetadataTables,
@@ -454,7 +476,11 @@ fn replay_metadata_table_batches(
         }
         if checkpoint_sequence.is_none_or(|checkpoint| batch.sequence > checkpoint) {
             for op in batch.ops {
-                tables.apply_checked(op)?;
+                tables.apply_checked(resolve_metadata_table_op_from_journal(
+                    root,
+                    batch.sequence,
+                    op,
+                )?)?;
             }
         }
         // Only advance past fully decoded records: a torn record at the tail
@@ -466,6 +492,68 @@ fn replay_metadata_table_batches(
         materialized_through_sequence,
         prefix_proof,
     })
+}
+
+fn resolve_metadata_table_op_from_journal(
+    root: &Path,
+    batch_sequence: u64,
+    op: DfsMetadataTableOp,
+) -> Result<DfsMetadataTableOp> {
+    let DfsMetadataTableOp::PutNamespacePrepareJournalReference {
+        shard_id,
+        journal_sequence,
+        file_system_id,
+        operation_id,
+        operation_digest,
+        owner_epoch,
+        status,
+    } = op
+    else {
+        return Ok(op);
+    };
+    if journal_sequence == 0 || journal_sequence > batch_sequence {
+        return Err(MetadataBackendError::Serde(format!(
+            "metadata table batch {batch_sequence} has invalid namespace prepare {operation_id} journal reference {journal_sequence}"
+        )));
+    }
+    let entry = segmented_journal_entry_at_sequence(root, journal_sequence)?.ok_or_else(|| {
+        MetadataBackendError::Serde(format!(
+            "metadata table batch {batch_sequence} cannot resolve namespace prepare {operation_id} from missing journal sequence {journal_sequence}"
+        ))
+    })?;
+    if entry.shard_id != shard_id {
+        return Err(MetadataBackendError::Serde(format!(
+            "metadata table namespace prepare {operation_id} journal reference names shard {}, entry {journal_sequence} belongs to {}",
+            shard_id.0, entry.shard_id.0
+        )));
+    }
+    let DfsMetadataMutation::PutNamespacePrepare {
+        file_system_id: journal_file_system_id,
+        operation_id: journal_operation_id,
+        status: journal_status,
+        prepare: Some(prepare),
+    } = entry.mutation
+    else {
+        return Err(MetadataBackendError::Serde(format!(
+            "metadata table namespace prepare {operation_id} reference {journal_sequence} does not name a payload-complete put-namespace-prepare entry"
+        )));
+    };
+    let prepare = normalized_namespace_prepare(&prepare);
+    if journal_file_system_id != file_system_id
+        || journal_operation_id != operation_id
+        || journal_status != status
+        || prepare.file_system_id != file_system_id
+        || prepare.shard_id != shard_id
+        || prepare.operation_id != operation_id
+        || prepare.operation_digest != operation_digest
+        || prepare.owner_epoch != owner_epoch
+        || prepare.status != status
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "metadata table namespace prepare {operation_id} reference {journal_sequence} scope/digest/epoch/status fence mismatch"
+        )));
+    }
+    Ok(DfsMetadataTableOp::PutNamespacePrepare { prepare })
 }
 
 pub(crate) fn append_metadata_table_batch(

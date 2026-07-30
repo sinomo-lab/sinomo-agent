@@ -1345,12 +1345,26 @@ impl SifsFileManagerBackend {
         files: &[(String, Vec<u8>)],
         deadline: Instant,
     ) -> Result<(), String> {
-        self.write_files_with_known_parents_deferred_publish_with_deadline(files, Some(deadline))
+        self.write_files_with_known_parents_deferred_publish_mode_until(files, false, deadline)
+    }
+
+    pub(crate) fn write_files_with_known_parents_deferred_publish_mode_until(
+        &self,
+        files: &[(String, Vec<u8>)],
+        overwrite_existing: bool,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        self.write_files_with_known_parents_deferred_publish_with_deadline(
+            files,
+            overwrite_existing,
+            Some(deadline),
+        )
     }
 
     fn write_files_with_known_parents_deferred_publish_with_deadline(
         &self,
         files: &[(String, Vec<u8>)],
+        overwrite_existing: bool,
         operation_deadline: Option<Instant>,
     ) -> Result<(), String> {
         let normalized = files
@@ -1364,14 +1378,16 @@ impl SifsFileManagerBackend {
         let result = (|| {
             self.refresh_service_peer_targets_with_deadline(&mut service, operation_deadline);
             sifs_operation_remaining(operation_deadline, "refreshing SIFS peer targets")?;
-            service
-                .posix_create_files_local_eventual_with_known_parents(
-                    normalized
-                        .iter()
-                        .map(|(path, bytes)| (path.as_str(), *bytes)),
-                )
-                .map(|_| ())
-                .map_err(|error| format!("cannot write SIFS bulk batch: {error}"))
+            let files = normalized
+                .iter()
+                .map(|(path, bytes)| (path.as_str(), *bytes));
+            if overwrite_existing {
+                service.posix_write_files_local_eventual_with_known_parents(files)
+            } else {
+                service.posix_create_files_local_eventual_with_known_parents(files)
+            }
+            .map(|_| ())
+            .map_err(|error| format!("cannot write SIFS bulk batch: {error}"))
         })();
         if let Some(previous_deadline) = previous_deadline {
             service.set_transport_operation_deadline(previous_deadline);
@@ -4120,6 +4136,54 @@ mod tests {
         writer.write_file(path, new).expect("write new payload");
 
         assert_eq!(reader.read_file(path).expect("read new payload"), new);
+    }
+
+    #[test]
+    fn bulk_write_mode_preserves_create_exclusivity_and_can_overwrite_existing_files() {
+        let root = temp_sifs_data_dir("bulk-write-overwrite-existing");
+        let data_dir = SinomoDataDir::new(&root);
+        let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
+        let parent = "/services/bulk-write-overwrite-existing";
+        let path = format!("{parent}/payload.bin");
+        let initial = vec![(path.clone(), b"initial payload".to_vec())];
+        let replacement = vec![(path.clone(), b"replacement payload".to_vec())];
+
+        backend.create_dir_all(parent).expect("create bulk parent");
+        backend
+            .write_files_with_known_parents_deferred_publish_until(
+                &initial,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .expect("create bulk file");
+        assert_eq!(
+            backend.read_file(&path).expect("read initial bulk file"),
+            initial[0].1
+        );
+
+        let create_error = backend
+            .write_files_with_known_parents_deferred_publish_until(
+                &replacement,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .expect_err("default bulk mode must retain create exclusivity");
+        assert!(
+            create_error.contains("already exists"),
+            "unexpected create-only bulk error: {create_error}"
+        );
+
+        backend
+            .write_files_with_known_parents_deferred_publish_mode_until(
+                &replacement,
+                true,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .expect("overwrite existing bulk file");
+        assert_eq!(
+            backend
+                .read_file(&path)
+                .expect("read replacement bulk file"),
+            replacement[0].1
+        );
     }
 
     #[test]

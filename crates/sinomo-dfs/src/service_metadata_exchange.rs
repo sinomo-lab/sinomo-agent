@@ -6,9 +6,11 @@
 //! background publish planner remains in `metadata_replication`.
 
 use std::path::Path;
+use std::time::Instant;
 
 use sinomo_core::node::NodeId;
 
+use crate::content_root_catalog::DfsContentRootCatalogFragmentBuilder;
 use crate::*;
 
 fn content_root_catalog_file_system_config_key_is_exact(key: &str) -> bool {
@@ -367,6 +369,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         head_watermarks: &[DfsMetadataShardHeadWatermark],
         max_pages_per_shard: usize,
     ) -> Result<DfsContentRootCatalog, DfsError> {
+        let trace_started = Instant::now();
         let content_root = content_root.as_ref();
         let expected_topology = DfsContentRootCatalogTopologySnapshot::canonical(
             file_systems.to_vec(),
@@ -415,8 +418,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
 
         let mut fragments = Vec::with_capacity(identities.len());
+        let mut total_pages = 0usize;
+        let mut total_entries = 0usize;
         for identity in &identities {
-            let initial_request = DfsContentRootCatalogPageRequest {
+            let shard_started = Instant::now();
+            let mut request = DfsContentRootCatalogPageRequest {
                 identity: identity.clone(),
                 expected_topology_digest: expected_topology_digest.clone(),
                 minimum_journal_sequence: head_watermarks
@@ -439,18 +445,49 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     })
                     .map(|watermark| watermark.state_fingerprint.clone()),
                 after: None,
-                max_entries: DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES,
+                max_entries: DEFAULT_DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRIES,
             };
-            let mut request = initial_request.clone();
-            let mut pages = Vec::new();
+            let mut builder = DfsContentRootCatalogFragmentBuilder::new(&request)?;
+            let mut page_count = 0usize;
+            let mut used_legacy_page_limit = false;
             loop {
                 let page = if identity.primary_node_id == self.node_id {
                     self.authoritative_content_root_catalog_page(&request)?
                 } else {
-                    match self.transport.request_content_root_catalog_page_direct(
+                    let response = self.transport.request_content_root_catalog_page_direct(
                         &identity.primary_node_id,
                         &request,
-                    ) {
+                    );
+                    let response = match response {
+                        Err(error)
+                            if page_count == 0
+                                && request.max_entries
+                                    > DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES =>
+                        {
+                            // The catalog wire shape predates the larger page
+                            // limit. During a rolling upgrade an older primary
+                            // safely rejects 1,024 entries, so retry the first
+                            // page at the historical 256-entry contract. Any
+                            // second failure remains fail-closed.
+                            request.max_entries = DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES;
+                            builder = DfsContentRootCatalogFragmentBuilder::new(&request)?;
+                            used_legacy_page_limit = true;
+                            crate::dfs_perf_trace(format_args!(
+                                "content-root-catalog-page-limit-fallback node={} filesystem={} shard={} primary={} first_error={}",
+                                self.node_id,
+                                identity.file_system_id,
+                                identity.shard_id.0,
+                                identity.primary_node_id,
+                                error
+                            ));
+                            self.transport.request_content_root_catalog_page_direct(
+                                &identity.primary_node_id,
+                                &request,
+                            )
+                        }
+                        response => response,
+                    };
+                    match response {
                         Ok(Some(page)) => page,
                         Ok(None) => DfsContentRootCatalogPage::incomplete_for_request(
                             &request,
@@ -472,37 +509,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         ),
                     }
                 };
-                page.validate_for_request(&request)?;
-                let next_cursor = page.next_cursor.clone();
-                let page_complete = page.is_complete();
-                pages.push(page);
-                if !page_complete || next_cursor.is_none() {
+                page_count = page_count.saturating_add(1);
+                let Some(next_request) = builder.push_page(page)? else {
                     break;
-                }
-                if pages.len() >= max_pages_per_shard {
-                    let next_cursor =
-                        next_cursor.expect("continued content-root page has a cursor");
-                    request.minimum_journal_sequence = next_cursor.journal_sequence;
-                    request.minimum_state_fingerprint = Some(next_cursor.state_fingerprint.clone());
-                    request.after = Some(next_cursor);
-                    pages.push(DfsContentRootCatalogPage::incomplete_for_request(
-                        &request,
+                };
+                if page_count >= max_pages_per_shard {
+                    builder.push_page(DfsContentRootCatalogPage::incomplete_for_request(
+                        &next_request,
                         DfsContentRootCatalogIncompleteReason::PageBudgetExceeded {
                             max_pages: max_pages_per_shard,
                         },
                         crate::metadata_tombstone::metadata_now_unix_nanos(),
-                    ));
+                    ))?;
                     break;
                 }
-                let next_cursor = next_cursor.expect("continued content-root page has a cursor");
-                request.minimum_journal_sequence = next_cursor.journal_sequence;
-                request.minimum_state_fingerprint = Some(next_cursor.state_fingerprint.clone());
-                request.after = Some(next_cursor);
+                request = next_request;
             }
-            fragments.push(DfsContentRootCatalogFragment::from_pages(
-                &initial_request,
-                &pages,
-            )?);
+            let fragment = builder.finish()?;
+            total_pages = total_pages.saturating_add(page_count);
+            total_entries = total_entries.saturating_add(fragment.entries.len());
+            crate::dfs_perf_trace(format_args!(
+                "content-root-catalog-shard-refresh node={} filesystem={} shard={} primary={} page_entry_limit={} legacy_limit={} pages={} entries={} complete={} total_ms={}",
+                self.node_id,
+                identity.file_system_id,
+                identity.shard_id.0,
+                identity.primary_node_id,
+                request.max_entries,
+                used_legacy_page_limit,
+                page_count,
+                fragment.entries.len(),
+                fragment.coverage.is_complete(),
+                shard_started.elapsed().as_millis()
+            ));
+            fragments.push(fragment);
         }
 
         let current_topology = self.global_content_root_catalog_topology()?;
@@ -529,6 +568,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // cluster-wide coverage and could advance absence aging early.
             .min()
             .unwrap_or_else(crate::metadata_tombstone::metadata_now_unix_nanos);
+        let identity_count = identities.len();
         let catalog = DfsContentRootCatalog::from_topology_fragments(
             expected_topology_digest,
             expected_topology.file_system_ids(),
@@ -537,9 +577,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Vec::new(),
             fragments,
         )?;
-        LocalDfsContentRootCatalogStore::new(content_root)
+        let catalog = LocalDfsContentRootCatalogStore::new(content_root)
             .install(catalog)
-            .map_err(DfsError::from)
+            .map_err(DfsError::from)?;
+        crate::dfs_perf_trace(format_args!(
+            "content-root-catalog-refresh node={} shards={} pages={} entries={} complete={} total_ms={}",
+            self.node_id,
+            identity_count,
+            total_pages,
+            total_entries,
+            catalog.is_complete(),
+            trace_started.elapsed().as_millis()
+        ));
+        Ok(catalog)
     }
 
     fn authoritative_content_root_catalog_page(

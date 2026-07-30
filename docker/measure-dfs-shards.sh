@@ -24,20 +24,28 @@
 # same Linux tasks; a worker that exits can make consecutive snapshot totals
 # regress, so phase totals clamp that interval to zero instead of fabricating a
 # negative count. The exact cumulative snapshots remain in timeline.csv.
-# Each node's redirected `/data/daemon/main.stderr.log` is also retained as the
-# exact byte range appended between measurement start and workload completion.
-# The manifest records reset/full-log fallbacks; capture is best effort so an
-# unavailable diagnostic cannot hide the primary workload result. Captured
-# bytes are scanned separately for panics, fatal process failures, DFS failures,
-# and retry-path anomalies. Expected transient control-plane diagnostics (for
-# example a client-side broken pipe or a join/health probe timeout) remain in
-# the raw artifact but do not fail this focused main-daemon stderr scan.
+# Each node's redirected `/data/daemon/main.stdout.log` and `main.stderr.log`
+# are retained as exact byte ranges appended between measurement start and
+# workload completion. The manifests record reset/full-log fallbacks; capture
+# is best effort so an unavailable diagnostic cannot hide the primary workload
+# result. Captured stderr is scanned separately for panics, fatal process
+# failures, DFS failures, and retry-path anomalies. Expected transient
+# control-plane diagnostics (for example a client-side broken pipe or a
+# join/health probe timeout) remain in the raw artifact but do not fail this
+# focused main-daemon stderr scan. Existing `sinomo.dfs.perf` timing records in
+# both streams are summarized without treating an absent record as zero.
 #
 # Important environment variables:
 #   SINOMO_DFS_PERF_PROJECT                 compose project (sinomo-dfs-test)
 #   SINOMO_DFS_PERF_COMPOSE_OVERRIDE        optional second compose file used to form the project
-#   SINOMO_DFS_PERF_FILES                   files per shard lane per phase (1024)
+#   SINOMO_DFS_PERF_MODE                    debug-gate (default), release-ceiling, or sustained-churn
+#   SINOMO_DFS_PERF_BINARY_PROFILE          debug (default) or release; release-ceiling requires release
+#   SINOMO_DFS_PERF_FILES                   files per shard lane per phase (mode default)
 #   SINOMO_DFS_PERF_BYTES                   bytes per file (1)
+#   SINOMO_DFS_PERF_SUSTAINED_ROUNDS        extra back-to-back three-lane rounds (mode default)
+#   SINOMO_DFS_PERF_MIN_SUSTAINED_AGGREGATE_FILES_PER_SECOND
+#                                             sustained end-to-end cluster floor (1000)
+#   SINOMO_DFS_PERF_BATCH_SIZE_SWEEP        comma-separated files-per-bulk-call full-gate sweep
 #   SINOMO_DFS_PERF_MIN_FILES_PER_SECOND    default isolated-write/aggregate floor (1000)
 #   SINOMO_DFS_PERF_MIN_ISOLATED_FILES_PER_SECOND
 #                                             required bulk write+commit publications/s per isolated lane
@@ -61,6 +69,10 @@
 # sub-threshold concurrent cluster throughput/utilization fails this gate.
 # Sleeping and externally progressing low-CPU samples remain evidence, not
 # inferred faults.
+#
+# `--summarize-traces ARTIFACT_DIR` rebuilds only the bounded
+# `sinomo.dfs.perf` timing summaries from previously captured daemon logs. It
+# does not contact Docker or alter an existing gate result.
 
 set -euo pipefail
 
@@ -69,12 +81,36 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 COMPOSE_FILE="${COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.dev.yml}"
 COMPOSE_OVERRIDE_FILE="${SINOMO_DFS_PERF_COMPOSE_OVERRIDE:-}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-${SINOMO_DFS_PERF_PROJECT:-sinomo-dfs-test}}"
-FILES="${SINOMO_DFS_PERF_FILES:-1024}"
+PERF_MODE="${SINOMO_DFS_PERF_MODE:-debug-gate}"
+BINARY_PROFILE="${SINOMO_DFS_PERF_BINARY_PROFILE:-debug}"
+case "$PERF_MODE" in
+  debug-gate)
+    MODE_DEFAULT_FILES=1024
+    MODE_DEFAULT_SUSTAINED_ROUNDS=0
+    ;;
+  release-ceiling)
+    MODE_DEFAULT_FILES=16384
+    MODE_DEFAULT_SUSTAINED_ROUNDS=0
+    ;;
+  sustained-churn)
+    MODE_DEFAULT_FILES=4096
+    MODE_DEFAULT_SUSTAINED_ROUNDS=8
+    ;;
+  *)
+    printf '[dfs-shard-perf] ERROR: SINOMO_DFS_PERF_MODE must be debug-gate, release-ceiling, or sustained-churn; got %q\n' \
+      "$PERF_MODE" >&2
+    exit 1
+    ;;
+esac
+FILES="${SINOMO_DFS_PERF_FILES:-$MODE_DEFAULT_FILES}"
 BYTES="${SINOMO_DFS_PERF_BYTES:-1}"
+SUSTAINED_ROUNDS="${SINOMO_DFS_PERF_SUSTAINED_ROUNDS:-$MODE_DEFAULT_SUSTAINED_ROUNDS}"
+BATCH_SIZE_SWEEP="${SINOMO_DFS_PERF_BATCH_SIZE_SWEEP:-}"
 DEFAULT_MIN_FILES_PER_SECOND="${SINOMO_DFS_PERF_MIN_FILES_PER_SECOND:-1000}"
 MIN_ISOLATED_FILES_PER_SECOND="${SINOMO_DFS_PERF_MIN_ISOLATED_FILES_PER_SECOND:-$DEFAULT_MIN_FILES_PER_SECOND}"
 MIN_CONCURRENT_AGGREGATE_FILES_PER_SECOND="${SINOMO_DFS_PERF_MIN_CONCURRENT_AGGREGATE_FILES_PER_SECOND:-$DEFAULT_MIN_FILES_PER_SECOND}"
 MIN_CONCURRENT_LANE_FILES_PER_SECOND="${SINOMO_DFS_PERF_MIN_CONCURRENT_LANE_FILES_PER_SECOND:-0}"
+MIN_SUSTAINED_AGGREGATE_FILES_PER_SECOND="${SINOMO_DFS_PERF_MIN_SUSTAINED_AGGREGATE_FILES_PER_SECOND:-$DEFAULT_MIN_FILES_PER_SECOND}"
 SAMPLE_SECONDS="${SINOMO_DFS_PERF_SAMPLE_SECONDS:-0.05}"
 MIN_PRIMARY_CPU_PERCENT="${SINOMO_DFS_PERF_MIN_PRIMARY_CPU_PERCENT:-80}"
 MIN_LANE_MS="${SINOMO_DFS_PERF_MIN_LANE_MS:-500}"
@@ -111,11 +147,15 @@ usage() {
   }' "$0"
 }
 
+TRACE_SUMMARY_ONLY=0
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   usage
   exit 0
 fi
-if [[ $# -ne 0 ]]; then
+if [[ "${1:-}" == "--summarize-traces" && $# -eq 2 ]]; then
+  TRACE_SUMMARY_ONLY=1
+  ARTIFACTS="$2"
+elif [[ $# -ne 0 ]]; then
   usage >&2
   exit 2
 fi
@@ -144,6 +184,260 @@ require_positive_uint() {
   (( value > 0 )) || die "$name must be greater than zero"
 }
 
+summarize_dfs_perf_traces() {
+  local artifacts="$1"
+  local records="$artifacts/dfs-perf-timing-records.tsv"
+  local summary="$artifacts/dfs-perf-timing-summary.tsv"
+  local coverage="$artifacts/dfs-perf-timing-coverage.tsv"
+  local status="$artifacts/dfs-perf-trace-summary-status.tsv"
+  local node source artifact observed_logs=0 parse_failures=0 record_count
+
+  mkdir -p "$artifacts"
+  printf 'node\tsource\trecord\tmetric\tunit\tvalue\tline\n' >"$records"
+  for node in "${NODES[@]}"; do
+    for source in stdout stderr; do
+      artifact="$artifacts/main-daemon-$node.workload.$source.log"
+      [[ -f "$artifact" ]] || continue
+      observed_logs=$((observed_logs + 1))
+      if ! LC_ALL=C sed -E $'s/\033\\[[0-9;]*[mK]//g' "$artifact" \
+        | awk -v node="$node" -v source="$source" '
+          function emit(metric, unit) {
+            if (metric in values) {
+              print node "\t" source "\t" record "\t" metric "\t" unit "\t" \
+                values[metric] "\t" NR
+            }
+          }
+          function has_record(name) {
+            return $0 ~ ("(^|[^[:alnum:]_-])" name "([^[:alnum:]_-]|$)")
+          }
+          {
+            record = ""
+            if (has_record("blob-only-write-streamed")) {
+              record = "blob-only-write-streamed"
+            } else if (has_record("blob-only-write")) {
+              record = "blob-only-write"
+            } else if (has_record("content-addressed-blob-write")) {
+              record = "content-addressed-blob-write"
+            } else if (has_record("packed-blob-lock")) {
+              record = "packed-blob-lock"
+            } else if (has_record("posix-bulk-authority-commit")) {
+              record = "posix-bulk-authority-commit"
+            } else if (has_record("posix-bulk-local-write")) {
+              record = "posix-bulk-local-write"
+            } else if (has_record("metadata-authority-confirmation")) {
+              record = "metadata-authority-confirmation"
+            } else if (has_record("content-root-catalog-shard-refresh")) {
+              record = "content-root-catalog-shard-refresh"
+            } else if (has_record("content-root-catalog-refresh")) {
+              record = "content-root-catalog-refresh"
+            } else if (has_record("metadata-journal-segment")) {
+              record = "metadata-journal-segment"
+            } else if (has_record("metadata-journal-entries")) {
+              record = "metadata-journal-entries"
+            } else if (has_record("metadata-table-batch")) {
+              record = "metadata-table-batch"
+            } else if (has_record("metadata-publish-plan")) {
+              record = "metadata-publish-plan"
+            }
+            if (record == "") next
+
+            delete values
+            for (field = 1; field <= NF; field++) {
+              separator = index($field, "=")
+              if (separator <= 1) continue
+              key = substr($field, 1, separator - 1)
+              value = substr($field, separator + 1)
+              gsub(/^[^0-9]+/, "", value)
+              sub(/[^0-9].*$/, "", value)
+              if (value ~ /^[0-9]+$/) values[key] = value
+            }
+
+            if (record == "packed-blob-lock") {
+              emit("wait_us", "us")
+              emit("hold_us", "us")
+            } else if (record == "posix-bulk-authority-commit") {
+              emit("prepare_us", "us")
+              emit("commit_ms", "ms")
+            } else if (record == "posix-bulk-local-write") {
+              emit("content_ms", "ms")
+              emit("prepare_setup_ms", "ms")
+              emit("group_prepare_ms", "ms")
+              emit("authority_commit_ms", "ms")
+              emit("stat_ms", "ms")
+              emit("total_ms", "ms")
+            } else if (record == "metadata-authority-confirmation") {
+              emit("probe_ms", "ms")
+              emit("assignment_ms", "ms")
+              emit("quorum_ms", "ms")
+              emit("total_ms", "ms")
+            } else if (record == "content-root-catalog-shard-refresh") {
+              emit("pages", "count")
+              emit("entries", "count")
+              emit("total_ms", "ms")
+            } else if (record == "content-root-catalog-refresh") {
+              emit("shards", "count")
+              emit("pages", "count")
+              emit("entries", "count")
+              emit("total_ms", "ms")
+            } else if (record == "blob-only-write") {
+              emit("hash_ms", "ms")
+              emit("manifest_check_ms", "ms")
+              emit("has_blob_ms", "ms")
+              emit("quota_ms", "ms")
+              emit("blob_write_ms", "ms")
+              emit("total_ms", "ms")
+            } else if (record == "blob-only-write-streamed") {
+              emit("manifest_check_ms", "ms")
+              emit("stream_hash_write_ms", "ms")
+              emit("create_dir_ms", "ms")
+              emit("publish_ms", "ms")
+              emit("total_ms", "ms")
+            } else if (record == "content-addressed-blob-write") {
+              emit("create_dir_ms", "ms")
+              emit("existing_check_ms", "ms")
+              emit("write_sync_ms", "ms")
+              emit("total_ms", "ms")
+            } else if (record == "metadata-journal-segment") {
+              emit("entries", "count")
+              emit("bytes", "bytes")
+              emit("create_dir_ms", "ms")
+              emit("encode_ms", "ms")
+              emit("write_sync_ms", "ms")
+              emit("sync_dir_ms", "ms")
+              emit("total_ms", "ms")
+            } else if (record == "metadata-journal-entries") {
+              emit("entries", "count")
+              emit("chunks", "count")
+              emit("sequence_ms", "ms")
+              emit("build_ms", "ms")
+              emit("append_ms", "ms")
+              emit("total_ms", "ms")
+            } else if (record == "metadata-table-batch") {
+              emit("ops", "count")
+              emit("bytes", "bytes")
+              emit("create_dir_ms", "ms")
+              emit("encode_ms", "ms")
+              emit("write_ms", "ms")
+              emit("total_ms", "ms")
+            } else if (record == "metadata-publish-plan") {
+              emit("outcomes", "count")
+              emit("targets", "count")
+              emit("total_ms", "ms")
+            }
+          }
+        ' >>"$records"; then
+        parse_failures=$((parse_failures + 1))
+      fi
+    done
+  done
+
+  printf 'record\tmetric\tunit\tsamples\tminimum\tp50\tp95\tmaximum\tmean\n' >"$summary"
+  sed -n '2,$p' "$records" \
+    | sort -t $'\t' -k3,3 -k4,4 -k5,5 -k6,6n \
+    | awk -F '\t' '
+        function flush(    p50_index, p95_index) {
+          if (samples == 0) return
+          p50_index = int((samples * 50 + 99) / 100)
+          p95_index = int((samples * 95 + 99) / 100)
+          printf "%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%.3f\n",
+            current_record, current_metric, current_unit, samples,
+            minimum, values[p50_index], values[p95_index], maximum, total / samples
+          delete values
+          samples = 0
+          total = 0
+        }
+        {
+          key = $3 SUBSEP $4 SUBSEP $5
+          if (current_key != "" && key != current_key) flush()
+          if (key != current_key) {
+            current_key = key
+            current_record = $3
+            current_metric = $4
+            current_unit = $5
+            minimum = $6
+          }
+          samples += 1
+          values[samples] = $6
+          maximum = $6
+          total += $6
+        }
+        END { flush() }
+      ' >>"$summary"
+
+  record_count=$(( $(wc -l <"$records") - 1 ))
+  (( record_count >= 0 )) || record_count=0
+  {
+    printf 'captured_log_files\t%s\n' "$observed_logs"
+    printf 'timing_records\t%s\n' "$record_count"
+    printf 'parse_failures\t%s\n' "$parse_failures"
+    if (( observed_logs == 0 )); then
+      printf 'status\tno-captured-daemon-logs\n'
+    elif (( parse_failures != 0 )); then
+      printf 'status\tpartial-parser-failure\n'
+    elif (( record_count == 0 )); then
+      printf 'status\tno-matching-records-or-tracing-disabled\n'
+    else
+      printf 'status\tobserved\n'
+    fi
+  } >"$status"
+
+  printf 'domain\trecord\ttiming\tsamples\tavailability\tnote\n' >"$coverage"
+  while IFS=$'\t' read -r domain record timing note; do
+    if [[ "$timing" == unavailable ]]; then
+      samples=0
+      availability=not-instrumented
+    else
+      samples="$(awk -F '\t' -v record="$record" -v metric="$timing" '
+        NR > 1 && $3 == record && $4 == metric { count += 1 }
+        END { print count + 0 }
+      ' "$records")"
+      if (( samples > 0 )); then
+        availability=observed
+      else
+        availability=not-observed
+      fi
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$domain" "$record" "$timing" "$samples" "$availability" "$note" \
+      >>"$coverage"
+  done <<'EOF'
+content-pack	packed-blob-lock	wait_us	packed small-blob lock wait only
+content-pack	packed-blob-lock	hold_us	packed small-blob lock hold only
+content-pack	packed-blob-write	unavailable	no existing successful pack append or sync duration record
+bulk-prepare	posix-bulk-local-write	prepare_setup_ms	build committed objects and authority groups
+bulk-prepare	posix-bulk-local-write	group_prepare_ms	build per-authority transactions and write proofs
+bulk-commit	posix-bulk-authority-commit	commit_ms	per-authority local or routed namespace commit
+replication-confirmation	metadata-authority-confirmation	total_ms	full-shard acknowledgement or cluster-quorum permit
+catalog	content-root-catalog-shard-refresh	total_ms	one exact-cut shard fragment refresh
+catalog	content-root-catalog-refresh	total_ms	complete multi-shard catalog refresh and durable install
+content-ingest	blob-only-write	blob_write_ms	loose blob write when emitted
+content-ingest	blob-only-write-streamed	stream_hash_write_ms	streamed hash and write when emitted
+content-ingest	content-addressed-blob-write	write_sync_ms	durable loose-blob write and sync when emitted
+journal	metadata-journal-segment	encode_ms	serialized authoritative journal segment entries
+journal	metadata-journal-segment	write_sync_ms	durable journal append and file sync
+journal	metadata-journal-segment	sync_dir_ms	first-segment parent directory sync
+journal	metadata-journal-entries	append_ms	batched journal append wrapper across segment chunks
+table	metadata-table-batch	encode_ms	materialized replay-cache table encoding
+table	metadata-table-batch	write_ms	unsynced materialized replay-cache append
+replication	metadata-publish-plan	total_ms	replication planning only
+replication	metadata-journal-transport	unavailable	no existing successful journal transport latency record
+EOF
+
+  if (( parse_failures != 0 )); then
+    log "DFS perf trace summary completed with $parse_failures parser input failure(s)"
+    return 1
+  fi
+  log "DFS perf trace summary: records=$record_count captured_logs=$observed_logs"
+}
+
+if (( TRACE_SUMMARY_ONLY != 0 )); then
+  for command in awk sed sort wc mkdir; do
+    require_command "$command"
+  done
+  summarize_dfs_perf_traces "$ARTIFACTS"
+  exit
+fi
+
 compose() {
   docker compose -p "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILES[@]}" "$@"
 }
@@ -163,11 +457,19 @@ run_container_timeout() {
     docker exec -i "${container_id[$node]}" "$@"
 }
 
-for command in docker jq timeout date awk sed grep cmp getconf sort; do
+for command in docker jq timeout date awk sed grep cmp getconf sort wc; do
   require_command "$command"
 done
+case "$BINARY_PROFILE" in
+  debug | release) ;;
+  *) die "SINOMO_DFS_PERF_BINARY_PROFILE must be debug or release, got '$BINARY_PROFILE'" ;;
+esac
+if [[ "$PERF_MODE" == release-ceiling && "$BINARY_PROFILE" != release ]]; then
+  die "release-ceiling mode requires SINOMO_DFS_PERF_BINARY_PROFILE=release; this is an operator assertion recorded with the artifacts"
+fi
 require_positive_uint SINOMO_DFS_PERF_FILES "$FILES"
 require_positive_uint SINOMO_DFS_PERF_BYTES "$BYTES"
+require_uint SINOMO_DFS_PERF_SUSTAINED_ROUNDS "$SUSTAINED_ROUNDS"
 require_positive_uint SINOMO_DFS_PERF_MIN_FILES_PER_SECOND "$DEFAULT_MIN_FILES_PER_SECOND"
 require_positive_uint \
   SINOMO_DFS_PERF_MIN_ISOLATED_FILES_PER_SECOND "$MIN_ISOLATED_FILES_PER_SECOND"
@@ -177,6 +479,9 @@ require_positive_uint \
 require_uint \
   SINOMO_DFS_PERF_MIN_CONCURRENT_LANE_FILES_PER_SECOND \
   "$MIN_CONCURRENT_LANE_FILES_PER_SECOND"
+require_positive_uint \
+  SINOMO_DFS_PERF_MIN_SUSTAINED_AGGREGATE_FILES_PER_SECOND \
+  "$MIN_SUSTAINED_AGGREGATE_FILES_PER_SECOND"
 require_positive_uint SINOMO_DFS_PERF_MIN_PRIMARY_CPU_PERCENT "$MIN_PRIMARY_CPU_PERCENT"
 require_positive_uint SINOMO_DFS_PERF_MIN_LANE_MS "$MIN_LANE_MS"
 require_uint SINOMO_DFS_PERF_MAX_IDLE_MS "$MAX_IDLE_MS"
@@ -190,6 +495,79 @@ require_positive_uint CLK_TCK "$CLK_TCK"
 
 mkdir -p "$ARTIFACTS"
 cd "$REPO_ROOT"
+
+if [[ -n "$BATCH_SIZE_SWEEP" ]]; then
+  compact_sweep="${BATCH_SIZE_SWEEP//[[:space:]]/}"
+  [[ "$compact_sweep" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] \
+    || die "SINOMO_DFS_PERF_BATCH_SIZE_SWEEP must be a comma-separated list of positive integers"
+  IFS=',' read -r -a sweep_sizes <<<"$compact_sweep"
+  declare -A seen_sweep_sizes=()
+  printf 'batch_size\tstatus\tartifact\tminimum_isolated_data_write_files_per_second\tconcurrent_aggregate_files_per_second\tsustained_aggregate_files_per_second\n' \
+    >"$ARTIFACTS/batch-sweep-summary.tsv"
+  {
+    printf 'mode\t%s\n' "$PERF_MODE"
+    printf 'binary_profile_operator_assertion\t%s\n' "$BINARY_PROFILE"
+    printf 'batch_sizes\t%s\n' "$compact_sweep"
+    printf 'gate_contract\tfull-configured-gate-per-batch-size\n'
+  } >"$ARTIFACTS/batch-sweep-config.tsv"
+  sweep_failed=0
+  for sweep_size in "${sweep_sizes[@]}"; do
+    [[ -z "${seen_sweep_sizes[$sweep_size]:-}" ]] \
+      || die "SINOMO_DFS_PERF_BATCH_SIZE_SWEEP contains duplicate size $sweep_size"
+    seen_sweep_sizes[$sweep_size]=1
+    child_artifact="$ARTIFACTS/batch-$sweep_size"
+    [[ ! -e "$child_artifact" ]] \
+      || die "batch sweep child artifact already exists: $child_artifact"
+    log "batch sweep: running full gate with $sweep_size files per bulk call"
+    child_status=failed
+    if SINOMO_DFS_PERF_BATCH_SIZE_SWEEP= \
+      SINOMO_DFS_PERF_FILES="$sweep_size" \
+      SINOMO_DFS_PERF_ARTIFACTS="$child_artifact" \
+      "$SCRIPT_DIR/measure-dfs-shards.sh"; then
+      child_status=passed
+    else
+      sweep_failed=1
+    fi
+    minimum_isolated=unavailable
+    if [[ -f "$child_artifact/workloads.tsv" ]]; then
+      minimum_isolated="$(
+        awk -F '\t' '
+          NR == 1 {
+            for (column = 1; column <= NF; column++) {
+              if ($column == "data_write_files_per_second") rate_column = column
+            }
+            next
+          }
+          $1 == "isolated" && rate_column > 0 {
+            if (minimum == "" || $rate_column + 0 < minimum + 0) minimum = $rate_column
+          }
+          END { if (minimum != "") print minimum }
+        ' "$child_artifact/workloads.tsv"
+      )"
+      minimum_isolated="${minimum_isolated:-unavailable}"
+    fi
+    concurrent_aggregate="$(
+      awk -F '\t' '$1 == "concurrent_aggregate_files_per_second" { print $2; exit }' \
+        "$child_artifact/aggregate-summary.tsv" 2>/dev/null || true
+    )"
+    concurrent_aggregate="${concurrent_aggregate:-unavailable}"
+    sustained_aggregate="$(
+      awk -F '\t' '$1 == "sustained_aggregate_files_per_second" { print $2; exit }' \
+        "$child_artifact/sustained-summary.tsv" 2>/dev/null || true
+    )"
+    sustained_aggregate="${sustained_aggregate:-disabled}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$sweep_size" "$child_status" "batch-$sweep_size" "$minimum_isolated" \
+      "$concurrent_aggregate" "$sustained_aggregate" \
+      >>"$ARTIFACTS/batch-sweep-summary.tsv"
+    if (( sweep_failed != 0 )); then
+      log "batch sweep stopped after failed size $sweep_size; inspect $child_artifact"
+      exit 1
+    fi
+  done
+  log "batch sweep passed: $ARTIFACTS/batch-sweep-summary.tsv"
+  exit
+fi
 
 declare -A container_id=()
 declare -A container_pid=()
@@ -397,12 +775,20 @@ done
 
 {
   printf 'run_id\t%s\n' "$RUN_ID"
+  printf 'performance_mode\t%s\n' "$PERF_MODE"
+  printf 'binary_profile_operator_assertion\t%s\n' "$BINARY_PROFILE"
+  printf 'binary_profile_verified_by_script\tno\n'
   printf 'compose_project\t%s\n' "$COMPOSE_PROJECT_NAME"
   printf 'compose_file\t%s\n' "$COMPOSE_FILE"
   printf 'compose_override_file\t%s\n' "${COMPOSE_OVERRIDE_FILE:-none}"
   printf 'files_per_lane_per_phase\t%s\n' "$FILES"
-  printf 'measurement_phases\tisolated-per-lane,concurrent-three-lane\n'
+  if (( SUSTAINED_ROUNDS > 0 )); then
+    printf 'measurement_phases\tisolated-per-lane,concurrent-three-lane,sustained-churn\n'
+  else
+    printf 'measurement_phases\tisolated-per-lane,concurrent-three-lane\n'
+  fi
   printf 'bytes_per_file\t%s\n' "$BYTES"
+  printf 'sustained_rounds\t%s\n' "$SUSTAINED_ROUNDS"
   printf 'default_min_files_per_second\t%s\n' "$DEFAULT_MIN_FILES_PER_SECOND"
   printf 'min_isolated_data_write_files_per_second_per_lane\t%s\n' \
     "$MIN_ISOLATED_FILES_PER_SECOND"
@@ -410,6 +796,8 @@ done
     "$MIN_CONCURRENT_AGGREGATE_FILES_PER_SECOND"
   printf 'min_concurrent_data_write_files_per_second_per_lane\t%s\n' \
     "$MIN_CONCURRENT_LANE_FILES_PER_SECOND"
+  printf 'min_sustained_aggregate_files_per_second\t%s\n' \
+    "$MIN_SUSTAINED_AGGREGATE_FILES_PER_SECOND"
   printf 'sample_seconds\t%s\n' "$SAMPLE_SECONDS"
   printf 'clock_ticks_per_second\t%s\n' "$CLK_TCK"
   printf 'min_primary_cpu_percent\t%s\n' "$MIN_PRIMARY_CPU_PERCENT"
@@ -811,6 +1199,9 @@ declare -A workload_pid=()
 declare -A workload_started_ns=()
 declare -A ready_lanes=()
 declare -a active_lanes=()
+declare -a workload_phases=(isolated concurrent)
+declare -a sustained_phases=()
+declare -A sustained_round_wall_usec=()
 workloads_finished=0
 workload_failed=0
 overlap_window_usec=0
@@ -837,7 +1228,9 @@ host_initial_memory_available_bytes="$sample_host_memory_available_bytes"
 host_initial_swap_total_bytes="$sample_host_swap_total_bytes"
 host_initial_swap_free_bytes="$sample_host_swap_free_bytes"
 declare -A main_daemon_stderr_start_bytes=()
+declare -A main_daemon_stdout_start_bytes=()
 main_daemon_stderr_capture_done=0
+main_daemon_stdout_capture_done=0
 main_daemon_stderr_scan_done=0
 main_daemon_stderr_scan_failed=0
 
@@ -849,6 +1242,14 @@ main_daemon_stderr_size() {
   '
 }
 
+main_daemon_stdout_size() {
+  local node="$1"
+  run_container_timeout 5 "$node" sh -c '
+    test -f /data/daemon/main.stdout.log \
+      && stat -c %s /data/daemon/main.stdout.log
+  '
+}
+
 for node in "${NODES[@]}"; do
   capture_error="$ARTIFACTS/main-daemon-$node.workload.stderr.capture.log"
   if start_bytes="$(main_daemon_stderr_size "$node" 2>"$capture_error")" \
@@ -857,6 +1258,14 @@ for node in "${NODES[@]}"; do
   else
     main_daemon_stderr_start_bytes[$node]=-1
     log "$node main daemon stderr start offset unavailable; workload capture will fall back to the current full log"
+  fi
+  capture_error="$ARTIFACTS/main-daemon-$node.workload.stdout.capture.log"
+  if start_bytes="$(main_daemon_stdout_size "$node" 2>"$capture_error")" \
+    && [[ "$start_bytes" =~ ^[0-9]+$ ]]; then
+    main_daemon_stdout_start_bytes[$node]="$start_bytes"
+  else
+    main_daemon_stdout_start_bytes[$node]=-1
+    log "$node main daemon stdout start offset unavailable; DFS perf trace capture will fall back to the current full log"
   fi
 done
 
@@ -919,6 +1328,66 @@ capture_main_daemon_stderr_workload() {
       >>"$ARTIFACTS/main-daemon-stderr-workload.tsv"
     if [[ "$status" == failed ]]; then
       log "$node main daemon stderr workload-window capture unavailable; inspect $capture_error"
+    fi
+  done
+}
+
+capture_main_daemon_stdout_workload() {
+  local node start_bytes end_bytes offset count mode status artifact artifact_name
+  local capture_error
+  (( main_daemon_stdout_capture_done == 0 )) || return 0
+  main_daemon_stdout_capture_done=1
+  printf 'node\tstart_bytes\tend_bytes\tmode\tstatus\tartifact\n' \
+    >"$ARTIFACTS/main-daemon-stdout-workload.tsv"
+  for node in "${NODES[@]}"; do
+    start_bytes="${main_daemon_stdout_start_bytes[$node]:--1}"
+    artifact_name="main-daemon-$node.workload.stdout.log"
+    artifact="$ARTIFACTS/$artifact_name"
+    capture_error="$ARTIFACTS/main-daemon-$node.workload.stdout.capture.log"
+    end_bytes=-1
+    offset=0
+    count=0
+    mode=unavailable
+    status=failed
+    if end_bytes="$(main_daemon_stdout_size "$node" 2>>"$capture_error")" \
+      && [[ "$end_bytes" =~ ^[0-9]+$ ]]; then
+      if (( start_bytes >= 0 && end_bytes >= start_bytes )); then
+        offset="$start_bytes"
+        count=$((end_bytes - start_bytes))
+        mode=appended-byte-range
+      else
+        offset=0
+        count="$end_bytes"
+        if (( start_bytes < 0 )); then
+          mode=full-current-no-start-offset
+        else
+          mode=full-current-after-reset
+        fi
+      fi
+      if run_container_timeout 5 "$node" sh -c '
+          file="$1"
+          offset="$2"
+          count="$3"
+          test -f "$file" || exit 2
+          test "$count" -eq 0 && exit 0
+          tail -c "+$((offset + 1))" "$file" | head -c "$count"
+        ' sh /data/daemon/main.stdout.log "$offset" "$count" \
+          >"$artifact" 2>>"$capture_error"; then
+        status=ok
+      fi
+    else
+      end_bytes=-1
+      if run_container_timeout 5 "$node" cat /data/daemon/main.stdout.log \
+          >"$artifact" 2>>"$capture_error"; then
+        mode=full-current-end-size-unavailable
+        status=best-effort
+      fi
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$node" "$start_bytes" "$end_bytes" "$mode" "$status" "$artifact_name" \
+      >>"$ARTIFACTS/main-daemon-stdout-workload.tsv"
+    if [[ "$status" == failed ]]; then
+      log "$node main daemon stdout workload-window capture unavailable; DFS perf timings will be marked not observed"
     fi
   done
 }
@@ -1077,6 +1546,7 @@ cleanup_workloads() {
 cleanup_and_capture_workload_evidence() {
   cleanup_workloads
   capture_main_daemon_stderr_workload || true
+  capture_main_daemon_stdout_workload || true
   scan_main_daemon_stderr_workload || true
 }
 trap cleanup_and_capture_workload_evidence EXIT INT TERM
@@ -1084,7 +1554,19 @@ trap cleanup_and_capture_workload_evidence EXIT INT TERM
 launch_workload() {
   local phase="$1" lane="$2"
   local client="${lane_client[$lane]}"
-  local base="${lane_base[$lane]%/}/$RUN_ID-$phase-$lane"
+  local base overwrite_existing=false
+  if [[ "$phase" == churn-* ]]; then
+    # Keep the live namespace bounded during long runs. The first round
+    # creates one stable file set and later rounds overwrite those exact paths,
+    # exercising version/history GC and retry semantics without making host
+    # memory scale with the total operation count.
+    base="${lane_base[$lane]%/}/$RUN_ID-sustained-$lane"
+    if [[ "$phase" != churn-0001 ]]; then
+      overwrite_existing=true
+    fi
+  else
+    base="${lane_base[$lane]%/}/$RUN_ID-$phase-$lane"
+  fi
   workload_started_ns[$lane]="$(date +%s%N)"
   (
     run_node_timeout "$TIMEOUT_SECONDS" "$client" \
@@ -1092,6 +1574,7 @@ launch_workload() {
       --param "base=$base" \
       --param "files=$FILES" \
       --param "bytes=$BYTES" \
+      --param "overwrite-existing=$overwrite_existing" \
       --param "min-files-per-second=0" \
       --param "timeout-seconds=$TIMEOUT_SECONDS"
   ) >"$ARTIFACTS/workload-$phase-$lane.json" \
@@ -1427,58 +1910,92 @@ for lane in "${LANES[@]}"; do
     || die "shards did not return to zero lag after the isolated $lane window"
 done
 
-log "workload: measuring concurrent three-shard aggregate utilization"
-active_lanes=("${LANES[@]}")
-concurrent_phase_started_ns="$(date +%s%N)"
-for lane in "${LANES[@]}"; do
-  ready_lanes[$lane]=0
-  launch_workload concurrent "$lane"
-done
-
-previous_loop_ns="$(date +%s%N)"
-while :; do
-  now_ns="$(date +%s%N)"
-  any_running=0
-  all_ready=1
+run_three_lane_workload_phase() {
+  local phase="$1" account_core_overlap="$2"
+  local phase_started_ns phase_finished_ns
+  active_lanes=("${LANES[@]}")
+  phase_started_ns="$(date +%s%N)"
   for lane in "${LANES[@]}"; do
     ready_lanes[$lane]=0
-    if kill -0 "${workload_pid[$lane]}" 2>/dev/null; then
-      any_running=1
-      grace_end_ns=$((workload_started_ns[$lane] + WARMUP_MS * 1000000))
-      if (( previous_loop_ns >= grace_end_ns )); then
-        ready_lanes[$lane]=1
+    launch_workload "$phase" "$lane"
+  done
+
+  previous_loop_ns="$(date +%s%N)"
+  while :; do
+    now_ns="$(date +%s%N)"
+    any_running=0
+    all_ready=1
+    for lane in "${LANES[@]}"; do
+      ready_lanes[$lane]=0
+      if kill -0 "${workload_pid[$lane]}" 2>/dev/null; then
+        any_running=1
+        grace_end_ns=$((workload_started_ns[$lane] + WARMUP_MS * 1000000))
+        if (( previous_loop_ns >= grace_end_ns )); then
+          ready_lanes[$lane]=1
+        else
+          all_ready=0
+        fi
       else
         all_ready=0
       fi
-    else
-      all_ready=0
+    done
+
+    sample_phase "$phase" "$all_ready" "$now_ns"
+
+    if (( account_core_overlap == 1 && all_ready == 1 )); then
+      overlap_window_usec=$((overlap_window_usec + (now_ns - previous_loop_ns) / 1000))
+      overlap_process_usage_usec=$((overlap_process_usage_usec + iteration_overlap_process_usage))
+      overlap_cgroup_usage_usec=$((overlap_cgroup_usage_usec + iteration_overlap_cgroup_usage))
     fi
+    previous_loop_ns="$now_ns"
+    (( any_running == 1 )) || break
+    sleep "$SAMPLE_SECONDS"
   done
 
-  sample_phase concurrent "$all_ready" "$now_ns"
+  for lane in "${LANES[@]}"; do
+    wait_for_workload "$phase" "$lane"
+  done
+  phase_finished_ns="$(date +%s%N)"
+  last_three_lane_wall_usec=$((
+    (phase_finished_ns - phase_started_ns + 999) / 1000
+  ))
+}
 
-  if (( all_ready == 1 )); then
-    overlap_window_usec=$((overlap_window_usec + (now_ns - previous_loop_ns) / 1000))
-    overlap_process_usage_usec=$((overlap_process_usage_usec + iteration_overlap_process_usage))
-    overlap_cgroup_usage_usec=$((overlap_cgroup_usage_usec + iteration_overlap_cgroup_usage))
-  fi
-  previous_loop_ns="$now_ns"
-  (( any_running == 1 )) || break
-  sleep "$SAMPLE_SECONDS"
-done
+log "workload: measuring concurrent three-shard aggregate utilization"
+run_three_lane_workload_phase concurrent 1
+concurrent_wall_usec="$last_three_lane_wall_usec"
 
-for lane in "${LANES[@]}"; do
-  wait_for_workload concurrent "$lane"
-done
-concurrent_phase_finished_ns="$(date +%s%N)"
-concurrent_wall_usec=$((
-  (concurrent_phase_finished_ns - concurrent_phase_started_ns + 999) / 1000
-))
+sustained_completed_rounds=0
+sustained_wall_usec=0
+if (( SUSTAINED_ROUNDS > 0 )); then
+  log "workload: measuring $SUSTAINED_ROUNDS back-to-back sustained churn round(s)"
+  sustained_started_ns="$(date +%s%N)"
+  for ((round = 1; round <= SUSTAINED_ROUNDS; round++)); do
+    printf -v phase 'churn-%04d' "$round"
+    workload_phases+=("$phase")
+    sustained_phases+=("$phase")
+    workload_failed_before_round="$workload_failed"
+    run_three_lane_workload_phase "$phase" 0
+    sustained_round_wall_usec[$phase]="$last_three_lane_wall_usec"
+    sustained_completed_rounds=$((sustained_completed_rounds + 1))
+    if (( workload_failed != workload_failed_before_round )); then
+      log "sustained churn stopped after command failure in $phase"
+      break
+    fi
+  done
+  sustained_finished_ns="$(date +%s%N)"
+  sustained_wall_usec=$((
+    (sustained_finished_ns - sustained_started_ns + 999) / 1000
+  ))
+fi
 workloads_finished=1
 capture_main_daemon_stderr_workload
+capture_main_daemon_stdout_workload
 if ! scan_main_daemon_stderr_workload; then
   workload_failed=1
 fi
+summarize_dfs_perf_traces "$ARTIFACTS" \
+  || log "DFS perf trace timing summary is partial; raw captured logs are retained"
 
 for node in "${NODES[@]}"; do
   docker logs --timestamps --since "$docker_log_since" "${container_id[$node]}" \
@@ -1491,14 +2008,21 @@ for node in "${NODES[@]}"; do
   fi
 done
 
-printf 'phase\tlane\tclient\tprimary\tshard\tfiles\telapsed_ms\tend_to_end_files_per_second\twrite_elapsed_ms\tdata_write_files_per_second\tretry_count\n' \
+printf 'phase\tlane\tclient\tprimary\tshard\tfiles\toverwrite_existing\tmkdir_elapsed_ms\twrite_elapsed_ms\tpublish_elapsed_ms\telapsed_ms\tend_to_end_files_per_second\tdata_write_files_per_second\tretry_count\n' \
   >"$ARTIFACTS/workloads.tsv"
 concurrent_total_files=0
-for phase in isolated concurrent; do
+sustained_total_files=0
+for phase in "${workload_phases[@]}"; do
   for lane in "${LANES[@]}"; do
     result="$ARTIFACTS/workload-$phase-$lane.json"
     stderr_file="$ARTIFACTS/workload-$phase-$lane.stderr.log"
-    if ! jq -e --argjson expected_files "$FILES" '
+    expected_overwrite=false
+    if [[ "$phase" == churn-* && "$phase" != churn-0001 ]]; then
+      expected_overwrite=true
+    fi
+    if ! jq -e \
+      --argjson expected_files "$FILES" \
+      --argjson expected_overwrite "$expected_overwrite" '
       .status == "passed"
       and (.diagnostics.retry_count | type) == "number"
       and .diagnostics.retry_count >= 0
@@ -1513,14 +2037,22 @@ for phase in isolated concurrent; do
       and (.diagnostics.files | type) == "number"
       and .diagnostics.files == $expected_files
       and .diagnostics.files == (.diagnostics.files | floor)
+      and (.diagnostics.overwrite_existing | type) == "boolean"
+      and .diagnostics.overwrite_existing == $expected_overwrite
       and (.diagnostics.elapsed_ms | type) == "number"
       and .diagnostics.elapsed_ms > 0
       and .diagnostics.elapsed_ms == (.diagnostics.elapsed_ms | floor)
+      and (.diagnostics.mkdir_elapsed_ms | type) == "number"
+      and .diagnostics.mkdir_elapsed_ms >= 0
+      and .diagnostics.mkdir_elapsed_ms == (.diagnostics.mkdir_elapsed_ms | floor)
       and (.diagnostics.files_per_second | type) == "number"
       and .diagnostics.files_per_second > 0
       and (.diagnostics.write_elapsed_ms | type) == "number"
       and .diagnostics.write_elapsed_ms > 0
       and .diagnostics.write_elapsed_ms == (.diagnostics.write_elapsed_ms | floor)
+      and (.diagnostics.publish_elapsed_ms | type) == "number"
+      and .diagnostics.publish_elapsed_ms >= 0
+      and .diagnostics.publish_elapsed_ms == (.diagnostics.publish_elapsed_ms | floor)
       and (.diagnostics.data_write_bytes_per_second | type) == "number"
       and .diagnostics.data_write_bytes_per_second > 0
     ' "$result" >/dev/null 2>&1; then
@@ -1540,9 +2072,12 @@ for phase in isolated concurrent; do
       workload_failed=1
     fi
     files_completed="$(jq -r '.diagnostics.files' "$result")"
+    overwrite_existing="$(jq -r '.diagnostics.overwrite_existing' "$result")"
+    mkdir_elapsed_ms="$(jq -r '.diagnostics.mkdir_elapsed_ms' "$result")"
     elapsed_ms="$(jq -r '.diagnostics.elapsed_ms' "$result")"
     files_per_second="$(jq -r '.diagnostics.files_per_second' "$result")"
     write_elapsed_ms="$(jq -r '.diagnostics.write_elapsed_ms' "$result")"
+    publish_elapsed_ms="$(jq -r '.diagnostics.publish_elapsed_ms' "$result")"
     data_write_files_per_second="$(
       jq -r --argjson bytes_per_file "$BYTES" \
         '.diagnostics.data_write_bytes_per_second / $bytes_per_file' "$result"
@@ -1553,6 +2088,9 @@ for phase in isolated concurrent; do
     fi
     if [[ "$phase" == "concurrent" ]]; then
       concurrent_total_files=$((concurrent_total_files + files_completed))
+      lane_data_write_min="$MIN_CONCURRENT_LANE_FILES_PER_SECOND"
+    elif [[ "$phase" == churn-* ]]; then
+      sustained_total_files=$((sustained_total_files + files_completed))
       lane_data_write_min="$MIN_CONCURRENT_LANE_FILES_PER_SECOND"
     else
       lane_data_write_min="$MIN_ISOLATED_FILES_PER_SECOND"
@@ -1565,11 +2103,11 @@ for phase in isolated concurrent; do
       log "$phase/$lane bulk write throughput was ${data_write_files_per_second} publications/s, below $lane_data_write_min"
       workload_failed=1
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$phase" "$lane" "${lane_client[$lane]}" "${lane_primary_service[$lane]}" \
-      "${lane_shard[$lane]}" "$files_completed" "$elapsed_ms" \
-      "$files_per_second" "$write_elapsed_ms" "$data_write_files_per_second" \
-      "$retry_count" \
+      "${lane_shard[$lane]}" "$files_completed" "$overwrite_existing" "$mkdir_elapsed_ms" \
+      "$write_elapsed_ms" "$publish_elapsed_ms" "$elapsed_ms" \
+      "$files_per_second" "$data_write_files_per_second" "$retry_count" \
       >>"$ARTIFACTS/workloads.tsv"
   done
 done
@@ -1590,6 +2128,76 @@ if (( concurrent_aggregate_milli < MIN_CONCURRENT_AGGREGATE_FILES_PER_SECOND * 1
   log "concurrent cluster throughput was ${concurrent_aggregate_files_per_second} publications/s, below ${MIN_CONCURRENT_AGGREGATE_FILES_PER_SECOND}"
   gate_failed=1
 fi
+
+printf 'phase\twall_ms\tfiles\tend_to_end_files_per_second\n' \
+  >"$ARTIFACTS/sustained-rounds.tsv"
+sustained_wall_ms=$((sustained_wall_usec / 1000))
+sustained_aggregate_milli=0
+sustained_aggregate_files_per_second=disabled
+sustained_status=disabled
+if (( SUSTAINED_ROUNDS > 0 )); then
+  sustained_status=passed
+  if (( sustained_wall_usec > 0 )); then
+    sustained_aggregate_milli=$((
+      sustained_total_files * 1000000000 / sustained_wall_usec
+    ))
+  fi
+  printf -v sustained_aggregate_files_per_second '%d.%03d' \
+    $((sustained_aggregate_milli / 1000)) $((sustained_aggregate_milli % 1000))
+  for phase in "${sustained_phases[@]}"; do
+    round_files="$(
+      awk -F '\t' -v phase="$phase" '
+        NR > 1 && $1 == phase { files += $6 }
+        END { print files + 0 }
+      ' "$ARTIFACTS/workloads.tsv"
+    )"
+    round_wall_usec="${sustained_round_wall_usec[$phase]}"
+    round_wall_ms=$((round_wall_usec / 1000))
+    round_aggregate_milli=0
+    if (( round_wall_usec > 0 )); then
+      round_aggregate_milli=$((round_files * 1000000000 / round_wall_usec))
+    fi
+    printf -v round_aggregate_files_per_second '%d.%03d' \
+      $((round_aggregate_milli / 1000)) $((round_aggregate_milli % 1000))
+    printf '%s\t%s\t%s\t%s\n' \
+      "$phase" "$round_wall_ms" "$round_files" "$round_aggregate_files_per_second" \
+      >>"$ARTIFACTS/sustained-rounds.tsv"
+  done
+
+  sustained_expected_files=$((SUSTAINED_ROUNDS * ${#LANES[@]} * FILES))
+  if (( sustained_completed_rounds != SUSTAINED_ROUNDS )); then
+    log "sustained churn completed $sustained_completed_rounds of $SUSTAINED_ROUNDS requested rounds"
+    sustained_status=failed
+    gate_failed=1
+  fi
+  if (( sustained_total_files != sustained_expected_files )); then
+    log "sustained churn completed $sustained_total_files files, expected $sustained_expected_files"
+    sustained_status=failed
+    gate_failed=1
+  fi
+  if (( sustained_wall_ms < MIN_LANE_MS )); then
+    log "sustained churn wall-clock window was only ${sustained_wall_ms}ms; increase files or rounds"
+    sustained_status=failed
+    gate_failed=1
+  fi
+  if (( sustained_aggregate_milli < MIN_SUSTAINED_AGGREGATE_FILES_PER_SECOND * 1000 )); then
+    log "sustained churn throughput was ${sustained_aggregate_files_per_second} publications/s, below ${MIN_SUSTAINED_AGGREGATE_FILES_PER_SECOND}"
+    sustained_status=failed
+    gate_failed=1
+  fi
+fi
+{
+  printf 'status\t%s\n' "$sustained_status"
+  printf 'requested_rounds\t%s\n' "$SUSTAINED_ROUNDS"
+  printf 'completed_rounds\t%s\n' "$sustained_completed_rounds"
+  printf 'sustained_wall_ms\t%s\n' "$sustained_wall_ms"
+  printf 'sustained_total_files\t%s\n' "$sustained_total_files"
+  printf 'sustained_aggregate_files_per_second\t%s\n' \
+    "$sustained_aggregate_files_per_second"
+  printf 'min_sustained_aggregate_files_per_second\t%s\n' \
+    "$MIN_SUSTAINED_AGGREGATE_FILES_PER_SECOND"
+} >"$ARTIFACTS/sustained-summary.tsv"
+
 printf '%s\n' \
   'lane,primary,main_daemon_host_pid,active_ms,main_daemon_average_cpu_percent,cgroup_average_cpu_percent,max_main_daemon_low_cpu_streak_ms,max_avoidable_ready_work_low_cpu_streak_ms,main_daemon_thread_voluntary_context_switches_delta,main_daemon_thread_nonvoluntary_context_switches_delta,main_daemon_process_io_observed,main_daemon_read_bytes_delta,main_daemon_write_bytes_delta' \
   >"$ARTIFACTS/isolated-primary-summary.csv"
@@ -1641,21 +2249,24 @@ for lane in "${LANES[@]}"; do
 done
 
 avoidable_classification="low_cpu_ready_no_resource_wait_or_progress"
-for lane in "${LANES[@]}"; do
-  classification_key="concurrent|$lane|$avoidable_classification"
-  concurrent_max_avoidable_idle=$((
-    ${classification_max_streak_usec[$classification_key]:-0} / 1000
-  ))
-  if (( concurrent_max_avoidable_idle > MAX_IDLE_MS )); then
-    log "concurrent ${lane_primary_service[$lane]}/$lane main daemon had a ${concurrent_max_avoidable_idle}ms low-CPU ready-work streak with no observed CPU/I/O pressure or storage/network progress"
-    gate_failed=1
-  fi
+for phase in "${workload_phases[@]}"; do
+  [[ "$phase" != isolated ]] || continue
+  for lane in "${LANES[@]}"; do
+    classification_key="$phase|$lane|$avoidable_classification"
+    concurrent_max_avoidable_idle=$((
+      ${classification_max_streak_usec[$classification_key]:-0} / 1000
+    ))
+    if (( concurrent_max_avoidable_idle > MAX_IDLE_MS )); then
+      log "$phase ${lane_primary_service[$lane]}/$lane main daemon had a ${concurrent_max_avoidable_idle}ms low-CPU ready-work streak with no observed CPU/I/O pressure or storage/network progress"
+      gate_failed=1
+    fi
+  done
 done
 
 printf '%s\n' \
   'phase,lane,primary,classification,samples,duration_ms,max_streak_ms' \
   >"$ARTIFACTS/sample-classification-summary.csv"
-for phase in isolated concurrent; do
+for phase in "${workload_phases[@]}"; do
   for lane in "${LANES[@]}"; do
     for sample_classification in "${SAMPLE_CLASSIFICATIONS[@]}"; do
       classification_key="$phase|$lane|$sample_classification"
@@ -1951,10 +2562,13 @@ record_host_memory_observation \
 } >"$ARTIFACTS/host-memory-summary.tsv"
 
 log "results: $ARTIFACTS"
-log "concurrent cluster=${concurrent_aggregate_files_per_second} publications/s over ${concurrent_wall_ms}ms; three-lane overlap=${overlap_ms}ms main-daemon efficiency=${aggregate_efficiency}% cgroup efficiency=${cgroup_aggregate_efficiency}%"
+log "mode=$PERF_MODE concurrent cluster=${concurrent_aggregate_files_per_second} publications/s over ${concurrent_wall_ms}ms; three-lane overlap=${overlap_ms}ms main-daemon efficiency=${aggregate_efficiency}% cgroup efficiency=${cgroup_aggregate_efficiency}%"
+if (( SUSTAINED_ROUNDS > 0 )); then
+  log "sustained churn=${sustained_aggregate_files_per_second} publications/s over ${sustained_wall_ms}ms and $sustained_completed_rounds round(s)"
+fi
 if (( gate_failed != 0 )); then
   log "DFS shard performance gate FAILED"
   exit 1
 fi
 
-log "DFS shard performance gate passed: isolated lanes met their bulk write+commit publication floor and the concurrent cluster met its end-to-end aggregate publication and utilization floors"
+log "DFS shard performance gate passed: isolated lanes met their bulk write+commit publication floor, the concurrent cluster met its end-to-end aggregate publication and utilization floors, and every enabled opt-in mode met its additional floor"

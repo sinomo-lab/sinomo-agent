@@ -37,6 +37,8 @@ mod metadata_lock;
 mod metadata_namespace_transaction;
 mod metadata_object_index;
 mod metadata_pages;
+#[allow(dead_code)]
+mod metadata_prepare_codec;
 mod metadata_read_snapshot;
 mod metadata_receipt;
 mod metadata_records;
@@ -123,14 +125,15 @@ pub(crate) use cluster_service::{
 };
 pub use content_root_catalog::{
     DEFAULT_DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRIES, DFS_CONTENT_ROOT_CATALOG_FORMAT_VERSION,
-    DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES, DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
-    DfsContentRootCatalog, DfsContentRootCatalogCollectionValidation,
-    DfsContentRootCatalogCoverage, DfsContentRootCatalogCursor, DfsContentRootCatalogEntry,
-    DfsContentRootCatalogFragment, DfsContentRootCatalogIncompleteReason,
-    DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest,
-    DfsContentRootCatalogShardIdentity, LocalDfsContentRootCatalogStore,
-    default_dfs_content_root_catalog_store, dfs_content_root_catalog_entries,
-    dfs_content_root_catalog_topology_digest,
+    DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES, DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES,
+    DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT, DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
+    DFS_CONTENT_ROOT_CATALOG_TARGET_PAGE_BYTES, DfsContentRootCatalog,
+    DfsContentRootCatalogCollectionValidation, DfsContentRootCatalogCoverage,
+    DfsContentRootCatalogCursor, DfsContentRootCatalogEntry, DfsContentRootCatalogFragment,
+    DfsContentRootCatalogIncompleteReason, DfsContentRootCatalogPage,
+    DfsContentRootCatalogPageRequest, DfsContentRootCatalogShardIdentity,
+    LocalDfsContentRootCatalogStore, default_dfs_content_root_catalog_store,
+    dfs_content_root_catalog_entries, dfs_content_root_catalog_topology_digest,
     dfs_content_root_catalog_topology_digest_with_file_systems,
 };
 pub(crate) use content_store::content_hash;
@@ -241,6 +244,7 @@ pub use maintenance::{
     DEFAULT_DFS_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS,
     DEFAULT_DFS_CONTENT_RESERVATION_REJECTION_GRACE, DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_AGE,
     DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_PAGES_PER_SHARD,
+    DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_ROOTS_PER_SHARD,
     DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_ISSUES,
     DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_OBJECTS,
     DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_JOBS,

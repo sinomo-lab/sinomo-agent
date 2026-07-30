@@ -278,6 +278,13 @@ impl DfsMetadataTables {
     /// dependency instead of silently publishing partial metadata.
     pub(crate) fn apply_checked(&mut self, op: DfsMetadataTableOp) -> Result<()> {
         match op {
+            DfsMetadataTableOp::PutNamespacePrepareJournalReference {
+                journal_sequence,
+                operation_id,
+                ..
+            } => Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {operation_id} table reference at journal sequence {journal_sequence} was not resolved"
+            ))),
             DfsMetadataTableOp::CommitNamespacePrepare {
                 operation_id,
                 operation_digest,
@@ -297,6 +304,16 @@ impl DfsMetadataTables {
     /// Validate any dependency referenced by a compact semantic operation
     /// without cloning or mutating its full prepared body.
     pub(crate) fn validate_checked(&self, op: &DfsMetadataTableOp) -> Result<()> {
+        if let DfsMetadataTableOp::PutNamespacePrepareJournalReference {
+            journal_sequence,
+            operation_id,
+            ..
+        } = op
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {operation_id} table reference at journal sequence {journal_sequence} was not resolved"
+            )));
+        }
         if let DfsMetadataTableOp::CommitNamespacePrepare {
             operation_id,
             operation_digest,
@@ -317,6 +334,16 @@ impl DfsMetadataTables {
         op: DfsMetadataTableOp,
         rollback: &mut DfsMetadataTableRollback,
     ) -> Result<()> {
+        if let DfsMetadataTableOp::PutNamespacePrepareJournalReference {
+            journal_sequence,
+            operation_id,
+            ..
+        } = &op
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {operation_id} table reference at journal sequence {journal_sequence} was not resolved"
+            )));
+        }
         let DfsMetadataTableOp::CommitNamespacePrepare {
             operation_id,
             operation_digest,
@@ -1161,6 +1188,15 @@ impl DfsMetadataTables {
                     .remove(&prepare.operation_id);
                 self.put_namespace_prepare_indexed(prepare);
             }
+            DfsMetadataTableOp::PutNamespacePrepareJournalReference {
+                journal_sequence,
+                operation_id,
+                ..
+            } => {
+                panic!(
+                    "namespace prepare {operation_id} table reference at journal sequence {journal_sequence} must be resolved before apply"
+                );
+            }
             DfsMetadataTableOp::CommitNamespacePrepare {
                 operation_id,
                 operation_digest,
@@ -1736,6 +1772,15 @@ impl DfsMetadataTableRollback {
                     &mut self.namespace_prepare_receipts,
                     &tables.namespace_prepare_receipts,
                     prepare.operation_id.clone(),
+                );
+            }
+            DfsMetadataTableOp::PutNamespacePrepareJournalReference {
+                journal_sequence,
+                operation_id,
+                ..
+            } => {
+                panic!(
+                    "namespace prepare {operation_id} table reference at journal sequence {journal_sequence} must be resolved before rollback planning"
                 );
             }
             DfsMetadataTableOp::CommitNamespacePrepare { operation_id, .. } => {

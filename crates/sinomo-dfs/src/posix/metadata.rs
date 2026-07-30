@@ -113,6 +113,41 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
+    /// Look up one overwrite-preparation object without hydrating read
+    /// locations from replica receipts.
+    ///
+    /// Bulk overwrite replaces `current_locations` with the local publisher
+    /// before it constructs either metadata or receipt records. Avoid hydrating
+    /// receipt-derived read locations that this write path cannot observe.
+    /// Parent revalidation passes `false` to retain tombstoned-ancestor
+    /// semantics; child lookups pass `true` only after that exact parent walk
+    /// succeeded in the same pinned generation.
+    pub(super) fn lookup_metadata_path_for_local_overwrite(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+        known_live_ancestors: bool,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        if !known_live_ancestors
+            && self.has_tombstone_ancestor_without_receipt_locations(file_system_id, path)?
+        {
+            return Ok(None);
+        }
+        self.lookup_metadata_path_raw_without_receipt_locations(file_system_id, path)
+    }
+
+    fn lookup_metadata_path_raw_without_receipt_locations(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        #[cfg(test)]
+        POSIX_METADATA_RAW_LOOKUP_COUNT
+            .set(POSIX_METADATA_RAW_LOOKUP_COUNT.get().saturating_add(1));
+        self.authoritative_metadata_object_for_path(file_system_id, path)
+            .map_err(Into::into)
+    }
+
     pub(super) fn resolve_posix_path(&self, path: &str, follow_final: bool) -> Result<String> {
         let file_system_id = sifs_file_system_id();
         let mut current = normalize_posix_path(path)?;
@@ -589,6 +624,41 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     // fails closed below if its own shard is unavailable.
                     return Ok(false);
                 }
+                Err(error) => return Err(error),
+            }
+            if parent == "/" {
+                return Ok(false);
+            }
+            parent = parent
+                .rsplit_once('/')
+                .map(|(ancestor, _)| if ancestor.is_empty() { "/" } else { ancestor })
+                .unwrap_or("/");
+        }
+    }
+
+    fn has_tombstone_ancestor_without_receipt_locations(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<bool> {
+        let path = normalize_posix_path(path)?;
+        if path == "/" {
+            return Ok(false);
+        }
+        let mut parent = path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or("/");
+        if parent.is_empty() {
+            parent = "/";
+        }
+        loop {
+            match self.lookup_metadata_path_raw_without_receipt_locations(file_system_id, parent) {
+                Ok(Some(object)) if object.kind == DfsObjectKind::Tombstone => return Ok(true),
+                Ok(_) => {}
+                Err(DfsPosixError::Metadata(
+                    crate::metadata_error::MetadataBackendError::UnknownFileSystem { .. },
+                )) => return Ok(false),
                 Err(error) => return Err(error),
             }
             if parent == "/" {

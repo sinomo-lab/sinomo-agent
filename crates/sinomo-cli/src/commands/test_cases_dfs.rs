@@ -369,7 +369,7 @@ sinomo_runtime::test::sinomo_test_case! {
 sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_bulk_write(ctx) {
         id: "cluster.dfs.bulk-write",
-        summary: "Write deterministic SIFS files and report throughput (--param base=... [--param files=N] [--param bytes=N])",
+        summary: "Write deterministic SIFS files and report throughput (--param base=... [--param files=N] [--param bytes=N] [--param overwrite-existing=BOOL])",
         tags: ["cluster-dfs", "probe", "performance"],
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
@@ -3535,6 +3535,7 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         .to_string();
     let files = optional_usize_parameter(ctx, "files", DEFAULT_BULK_FILE_COUNT)?;
     let bytes = optional_usize_parameter(ctx, "bytes", DEFAULT_BULK_FILE_BYTES)?;
+    let overwrite_existing = optional_bool_parameter(ctx, "overwrite-existing", false)?;
     let timeout = expect_timeout(ctx)?;
     let min_files_per_second = optional_f64_parameter(ctx, "min-files-per-second", 0.0)?;
     let max_proc_wchar_amplification =
@@ -3572,7 +3573,15 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let write_started = Instant::now();
     let write_result = retry_bulk_mutation_with_metrics(
         deadline,
-        || backend.write_files_with_known_parents_deferred_publish_until(&batch, deadline),
+        || {
+            if overwrite_existing {
+                backend.write_files_with_known_parents_deferred_publish_mode_until(
+                    &batch, true, deadline,
+                )
+            } else {
+                backend.write_files_with_known_parents_deferred_publish_until(&batch, deadline)
+            }
+        },
         || format!("cannot write SIFS bulk batch under {base}"),
         &mut write_retries,
     );
@@ -3608,6 +3617,7 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("base", &base);
     ctx.record("files", files);
     ctx.record("bytes_per_file", bytes);
+    ctx.record("overwrite_existing", overwrite_existing);
     ctx.record("total_bytes", total_bytes);
     ctx.record("elapsed_ms", elapsed_ms);
     ctx.record("mkdir_elapsed_ms", mkdir_elapsed.as_millis() as u64);
@@ -3705,7 +3715,7 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     }
 
     Ok(SinomoTestOutcome::passed(format!(
-        "bulk write on node {node} wrote {files} files ({total_bytes} bytes) in {elapsed_ms}ms ({files_per_second:.2} files/s)"
+        "bulk write on node {node} wrote {files} files ({total_bytes} bytes, overwrite-existing={overwrite_existing}) in {elapsed_ms}ms ({files_per_second:.2} files/s)"
     )))
 }
 
@@ -5355,6 +5365,29 @@ mod tests {
             files,
             max_per_file,
             fixed
+        ));
+    }
+
+    #[test]
+    fn bulk_write_overwrite_existing_defaults_false_and_rejects_invalid_boolean() {
+        let default = SinomoTestContext::new("unused");
+        assert!(
+            !optional_bool_parameter(&default, "overwrite-existing", false)
+                .expect("default overwrite-existing mode")
+        );
+
+        let enabled = SinomoTestContext::new("unused").with_parameter("overwrite-existing", "true");
+        assert!(
+            optional_bool_parameter(&enabled, "overwrite-existing", false)
+                .expect("explicit overwrite-existing mode")
+        );
+
+        let invalid =
+            SinomoTestContext::new("unused").with_parameter("overwrite-existing", "sometimes");
+        assert!(matches!(
+            optional_bool_parameter(&invalid, "overwrite-existing", false),
+            Err(SinomoTestError::InvalidParameter { ref name, .. })
+                if name == "overwrite-existing"
         ));
     }
 

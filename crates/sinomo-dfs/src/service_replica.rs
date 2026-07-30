@@ -310,6 +310,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation: &DfsMetadataAuthorityOperation,
         prepared_batch: &DfsMetadataJournalBatch,
     ) -> Result<DfsCanonicalAuthorization, DfsError> {
+        let trace_started = Instant::now();
         if self.control_plane.is_none() {
             return Err(DfsError::Distributed {
                 message: "clustered metadata authorization has no control-plane client".to_string(),
@@ -343,6 +344,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let required_node_ids = std::iter::once(shard.primary_node_id.clone())
             .chain(shard.replica_node_ids.iter().cloned())
             .collect::<BTreeSet<_>>();
+        let mut trace_probe_ms = 0_u128;
+        let mut trace_assignment_ms = 0_u128;
+        let mut trace_acknowledged = 0_usize;
         if let Some(record_count) =
             oversized_namespace_prepare_record_count(shard, operation, prepared_batch)
         {
@@ -356,12 +360,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 required_node_ids.len(),
             ));
         } else {
+            let probe_started = Instant::now();
             let acknowledged_node_ids = self.fresh_metadata_shard_authority_acknowledgements(
                 shard,
                 operation,
                 prepared_batch,
                 DFS_METADATA_AUTHORITY_PROBE_TIMEOUT,
             )?;
+            trace_probe_ms = probe_started.elapsed().as_millis();
+            trace_acknowledged = acknowledged_node_ids.len();
             dfs_perf_trace(format_args!(
                 "metadata_authority action=probe shard={} epoch={} prepare={} acknowledgements={} required={}",
                 shard.shard_id,
@@ -370,9 +377,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 acknowledged_node_ids.len(),
                 required_node_ids.len(),
             ));
-            if acknowledged_node_ids == required_node_ids
-                && self.metadata_shard_assignment_still_exact(shard)?
-            {
+            let assignment_started = Instant::now();
+            let assignment_still_exact = acknowledged_node_ids == required_node_ids
+                && self.metadata_shard_assignment_still_exact(shard)?;
+            trace_assignment_ms = assignment_started.elapsed().as_millis();
+            if assignment_still_exact {
+                dfs_perf_trace(format_args!(
+                    "metadata-authority-confirmation node={} shard={} epoch={} mode=full-shard required={} acknowledged={} probe_ms={} assignment_ms={} quorum_ms=0 total_ms={}",
+                    self.node_id,
+                    shard.shard_id,
+                    shard.epoch,
+                    required_node_ids.len(),
+                    trace_acknowledged,
+                    trace_probe_ms,
+                    trace_assignment_ms,
+                    trace_started.elapsed().as_millis()
+                ));
                 return Ok(DfsCanonicalAuthorization::FullShard {
                     operation_digest: metadata_authority_operation_digest(operation).to_string(),
                     expected_shard: shard.clone(),
@@ -390,6 +410,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ));
         }
         let operation_digest = metadata_authority_operation_digest(operation);
+        let quorum_started = Instant::now();
         let Some(permit_id) = self.certify_exact_metadata_shard_operation(
             shard,
             operation_digest,
@@ -403,6 +424,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 epoch: shard.epoch,
             });
         };
+        let trace_quorum_ms = quorum_started.elapsed().as_millis();
+        dfs_perf_trace(format_args!(
+            "metadata-authority-confirmation node={} shard={} epoch={} mode=cluster-quorum required={} acknowledged={} probe_ms={} assignment_ms={} quorum_ms={} total_ms={}",
+            self.node_id,
+            shard.shard_id,
+            shard.epoch,
+            required_node_ids.len(),
+            trace_acknowledged,
+            trace_probe_ms,
+            trace_assignment_ms,
+            trace_quorum_ms,
+            trace_started.elapsed().as_millis()
+        ));
         Ok(DfsCanonicalAuthorization::ClusterQuorum {
             operation_digest: operation_digest.to_string(),
             expected_shard: shard.clone(),
