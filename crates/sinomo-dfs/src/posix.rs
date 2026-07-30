@@ -81,6 +81,7 @@ pub(crate) const POSIX_RENAME_MOVE_TRANSACTION_MAX_PATH_BYTES: usize =
 const POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE: usize = 1024;
 const POSIX_REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const POSIX_REMOTE_READ_IDLE_WAIT_INITIAL: Duration = Duration::from_millis(2);
+const POSIX_BULK_PARENT_RETRY_ATTEMPTS: usize = 3;
 /// Follow-up sync rounds a routed-operation wrapper performs when bounded
 /// response replay has not yet surfaced the mutation locally.
 const POSIX_ROUTED_SYNC_RETRY_ROUNDS: usize = 4;
@@ -1399,16 +1400,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
-    fn resolve_posix_bulk_parent(&mut self, path: &str) -> Result<(String, DfsObjectMetadata)> {
+    fn resolve_posix_bulk_parent(
+        &mut self,
+        path: &str,
+        require_authoritative: bool,
+    ) -> Result<(String, DfsObjectMetadata)> {
         let (mut path, mut parent) =
             self.resolve_posix_path_distributed_with_terminal_object(path)?;
-        if parent
-            .as_ref()
-            .is_none_or(|parent| parent.kind == DfsObjectKind::Tombstone)
+        if require_authoritative
+            || parent
+                .as_ref()
+                .is_none_or(|parent| parent.kind == DfsObjectKind::Tombstone)
         {
-            // Ordinary path resolution deliberately stays local. Preserve the
-            // previous remote-primary/stale-tombstone recovery path when this
-            // node does not have a live terminal parent to reuse.
+            // The first attempt remains local-first. A stale-parent conflict
+            // forces one authoritative refresh per distinct parent before the
+            // complete same-shard batch is rebuilt and retried.
             (path, parent) = self.lookup_sifs_path_distributed_synced(&path, false)?;
         }
         let parent = parent.ok_or_else(|| DfsPosixError::MissingParent { path: path.clone() })?;
@@ -1430,6 +1436,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         I: IntoIterator<Item = (&'a str, &'a [u8])>,
     {
         let files = files.into_iter().collect::<Vec<_>>();
+        for attempt in 0..POSIX_BULK_PARENT_RETRY_ATTEMPTS {
+            match self.posix_write_files_local_eventual_with_known_parents_once(&files, attempt > 0)
+            {
+                Err(DfsPosixError::Conflict { .. })
+                    if attempt + 1 < POSIX_BULK_PARENT_RETRY_ATTEMPTS => {}
+                result => return result,
+            }
+        }
+        unreachable!("bounded bulk-parent retry loop always returns")
+    }
+
+    fn posix_write_files_local_eventual_with_known_parents_once<'a>(
+        &mut self,
+        files: &[(&'a str, &'a [u8])],
+        require_authoritative_parents: bool,
+    ) -> Result<Vec<DfsStat>> {
         if files.is_empty() {
             return Ok(Vec::new());
         }
@@ -1438,7 +1460,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut seen_objects = BTreeSet::new();
         let mut resolved_parents = BTreeMap::<String, (String, DfsObjectMetadata)>::new();
         let metadata_shard_snapshot = self.refresh_sifs_metadata_shards()?;
-        for (path, bytes) in &files {
+        for (path, bytes) in files {
             let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
             if requires_directory {
                 return match self.ensure_resolved_path_is_directory(&path) {
@@ -1458,7 +1480,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let (resolved_parent, parent_object) = match resolved_parents.get(&parent) {
                 Some(resolved) => resolved.clone(),
                 None => {
-                    let resolved = self.resolve_posix_bulk_parent(&parent)?;
+                    let resolved =
+                        self.resolve_posix_bulk_parent(&parent, require_authoritative_parents)?;
                     resolved_parents.insert(parent.clone(), resolved.clone());
                     resolved
                 }
@@ -1475,7 +1498,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     return Err(DfsPosixError::IsDirectory { path });
                 }
                 Some(object) if object.kind == DfsObjectKind::Symlink => {
-                    return self.posix_write_files_local_eventual_fallback(&files);
+                    return self.posix_write_files_local_eventual_fallback(files);
                 }
                 Some(object) if object.kind == DfsObjectKind::Hardlink => {
                     let object = self.resolve_hardlink_target(&object)?;
@@ -1502,12 +1525,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             };
             if !seen_objects.insert(object.object_id.clone()) {
-                return self.posix_write_files_local_eventual_fallback(&files);
+                return self.posix_write_files_local_eventual_fallback(files);
             }
             if object.policy != DfsObjectPolicy::ReplicatedEventual
                 || object.owner_node_id != self.node_id
             {
-                return self.posix_write_files_local_eventual_fallback(&files);
+                return self.posix_write_files_local_eventual_fallback(files);
             }
             let metadata_shard = match metadata_shard_snapshot.as_deref() {
                 Some(shards) => {
@@ -1554,6 +1577,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         I: IntoIterator<Item = (&'a str, &'a [u8])>,
     {
         let files = files.into_iter().collect::<Vec<_>>();
+        for attempt in 0..POSIX_BULK_PARENT_RETRY_ATTEMPTS {
+            match self
+                .posix_create_files_local_eventual_with_known_parents_once(&files, attempt > 0)
+            {
+                Err(DfsPosixError::Conflict { .. })
+                    if attempt + 1 < POSIX_BULK_PARENT_RETRY_ATTEMPTS => {}
+                result => return result,
+            }
+        }
+        unreachable!("bounded bulk-parent retry loop always returns")
+    }
+
+    fn posix_create_files_local_eventual_with_known_parents_once<'a>(
+        &mut self,
+        files: &[(&'a str, &'a [u8])],
+        require_authoritative_parents: bool,
+    ) -> Result<Vec<DfsStat>> {
         if files.is_empty() {
             return Ok(Vec::new());
         }
@@ -1562,7 +1602,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut seen_paths = BTreeSet::new();
         let mut resolved_parents = BTreeMap::<String, (String, DfsObjectMetadata)>::new();
         let metadata_shard_snapshot = self.refresh_sifs_metadata_shards()?;
-        for (path, bytes) in files {
+        for &(path, bytes) in files {
             let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
             if requires_directory {
                 return Err(DfsPosixError::IsDirectory { path });
@@ -1573,7 +1613,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let (resolved_parent, parent_object) = match resolved_parents.get(&parent) {
                 Some(resolved) => resolved.clone(),
                 None => {
-                    let resolved = self.resolve_posix_bulk_parent(&parent)?;
+                    let resolved =
+                        self.resolve_posix_bulk_parent(&parent, require_authoritative_parents)?;
                     resolved_parents.insert(parent.clone(), resolved.clone());
                     resolved
                 }
@@ -1701,11 +1742,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             let key = (metadata_authority, parent.object_id.clone());
             touched_parent_objects.entry(key).or_insert_with(|| {
-                // This object is the exact version observed while resolving
-                // the parent. The namespace prepare still fences its path and
-                // predecessor version authoritatively before applying this
-                // increment, so reusing it does not turn the commit into a
-                // blind parent overwrite.
+                // This is the version observed while resolving the parent. The
+                // write proof carries that exact predecessor to the metadata
+                // authority; a mismatch rejects the whole shard group and
+                // triggers an authoritative parent refresh plus bounded retry.
                 let mut parent = parent.clone();
                 parent.version = next_version(&parent.version);
                 parent.modified_at_unix_nanos = write_time;
@@ -1761,6 +1801,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 })
                 .map(|(write, object)| DfsLocalEventualBatchWriteProof {
                     expected_base_version: write.expected_base_version.clone(),
+                    expected_parent_object_id: write
+                        .parent_touch
+                        .as_ref()
+                        .map(|parent| parent.object.object_id.clone()),
+                    expected_parent_version: write
+                        .parent_touch
+                        .as_ref()
+                        .map(|parent| parent.object.version.clone()),
                     receipt: DfsReplicaReceiptRecord {
                         receipt: DfsWriteReceipt {
                             file_system_id: object.file_system_id.clone(),
@@ -1804,7 +1852,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 // are visible the caller still needs the partial-commit
                 // boundary.
                 if committed_metadata_paths.is_empty()
-                    && matches!(&source, DfsPosixError::AlreadyExists { .. })
+                    && matches!(
+                        &source,
+                        DfsPosixError::AlreadyExists { .. } | DfsPosixError::Conflict { .. }
+                    )
                 {
                     return Err(source);
                 }

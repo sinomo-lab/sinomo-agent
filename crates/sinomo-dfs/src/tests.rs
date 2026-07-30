@@ -38882,6 +38882,137 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
 }
 
 #[test]
+fn sifs_cluster_bulk_create_rebases_stale_parent_on_authority() {
+    let mut cluster = sifs_two_primary_cluster("sifs-bulk-stale-parent-rebase");
+    let parent_path = "/services/bulk-stale-parent";
+    let child_path = "/services/bulk-stale-parent/created.txt";
+    cluster
+        .services_primary
+        .posix_mkdir_all(parent_path)
+        .expect("authoritative bulk parent");
+    sifs_two_primary_publish_until(&mut cluster, "initial bulk parent", |cluster| {
+        cluster.replica.posix_stat(parent_path).is_ok()
+    });
+    let stale_parent_version =
+        DfsVersion::from_legacy_named("version_1").expect("stale parent version");
+    let authority_parent_version =
+        DfsVersion::from_legacy_named("version_3").expect("authority parent version");
+    for (service, version) in [
+        (&mut cluster.replica, stale_parent_version.clone()),
+        (
+            &mut cluster.services_primary,
+            authority_parent_version.clone(),
+        ),
+    ] {
+        let mut parent = service
+            .metadata_backend
+            .as_ref()
+            .expect("bulk parent metadata backend")
+            .get_object_by_path(&sifs_file_system_id(), parent_path)
+            .expect("bulk parent lookup")
+            .expect("bulk parent object");
+        parent.version = version;
+        service
+            .metadata_backend
+            .as_mut()
+            .expect("bulk parent metadata backend")
+            .put_object(&parent)
+            .expect("force test parent generation");
+        service
+            .metadata
+            .add_object(parent)
+            .expect("refresh test parent in memory");
+        service.clear_metadata_lookup_cache();
+    }
+    let stale_parent_version = cluster
+        .replica
+        .posix_stat(parent_path)
+        .expect("replica bulk parent")
+        .version;
+
+    let authority_parent_before = cluster
+        .services_primary
+        .posix_stat(parent_path)
+        .expect("advanced authoritative bulk parent");
+    assert_ne!(
+        authority_parent_before.version, stale_parent_version,
+        "test must retain a stale requester parent"
+    );
+    assert_eq!(
+        cluster
+            .replica
+            .posix_stat(parent_path)
+            .expect("still-stale replica bulk parent")
+            .version,
+        stale_parent_version,
+        "requester must not process the queued parent advances before preparing the batch"
+    );
+    let SifsTwoPrimaryCluster {
+        root,
+        services_primary,
+        mut replica,
+        ..
+    } = cluster;
+    let stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&stop);
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+
+    let stats = replica
+        .posix_create_files_local_eventual_with_known_parents([(
+            child_path,
+            b"stale parent bulk payload".as_slice(),
+        )])
+        .expect("bulk create from stale-parent requester");
+    assert_eq!(stats.len(), 1);
+
+    stop.store(true, Ordering::SeqCst);
+    let services_primary = services_thread.join().expect("services primary thread");
+    let authority_parent_after = services_primary
+        .posix_stat(parent_path)
+        .expect("authoritative parent after bulk create");
+    assert_ne!(
+        authority_parent_after.version, authority_parent_before.version,
+        "the successful retry must advance the authoritative parent"
+    );
+    assert_eq!(
+        services_primary
+            .posix_stat(child_path)
+            .expect("authoritative bulk child")
+            .content_hash
+            .as_deref(),
+        Some(content_hash(b"stale parent bulk payload").as_str())
+    );
+    let bulk_requests = services_primary
+        .metadata_backend
+        .as_ref()
+        .expect("services metadata backend")
+        .list_namespace_requests()
+        .expect("bulk namespace request ledger")
+        .into_iter()
+        .filter(|request| {
+            matches!(
+                request.operation,
+                DfsNamespaceOperation::CommitLocalEventualBatch { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        bulk_requests.iter().any(|request| {
+            matches!(
+                request.result,
+                Some(DfsNamespaceResult::Rejected {
+                    posix_error: Some(DfsNamespacePosixError::Conflict { .. }),
+                    ..
+                })
+            )
+        }),
+        "the authority must reject the requester's stale parent generation before retry"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn routed_namespace_without_local_replay_omits_response_journal_batches() {
     let cluster = sifs_two_primary_cluster("sifs-namespace-no-replay-batches");
     let SifsTwoPrimaryCluster {
@@ -39559,6 +39690,8 @@ fn local_eventual_batch_shard_selection_lists_control_plane_once_for_bulk_paths(
         .iter()
         .map(|object| DfsLocalEventualBatchWriteProof {
             expected_base_version: None,
+            expected_parent_object_id: None,
+            expected_parent_version: None,
             receipt: DfsReplicaReceiptRecord {
                 receipt: DfsWriteReceipt {
                     file_system_id: object.file_system_id.clone(),

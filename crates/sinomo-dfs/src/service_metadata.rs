@@ -846,17 +846,61 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     object.path
                 )));
             };
-            if !writes_by_object.values().any(|write| {
-                objects
-                    .get(&write.receipt.receipt.object_id)
-                    .and_then(|file| crate::posix_path::parent_posix_path(&file.path))
-                    .as_deref()
-                    == Some(object.path.as_str())
-            }) {
+            let parent_writes = writes_by_object
+                .values()
+                .filter(|write| {
+                    write.expected_base_version.is_none()
+                        && objects
+                            .get(&write.receipt.receipt.object_id)
+                            .and_then(|file| crate::posix_path::parent_posix_path(&file.path))
+                            .as_deref()
+                            == Some(object.path.as_str())
+                })
+                .collect::<Vec<_>>();
+            if parent_writes.is_empty() {
                 return Err(reject(format!(
                     "local-eventual batch directory touch {} is not the parent of a proven file",
                     object.path
                 )));
+            }
+            let expected_parent_versions = parent_writes
+                .iter()
+                .map(|write| {
+                    match (
+                        write.expected_parent_object_id.as_ref(),
+                        write.expected_parent_version.as_ref(),
+                    ) {
+                        (Some(parent_object_id), Some(parent_version))
+                            if parent_object_id == &object.object_id =>
+                        {
+                            Ok(parent_version.clone())
+                        }
+                        _ => Err(reject(format!(
+                            "local-eventual batch write proof for parent {} has no exact parent generation",
+                            object.path
+                        ))),
+                    }
+                })
+                .collect::<Result<BTreeSet<_>, _>>()?;
+            let mut expected_parent_versions = expected_parent_versions.iter();
+            let Some(expected_parent_version) = expected_parent_versions.next() else {
+                return Err(reject(format!(
+                    "local-eventual batch write proofs omit the parent generation for {}",
+                    object.path
+                )));
+            };
+            if expected_parent_versions.next().is_some() {
+                return Err(reject(format!(
+                    "local-eventual batch write proofs disagree on the parent generation for {}",
+                    object.path
+                )));
+            }
+            if &current.version != expected_parent_version {
+                return Err(DfsError::StaleDirectoryVersion {
+                    path: object.path.clone(),
+                    expected_version: expected_parent_version.clone(),
+                    current_version: current.version,
+                });
             }
             let mut allowed = current.clone();
             allowed.version = object.version.clone();

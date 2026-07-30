@@ -93,6 +93,14 @@ pub enum DfsError {
     DirectoryNotEmpty { path: String },
     #[error("path already exists: {path}")]
     AlreadyExists { path: String },
+    #[error(
+        "directory {path} changed before the namespace batch committed: expected version {expected_version}, current version {current_version}"
+    )]
+    StaleDirectoryVersion {
+        path: String,
+        expected_version: DfsVersion,
+        current_version: DfsVersion,
+    },
     /// The caller cancelled the operation through the service's
     /// [`DfsCancellationFlag`](crate::DfsCancellationFlag) — typically a budgeted
     /// load giving up while the cluster/DFS link is degraded. Distributed wait

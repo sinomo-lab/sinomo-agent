@@ -1367,9 +1367,11 @@ and bounded witnesses cover two-slot fan-out, an N3-before-N2 acknowledgement,
 quorum fallback with a late N2 response, stale-response isolation, retry, and
 ordered completion. This finite three-node slice abstracts RPC bytes, timeouts,
 membership changes, and the full-shard grace timer.
-The Rust refinement is `send_metadata_journal_batches_direct`, with
-`DFS_METADATA_JOURNAL_DIRECT_MAX_INFLIGHT` as the two-slot cap and
-`DFS_METADATA_JOURNAL_DIRECT_FANOUT_BUDGET` as the shared best-effort deadline.
+The Rust refinement is `send_metadata_journal_batches_direct`. Checkpoint
+catch-up uses the two-slot `DFS_METADATA_CHECKPOINT_DIRECT_MAX_INFLIGHT` cap and
+the short `DFS_METADATA_CHECKPOINT_DIRECT_FANOUT_BUDGET`; operation-bound
+authority fan-out uses its cluster-sized inflight cap and a larger outer cap,
+while the caller supplies the tighter small- or large-prepare deadline.
 
 The `dfs_metadata_shard_concurrent_dispatch_safety.safety` companion defines
 the daemon mutation-lane scheduler above the already-concurrent object-RPC

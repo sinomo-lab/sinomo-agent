@@ -70,6 +70,16 @@ impl From<DfsError> for DfsPosixError {
         match error {
             DfsError::DirectoryNotEmpty { path } => DfsPosixError::DirectoryNotEmpty { path },
             DfsError::AlreadyExists { path } => DfsPosixError::AlreadyExists { path },
+            DfsError::StaleDirectoryVersion {
+                path,
+                expected_version,
+                current_version,
+            } => DfsPosixError::Conflict {
+                path,
+                reason: format!(
+                    "parent directory changed from version {expected_version} to {current_version}"
+                ),
+            },
             error => DfsPosixError::Dfs(error),
         }
     }

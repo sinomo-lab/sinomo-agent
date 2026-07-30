@@ -58,9 +58,12 @@ const DFS_METADATA_CHECKPOINT_DIRECT_MAX_INFLIGHT: usize = 2;
 /// not serialize required acknowledgements behind the best-effort checkpoint
 /// cap and then needlessly fall back to cluster KV.
 const DFS_METADATA_AUTHORITY_DIRECT_MAX_INFLIGHT: usize = 8;
-/// Keep one slow checkpoint replica from holding a served mutation lane. The
-/// operation-wide deadline, when shorter, is folded into each RPC below.
-const DFS_METADATA_JOURNAL_DIRECT_FANOUT_BUDGET: Duration = Duration::from_millis(250);
+/// Keep one slow checkpoint replica from holding a served mutation lane.
+const DFS_METADATA_CHECKPOINT_DIRECT_FANOUT_BUDGET: Duration = Duration::from_millis(250);
+/// Large namespace prepares use segmented value bodies and need enough time to
+/// reach healthy WAN replicas before falling back to the degraded KV fence.
+/// The operation-wide authority deadline remains the tighter normal bound.
+const DFS_METADATA_AUTHORITY_DIRECT_FANOUT_BUDGET: Duration = Duration::from_secs(5);
 /// Refinement of retry cooling in `replica_promotion_outbox.qnt`.
 ///
 /// Failed replay-safe post-response work is intentionally ineligible for a
@@ -3318,16 +3321,29 @@ impl DfsMessageTransport for DfsNodeTransport {
         if peer_transport.is_none() && async_peer_transport.is_none() {
             return Ok(None);
         }
-        let max_inflight = if !requests.is_empty()
+        let authority_fanout = !requests.is_empty()
             && requests
                 .iter()
-                .all(|(_, command)| command.authority_probe.is_some())
-        {
+                .all(|(_, command)| command.authority_probe.is_some());
+        let max_inflight = if authority_fanout {
             DFS_METADATA_AUTHORITY_DIRECT_MAX_INFLIGHT
         } else {
             DFS_METADATA_CHECKPOINT_DIRECT_MAX_INFLIGHT
         };
-        let deadline = Instant::now() + DFS_METADATA_JOURNAL_DIRECT_FANOUT_BUDGET;
+        let fanout_budget = if authority_fanout {
+            DFS_METADATA_AUTHORITY_DIRECT_FANOUT_BUDGET
+        } else {
+            DFS_METADATA_CHECKPOINT_DIRECT_FANOUT_BUDGET
+        };
+        let fanout_deadline = Instant::now() + fanout_budget;
+        // The authority caller installs its operation-specific deadline before
+        // entering this transport: 250 ms for ordinary prepares and 5 seconds
+        // for large streamed prepares. Clamp the fanout scheduler itself as
+        // well as each RPC's send options so a queued ordinary probe cannot
+        // inherit the large-prepare outer cap.
+        let deadline = self
+            .operation_deadline
+            .map_or(fanout_deadline, |deadline| deadline.min(fanout_deadline));
         let mut prepared = Vec::with_capacity(requests.len());
         for (target_node_id, command) in requests {
             if target_node_id == &self.local_node_id
@@ -4158,6 +4174,42 @@ mod tests {
 
         assert_eq!(peer.max_active.load(Ordering::SeqCst), targets.len());
         assert_eq!(responses.len(), targets.len());
+    }
+
+    #[test]
+    fn blocking_metadata_authority_fanout_honors_operation_deadline() {
+        let local = node_id("node_metadata_authority_deadline_blocking_n1");
+        let targets = vec![node_id("node_metadata_authority_deadline_blocking_n2")];
+        let peer = Arc::new(MetadataFanoutPeerTransport {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            failed_target: None,
+            slow_target: None,
+            fast_delay: Duration::from_millis(400),
+            slow_delay: Duration::from_millis(400),
+        });
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer;
+        let mut transport = DfsNodeServedMessageTransport::new_with_peer_transport_for_nodes(
+            local.clone(),
+            targets.clone(),
+            sync_peer,
+            Duration::from_secs(2),
+        );
+        transport.set_operation_deadline(Some(Instant::now() + Duration::from_millis(50)));
+
+        let started = Instant::now();
+        let responses = transport
+            .send_metadata_journal_batches_direct(&test_metadata_authority_fanout_requests(
+                &local, &targets,
+            ))
+            .expect("deadline-bounded metadata authority fan-out")
+            .expect("blocking peer retained");
+
+        assert!(responses.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "ordinary authority fan-out must retain the caller's shorter deadline"
+        );
     }
 
     #[test]

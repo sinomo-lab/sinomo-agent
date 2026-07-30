@@ -267,6 +267,13 @@ pub struct DfsNamespaceShardCursor {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsLocalEventualBatchWriteProof {
     pub expected_base_version: Option<DfsVersion>,
+    /// Exact parent generation from which this create's directory touch was
+    /// derived. The metadata authority rejects a stale generation before
+    /// preparing any child or parent record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_parent_object_id: Option<DfsObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_parent_version: Option<DfsVersion>,
     pub receipt: DfsReplicaReceiptRecord,
 }
 
