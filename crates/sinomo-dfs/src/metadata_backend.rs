@@ -15,7 +15,8 @@ use crate::content_root_catalog::{
     DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES, DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
     DFS_CONTENT_ROOT_CATALOG_TARGET_PAGE_BYTES, DfsContentRootCatalogCoverage,
     DfsContentRootCatalogCursor, DfsContentRootCatalogEntry, DfsContentRootCatalogIncompleteReason,
-    DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest, dfs_content_root_catalog_entries,
+    DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest,
+    dfs_content_root_catalog_entries_from_canonical_protection,
 };
 use crate::control_plane::{DfsMetadataNamespacePrepareCodec, DfsMetadataShardConfig};
 use crate::metadata_api::{
@@ -2040,6 +2041,90 @@ struct DfsContentRootCatalogSnapshotCache {
     entries: Arc<Vec<DfsContentRootCatalogEntry>>,
 }
 
+impl DfsContentRootCatalogSnapshotCache {
+    fn satisfies_request(&self, request: &DfsContentRootCatalogPageRequest) -> bool {
+        match request.after.as_ref() {
+            Some(after) => {
+                self.journal_sequence == after.journal_sequence
+                    && self.state_fingerprint == after.state_fingerprint
+            }
+            // A new catalog generation must re-observe the live durable head.
+            // Reusing an old cut here could indefinitely retain post-cut
+            // reservations if a quorum watermark stopped advancing.
+            None => false,
+        }
+    }
+}
+
+fn content_root_catalog_page_from_snapshot(
+    request: &DfsContentRootCatalogPageRequest,
+    generated_at_unix_nanos: u64,
+    snapshot: &DfsContentRootCatalogSnapshotCache,
+) -> Result<DfsContentRootCatalogPage> {
+    let entries = snapshot.entries.as_ref();
+    let journal_sequence = snapshot.journal_sequence;
+    let state_fingerprint = &snapshot.state_fingerprint;
+    let start = request
+        .after
+        .as_ref()
+        .map(|after| entries.partition_point(|entry| entry <= &after.last_entry))
+        .unwrap_or(0);
+    let maximum_end = start.saturating_add(request.max_entries).min(entries.len());
+    let page_for_end = |end: usize| {
+        let page_entries = entries[start..end].to_vec();
+        let next_cursor = (end < entries.len()).then(|| DfsContentRootCatalogCursor {
+            journal_sequence,
+            state_fingerprint: state_fingerprint.clone(),
+            generated_at_unix_nanos,
+            last_entry: page_entries
+                .last()
+                .cloned()
+                .expect("a continued content-root page contains an entry"),
+        });
+        DfsContentRootCatalogPage {
+            identity: request.identity.clone(),
+            topology_digest: request.expected_topology_digest.clone(),
+            generated_at_unix_nanos,
+            coverage: DfsContentRootCatalogCoverage::Complete {
+                prefix_proof_version: DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
+                journal_sequence,
+                state_fingerprint: state_fingerprint.clone(),
+            },
+            entries: page_entries,
+            next_cursor,
+        }
+    };
+    let mut end = maximum_end;
+    let mut page = page_for_end(end);
+    let mut encoded_page_bytes = None;
+    while end > start.saturating_add(1) {
+        let encoded_bytes = page.encoded_size_bytes()?;
+        if encoded_bytes <= DFS_CONTENT_ROOT_CATALOG_TARGET_PAGE_BYTES {
+            encoded_page_bytes = Some(encoded_bytes);
+            break;
+        }
+        let current_entries = end.saturating_sub(start);
+        let scaled_entries = DFS_CONTENT_ROOT_CATALOG_TARGET_PAGE_BYTES
+            .saturating_mul(current_entries)
+            .checked_div(encoded_bytes)
+            .unwrap_or(1)
+            .clamp(1, current_entries.saturating_sub(1));
+        end = start.saturating_add(scaled_entries);
+        page = page_for_end(end);
+    }
+    let encoded_page_bytes = match encoded_page_bytes {
+        Some(encoded_page_bytes) => encoded_page_bytes,
+        None => page.encoded_size_bytes()?,
+    };
+    if encoded_page_bytes > DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES {
+        return Err(MetadataBackendError::Serde(format!(
+            "DFS content-root catalog page encodes to {encoded_page_bytes} bytes, exceeding the {}-byte transport budget",
+            DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES
+        )));
+    }
+    Ok(page)
+}
+
 #[derive(Clone, Debug)]
 pub struct LocalSobjMetadataBackend {
     shard_id: DfsMetadataShardId,
@@ -2057,6 +2142,7 @@ pub struct LocalSobjMetadataBackend {
     table_snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
     read_snapshot_cache: Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
     content_root_catalog_snapshot_cache: Option<Arc<DfsContentRootCatalogSnapshotCache>>,
+    content_root_catalog_previous_snapshot_cache: Option<Arc<DfsContentRootCatalogSnapshotCache>>,
     consistent_read_snapshot_depth: usize,
     /// This non-primary handle intentionally ignored an unreadable rebuildable
     /// table-log suffix. It may serve only its last self-contained snapshot
@@ -2100,6 +2186,7 @@ impl LocalSobjMetadataBackend {
             table_snapshot_fingerprint: None,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
             content_root_catalog_snapshot_cache: None,
+            content_root_catalog_previous_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
             replica_repair_only: false,
             namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
@@ -2223,6 +2310,7 @@ impl LocalSobjMetadataBackend {
             table_snapshot_fingerprint: state.snapshot_fingerprint,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
             content_root_catalog_snapshot_cache: None,
+            content_root_catalog_previous_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
             replica_repair_only: false,
             namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
@@ -2291,6 +2379,7 @@ impl LocalSobjMetadataBackend {
             table_snapshot_fingerprint: state.snapshot_fingerprint,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
             content_root_catalog_snapshot_cache: None,
+            content_root_catalog_previous_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
             replica_repair_only: true,
             namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
@@ -2634,6 +2723,7 @@ impl LocalSobjMetadataBackend {
             table_snapshot_fingerprint: None,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
             content_root_catalog_snapshot_cache: None,
+            content_root_catalog_previous_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
             replica_repair_only: false,
             namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
@@ -8100,11 +8190,47 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             ));
         }
 
-        // Hold the cross-process metadata writer fence through refresh, root
-        // derivation, and page construction. A continuation therefore names
-        // one exact durable cut rather than mixing roots across concurrent
-        // materialization.
-        let _lock = self.metadata_write_lock()?;
+        if request.after.is_some() {
+            // Freeze installation uses this same cross-process writer fence.
+            // Select and clone the immutable cut while holding it, then release
+            // before slicing or encoding the page.
+            let cache_lock = self.metadata_write_lock()?;
+            if let Some(freeze) = self.membership_handoff_write_freeze()?
+                && !freeze
+                    .activated_epoch
+                    .is_some_and(|epoch| self.instance_authority_epoch == Some(epoch))
+            {
+                return Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                    request,
+                    DfsContentRootCatalogIncompleteReason::MembershipHandoffFrozen {
+                        handoff_id: Some(freeze.handoff_id),
+                    },
+                    generated_at_unix_nanos,
+                ));
+            }
+            let cached_snapshot = [
+                self.content_root_catalog_snapshot_cache.as_ref(),
+                self.content_root_catalog_previous_snapshot_cache.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|snapshot| snapshot.satisfies_request(request))
+            .cloned();
+            drop(cache_lock);
+            if let Some(snapshot) = cached_snapshot {
+                return content_root_catalog_page_from_snapshot(
+                    request,
+                    generated_at_unix_nanos,
+                    &snapshot,
+                );
+            }
+        }
+
+        // Build one immutable exact-cut snapshot under the cross-process
+        // writer fence. Page slicing and encoding happen after releasing the
+        // fence, and exact continuation requests can reuse the snapshot even
+        // when later metadata writes advance the live journal.
+        let lock = self.metadata_write_lock()?;
         self.refresh_after_metadata_write_lock()?;
         if let Some(freeze) = self.membership_handoff_write_freeze()?
             && !freeze
@@ -8146,33 +8272,6 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         }
         let state_fingerprint = prefix_proof.digest.clone();
 
-        let cache_matches = self
-            .content_root_catalog_snapshot_cache
-            .as_ref()
-            .is_some_and(|cache| {
-                cache.journal_sequence == journal_sequence
-                    && cache.state_fingerprint == state_fingerprint
-            });
-        if !cache_matches {
-            let protection = metadata_content_protection_from_tables(&self.tables);
-            let entries = dfs_content_root_catalog_entries(&protection);
-            self.content_root_catalog_snapshot_cache =
-                Some(Arc::new(DfsContentRootCatalogSnapshotCache {
-                    journal_sequence,
-                    state_fingerprint: state_fingerprint.clone(),
-                    entries: Arc::new(entries),
-                }));
-            #[cfg(test)]
-            self.content_root_catalog_snapshot_builds
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        let snapshot = self
-            .content_root_catalog_snapshot_cache
-            .as_ref()
-            .cloned()
-            .expect("content-root catalog snapshot cache was populated");
-        let entries = snapshot.entries.as_ref();
-
         let cut_changed = request.after.as_ref().is_some_and(|after| {
             after.journal_sequence != journal_sequence
                 || after.state_fingerprint != state_fingerprint
@@ -8190,65 +8289,35 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             ));
         }
 
-        let start = request
-            .after
+        let cache_matches = self
+            .content_root_catalog_snapshot_cache
             .as_ref()
-            .map(|after| entries.partition_point(|entry| entry <= &after.last_entry))
-            .unwrap_or(0);
-        let maximum_end = start.saturating_add(request.max_entries).min(entries.len());
-        let page_for_end = |end: usize| {
-            let page_entries = entries[start..end].to_vec();
-            let next_cursor = (end < entries.len()).then(|| DfsContentRootCatalogCursor {
-                journal_sequence,
-                state_fingerprint: state_fingerprint.clone(),
-                generated_at_unix_nanos,
-                last_entry: page_entries
-                    .last()
-                    .cloned()
-                    .expect("a continued content-root page contains an entry"),
+            .is_some_and(|cache| {
+                cache.journal_sequence == journal_sequence
+                    && cache.state_fingerprint == state_fingerprint
             });
-            DfsContentRootCatalogPage {
-                identity: request.identity.clone(),
-                topology_digest: request.expected_topology_digest.clone(),
-                generated_at_unix_nanos,
-                coverage: DfsContentRootCatalogCoverage::Complete {
-                    prefix_proof_version: DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
+        if !cache_matches {
+            let protection = metadata_content_protection_from_tables(&self.tables);
+            let entries = dfs_content_root_catalog_entries_from_canonical_protection(protection);
+            self.content_root_catalog_previous_snapshot_cache =
+                self.content_root_catalog_snapshot_cache.take();
+            self.content_root_catalog_snapshot_cache =
+                Some(Arc::new(DfsContentRootCatalogSnapshotCache {
                     journal_sequence,
                     state_fingerprint: state_fingerprint.clone(),
-                },
-                entries: page_entries,
-                next_cursor,
-            }
-        };
-        let mut end = maximum_end;
-        let mut page = page_for_end(end);
-        let mut encoded_page_bytes = None;
-        while end > start.saturating_add(1) {
-            let encoded_bytes = page.encoded_size_bytes()?;
-            if encoded_bytes <= DFS_CONTENT_ROOT_CATALOG_TARGET_PAGE_BYTES {
-                encoded_page_bytes = Some(encoded_bytes);
-                break;
-            }
-            let current_entries = end.saturating_sub(start);
-            let scaled_entries = DFS_CONTENT_ROOT_CATALOG_TARGET_PAGE_BYTES
-                .saturating_mul(current_entries)
-                .checked_div(encoded_bytes)
-                .unwrap_or(1)
-                .clamp(1, current_entries.saturating_sub(1));
-            end = start.saturating_add(scaled_entries);
-            page = page_for_end(end);
+                    entries: Arc::new(entries),
+                }));
+            #[cfg(test)]
+            self.content_root_catalog_snapshot_builds
+                .fetch_add(1, Ordering::Relaxed);
         }
-        let encoded_page_bytes = match encoded_page_bytes {
-            Some(encoded_page_bytes) => encoded_page_bytes,
-            None => page.encoded_size_bytes()?,
-        };
-        if encoded_page_bytes > DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES {
-            return Err(MetadataBackendError::Serde(format!(
-                "DFS content-root catalog page encodes to {encoded_page_bytes} bytes, exceeding the {}-byte transport budget",
-                DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES
-            )));
-        }
-        Ok(page)
+        let snapshot = self
+            .content_root_catalog_snapshot_cache
+            .as_ref()
+            .cloned()
+            .expect("content-root catalog snapshot cache was populated");
+        drop(lock);
+        content_root_catalog_page_from_snapshot(request, generated_at_unix_nanos, &snapshot)
     }
 
     fn metadata_content_protection(&self) -> Result<DfsMetadataContentProtection> {
@@ -18223,6 +18292,162 @@ mod tests {
             2,
             "a new durable cut must rebuild the root snapshot"
         );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn content_root_catalog_continuation_reuses_exact_cut_after_live_head_advances() {
+        let root = temp_root("content-root-catalog-continuation-cache");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        let file = object(version("version_catalog_current"));
+        backend.put_object(&file).expect("object");
+        for index in 0..96 {
+            let mut record = object_version_record(
+                &file,
+                version(&format!("version_catalog_{index:03}")),
+                OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(index),
+            );
+            record.content_hash = Some(format!("blake3:catalog-{index:03}"));
+            backend.put_version(&record).expect("catalog version");
+        }
+
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file.file_system_id.clone(),
+            shard_id: shard_id.0.clone(),
+            primary_node_id: node("node_owner"),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let request = DfsContentRootCatalogPageRequest {
+            identity: DfsContentRootCatalogShardIdentity::from_config(&shard),
+            expected_topology_digest: dfs_content_root_catalog_topology_digest(&[shard])
+                .expect("topology digest"),
+            minimum_journal_sequence: 0,
+            minimum_state_fingerprint: None,
+            after: None,
+            max_entries: 16,
+        };
+        let first = backend
+            .content_root_catalog_page(&request)
+            .expect("first content-root page");
+        let first_cut = first.coverage.durable_cut().expect("complete first cut").0;
+        let next = first.next_cursor.expect("fixture continuation");
+
+        let mut later = object_version_record(
+            &file,
+            version("version_catalog_after_first_page"),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(97),
+        );
+        later.content_hash = Some("blake3:catalog-after-first-page".to_string());
+        backend
+            .put_version(&later)
+            .expect("advance live metadata head");
+
+        let mut continuation_request = request.clone();
+        continuation_request.minimum_journal_sequence = next.journal_sequence;
+        continuation_request.minimum_state_fingerprint = Some(next.state_fingerprint.clone());
+        continuation_request.after = Some(next);
+
+        backend
+            .content_root_catalog_page(&request)
+            .expect("new observation at advanced live head");
+        assert_eq!(
+            backend
+                .content_root_catalog_snapshot_builds
+                .load(Ordering::Relaxed),
+            2,
+            "a new first page must re-observe the advanced durable head"
+        );
+
+        let continuation = backend
+            .content_root_catalog_page(&continuation_request)
+            .expect("interleaved cached exact-cut continuation");
+        continuation
+            .validate_for_request(&continuation_request)
+            .expect("valid cached continuation");
+        assert_eq!(
+            continuation
+                .coverage
+                .durable_cut()
+                .expect("complete continuation")
+                .0,
+            first_cut,
+            "pagination must remain on the first page's immutable durable cut"
+        );
+        assert_eq!(
+            backend
+                .content_root_catalog_snapshot_builds
+                .load(Ordering::Relaxed),
+            2,
+            "the prior exact cut must survive one interleaved first-page observation"
+        );
+
+        let mut latest = object_version_record(
+            &file,
+            version("version_catalog_after_interleaved_page"),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(98),
+        );
+        latest.content_hash = Some("blake3:catalog-after-interleaved-page".to_string());
+        backend
+            .put_version(&latest)
+            .expect("advance live metadata head again");
+        let third = backend
+            .content_root_catalog_page(&request)
+            .expect("third live-head observation");
+        assert_eq!(
+            backend
+                .content_root_catalog_snapshot_builds
+                .load(Ordering::Relaxed),
+            3,
+            "the bounded cache must retain only the two newest durable cuts"
+        );
+        let evicted = backend
+            .content_root_catalog_page(&continuation_request)
+            .expect("evicted continuation fails closed");
+        assert!(matches!(
+            evicted.coverage,
+            DfsContentRootCatalogCoverage::Incomplete { ref reasons }
+                if reasons == &[DfsContentRootCatalogIncompleteReason::StateFingerprintChanged]
+        ));
+        assert_eq!(
+            backend
+                .content_root_catalog_snapshot_builds
+                .load(Ordering::Relaxed),
+            3,
+            "an evicted stale cursor must fail before deriving another full root snapshot"
+        );
+
+        let third_next = third.next_cursor.expect("third-cut continuation");
+        backend
+            .freeze_metadata_shard_for_membership_handoff(
+                &shard_id,
+                "catalog-continuation-handoff",
+                1,
+            )
+            .expect("freeze metadata shard")
+            .expect("matching shard freeze");
+        let mut frozen_request = request;
+        frozen_request.minimum_journal_sequence = third_next.journal_sequence;
+        frozen_request.minimum_state_fingerprint = Some(third_next.state_fingerprint.clone());
+        frozen_request.after = Some(third_next);
+        let frozen = backend
+            .content_root_catalog_page(&frozen_request)
+            .expect("frozen continuation response");
+        assert!(matches!(
+            frozen.coverage,
+            DfsContentRootCatalogCoverage::Incomplete { ref reasons }
+                if matches!(
+                    reasons.as_slice(),
+                    [DfsContentRootCatalogIncompleteReason::MembershipHandoffFrozen {
+                        handoff_id: Some(handoff_id)
+                    }] if handoff_id == "catalog-continuation-handoff"
+                )
+        ));
         cleanup(&root);
     }
 

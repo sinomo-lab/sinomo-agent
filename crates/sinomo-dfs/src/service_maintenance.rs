@@ -7,6 +7,8 @@
 
 use sinomo_core::node::NodeId;
 
+use std::collections::BTreeSet;
+
 use crate::*;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -178,6 +180,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 (Some(_), None) | (None, _) => None,
             };
         let content_gc_requested = options.version_gc.is_some() || options.orphan_gc.is_some();
+        let content_reservation_reconciliation_requested =
+            options.content_reservation_reconciliation.is_some();
         // A local metadata image is not a cluster-wide reachability proof. Only
         // a complete, topology-current, freshness-checked catalog assembled
         // from every exact shard primary can authorize destructive collection.
@@ -204,11 +208,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let content_gc_metadata_protection_unavailable =
             content_gc_requested && content_protection.is_none();
         let content_reservation_reconciliation = match (
-            content_gc_requested,
             content_protection.as_ref(),
             options.content_reservation_reconciliation,
         ) {
-            (true, Some(content_protection), Some(mut reconciliation)) => {
+            (Some(content_protection), Some(mut reconciliation)) => {
                 let Some((catalog_generation, _, catalog_installed_at_unix_nanos)) =
                     catalog_observation.as_ref()
                 else {
@@ -296,11 +299,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             (Some(_), None) | (None, _) => None,
         };
-        let durable_content_reservation_count = if content_gc_requested {
-            self.content.content_reservation_roots()?.reservation_count
-        } else {
-            0
-        };
+        let durable_content_reservation_count =
+            if content_gc_requested || content_reservation_reconciliation_requested {
+                self.content.content_reservation_roots()?.reservation_count
+            } else {
+                0
+            };
         let tombstone_compaction_requested = options.tombstone_compaction.is_some();
         let metadata_backend_configured = self.metadata_backend.is_some();
         let tombstone_compaction =
@@ -323,6 +327,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             metadata_backend_configured,
             tombstone_compaction_requested,
             tombstone_compaction,
+        })
+    }
+
+    /// Releases only reservations whose exact object-version identity was
+    /// positively witnessed by a previously installed complete catalog.
+    ///
+    /// This path never rejects an uncovered reservation and never authorizes
+    /// manifest or blob deletion. Positive historical coverage is monotonic:
+    /// once authoritative metadata accepted the version, the local
+    /// pre-catalog reservation no longer needs to stand in for that evidence.
+    pub(crate) fn reconcile_content_reservations_from_installed_catalog(
+        &mut self,
+        catalog_versions: &BTreeSet<(String, String)>,
+        catalog_generation: &str,
+        max_reservations: u64,
+    ) -> Result<DfsLifecycleMaintenanceReport, DfsError> {
+        let reconciliation = self.content.reconcile_content_reservations_with_catalog(
+            catalog_versions,
+            &BTreeSet::new(),
+            ContentStoreReservationReconciliationOptions::bounded(
+                0,
+                std::time::Duration::ZERO,
+                max_reservations,
+            )
+            .with_catalog_generation(catalog_generation),
+        )?;
+        let durable_content_reservation_count =
+            self.content.content_reservation_roots()?.reservation_count;
+        Ok(DfsLifecycleMaintenanceReport {
+            content_reservation_reconciliation: Some(reconciliation),
+            durable_content_reservation_count,
+            metadata_backend_configured: self.metadata_backend.is_some(),
+            ..DfsLifecycleMaintenanceReport::default()
         })
     }
 

@@ -1802,9 +1802,16 @@ fn daemon_dfs_initial_maintenance_phase(paths: &DaemonPaths) -> Result<Duration,
 fn spawn_daemon_dfs_maintenance_task(
     paths: DaemonPaths,
     runtime: tokio::runtime::Handle,
+    content_gc_requested: bool,
+    content_reservation_reconciliation_requested: bool,
 ) -> OwnedDaemonDfsMaintenanceTask {
     OwnedDaemonDfsMaintenanceTask::new(tokio::spawn(
-        run_daemon_dfs_maintenance_tick_in_blocking_task(paths, runtime),
+        run_daemon_dfs_maintenance_tick_in_blocking_task(
+            paths,
+            runtime,
+            content_gc_requested,
+            content_reservation_reconciliation_requested,
+        ),
     ))
 }
 
@@ -2446,6 +2453,12 @@ async fn run_daemon_background_maintenance_loop(
                     None
                 }
             };
+            let content_gc_requested = work
+                .as_ref()
+                .is_some_and(DaemonDfsPendingMaintenanceWork::should_run_content_gc);
+            let content_reservation_reconciliation_requested = work.as_ref().is_some_and(
+                DaemonDfsPendingMaintenanceWork::should_reconcile_content_reservations,
+            );
             let decision = daemon_dfs_maintenance_revalidation_decision(
                 Instant::now(),
                 daemon_dfs_now_unix_nanos(),
@@ -2464,8 +2477,12 @@ async fn run_daemon_background_maintenance_loop(
             ) {
                 let dfs_paths = paths.clone();
                 let dfs_runtime = runtime.clone();
-                dfs_maintenance_task =
-                    Some(spawn_daemon_dfs_maintenance_task(dfs_paths, dfs_runtime));
+                dfs_maintenance_task = Some(spawn_daemon_dfs_maintenance_task(
+                    dfs_paths,
+                    dfs_runtime,
+                    content_gc_requested,
+                    content_reservation_reconciliation_requested,
+                ));
                 dfs_triggered_maintenance_requested = false;
                 dfs_immediate_continuation_requested = false;
             }
