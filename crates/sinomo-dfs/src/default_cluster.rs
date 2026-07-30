@@ -9,7 +9,7 @@ use sinomo_core::network::{
     ClusterConnectivityGraph, ClusterPaths, cluster_healthy_route_next_hop,
     pooled_routed_relationship_is_active,
 };
-use sinomo_core::node::NodeId;
+use sinomo_core::node::{DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY, NodeId};
 use sinomo_core::{ClusterBootstrapState, ClusterMemberRecord, ClusterMemberRole, DfsObjectPolicy};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -27,12 +27,12 @@ use crate::{
     AsyncDfsControlPlaneKvClient, DfsControlPlaneAsyncStore, DfsControlPlaneKvClient,
     DfsControlPlaneStore, DfsError, DfsFileSystem, DfsFileSystemConfig, DfsFileSystemId,
     DfsMessageSender, DfsMetadataBackend, DfsMetadataJournalBatchSender,
-    DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardHeadWatermark,
-    DfsMetadataShardId, DfsMetadataShardMembershipHandoff, DfsMetadataShardMembershipHandoffProof,
-    DfsMetadataSnapshotInstallSender, DfsNodeAdvertisement, DfsPeerTransport, DfsSmokeOptions,
-    DfsSmokeReport, DfsSubtreePolicy, SIFS_SERVICES_PATH, SIFS_USERS_PATH, content_service_key,
-    default_dfs_metadata_shards_root, dfs_message_sender_from_peer_transport,
-    dfs_metadata_journal_batch_sender_from_peer_transport,
+    DfsMetadataNamespacePrepareCodec, DfsMetadataShardAssignment, DfsMetadataShardConfig,
+    DfsMetadataShardHeadWatermark, DfsMetadataShardId, DfsMetadataShardMembershipHandoff,
+    DfsMetadataShardMembershipHandoffProof, DfsMetadataSnapshotInstallSender, DfsNodeAdvertisement,
+    DfsPeerTransport, DfsSmokeOptions, DfsSmokeReport, DfsSubtreePolicy, SIFS_SERVICES_PATH,
+    SIFS_USERS_PATH, content_service_key, default_dfs_metadata_shards_root,
+    dfs_message_sender_from_peer_transport, dfs_metadata_journal_batch_sender_from_peer_transport,
     dfs_metadata_snapshot_install_sender_from_peer_transport, distributed_sifs,
     file_system_config_key, local_dfs_metadata_shard_path, materialize_default_sifs_metadata,
     metadata_replication::{
@@ -1774,12 +1774,14 @@ pub fn default_cluster_metadata_shard_with_host(
         ),
         epoch: 1,
         assignment,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let Some(current) = host.current_metadata_shard(&file_system.file_system_id, shard_id)? else {
         desired.primary_node_id = bootstrap_primary_node_id.clone();
         desired.replica_node_ids =
             default_metadata_shard_replica_node_ids(&service_node_ids, &bootstrap_primary_node_id);
+        let _ = select_metadata_namespace_prepare_codec(state, &mut desired, None);
         return Ok(desired);
     };
     let current_primary_unavailable =
@@ -1809,6 +1811,9 @@ pub fn default_cluster_metadata_shard_with_host(
         // a later bootstrap pass can reconcile newly added/removed replicas.
         desired.replica_node_ids = replica_node_ids;
     }
+    if !select_metadata_namespace_prepare_codec(state, &mut desired, Some(&current)) {
+        return Ok(current);
+    }
     if current.primary_node_id != desired.primary_node_id
         && !host.metadata_shard_primary_transfer_ready(&current, &desired.primary_node_id)?
     {
@@ -1816,6 +1821,9 @@ pub fn default_cluster_metadata_shard_with_host(
         expanded.primary_node_id = current.primary_node_id.clone();
         expanded.replica_node_ids =
             default_metadata_shard_replica_node_ids(&service_node_ids, &current.primary_node_id);
+        if !select_metadata_namespace_prepare_codec(state, &mut expanded, Some(&current)) {
+            return Ok(current);
+        }
         if metadata_shard_layout_matches(&current, &expanded) {
             return Ok(current);
         }
@@ -1855,6 +1863,7 @@ pub async fn default_cluster_metadata_shard_with_async_host(
         ),
         epoch: 1,
         assignment,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let Some(current) = host
@@ -1864,6 +1873,7 @@ pub async fn default_cluster_metadata_shard_with_async_host(
         desired.primary_node_id = bootstrap_primary_node_id.clone();
         desired.replica_node_ids =
             default_metadata_shard_replica_node_ids(&service_node_ids, &bootstrap_primary_node_id);
+        let _ = select_metadata_namespace_prepare_codec(state, &mut desired, None);
         return Ok(desired);
     };
     let current_primary_unavailable =
@@ -1889,6 +1899,9 @@ pub async fn default_cluster_metadata_shard_with_async_host(
     {
         desired.replica_node_ids = replica_node_ids;
     }
+    if !select_metadata_namespace_prepare_codec(state, &mut desired, Some(&current)) {
+        return Ok(current);
+    }
     if current.primary_node_id != desired.primary_node_id
         && !host
             .metadata_shard_primary_transfer_ready_async(
@@ -1901,6 +1914,9 @@ pub async fn default_cluster_metadata_shard_with_async_host(
         expanded.primary_node_id = current.primary_node_id.clone();
         expanded.replica_node_ids =
             default_metadata_shard_replica_node_ids(&service_node_ids, &current.primary_node_id);
+        if !select_metadata_namespace_prepare_codec(state, &mut expanded, Some(&current)) {
+            return Ok(current);
+        }
         if metadata_shard_layout_matches(&current, &expanded) {
             return Ok(current);
         }
@@ -1993,7 +2009,47 @@ pub fn metadata_shard_layout_matches(
         && left.primary_node_id == right.primary_node_id
         && left.replica_node_ids == right.replica_node_ids
         && left.assignment == right.assignment
+        && left.namespace_prepare_codec == right.namespace_prepare_codec
         && left.default_policy == right.default_policy
+}
+
+fn select_metadata_namespace_prepare_codec(
+    state: &ClusterBootstrapState,
+    shard: &mut DfsMetadataShardConfig,
+    current: Option<&DfsMetadataShardConfig>,
+) -> bool {
+    let assigned_node_ids = std::iter::once(&shard.primary_node_id)
+        .chain(shard.replica_node_ids.iter())
+        .collect::<BTreeSet<_>>();
+    let all_assigned_support_packed_v1 = !assigned_node_ids.is_empty()
+        && assigned_node_ids.iter().all(|node_id| {
+            state.members.iter().any(|member| {
+                member.node_id == **node_id
+                    && member.state.is_authorized()
+                    && member.capabilities.iter().any(|capability| {
+                        capability.as_str() == DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY
+                    })
+            })
+        });
+    if current.is_some_and(|current| {
+        current.namespace_prepare_codec == DfsMetadataNamespacePrepareCodec::PackedV1
+    }) && !all_assigned_support_packed_v1
+    {
+        // Capability loss cannot prove that an older binary can reopen retained
+        // packed journal history. Keep the exact active generation instead of
+        // manufacturing an unsafe Legacy transition. Membership reconciliation
+        // can resume after every desired member is capable (or the incapable
+        // member has been removed); a future rollback protocol must provide a
+        // canonical legacy-readable snapshot and replay floor first.
+        shard.namespace_prepare_codec = DfsMetadataNamespacePrepareCodec::PackedV1;
+        return false;
+    }
+    shard.namespace_prepare_codec = if all_assigned_support_packed_v1 {
+        DfsMetadataNamespacePrepareCodec::PackedV1
+    } else {
+        DfsMetadataNamespacePrepareCodec::Legacy
+    };
+    true
 }
 
 pub fn stable_dfs_service_node_ids(state: &ClusterBootstrapState) -> Vec<NodeId> {
@@ -2192,6 +2248,7 @@ mod tests {
                 replica_node_ids: Vec::new(),
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -2203,6 +2260,7 @@ mod tests {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: SIFS_SERVICES_PATH.to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -2214,6 +2272,7 @@ mod tests {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: SIFS_USERS_PATH.to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
         ]
@@ -2301,6 +2360,320 @@ mod tests {
     }
 
     #[test]
+    fn metadata_prepare_codec_stays_legacy_until_every_assigned_member_is_capable() {
+        let mut state = test_cluster_state_with_members(
+            "cluster_dfs_prepare_codec_mixed",
+            "node_dfs_prepare_codec_local",
+            &[
+                "node_dfs_prepare_codec_remote_a",
+                "node_dfs_prepare_codec_remote_b",
+            ],
+        );
+        let file_system = default_cluster_sifs(&state);
+        let mut host = TestDefaultClusterBootstrapHost {
+            current_shard: None,
+            unavailable_node_ids: BTreeSet::new(),
+            primary_transfer_ready: false,
+            primary_transfer_targets: Vec::new(),
+        };
+
+        let missing = default_cluster_metadata_shard_with_host(
+            &mut host,
+            &state,
+            &file_system,
+            "root",
+            DfsMetadataShardAssignment::Root,
+            0,
+        )
+        .expect("missing capability falls back to legacy");
+        assert_eq!(
+            missing.namespace_prepare_codec,
+            DfsMetadataNamespacePrepareCodec::Legacy
+        );
+
+        let capability =
+            sinomo_core::CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY)
+                .expect("static capability");
+        let member_count = state.members.len();
+        for member in state.members.iter_mut().take(member_count - 1) {
+            member.capabilities.push(capability.clone());
+        }
+        let mixed = default_cluster_metadata_shard_with_host(
+            &mut host,
+            &state,
+            &file_system,
+            "root",
+            DfsMetadataShardAssignment::Root,
+            0,
+        )
+        .expect("mixed capability falls back to legacy");
+        assert_eq!(
+            mixed.namespace_prepare_codec,
+            DfsMetadataNamespacePrepareCodec::Legacy
+        );
+    }
+
+    #[test]
+    fn metadata_prepare_codec_activation_requires_every_assigned_member_and_is_one_way() {
+        let mut state = test_cluster_state_with_members(
+            "cluster_dfs_prepare_codec_transition",
+            "node_dfs_prepare_codec_transition_local",
+            &[
+                "node_dfs_prepare_codec_transition_remote_a",
+                "node_dfs_prepare_codec_transition_remote_b",
+            ],
+        );
+        let file_system = default_cluster_sifs(&state);
+        let mut host = TestDefaultClusterBootstrapHost {
+            current_shard: None,
+            unavailable_node_ids: BTreeSet::new(),
+            primary_transfer_ready: false,
+            primary_transfer_targets: Vec::new(),
+        };
+        let legacy = default_cluster_metadata_shard_with_host(
+            &mut host,
+            &state,
+            &file_system,
+            "root",
+            DfsMetadataShardAssignment::Root,
+            0,
+        )
+        .expect("legacy shard");
+        assert_eq!(
+            legacy.namespace_prepare_codec,
+            DfsMetadataNamespacePrepareCodec::Legacy
+        );
+
+        let capability =
+            sinomo_core::CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY)
+                .expect("static capability");
+        for member in &mut state.members {
+            member.capabilities.push(capability.clone());
+        }
+        host.current_shard = Some(legacy.clone());
+
+        let packed = default_cluster_metadata_shard_with_host(
+            &mut host,
+            &state,
+            &file_system,
+            "root",
+            DfsMetadataShardAssignment::Root,
+            0,
+        )
+        .expect("packed shard");
+        assert_eq!(
+            packed.namespace_prepare_codec,
+            DfsMetadataNamespacePrepareCodec::PackedV1
+        );
+        assert_eq!(packed.epoch, legacy.epoch + 1);
+        assert_eq!(packed.primary_node_id, legacy.primary_node_id);
+        assert_eq!(packed.replica_node_ids, legacy.replica_node_ids);
+        assert!(
+            host.primary_transfer_targets.is_empty(),
+            "a codec-only transition must not masquerade as a primary rotation"
+        );
+
+        state
+            .members
+            .last_mut()
+            .expect("assigned member")
+            .capabilities
+            .retain(|candidate| candidate != &capability);
+        host.current_shard = Some(packed.clone());
+        let retained = default_cluster_metadata_shard_with_host(
+            &mut host,
+            &state,
+            &file_system,
+            "root",
+            DfsMetadataShardAssignment::Root,
+            0,
+        )
+        .expect("capability loss retains the packed generation");
+        assert_eq!(
+            retained, packed,
+            "capability loss must fail closed instead of advertising an old-binary-safe downgrade"
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_shard_config_without_codec_defaults_and_stays_compact() {
+        let file_system_id =
+            DfsFileSystemId::from_legacy_named("prepare-codec-serde-fs").expect("filesystem");
+        let primary =
+            NodeId::from_legacy_named("prepare-codec-serde-primary").expect("primary node");
+        let mut packed = split_default_metadata_shards(
+            &file_system_id,
+            primary.clone(),
+            primary.clone(),
+            primary,
+        )
+        .remove(0);
+        packed.namespace_prepare_codec = DfsMetadataNamespacePrepareCodec::PackedV1;
+        let mut legacy_value = serde_json::to_value(packed).expect("encode packed config");
+        assert!(
+            legacy_value
+                .as_object_mut()
+                .expect("config object")
+                .remove("namespace_prepare_codec")
+                .is_some(),
+            "packed configs must explicitly carry their codec"
+        );
+
+        let decoded: DfsMetadataShardConfig =
+            serde_json::from_value(legacy_value).expect("decode legacy config");
+        assert_eq!(
+            decoded.namespace_prepare_codec,
+            DfsMetadataNamespacePrepareCodec::Legacy
+        );
+        assert!(
+            serde_json::to_value(decoded)
+                .expect("re-encode legacy config")
+                .get("namespace_prepare_codec")
+                .is_none(),
+            "legacy remains the compact omitted-field representation"
+        );
+    }
+
+    #[test]
+    fn control_plane_bootstrap_parks_codec_upgrade_for_exact_handoff() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-bootstrap-prepare-codec-upgrade");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let mut state = test_cluster_state_with_members(
+            "cluster_dfs_bootstrap_prepare_codec_upgrade",
+            "node_dfs_bootstrap_prepare_codec_upgrade_owner",
+            &["node_dfs_bootstrap_prepare_codec_upgrade_replica"],
+        );
+        let capability =
+            sinomo_core::CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY)
+                .expect("static capability");
+        for member in &mut state.members {
+            member.capabilities.push(capability.clone());
+        }
+        let owner = state.local_node_id.clone();
+        let replica = state.members[1].node_id.clone();
+        let file_system_id =
+            DfsFileSystemId::from_legacy_named("bootstrap-prepare-codec-upgrade-fs")
+                .expect("filesystem id");
+        let retiring = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: vec![replica],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let desired = DfsMetadataShardConfig {
+            epoch: 2,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
+            ..retiring.clone()
+        };
+        let mut kv = sinomo_core::kv::InProcessKvStore::new();
+        put_cluster_member_records(&mut kv, &state.members);
+        let mut host = DfsControlPlaneDefaultClusterBootstrapHost::new(
+            data_dir,
+            cluster_paths,
+            owner,
+            Box::new(kv),
+        );
+        host.put_metadata_shard(&retiring)
+            .expect("create retiring shard");
+
+        assert!(matches!(
+            host.put_metadata_shard(&desired),
+            Err(DfsError::MetadataShardMembershipHandoffParked {
+                file_system_id: parked_file_system_id,
+                shard_id,
+                retiring_epoch: 1,
+                desired_epoch: 2,
+                ..
+            }) if parked_file_system_id == file_system_id && shard_id == "root"
+        ));
+        assert_eq!(
+            host.current_metadata_shard(&file_system_id, "root")
+                .expect("read retiring shard"),
+            Some(retiring.clone()),
+            "the persisted format must not change before exact handoff completion"
+        );
+        let pending = DfsControlPlaneStore::new(host.control_plane.as_mut())
+            .get_metadata_shard_membership_handoff(&file_system_id, "root")
+            .expect("read codec handoff")
+            .expect("codec handoff parked");
+        assert_eq!(pending.retiring_shard, retiring);
+        assert_eq!(pending.desired_shard, desired);
+    }
+
+    #[test]
+    fn control_plane_bootstrap_rejects_packed_downgrade_without_replay_floor() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-bootstrap-prepare-codec-downgrade");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let mut state = test_cluster_state_with_members(
+            "cluster_dfs_bootstrap_prepare_codec_downgrade",
+            "node_dfs_bootstrap_prepare_codec_downgrade_owner",
+            &["node_dfs_bootstrap_prepare_codec_downgrade_replica"],
+        );
+        let capability =
+            sinomo_core::CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY)
+                .expect("static capability");
+        for member in &mut state.members {
+            member.capabilities.push(capability.clone());
+        }
+        let owner = state.local_node_id.clone();
+        let replica = state.members[1].node_id.clone();
+        let file_system_id =
+            DfsFileSystemId::from_legacy_named("bootstrap-prepare-codec-downgrade-fs")
+                .expect("filesystem id");
+        let retiring = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner.clone(),
+            replica_node_ids: vec![replica],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let desired = DfsMetadataShardConfig {
+            epoch: 2,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
+            ..retiring.clone()
+        };
+        let mut kv = sinomo_core::kv::InProcessKvStore::new();
+        put_cluster_member_records(&mut kv, &state.members);
+        let mut host = DfsControlPlaneDefaultClusterBootstrapHost::new(
+            data_dir,
+            cluster_paths,
+            owner,
+            Box::new(kv),
+        );
+        host.put_metadata_shard(&retiring)
+            .expect("create packed retiring shard");
+
+        assert!(matches!(
+            host.put_metadata_shard(&desired),
+            Err(DfsError::Distributed { message })
+                if message.contains("legacy-readable snapshot")
+                    && message.contains("replay-floor proof")
+        ));
+        assert_eq!(
+            host.current_metadata_shard(&file_system_id, "root")
+                .expect("read retained packed shard"),
+            Some(retiring),
+            "an unproven downgrade must leave the packed generation authoritative"
+        );
+        assert!(
+            DfsControlPlaneStore::new(host.control_plane.as_mut())
+                .get_metadata_shard_membership_handoff(&file_system_id, "root")
+                .expect("read downgrade handoff")
+                .is_none(),
+            "an unsafe downgrade must be rejected before publishing a handoff"
+        );
+    }
+
+    #[test]
     fn control_plane_bootstrap_host_parks_primary_rotation_handoff() {
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-bootstrap-shard-cas");
         let data_dir = SinomoDataDir::new(root.join("data"));
@@ -2317,6 +2690,7 @@ mod tests {
             replica_node_ids: vec![replacement.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut host = DfsControlPlaneDefaultClusterBootstrapHost::new(
@@ -2382,6 +2756,7 @@ mod tests {
             replica_node_ids: vec![old_replica],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let desired = DfsMetadataShardConfig {
@@ -2451,6 +2826,7 @@ mod tests {
             replica_node_ids: vec![replacement.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut host = DfsControlPlaneDefaultClusterAsyncBootstrapHost::new(
@@ -2821,6 +3197,7 @@ mod tests {
                 replica_node_ids: vec![local.clone()],
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -2832,6 +3209,7 @@ mod tests {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: SIFS_SERVICES_PATH.to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -2843,6 +3221,7 @@ mod tests {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: SIFS_USERS_PATH.to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
         ];
@@ -2898,6 +3277,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: SIFS_SERVICES_PATH.to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
 
@@ -3764,6 +4144,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: SIFS_SERVICES_PATH.to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut host = TestDefaultClusterBootstrapHost {
@@ -3825,6 +4206,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: SIFS_SERVICES_PATH.to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         assert_eq!(
@@ -3958,6 +4340,7 @@ mod tests {
             replica_node_ids: vec![local.clone()],
             epoch: 5,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         assert!(
@@ -4090,5 +4473,19 @@ mod tests {
             ));
         }
         state
+    }
+
+    fn put_cluster_member_records(
+        kv: &mut sinomo_core::kv::InProcessKvStore,
+        members: &[ClusterMemberRecord],
+    ) {
+        for member in members {
+            DfsControlPlaneKvClient::put(
+                kv,
+                sinomo_core::node::cluster_member_key(&member.node_id),
+                sinomo_core::kv::encode_kv_value(member).expect("encode cluster member"),
+            )
+            .expect("put cluster member");
+        }
     }
 }

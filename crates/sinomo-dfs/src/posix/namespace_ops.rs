@@ -659,6 +659,7 @@ mod atomic_namespace_tests {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         })
         .collect()

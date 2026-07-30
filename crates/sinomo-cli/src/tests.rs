@@ -8252,6 +8252,7 @@ fn dfs_operator_inspection_uses_configured_metadata_shards() {
         replica_node_ids: Vec::new(),
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let services_shard = DfsMetadataShardConfig {
@@ -8263,6 +8264,7 @@ fn dfs_operator_inspection_uses_configured_metadata_shards() {
         assignment: DfsMetadataShardAssignment::PathPrefix {
             prefix: "/services".to_string(),
         },
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     append_cluster_raft_command(

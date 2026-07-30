@@ -683,6 +683,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 7,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         }
     }

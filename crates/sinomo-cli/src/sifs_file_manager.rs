@@ -5093,6 +5093,7 @@ mod tests {
                 replica_node_ids: Vec::new(),
                 epoch: 1,
                 assignment: sinomo_runtime::dfs::DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -5104,6 +5105,7 @@ mod tests {
                 assignment: sinomo_runtime::dfs::DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
             },
             DfsMetadataShardConfig {
@@ -5115,6 +5117,7 @@ mod tests {
                 assignment: sinomo_runtime::dfs::DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/users".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
             },
         ];

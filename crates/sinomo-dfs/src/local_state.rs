@@ -753,6 +753,7 @@ mod tests {
             replica_node_ids: vec![remote.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let local_replica = DfsMetadataShardConfig {
@@ -764,6 +765,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: "/services".to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut status = empty_status();

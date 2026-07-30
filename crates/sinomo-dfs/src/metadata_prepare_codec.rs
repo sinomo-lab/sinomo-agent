@@ -1,9 +1,9 @@
 //! Compact, versioned storage codec for authoritative namespace prepares.
 //!
-//! This module deliberately does not change journal writers or the canonical
-//! metadata schema. It provides the conversion boundary needed for a future
-//! capability-gated journal payload while snapshots and in-memory tables keep
-//! using [`DfsNamespacePrepareRecord`].
+//! The journal may store this body only when the shard's quorum-committed
+//! configuration selects packed-v1. Replicas decode both representations,
+//! while snapshots and in-memory tables keep using
+//! [`DfsNamespacePrepareRecord`].
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::events::EventId;
@@ -27,6 +27,8 @@ pub(crate) const DFS_PACKED_NAMESPACE_PREPARE_V1: u8 = 1;
 pub(crate) enum DfsNamespacePrepareCodecError {
     #[error("unsupported packed namespace prepare version {0}")]
     UnsupportedVersion(u8),
+    #[error("namespace prepare journal mutation contains both canonical and packed payloads")]
+    AmbiguousPayload,
     #[error("namespace prepare record {field} belongs to filesystem {actual}, expected {expected}")]
     CrossFileSystem {
         field: String,
@@ -43,7 +45,7 @@ pub(crate) enum DfsNamespacePrepareCodecError {
 /// binary format.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DfsPackedNamespacePrepareV1 {
+pub struct DfsPackedNamespacePrepareV1 {
     #[serde(rename = "f")]
     format_version: u8,
     #[serde(rename = "s")]
@@ -67,10 +69,81 @@ pub(crate) struct DfsPackedNamespacePrepareV1 {
 }
 
 impl DfsPackedNamespacePrepareV1 {
+    pub(crate) fn format_is_supported(&self) -> bool {
+        self.format_version == DFS_PACKED_NAMESPACE_PREPARE_V1
+    }
+
+    fn require_supported_format(&self) -> Result<(), DfsNamespacePrepareCodecError> {
+        if self.format_is_supported() {
+            return Ok(());
+        }
+        Err(DfsNamespacePrepareCodecError::UnsupportedVersion(
+            self.format_version,
+        ))
+    }
+
+    pub(crate) fn shard_id(&self) -> &DfsMetadataShardId {
+        &self.shard_id
+    }
+
+    pub(crate) fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+
+    pub(crate) fn operation_digest(&self) -> &str {
+        &self.operation_digest
+    }
+
+    /// Validate the fields that remain filesystem-qualified in packed-v1.
+    ///
+    /// Objects, versions, expectations, and receipts inherit the enclosing
+    /// mutation's filesystem when unpacked. Advisory-lock state and completed
+    /// request evidence retain their complete wire records, so they must be
+    /// checked without expanding the packed body.
+    pub(crate) fn validate_file_system_scope(
+        &self,
+        expected: &DfsFileSystemId,
+    ) -> Result<(), DfsNamespacePrepareCodecError> {
+        self.require_supported_format()?;
+        for (index, state) in self.transaction.advisory_lock_states.iter().enumerate() {
+            require_indexed_file_system(
+                "transaction.advisory_lock_states",
+                index,
+                expected,
+                &state.file_system_id,
+            )?;
+        }
+        if let Some(request) = &self.completed_request {
+            require_file_system("completed_request", expected, &request.file_system_id)?;
+        }
+        if let Some(completion) = &self.completed_request_completion {
+            require_file_system(
+                "completed_request_completion",
+                expected,
+                &completion.file_system_id,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Compare the identity retained inside packed-v1 without reconstructing
+    /// the canonical prepare. Filesystem, operation, and status are carried by
+    /// the enclosing mutation and are fenced by the caller.
+    pub(crate) fn matches_prepare_identity(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        owner_epoch: u64,
+        operation_digest: &str,
+    ) -> bool {
+        self.shard_id() == shard_id
+            && self.owner_epoch() == owner_epoch
+            && self.operation_digest() == operation_digest
+    }
+
     pub(crate) fn pack(
         prepare: &DfsNamespacePrepareRecord,
     ) -> Result<Self, DfsNamespacePrepareCodecError> {
-        validate_file_system_scope(prepare)?;
+        validate_namespace_prepare_file_system_scope(prepare, &prepare.file_system_id)?;
         Ok(Self {
             format_version: DFS_PACKED_NAMESPACE_PREPARE_V1,
             shard_id: prepare.shard_id.clone(),
@@ -103,12 +176,8 @@ impl DfsPackedNamespacePrepareV1 {
         operation_id: &str,
         status: DfsNamespacePrepareStatus,
     ) -> Result<DfsNamespacePrepareRecord, DfsNamespacePrepareCodecError> {
-        if self.format_version != DFS_PACKED_NAMESPACE_PREPARE_V1 {
-            return Err(DfsNamespacePrepareCodecError::UnsupportedVersion(
-                self.format_version,
-            ));
-        }
-        let prepare = DfsNamespacePrepareRecord {
+        self.validate_file_system_scope(file_system_id)?;
+        Ok(DfsNamespacePrepareRecord {
             operation_id: operation_id.to_string(),
             file_system_id: file_system_id.clone(),
             shard_id: self.shard_id.clone(),
@@ -133,9 +202,27 @@ impl DfsPackedNamespacePrepareV1 {
             completed_request: self.completed_request.clone(),
             completed_request_completion: self.completed_request_completion.clone(),
             status,
-        };
-        validate_file_system_scope(&prepare)?;
-        Ok(prepare)
+        })
+    }
+
+    pub(crate) fn visit_affected_object_ids(&self, mut visit: impl FnMut(&DfsObjectId)) {
+        for expected in &self.expected_object_versions {
+            visit(&expected.object_id);
+        }
+        for object in &self.transaction.objects {
+            visit(&object.object_id);
+        }
+    }
+
+    pub(crate) fn record_count(&self) -> usize {
+        self.transaction
+            .objects
+            .len()
+            .saturating_add(self.transaction.versions.len())
+            .saturating_add(self.transaction.advisory_lock_states.len())
+            .saturating_add(self.expected_object_versions.len())
+            .saturating_add(self.expected_path_occupants.len())
+            .saturating_add(self.content_receipts.len())
     }
 }
 
@@ -451,35 +538,40 @@ impl PackedReplicaReceiptV1 {
     }
 }
 
-fn validate_file_system_scope(
+pub(crate) fn validate_namespace_prepare_file_system_scope(
     prepare: &DfsNamespacePrepareRecord,
+    expected: &DfsFileSystemId,
 ) -> Result<(), DfsNamespacePrepareCodecError> {
-    let expected = &prepare.file_system_id;
+    require_file_system("prepare", expected, &prepare.file_system_id)?;
     require_file_system("transaction", expected, &prepare.transaction.file_system_id)?;
     for (index, object) in prepare.transaction.objects.iter().enumerate() {
-        require_file_system(
-            &format!("transaction.objects[{index}]"),
+        require_indexed_file_system(
+            "transaction.objects",
+            index,
             expected,
             &object.file_system_id,
         )?;
     }
     for (index, version) in prepare.transaction.versions.iter().enumerate() {
-        require_file_system(
-            &format!("transaction.versions[{index}]"),
+        require_indexed_file_system(
+            "transaction.versions",
+            index,
             expected,
             &version.file_system_id,
         )?;
     }
     for (index, lock) in prepare.transaction.advisory_lock_states.iter().enumerate() {
-        require_file_system(
-            &format!("transaction.advisory_lock_states[{index}]"),
+        require_indexed_file_system(
+            "transaction.advisory_lock_states",
+            index,
             expected,
             &lock.file_system_id,
         )?;
     }
     for (index, receipt) in prepare.content_receipts.iter().enumerate() {
-        require_file_system(
-            &format!("content_receipts[{index}]"),
+        require_indexed_file_system(
+            "content_receipts",
+            index,
             expected,
             &receipt.receipt.file_system_id,
         )?;
@@ -495,6 +587,22 @@ fn validate_file_system_scope(
         )?;
     }
     Ok(())
+}
+
+fn require_indexed_file_system(
+    field: &str,
+    index: usize,
+    expected: &DfsFileSystemId,
+    actual: &DfsFileSystemId,
+) -> Result<(), DfsNamespacePrepareCodecError> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(DfsNamespacePrepareCodecError::CrossFileSystem {
+        field: format!("{field}[{index}]"),
+        expected: expected.to_string(),
+        actual: actual.to_string(),
+    })
 }
 
 fn require_file_system(
@@ -688,6 +796,12 @@ mod tests {
         packed.format_version = DFS_PACKED_NAMESPACE_PREPARE_V1.saturating_add(1);
         assert_eq!(
             packed
+                .validate_file_system_scope(&prepare.file_system_id)
+                .expect_err("borrowed validation must reject unsupported format"),
+            DfsNamespacePrepareCodecError::UnsupportedVersion(2)
+        );
+        assert_eq!(
+            packed
                 .unpack(
                     &prepare.file_system_id,
                     &prepare.operation_id,
@@ -757,6 +871,21 @@ mod tests {
             error,
             DfsNamespacePrepareCodecError::CrossFileSystem { ref field, .. }
                 if field == "transaction.objects[0]"
+        ));
+    }
+
+    #[test]
+    fn packed_prepare_v1_borrowed_validation_rejects_retained_cross_file_system_record() {
+        let prepare = fixture_prepare(1);
+        let mut packed = DfsPackedNamespacePrepareV1::pack(&prepare).expect("pack prepare");
+        packed.transaction.advisory_lock_states[0].file_system_id = id("sifs-packed-codec-other");
+        let error = packed
+            .validate_file_system_scope(&prepare.file_system_id)
+            .expect_err("cross-filesystem retained record");
+        assert!(matches!(
+            error,
+            DfsNamespacePrepareCodecError::CrossFileSystem { ref field, .. }
+                if field == "transaction.advisory_lock_states[0]"
         ));
     }
 

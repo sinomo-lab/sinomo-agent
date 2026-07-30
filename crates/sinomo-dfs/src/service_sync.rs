@@ -214,7 +214,7 @@ pub(crate) fn rebind_completed_metadata_shard_membership_handoff(
         return Ok(backend.clear_metadata_shard_membership_handoff_freeze(
             &shard_id,
             &freeze.handoff_id,
-            active.epoch,
+            active,
         )?);
     }
 
@@ -685,7 +685,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 backend.clear_metadata_shard_membership_handoff_freeze(
                     &shard_id,
                     &handoff.handoff_id,
-                    handoff.desired_shard.epoch,
+                    &handoff.desired_shard,
                 )?;
             } else {
                 // Record completion durably but never bind the retiring
@@ -2690,6 +2690,7 @@ mod tests {
             replica_node_ids,
             epoch: 7,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         control_plane.with_client(|kv| {
@@ -2714,6 +2715,7 @@ mod tests {
         .with_control_plane(control_plane.clone())
         .with_metadata_backend(backend)
         .expect("metadata-backed service");
+        txn_calls.store(0, Ordering::SeqCst);
         ConfiguredSyncFixture {
             root,
             control_plane,
@@ -3077,6 +3079,7 @@ mod tests {
             replica_node_ids: vec![current_primary.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let current_shard = DfsMetadataShardConfig {
@@ -3859,6 +3862,7 @@ mod tests {
             replica_node_ids: vec![promoted_primary.clone()],
             epoch: 15,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let active = DfsMetadataShardConfig {
@@ -4209,6 +4213,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: "/services".to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let active = DfsMetadataShardConfig {
@@ -4228,7 +4233,7 @@ mod tests {
             .expect("freeze retiring generation")
             .expect("local shard");
         backend
-            .clear_metadata_shard_membership_handoff_freeze(&shard_id, handoff_id, active.epoch)
+            .clear_metadata_shard_membership_handoff_freeze(&shard_id, handoff_id, &active)
             .expect("bind activated generation");
         backend
             .put_object(&directory_object("/services/after-handoff", local.clone()))
@@ -4333,6 +4338,7 @@ mod tests {
             replica_node_ids: vec![old_replica],
             epoch: 31,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let desired = DfsMetadataShardConfig {
@@ -4402,7 +4408,7 @@ mod tests {
             .clear_metadata_shard_membership_handoff_freeze(
                 &shard_id,
                 &handoff.handoff_id,
-                desired.epoch,
+                &desired,
             )
             .expect("completing process activates local marker");
         let recovered_after_mount_open = directory_object("/recovered-after-open", local.clone());
@@ -4528,6 +4534,7 @@ mod tests {
             replica_node_ids: vec![old_replica],
             epoch: 41,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let desired = DfsMetadataShardConfig {
@@ -4630,6 +4637,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: "/services".to_string(),
             },
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut inner = InProcessKvStore::new();

@@ -1,23 +1,29 @@
 use sinomo_core::events::EventId;
 use sinomo_core::kv::InProcessKvStore;
 use sinomo_core::network::InProcessNetwork;
-use sinomo_core::node::NodeId;
-use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
+use sinomo_core::node::{
+    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY, NodeId, cluster_member_key,
+};
+use sinomo_core::{
+    ClusterMemberRecord, ClusterMemberState, DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest,
+};
 use sinomo_dfs::{
     DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, DfsBlobTransferResult, DfsCommitVersionCommand,
     DfsConfirmedTimeoutAction, DfsConfirmedTimeoutOutcome, DfsControlPlaneStore,
     DfsDistributedWriteResult, DfsError, DfsFetchBlobResponse, DfsFetchBlobResult, DfsFileSystem,
     DfsFileSystemId, DfsMessageTransport, DfsMetadataBackend, DfsMetadataMutation,
-    DfsMetadataReplicationOutcome, DfsMetadataShardAssignment, DfsMetadataShardConfig,
-    DfsMetadataShardId, DfsNetworkMessage, DfsNodeAdvertisement, DfsObjectId, DfsObjectKind,
+    DfsMetadataNamespacePrepareCodec, DfsMetadataReplicationOutcome, DfsMetadataShardAssignment,
+    DfsMetadataShardConfig, DfsMetadataShardId, DfsNamespaceObjectVersionExpectation,
+    DfsNamespacePathOccupantExpectation, DfsNamespacePrepareRecord, DfsNamespacePrepareStatus,
+    DfsNamespaceTransaction, DfsNetworkMessage, DfsNodeAdvertisement, DfsObjectId, DfsObjectKind,
     DfsObjectMetadata, DfsObjectVersionRecord, DfsReadData, DfsReadResponse, DfsReadResult,
     DfsRepairReplicaCommand, DfsRepairReplicaResponse, DfsReplicaReceiptRecord,
     DfsReplicationPolicy, DfsRoutedCall, DfsRoutedMessage, DfsStageBlobCommand,
     DfsStageBlobResponse, DfsVersion, DfsWriteIntentState, DfsWriteIntentStatus,
-    LocalSobjMetadataBackend, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
-    NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
-    SharedDfsControlPlaneKvClient, file_system_config_key, metadata_shard_key,
-    placement_reconciliation_activity_index_key, sifs_node_files_path,
+    LocalShardedMetadataBackend, LocalSobjMetadataBackend, NetworkedDfsReadFreshness,
+    NetworkedDfsReadOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
+    NetworkedDfsWriteOutcome, SharedDfsControlPlaneKvClient, file_system_config_key,
+    metadata_shard_key, placement_reconciliation_activity_index_key, sifs_node_files_path,
 };
 use std::fs;
 use std::io::{Read, Result as IoResult};
@@ -2217,6 +2223,7 @@ fn networked_dfs_uses_kv_only_for_bounded_control_plane_records() {
         replica_node_ids: Vec::new(),
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     control_plane.with_client(|kv| {
@@ -2364,6 +2371,7 @@ fn distributed_sifs_bootstrap_exposes_cluster_root_users_and_services_in_metadat
         replica_node_ids: Vec::new(),
         epoch: 1,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     control_plane.with_client(|kv| {
@@ -2507,6 +2515,7 @@ fn networked_dfs_applies_metadata_journal_batches_from_peer() {
                 replica_node_ids: vec![replica.clone()],
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -2575,6 +2584,242 @@ fn networked_dfs_applies_metadata_journal_batches_from_peer() {
         )
     }));
 
+    cleanup(&root);
+}
+
+#[test]
+fn networked_dfs_replicates_packed_namespace_prepare_and_reopens_exact_prefix() {
+    let owner = NodeId::from_legacy_named("node_packed_prepare_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_packed_prepare_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let shard_id = DfsMetadataShardId::new("root");
+    let object_id =
+        DfsObjectId::from_legacy_named("obj_packed_prepare_replication").expect("object");
+    let base_version =
+        DfsVersion::from_legacy_named("version_packed_prepare_base").expect("version");
+    let committed_version =
+        DfsVersion::from_legacy_named("version_packed_prepare_committed").expect("version");
+    let root = temp_root("networked_packed_namespace_prepare");
+    let owner_metadata_root = root.join("owner-meta");
+    let replica_metadata_root = root.join("replica-meta");
+    let network = InProcessNetwork::new();
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system_id.clone(),
+        shard_id: shard_id.0.clone(),
+        primary_node_id: owner.clone(),
+        replica_node_ids: vec![replica.clone()],
+        epoch: 7,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    control_plane.with_client(|kv| {
+        let cluster_id = sinomo_core::Id::from_legacy_named("networked-packed-prepare-cluster")
+            .expect("cluster id");
+        let capability =
+            sinomo_core::CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY)
+                .expect("static capability");
+        for node_id in [&owner, &replica] {
+            let mut member = ClusterMemberRecord::local_non_voting(
+                cluster_id.clone(),
+                node_id.clone(),
+                format!("{node_id}"),
+                format!("{node_id}-public-key"),
+                OffsetDateTime::UNIX_EPOCH,
+            );
+            member.state = ClusterMemberState::Active;
+            member.capabilities.push(capability.clone());
+            kv.put_serde(cluster_member_key(node_id), &member, None)
+                .expect("put packed prepare capable member");
+        }
+        DfsControlPlaneStore::new(kv)
+            .put_metadata_shard(&shard)
+            .expect("metadata shard");
+    });
+
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "packed prepare replication".to_string(),
+        owner_node_id: owner.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let current = DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id: file_system_id.clone(),
+        path: "services/packed-prepare.txt".to_string(),
+        kind: DfsObjectKind::File,
+        tombstone_provenance: None,
+        owner_node_id: owner.clone(),
+        current_locations: vec![owner.clone()],
+        content_hash: Some(content_hash(b"packed prepare")),
+        content_size_bytes: Some(14),
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
+        version: base_version.clone(),
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+    let mut committed = current.clone();
+    committed.version = committed_version;
+    committed.mode = 0o600;
+    let mut prepare = DfsNamespacePrepareRecord {
+        operation_id: "operation-networked-packed-prepare".to_string(),
+        file_system_id: file_system_id.clone(),
+        shard_id: shard_id.clone(),
+        owner_epoch: shard.epoch,
+        operation_digest: String::new(),
+        expected_object_versions: vec![DfsNamespaceObjectVersionExpectation {
+            object_id: object_id.clone(),
+            expected_version: Some(base_version),
+        }],
+        expected_path_occupants: vec![DfsNamespacePathOccupantExpectation {
+            path: current.path.clone(),
+            expected_object_id: Some(object_id),
+        }],
+        content_receipts: Vec::new(),
+        transaction: DfsNamespaceTransaction {
+            transaction_id: "transaction-networked-packed-prepare".to_string(),
+            file_system_id: file_system_id.clone(),
+            objects: vec![committed],
+            versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        },
+        completed_request: None,
+        completed_request_completion: None,
+        status: DfsNamespacePrepareStatus::Prepared,
+    };
+    let digest_payload = serde_json::to_vec(&(
+        &prepare.operation_id,
+        &prepare.file_system_id,
+        &prepare.shard_id,
+        prepare.owner_epoch,
+        &prepare.expected_object_versions,
+        &prepare.expected_path_occupants,
+        &prepare.transaction,
+        &prepare.completed_request,
+        &prepare.completed_request_completion,
+    ))
+    .expect("encode namespace prepare identity");
+    prepare.operation_digest = content_hash(&digest_payload);
+
+    let mut owner_backend =
+        LocalShardedMetadataBackend::new(&owner_metadata_root, vec![shard.clone()])
+            .expect("owner sharded metadata");
+    owner_backend
+        .put_file_system(&file_system)
+        .expect("owner filesystem");
+    owner_backend.put_object(&current).expect("owner object");
+    let prepare_entry = owner_backend
+        .prepare_namespace_transaction(&prepare)
+        .expect("owner packed namespace prepare");
+    assert!(
+        matches!(
+            &prepare_entry.mutation,
+            DfsMetadataMutation::PutNamespacePrepare {
+                prepare: None,
+                packed_prepare_v1: Some(_),
+                ..
+            }
+        ),
+        "the primary must author PackedV1 instead of retaining a canonical journal body"
+    );
+    let replica_backend =
+        LocalShardedMetadataBackend::new(&replica_metadata_root, vec![shard.clone()])
+            .expect("replica sharded metadata");
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_control_plane(control_plane.clone())
+    .with_metadata_backend_lazy(owner_backend)
+    .expect("owner metadata backend");
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("replica-content")).expect("replica content"),
+    )
+    .with_control_plane(control_plane)
+    .with_metadata_backend_lazy(replica_backend)
+    .expect("replica metadata backend");
+    let owner_prefix = owner_dfs
+        .metadata_backend()
+        .expect("owner metadata backend")
+        .metadata_prefix_proof(&shard_id)
+        .expect("owner prefix proof")
+        .expect("owner shard prefix proof");
+
+    let batch = owner_dfs
+        .send_metadata_journal_since(&replica, 0)
+        .expect("send packed journal")
+        .expect("nonempty packed journal batch");
+    assert!(
+        batch.entries.iter().any(|entry| entry == &prepare_entry),
+        "the network batch must include the exact packed prepare journal entry"
+    );
+    let expected_applied_entries = batch.entries.len();
+    let events = replica_dfs
+        .process_incoming()
+        .expect("replica applies packed journal");
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
+                    source_node_id,
+                    applied_entries,
+                    ..
+                } if source_node_id == &owner
+                    && *applied_entries == expected_applied_entries
+            )
+        }),
+        "unexpected packed journal events: {events:#?}"
+    );
+
+    let replica_backend = replica_dfs
+        .metadata_backend()
+        .expect("replica metadata backend");
+    assert_eq!(
+        replica_backend
+            .metadata_prefix_proof(&shard_id)
+            .expect("replica prefix proof"),
+        Some(owner_prefix.clone()),
+        "network replay must preserve the primary's exact packed journal prefix"
+    );
+    assert_eq!(
+        replica_backend
+            .get_namespace_prepare(&prepare.operation_id)
+            .expect("replica namespace prepare"),
+        Some(prepare.clone()),
+        "replica tables must materialize the canonical prepare"
+    );
+
+    drop(replica_dfs);
+    let reopened_replica = LocalShardedMetadataBackend::new(&replica_metadata_root, vec![shard])
+        .expect("reopened replica metadata");
+    assert_eq!(
+        reopened_replica
+            .metadata_prefix_proof(&shard_id)
+            .expect("reopened prefix proof"),
+        Some(owner_prefix)
+    );
+    assert_eq!(
+        reopened_replica
+            .get_namespace_prepare(&prepare.operation_id)
+            .expect("reopened namespace prepare"),
+        Some(prepare),
+        "reopen must resolve the packed prepare through its journal-referenced table entry"
+    );
+
+    drop(reopened_replica);
+    drop(owner_dfs);
     cleanup(&root);
 }
 
@@ -2690,6 +2935,7 @@ fn networked_dfs_applies_metadata_journal_incrementally_without_full_hydrate() {
                 replica_node_ids: vec![replica.clone()],
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -2842,6 +3088,7 @@ fn networked_dfs_routes_non_primary_write_to_metadata_shard_primary() {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -3040,6 +3287,7 @@ fn networked_dfs_strict_routed_write_completion_resolves_remote_intent_alias() {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -3236,6 +3484,7 @@ fn routed_write_response_from_retired_primary_fails_closed_after_requester_becom
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -3391,6 +3640,7 @@ fn routed_write_response_from_retired_primary_fails_closed_after_requester_becom
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard transfer");
@@ -3441,6 +3691,7 @@ fn networked_dfs_routes_reader_write_to_metadata_primary_via_fetch() {
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -3608,6 +3859,7 @@ fn networked_dfs_configured_metadata_replication_drains_bounded_batches() {
                 replica_node_ids: vec![replica.clone()],
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard");
@@ -3802,6 +4054,7 @@ fn networked_dfs_replicates_configured_metadata_shard_to_replicas() {
                 replica_node_ids: vec![replica.clone()],
                 epoch: 1,
                 assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("metadata shard config");
@@ -4866,6 +5119,7 @@ fn distributed_symlink_follow_routes_cross_prefix_stat_and_owner_to_target_prima
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/services/links".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("link shard");
@@ -4879,6 +5133,7 @@ fn distributed_symlink_follow_routes_cross_prefix_stat_and_owner_to_target_prima
                 assignment: DfsMetadataShardAssignment::PathPrefix {
                     prefix: "/users".to_string(),
                 },
+                namespace_prepare_codec: Default::default(),
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             })
             .expect("target shard");
@@ -11277,6 +11532,7 @@ fn networked_dfs_owner_handoff_requires_latest_content_and_routes_old_owner() {
         replica_node_ids: vec![candidate.clone()],
         epoch: 7,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     control_plane.with_client(|kv| {
@@ -11408,6 +11664,7 @@ fn networked_dfs_owner_handoff_uses_backend_current_metadata() {
         replica_node_ids: vec![candidate.clone()],
         epoch: 11,
         assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     control_plane.with_client(|kv| {

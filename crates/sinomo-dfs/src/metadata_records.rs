@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sinomo_core::DfsWriteReceipt;
 use sinomo_core::events::EventId;
 use sinomo_core::node::NodeId;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -15,6 +16,10 @@ use time::OffsetDateTime;
 use crate::advisory_lock::DfsAdvisoryLockStateRecord;
 use crate::metadata_api::DfsMetadataBackend;
 use crate::metadata_keys::{normalize_node_locations, object_inode_id};
+use crate::metadata_prepare_codec::{
+    DfsNamespacePrepareCodecError, DfsPackedNamespacePrepareV1,
+    validate_namespace_prepare_file_system_scope,
+};
 use crate::{
     DfsConflictReadView, DfsError, DfsFileSystem, DfsFileSystemId, DfsNamespaceOperation,
     DfsNamespaceResult, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsPosixCoordinationResult,
@@ -834,6 +839,12 @@ pub enum DfsMetadataMutation {
         status: DfsNamespacePrepareStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prepare: Option<DfsNamespacePrepareRecord>,
+        /// Packed authoritative body selected only by a capability-fenced
+        /// shard configuration. Exactly one prepare representation may be
+        /// present. Older readers ignore this additive field, observe the
+        /// missing canonical body, and fail replay closed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        packed_prepare_v1: Option<DfsPackedNamespacePrepareV1>,
     },
     /// Fenced commit of the complete Prepared body already durable earlier in
     /// this shard's journal. Replayers must resolve the referenced prepare and
@@ -902,6 +913,177 @@ pub enum DfsMetadataMutation {
     },
 }
 
+/// Borrowed view of the one authoritative namespace-prepare representation in
+/// a journal mutation.
+///
+/// The outer fields remain part of the view because packed-v1 intentionally
+/// omits them. Validation and identity checks can therefore stay allocation
+/// free until a caller explicitly requests canonical table materialization.
+pub(crate) enum DfsNamespacePreparePayloadRef<'a> {
+    Canonical {
+        file_system_id: &'a DfsFileSystemId,
+        operation_id: &'a str,
+        status: &'a DfsNamespacePrepareStatus,
+        prepare: &'a DfsNamespacePrepareRecord,
+    },
+    PackedV1 {
+        file_system_id: &'a DfsFileSystemId,
+        operation_id: &'a str,
+        status: &'a DfsNamespacePrepareStatus,
+        prepare: &'a DfsPackedNamespacePrepareV1,
+    },
+}
+
+impl<'a> DfsNamespacePreparePayloadRef<'a> {
+    pub(crate) fn into_canonical(
+        self,
+    ) -> Result<Cow<'a, DfsNamespacePrepareRecord>, DfsNamespacePrepareCodecError> {
+        match self {
+            Self::Canonical { prepare, .. } => Ok(Cow::Borrowed(prepare)),
+            Self::PackedV1 {
+                file_system_id,
+                operation_id,
+                status,
+                prepare,
+            } => Ok(Cow::Owned(prepare.unpack(
+                file_system_id,
+                operation_id,
+                status.clone(),
+            )?)),
+        }
+    }
+
+    pub(crate) fn validate_file_system_scope(
+        &self,
+        expected: &DfsFileSystemId,
+    ) -> Result<(), DfsNamespacePrepareCodecError> {
+        match self {
+            Self::Canonical {
+                file_system_id,
+                prepare,
+                ..
+            } => {
+                require_prepare_outer_file_system(file_system_id, expected)?;
+                validate_namespace_prepare_file_system_scope(prepare, expected)
+            }
+            Self::PackedV1 {
+                file_system_id,
+                prepare,
+                ..
+            } => {
+                require_prepare_outer_file_system(file_system_id, expected)?;
+                prepare.validate_file_system_scope(expected)
+            }
+        }
+    }
+
+    pub(crate) fn matches_prepare_identity(&self, expected: &DfsNamespacePrepareRecord) -> bool {
+        match self {
+            Self::Canonical {
+                file_system_id,
+                operation_id,
+                status,
+                prepare,
+            } => {
+                *file_system_id == &expected.file_system_id
+                    && *operation_id == expected.operation_id
+                    && *status == &expected.status
+                    && prepare.file_system_id == expected.file_system_id
+                    && prepare.operation_id == expected.operation_id
+                    && prepare.status == expected.status
+                    && prepare.shard_id == expected.shard_id
+                    && prepare.owner_epoch == expected.owner_epoch
+                    && prepare.operation_digest == expected.operation_digest
+            }
+            Self::PackedV1 {
+                file_system_id,
+                operation_id,
+                status,
+                prepare,
+            } => {
+                *file_system_id == &expected.file_system_id
+                    && *operation_id == expected.operation_id
+                    && *status == &expected.status
+                    && prepare.matches_prepare_identity(
+                        &expected.shard_id,
+                        expected.owner_epoch,
+                        &expected.operation_digest,
+                    )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn matches_authority(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        operation_id: &str,
+        status: &DfsNamespacePrepareStatus,
+        shard_id: &DfsMetadataShardId,
+        owner_epoch: u64,
+        operation_digest: &str,
+    ) -> bool {
+        match self {
+            Self::Canonical {
+                file_system_id: outer_file_system_id,
+                operation_id: outer_operation_id,
+                status: outer_status,
+                prepare,
+            } => {
+                *outer_file_system_id == file_system_id
+                    && *outer_operation_id == operation_id
+                    && *outer_status == status
+                    && prepare.file_system_id == *file_system_id
+                    && prepare.operation_id == operation_id
+                    && prepare.status == *status
+                    && prepare.shard_id == *shard_id
+                    && prepare.owner_epoch == owner_epoch
+                    && prepare.operation_digest == operation_digest
+            }
+            Self::PackedV1 {
+                file_system_id: outer_file_system_id,
+                operation_id: outer_operation_id,
+                status: outer_status,
+                prepare,
+            } => {
+                *outer_file_system_id == file_system_id
+                    && *outer_operation_id == operation_id
+                    && *outer_status == status
+                    && prepare.matches_prepare_identity(shard_id, owner_epoch, operation_digest)
+            }
+        }
+    }
+
+    pub(crate) fn record_count(&self) -> usize {
+        match self {
+            Self::Canonical { prepare, .. } => prepare
+                .transaction
+                .objects
+                .len()
+                .saturating_add(prepare.transaction.versions.len())
+                .saturating_add(prepare.transaction.advisory_lock_states.len())
+                .saturating_add(prepare.expected_object_versions.len())
+                .saturating_add(prepare.expected_path_occupants.len())
+                .saturating_add(prepare.content_receipts.len()),
+            Self::PackedV1 { prepare, .. } => prepare.record_count(),
+        }
+    }
+}
+
+fn require_prepare_outer_file_system(
+    actual: &DfsFileSystemId,
+    expected: &DfsFileSystemId,
+) -> Result<(), DfsNamespacePrepareCodecError> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(DfsNamespacePrepareCodecError::CrossFileSystem {
+        field: "outer mutation".to_string(),
+        expected: expected.to_string(),
+        actual: actual.to_string(),
+    })
+}
+
 impl DfsMetadataMutation {
     fn visit_affected_object_ids(&self, mut visit: impl FnMut(&DfsObjectId)) {
         match self {
@@ -953,18 +1135,23 @@ impl DfsMetadataMutation {
             Self::ApplyNamespaceTransaction {
                 transaction: None, ..
             } => {}
-            Self::PutNamespacePrepare {
-                prepare: Some(prepare),
-                ..
-            } => {
-                for expected in &prepare.expected_object_versions {
-                    visit(&expected.object_id);
+            Self::PutNamespacePrepare { .. } => match self.namespace_prepare_payload_ref() {
+                Ok(Some(DfsNamespacePreparePayloadRef::Canonical { prepare, .. })) => {
+                    for expected in &prepare.expected_object_versions {
+                        visit(&expected.object_id);
+                    }
+                    for object in &prepare.transaction.objects {
+                        visit(&object.object_id);
+                    }
                 }
-                for object in &prepare.transaction.objects {
-                    visit(&object.object_id);
+                Ok(Some(DfsNamespacePreparePayloadRef::PackedV1 { prepare, .. })) => {
+                    prepare.visit_affected_object_ids(visit);
                 }
-            }
-            Self::PutNamespacePrepare { prepare: None, .. } => {}
+                // Missing, dual, unsupported, or malformed payloads are rejected
+                // by replay. Do not let a pre-validation routing/index visitor
+                // report a partial object set for such an entry.
+                Ok(None) | Err(_) => {}
+            },
             Self::CommitNamespacePrepare { object_ids, .. } => {
                 for object_id in object_ids {
                     visit(object_id);
@@ -1240,7 +1427,63 @@ impl DfsMetadataMutation {
             operation_id: prepare.operation_id.clone(),
             status: prepare.status.clone(),
             prepare: Some(prepare.clone()),
+            packed_prepare_v1: None,
         }
+    }
+
+    pub(crate) fn put_namespace_prepare_packed_v1(
+        prepare: &DfsNamespacePrepareRecord,
+    ) -> Result<Self, DfsNamespacePrepareCodecError> {
+        Ok(Self::PutNamespacePrepare {
+            file_system_id: prepare.file_system_id.clone(),
+            operation_id: prepare.operation_id.clone(),
+            status: prepare.status.clone(),
+            prepare: None,
+            packed_prepare_v1: Some(DfsPackedNamespacePrepareV1::pack(prepare)?),
+        })
+    }
+
+    pub(crate) fn namespace_prepare_payload_ref(
+        &self,
+    ) -> Result<Option<DfsNamespacePreparePayloadRef<'_>>, DfsNamespacePrepareCodecError> {
+        let Self::PutNamespacePrepare {
+            file_system_id,
+            operation_id,
+            status,
+            prepare,
+            packed_prepare_v1,
+        } = self
+        else {
+            return Ok(None);
+        };
+        match (prepare.as_ref(), packed_prepare_v1.as_ref()) {
+            (Some(_), Some(_)) => Err(DfsNamespacePrepareCodecError::AmbiguousPayload),
+            (Some(prepare), None) => Ok(Some(DfsNamespacePreparePayloadRef::Canonical {
+                file_system_id,
+                operation_id,
+                status,
+                prepare,
+            })),
+            (None, Some(prepare)) => {
+                prepare.validate_file_system_scope(file_system_id)?;
+                Ok(Some(DfsNamespacePreparePayloadRef::PackedV1 {
+                    file_system_id,
+                    operation_id,
+                    status,
+                    prepare,
+                }))
+            }
+            (None, None) => Ok(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn namespace_prepare_payload(
+        &self,
+    ) -> Result<Option<Cow<'_, DfsNamespacePrepareRecord>>, DfsNamespacePrepareCodecError> {
+        self.namespace_prepare_payload_ref()?
+            .map(DfsNamespacePreparePayloadRef::into_canonical)
+            .transpose()
     }
 
     pub(crate) fn commit_namespace_prepare(prepare: &DfsNamespacePrepareRecord) -> Self {
@@ -3124,6 +3367,66 @@ mod tests {
         assert!(decoded.content_receipts.is_empty());
         assert!(decoded.completed_request.is_none());
         assert!(decoded.completed_request_completion.is_none());
+    }
+
+    #[test]
+    fn ambiguous_namespace_prepare_payload_has_no_prevalidation_affected_object_ids() {
+        let prepared_object = object(version("version_ambiguous_prepare"));
+        let prepare = DfsNamespacePrepareRecord {
+            operation_id: "ambiguous-namespace-prepare".to_string(),
+            file_system_id: file_system_id(),
+            shard_id: DfsMetadataShardId::new("shard-root"),
+            owner_epoch: 1,
+            operation_digest: "blake3:ambiguous-namespace-prepare".to_string(),
+            expected_object_versions: Vec::new(),
+            expected_path_occupants: Vec::new(),
+            content_receipts: Vec::new(),
+            transaction: DfsNamespaceTransaction {
+                transaction_id: "ambiguous-namespace-transaction".to_string(),
+                file_system_id: file_system_id(),
+                objects: vec![prepared_object],
+                versions: Vec::new(),
+                advisory_lock_states: Vec::new(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            },
+            completed_request: None,
+            completed_request_completion: None,
+            status: DfsNamespacePrepareStatus::Prepared,
+        };
+        let packed = match DfsMetadataMutation::put_namespace_prepare_packed_v1(&prepare)
+            .expect("pack namespace prepare")
+        {
+            DfsMetadataMutation::PutNamespacePrepare {
+                packed_prepare_v1: Some(packed),
+                ..
+            } => packed,
+            _ => panic!("packed namespace prepare constructor returned another mutation"),
+        };
+        let ambiguous = match DfsMetadataMutation::put_namespace_prepare(&prepare) {
+            DfsMetadataMutation::PutNamespacePrepare {
+                file_system_id,
+                operation_id,
+                status,
+                prepare,
+                ..
+            } => DfsMetadataMutation::PutNamespacePrepare {
+                file_system_id,
+                operation_id,
+                status,
+                prepare,
+                packed_prepare_v1: Some(packed),
+            },
+            _ => panic!("namespace prepare constructor returned another mutation"),
+        };
+
+        assert!(matches!(
+            ambiguous.namespace_prepare_payload_ref(),
+            Err(DfsNamespacePrepareCodecError::AmbiguousPayload)
+        ));
+        assert!(
+            ambiguous.affected_object_ids().is_empty(),
+            "a dual payload must not publish a partial routing/index object set before replay rejects it"
+        );
     }
 
     #[test]

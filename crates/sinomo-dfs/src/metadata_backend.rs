@@ -17,8 +17,7 @@ use crate::content_root_catalog::{
     DfsContentRootCatalogCursor, DfsContentRootCatalogEntry, DfsContentRootCatalogIncompleteReason,
     DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest, dfs_content_root_catalog_entries,
 };
-#[cfg(test)]
-use crate::control_plane::DfsMetadataShardConfig;
+use crate::control_plane::{DfsMetadataNamespacePrepareCodec, DfsMetadataShardConfig};
 use crate::metadata_api::{
     DfsMetadataBackend, DfsMetadataReplicaIngestPermit, DfsMetadataShardWriteFreeze,
     namespace_prepare_expectations_from_lookups,
@@ -71,6 +70,7 @@ use crate::metadata_read_snapshot;
 use crate::metadata_receipt::{receipt_for_replica_from_backend, replay_receipt_matches_existing};
 use crate::metadata_records::*;
 use crate::metadata_replay::{
+    borrowed_namespace_prepare_payload, decoded_namespace_prepare_payload,
     hydrate_journal_entry_payloads, journal_entry_has_replay_payloads,
     require_journal_entry_replay_payloads, require_replica_journal_entry_file_system,
     required_replay_payload,
@@ -1544,7 +1544,7 @@ fn namespace_prepare_journal_reference(
         file_system_id,
         operation_id,
         status,
-        prepare: Some(journal_prepare),
+        ..
     } = &entry.mutation
     else {
         return Err(MetadataBackendError::Serde(format!(
@@ -1552,17 +1552,26 @@ fn namespace_prepare_journal_reference(
             entry.sequence, prepare.operation_id
         )));
     };
+    let journal_prepare = borrowed_namespace_prepare_payload(entry)?.ok_or_else(|| {
+        MetadataBackendError::Serde(format!(
+            "journal entry {} cannot back namespace prepare {} table materialization without a payload",
+            entry.sequence, prepare.operation_id
+        ))
+    })?;
+    journal_prepare
+        .validate_file_system_scope(&prepare.file_system_id)
+        .map_err(|source| {
+            MetadataBackendError::Serde(format!(
+                "journal entry {} cannot back namespace prepare {} table materialization: {source}",
+                entry.sequence, prepare.operation_id
+            ))
+        })?;
     if entry.sequence == 0
         || entry.shard_id != prepare.shard_id
         || file_system_id != &prepare.file_system_id
         || operation_id != &prepare.operation_id
         || status != &prepare.status
-        || journal_prepare.file_system_id != prepare.file_system_id
-        || journal_prepare.shard_id != prepare.shard_id
-        || journal_prepare.operation_id != prepare.operation_id
-        || journal_prepare.operation_digest != prepare.operation_digest
-        || journal_prepare.owner_epoch != prepare.owner_epoch
-        || journal_prepare.status != prepare.status
+        || !journal_prepare.matches_prepare_identity(prepare)
     {
         return Err(MetadataBackendError::Serde(format!(
             "journal entry {} does not match namespace prepare {} table reference fences",
@@ -2053,6 +2062,9 @@ pub struct LocalSobjMetadataBackend {
     /// table-log suffix. It may serve only its last self-contained snapshot
     /// until authenticated replica repair installs a new authoritative image.
     replica_repair_only: bool,
+    /// Persisted prepare representation selected by the quorum-committed shard
+    /// configuration. Direct and legacy backends remain fail-safe legacy.
+    namespace_prepare_codec: DfsMetadataNamespacePrepareCodec,
     #[cfg(test)]
     receipt_scan_counters: Arc<MetadataReceiptScanCounters>,
     #[cfg(test)]
@@ -2090,6 +2102,7 @@ impl LocalSobjMetadataBackend {
             content_root_catalog_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
             replica_repair_only: false,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
             #[cfg(test)]
@@ -2212,6 +2225,7 @@ impl LocalSobjMetadataBackend {
             content_root_catalog_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
             replica_repair_only: false,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
             #[cfg(test)]
@@ -2279,6 +2293,7 @@ impl LocalSobjMetadataBackend {
             content_root_catalog_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
             replica_repair_only: true,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
             #[cfg(test)]
@@ -2293,6 +2308,10 @@ impl LocalSobjMetadataBackend {
     /// Metadata shard owned by this local backend handle.
     pub fn shard_id(&self) -> &DfsMetadataShardId {
         &self.shard_id
+    }
+
+    pub(crate) fn set_namespace_prepare_codec(&mut self, codec: DfsMetadataNamespacePrepareCodec) {
+        self.namespace_prepare_codec = codec;
     }
 
     #[cfg(test)]
@@ -2617,6 +2636,7 @@ impl LocalSobjMetadataBackend {
             content_root_catalog_snapshot_cache: None,
             consistent_read_snapshot_depth: 0,
             replica_repair_only: false,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
             #[cfg(test)]
@@ -3598,10 +3618,14 @@ impl LocalSobjMetadataBackend {
                 file_system_id,
                 operation_id,
                 status,
-                prepare,
+                ..
             } => {
-                let prepare =
-                    required_replay_payload(entry, "put-namespace-prepare", prepare.as_ref())?;
+                let prepare = decoded_namespace_prepare_payload(entry)?.ok_or_else(|| {
+                    MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} cannot replay put-namespace-prepare without its record payload",
+                        entry.shard_id.0, entry.sequence
+                    ))
+                })?;
                 if prepare.file_system_id != *file_system_id
                     || prepare.operation_id != *operation_id
                     || prepare.status != *status
@@ -3610,7 +3634,7 @@ impl LocalSobjMetadataBackend {
                         "journal namespace prepare scope {file_system_id}/{operation_id}/{status:?} does not match its payload"
                     )));
                 }
-                let prepare = normalized_namespace_prepare(prepare);
+                let prepare = normalized_namespace_prepare(&prepare);
                 if let Some(receipt) = self.tables.namespace_prepare_receipts.get(operation_id) {
                     if receipt.status == prepare.status
                         && receipt.matches_prepare_identity(&prepare)
@@ -4120,8 +4144,20 @@ impl LocalSobjMetadataBackend {
         prepare: &DfsNamespacePrepareRecord,
         apply_ops: Vec<DfsMetadataTableOp>,
     ) -> Result<DfsMetadataJournalEntry> {
-        let entry =
-            self.write_journal_unlocked(DfsMetadataMutation::put_namespace_prepare(prepare))?;
+        let mutation = match self.namespace_prepare_codec {
+            DfsMetadataNamespacePrepareCodec::Legacy => {
+                DfsMetadataMutation::put_namespace_prepare(prepare)
+            }
+            DfsMetadataNamespacePrepareCodec::PackedV1 => {
+                DfsMetadataMutation::put_namespace_prepare_packed_v1(prepare).map_err(|source| {
+                    MetadataBackendError::Serde(format!(
+                        "pack namespace prepare {} for journal: {source}",
+                        prepare.operation_id
+                    ))
+                })?
+            }
+        };
+        let entry = self.write_journal_unlocked(mutation)?;
         let persisted_ops = namespace_prepare_persisted_table_ops(&entry, &apply_ops)?;
         self.append_and_apply_table_ops_with_persisted_ops(
             entry.sequence,
@@ -4590,11 +4626,11 @@ impl LocalSobjMetadataBackend {
                     retention: retention.clone(),
                 }]
             }
-            DfsMetadataMutation::PutNamespacePrepare { prepare, .. } => {
-                let Some(prepare) = prepare.as_ref() else {
+            DfsMetadataMutation::PutNamespacePrepare { .. } => {
+                let Some(prepare) = decoded_namespace_prepare_payload(entry)? else {
                     return Ok(());
                 };
-                let prepare = normalized_namespace_prepare(prepare);
+                let prepare = normalized_namespace_prepare(&prepare);
                 namespace_prepare_table_ops_for_record(&self.tables, &self.shard_id, &prepare)?
             }
             DfsMetadataMutation::CommitNamespacePrepare {
@@ -4996,29 +5032,48 @@ impl LocalSobjMetadataBackend {
     fn clear_membership_handoff_write_freeze(
         &mut self,
         handoff_id: &str,
-        activated_epoch: u64,
+        active_shard: &DfsMetadataShardConfig,
     ) -> Result<bool> {
         let lock = self.begin_metadata_write_allow_frozen()?;
-        if !self
-            .mark_membership_handoff_write_freeze_activated_unlocked(handoff_id, activated_epoch)?
-        {
-            return Ok(false);
-        }
+        let previous_namespace_prepare_codec = std::mem::replace(
+            &mut self.namespace_prepare_codec,
+            active_shard.namespace_prepare_codec,
+        );
         let previous_instance_authority_epoch =
-            self.instance_authority_epoch.replace(activated_epoch);
+            self.instance_authority_epoch.replace(active_shard.epoch);
+        let marker_activated = self.mark_membership_handoff_write_freeze_activated_unlocked(
+            handoff_id,
+            active_shard.epoch,
+        );
+        match marker_activated {
+            Ok(true) => {}
+            Ok(false) => {
+                self.namespace_prepare_codec = previous_namespace_prepare_codec;
+                self.instance_authority_epoch = previous_instance_authority_epoch;
+                return Ok(false);
+            }
+            Err(error) => {
+                self.namespace_prepare_codec = previous_namespace_prepare_codec;
+                self.instance_authority_epoch = previous_instance_authority_epoch;
+                return Err(error);
+            }
+        }
         drop(lock);
 
         // Backend open deliberately defers append-producing recovery while a
         // freeze survives a crash. The durable activated-generation marker
-        // remains in place throughout recovery: only this freshly rebound
-        // instance can write, while independently opened stale instances stay
-        // fenced. Roll the local binding back if recovery is incomplete so a
-        // later fresh reconciliation must retry it.
+        // remains in place throughout recovery. The active prepare codec and
+        // authority epoch are installed together before that marker advances,
+        // so recovery cannot append with the retiring generation's format.
+        // Only this freshly rebound instance can write, while independently
+        // opened stale instances stay fenced. Roll the local binding back if
+        // recovery is incomplete so a later fresh reconciliation must retry it.
         let recovery = self
             .recover_namespace_transactions()
             .and_then(|_| self.recover_visible_version_commits())
             .and_then(|_| self.recover_object_locations_from_visible_versions());
         if let Err(error) = recovery {
+            self.namespace_prepare_codec = previous_namespace_prepare_codec;
             self.instance_authority_epoch = previous_instance_authority_epoch;
             return Err(error);
         }
@@ -8729,12 +8784,12 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         &mut self,
         shard_id: &DfsMetadataShardId,
         handoff_id: &str,
-        activated_epoch: u64,
+        active_shard: &DfsMetadataShardConfig,
     ) -> Result<bool> {
-        if shard_id != &self.shard_id {
+        if shard_id != &self.shard_id || active_shard.shard_id != shard_id.0 {
             return Ok(false);
         }
-        self.clear_membership_handoff_write_freeze(handoff_id, activated_epoch)
+        self.clear_membership_handoff_write_freeze(handoff_id, active_shard)
     }
 
     fn metadata_replication_cursor(
@@ -9615,8 +9670,149 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         }
+    }
+
+    fn root_shard_config_at_epoch(shard_id: &str, epoch: u64) -> DfsMetadataShardConfig {
+        let mut config = shard_config(shard_id, DfsMetadataShardAssignment::Root);
+        config.epoch = epoch;
+        config
+    }
+
+    fn assert_retained_sharded_backend_rebinds_prepare_codec(
+        retiring_codec: DfsMetadataNamespacePrepareCodec,
+        active_codec: DfsMetadataNamespacePrepareCodec,
+        expect_packed: bool,
+    ) {
+        let label = if expect_packed {
+            "legacy-to-packed"
+        } else {
+            "packed-to-legacy"
+        };
+        let root = temp_root(&format!("membership-handoff-codec-{label}"));
+        let shard_id = DfsMetadataShardId::new("root");
+        let local_node_id = node("node_owner");
+        let mut retiring = root_shard_config_at_epoch(&shard_id.0, 7);
+        retiring.namespace_prepare_codec = retiring_codec;
+        retiring.replica_node_ids = vec![node("old-replica")];
+        let mut active = retiring.clone();
+        active.epoch = 8;
+        active.namespace_prepare_codec = active_codec;
+        active.replica_node_ids = vec![node("new-replica")];
+
+        let mut backend =
+            LocalShardedMetadataBackend::new(&root, vec![retiring.clone()]).expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        let current = object(version(&format!("version_{label}_1")));
+        backend.put_object(&current).expect("current object");
+        let mut rebind_current = current.clone();
+        rebind_current.object_id =
+            DfsObjectId::from_legacy_named(format!("obj_{label}_rebind")).expect("object id");
+        rebind_current.path = format!("/services/{label}/rebind");
+        rebind_current.version = version(&format!("version_{label}_rebind_1"));
+        backend
+            .put_object(&rebind_current)
+            .expect("rebind current object");
+        let mut rebind_committed = rebind_current.clone();
+        rebind_committed.version = version(&format!("version_{label}_rebind_2"));
+        rebind_committed.mode = 0o600;
+        let retiring_prepare = namespace_prepare(
+            &format!("prepare-{label}-rebind"),
+            &shard_id.0,
+            &rebind_current,
+            rebind_committed,
+        );
+        backend
+            .prepare_namespace_transaction(&retiring_prepare)
+            .expect("retiring-generation hidden prepare");
+
+        let handoff_id = format!("handoff-codec-{label}");
+        let freeze = backend
+            .freeze_metadata_shard_for_membership_handoff(&shard_id, &handoff_id, retiring.epoch)
+            .expect("freeze retiring codec generation")
+            .expect("configured local shard");
+        let proof = crate::DfsMetadataShardMembershipHandoffProof {
+            handoff_id: handoff_id.clone(),
+            retiring_shard: retiring,
+            desired_shard: active.clone(),
+            journal_sequence: freeze.journal_sequence,
+            state_fingerprint: freeze.state_fingerprint.clone(),
+            acknowledged_node_ids: [local_node_id.clone()].into_iter().collect(),
+        };
+        assert!(
+            crate::service_sync::rebind_completed_metadata_shard_membership_handoff(
+                &mut backend,
+                &local_node_id,
+                &active,
+                None,
+                Some(&proof),
+            )
+            .expect("proof-bound retained-backend rebind")
+        );
+
+        let status = backend
+            .metadata_shard_statuses()
+            .expect("shard status")
+            .into_iter()
+            .find(|status| status.shard_id == shard_id)
+            .expect("rebound shard status");
+        assert_eq!(status.file_system_id, Some(active.file_system_id.clone()));
+        assert_eq!(status.primary_node_id, Some(active.primary_node_id.clone()));
+        assert_eq!(status.replica_node_ids, active.replica_node_ids);
+        assert_eq!(status.epoch, Some(active.epoch));
+
+        let assert_active_codec = |entry: DfsMetadataJournalEntry, context: &str| {
+            let DfsMetadataMutation::PutNamespacePrepare {
+                prepare: legacy,
+                packed_prepare_v1: packed,
+                ..
+            } = entry.mutation
+            else {
+                panic!("{context} must journal a namespace prepare");
+            };
+            assert_eq!(
+                (legacy.is_some(), packed.is_some()),
+                (!expect_packed, expect_packed),
+                "{context} must use the active generation's prepare codec"
+            );
+        };
+
+        let mut rebound_prepare = retiring_prepare.clone();
+        rebound_prepare.owner_epoch = active.epoch;
+        rebound_prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&rebound_prepare)
+                .expect("rebound prepare digest");
+        let rebound_entry = backend
+            .rebind_prepared_namespace_transaction(
+                &retiring_prepare.operation_id,
+                &retiring_prepare.operation_digest,
+                retiring_prepare.owner_epoch,
+                &rebound_prepare,
+            )
+            .expect("pre-freeze prepare rebind uses active generation");
+        assert_active_codec(rebound_entry, "pre-freeze prepare rebind");
+
+        let mut committed = current.clone();
+        committed.version = version(&format!("version_{label}_2"));
+        committed.mode = 0o600;
+        let mut prepare = namespace_prepare(
+            &format!("prepare-{label}"),
+            &shard_id.0,
+            &current,
+            committed,
+        );
+        prepare.owner_epoch = active.epoch;
+        prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+                .expect("active-generation prepare digest");
+        let entry = backend
+            .prepare_namespace_transaction(&prepare)
+            .expect("retained backend uses active prepare generation");
+        assert_active_codec(entry, "fresh active prepare");
+
+        cleanup(&root);
     }
 
     fn table_path_record(
@@ -10182,11 +10378,20 @@ mod tests {
         );
 
         let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV1);
         backend.put_file_system(&file_system()).expect("filesystem");
         backend.put_object(&current).expect("current object");
         let entry = backend
             .prepare_namespace_transaction(&prepare)
             .expect("durable hidden prepare");
+        assert!(matches!(
+            &entry.mutation,
+            DfsMetadataMutation::PutNamespacePrepare {
+                prepare: None,
+                packed_prepare_v1: Some(_),
+                ..
+            }
+        ));
         let authoritative_sequence = backend.journal_last_sequence();
         let authoritative_snapshot = backend.export_table_snapshot();
 
@@ -10580,6 +10785,129 @@ mod tests {
     }
 
     #[test]
+    fn packed_namespace_prepare_replays_with_exact_prefix_and_canonical_snapshot() {
+        let root = temp_root("packed_namespace_prepare_replay");
+        let source_root = root.join("source");
+        let replica_root = root.join("replica");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let current = object(version("version_packed_prepare_base"));
+        let mut committed = current.clone();
+        committed.version = version("version_packed_prepare_committed");
+        committed.mode = 0o600;
+        let prepare =
+            namespace_prepare("operation-packed-prepare", &shard_id.0, &current, committed);
+        let mut config = shard_config(&shard_id.0, DfsMetadataShardAssignment::Root);
+        config.epoch = prepare.owner_epoch;
+        config.namespace_prepare_codec = DfsMetadataNamespacePrepareCodec::PackedV1;
+
+        let mut source =
+            LocalShardedMetadataBackend::new(&source_root, vec![config.clone()]).expect("source");
+        source.put_file_system(&file_system()).expect("filesystem");
+        source.put_object(&current).expect("current object");
+        source
+            .prepare_namespace_transaction(&prepare)
+            .expect("packed namespace prepare");
+
+        let entries = source.journal_since(0).expect("source journal");
+        let prepare_entry = entries.last().expect("prepare journal entry");
+        let DfsMetadataMutation::PutNamespacePrepare {
+            prepare: canonical,
+            packed_prepare_v1,
+            ..
+        } = &prepare_entry.mutation
+        else {
+            panic!("last journal entry must be a namespace prepare");
+        };
+        assert!(
+            canonical.is_none(),
+            "packed activation must not retain a second canonical body"
+        );
+        assert!(
+            packed_prepare_v1.is_some(),
+            "packed activation must emit the packed v1 body"
+        );
+        assert_eq!(
+            prepare_entry
+                .mutation
+                .namespace_prepare_payload()
+                .expect("decode packed prepare")
+                .as_deref(),
+            Some(&prepare)
+        );
+        let source_prefix = DfsMetadataBackend::metadata_prefix_proof(&source, &shard_id)
+            .expect("source prefix proof")
+            .expect("source shard prefix proof");
+
+        let mut replica =
+            LocalShardedMetadataBackend::new(&replica_root, vec![config.clone()]).expect("replica");
+        replica
+            .apply_journal_batch(&DfsMetadataJournalBatch {
+                shard_id: shard_id.clone(),
+                next_after_sequence: prepare_entry.sequence,
+                entries: entries.clone(),
+            })
+            .expect("incremental packed replay");
+        assert_eq!(
+            DfsMetadataBackend::metadata_prefix_proof(&replica, &shard_id)
+                .expect("replica prefix proof")
+                .expect("replica shard prefix proof"),
+            source_prefix,
+            "replica prefix hashing must preserve the exact packed journal bytes"
+        );
+        assert_eq!(
+            replica
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("replica prepare"),
+            Some(prepare.clone())
+        );
+
+        let snapshot = source
+            .export_shard_table_snapshot(&shard_id)
+            .expect("export shard snapshot")
+            .expect("source shard snapshot");
+        assert!(
+            snapshot
+                .tables
+                .as_ref()
+                .expect("structured snapshot tables")
+                .namespace_prepares
+                .contains(&prepare),
+            "snapshots must remain canonical across journal codec changes"
+        );
+
+        drop(replica);
+        let replica =
+            LocalShardedMetadataBackend::new(&replica_root, vec![config]).expect("reopen replica");
+        assert_eq!(
+            replica
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("reopened replica prepare"),
+            Some(prepare.clone()),
+            "journal-referenced table replay must resolve packed prepare bodies"
+        );
+
+        let mut ambiguous = prepare_entry.clone();
+        let DfsMetadataMutation::PutNamespacePrepare {
+            prepare: canonical,
+            packed_prepare_v1,
+            ..
+        } = &mut ambiguous.mutation
+        else {
+            panic!("prepare entry changed mutation kind");
+        };
+        assert!(packed_prepare_v1.is_some());
+        *canonical = Some(prepare);
+        let error = require_journal_entry_replay_payloads(&ambiguous)
+            .expect_err("dual prepare representations must fail replay");
+        assert!(
+            error.to_string().contains("both canonical and packed"),
+            "unexpected ambiguous prepare error: {error}"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn compact_namespace_commit_mutation_stays_bounded_for_4096_objects() {
         let shard_id = DfsMetadataShardId::new("shard-root");
         let current = object(version("version_compact_commit_size_base"));
@@ -10614,10 +10942,25 @@ mod tests {
                 .expect("4096-object prepare digest");
 
         let full = DfsMetadataMutation::put_namespace_prepare(&prepare);
+        let packed =
+            DfsMetadataMutation::put_namespace_prepare_packed_v1(&prepare).expect("pack prepare");
         let compact = DfsMetadataMutation::commit_namespace_prepare(&prepare);
+        assert_eq!(packed.affected_object_ids().len(), 4096);
         assert_eq!(compact.affected_object_ids().len(), 4096);
         let full_bytes = serde_json::to_vec(&full).expect("encode full prepare");
         let compact_bytes = serde_json::to_vec(&compact).expect("encode compact commit");
+        let full_wire_bytes =
+            sinomo_object_serde::to_bytes(&full, 1, sinomo_core::object::LengthMode::U32)
+                .expect("encode full prepare wire mutation");
+        let packed_wire_bytes =
+            sinomo_object_serde::to_bytes(&packed, 1, sinomo_core::object::LengthMode::U32)
+                .expect("encode packed prepare wire mutation");
+        assert!(
+            packed_wire_bytes.len().saturating_mul(4) < full_wire_bytes.len().saturating_mul(3),
+            "packed prepare should save at least 25%: full={} packed={}",
+            full_wire_bytes.len(),
+            packed_wire_bytes.len()
+        );
         assert!(
             compact_bytes.len() < 512 * 1024,
             "4096-object compact marker unexpectedly exceeds 512 KiB: {}",
@@ -17832,6 +18175,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut request = DfsContentRootCatalogPageRequest {
@@ -17916,6 +18260,7 @@ mod tests {
             replica_node_ids: Vec::new(),
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let request = DfsContentRootCatalogPageRequest {
@@ -21349,6 +21694,24 @@ mod tests {
     }
 
     #[test]
+    fn retained_sharded_backend_rebinds_legacy_prepare_codec_to_packed_v1() {
+        assert_retained_sharded_backend_rebinds_prepare_codec(
+            DfsMetadataNamespacePrepareCodec::Legacy,
+            DfsMetadataNamespacePrepareCodec::PackedV1,
+            true,
+        );
+    }
+
+    #[test]
+    fn retained_sharded_backend_rebinds_packed_v1_prepare_codec_to_legacy() {
+        assert_retained_sharded_backend_rebinds_prepare_codec(
+            DfsMetadataNamespacePrepareCodec::PackedV1,
+            DfsMetadataNamespacePrepareCodec::Legacy,
+            false,
+        );
+    }
+
+    #[test]
     fn membership_handoff_freeze_survives_reopen_and_blocks_new_journal_entries() {
         let root = temp_root("membership-handoff-freeze-reopen");
         let metadata_root = root.join("metadata");
@@ -21399,7 +21762,11 @@ mod tests {
 
         assert!(
             reopened
-                .clear_metadata_shard_membership_handoff_freeze(&shard_id, "different-handoff", 8,)
+                .clear_metadata_shard_membership_handoff_freeze(
+                    &shard_id,
+                    "different-handoff",
+                    &root_shard_config_at_epoch(&shard_id.0, 8),
+                )
                 .is_err(),
             "a completion for another handoff must not release this marker"
         );
@@ -21408,7 +21775,7 @@ mod tests {
                 .clear_metadata_shard_membership_handoff_freeze(
                     &shard_id,
                     "handoff-freeze-reopen",
-                    9,
+                    &root_shard_config_at_epoch(&shard_id.0, 9),
                 )
                 .is_err(),
             "a completion must bind the exact successor authority epoch"
@@ -21423,7 +21790,7 @@ mod tests {
                 .clear_metadata_shard_membership_handoff_freeze(
                     &shard_id,
                     "handoff-freeze-reopen",
-                    8,
+                    &root_shard_config_at_epoch(&shard_id.0, 8),
                 )
                 .expect("advance handoff marker to activated generation")
         );
@@ -21507,7 +21874,7 @@ mod tests {
                 .clear_metadata_shard_membership_handoff_freeze(
                     &shard_id,
                     "handoff-nonbinding-activation",
-                    18,
+                    &root_shard_config_at_epoch(&shard_id.0, 18),
                 )
                 .expect("fresh authority observer binds exact activated generation")
         );
@@ -21929,7 +22296,7 @@ mod tests {
                 .clear_metadata_shard_membership_handoff_freeze(
                     &shard_id,
                     "handoff-cross-process-generation",
-                    12,
+                    &root_shard_config_at_epoch(&shard_id.0, 12),
                 )
                 .expect("activate generation")
         );
@@ -21948,7 +22315,7 @@ mod tests {
             .clear_metadata_shard_membership_handoff_freeze(
                 &shard_id,
                 "handoff-cross-process-generation",
-                12,
+                &root_shard_config_at_epoch(&shard_id.0, 12),
             )
             .expect("fresh control-plane observer rebinds stale instance");
         stale

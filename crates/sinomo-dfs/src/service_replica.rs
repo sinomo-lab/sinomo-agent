@@ -22,39 +22,59 @@ static DFS_METADATA_SHARD_PUBLICATION_LOCKS: OnceLock<(Mutex<BTreeSet<String>>, 
     OnceLock::new();
 
 fn metadata_authority_probe_timeout(
+    shard: &DfsMetadataShardConfig,
     operation: &DfsMetadataAuthorityOperation,
     prepared_batch: &DfsMetadataJournalBatch,
 ) -> Duration {
     let DfsMetadataAuthorityOperation::NamespaceMutation {
-        prepare_sequence, ..
+        operation_id,
+        file_system_id,
+        prepare_sequence,
+        payload_digest,
     } = operation
     else {
         return DFS_METADATA_AUTHORITY_PROBE_TIMEOUT;
     };
-    let Some(prepare) = prepared_batch.entries.iter().find_map(|entry| {
-        if entry.sequence != *prepare_sequence {
-            return None;
-        }
-        let DfsMetadataMutation::PutNamespacePrepare {
-            prepare: Some(prepare),
-            ..
-        } = &entry.mutation
-        else {
-            return None;
-        };
-        Some(prepare)
-    }) else {
+    let Some(entry) = prepared_batch
+        .entries
+        .iter()
+        .find(|entry| entry.sequence == *prepare_sequence)
+    else {
         return DFS_METADATA_AUTHORITY_PROBE_TIMEOUT;
     };
-    let record_count = prepare
-        .transaction
-        .objects
-        .len()
-        .saturating_add(prepare.transaction.versions.len())
-        .saturating_add(prepare.transaction.advisory_lock_states.len())
-        .saturating_add(prepare.expected_object_versions.len())
-        .saturating_add(prepare.expected_path_occupants.len())
-        .saturating_add(prepare.content_receipts.len());
+    let DfsMetadataMutation::PutNamespacePrepare {
+        file_system_id: mutation_file_system_id,
+        operation_id: mutation_operation_id,
+        status,
+        ..
+    } = &entry.mutation
+    else {
+        return DFS_METADATA_AUTHORITY_PROBE_TIMEOUT;
+    };
+    if entry.shard_id.0 != shard.shard_id
+        || file_system_id != &shard.file_system_id
+        || mutation_file_system_id != file_system_id
+        || mutation_operation_id != operation_id
+        || status != &DfsNamespacePrepareStatus::Prepared
+    {
+        return DFS_METADATA_AUTHORITY_PROBE_TIMEOUT;
+    }
+    let Ok(Some(prepare)) = entry.mutation.namespace_prepare_payload_ref() else {
+        return DFS_METADATA_AUTHORITY_PROBE_TIMEOUT;
+    };
+    if prepare.validate_file_system_scope(file_system_id).is_err()
+        || !prepare.matches_authority(
+            file_system_id,
+            operation_id,
+            &DfsNamespacePrepareStatus::Prepared,
+            &entry.shard_id,
+            shard.epoch,
+            payload_digest,
+        )
+    {
+        return DFS_METADATA_AUTHORITY_PROBE_TIMEOUT;
+    }
+    let record_count = prepare.record_count();
     if record_count > DFS_METADATA_AUTHORITY_LARGE_NAMESPACE_RECORDS {
         DFS_METADATA_AUTHORITY_LARGE_PROBE_TIMEOUT
     } else {
@@ -332,7 +352,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // transport segments. Large prepares therefore use the same stream-
         // native replica path as small ones; semantic record count must never
         // select the degraded KV-only authorization path.
-        let probe_timeout = metadata_authority_probe_timeout(operation, prepared_batch);
+        let probe_timeout = metadata_authority_probe_timeout(shard, operation, prepared_batch);
         let probe_started = Instant::now();
         let acknowledged_node_ids = self.fresh_metadata_shard_authority_acknowledgements(
             shard,
@@ -1781,6 +1801,7 @@ mod authority_probe_tests {
             replica_node_ids,
             epoch: 7,
             assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let mut inner = InProcessKvStore::new();
@@ -2303,7 +2324,7 @@ mod authority_probe_tests {
         let (operation, prepared_batch) =
             prepared_namespace_authority_fixture(&mut service, &object, &shard, 257);
         assert_eq!(
-            metadata_authority_probe_timeout(&operation, &prepared_batch),
+            metadata_authority_probe_timeout(&shard, &operation, &prepared_batch),
             DFS_METADATA_AUTHORITY_LARGE_PROBE_TIMEOUT
         );
 
@@ -2328,6 +2349,60 @@ mod authority_probe_tests {
     }
 
     #[test]
+    fn packed_oversized_namespace_authority_replicates_prepare_before_publication() {
+        let replicas = vec![
+            node("node_packed_oversized_namespace_authority_replica_a"),
+            node("node_packed_oversized_namespace_authority_replica_b"),
+        ];
+        let expected_probe_count = replicas.len();
+        let (mut service, object, _, shard, txn_calls, _) =
+            authority_fixture(ProbeBehavior::Accept, replicas);
+        let sent = Arc::clone(&service.transport.sent);
+        let (operation, mut prepared_batch) =
+            prepared_namespace_authority_fixture(&mut service, &object, &shard, 257);
+        let entry = prepared_batch
+            .entries
+            .iter_mut()
+            .find(|entry| {
+                entry.sequence == metadata_authority_operation_prepare_sequence(&operation)
+            })
+            .expect("namespace prepare entry");
+        let prepare = match &entry.mutation {
+            DfsMetadataMutation::PutNamespacePrepare {
+                prepare: Some(prepare),
+                packed_prepare_v1: None,
+                ..
+            } => prepare.clone(),
+            _ => panic!("fixture should contain one canonical namespace prepare"),
+        };
+        entry.mutation = DfsMetadataMutation::put_namespace_prepare_packed_v1(&prepare)
+            .expect("pack namespace prepare");
+        assert_eq!(
+            metadata_authority_probe_timeout(&shard, &operation, &prepared_batch),
+            DFS_METADATA_AUTHORITY_LARGE_PROBE_TIMEOUT
+        );
+
+        let authorization = service
+            .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
+            .expect("packed oversized namespace prepare replicates through the DFS data plane");
+        assert!(
+            matches!(authorization, DfsCanonicalAuthorization::FullShard { .. }),
+            "packed encoding must not bypass full-shard DFS durability"
+        );
+        assert_eq!(txn_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            sent.lock().expect("sent messages").len(),
+            expected_probe_count,
+            "every configured replica must receive the packed prepared batch"
+        );
+        drop(
+            service
+                .validate_canonical_authorization(&authorization, &operation)
+                .expect("packed full-shard evidence remains subject to canonical revalidation"),
+        );
+    }
+
+    #[test]
     fn small_namespace_authority_keeps_full_shard_probe() {
         let replicas = vec![
             node("node_small_namespace_authority_replica_a"),
@@ -2340,7 +2415,7 @@ mod authority_probe_tests {
         let (operation, prepared_batch) =
             persisted_small_namespace_authority_fixture(&mut service, &object, &shard);
         assert_eq!(
-            metadata_authority_probe_timeout(&operation, &prepared_batch),
+            metadata_authority_probe_timeout(&shard, &operation, &prepared_batch),
             DFS_METADATA_AUTHORITY_PROBE_TIMEOUT
         );
 
