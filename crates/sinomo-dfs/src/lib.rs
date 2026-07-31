@@ -274,6 +274,7 @@ pub use maintenance::{
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions_and_committed_work_tracker_until_hydration_cancelled,
     run_cluster_dfs_maintenance_tick_with_peer_transport,
     run_cluster_dfs_maintenance_tick_with_reusable_service_until_hydration_cancelled,
+    run_cluster_dfs_reactive_maintenance_tick_with_reusable_service,
     run_dfs_lifecycle_maintenance_with_host, run_dfs_maintenance_tick_with_async_host,
     run_dfs_maintenance_tick_with_async_host_and_execution_exclusions,
     run_dfs_maintenance_tick_with_host, write_dfs_anti_entropy_cursor,

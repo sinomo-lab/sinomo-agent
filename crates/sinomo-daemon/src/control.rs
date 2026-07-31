@@ -6,7 +6,7 @@ use crate::cluster::{
 use crate::dfs::{
     DaemonDfsMaintenanceTickOutcome, DaemonDfsPendingMaintenanceWork,
     daemon_dfs_maintenance_notify, daemon_dfs_node_transport, daemon_dfs_node_transport_on_runtime,
-    daemon_dfs_now_unix_nanos, daemon_dfs_pending_maintenance_work,
+    daemon_dfs_now_unix_nanos, daemon_dfs_pending_reactive_maintenance_work,
     evict_daemon_dfs_message_service_cache_on_shutdown,
     notify_daemon_dfs_metadata_publish_route_generation_on_runtime,
     register_daemon_dfs_data_owner_lock, run_daemon_dfs_maintenance_tick_in_blocking_task,
@@ -1950,6 +1950,7 @@ fn daemon_dfs_maintenance_completion_decision(
     decision
 }
 
+#[cfg(test)]
 fn daemon_dfs_maintenance_revalidation_decision(
     observed_at: Instant,
     observed_at_unix_nanos: u64,
@@ -1991,22 +1992,18 @@ fn daemon_dfs_failed_maintenance_decision(
 }
 
 fn daemon_dfs_maintenance_notification_decision(
-    observed_at: Instant,
+    _observed_at: Instant,
     triggered_maintenance_requested: bool,
     immediate_continuation_requested: bool,
     next_probe_at: Option<Instant>,
 ) -> DaemonDfsMaintenanceProbeDecision {
-    // Notifications are edge-triggered hints from several sources, including
-    // generic cluster refreshes and replicated metadata. They must wake the
-    // classifier, not bypass it and launch a full metadata pass directly.
+    // Notifications are committed queue edges. The normal pass is reactive
+    // and never reconstructs the complete metadata/content image, so it can
+    // be launched directly without an O(total-state) classifier.
     DaemonDfsMaintenanceProbeDecision {
-        trigger_maintenance: triggered_maintenance_requested,
+        trigger_maintenance: true,
         immediate_continuation: triggered_maintenance_requested && immediate_continuation_requested,
-        next_probe_at: Some(
-            next_probe_at
-                .map(|next_probe_at| next_probe_at.min(observed_at))
-                .unwrap_or(observed_at),
-        ),
+        next_probe_at,
     }
 }
 
@@ -2310,7 +2307,7 @@ async fn run_daemon_background_maintenance_loop(
                 Some(outcome) => {
                     let probe_paths = paths.clone();
                     let work = match tokio::task::spawn_blocking(move || {
-                        daemon_dfs_pending_maintenance_work(&probe_paths)
+                        daemon_dfs_pending_reactive_maintenance_work(&probe_paths)
                     })
                     .await
                     {
@@ -2372,7 +2369,7 @@ async fn run_daemon_background_maintenance_loop(
         {
             let probe_paths = paths.clone();
             let work = match tokio::task::spawn_blocking(move || {
-                daemon_dfs_pending_maintenance_work(&probe_paths)
+                daemon_dfs_pending_reactive_maintenance_work(&probe_paths)
             })
             .await
             {
@@ -2413,42 +2410,6 @@ async fn run_daemon_background_maintenance_loop(
         ) && dfs_maintenance_task.is_none()
             && dfs_triggered_maintenance_due
         {
-            // A trigger is a durable-work classification observed at an
-            // earlier point in time. Revalidate it at the launch boundary so
-            // resolved work never acquires the broad DFS service lane or its
-            // distributed maintenance lease.
-            let probe_paths = paths.clone();
-            let work = match tokio::task::spawn_blocking(move || {
-                daemon_dfs_pending_maintenance_work(&probe_paths)
-            })
-            .await
-            {
-                Ok(Ok(work)) => Some(work),
-                Ok(Err(error)) => {
-                    tracing::warn!(
-                        "sinomo {label} DFS maintenance pre-launch probe failed: {error}"
-                    );
-                    None
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "sinomo {label} DFS maintenance pre-launch probe task failed: {error}"
-                    );
-                    None
-                }
-            };
-            let decision = daemon_dfs_maintenance_revalidation_decision(
-                Instant::now(),
-                daemon_dfs_now_unix_nanos(),
-                work,
-                dfs_immediate_continuation_requested,
-            );
-            dfs_triggered_maintenance_requested = decision.trigger_maintenance;
-            dfs_immediate_continuation_requested = decision.immediate_continuation;
-            next_dfs_maintenance_probe = decision.next_probe_at;
-            if daemon_shutdown_requested(&shutdown_rx) {
-                break;
-            }
             if daemon_dfs_maintenance_should_launch(
                 dfs_triggered_maintenance_due,
                 dfs_triggered_maintenance_requested,
@@ -9093,7 +9054,7 @@ mod tests {
     }
 
     #[test]
-    fn dfs_maintenance_notification_requests_a_probe_without_forcing_a_pass() {
+    fn dfs_maintenance_notification_launches_only_the_reactive_pass() {
         let observed_at = Instant::now();
         let mut next_probe_at = None;
         let triggered_maintenance_requested = false;
@@ -9106,25 +9067,22 @@ mod tests {
         );
         next_probe_at = notification.next_probe_at;
 
-        assert!(daemon_dfs_maintenance_probe_is_due(
-            observed_at,
-            next_probe_at
-        ));
         assert!(
-            !notification.trigger_maintenance,
-            "an edge hint must not bypass pending-work classification"
+            notification.trigger_maintenance,
+            "a committed queue edge must launch reactive maintenance without a metadata inventory"
         );
         assert!(!notification.immediate_continuation);
+        assert_eq!(next_probe_at, None);
 
         let decision = daemon_dfs_failed_maintenance_decision(
             observed_at,
-            triggered_maintenance_requested,
+            notification.trigger_maintenance,
             next_probe_at,
         );
         assert_eq!(
             decision.next_probe_at,
-            Some(observed_at),
-            "task failure must not discard a notification probe already due"
+            observed_at.checked_add(DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL),
+            "task failure must retain a bounded retry without running an inventory"
         );
     }
 

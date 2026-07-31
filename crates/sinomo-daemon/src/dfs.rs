@@ -18,39 +18,38 @@ use sinomo_core::network::{
 use sinomo_core::node::NodeId;
 #[cfg(test)]
 use sinomo_dfs::DfsFileSystemConfig;
-use sinomo_dfs::{
-    ContentStoreError, DfsCommittedWorkTracker, DfsConflictRecord, DfsConflictStatus,
-    DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture, DfsDataPlaneResponse,
-    DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions, DfsFileSystemId,
-    DfsInboundAttachment, DfsMaintenanceExecutionExclusions, DfsMaintenanceTickOptions,
-    DfsMaintenanceTickReport, DfsMessageCommand, DfsMessageCommittedWork, DfsMessageExecutionScope,
-    DfsMessageProcessResult, DfsMessageResponse, DfsMetadataBackend,
-    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
-    DfsMetadataPublishScheduleOptions, DfsMetadataPublishScheduleStart, DfsMetadataShardId,
-    DfsMetadataShardMembershipHandoff, DfsMetadataShardStatus, DfsMetadataSummary,
-    DfsNodeDetachedSendState, DfsNodeDetachedSendWorker, DfsNodeServedMessageTransport,
-    DfsNodeTransport, DfsObjectId, DfsObjectMetadata, DfsObjectRpcSendOptions,
-    DfsObjectVersionRecord, DfsOperatorInspector, DfsOperatorRepairView, DfsPeerTransport,
-    DfsPeerTransportError, DfsPlacementReconciliationJob, DfsPlacementReconciliationState,
-    DfsRepairAttemptRecord, DfsReplicaReceiptRecord, DfsVersion, DfsWriteIntentRecord,
-    DfsWriteIntentStatus, LocalContentStore, NetworkedDfsService,
-    default_dfs_repair_attempt_snapshot_path, dfs_message_execution_scope,
-    read_dfs_repair_attempt_snapshot,
-};
 #[cfg(test)]
 use sinomo_dfs::{
-    ContentStoreGcOptions, ContentStoreVersionGcOptions, DaemonDfsInspectionRequest,
-    DaemonDfsInspectionResponse, DfsContentRootCatalogCollectionValidation,
-    DfsContentRootCatalogIncompleteReason, DfsMaintenanceRunOptions,
-    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
-    DfsMetadataJournalBatchSender, DfsMetadataPeerTransportError, DfsMetadataShardAssignment,
-    DfsMetadataShardConfig, DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult,
-    DfsMetadataSnapshotInstallSender, LocalSobjMetadataBackend,
-    cluster_dfs_all_file_system_configs, cluster_dfs_all_metadata_shard_head_watermarks,
+    ContentStoreError, ContentStoreGcOptions, ContentStoreVersionGcOptions,
+    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsConflictRecord, DfsConflictStatus,
+    DfsContentRootCatalogCollectionValidation, DfsContentRootCatalogIncompleteReason,
+    DfsMaintenanceRunOptions, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
+    DfsMetadataJournalBatchResult, DfsMetadataJournalBatchSender, DfsMetadataPeerTransportError,
+    DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardStatus,
+    DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult,
+    DfsMetadataSnapshotInstallSender, DfsMetadataSummary, DfsObjectId, DfsObjectMetadata,
+    DfsObjectVersionRecord, DfsOperatorInspector, DfsOperatorRepairView, DfsRepairAttemptRecord,
+    DfsReplicaReceiptRecord, DfsVersion, DfsWriteIntentRecord, DfsWriteIntentStatus,
+    LocalSobjMetadataBackend, cluster_dfs_all_file_system_configs,
+    cluster_dfs_all_metadata_shard_head_watermarks,
     cluster_dfs_all_metadata_shard_membership_handoffs, cluster_dfs_all_metadata_shards,
     default_dfs_content_root_catalog_store, default_dfs_metadata_root, distributed_sifs,
     distributed_sifs_bootstrap_objects, file_system_config_key, metadata_shard_key,
     sifs_node_files_path,
+};
+use sinomo_dfs::{
+    DfsCommittedWorkTracker, DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture,
+    DfsDataPlaneResponse, DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions,
+    DfsFileSystemId, DfsInboundAttachment, DfsMaintenanceExecutionExclusions,
+    DfsMaintenanceTickOptions, DfsMaintenanceTickReport, DfsMessageCommand,
+    DfsMessageCommittedWork, DfsMessageExecutionScope, DfsMessageProcessResult, DfsMessageResponse,
+    DfsMetadataBackend, DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
+    DfsMetadataPublishScheduleOptions, DfsMetadataPublishScheduleStart, DfsMetadataShardId,
+    DfsMetadataShardMembershipHandoff, DfsNodeDetachedSendState, DfsNodeDetachedSendWorker,
+    DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport,
+    DfsPeerTransportError, DfsPlacementReconciliationJob, DfsPlacementReconciliationState,
+    LocalContentStore, NetworkedDfsService, default_dfs_repair_attempt_snapshot_path,
+    dfs_message_execution_scope, read_dfs_repair_attempt_snapshot,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
@@ -463,7 +462,9 @@ impl Deref for DaemonDfsMessageServiceLaneHandle {
 #[derive(Debug)]
 struct DaemonDfsDetachedSendRuntime {
     state: DfsNodeDetachedSendState,
+    #[cfg(test)]
     recovery_scan_generation: AtomicU64,
+    #[cfg(test)]
     metadata_authority_generation: OnceLock<Arc<DaemonDfsMetadataAuthorityGeneration>>,
     message_worker_active: AtomicBool,
     message_worker_schedule: Mutex<DaemonDfsDetachedWorkerSchedule>,
@@ -501,7 +502,9 @@ impl DaemonDfsDetachedSendRuntime {
     fn new() -> Self {
         Self {
             state: DfsNodeDetachedSendState::new(),
+            #[cfg(test)]
             recovery_scan_generation: AtomicU64::new(0),
+            #[cfg(test)]
             metadata_authority_generation: OnceLock::new(),
             message_worker_active: AtomicBool::new(false),
             message_worker_schedule: Mutex::new(DaemonDfsDetachedWorkerSchedule::default()),
@@ -836,6 +839,7 @@ pub(crate) fn daemon_dfs_now_unix_nanos() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 fn daemon_dfs_duration_nanos(duration: Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
@@ -1645,6 +1649,7 @@ pub(crate) fn notify_daemon_dfs_maintenance_work() {
     daemon_dfs_maintenance_notify().notify_one();
 }
 
+#[cfg(test)]
 fn daemon_dfs_local_membership_handoff_keys(
     metadata_shard_statuses: &[DfsMetadataShardStatus],
     local_node_id: &NodeId,
@@ -1732,12 +1737,14 @@ fn daemon_dfs_maintenance_execution_exclusions(
 }
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
 enum DaemonDfsMetadataLookup<T> {
     Found(T),
     Missing,
     Unavailable,
 }
 
+#[cfg(test)]
 trait DaemonDfsMetadataLookupSource {
     fn object_lookup(&self, object_id: &DfsObjectId) -> DaemonDfsMetadataLookup<DfsObjectMetadata>;
 
@@ -1748,6 +1755,7 @@ trait DaemonDfsMetadataLookupSource {
     ) -> DaemonDfsMetadataLookup<DfsObjectVersionRecord>;
 }
 
+#[cfg(test)]
 impl<T> DaemonDfsMetadataLookupSource for T
 where
     T: DfsMetadataBackend + ?Sized,
@@ -1774,11 +1782,13 @@ where
 }
 
 #[derive(Debug, Default)]
+#[cfg(test)]
 struct DaemonDfsMetadataLookups {
     objects: BTreeMap<DfsObjectId, DaemonDfsMetadataLookup<DfsObjectMetadata>>,
     versions: BTreeMap<(DfsObjectId, DfsVersion), DaemonDfsMetadataLookup<DfsObjectVersionRecord>>,
 }
 
+#[cfg(test)]
 impl DaemonDfsMetadataLookupSource for DaemonDfsMetadataLookups {
     fn object_lookup(&self, object_id: &DfsObjectId) -> DaemonDfsMetadataLookup<DfsObjectMetadata> {
         self.objects
@@ -1799,6 +1809,7 @@ impl DaemonDfsMetadataLookupSource for DaemonDfsMetadataLookups {
     }
 }
 
+#[cfg(test)]
 fn daemon_dfs_intents_without_recovery_source<M>(
     data_dir: &SinomoDataDir,
     metadata: &M,
@@ -1968,6 +1979,7 @@ where
         .collect()
 }
 
+#[cfg(test)]
 fn daemon_dfs_repairs_without_recovery_source<M>(
     data_dir: &SinomoDataDir,
     metadata: &M,
@@ -2058,6 +2070,7 @@ where
         .collect()
 }
 
+#[cfg(test)]
 fn daemon_dfs_actionable_conflict_count(
     metadata: &dyn DfsMetadataBackend,
     conflicts: &[DfsConflictRecord],
@@ -2075,6 +2088,7 @@ fn daemon_dfs_actionable_conflict_count(
     Ok(actionable)
 }
 
+#[cfg(test)]
 fn daemon_dfs_conflict_requires_maintenance(
     conflict: &DfsConflictRecord,
     current: Option<&DfsObjectMetadata>,
@@ -2129,6 +2143,7 @@ fn daemon_dfs_actionable_placement_reconciliation_count(
         .count()
 }
 
+#[cfg(test)]
 fn daemon_dfs_pending_work_from_records(
     pending_write_count: usize,
     pending_repair_count: usize,
@@ -2665,6 +2680,7 @@ fn daemon_dfs_content_gc_projection(
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 struct DaemonDfsMaintenanceMetadataObservation {
     summary: DfsMetadataSummary,
     metadata_shard_statuses: Vec<DfsMetadataShardStatus>,
@@ -2675,6 +2691,7 @@ struct DaemonDfsMaintenanceMetadataObservation {
     lookups: DaemonDfsMetadataLookups,
 }
 
+#[cfg(test)]
 fn daemon_dfs_maintenance_metadata_observation(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -2764,6 +2781,70 @@ fn daemon_dfs_maintenance_metadata_observation(
     .map_err(Into::into)
 }
 
+/// Inspect only the bounded durable queues owned by normal reactive healing.
+///
+/// This function is safe on daemon startup and notification handling: it does
+/// not open a DFS metadata backend, enumerate object/shard indexes, or inspect
+/// content. Full metadata reconstruction belongs to explicit disaster
+/// recovery, not to the automatic scheduler.
+pub(crate) fn daemon_dfs_pending_reactive_maintenance_work(
+    paths: &DaemonPaths,
+) -> Result<DaemonDfsPendingMaintenanceWork, DaemonError> {
+    let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    if !cluster_paths.state.exists() {
+        return Ok(DaemonDfsPendingMaintenanceWork::default());
+    }
+    let now_unix_nanos = daemon_dfs_now_unix_nanos();
+    let repair_attempt_records =
+        read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))?
+            .map(|snapshot| snapshot.records)
+            .unwrap_or_default();
+    let due_repair_attempt_count = repair_attempt_records
+        .iter()
+        .filter(|record| {
+            record.next_retry_unix_nanos != u64::MAX
+                && record.next_retry_unix_nanos <= now_unix_nanos
+        })
+        .count();
+    let next_repair_retry_unix_nanos = repair_attempt_records
+        .iter()
+        .filter(|record| {
+            record.next_retry_unix_nanos != u64::MAX
+                && record.next_retry_unix_nanos > now_unix_nanos
+        })
+        .map(|record| record.next_retry_unix_nanos)
+        .min();
+    let placement_reconciliation_jobs =
+        sinomo_core::cluster::read_cluster_kv_latest_observed_prefix_entries(
+            &cluster_paths,
+            &sinomo_dfs::placement_reconciliations_prefix(&sinomo_dfs::sifs_file_system_id()),
+        )?
+        .into_iter()
+        .map(|entry| entry.decode::<DfsPlacementReconciliationJob>())
+        .collect::<Result<Vec<_>, _>>()?;
+    let actionable_placement_reconciliation_count =
+        daemon_dfs_actionable_placement_reconciliation_count(
+            &placement_reconciliation_jobs,
+            repair_attempt_records.len(),
+        );
+
+    Ok(DaemonDfsPendingMaintenanceWork {
+        pending_repair_count: repair_attempt_records.len(),
+        repair_attempt_count: repair_attempt_records.len(),
+        due_repair_attempt_count,
+        next_repair_retry_unix_nanos,
+        actionable_placement_reconciliation_count,
+        ..DaemonDfsPendingMaintenanceWork::default()
+    })
+}
+
+/// Full metadata classifier retained for explicit recovery/operator tests.
+///
+/// Unlike [`daemon_dfs_pending_reactive_maintenance_work`], this opens the
+/// cluster-aware metadata image and is therefore O(total metadata). Production
+/// daemon scheduling must never call it.
+#[cfg(test)]
 pub(crate) fn daemon_dfs_pending_maintenance_work(
     paths: &DaemonPaths,
 ) -> Result<DaemonDfsPendingMaintenanceWork, DaemonError> {
@@ -3619,6 +3700,7 @@ fn daemon_dfs_metadata_authority_generation_for_identity(
     Ok(generation)
 }
 
+#[cfg(test)]
 fn daemon_dfs_retained_metadata_authority_generation(
     detached_send_runtime: &DaemonDfsDetachedSendRuntime,
     cluster_paths: &ClusterPaths,
@@ -3912,6 +3994,7 @@ fn open_daemon_dfs_message_content_read_lane_with_content(
     }))
 }
 
+#[cfg(test)]
 struct DaemonDfsCommitPromotionRecovery {
     detached_runtime: Arc<DaemonDfsDetachedSendRuntime>,
     worker: DfsNodeDetachedSendWorker,
@@ -3929,6 +4012,7 @@ struct DaemonDfsCommitPromotionRecovery {
 /// fence another node out of unrelated cluster maintenance. An empty committed
 /// shard topology is transient bootstrap state, so it leaves recovery
 /// incomplete for the next maintenance tick.
+#[cfg(test)]
 fn prepare_daemon_dfs_commit_promotion_recovery(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -6036,8 +6120,8 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     runtime: &tokio::runtime::Handle,
     maintenance_kind: DaemonDfsMaintenanceKind,
     committed_work_tracker: DfsCommittedWorkTracker,
-    deferred_work: &mut Option<(Arc<DaemonDfsDetachedSendRuntime>, DfsNodeDetachedSendWorker)>,
-    foreground_preemption: &DaemonDfsMaintenanceForegroundPreemption,
+    _deferred_work: &mut Option<(Arc<DaemonDfsDetachedSendRuntime>, DfsNodeDetachedSendWorker)>,
+    _foreground_preemption: &DaemonDfsMaintenanceForegroundPreemption,
 ) -> Result<bool, DaemonError> {
     // The scheduler's retained read-only image is useful between probes, but a
     // broad writable generation will decode the same tables. Release it first
@@ -6076,37 +6160,57 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     } = retained_lane;
     let DaemonDfsMessageServiceLane {
         service: mut maintenance_service,
+        metadata_hydrated: service_was_fully_hydrated,
         ..
     } = lane;
+    #[cfg(test)]
     let authority_generation_before_maintenance = metadata_authority_generation.generation();
     let async_peer_transport = daemon_dfs_async_peer_transport(&data_dir, runtime);
-    let options = match maintenance_kind {
-        DaemonDfsMaintenanceKind::Routine => daemon_dfs_routine_maintenance_tick_options(),
+    let maintenance_result = match maintenance_kind {
+        DaemonDfsMaintenanceKind::Routine => {
+            sinomo_dfs::run_cluster_dfs_reactive_maintenance_tick_with_reusable_service(
+                &mut maintenance_service,
+                data_dir.clone(),
+                cluster_paths.clone(),
+                cluster_state,
+                async_peer_transport,
+                execution_exclusions,
+                committed_work_tracker,
+                daemon_dfs_routine_maintenance_tick_options(),
+            )
+            .await
+            .map(Some)
+            .map_err(DaemonError::from)
+        }
         #[cfg(test)]
         DaemonDfsMaintenanceKind::ExplicitDisasterRecovery => {
-            daemon_dfs_explicit_disaster_recovery_tick_options(true, true)
+            sinomo_dfs::run_cluster_dfs_maintenance_tick_with_reusable_service_until_hydration_cancelled(
+                &mut maintenance_service,
+                data_dir.clone(),
+                cluster_paths.clone(),
+                cluster_state,
+                async_peer_transport,
+                execution_exclusions,
+                committed_work_tracker,
+                &|| {
+                    _foreground_preemption.is_requested()
+                        || metadata_authority_generation.generation()
+                            != authority_generation_before_maintenance
+                },
+                daemon_dfs_explicit_disaster_recovery_tick_options(true, true),
+            )
+            .await
+            .map_err(DaemonError::from)
         }
     };
-    let maintenance_result =
-        sinomo_dfs::run_cluster_dfs_maintenance_tick_with_reusable_service_until_hydration_cancelled(
-            &mut maintenance_service,
-            data_dir.clone(),
-            cluster_paths.clone(),
-            cluster_state,
-            async_peer_transport,
-            execution_exclusions,
-            committed_work_tracker,
-            &|| {
-                foreground_preemption.is_requested()
-                    || metadata_authority_generation.generation()
-                        != authority_generation_before_maintenance
-            },
-            options,
-        )
-        .await
-        .map_err(DaemonError::from);
     match &maintenance_result {
-        Ok(Some(_)) => {
+        #[cfg(test)]
+        Ok(Some(_))
+            if matches!(
+                maintenance_kind,
+                DaemonDfsMaintenanceKind::ExplicitDisasterRecovery
+            ) =>
+        {
             let authority_generation_after_maintenance = metadata_authority_generation.generation();
             if authority_generation_after_maintenance == authority_generation_before_maintenance {
                 // The broad maintenance service already performed the explicit
@@ -6118,32 +6222,48 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
                     .store(authority_generation_after_maintenance, Ordering::Release);
             }
         }
-        Err(_) => {
-            // The broad tick can repair a durable intent before failing later
-            // in unrelated replication or namespace work. Force the
-            // independent recovery scan to close that partial-progress gap.
+        #[cfg(test)]
+        Err(_)
+            if matches!(
+                maintenance_kind,
+                DaemonDfsMaintenanceKind::ExplicitDisasterRecovery
+            ) =>
+        {
+            // A disaster-recovery hydrate can repair a durable intent before
+            // failing later. Preserve that explicit recovery obligation.
             detached_send_runtime
                 .recovery_scan_generation
                 .store(0, Ordering::Release);
         }
-        Ok(None) => {}
+        Ok(Some(_)) | Ok(None) | Err(_) => {}
     }
-    // A successful broad tick leaves a complete accumulated metadata
-    // projection in memory. Collapse it back to the ordinary lazy request
-    // shell while retaining the exact open backend. Any error, cancellation,
-    // or frozen primary drops the lane instead.
+    // Routine maintenance is deliberately reactive and must retain the exact
+    // request-lane state which owns queued repair retries. An explicit
+    // disaster-recovery hydrate, by contrast, is collapsed back to a lazy
+    // shell so its complete projection is never retained during normal work.
     let reusable_service = if matches!(&maintenance_result, Ok(Some(_))) {
         match maintenance_service.operational_metrics() {
             Ok(metrics) if metrics.authoritative_write_frozen_shard_count == 0 => {
-                match maintenance_service.into_lazy_metadata_backend_service() {
-                    Ok(service) => Some(service),
-                    Err(error) => {
-                        tracing::warn!(
-                            data_root = %data_dir.root().display(),
-                            "dropping daemon DFS maintenance service after lazy reset failed: {error}"
-                        );
-                        None
+                let reset_to_lazy = service_was_fully_hydrated;
+                #[cfg(test)]
+                let reset_to_lazy = reset_to_lazy
+                    || matches!(
+                        maintenance_kind,
+                        DaemonDfsMaintenanceKind::ExplicitDisasterRecovery
+                    );
+                if reset_to_lazy {
+                    match maintenance_service.into_lazy_metadata_backend_service() {
+                        Ok(service) => Some(service),
+                        Err(error) => {
+                            tracing::warn!(
+                                data_root = %data_dir.root().display(),
+                                "dropping daemon DFS disaster-recovery service after lazy reset failed: {error}"
+                            );
+                            None
+                        }
                     }
+                } else {
+                    Some(maintenance_service)
                 }
             }
             Ok(metrics) => {
@@ -6168,30 +6288,36 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
         drop(maintenance_service);
         None
     };
-    let promotion_recovery_started = Instant::now();
-    match prepare_daemon_dfs_commit_promotion_recovery(&data_dir, &cluster_paths, runtime) {
-        Ok(DaemonDfsCommitPromotionRecovery {
-            detached_runtime,
-            worker,
-            scan_result,
-        }) => {
-            *deferred_work = Some((detached_runtime, worker));
-            if let Err(error) = scan_result {
+    #[cfg(test)]
+    if matches!(
+        maintenance_kind,
+        DaemonDfsMaintenanceKind::ExplicitDisasterRecovery
+    ) {
+        let promotion_recovery_started = Instant::now();
+        match prepare_daemon_dfs_commit_promotion_recovery(&data_dir, &cluster_paths, runtime) {
+            Ok(DaemonDfsCommitPromotionRecovery {
+                detached_runtime,
+                worker,
+                scan_result,
+            }) => {
+                *_deferred_work = Some((detached_runtime, worker));
+                if let Err(error) = scan_result {
+                    tracing::warn!(
+                        "sinomo daemon DFS commit-promotion disaster-recovery scan remains pending: {error}"
+                    );
+                }
+            }
+            Err(error) => {
                 tracing::warn!(
-                    "sinomo daemon DFS commit-promotion recovery scan remains pending; retrying on maintenance: {error}"
+                    "sinomo daemon DFS commit-promotion disaster recovery remains pending: {error}"
                 );
             }
         }
-        Err(error) => {
-            tracing::warn!(
-                "sinomo daemon DFS commit-promotion recovery remains pending; retrying on maintenance: {error}"
-            );
-        }
+        daemon_dfs_perf_trace(format_args!(
+            "commit-promotion-disaster-recovery maintenance_ms={}",
+            promotion_recovery_started.elapsed().as_millis()
+        ));
     }
-    daemon_dfs_perf_trace(format_args!(
-        "commit-promotion-recovery maintenance_ms={}",
-        promotion_recovery_started.elapsed().as_millis()
-    ));
     if let Some(service) = reusable_service {
         let retained = DaemonDfsMaintenanceServiceLane {
             signature,
@@ -9887,6 +10013,52 @@ mod tests {
             1,
             "a repair-free job needs one final pass to CAS Completed"
         );
+    }
+
+    #[test]
+    fn daemon_dfs_reactive_probe_never_opens_the_metadata_or_content_inventory() {
+        let root = temp_root("reactive-probe-skips-inventory");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let node_id = NodeId::from_legacy_named("node_reactive_probe").expect("node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_reactive_probe").expect("cluster"),
+            "reactive probe",
+            node_id.clone(),
+            "local",
+            "pk-local",
+            OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("write state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("sync raft");
+
+        let corrupt_metadata = data_dir
+            .dfs_dir()
+            .join("metadata")
+            .join("root")
+            .join("metadata-tables.snapshot.sobj");
+        fs::create_dir_all(corrupt_metadata.parent().expect("metadata parent"))
+            .expect("create corrupt metadata parent");
+        fs::write(&corrupt_metadata, b"must not be opened by reactive probe")
+            .expect("write corrupt metadata");
+        let corrupt_manifest = data_dir
+            .dfs_dir()
+            .join("content")
+            .join("objects")
+            .join("ignored")
+            .join("ignored")
+            .join("manifest.sobj");
+        fs::create_dir_all(corrupt_manifest.parent().expect("manifest parent"))
+            .expect("create corrupt manifest parent");
+        fs::write(&corrupt_manifest, b"must not be opened by reactive probe")
+            .expect("write corrupt manifest");
+
+        let pending = daemon_dfs_pending_reactive_maintenance_work(&paths).expect("reactive probe");
+        assert_eq!(pending, DaemonDfsPendingMaintenanceWork::default());
     }
 
     #[test]

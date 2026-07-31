@@ -407,6 +407,67 @@ where
     .map(Some)
 }
 
+/// Run bounded, queue-driven cluster maintenance against an already-open
+/// daemon service lane without reconstructing the complete DFS projection.
+///
+/// This is the normal production healing path. It consumes durable namespace,
+/// placement, handoff, and repair queues plus the service lane's exact
+/// foreground state. Full metadata/content hydration is intentionally reserved
+/// for an explicitly requested disaster-recovery pass.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_cluster_dfs_reactive_maintenance_tick_with_reusable_service<T>(
+    service: &mut NetworkedDfsService<T>,
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    state: sinomo_core::ClusterBootstrapState,
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    execution_exclusions: DfsMaintenanceExecutionExclusions,
+    committed_work_tracker: DfsCommittedWorkTracker,
+    options: DfsMaintenanceTickOptions,
+) -> Result<DfsMaintenanceTickReport, DfsError>
+where
+    T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
+{
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| DfsError::Metadata {
+            message: source.to_string(),
+        })?;
+    if !cluster_paths.state.exists() {
+        return Err(DfsError::Metadata {
+            message: "reactive DFS maintenance requires initialized cluster state".to_string(),
+        });
+    }
+
+    service.refresh_control_plane_latest()?;
+    service.set_committed_work_tracker(committed_work_tracker);
+    let local_node_id = state.local_node_id.clone();
+    let file_system = distributed_sifs(local_node_id.clone());
+    let metadata_shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
+    let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+    let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
+    let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
+    let mut metadata_transport = AsyncDfsMetadataNodeTransport::new(
+        peer_node_ids,
+        async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
+    );
+
+    run_dfs_maintenance_tick_with_async_host_and_execution_exclusions(
+        service,
+        &mut maintenance_host,
+        &data_dir,
+        file_system.file_system_id,
+        &local_node_id,
+        metadata_shards,
+        &mut metadata_publisher_host,
+        &mut metadata_transport,
+        &execution_exclusions,
+        options,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional_detached_state(
     runtime: &tokio::runtime::Handle,
@@ -1255,6 +1316,18 @@ pub fn run_dfs_lifecycle_maintenance_with_host<T: DfsMessageTransport>(
     host: &mut dyn DfsMaintenanceHost,
     options: DfsMaintenanceRunOptions,
 ) -> Result<Vec<DfsLifecycleMaintenanceReport>, DfsError> {
+    let maintenance_requested = options.repair_metadata
+        || options.cleanup_stale_staging
+        || options.compact_tombstones
+        || options.collect_metadata_history
+        || options.collect_content_versions
+        || options.collect_orphan_content;
+    if !maintenance_requested {
+        // An anti-entropy walk is an O(total-metadata) inventory even when
+        // `repair_metadata` is false. Routine/reactive cluster work must never
+        // enter this helper merely to obtain an empty lifecycle report.
+        return Ok(Vec::new());
+    }
     let Some(metadata_backend) = service.metadata_backend() else {
         return Ok(Vec::new());
     };
@@ -1322,12 +1395,12 @@ pub fn run_dfs_lifecycle_maintenance_with_host<T: DfsMessageTransport>(
         let after = saved_cursor.and_then(|cursor| cursor.next_cursor);
         let report = service.run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
             stale_staging_gc: stale_staging_gc.take(),
-            anti_entropy: Some(DfsAntiEntropyOptions {
+            anti_entropy: options.repair_metadata.then_some(DfsAntiEntropyOptions {
                 file_system_id: file_system.file_system_id.clone(),
                 after,
                 max_objects: options.anti_entropy_max_objects,
                 max_issues: options.anti_entropy_max_issues,
-                repair_metadata: options.repair_metadata,
+                repair_metadata: true,
             }),
             metadata_history_gc: metadata_history_gc.take(),
             version_gc: version_gc.take(),
