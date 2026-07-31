@@ -6,7 +6,7 @@
 //! `service_fetch_transfer` and `service_read_transfer`; outbound session
 //! request construction stays in `service_outbound`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use sinomo_core::node::NodeId;
@@ -561,6 +561,7 @@ where
         execution_exclusions: &DfsMaintenanceExecutionExclusions,
     ) -> Result<Vec<DistributedRepairJob>, DfsError> {
         self.prune_idle_transfer_state();
+        self.restore_pending_writes_for_repair_attempt_records(repair_attempts)?;
         self.restore_pending_writes_for_repair_jobs()?;
         self.restore_repair_attempt_records(repair_attempts);
         if self.pending_writes.is_empty() || max_scheduled == 0 {
@@ -1074,7 +1075,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.retry_pending_repairs_bounded_with_attempts(max_scheduled, &[])
     }
 
-    pub(crate) fn retry_pending_repairs_bounded_with_attempts(
+    /// Retry a bounded durable repair queue after restoring only its exact
+    /// intent identities from the metadata backend.
+    ///
+    /// This restart path is O(active repair work), rather than O(total DFS
+    /// metadata), and therefore does not require a full service hydrate.
+    pub fn retry_pending_repairs_bounded_with_attempts(
         &mut self,
         max_scheduled: usize,
         repair_attempts: &[DfsRepairAttemptRecord],
@@ -1105,6 +1111,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_filter: Option<&BTreeSet<String>>,
     ) -> Result<Vec<DistributedRepairJob>, DfsError> {
         self.prune_idle_transfer_state();
+        self.restore_pending_writes_for_repair_attempt_records(repair_attempts)?;
         self.restore_pending_writes_for_repair_jobs()?;
         self.restore_repair_attempt_records(repair_attempts);
         if self.pending_writes.is_empty()
@@ -1798,7 +1805,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
-    pub(crate) fn active_repair_attempt_records(&self) -> Vec<DfsRepairAttemptRecord> {
+    fn repair_queue_records(&self, include_unattempted: bool) -> Vec<DfsRepairAttemptRecord> {
         let now = dfs_now_unix_nanos();
         let mut records = Vec::new();
         for (intent_id, pending) in &self.pending_writes {
@@ -1817,7 +1824,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     continue;
                 }
-                if state.attempts == 0 {
+                if state.attempts == 0 && !include_unattempted {
                     continue;
                 }
                 let transfer_request_id = pending
@@ -1848,10 +1855,47 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     missing_replica_node_id: replica_node_id.clone(),
                     attempts: state.attempts,
                     in_flight: state.inflight,
-                    last_attempt_unix_nanos: now,
-                    next_retry_unix_nanos,
+                    last_attempt_unix_nanos: if state.attempts == 0 { 0 } else { now },
+                    next_retry_unix_nanos: if state.attempts == 0 {
+                        now
+                    } else {
+                        next_retry_unix_nanos
+                    },
                     transfer_request_id,
                     last_error,
+                });
+            }
+        }
+        if include_unattempted {
+            let mut recorded_targets = records
+                .iter()
+                .map(|record| {
+                    (
+                        record.intent_id.clone(),
+                        record.missing_replica_node_id.clone(),
+                    )
+                })
+                .collect::<BTreeSet<_>>();
+            for job in self.coordinator.repair_jobs() {
+                let key = (job.intent_id.clone(), job.missing_replica_node_id.clone());
+                if !recorded_targets.insert(key) {
+                    continue;
+                }
+                let Some(pending) = self.pending_writes.get(&job.intent_id) else {
+                    continue;
+                };
+                records.push(DfsRepairAttemptRecord {
+                    intent_id: job.intent_id.clone(),
+                    object_id: pending.object_id.clone(),
+                    version: pending.version.clone(),
+                    content_hash: pending.content_hash.clone(),
+                    missing_replica_node_id: job.missing_replica_node_id.clone(),
+                    attempts: 0,
+                    in_flight: false,
+                    last_attempt_unix_nanos: 0,
+                    next_retry_unix_nanos: now,
+                    transfer_request_id: None,
+                    last_error: None,
                 });
             }
         }
@@ -1862,6 +1906,37 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             })
         });
         records
+    }
+
+    pub(crate) fn active_repair_attempt_records(&self) -> Vec<DfsRepairAttemptRecord> {
+        self.repair_queue_records(false)
+    }
+
+    /// Return the exact bounded repair work owned by this live service lane.
+    ///
+    /// Unlike [`Self::active_repair_attempt_records`], this includes jobs which
+    /// have not made their first network attempt. The daemon persists these
+    /// zero-attempt records at the same committed edge that wakes reactive
+    /// maintenance, so a restart never needs a full metadata inventory to
+    /// rediscover ordinary repair work.
+    pub fn durable_repair_queue_records(&self) -> Vec<DfsRepairAttemptRecord> {
+        self.repair_queue_records(true)
+    }
+
+    fn restore_pending_writes_for_repair_attempt_records(
+        &mut self,
+        records: &[DfsRepairAttemptRecord],
+    ) -> Result<(), DfsError> {
+        let mut intents = BTreeMap::<String, DfsObjectId>::new();
+        for record in records {
+            intents
+                .entry(record.intent_id.clone())
+                .or_insert_with(|| record.object_id.clone());
+        }
+        for (intent_id, object_id) in intents {
+            self.restore_pending_write_for_intent_if_missing(&intent_id, &object_id)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn observe_repair_maintenance_events(

@@ -28,10 +28,9 @@ use sinomo_dfs::{
     DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardStatus,
     DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult,
     DfsMetadataSnapshotInstallSender, DfsMetadataSummary, DfsObjectId, DfsObjectMetadata,
-    DfsObjectVersionRecord, DfsOperatorInspector, DfsOperatorRepairView, DfsRepairAttemptRecord,
-    DfsReplicaReceiptRecord, DfsVersion, DfsWriteIntentRecord, DfsWriteIntentStatus,
-    LocalSobjMetadataBackend, cluster_dfs_all_file_system_configs,
-    cluster_dfs_all_metadata_shard_head_watermarks,
+    DfsObjectVersionRecord, DfsOperatorInspector, DfsOperatorRepairView, DfsReplicaReceiptRecord,
+    DfsVersion, DfsWriteIntentRecord, DfsWriteIntentStatus, LocalSobjMetadataBackend,
+    cluster_dfs_all_file_system_configs, cluster_dfs_all_metadata_shard_head_watermarks,
     cluster_dfs_all_metadata_shard_membership_handoffs, cluster_dfs_all_metadata_shards,
     default_dfs_content_root_catalog_store, default_dfs_metadata_root, distributed_sifs,
     distributed_sifs_bootstrap_objects, file_system_config_key, metadata_shard_key,
@@ -48,8 +47,9 @@ use sinomo_dfs::{
     DfsMetadataShardMembershipHandoff, DfsNodeDetachedSendState, DfsNodeDetachedSendWorker,
     DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport,
     DfsPeerTransportError, DfsPlacementReconciliationJob, DfsPlacementReconciliationState,
-    LocalContentStore, NetworkedDfsService, default_dfs_repair_attempt_snapshot_path,
-    dfs_message_execution_scope, read_dfs_repair_attempt_snapshot,
+    DfsRepairAttemptRecord, DfsRepairAttemptSnapshot, LocalContentStore, NetworkedDfsService,
+    default_dfs_repair_attempt_snapshot_path, dfs_message_execution_scope,
+    read_dfs_repair_attempt_snapshot, write_dfs_repair_attempt_snapshot,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
@@ -706,6 +706,7 @@ static DAEMON_DFS_DETACHED_SEND_RUNTIMES: OnceLock<
     Mutex<BTreeMap<DaemonDfsDetachedSendRuntimeKey, Arc<DaemonDfsDetachedSendRuntime>>>,
 > = OnceLock::new();
 static DAEMON_DFS_MAINTENANCE_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
+static DAEMON_DFS_REPAIR_QUEUE_SNAPSHOT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static DAEMON_DFS_PLACEMENT_AUTHORITY_SESSION_ID: OnceLock<String> = OnceLock::new();
 static DAEMON_DFS_DATA_OWNER_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<DaemonDataOwnerLock>>>> =
     OnceLock::new();
@@ -2781,6 +2782,56 @@ fn daemon_dfs_maintenance_metadata_observation(
     .map_err(Into::into)
 }
 
+/// Add newly committed repair identities to the bounded durable queue.
+///
+/// This runs at the mutation's committed edge, before its live service lane is
+/// released. Existing retry/backoff state wins for an already queued target;
+/// maintenance remains the sole owner of advancing or clearing that state.
+/// The work is O(active repair targets) and never opens DFS metadata or content
+/// inventory.
+fn persist_daemon_dfs_repair_queue_records(
+    data_dir: &SinomoDataDir,
+    committed_records: Vec<DfsRepairAttemptRecord>,
+) -> Result<(), sinomo_dfs::DfsError> {
+    if committed_records.is_empty() {
+        return Ok(());
+    }
+    let _guard = DAEMON_DFS_REPAIR_QUEUE_SNAPSHOT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| sinomo_dfs::DfsError::Metadata {
+            message: "daemon DFS repair queue snapshot lock poisoned".to_string(),
+        })?;
+    let path = default_dfs_repair_attempt_snapshot_path(data_dir);
+    let existing_records = read_dfs_repair_attempt_snapshot(&path)?
+        .map(|snapshot| snapshot.records)
+        .unwrap_or_default();
+    let mut records_by_target = BTreeMap::<(String, NodeId), DfsRepairAttemptRecord>::new();
+    for record in existing_records {
+        records_by_target.insert(
+            (
+                record.intent_id.clone(),
+                record.missing_replica_node_id.clone(),
+            ),
+            record,
+        );
+    }
+    for record in committed_records {
+        records_by_target
+            .entry((
+                record.intent_id.clone(),
+                record.missing_replica_node_id.clone(),
+            ))
+            .or_insert(record);
+    }
+    write_dfs_repair_attempt_snapshot(
+        &path,
+        &DfsRepairAttemptSnapshot {
+            records: records_by_target.into_values().collect(),
+        },
+    )
+}
+
 /// Inspect only the bounded durable queues owned by normal reactive healing.
 ///
 /// This function is safe on daemon startup and notification handling: it does
@@ -4380,6 +4431,19 @@ fn process_daemon_dfs_message_command_on_runtime(
                 })
             })
     };
+    let repair_queue_persistence_error = if !is_read_only
+        && (process_report.committed_work.repair_maintenance
+            || process_report.outcome.as_ref().is_ok_and(|result| {
+                sinomo_dfs::dfs_events_should_wake_repair_maintenance(&result.events)
+            })) {
+        persist_daemon_dfs_repair_queue_records(
+            data_dir,
+            service_lane.service.durable_repair_queue_records(),
+        )
+        .err()
+    } else {
+        None
+    };
     let process = process_started.elapsed();
     let (outbound_message_count, event_count) = process_report
         .outcome
@@ -4409,6 +4473,16 @@ fn process_daemon_dfs_message_command_on_runtime(
         trace_started.elapsed().as_millis()
     ));
     drop(service_lane);
+    if let Some(error) = repair_queue_persistence_error {
+        tracing::error!(
+            target: "sinomo.dfs.fault_healing",
+            data_root = %cache_key.display(),
+            request = %request_id,
+            kind = message_kind,
+            error = %error,
+            "failed to persist committed DFS repair queue; restart recovery may require explicit disaster recovery"
+        );
+    }
     #[cfg(test)]
     wait_at_daemon_dfs_message_committed_edge_test_hook(&request_id);
     let committed_edges = emit_daemon_dfs_committed_edges(
@@ -10059,6 +10133,69 @@ mod tests {
 
         let pending = daemon_dfs_pending_reactive_maintenance_work(&paths).expect("reactive probe");
         assert_eq!(pending, DaemonDfsPendingMaintenanceWork::default());
+
+        let retry_target =
+            NodeId::from_legacy_named("node_reactive_retry_target").expect("retry target");
+        let new_target = NodeId::from_legacy_named("node_reactive_new_target").expect("new target");
+        let now = daemon_dfs_now_unix_nanos();
+        let preserved_retry = DfsRepairAttemptRecord {
+            intent_id: "intent-reactive-retry".to_string(),
+            object_id: DfsObjectId::from_legacy_named("object_reactive_retry")
+                .expect("retry object"),
+            version: DfsVersion::from_legacy_named("version_reactive_retry")
+                .expect("retry version"),
+            content_hash: "blake3:reactive-retry".to_string(),
+            missing_replica_node_id: retry_target,
+            attempts: 3,
+            in_flight: false,
+            last_attempt_unix_nanos: now.saturating_sub(1),
+            next_retry_unix_nanos: now.saturating_add(1_000_000_000),
+            transfer_request_id: None,
+            last_error: Some("retry later".to_string()),
+        };
+        write_dfs_repair_attempt_snapshot(
+            &default_dfs_repair_attempt_snapshot_path(&data_dir),
+            &DfsRepairAttemptSnapshot {
+                records: vec![preserved_retry.clone()],
+            },
+        )
+        .expect("initial repair queue");
+        let new_repair = DfsRepairAttemptRecord {
+            intent_id: "intent-reactive-new".to_string(),
+            object_id: DfsObjectId::from_legacy_named("object_reactive_new").expect("new object"),
+            version: DfsVersion::from_legacy_named("version_reactive_new").expect("new version"),
+            content_hash: "blake3:reactive-new".to_string(),
+            missing_replica_node_id: new_target,
+            attempts: 0,
+            in_flight: false,
+            last_attempt_unix_nanos: 0,
+            next_retry_unix_nanos: 0,
+            transfer_request_id: None,
+            last_error: None,
+        };
+        let mut stale_retry = preserved_retry.clone();
+        stale_retry.attempts = 0;
+        stale_retry.next_retry_unix_nanos = 0;
+        persist_daemon_dfs_repair_queue_records(&data_dir, vec![stale_retry, new_repair])
+            .expect("merge committed repair queue");
+
+        let snapshot =
+            read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))
+                .expect("read merged repair queue")
+                .expect("merged repair queue");
+        assert_eq!(snapshot.records.len(), 2);
+        assert!(
+            snapshot
+                .records
+                .iter()
+                .any(|record| record == &preserved_retry),
+            "committed queue persistence must not regress existing retry/backoff state"
+        );
+        let pending =
+            daemon_dfs_pending_reactive_maintenance_work(&paths).expect("queued reactive probe");
+        assert_eq!(pending.pending_repair_count, 2);
+        assert_eq!(pending.due_repair_attempt_count, 1);
+        assert!(pending.should_trigger_background_maintenance());
     }
 
     #[test]

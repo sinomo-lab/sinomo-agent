@@ -26132,6 +26132,25 @@ fn stateless_repair_response_restores_pending_write_without_inflight_request() {
     dfs.apply_committed_intent(&intent.intent_id)
         .expect("commit with missing replica");
     assert_eq!(dfs.coordinator.repair_jobs().len(), 1);
+    let pending = dfs
+        .pending_writes
+        .get_mut(&intent.intent_id)
+        .expect("committed pending repair");
+    pending.repair_retries.clear();
+    pending.repair_inflight_request_ids.clear();
+    dfs.repair_attempt_records.clear();
+    assert!(
+        dfs.active_repair_attempt_records().is_empty(),
+        "an unattempted committed repair has no operational attempt record"
+    );
+    let durable_repair_queue = dfs.durable_repair_queue_records();
+    assert_eq!(durable_repair_queue.len(), 1);
+    assert_eq!(durable_repair_queue[0].intent_id, intent.intent_id);
+    assert_eq!(durable_repair_queue[0].attempts, 0);
+    assert_eq!(
+        durable_repair_queue[0].missing_replica_node_id, replica,
+        "restart durability must include the exact unattempted repair target"
+    );
     drop(dfs);
 
     let mut recovered = networked_sifs_with_backend(&root, owner.clone());

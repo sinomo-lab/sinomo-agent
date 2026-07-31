@@ -931,25 +931,12 @@ pub fn write_dfs_repair_attempt_snapshot(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| DfsError::Metadata {
             message: format!(
-                "could not create DFS repair attempt snapshot directory {}: {source}",
+                "could not create DFS repair queue snapshot directory {}: {source}",
                 parent.display()
             ),
         })?;
     }
-    let bytes = sinomo_object_serde::to_bytes(snapshot, 1, LengthMode::U32).map_err(|source| {
-        DfsError::Serialization {
-            message: format!(
-                "DFS repair attempt snapshot object error at {}: {source}",
-                path.display()
-            ),
-        }
-    })?;
-    std::fs::write(path, bytes).map_err(|source| DfsError::Metadata {
-        message: format!(
-            "could not write DFS repair attempt snapshot {}: {source}",
-            path.display()
-        ),
-    })
+    crate::metadata_io::write_sobj_atomic(path, snapshot).map_err(DfsError::from)
 }
 
 pub fn read_dfs_metadata_replication_suppression_snapshot(
@@ -2168,15 +2155,19 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
     if let Some(content_gc) = run_dfs_content_gc_without_catalog(service, options.lifecycle)? {
         lifecycle_reports.push(content_gc);
     }
-    let repair_attempts_before = maintenance_host.load_repair_attempt_records()?;
+    let durable_repair_queue_before = maintenance_host.load_repair_attempt_records()?;
     let scheduled_repairs = service.retry_pending_repairs_bounded_with_attempts(
         options.repair_max_jobs,
-        &repair_attempts_before,
+        &durable_repair_queue_before,
     )?;
+    let repair_attempts_before = durable_repair_queue_before
+        .into_iter()
+        .filter(|record| record.attempts > 0)
+        .collect();
     let followup_events = service.process_incoming_until_quiescent()?;
     service.observe_repair_maintenance_events(&followup_events);
     let repair_attempts_after = service.active_repair_attempt_records();
-    maintenance_host.store_repair_attempt_records(&repair_attempts_after)?;
+    maintenance_host.store_repair_attempt_records(&service.durable_repair_queue_records())?;
     let metadata_replication = if options.publish_metadata {
         publish_dfs_metadata_journal_with_host(
             file_system_id,
@@ -2437,9 +2428,9 @@ where
             lifecycle_reports.push(content_gc);
         }
     }
-    let repair_attempts_before = maintenance_host.load_repair_attempt_records()?;
+    let durable_repair_queue_before = maintenance_host.load_repair_attempt_records()?;
     let (parked_repair_attempts, eligible_repair_attempts): (Vec<_>, Vec<_>) =
-        repair_attempts_before
+        durable_repair_queue_before
             .iter()
             .cloned()
             .partition(|record| execution_exclusions.contains(&record.missing_replica_node_id));
@@ -2458,13 +2449,23 @@ where
         .iter()
         .map(|job| (job.intent_id.clone(), job.missing_replica_node_id.clone()))
         .collect::<BTreeSet<_>>();
+    let durable_repair_queue_after = merge_parked_dfs_repair_attempt_records(
+        service.durable_repair_queue_records(),
+        parked_repair_attempts.clone(),
+        &active_repair_keys,
+        execution_exclusions,
+    );
     let repair_attempts_after = merge_parked_dfs_repair_attempt_records(
         service.active_repair_attempt_records(),
         parked_repair_attempts,
         &active_repair_keys,
         execution_exclusions,
     );
-    maintenance_host.store_repair_attempt_records(&repair_attempts_after)?;
+    let repair_attempts_before = durable_repair_queue_before
+        .into_iter()
+        .filter(|record| record.attempts > 0)
+        .collect();
+    maintenance_host.store_repair_attempt_records(&durable_repair_queue_after)?;
     let metadata_replication = if options.publish_metadata {
         crate::publish_dfs_metadata_journal_with_async_host_and_execution_exclusions(
             file_system_id,

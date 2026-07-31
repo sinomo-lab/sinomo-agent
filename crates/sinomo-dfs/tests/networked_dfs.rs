@@ -1437,7 +1437,7 @@ fn networked_dfs_recovers_committed_repair_jobs_from_metadata_backend() {
         last_modified_by_event_id: None,
     };
 
-    {
+    let mut durable_repair_queue = {
         let owner_backend =
             LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &owner_meta)
                 .expect("owner metadata");
@@ -1471,7 +1471,15 @@ fn networked_dfs_recovers_committed_repair_jobs_from_metadata_backend() {
             write,
             NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } if repair_jobs.len() == 1
         ));
-    }
+        let records = owner_dfs.durable_repair_queue_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].object_id, object_id);
+        assert_eq!(records[0].missing_replica_node_id, replica);
+        records
+    };
+    durable_repair_queue[0].in_flight = false;
+    durable_repair_queue[0].next_retry_unix_nanos = 0;
+    durable_repair_queue[0].transfer_request_id = None;
 
     let recovered_backend =
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &owner_meta)
@@ -1480,15 +1488,11 @@ fn networked_dfs_recovers_committed_repair_jobs_from_metadata_backend() {
         network.add_node(owner.clone()),
         sinomo_dfs::LocalContentStore::new(&owner_content).expect("recovered content"),
     )
-    .with_metadata_backend(recovered_backend)
+    .with_metadata_backend_lazy(recovered_backend)
     .expect("recovered metadata backend");
-    assert_eq!(
-        recovered_owner
-            .metadata()
-            .object(&object_id)
-            .expect("recovered object")
-            .version,
-        version_2
+    assert!(
+        recovered_owner.metadata().object(&object_id).is_none(),
+        "restart recovery must begin from a lazy metadata lane"
     );
 
     let replica_backend = LocalSobjMetadataBackend::new(
@@ -1511,10 +1515,18 @@ fn networked_dfs_recovers_committed_repair_jobs_from_metadata_backend() {
 
     assert_eq!(
         recovered_owner
-            .retry_pending_repairs()
+            .retry_pending_repairs_bounded_with_attempts(1, &durable_repair_queue)
             .expect("retry recovered repair")
             .len(),
         1
+    );
+    assert_eq!(
+        recovered_owner
+            .metadata()
+            .object(&object_id)
+            .expect("targeted restored object")
+            .version,
+        version_2
     );
     let events = replica_dfs.process_incoming().expect("replica repair");
     assert!(events.iter().any(|event| {
