@@ -495,6 +495,29 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         })
     }
 
+    /// Build the directory-order cursor for an object that is visible through
+    /// an in-memory overlay. Indexed backends override this so callers can
+    /// merge a bounded transient set into durable pages without abandoning the
+    /// backend's directory index.
+    fn directory_page_cursor_for_object(
+        &self,
+        object: &DfsObjectMetadata,
+    ) -> Result<DfsDirectoryPageCursor>;
+
+    /// Return one indexed directory page together with each entry's exact
+    /// resume cursor. Overlay-aware callers use these cursors directly instead
+    /// of re-reading backend state once per durable object.
+    fn child_objects_for_directory_page_entries(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        directory_path: &str,
+        after: Option<&DfsDirectoryPageCursor>,
+        max_entries: usize,
+    ) -> Result<(
+        Vec<(DfsObjectMetadata, DfsDirectoryPageCursor)>,
+        Option<DfsDirectoryPageCursor>,
+    )>;
+
     /// Compatibility helper that lists direct children below a directory path.
     fn child_objects_for_directory(
         &self,

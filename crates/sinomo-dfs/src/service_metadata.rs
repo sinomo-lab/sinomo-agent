@@ -451,7 +451,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let result = self.metadata.add_object(object);
         if result.is_ok() {
             if changes_namespace_view {
-                self.transient_metadata_object_ids.insert(object_id.clone());
+                let transient_object = self
+                    .metadata
+                    .object(&object_id)
+                    .expect("successfully added transient metadata object")
+                    .clone();
+                self.transient_metadata_object_ids
+                    .insert_object(&transient_object);
                 if let Some(predecessor_object_id) = predecessor_object_id {
                     self.transient_metadata_predecessor_object_ids
                         .insert(object_id, predecessor_object_id);

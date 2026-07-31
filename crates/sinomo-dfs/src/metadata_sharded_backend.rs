@@ -1828,6 +1828,64 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         })
     }
 
+    fn directory_page_cursor_for_object(
+        &self,
+        object: &DfsObjectMetadata,
+    ) -> Result<DfsDirectoryPageCursor> {
+        let shard_id = self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
+        let cursor = self
+            .shard_backend(&shard_id)?
+            .indexed_directory_page_cursor_for_object(object)?;
+        Ok(directory_page_cursor_with_shard(cursor, &shard_id))
+    }
+
+    fn child_objects_for_directory_page_entries(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        directory_path: &str,
+        after: Option<&DfsDirectoryPageCursor>,
+        max_entries: usize,
+    ) -> Result<(
+        Vec<(DfsObjectMetadata, DfsDirectoryPageCursor)>,
+        Option<DfsDirectoryPageCursor>,
+    )> {
+        if max_entries == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let resume_shard_id = after.and_then(|cursor| cursor.shard_id.as_ref());
+        let mut entries = collect_resumed_sharded_page_entries(
+            &self.shards,
+            after,
+            resume_shard_id,
+            max_entries,
+            local_directory_page_cursor,
+            |_, backend, cursor, limit| {
+                let page = backend.child_objects_for_directory_page_entries(
+                    file_system_id,
+                    directory_path,
+                    cursor,
+                    limit,
+                )?;
+                Ok((page.entries, page.next_cursor))
+            },
+            |shard_id, _, (object, local_cursor)| {
+                if !self.object_is_listable_from_shard(&object, shard_id)? {
+                    return Ok(None);
+                }
+                Ok(Some((
+                    object,
+                    directory_page_cursor_with_shard(local_cursor, shard_id),
+                )))
+            },
+        )?;
+        let has_more = entries.len() > max_entries;
+        entries.truncate(max_entries);
+        let next_cursor = has_more
+            .then(|| entries.last().map(|(_, cursor)| cursor.clone()))
+            .flatten();
+        Ok((entries, next_cursor))
+    }
+
     fn child_tombstones_for_directory(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -1859,41 +1917,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         after: Option<&DfsDirectoryPageCursor>,
         max_entries: usize,
     ) -> Result<DfsDirectoryPage> {
-        if max_entries == 0 {
-            return Ok(DfsDirectoryPage {
-                objects: Vec::new(),
-                next_cursor: None,
-            });
-        }
-        let resume_shard_id = after.and_then(|cursor| cursor.shard_id.as_ref());
-        let entries = collect_resumed_sharded_page_entries(
-            &self.shards,
+        let (entries, next_cursor) = DfsMetadataBackend::child_objects_for_directory_page_entries(
+            self,
+            file_system_id,
+            directory_path,
             after,
-            resume_shard_id,
             max_entries,
-            local_directory_page_cursor,
-            |_, backend, cursor, limit| {
-                let page = backend.child_objects_for_directory_page_entries(
-                    file_system_id,
-                    directory_path,
-                    cursor,
-                    limit,
-                )?;
-                Ok((page.entries, page.next_cursor))
-            },
-            |shard_id, _, (object, local_cursor)| {
-                if !self.object_is_listable_from_shard(&object, shard_id)? {
-                    return Ok(None);
-                }
-                Ok(Some((
-                    object,
-                    directory_page_cursor_with_shard(local_cursor, shard_id),
-                )))
-            },
         )?;
-        let (objects, next_cursor) = finish_cursor_page(entries, max_entries);
         Ok(DfsDirectoryPage {
-            objects,
+            objects: entries.into_iter().map(|(object, _)| object).collect(),
             next_cursor,
         })
     }

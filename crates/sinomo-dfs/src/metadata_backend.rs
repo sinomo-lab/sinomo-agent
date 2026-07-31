@@ -45,7 +45,9 @@ use crate::metadata_journal::{
     recover_next_journal_sequence, write_local_journal_entries,
     write_local_journal_entry_with_record_bytes,
 };
-use crate::metadata_keys::normalize_path;
+use crate::metadata_keys::{
+    directory_page_cursor_with_dentry, normalize_path, path_record_for_object,
+};
 use crate::metadata_limits::{
     DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, MAX_DURABLE_VERSION_PINS_PER_OBJECT,
     OBJECT_LOCAL_METADATA_PAGE_SIZE,
@@ -56,7 +58,10 @@ use crate::metadata_namespace_transaction::{
     plan_namespace_transaction_table_ops as namespace_transaction_table_ops,
     preapply_namespace_transaction_table_ops, validate_namespace_transaction_preconditions,
 };
-use crate::metadata_object_index::object_index_table_ops_with_previous as plan_object_index_table_ops_with_previous;
+use crate::metadata_object_index::{
+    object_index_table_ops_with_previous as plan_object_index_table_ops_with_previous,
+    path_record_for_new_dentry,
+};
 use crate::metadata_pages::{
     DfsDirectoryPageEntries, child_objects_for_directory_from_tables,
     child_objects_for_directory_page_entries_from_tables, collect_metadata_pages,
@@ -6008,6 +6013,36 @@ impl LocalSobjMetadataBackend {
         ))
     }
 
+    pub(crate) fn indexed_directory_page_cursor_for_object(
+        &self,
+        object: &DfsObjectMetadata,
+    ) -> Result<DfsDirectoryPageCursor> {
+        let tables = self.current_tables_snapshot()?;
+        let base_path_record = path_record_for_object(object);
+        let stored_live_path_record = tables
+            .paths
+            .get(&(object.file_system_id.clone(), base_path_record.path.clone()))
+            .filter(|path_record| {
+                tables
+                    .objects
+                    .get(&path_record.object_id)
+                    .is_some_and(|stored| {
+                        stored.kind != DfsObjectKind::Tombstone
+                            && stored.file_system_id == object.file_system_id
+                            && normalize_path(&stored.path) == path_record.path
+                    })
+            })
+            .cloned();
+        let path_record = stored_live_path_record
+            .unwrap_or_else(|| path_record_for_new_dentry(&tables, base_path_record).0);
+        Ok(directory_page_cursor_with_dentry(
+            object,
+            path_record.dirfrag_id,
+            path_record.name_hash,
+            path_record.name,
+        ))
+    }
+
     /// Apply one object-family history mutation copied from a shard that is
     /// still authoritative while the object is moving. The source journal
     /// sequence is local to that shard, so the target records an equivalent
@@ -6436,6 +6471,33 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             objects: page.entries.into_iter().map(|(object, _)| object).collect(),
             next_cursor: page.next_cursor,
         })
+    }
+
+    fn directory_page_cursor_for_object(
+        &self,
+        object: &DfsObjectMetadata,
+    ) -> Result<DfsDirectoryPageCursor> {
+        self.indexed_directory_page_cursor_for_object(object)
+    }
+
+    fn child_objects_for_directory_page_entries(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        directory_path: &str,
+        after: Option<&DfsDirectoryPageCursor>,
+        max_entries: usize,
+    ) -> Result<(
+        Vec<(DfsObjectMetadata, DfsDirectoryPageCursor)>,
+        Option<DfsDirectoryPageCursor>,
+    )> {
+        let page = LocalSobjMetadataBackend::child_objects_for_directory_page_entries(
+            self,
+            file_system_id,
+            directory_path,
+            after,
+            max_entries,
+        )?;
+        Ok((page.entries, page.next_cursor))
     }
 
     fn hardlinks_to_object(
@@ -19851,7 +19913,26 @@ mod tests {
         let mut bucketed = object(version("version_1"));
         bucketed.object_id = DfsObjectId::from_legacy_named("obj_bucketed").expect("object");
         bucketed.path = "/docs/bucketed.md".to_string();
+        let candidate_cursor = backend
+            .indexed_directory_page_cursor_for_object(&bucketed)
+            .expect("candidate dentry cursor");
+        assert_ne!(
+            candidate_cursor
+                .dentry
+                .as_ref()
+                .expect("indexed candidate cursor")
+                .dirfrag_id,
+            DfsDirFragmentId::new("root"),
+            "an overlay candidate must use the same bucket fragment as its future durable dentry"
+        );
         backend.put_object(&bucketed).expect("bucketed object");
+        assert_eq!(
+            backend
+                .indexed_directory_page_cursor_for_object(&bucketed)
+                .expect("durable dentry cursor"),
+            candidate_cursor,
+            "settling an overlay must not change its pagination position"
+        );
 
         let bucketed_record = table_path_record(&backend, &bucketed.file_system_id, &bucketed.path);
         assert_ne!(

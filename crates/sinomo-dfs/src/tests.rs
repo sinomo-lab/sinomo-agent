@@ -29795,21 +29795,44 @@ fn sifs_posix_empty_directory_checks_are_bounded_for_large_directories() {
     let source = "/services/sandbox/instances/sandbox_bounded_empty_dir/work/source";
     let nonempty = "/services/sandbox/instances/sandbox_bounded_empty_dir/work/nonempty";
 
-    let mut dfs = networked_sifs_with_backend(&root, node_id);
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
     dfs.posix_mkdir_all(source).expect("mkdir source");
     for index in 0..160 {
         dfs.posix_mkdir_all(&format!("{nonempty}/child-{index:04}"))
             .expect("mkdir child");
     }
+    let mut transient = file_metadata(node_id.clone());
+    transient.file_system_id = sifs_file_system_id();
+    transient.object_id =
+        DfsObjectId::from_legacy_named("obj_sifs_bounded_empty_dir_transient").expect("object id");
+    transient.path = format!("{nonempty}/transient.txt");
+    transient.version = DfsVersion::generate();
+    transient.content_hash = None;
+    transient.content_size_bytes = Some(0);
+    dfs.add_transient_object_metadata(transient)
+        .expect("transient child overlay");
 
+    crate::posix::reset_posix_metadata_full_directory_collect_count();
     assert!(matches!(
         dfs.posix_rmdir(nonempty),
         Err(DfsPosixError::DirectoryNotEmpty { .. })
     ));
+    assert_eq!(
+        crate::posix::posix_metadata_full_directory_collect_count(),
+        0,
+        "rmdir emptiness checks must stay on the bounded dentry page path with an overlay"
+    );
+
+    crate::posix::reset_posix_metadata_full_directory_collect_count();
     assert!(matches!(
         dfs.posix_rename(source, nonempty),
         Err(DfsPosixError::DirectoryNotEmpty { .. })
     ));
+    assert_eq!(
+        crate::posix::posix_metadata_full_directory_collect_count(),
+        0,
+        "rename destination checks must stay on the bounded dentry page path with an overlay"
+    );
     assert!(dfs.posix_stat(source).is_ok());
 
     std::fs::remove_dir_all(root).ok();
@@ -32679,10 +32702,10 @@ fn sifs_posix_list_dir_page_preserves_transient_overlays_across_pages() {
     tombstone.version = DfsVersion::generate();
     tombstone.content_hash = None;
     tombstone.content_size_bytes = None;
-    dfs.add_transient_object_metadata(tombstone)
+    dfs.add_transient_object_metadata(tombstone.clone())
         .expect("transient tombstone");
 
-    let mut transient = file_metadata(node_id);
+    let mut transient = file_metadata(node_id.clone());
     transient.file_system_id = sifs_file_system_id();
     transient.object_id =
         DfsObjectId::from_legacy_named("obj_sifs_list_transient_child").expect("object id");
@@ -32690,8 +32713,41 @@ fn sifs_posix_list_dir_page_preserves_transient_overlays_across_pages() {
     transient.version = DfsVersion::generate();
     transient.content_hash = None;
     transient.content_size_bytes = Some(0);
-    dfs.add_transient_object_metadata(transient)
+    dfs.add_transient_object_metadata(transient.clone())
         .expect("memory-only child");
+    for index in 0..64 {
+        let mut unrelated = file_metadata(node_id.clone());
+        unrelated.file_system_id = sifs_file_system_id();
+        unrelated.object_id =
+            DfsObjectId::from_legacy_named(format!("obj_sifs_list_unrelated_transient_{index}"))
+                .expect("unrelated object id");
+        unrelated.path = format!("/unrelated/transient-{index}.txt");
+        unrelated.version = DfsVersion::generate();
+        unrelated.content_hash = None;
+        unrelated.content_size_bytes = Some(0);
+        dfs.add_transient_object_metadata(unrelated)
+            .expect("unrelated transient child");
+    }
+    assert_eq!(dfs.transient_metadata_object_ids.len(), 66);
+
+    crate::posix::reset_posix_metadata_full_directory_collect_count();
+    crate::posix::reset_posix_transient_child_candidate_visit_count();
+    crate::metadata_backend::reset_metadata_current_tables_snapshot_calls();
+    let probe_page = dfs
+        .posix_list_dir_page(dir_path, None, 2)
+        .expect("bounded overlay page probe");
+    assert!(probe_page.next_cursor.is_some());
+    let snapshot_calls = crate::metadata_backend::metadata_current_tables_snapshot_calls();
+    assert!(
+        snapshot_calls <= 11,
+        "overlay merge opened {snapshot_calls} metadata table snapshots for a two-entry page; \
+         durable entries must retain the cursors produced by the indexed page scan"
+    );
+    assert_eq!(
+        crate::posix::posix_transient_child_candidate_visit_count(),
+        2,
+        "directory pagination must not inspect transient objects belonging to other parents"
+    );
 
     let mut cursor = None;
     let mut names = Vec::new();
@@ -32703,12 +32759,25 @@ fn sifs_posix_list_dir_page_preserves_transient_overlays_across_pages() {
         assert!(page.entries.len() <= 2);
         if let Some(next_cursor) = page.next_cursor.as_ref() {
             assert!(
-                next_cursor.dentry.is_none() && next_cursor.shard_id.is_none(),
-                "overlay pages must retain their path-ordered cursor across page boundaries"
+                next_cursor.dentry.is_some(),
+                "overlay pages must retain the bounded backend dentry cursor"
             );
         }
         names.extend(page.entries.into_iter().map(|entry| entry.name));
         pages = pages.saturating_add(1);
+        if pages == 1 {
+            let backend = dfs.metadata_backend.as_mut().expect("metadata backend");
+            backend
+                .put_object(&tombstone)
+                .expect("settle transient tombstone");
+            backend
+                .put_object(&transient)
+                .expect("settle transient child");
+            dfs.transient_metadata_object_ids
+                .remove(&tombstone.object_id);
+            dfs.transient_metadata_object_ids
+                .remove(&transient.object_id);
+        }
         let Some(next_cursor) = page.next_cursor else {
             break;
         };
@@ -32726,6 +32795,16 @@ fn sifs_posix_list_dir_page_preserves_transient_overlays_across_pages() {
         ]
     );
     assert_eq!(pages, 3);
+    assert_eq!(
+        crate::posix::posix_metadata_full_directory_collect_count(),
+        0,
+        "a transient overlay must not materialize and sort the complete directory on any page"
+    );
+    assert_eq!(
+        crate::posix::posix_transient_child_candidate_visit_count(),
+        4,
+        "settled transient children must leave the parent index while unrelated overlays stay isolated"
+    );
 
     std::fs::remove_dir_all(root).ok();
 }

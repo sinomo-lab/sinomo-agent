@@ -21,7 +21,11 @@ mod routing;
 pub(crate) mod sync;
 
 #[cfg(test)]
-pub(crate) use metadata::{posix_metadata_raw_lookup_count, reset_posix_metadata_raw_lookup_count};
+pub(crate) use metadata::{
+    posix_metadata_full_directory_collect_count, posix_metadata_raw_lookup_count,
+    posix_transient_child_candidate_visit_count, reset_posix_metadata_full_directory_collect_count,
+    reset_posix_metadata_raw_lookup_count, reset_posix_transient_child_candidate_visit_count,
+};
 
 #[cfg(test)]
 thread_local! {

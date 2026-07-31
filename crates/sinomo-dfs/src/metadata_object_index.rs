@@ -243,7 +243,7 @@ fn stored_path_record_for_object(
         .cloned()
 }
 
-fn path_record_for_new_dentry(
+pub(crate) fn path_record_for_new_dentry(
     tables: &DfsMetadataTables,
     mut path_record: DfsPathRecord,
 ) -> (DfsPathRecord, Option<DfsDirFragmentRecord>) {

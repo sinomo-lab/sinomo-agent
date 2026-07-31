@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
 
+use crate::metadata_keys::normalize_posix_path as normalize_metadata_posix_path;
+use crate::posix_path::parent_posix_path;
 use crate::transfer::{PendingNetworkedRead, PendingNetworkedWrite};
 use crate::{
     DfsBulkReadItemResponse, DfsConflictRecord, DfsConflictStatus, DfsControlPlaneKvClient,
@@ -31,6 +33,94 @@ pub(crate) const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 1024;
 pub(crate) const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 2;
 
 pub(crate) const DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT: usize = 8;
+
+/// Transient namespace objects indexed by their direct parent directory.
+///
+/// Membership is established only after `add_transient_object_metadata` has
+/// compared the object with durable metadata. Directory reads can therefore
+/// decide whether an overlay merge is needed without scanning every in-flight
+/// object or issuing another backend lookup for each candidate.
+#[derive(Debug, Default)]
+pub(crate) struct TransientMetadataObjectIndex {
+    object_ids: BTreeSet<DfsObjectId>,
+    parent_by_object_id: BTreeMap<DfsObjectId, (DfsFileSystemId, String)>,
+    object_ids_by_parent: BTreeMap<DfsFileSystemId, BTreeMap<String, BTreeSet<DfsObjectId>>>,
+}
+
+impl TransientMetadataObjectIndex {
+    pub(crate) fn insert_object(&mut self, object: &DfsObjectMetadata) {
+        self.remove(&object.object_id);
+        self.object_ids.insert(object.object_id.clone());
+        let normalized_path = normalize_metadata_posix_path(&object.path);
+        let Some(parent) = parent_posix_path(&normalized_path) else {
+            return;
+        };
+        self.parent_by_object_id.insert(
+            object.object_id.clone(),
+            (object.file_system_id.clone(), parent.clone()),
+        );
+        self.object_ids_by_parent
+            .entry(object.file_system_id.clone())
+            .or_default()
+            .entry(parent)
+            .or_default()
+            .insert(object.object_id.clone());
+    }
+
+    pub(crate) fn remove(&mut self, object_id: &DfsObjectId) -> bool {
+        let removed = self.object_ids.remove(object_id);
+        let Some((file_system_id, parent)) = self.parent_by_object_id.remove(object_id) else {
+            return removed;
+        };
+        let remove_file_system = self
+            .object_ids_by_parent
+            .get_mut(&file_system_id)
+            .is_some_and(|parents| {
+                let remove_parent = parents.get_mut(&parent).is_some_and(|object_ids| {
+                    object_ids.remove(object_id);
+                    object_ids.is_empty()
+                });
+                if remove_parent {
+                    parents.remove(&parent);
+                }
+                parents.is_empty()
+            });
+        if remove_file_system {
+            self.object_ids_by_parent.remove(&file_system_id);
+        }
+        removed
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.object_ids.clear();
+        self.parent_by_object_id.clear();
+        self.object_ids_by_parent.clear();
+    }
+
+    pub(crate) fn contains(&self, object_id: &DfsObjectId) -> bool {
+        self.object_ids.contains(object_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.object_ids.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.object_ids.len()
+    }
+
+    pub(crate) fn child_object_ids(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        parent: &str,
+    ) -> Option<&BTreeSet<DfsObjectId>> {
+        let parent = normalize_metadata_posix_path(parent);
+        self.object_ids_by_parent.get(file_system_id)?.get(&parent)
+    }
+}
+
 // Namespace RPCs are on the app-visible critical path and may include a
 // durable WAN metadata mutation plus bounded journal replay. The authority's
 // durable request ledger prevents blind re-execution after this deadline.
@@ -129,7 +219,7 @@ pub struct NetworkedDfsService<T> {
     pub(crate) node_id: NodeId,
     pub(crate) metadata: DfsMetadataStore,
     pub(crate) tombstones_by_metadata_path: BTreeMap<(DfsFileSystemId, String), DfsObjectMetadata>,
-    pub(crate) transient_metadata_object_ids: BTreeSet<DfsObjectId>,
+    pub(crate) transient_metadata_object_ids: TransientMetadataObjectIndex,
     pub(crate) transient_metadata_predecessor_object_ids: BTreeMap<DfsObjectId, DfsObjectId>,
     pub(crate) content: LocalContentStore,
     pub(crate) coordinator: DistributedEventualCoordinator,

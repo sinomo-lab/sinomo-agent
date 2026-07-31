@@ -6,6 +6,7 @@
 //! the POSIX facade so writes, reads, routed operations, jobs, and queries all
 //! share the same interpretation without adding to the crate-level API.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use super::{POSIX_LINK_COUNT_PAGE_SIZE, POSIX_LIST_DIR_COLLECT_PAGE_SIZE, now_unix_nanos};
@@ -27,6 +28,10 @@ use crate::{
 #[cfg(test)]
 std::thread_local! {
     static POSIX_METADATA_RAW_LOOKUP_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static POSIX_TRANSIENT_CHILD_CANDIDATE_VISIT_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
@@ -51,6 +56,26 @@ pub(crate) fn reset_posix_metadata_raw_lookup_count() {
 #[cfg(test)]
 pub(crate) fn posix_metadata_raw_lookup_count() -> usize {
     POSIX_METADATA_RAW_LOOKUP_COUNT.get()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_posix_metadata_full_directory_collect_count() {
+    POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn posix_metadata_full_directory_collect_count() -> usize {
+    POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT.get()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_posix_transient_child_candidate_visit_count() {
+    POSIX_TRANSIENT_CHILD_CANDIDATE_VISIT_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn posix_transient_child_candidate_visit_count() -> usize {
+    POSIX_TRANSIENT_CHILD_CANDIDATE_VISIT_COUNT.get()
 }
 
 fn append_unobserved_components(
@@ -88,6 +113,26 @@ fn sifs_dir_direct_child_path(
         return None;
     }
     Some(object_path)
+}
+
+fn compare_directory_page_cursors(
+    left: &DfsDirectoryPageCursor,
+    right: &DfsDirectoryPageCursor,
+) -> Ordering {
+    left.shard_id
+        .cmp(&right.shard_id)
+        .then_with(|| match (&left.dentry, &right.dentry) {
+            (Some(left), Some(right)) => left
+                .dirfrag_id
+                .cmp(&right.dirfrag_id)
+                .then_with(|| left.name_hash.cmp(&right.name_hash))
+                .then_with(|| left.name.cmp(&right.name)),
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+        })
+        .then_with(|| left.path.cmp(&right.path))
+        .then_with(|| left.object_id.cmp(&right.object_id))
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -672,6 +717,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(crate) fn child_objects_for_sifs_dir(&self, path: &str) -> Result<Vec<DfsObjectMetadata>> {
+        #[cfg(test)]
+        POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT.set(
+            POSIX_METADATA_FULL_DIRECTORY_COLLECT_COUNT
+                .get()
+                .saturating_add(1),
+        );
         let file_system_id = sifs_file_system_id();
         let mut children = Vec::new();
         if let Some(backend) = self.metadata_backend.as_ref() {
@@ -783,27 +834,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) -> bool {
-        let prefix = if path == "/" {
-            "/".to_string()
-        } else {
-            format!("{}/", path.trim_end_matches('/'))
-        };
         self.transient_metadata_object_ids
-            .iter()
-            .filter_map(|object_id| self.metadata.object(object_id))
-            .any(|object| {
-                if sifs_dir_direct_child_path(file_system_id, path, &prefix, object).is_none() {
-                    return false;
-                }
-                self.metadata_backend
-                    .as_ref()
-                    .and_then(|backend| backend.get_object(&object.object_id).ok().flatten())
-                    .is_none_or(|backend_object| {
-                        backend_object.file_system_id != object.file_system_id
-                            || backend_object.path != object.path
-                            || backend_object.kind != object.kind
-                    })
-            })
+            .child_object_ids(file_system_id, path)
+            .is_some_and(|object_ids| !object_ids.is_empty())
     }
 
     pub(super) fn child_objects_for_sifs_dir_page(
@@ -819,20 +852,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         let file_system_id = sifs_file_system_id();
-        let backend_cursor_active =
-            after.is_some_and(|cursor| cursor.dentry.is_some() || cursor.shard_id.is_some());
         let path_cursor_active =
             after.is_some_and(|cursor| cursor.dentry.is_none() && cursor.shard_id.is_none());
         let needs_overlay_merge =
             self.has_transient_child_overlay_for_sifs_dir(&file_system_id, path);
-        // The first page selects the ordering mode and the opaque cursor pins it
-        // for the rest of the walk. Backend pages use dentry/shard order;
-        // transient-overlay pages retain the legacy path order. This prevents a
-        // mid-walk overlay change from reinterpreting an existing cursor.
-        if self.metadata_backend.is_none()
-            || path_cursor_active
-            || (!backend_cursor_active && needs_overlay_merge)
-        {
+        // Preserve legacy path-only cursors emitted by older processes during
+        // a rolling upgrade. New backed walks never emit this mode, including
+        // when they merge transient namespace entries.
+        if self.metadata_backend.is_none() || path_cursor_active {
             let mut objects = self.child_objects_for_sifs_dir(path)?;
             objects.sort_by(|left, right| {
                 left.path
@@ -867,29 +894,103 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .as_ref()
             .expect("backend cursor path requires a metadata backend");
 
-        // Preserve the backend's bounded dentry/shard cursor instead of
-        // collecting, sorting, and truncating the complete directory for every
-        // public page. A transient in-memory tombstone can remove entries from
-        // a backend page, so keep advancing bounded backend pages until the
-        // caller's requested page is full or the backend is exhausted.
-        let mut cursor = after.cloned();
-        let mut objects = Vec::with_capacity(max_entries);
-        loop {
-            let remaining = max_entries.saturating_sub(objects.len());
-            if remaining == 0 {
-                return Ok(DfsDirectoryPage {
-                    objects,
-                    next_cursor: cursor,
+        // Missing transient children do not have a durable dentry yet. Derive
+        // the exact cursor the backend would assign and merge only this bounded
+        // in-memory set into the indexed stream. A live durable entry for the
+        // same path will be visited below and receives its overlay there.
+        let mut entries = Vec::<(DfsDirectoryPageCursor, DfsObjectMetadata)>::new();
+        if needs_overlay_merge {
+            let prefix = if path == "/" {
+                "/".to_string()
+            } else {
+                format!("{}/", path.trim_end_matches('/'))
+            };
+            let mut transient_by_path = BTreeMap::<String, DfsObjectMetadata>::new();
+            for object_id in self
+                .transient_metadata_object_ids
+                .child_object_ids(&file_system_id, path)
+                .into_iter()
+                .flatten()
+            {
+                #[cfg(test)]
+                POSIX_TRANSIENT_CHILD_CANDIDATE_VISIT_COUNT.set(
+                    POSIX_TRANSIENT_CHILD_CANDIDATE_VISIT_COUNT
+                        .get()
+                        .saturating_add(1),
+                );
+                let Some(object) = self.metadata.object(object_id) else {
+                    continue;
+                };
+                let Some(object_path) =
+                    sifs_dir_direct_child_path(&file_system_id, path, &prefix, object)
+                else {
+                    continue;
+                };
+                let replace = transient_by_path.get(&object_path).is_none_or(|existing| {
+                    existing.version < object.version
+                        || (existing.version == object.version
+                            && existing.kind == DfsObjectKind::Tombstone
+                            && object.kind != DfsObjectKind::Tombstone)
                 });
+                if replace {
+                    transient_by_path.insert(object_path, object.clone());
+                }
             }
-            let page = backend.child_objects_for_directory_page(
+            for (object_path, overlay) in transient_by_path {
+                let backend_object =
+                    backend.get_object_by_path(&file_system_id, &metadata_path(&object_path))?;
+                let backend_will_emit = backend_object
+                    .as_ref()
+                    .is_some_and(|object| object.kind != DfsObjectKind::Tombstone);
+                let authoritative = match backend_object {
+                    Some(backend_object)
+                        if self
+                            .transient_metadata_object_ids
+                            .contains(&overlay.object_id)
+                            || self.local_write_view_overrides_backend(
+                                &overlay.object_id,
+                                &overlay,
+                                Some(&backend_object),
+                            ) =>
+                    {
+                        overlay
+                    }
+                    Some(backend_object) => backend_object,
+                    None => overlay,
+                };
+                if backend_will_emit || authoritative.kind == DfsObjectKind::Tombstone {
+                    continue;
+                }
+                let cursor = backend.directory_page_cursor_for_object(&authoritative)?;
+                if after.is_none_or(|after| {
+                    compare_directory_page_cursors(&cursor, after) == Ordering::Greater
+                }) {
+                    entries.push((cursor, authoritative));
+                }
+            }
+        }
+
+        // Preserve the backend's bounded dentry/shard cursor instead of
+        // collecting, sorting, and truncating the complete directory. A
+        // transient tombstone can remove durable entries, so advance bounded
+        // backend pages until max_entries + 1 live candidates are available or
+        // the backend is exhausted.
+        let target_entries = max_entries.saturating_add(1);
+        let mut cursor = after.cloned();
+        let mut backend_entry_count = 0usize;
+        let mut backend_exhausted = false;
+        loop {
+            let remaining = target_entries.saturating_sub(backend_entry_count);
+            if remaining == 0 {
+                break;
+            }
+            let (backend_entries, next_cursor) = backend.child_objects_for_directory_page_entries(
                 &file_system_id,
                 path,
                 cursor.as_ref(),
                 remaining,
             )?;
-            let next_cursor = page.next_cursor;
-            for backend_object in page.objects {
+            for (backend_object, entry_cursor) in backend_entries {
                 let object_path = normalize_posix_path(&backend_object.path)?;
                 let tombstone_key = (file_system_id.clone(), metadata_path(&object_path));
                 let mut memory_overlay = self
@@ -926,24 +1027,49 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     _ => backend_object,
                 };
                 if authoritative.kind != DfsObjectKind::Tombstone {
-                    objects.push(authoritative);
+                    entries.push((entry_cursor, authoritative));
+                    backend_entry_count = backend_entry_count.saturating_add(1);
                 }
             }
 
-            if objects.len() >= max_entries || next_cursor.is_none() {
-                return Ok(DfsDirectoryPage {
-                    objects,
-                    next_cursor,
-                });
+            let Some(next_cursor) = next_cursor else {
+                backend_exhausted = true;
+                break;
+            };
+            if cursor.as_ref() == Some(&next_cursor) {
+                backend_exhausted = true;
+                break;
             }
-            if next_cursor == cursor {
-                return Ok(DfsDirectoryPage {
-                    objects,
-                    next_cursor: None,
-                });
-            }
-            cursor = next_cursor;
+            cursor = Some(next_cursor);
         }
+
+        entries.sort_by(|(left_cursor, _), (right_cursor, _)| {
+            compare_directory_page_cursors(left_cursor, right_cursor)
+        });
+        // A transient candidate may settle between its point lookup above and
+        // the backend page snapshot. Stable sorting keeps the overlay first;
+        // collapse the duplicate durable observation before page sizing.
+        let mut deduplicated_entries = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let duplicate = deduplicated_entries.last().is_some_and(
+                |(cursor, object): &(DfsDirectoryPageCursor, DfsObjectMetadata)| {
+                    cursor == &entry.0 && object.object_id == entry.1.object_id
+                },
+            );
+            if !duplicate {
+                deduplicated_entries.push(entry);
+            }
+        }
+        let mut entries = deduplicated_entries;
+        let has_more = entries.len() > max_entries || !backend_exhausted;
+        entries.truncate(max_entries);
+        let next_cursor = has_more
+            .then(|| entries.last().map(|(cursor, _)| cursor.clone()))
+            .flatten();
+        Ok(DfsDirectoryPage {
+            objects: entries.into_iter().map(|(_, object)| object).collect(),
+            next_cursor,
+        })
     }
 
     pub(super) fn sifs_dir_has_children(&self, path: &str) -> Result<bool> {

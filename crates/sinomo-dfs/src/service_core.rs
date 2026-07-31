@@ -46,7 +46,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             node_id,
             metadata,
             tombstones_by_metadata_path: BTreeMap::new(),
-            transient_metadata_object_ids: BTreeSet::new(),
+            transient_metadata_object_ids: Default::default(),
             transient_metadata_predecessor_object_ids: BTreeMap::new(),
             content,
             coordinator: DistributedEventualCoordinator::new(),
