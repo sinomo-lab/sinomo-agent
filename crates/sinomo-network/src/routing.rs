@@ -42,6 +42,13 @@ const MAX_ROUTE_SEARCH_STATES: usize = 4096;
 const MAX_ROUTED_SESSION_HOPS: usize = 16;
 const ROUTED_CANDIDATE_BASE_HANDSHAKE_BUDGET: Duration = Duration::from_millis(100);
 const ROUTED_CANDIDATE_PER_HOP_HANDSHAKE_BUDGET: Duration = Duration::from_millis(250);
+/// Receiver-side wall-clock tolerance for a signed routed-session deadline.
+///
+/// The caller's monotonic timeout still bounds its own work. This tolerance
+/// only prevents a modestly fast peer clock from rejecting an otherwise-live
+/// open before the caller's deadline; without it, a two-second connectivity
+/// probe fails whenever two cluster nodes differ by more than two seconds.
+const ROUTED_SESSION_DEADLINE_CLOCK_SKEW_MILLIS: i64 = 30_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RouteConstraints {
@@ -1546,7 +1553,10 @@ fn validate_routed_session_descriptor(
         || descriptor.path.last() != Some(&descriptor.destination_node_id)
         || usize::from(descriptor.hop_limit) < hop_count
         || usize::from(descriptor.hop_limit) > MAX_ROUTED_SESSION_HOPS
-        || descriptor.deadline_unix_millis < routed_session_now_unix_millis()
+        || descriptor
+            .deadline_unix_millis
+            .saturating_add(ROUTED_SESSION_DEADLINE_CLOCK_SKEW_MILLIS)
+            < routed_session_now_unix_millis()
         || !key_configuration_valid
     {
         return Err(NetworkError::AuthDenied);
@@ -4759,8 +4769,19 @@ mod tests {
             Err(NetworkError::AuthDenied)
         );
 
+        let mut receiver_clock_ahead = descriptor.clone();
+        receiver_clock_ahead.deadline_unix_millis = routed_session_now_unix_millis()
+            .saturating_sub(ROUTED_SESSION_DEADLINE_CLOCK_SKEW_MILLIS);
+        assert_eq!(
+            validate_routed_session_descriptor(&directory, &receiver_clock_ahead),
+            Ok(()),
+            "a modestly fast receiver clock must not reject a live routed-session open"
+        );
+
         let mut expired = descriptor.clone();
-        expired.deadline_unix_millis = routed_session_now_unix_millis().saturating_sub(1);
+        expired.deadline_unix_millis = routed_session_now_unix_millis()
+            .saturating_sub(ROUTED_SESSION_DEADLINE_CLOCK_SKEW_MILLIS)
+            .saturating_sub(1);
         assert_eq!(
             validate_routed_session_descriptor(&directory, &expired),
             Err(NetworkError::AuthDenied)

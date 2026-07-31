@@ -818,7 +818,7 @@ where
             })
         };
     }
-    block_on_daemon_client_on_ephemeral_sync_runtime(future)
+    block_on_daemon_client_on_process_runtime(future)
 }
 
 fn block_on_daemon_client_stream<F, T>(future: F) -> Result<T, DaemonError>
@@ -831,7 +831,7 @@ where
             detail: "streaming daemon RPC sync client cannot run inside a Tokio runtime; use send_daemon_rpc_stream_async".to_string(),
         });
     }
-    block_on_daemon_client_on_ephemeral_sync_runtime(future)
+    block_on_daemon_client_on_process_runtime(future)
 }
 
 fn block_on_daemon_client_on_owner_runtime<F, T>(
@@ -858,20 +858,29 @@ where
     runtime.block_on(future)
 }
 
-fn block_on_daemon_client_on_ephemeral_sync_runtime<F, T>(future: F) -> Result<T, DaemonError>
+fn daemon_client_sync_runtime() -> Result<&'static tokio::runtime::Runtime, DaemonError> {
+    static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    match RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("sinomo-daemon-client-sync")
+            .enable_all()
+            .build()
+            .map_err(|source| source.to_string())
+    }) {
+        Ok(runtime) => Ok(runtime),
+        Err(detail) => Err(DaemonError::Network {
+            address: "daemon client runtime".to_string(),
+            detail: detail.clone(),
+        }),
+    }
+}
+
+fn block_on_daemon_client_on_process_runtime<F, T>(future: F) -> Result<T, DaemonError>
 where
     F: std::future::Future<Output = Result<T, DaemonError>>,
 {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|source| DaemonError::Network {
-            address: "daemon client runtime".to_string(),
-            detail: source.to_string(),
-        })?;
-    let output = runtime.block_on(future);
-    runtime.shutdown_timeout(Duration::from_millis(250));
-    output
+    daemon_client_sync_runtime()?.block_on(future)
 }
 
 pub(crate) struct DaemonObjectRpcAsyncHost {
@@ -2953,7 +2962,7 @@ where
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         return block_on_daemon_client_on_owner_runtime(&runtime, future);
     }
-    block_on_daemon_client_on_ephemeral_sync_runtime(future)
+    block_on_daemon_client_on_process_runtime(future)
 }
 
 fn rollout_binary_rpc_call(
@@ -3322,6 +3331,34 @@ mod tests {
     use sinomo_core::network::ObjectRpcRequest;
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn synchronous_client_runtime_keeps_background_tasks_alive_between_calls() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = super::block_on_daemon_client_on_process_runtime(async move {
+            Ok(tokio::spawn(async move {
+                release_rx.await.expect("release background task");
+                37_u8
+            }))
+        })
+        .expect("spawn background task");
+
+        let value = super::block_on_daemon_client_on_process_runtime(async move {
+            release_tx
+                .send(())
+                .map_err(|_| crate::DaemonError::Network {
+                    address: "daemon client runtime test".to_string(),
+                    detail: "background task stopped with its originating call".to_string(),
+                })?;
+            task.await.map_err(|source| crate::DaemonError::Network {
+                address: "daemon client runtime test".to_string(),
+                detail: source.to_string(),
+            })
+        })
+        .expect("background task survives the first synchronous call");
+
+        assert_eq!(value, 37);
+    }
 
     #[test]
     fn local_cluster_kv_snapshot_decoder_preserves_observation_metadata() {

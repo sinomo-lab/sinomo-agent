@@ -1271,7 +1271,14 @@ impl LocalContentStore {
             }
             Err(error) => return Err(error),
         }
-        fs::File::open(&sentinel_path)
+        // Windows rejects FlushFileBuffers for the read-only handle returned by
+        // File::open, even when this process owns the file. Open the durable
+        // sentinel writable so sync_all preserves the publication fence on
+        // every supported platform.
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&sentinel_path)
             .and_then(|file| file.sync_all())
             .map_err(|source| ContentStoreError::Io {
                 path: sentinel_path.clone(),
@@ -7588,6 +7595,15 @@ mod tests {
     use super::*;
 
     static TEST_ORPHAN_CATALOG_OBSERVATION: AtomicU64 = AtomicU64::new(1);
+
+    #[cfg(windows)]
+    #[test]
+    fn content_reservation_writer_syncs_existing_sentinel_on_windows() {
+        let root = temp_root("content_reservation_writer_windows_sentinel_sync");
+        LocalContentStore::new(&root).expect("create store and durable sentinel");
+        LocalContentStore::new(&root).expect("reopen store and sync existing sentinel");
+        cleanup(&root);
+    }
 
     fn orphan_catalog_observation() -> (String, u64) {
         let sequence = TEST_ORPHAN_CATALOG_OBSERVATION.fetch_add(1, Ordering::SeqCst);
