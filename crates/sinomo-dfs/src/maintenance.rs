@@ -1764,8 +1764,9 @@ pub struct DfsMaintenanceTickReport {
     pub followup_events: Vec<NetworkedDfsServiceEvent>,
     pub repair_attempts_before: Vec<DfsRepairAttemptRecord>,
     pub repair_attempts_after: Vec<DfsRepairAttemptRecord>,
-    /// This bounded pass stopped while another repair record was immediately
-    /// runnable. The daemon may continue without its ordinary retry gate.
+    /// This bounded pass scheduled at least one repair and stopped while
+    /// another repair record was immediately runnable. The daemon may continue
+    /// without its ordinary retry gate.
     pub repair_budget_exhausted: bool,
     pub metadata_replication: DfsMetadataJournalReplicationReport,
 }
@@ -2213,6 +2214,7 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
     let repair_budget_exhausted = options.repair_max_jobs > 0
         && options.repair_max_jobs != usize::MAX
         && repair_queue_count_before >= options.repair_max_jobs
+        && !scheduled_repairs.is_empty()
         && durable_repair_queue_after.iter().any(|record| {
             record.next_retry_unix_nanos != u64::MAX
                 && record.next_retry_unix_nanos <= dfs_now_unix_nanos()
@@ -2579,6 +2581,7 @@ where
     let repair_budget_exhausted = options.repair_max_jobs > 0
         && options.repair_max_jobs != usize::MAX
         && eligible_repair_attempts.len() >= options.repair_max_jobs
+        && !scheduled_repairs.is_empty()
         && durable_repair_queue_after.iter().any(|record| {
             record.next_retry_unix_nanos != u64::MAX
                 && record.next_retry_unix_nanos <= dfs_now_unix_nanos()

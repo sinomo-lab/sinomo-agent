@@ -6665,7 +6665,7 @@ fn daemon_dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport
     namespace_job_limit_reached
         || placement_page_remaining
         || lifecycle_limit_reached
-        || report.repair_budget_exhausted
+        || (report.repair_budget_exhausted && !report.scheduled_repairs.is_empty())
 }
 
 /// Run the complete DFS maintenance future from Tokio's blocking pool.
@@ -7328,10 +7328,11 @@ mod tests {
         DfsObjectPolicy, DfsWriteRequest,
     };
     use sinomo_dfs::{
-        DfsBlobTransferResult, DfsDistributedWriteCommand, DfsMetadataJournalReplicationOutcome,
-        DfsMetadataReplicaLagStatus, DfsNamespaceCommand, DfsNamespaceJobStatus,
-        DfsNamespaceOperation, DfsNetworkMessage, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
-        DfsReplicationPolicy, DfsRoutedMessage, DfsStageBlobCommand, DfsVersion, DfsWriteOptions,
+        DfsBlobTransferResult, DfsDistributedWriteCommand, DfsFileSystemId,
+        DfsMetadataJournalReplicationOutcome, DfsMetadataReplicaLagStatus, DfsNamespaceCommand,
+        DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNetworkMessage, DfsObjectId,
+        DfsObjectKind, DfsObjectMetadata, DfsReplicationPolicy, DfsRoutedMessage,
+        DfsStageBlobCommand, DfsVersion, DfsWriteOptions, DistributedRepairJob,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -9754,11 +9755,26 @@ mod tests {
             "a completed bounded job plus an explicitly skipped running job owns continuation"
         );
 
-        let mut bounded_repairs = empty_report();
-        bounded_repairs.repair_budget_exhausted = true;
+        let mut no_progress_repairs = empty_report();
+        no_progress_repairs.repair_budget_exhausted = true;
+        assert!(
+            !daemon_dfs_maintenance_report_reached_limit(&no_progress_repairs),
+            "a bare repair remainder without a scheduled repair must keep ordinary backoff"
+        );
+
+        let mut bounded_repairs = no_progress_repairs;
+        bounded_repairs
+            .scheduled_repairs
+            .push(DistributedRepairJob {
+                intent_id: "intent-bounded-repair".to_string(),
+                file_system_id: DfsFileSystemId::generate(),
+                object_id: DfsObjectId::generate(),
+                version: DfsVersion::generate(),
+                missing_replica_node_id: NodeId::generate(),
+            });
         assert!(
             daemon_dfs_maintenance_report_reached_limit(&bounded_repairs),
-            "an immediately runnable repair remainder owns continuation"
+            "a scheduled repair plus an immediately runnable remainder owns continuation"
         );
 
         let mut no_progress_compaction = empty_report();
