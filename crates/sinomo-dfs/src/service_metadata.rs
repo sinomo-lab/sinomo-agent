@@ -11,6 +11,7 @@ use time::OffsetDateTime;
 
 use crate::metadata_pages::collect_metadata_pages;
 use crate::metadata_receipt::receipt_for_replica_from_backend;
+use crate::posix_model;
 use crate::{
     DFS_METADATA_OBJECT_INTENT_PAGE_SIZE, DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
     DfsControlPlaneStore, DfsDistributedError, DfsError, DfsFileSystem, DfsFileSystemConfig,
@@ -18,10 +19,141 @@ use crate::{
     DfsMetadataShardConfig, DfsMetadataShardId, DfsNamespaceObjectVersionExpectation,
     DfsNamespacePathOccupantExpectation, DfsNamespacePrepareRecord, DfsNamespacePrepareStatus,
     DfsNamespaceTransaction, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsObjectVersionRecord,
-    DfsReplicaReceiptRecord, DfsVersion, DfsWriteIntentRecord, NetworkedDfsService, dfs_perf_trace,
-    metadata_path, namespace_transaction_id_for_batch, normalize_current_locations,
-    object_version_record, path_index_key,
+    DfsReplicaReceiptRecord, DfsVersion, DfsWriteIntentRecord, MetadataBackendError,
+    NetworkedDfsService, dfs_perf_trace, metadata_path, namespace_transaction_id_for_batch,
+    normalize_current_locations, object_version_record, path_index_key,
 };
+
+#[derive(Debug)]
+enum NamespaceTransactionApplyError {
+    Dfs(DfsError),
+    PrepareConflict {
+        path: String,
+        object_id: DfsObjectId,
+        expected: DfsVersion,
+        current: DfsVersion,
+    },
+}
+
+impl NamespaceTransactionApplyError {
+    fn from_prepare_error(
+        transaction: &DfsNamespaceTransaction,
+        error: MetadataBackendError,
+    ) -> Self {
+        match error {
+            MetadataBackendError::Conflict {
+                object_id,
+                expected,
+                current,
+            } => {
+                let path = transaction
+                    .objects
+                    .iter()
+                    .find(|object| object.object_id == object_id)
+                    .map(|object| object.path.clone())
+                    .unwrap_or_else(|| format!("object:{object_id}"));
+                Self::PrepareConflict {
+                    path,
+                    object_id,
+                    expected,
+                    current,
+                }
+            }
+            error => Self::Dfs(DfsError::from(error)),
+        }
+    }
+
+    fn into_dfs_error(self) -> DfsError {
+        match self {
+            Self::Dfs(error) => error,
+            Self::PrepareConflict {
+                object_id,
+                expected,
+                current,
+                ..
+            } => DfsError::from(MetadataBackendError::Conflict {
+                object_id,
+                expected,
+                current,
+            }),
+        }
+    }
+
+    fn into_posix_error(self) -> posix_model::DfsPosixError {
+        match self {
+            Self::Dfs(error) => posix_model::DfsPosixError::from(error),
+            Self::PrepareConflict {
+                path,
+                object_id,
+                expected,
+                current,
+            } => posix_model::DfsPosixError::Conflict {
+                path,
+                reason: format!(
+                    "object {object_id} changed from version {expected} to {current} after namespace expectations were captured"
+                ),
+            },
+        }
+    }
+}
+
+impl From<DfsError> for NamespaceTransactionApplyError {
+    fn from(error: DfsError) -> Self {
+        Self::Dfs(error)
+    }
+}
+
+impl From<MetadataBackendError> for NamespaceTransactionApplyError {
+    fn from(error: MetadataBackendError) -> Self {
+        Self::Dfs(DfsError::from(error))
+    }
+}
+
+#[cfg(test)]
+type NamespacePrepareAfterExpectationsTestHook =
+    Box<dyn FnOnce(&mut dyn crate::DfsMetadataBackend)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static NAMESPACE_PREPARE_AFTER_EXPECTATIONS_TEST_HOOK:
+        std::cell::RefCell<Option<NamespacePrepareAfterExpectationsTestHook>> =
+            const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct NamespacePrepareAfterExpectationsTestHookGuard;
+
+#[cfg(test)]
+impl Drop for NamespacePrepareAfterExpectationsTestHookGuard {
+    fn drop(&mut self) {
+        NAMESPACE_PREPARE_AFTER_EXPECTATIONS_TEST_HOOK.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_namespace_prepare_after_expectations_test_hook(
+    hook: impl FnOnce(&mut dyn crate::DfsMetadataBackend) + 'static,
+) -> NamespacePrepareAfterExpectationsTestHookGuard {
+    NAMESPACE_PREPARE_AFTER_EXPECTATIONS_TEST_HOOK.with(|slot| {
+        let previous = slot.borrow_mut().replace(Box::new(hook));
+        assert!(
+            previous.is_none(),
+            "namespace-prepare expectation test hook is already installed on this thread"
+        );
+    });
+    NamespacePrepareAfterExpectationsTestHookGuard
+}
+
+#[cfg(test)]
+fn run_namespace_prepare_after_expectations_test_hook(backend: &mut dyn crate::DfsMetadataBackend) {
+    NAMESPACE_PREPARE_AFTER_EXPECTATIONS_TEST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(backend);
+        }
+    });
+}
 
 fn namespace_transaction_shard_paths(
     backend: &dyn crate::DfsMetadataBackend,
@@ -584,6 +716,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         transaction: DfsNamespaceTransaction,
     ) -> Result<(), DfsError> {
         self.apply_namespace_transaction_with_selected_shard(transaction, None, Vec::new())
+            .map_err(NamespaceTransactionApplyError::into_dfs_error)
     }
 
     fn validate_local_eventual_batch_commit(
@@ -592,8 +725,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         transaction: &DfsNamespaceTransaction,
         writes: &[DfsLocalEventualBatchWriteProof],
         selected_shard: Option<&DfsMetadataShardConfig>,
-    ) -> Result<(), DfsError> {
-        let reject = |message: String| DfsError::Distributed { message };
+    ) -> Result<(), posix_model::DfsPosixError> {
+        let reject =
+            |message: String| posix_model::DfsPosixError::Dfs(DfsError::Distributed { message });
         if transaction.objects.is_empty() || writes.is_empty() {
             return Err(reject(
                 "local-eventual batch requires at least one proven file write".to_string(),
@@ -610,37 +744,44 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .unwrap_or(&self.node_id);
         let shard_id = selected_shard.map(|shard| DfsMetadataShardId::new(shard.shard_id.clone()));
         let current_object =
-            |object_id: &DfsObjectId| -> Result<Option<DfsObjectMetadata>, DfsError> {
+            |object_id: &DfsObjectId| -> Result<
+                Option<DfsObjectMetadata>,
+                posix_model::DfsPosixError,
+            > {
                 if let Some(backend) = self.metadata_backend.as_ref() {
                     return match shard_id.as_ref() {
                         Some(shard_id) => backend.get_object_on_shard(shard_id, object_id),
                         None => backend.get_object(object_id),
                     }
-                    .map_err(DfsError::from);
+                    .map_err(DfsError::from)
+                    .map_err(posix_model::DfsPosixError::from);
                 }
                 Ok(self.metadata.object(object_id).cloned())
             };
-        let current_path = |path: &str| -> Result<Option<DfsObjectMetadata>, DfsError> {
-            if let Some(backend) = self.metadata_backend.as_ref() {
-                return match shard_id.as_ref() {
-                    Some(shard_id) => backend.get_object_by_path_on_shard(
-                        shard_id,
-                        &transaction.file_system_id,
-                        path,
-                    ),
-                    None => backend.get_object_by_path(&transaction.file_system_id, path),
+        let current_path =
+            |path: &str| -> Result<Option<DfsObjectMetadata>, posix_model::DfsPosixError> {
+                if let Some(backend) = self.metadata_backend.as_ref() {
+                    return match shard_id.as_ref() {
+                        Some(shard_id) => backend.get_object_by_path_on_shard(
+                            shard_id,
+                            &transaction.file_system_id,
+                            path,
+                        ),
+                        None => backend.get_object_by_path(&transaction.file_system_id, path),
+                    }
+                    .map_err(DfsError::from)
+                    .map_err(posix_model::DfsPosixError::from);
                 }
-                .map_err(DfsError::from);
-            }
-            Ok(self
-                .metadata
-                .object_by_normalized_posix_path(
-                    &transaction.file_system_id,
-                    &crate::posix_path::normalize_posix_path(path)
-                        .map_err(|_| reject(format!("invalid local-eventual batch path {path}")))?,
-                )
-                .cloned())
-        };
+                Ok(self
+                    .metadata
+                    .object_by_normalized_posix_path(
+                        &transaction.file_system_id,
+                        &crate::posix_path::normalize_posix_path(path).map_err(|_| {
+                            reject(format!("invalid local-eventual batch path {path}"))
+                        })?,
+                    )
+                    .cloned())
+            };
 
         let objects = transaction
             .objects
@@ -789,10 +930,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 false
             };
             if write.expected_base_version.is_none() && create_path_is_occupied {
-                return Err(DfsError::AlreadyExists {
+                return Err(posix_model::DfsPosixError::AlreadyExists {
                     path: object.path.clone(),
                 });
             }
+            let observed_base = current
+                .as_ref()
+                .filter(|current| current.kind != DfsObjectKind::Tombstone)
+                .map(|current| current.version.to_string())
+                .unwrap_or_else(|| "absent-or-tombstoned".to_string());
+            let expected_base = write
+                .expected_base_version
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "absent-or-tombstoned".to_string());
             match (&write.expected_base_version, current) {
                 (Some(expected_base), Some(current))
                     if current.kind != DfsObjectKind::Tombstone
@@ -823,9 +974,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }),
                 ) => {}
                 _ => {
-                    return Err(reject(format!(
-                        "local-eventual batch base version changed for object {object_id}"
-                    )));
+                    return Err(posix_model::DfsPosixError::Conflict {
+                        path: object.path.clone(),
+                        reason: format!(
+                            "object {object_id} base changed from {expected_base} to {observed_base} before the batch committed"
+                        ),
+                    });
                 }
             }
         }
@@ -841,10 +995,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )));
             }
             let Some(current) = current_object(&object.object_id)? else {
-                return Err(reject(format!(
-                    "local-eventual batch directory touch {} has no current object",
-                    object.path
-                )));
+                return Err(posix_model::DfsPosixError::Conflict {
+                    path: object.path.clone(),
+                    reason: "parent directory disappeared before the batch committed".to_string(),
+                });
             };
             let parent_writes = writes_by_object
                 .values()
@@ -900,7 +1054,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     path: object.path.clone(),
                     expected_version: expected_parent_version.clone(),
                     current_version: current.version,
-                });
+                }
+                .into());
             }
             let mut allowed = current.clone();
             allowed.version = object.version.clone();
@@ -1049,13 +1204,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         transaction: DfsNamespaceTransaction,
         writes: &[DfsLocalEventualBatchWriteProof],
         selected_shard: Option<DfsMetadataShardConfig>,
-    ) -> Result<bool, DfsError> {
-        if self.local_eventual_batch_commit_is_durable_replay(
-            &transaction,
-            writes,
-            selected_shard.as_ref(),
-        )? {
-            self.materialize_namespace_transaction_in_memory(&transaction)?;
+    ) -> Result<bool, posix_model::DfsPosixError> {
+        if self
+            .local_eventual_batch_commit_is_durable_replay(
+                &transaction,
+                writes,
+                selected_shard.as_ref(),
+            )
+            .map_err(posix_model::DfsPosixError::from)?
+        {
+            self.materialize_namespace_transaction_in_memory(&transaction)
+                .map_err(posix_model::DfsPosixError::from)?;
             return Ok(false);
         }
         self.validate_local_eventual_batch_commit(
@@ -1065,11 +1224,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             selected_shard.as_ref(),
         )?;
         let receipts = writes.iter().map(|write| write.receipt.clone()).collect();
-        self.apply_namespace_transaction_with_selected_shard(
-            transaction,
-            selected_shard,
-            receipts,
-        )?;
+        self.apply_namespace_transaction_with_selected_shard(transaction, selected_shard, receipts)
+            .map_err(NamespaceTransactionApplyError::into_posix_error)?;
         Ok(true)
     }
 
@@ -1080,12 +1236,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// affected transaction paths. Reusing it here avoids a second control
     /// plane prefix scan in the same compound operation without caching shard
     /// configuration across independent filesystem operations.
-    pub(crate) fn apply_namespace_transaction_with_selected_shard(
+    fn apply_namespace_transaction_with_selected_shard(
         &mut self,
         transaction: DfsNamespaceTransaction,
         selected_shard: Option<DfsMetadataShardConfig>,
         content_receipts: Vec<DfsReplicaReceiptRecord>,
-    ) -> Result<(), DfsError> {
+    ) -> Result<(), NamespaceTransactionApplyError> {
         self.clear_metadata_lookup_cache();
         let trace_started = Instant::now();
         let trace_object_count = transaction.objects.len();
@@ -1107,7 +1263,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Err(DfsError::Metadata {
                     message: "clustered namespace mutation requires a durable metadata backend"
                         .to_string(),
-                });
+                }
+                .into());
             }
             let mut shard = selected_shard;
             if shard.is_none()
@@ -1133,7 +1290,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             "clustered namespace transaction {} must resolve to exactly one metadata shard, found [{}]",
                             transaction.transaction_id, shard_ids
                         ),
-                    });
+                    }
+                    .into());
                 };
                 shard = Some(selected.clone());
             }
@@ -1158,7 +1316,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             "clustered namespace transaction {} must resolve to exactly one metadata shard, found [{}]",
                             transaction.transaction_id, shard_ids
                         ),
-                    });
+                    }
+                    .into());
                 };
                 shard = Some(selected.clone());
             }
@@ -1169,7 +1328,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         local_node_id: self.node_id.clone(),
                         primary_node_id: selected.primary_node_id.clone(),
                         epoch: selected.epoch,
-                    });
+                    }
+                    .into());
                 }
                 let ensure_started = Instant::now();
                 let file_system = if let Some(file_system) = configured_file_system.clone() {
@@ -1208,7 +1368,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         "clustered namespace transaction {} has no shard-addressable path",
                         transaction.transaction_id
                     ),
-                });
+                }
+                .into());
             }
             let shard = if let Some(shard) = shard {
                 shard
@@ -1229,7 +1390,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             "clustered namespace transaction {} must resolve to exactly one metadata shard, found [{}]",
                             transaction.transaction_id, shard_ids
                         ),
-                    });
+                    }
+                    .into());
                 };
                 if shard.primary_node_id != self.node_id {
                     return Err(DfsError::StaleOwnerEpoch {
@@ -1237,7 +1399,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         local_node_id: self.node_id.clone(),
                         primary_node_id: shard.primary_node_id.clone(),
                         epoch: shard.epoch,
-                    });
+                    }
+                    .into());
                 }
                 let ensure_started = Instant::now();
                 let file_system = if let Some(file_system) = configured_file_system.clone() {
@@ -1276,6 +1439,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &transaction,
                 )?;
             trace_expectations_ms = expectations_started.elapsed().as_millis();
+            #[cfg(test)]
+            run_namespace_prepare_after_expectations_test_hook(
+                self.metadata_backend
+                    .as_mut()
+                    .expect("clustered metadata backend checked above")
+                    .as_mut(),
+            );
             let completed_request = self.durable_namespace_request_completion_for_transaction(
                 &transaction,
                 &prepare_shard_id,
@@ -1345,7 +1515,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .metadata_backend
                 .as_mut()
                 .expect("clustered metadata backend checked above")
-                .prepare_namespace_transaction(&prepare)?;
+                .prepare_namespace_transaction(&prepare)
+                .map_err(|error| {
+                    NamespaceTransactionApplyError::from_prepare_error(&prepare.transaction, error)
+                })?;
             if prepare.completed_request.is_some() || prepare.completed_request_completion.is_some()
             {
                 self.active_durable_namespace_prepare_recorded = true;
@@ -1356,7 +1529,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         "namespace prepare {} was journaled on shard {}, expected {}",
                         prepare.operation_id, prepare_entry.shard_id.0, prepare.shard_id.0
                     ),
-                });
+                }
+                .into());
             }
             let prepare_sequence = prepare_entry.sequence;
             let prepared_batch = DfsMetadataJournalBatch {

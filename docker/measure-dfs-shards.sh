@@ -460,7 +460,7 @@ run_container_timeout() {
     docker exec -i "${container_id[$node]}" "$@"
 }
 
-for command in docker jq timeout date awk sed grep cmp getconf sort wc; do
+for command in docker jq timeout date awk sed grep cmp getconf sort wc mv; do
   require_command "$command"
 done
 case "$BINARY_PROFILE" in
@@ -1215,6 +1215,7 @@ printf '%s\n' \
 
 declare -A workload_pid=()
 declare -A workload_started_ns=()
+declare -A workload_finished_ns=()
 declare -A ready_lanes=()
 declare -a active_lanes=()
 declare -a workload_phases=(isolated concurrent)
@@ -1570,9 +1571,9 @@ cleanup_and_capture_workload_evidence() {
 trap cleanup_and_capture_workload_evidence EXIT INT TERM
 
 launch_workload() {
-  local phase="$1" lane="$2"
+  local phase="$1" lane="$2" start_barrier="${3:-}"
   local client="${lane_client[$lane]}"
-  local base overwrite_existing=false
+  local base completion_file ready_file overwrite_existing=false
   if [[ "$phase" == churn-* ]]; then
     # Keep the live namespace bounded during long runs. The first round
     # creates one stable file set and later rounds overwrite those exact paths,
@@ -1585,16 +1586,42 @@ launch_workload() {
   else
     base="${lane_base[$lane]%/}/$RUN_ID-$phase-$lane"
   fi
-  workload_started_ns[$lane]="$(date +%s%N)"
+  completion_file="$ARTIFACTS/workload-$phase-$lane.finished-ns"
+  ready_file="$ARTIFACTS/workload-$phase-$lane.ready-ns"
+  rm -f "$completion_file" "$ready_file"
+  if [[ -z "$start_barrier" ]]; then
+    workload_started_ns[$lane]="$(date +%s%N)"
+  fi
   (
-    run_node_timeout "$TIMEOUT_SECONDS" "$client" \
-      sinomo test run cluster.dfs.bulk-write --require-cluster --json \
-      --param "base=$base" \
-      --param "files=$FILES" \
-      --param "bytes=$BYTES" \
-      --param "overwrite-existing=$overwrite_existing" \
-      --param "min-files-per-second=0" \
-      --param "timeout-seconds=$TIMEOUT_SECONDS"
+    local workload_status
+    if [[ -n "$start_barrier" ]]; then
+      # Concurrent lanes are spawned sequentially by the host shell. Park all
+      # launchers before docker exec so project/process setup for an earlier
+      # lane cannot consume the aggregate DFS window before its peers exist.
+      # The parent releases every lane from one timestamp; process startup and
+      # all filesystem work remain inside the measured phase.
+      date +%s%N >"$ready_file"
+      while [[ ! -e "$start_barrier" ]]; do
+        sleep 0.001
+      done
+    fi
+    # Resolve container IDs during preflight and exec them directly so Compose
+    # project discovery is not charged to DFS throughput. The debug binary and
+    # test process startup remain inside the end-to-end workload window.
+    if run_container_timeout "$TIMEOUT_SECONDS" "$client" \
+        sinomo test run cluster.dfs.bulk-write --require-cluster --json \
+        --param "base=$base" \
+        --param "files=$FILES" \
+        --param "bytes=$BYTES" \
+        --param "overwrite-existing=$overwrite_existing" \
+        --param "min-files-per-second=0" \
+        --param "timeout-seconds=$TIMEOUT_SECONDS"; then
+      workload_status=0
+    else
+      workload_status=$?
+    fi
+    date +%s%N >"$completion_file"
+    exit "$workload_status"
   ) >"$ARTIFACTS/workload-$phase-$lane.json" \
     2>"$ARTIFACTS/workload-$phase-$lane.stderr.log" &
   workload_pid[$lane]=$!
@@ -1876,10 +1903,24 @@ sample_phase() {
 
 wait_for_workload() {
   local phase="$1" lane="$2"
+  local completion_file="$ARTIFACTS/workload-$phase-$lane.finished-ns"
+  local completion_timestamp
   if wait "${workload_pid[$lane]}"; then
     :
   else
     log "$phase/$lane workload command failed"
+    workload_failed=1
+  fi
+  completion_timestamp=""
+  if [[ -s "$completion_file" ]]; then
+    completion_timestamp="$(<"$completion_file")"
+  fi
+  if [[ "$completion_timestamp" =~ ^[0-9]+$ ]] \
+    && (( completion_timestamp >= workload_started_ns[$lane] )); then
+    workload_finished_ns[$lane]="$completion_timestamp"
+  else
+    workload_finished_ns[$lane]="${workload_started_ns[$lane]}"
+    log "$phase/$lane workload completion timestamp was missing, malformed, or before its start"
     workload_failed=1
   fi
   unset "workload_pid[$lane]" "workload_started_ns[$lane]"
@@ -1930,13 +1971,59 @@ done
 
 run_three_lane_workload_phase() {
   local phase="$1" account_core_overlap="$2"
-  local phase_started_ns phase_finished_ns
+  local lane_finished_ns phase_started_ns phase_finished_ns
+  local start_barrier="$ARTIFACTS/workload-$phase.start-barrier"
+  local launch_ready=1 launch_ready_deadline
   active_lanes=("${LANES[@]}")
-  phase_started_ns="$(date +%s%N)"
+  rm -f "$start_barrier" "$start_barrier.tmp"
   for lane in "${LANES[@]}"; do
     ready_lanes[$lane]=0
-    launch_workload "$phase" "$lane"
+    launch_workload "$phase" "$lane" "$start_barrier"
   done
+
+  # Do not release a partially launched phase. Readiness is host-local and
+  # should be effectively immediate, but retain the workload timeout as a
+  # fail-closed ceiling so a broken launcher cannot park the benchmark.
+  launch_ready_deadline=$(( $(date +%s) + 10 ))
+  for lane in "${LANES[@]}"; do
+    while [[ ! -s "$ARTIFACTS/workload-$phase-$lane.ready-ns" ]]; do
+      if ! kill -0 "${workload_pid[$lane]}" 2>/dev/null; then
+        log "$phase/$lane workload launcher exited before the synchronized start"
+        workload_failed=1
+        launch_ready=0
+        break
+      fi
+      if (( $(date +%s) >= launch_ready_deadline )); then
+        log "$phase workload launchers did not reach the synchronized start before timeout"
+        workload_failed=1
+        launch_ready=0
+        break
+      fi
+      sleep 0.001
+    done
+  done
+
+  if (( launch_ready == 0 )); then
+    for lane in "${LANES[@]}"; do
+      if kill -0 "${workload_pid[$lane]}" 2>/dev/null; then
+        kill "${workload_pid[$lane]}" 2>/dev/null || true
+      fi
+    done
+    for lane in "${LANES[@]}"; do
+      wait "${workload_pid[$lane]}" 2>/dev/null || true
+      unset "workload_pid[$lane]" "workload_started_ns[$lane]"
+    done
+    rm -f "$start_barrier" "$start_barrier.tmp"
+    last_three_lane_wall_usec=0
+    return 1
+  fi
+
+  phase_started_ns="$(date +%s%N)"
+  for lane in "${LANES[@]}"; do
+    workload_started_ns[$lane]="$phase_started_ns"
+  done
+  printf '%s\n' "$phase_started_ns" >"$start_barrier.tmp"
+  mv "$start_barrier.tmp" "$start_barrier"
 
   previous_loop_ns="$(date +%s%N)"
   while :; do
@@ -1973,7 +2060,14 @@ run_three_lane_workload_phase() {
   for lane in "${LANES[@]}"; do
     wait_for_workload "$phase" "$lane"
   done
-  phase_finished_ns="$(date +%s%N)"
+  rm -f "$start_barrier"
+  phase_finished_ns="$phase_started_ns"
+  for lane in "${LANES[@]}"; do
+    lane_finished_ns="${workload_finished_ns[$lane]:-$phase_started_ns}"
+    if (( lane_finished_ns > phase_finished_ns )); then
+      phase_finished_ns="$lane_finished_ns"
+    fi
+  done
   last_three_lane_wall_usec=$((
     (phase_finished_ns - phase_started_ns + 999) / 1000
   ))

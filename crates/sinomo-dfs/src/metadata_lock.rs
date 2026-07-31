@@ -7,12 +7,20 @@
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_io::create_dir_all;
 use fs2::FileExt;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Condvar, Mutex, OnceLock};
 
 static METADATA_WRITE_PATH_LOCKS: OnceLock<(Mutex<BTreeSet<PathBuf>>, Condvar)> = OnceLock::new();
+static METADATA_WRITE_ACTIVITY: OnceLock<Mutex<BTreeMap<PathBuf, MetadataWriteActivity>>> =
+    OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MetadataWriteActivity {
+    pub(crate) epoch: u64,
+    pub(crate) pending_writers: usize,
+}
 
 #[derive(Debug)]
 pub(crate) struct MetadataWriteLock {
@@ -21,7 +29,29 @@ pub(crate) struct MetadataWriteLock {
 }
 
 pub(crate) fn metadata_write_lock(root: PathBuf, lock_path: PathBuf) -> Result<MetadataWriteLock> {
+    let mut activity = MetadataWriteActivityRegistration::begin(root.clone());
     let path_guard = MetadataPathWriteGuard::lock(root);
+    activity.acquired();
+    metadata_write_lock_after_path_guard(path_guard, lock_path)
+}
+
+/// Acquire the metadata writer lock for rebuildable checkpoint work.
+///
+/// Checkpoint admission observes ordinary writer waiters before rotating a
+/// generation. The checkpoint itself must not register as foreground
+/// activity or it would perpetually preempt its own soft-pressure request.
+pub(crate) fn metadata_checkpoint_write_lock(
+    root: PathBuf,
+    lock_path: PathBuf,
+) -> Result<MetadataWriteLock> {
+    let path_guard = MetadataPathWriteGuard::lock(root);
+    metadata_write_lock_after_path_guard(path_guard, lock_path)
+}
+
+fn metadata_write_lock_after_path_guard(
+    path_guard: MetadataPathWriteGuard,
+    lock_path: PathBuf,
+) -> Result<MetadataWriteLock> {
     if let Some(parent) = lock_path.parent() {
         create_dir_all(parent.to_owned())?;
     };
@@ -42,6 +72,62 @@ pub(crate) fn metadata_write_lock(root: PathBuf, lock_path: PathBuf) -> Result<M
         _path_guard: path_guard,
         _file: file,
     })
+}
+
+pub(crate) fn metadata_write_activity(root: &std::path::Path) -> MetadataWriteActivity {
+    METADATA_WRITE_ACTIVITY
+        .get()
+        .and_then(|activity| {
+            activity
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(root)
+                .copied()
+        })
+        .unwrap_or_default()
+}
+
+struct MetadataWriteActivityRegistration {
+    root: PathBuf,
+    pending: bool,
+}
+
+impl MetadataWriteActivityRegistration {
+    fn begin(root: PathBuf) -> Self {
+        let activity = METADATA_WRITE_ACTIVITY.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let mut activity = activity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = activity.entry(root.clone()).or_default();
+        entry.epoch = entry.epoch.saturating_add(1);
+        entry.pending_writers = entry.pending_writers.saturating_add(1);
+        Self {
+            root,
+            pending: true,
+        }
+    }
+
+    fn acquired(&mut self) {
+        if !self.pending {
+            return;
+        }
+        self.pending = false;
+        let Some(activity) = METADATA_WRITE_ACTIVITY.get() else {
+            return;
+        };
+        let mut activity = activity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = activity.get_mut(&self.root) {
+            entry.pending_writers = entry.pending_writers.saturating_sub(1);
+        }
+    }
+}
+
+impl Drop for MetadataWriteActivityRegistration {
+    fn drop(&mut self) {
+        self.acquired();
+    }
 }
 
 /// In-process mutual exclusion for metadata writes, keyed by backend root. Two

@@ -291,6 +291,7 @@ pub use message_transport::{
 };
 pub use metadata_api::{
     DfsMetadataBackend, DfsMetadataReplicaIngestPermit, DfsMetadataShardWriteFreeze,
+    DfsNamespaceRequestAdmissionSnapshot,
 };
 pub use metadata_backend::LocalSobjMetadataBackend;
 pub use metadata_error::MetadataBackendError;
@@ -344,15 +345,17 @@ pub use metadata_replication::{
     DfsMetadataJournalReplicationTransportFuture, DfsMetadataNodeTransport,
     DfsMetadataPeerTransportError, DfsMetadataPublishScheduleOptions,
     DfsMetadataPublishScheduleStart, DfsMetadataPublishScheduler, DfsMetadataReplicaShardContext,
-    DfsMetadataSnapshotInstallSender, LocalDfsMetadataJournalPublisherHost,
-    cluster_dfs_metadata_replica_shard_context, dfs_events_advance_metadata_replica,
-    dfs_events_should_publish_metadata, dfs_metadata_replication_fault_notice_lines,
-    dfs_metadata_replication_notice_lines, dfs_metadata_replication_report_needs_retry,
-    dfs_metadata_replication_sent_count, materialize_default_sifs_metadata,
-    materialize_default_sifs_metadata_on_shards, process_cluster_dfs_metadata_journal_batch,
-    process_cluster_dfs_metadata_snapshot_install, process_dfs_metadata_journal_batch,
-    process_dfs_metadata_snapshot_install, publish_cluster_dfs_metadata_journal,
-    publish_cluster_dfs_metadata_journal_async,
+    DfsMetadataSnapshotInstallSender, DfsPreparedClusterMetadataJournalPublish,
+    LocalDfsMetadataJournalPublisherHost, cluster_dfs_metadata_replica_shard_context,
+    dfs_events_advance_metadata_replica, dfs_events_should_publish_metadata,
+    dfs_metadata_replication_fault_notice_lines, dfs_metadata_replication_notice_lines,
+    dfs_metadata_replication_report_needs_retry, dfs_metadata_replication_sent_count,
+    execute_prepared_cluster_dfs_metadata_publish_with_async_peer_transport,
+    materialize_default_sifs_metadata, materialize_default_sifs_metadata_on_shards,
+    prepare_cluster_dfs_metadata_shard_publish_with_execution_exclusions,
+    process_cluster_dfs_metadata_journal_batch, process_cluster_dfs_metadata_snapshot_install,
+    process_dfs_metadata_journal_batch, process_dfs_metadata_snapshot_install,
+    publish_cluster_dfs_metadata_journal, publish_cluster_dfs_metadata_journal_async,
     publish_cluster_dfs_metadata_journal_async_with_execution_exclusions,
     publish_cluster_dfs_metadata_journal_with_async_peer_transport,
     publish_cluster_dfs_metadata_journal_with_peer_transport,
@@ -521,11 +524,11 @@ pub use routes::{
     dfs_message_allows_write_repair_progress, dfs_message_execution_scope,
     dfs_message_is_read_only_request, dfs_message_requires_fresh_metadata,
     dfs_message_requires_full_metadata_hydrate, dfs_message_rpc_call, dfs_message_rpc_request,
-    dfs_metadata_journal_batch_execution_scope, dfs_metadata_journal_batch_rpc_call,
-    dfs_metadata_journal_batch_rpc_request, dfs_metadata_snapshot_install_execution_scope,
-    dfs_metadata_snapshot_install_rpc_call, dfs_metadata_snapshot_install_rpc_request,
-    dfs_route_is_message_data_plane, dfs_routed_message_rpc_request, dfs_smoke_rpc_request,
-    dfs_status_rpc_request,
+    dfs_metadata_journal_batch_execution_scope, dfs_metadata_journal_batch_replayable_rpc_call,
+    dfs_metadata_journal_batch_rpc_call, dfs_metadata_journal_batch_rpc_request,
+    dfs_metadata_snapshot_install_execution_scope, dfs_metadata_snapshot_install_rpc_call,
+    dfs_metadata_snapshot_install_rpc_request, dfs_route_is_message_data_plane,
+    dfs_routed_message_rpc_request, dfs_smoke_rpc_request, dfs_status_rpc_request,
 };
 pub(crate) use routes::{
     build_dfs_routed_message, dfs_network_message_allows_write_repair_progress,

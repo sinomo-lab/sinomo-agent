@@ -1,7 +1,7 @@
 //! Durable SOBJ and filesystem IO helpers for DFS metadata backends.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::time::{Duration, Instant};
@@ -214,6 +214,78 @@ pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         durable_file::DurableAtomicFileOptions::new("tmp", "tmp").sync_all(),
     )
     .map_err(metadata_durable_file_error)
+}
+
+/// One fully written and synced replacement that has not entered the durable
+/// namespace yet.
+///
+/// Staging deliberately does not sync the parent directory: a crash before
+/// installation may discard the private staging name, while a surviving
+/// orphan is never observable through the destination. Installation performs
+/// the atomic replacement and parent-directory sync as one final operation.
+#[derive(Debug)]
+pub(crate) struct StagedFileReplacement {
+    staged_path: PathBuf,
+    destination_path: PathBuf,
+    installed: bool,
+}
+
+impl StagedFileReplacement {
+    pub(crate) fn install(mut self) -> Result<()> {
+        durable_file::install_staged_file(&self.staged_path, &self.destination_path, true)
+            .map_err(metadata_durable_file_error)?;
+        self.installed = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.staged_path
+    }
+}
+
+impl Drop for StagedFileReplacement {
+    fn drop(&mut self) {
+        if !self.installed {
+            let _ = fs::remove_file(&self.staged_path);
+        }
+    }
+}
+
+/// Write and sync a private, same-directory replacement without publishing it.
+///
+/// The caller can do arbitrarily expensive encoding and IO before entering a
+/// higher-level writer critical section, then call [`StagedFileReplacement::install`]
+/// after revalidating the generation it intends to replace.
+pub(crate) fn stage_file_replacement(
+    destination_path: &Path,
+    bytes: &[u8],
+    label: &str,
+) -> Result<StagedFileReplacement> {
+    let parent = destination_path.parent().unwrap_or_else(|| Path::new("."));
+    create_dir_all(parent.to_path_buf())?;
+    let destination_name = destination_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("metadata");
+    let staged_path = parent.join(format!(
+        ".{destination_name}.{label}.{}.stage",
+        sinomo_core::Id::generate()
+    ));
+    let mut file = durable_file::create_private_staged_file(&staged_path)
+        .map_err(metadata_durable_file_error)?;
+    if let Err(source) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        let _ = fs::remove_file(&staged_path);
+        return Err(MetadataBackendError::Io {
+            path: staged_path,
+            source,
+        });
+    }
+    Ok(StagedFileReplacement {
+        staged_path,
+        destination_path: destination_path.to_path_buf(),
+        installed: false,
+    })
 }
 
 pub(crate) fn sync_dir(path: &Path) -> Result<()> {

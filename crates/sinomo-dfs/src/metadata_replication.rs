@@ -652,31 +652,89 @@ pub async fn publish_cluster_dfs_metadata_shard_with_peer_transports_async_and_e
     execution_exclusions: &DfsMaintenanceExecutionExclusions,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
-    let refresh_cluster_paths = cluster_paths.clone();
-    tokio::task::spawn_blocking(move || {
+    let plan_data_dir = data_dir.clone();
+    let plan_cluster_paths = cluster_paths.clone();
+    let plan_execution_exclusions = execution_exclusions.clone();
+    let Some(plan) = tokio::task::spawn_blocking(move || {
         refresh_cluster_dfs_kv_snapshot_with_peer_transport(
-            &refresh_cluster_paths,
+            &plan_cluster_paths,
             sync_peer_transport,
+        )?;
+        prepare_cluster_dfs_metadata_shard_publish_with_execution_exclusions(
+            &plan_data_dir,
+            &plan_cluster_paths,
+            file_system_id,
+            shard_id,
+            &plan_execution_exclusions,
+            options,
         )
     })
     .await
     .map_err(|source| DfsError::Metadata {
-        message: format!("DFS metadata publish KV refresh task failed: {source}"),
-    })??;
-
-    let Some(plan) = prepare_cluster_dfs_metadata_journal_publish_async(
-        data_dir,
-        cluster_paths,
-        execution_exclusions,
-        Some((file_system_id, shard_id)),
-        options,
-    )
-    .await?
+        message: format!("DFS metadata publish planning task failed: {source}"),
+    })??
     else {
         return Ok(DfsMetadataJournalReplicationReport {
             outcomes: Vec::new(),
         });
     };
+    execute_prepared_cluster_dfs_metadata_publish_with_async_peer_transport(
+        plan,
+        peer_transport,
+        options,
+    )
+    .await
+}
+
+/// Capture one shard's durable publication plan without performing any peer
+/// I/O.
+///
+/// Daemon callers can hold their exact-shard mutation admission around this
+/// bounded local phase, then release it before executing the potentially slow
+/// network plan. Cluster KV refresh, when required, must complete before
+/// entering this function because it can itself perform peer RPC.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_cluster_dfs_metadata_shard_publish_with_execution_exclusions(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    file_system_id: DfsFileSystemId,
+    shard_id: DfsMetadataShardId,
+    execution_exclusions: &DfsMaintenanceExecutionExclusions,
+    options: DfsMetadataJournalReplicationOptions,
+) -> Result<Option<DfsPreparedClusterMetadataJournalPublish>, DfsError> {
+    let trace_started = Instant::now();
+    let prepared = prepare_cluster_dfs_metadata_journal_publish(
+        data_dir.clone(),
+        cluster_paths.clone(),
+        execution_exclusions,
+        Some((file_system_id, shard_id)),
+        options,
+    )?;
+    let (outcomes, targets) = prepared
+        .as_ref()
+        .map(|prepared| (prepared.outcomes.len(), prepared.targets.len()))
+        .unwrap_or_default();
+    let traceparent = crate::current_dfs_traceparent().unwrap_or_default();
+    tracing::trace!(
+        target: "sinomo.dfs.perf",
+        traceparent = %traceparent,
+        outcomes,
+        targets,
+        total_ms = trace_started.elapsed().as_millis(),
+        "metadata-publish-plan"
+    );
+    Ok(prepared)
+}
+
+/// Execute an already captured cluster metadata-publication plan.
+///
+/// This phase performs peer I/O and durable cursor checkpointing, but does not
+/// reopen the primary journal or recalculate the captured suffix.
+pub async fn execute_prepared_cluster_dfs_metadata_publish_with_async_peer_transport(
+    plan: DfsPreparedClusterMetadataJournalPublish,
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    options: DfsMetadataJournalReplicationOptions,
+) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
     let mut transport = AsyncDfsMetadataNodeTransport::new(
         plan.peer_node_ids.clone(),
         async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
@@ -2979,8 +3037,12 @@ impl DfsMetadataJournalPublisherHost for LocalDfsMetadataJournalPublisherHost {
     }
 }
 
+/// Immutable metadata-publication work captured from one durable cluster view.
+///
+/// The fields remain private so callers cannot alter authority evidence,
+/// journal bounds, or target ordering between planning and execution.
 #[derive(Clone, Debug)]
-struct DfsPreparedClusterMetadataJournalPublish {
+pub struct DfsPreparedClusterMetadataJournalPublish {
     data_dir: SinomoDataDir,
     local_node_id: NodeId,
     peer_node_ids: Vec<NodeId>,

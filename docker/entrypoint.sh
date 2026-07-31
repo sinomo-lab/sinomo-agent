@@ -18,6 +18,8 @@
 #   PUBLISH_INVITE      invite file to (re)publish with PUBLISH_INTRODUCER (seed + bridges)
 #   PUBLISH_INTRODUCER  introducer host:port to advertise in the published invite
 #   SINOMO_DISABLE_IROH "1" => run on direct LAN transports only (default here)
+#   SINOMO_DFS_METADATA_CHECKPOINT_COORDINATION_LOCK optional host-local advisory
+#                        lock shared by co-located DFS metadata replicas
 #   SINOMO_MANUAL_ENDPOINTS_JSON optional raw configs/cluster/endpoints.json content
 #   WAIT_FOR_INTRODUCER_READY "1" => wait for /shared/<introducer-host>.joined (dev harness)
 #   WAIT_FOR_JOIN_READY_NODES optional space-separated node names to wait for before joining
@@ -48,6 +50,10 @@ FORMATION_OBSERVE_MAX_EVENTS="${SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS:-32768}
 FORMATION_OBSERVE_FILTER="${SINOMO_TEST_FORMATION_OBSERVE_FILTER:-sinomo.cluster.formation=trace,sinomo.cluster.health=trace,sinomo.daemon.cluster_network_maintenance=trace,sinomo.daemon.cluster_member_publish=trace,sinomo.daemon.node_status_publish=trace,sinomo.cluster.raft_fanout=trace}"
 
 export SINOMO_DATA_DIR="$DATA"
+# All dev-cluster nodes share /shared. Serialize the memory-heavy snapshot fold
+# across these co-located replicas so a replay-pressure wave cannot multiply
+# full-table decode/encode memory and stall foreground namespace writes.
+export SINOMO_DFS_METADATA_CHECKPOINT_COORDINATION_LOCK="${SINOMO_DFS_METADATA_CHECKPOINT_COORDINATION_LOCK:-/shared/dfs-metadata-checkpoint-fold.lock}"
 # This segmented test cluster runs with iroh off by default so segmentation is real.
 export SINOMO_DISABLE_IROH="${SINOMO_DISABLE_IROH:-1}"
 export SINOMO_DAEMON_ADVERTISE_HOST="${SINOMO_DAEMON_ADVERTISE_HOST:-$NODE_NAME}"

@@ -3184,7 +3184,7 @@ fn restore_daemon_dfs_message_mutation_service_after_maintenance(
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn release_daemon_dfs_idle_allocator_pages() {
+fn release_daemon_dfs_idle_allocator_pages() -> bool {
     unsafe extern "C" {
         fn malloc_trim(pad: usize) -> std::ffi::c_int;
     }
@@ -3193,11 +3193,13 @@ fn release_daemon_dfs_idle_allocator_pages() {
     // metadata shards. glibc's per-thread arenas otherwise retain those freed
     // pages indefinitely, leaving an idle daemon with the peak RSS of the last
     // maintenance pass.
-    let _ = unsafe { malloc_trim(0) };
+    unsafe { malloc_trim(0) != 0 }
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn release_daemon_dfs_idle_allocator_pages() {}
+fn release_daemon_dfs_idle_allocator_pages() -> bool {
+    false
+}
 
 /// Release the process-global cached lane during main-daemon shutdown. Active
 /// blocking handlers retain both their lane Arc and an explicit data-owner Arc,
@@ -6100,6 +6102,18 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
             .await
         })
         .await;
+    // The cancellable broad generation has been collapsed or destroyed at
+    // this point. Return its freed pages while maintenance still owns message
+    // admission: trimming after releasing the permit can contend on glibc
+    // arena locks with the foreground request this pass just admitted.
+    let allocator_trim_started = Instant::now();
+    let allocator_trimmed = release_daemon_dfs_idle_allocator_pages();
+    tracing::trace!(
+        target: "sinomo.dfs.perf",
+        allocator_trimmed,
+        allocator_trim_ms = allocator_trim_started.elapsed().as_millis(),
+        "dfs maintenance allocator trim"
+    );
     // The preemption helper has already completed or dropped the entire
     // maintenance future before this permit is released. On success it may
     // have restored a reset backend-bearing request lane; on preemption/error
@@ -6131,7 +6145,6 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
         committed_work_tracker.take(),
         &[],
     );
-    release_daemon_dfs_idle_allocator_pages();
     match maintenance_result {
         DaemonDfsMaintenancePreemptionOutcome::Finished(result) => {
             let reached_limit = result?;
@@ -6650,6 +6663,54 @@ fn daemon_dfs_metadata_publish_discovery_lanes(
     Ok(lanes)
 }
 
+async fn run_daemon_dfs_metadata_publish_lane_planning_with_admission<T, F>(
+    mutation_scheduler: Arc<DaemonDfsMutationScheduler>,
+    lane: DaemonDfsMutationLaneKey,
+    plan: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let execution_scope = DfsMessageExecutionScope::ExactShard {
+        file_system_id: lane.file_system_id,
+        shard_id: lane.shard_id,
+    };
+    let admission = mutation_scheduler
+        .admit(&execution_scope)
+        .await
+        .map_err(|error| format!("DFS metadata publish admission failed: {error}"))?;
+    tokio::task::spawn_blocking(move || {
+        // Cancellation of the scheduler future cannot release admission while
+        // its blocking durable-view refresh is still reading the shard.
+        let _admission = admission;
+        plan()
+    })
+    .await
+    .map_err(|error| format!("DFS metadata publish planning task failed: {error}"))?
+}
+
+async fn run_daemon_dfs_metadata_publish_blocking_execution<G, T, Fut>(
+    runtime: tokio::runtime::Handle,
+    execution_guard: G,
+    execute: Fut,
+) -> Result<T, String>
+where
+    G: Send + 'static,
+    T: Send + 'static,
+    Fut: std::future::Future<Output = Result<T, String>> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        // Tokio cannot cancel an already-running blocking closure. Keeping the
+        // capability here prevents scheduler cancellation from releasing it
+        // while nested async transport or cursor commits are still active.
+        let _execution_guard = execution_guard;
+        runtime.block_on(execute)
+    })
+    .await
+    .map_err(|error| format!("DFS metadata publish execution task failed: {error}"))?
+}
+
 fn schedule_daemon_dfs_metadata_publish_discovery_on_runtime(
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
@@ -6797,6 +6858,17 @@ fn schedule_daemon_dfs_metadata_publish_lane_on_runtime(
     };
     #[cfg(test)]
     record_daemon_dfs_metadata_publish_lane_request(&data_dir, &lane);
+    let mutation_scheduler = match daemon_dfs_mutation_scheduler(&data_dir) {
+        Ok(scheduler) => scheduler,
+        Err(error) => {
+            tracing::warn!(
+                file_system_id = %lane.file_system_id,
+                shard_id = %lane.shard_id.0,
+                "sinomo daemon DFS metadata lane lacks mutation admission: {error}"
+            );
+            return DfsMetadataPublishScheduleStart::AlreadyRunning;
+        }
+    };
     let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, runtime);
     let async_peer_transport = daemon_dfs_async_peer_transport(&data_dir, runtime);
     let publish_data_dir = data_dir;
@@ -6822,39 +6894,87 @@ fn schedule_daemon_dfs_metadata_publish_lane_on_runtime(
             let async_peer_transport = Arc::clone(&async_peer_transport);
             let runtime = publish_runtime.clone();
             let data_owner_lock = Arc::clone(&data_owner_lock);
+            let mutation_scheduler = Arc::clone(&mutation_scheduler);
+            let lane = DaemonDfsMutationLaneKey {
+                file_system_id: file_system_id.clone(),
+                shard_id: shard_id.clone(),
+            };
             async move {
-                // The scheduler task can be cancelled during runtime shutdown,
-                // while a blocking planner or transport task keeps running.
-                // Own the daemon's OS-backed data capability in the outer
-                // blocking closure for the complete publish future so an old
-                // authority generation cannot overlap its replacement.
+                // A non-voter refresh can perform peer RPC and inherit a long
+                // network deadline. Complete it before exact-shard admission
+                // so it cannot stall foreground mutations.
+                let refresh_cluster_paths = cluster_paths.clone();
+                let refresh_data_owner_lock = Arc::clone(&data_owner_lock);
                 tokio::task::spawn_blocking(move || {
-                    let _data_owner_lock = data_owner_lock;
-                    let execution_exclusions =
-                        sinomo_core::cluster::read_cluster_state_without_kv(&exclusion_paths)
-                            .map(|state| {
-                                daemon_dfs_maintenance_execution_exclusions(
-                                    &exclusion_paths,
-                                    &state,
-                                )
-                            })
-                            .unwrap_or_default();
-                    runtime.block_on(
-                        sinomo_dfs::publish_cluster_dfs_metadata_shard_with_peer_transports_async_and_execution_exclusions(
-                            &data_dir,
-                            &cluster_paths,
-                            peer_transport,
-                            async_peer_transport,
-                            file_system_id,
-                            shard_id,
-                            &execution_exclusions,
-                            daemon_dfs_metadata_replication_options(),
-                        ),
+                    let _data_owner_lock = refresh_data_owner_lock;
+                    sinomo_dfs::refresh_cluster_dfs_kv_snapshot_with_peer_transport(
+                        &refresh_cluster_paths,
+                        peer_transport,
                     )
                 })
                 .await
-                .map_err(|source| format!("DFS metadata publish task failed: {source}"))?
-                .map_err(|error| error.to_string())
+                .map_err(|error| format!("DFS metadata KV refresh task failed: {error}"))?
+                .map_err(|error| error.to_string())?;
+
+                let planning_data_owner_lock = Arc::clone(&data_owner_lock);
+                let replication_options = daemon_dfs_metadata_replication_options();
+                let plan = run_daemon_dfs_metadata_publish_lane_planning_with_admission(
+                    mutation_scheduler,
+                    lane,
+                    move || {
+                        // The scheduler task can be cancelled while this
+                        // blocking planner is running. Keep exact-shard
+                        // admission and the OS-backed data capability in this
+                        // closure through local durable plan capture. Admission
+                        // is intentionally released before the slow peer
+                        // transport and cursor-checkpoint phase below.
+                        let _data_owner_lock = planning_data_owner_lock;
+                        let execution_exclusions =
+                            sinomo_core::cluster::read_cluster_state_without_kv(&exclusion_paths)
+                                .map(|state| {
+                                    daemon_dfs_maintenance_execution_exclusions(
+                                        &exclusion_paths,
+                                        &state,
+                                    )
+                                })
+                                .unwrap_or_default();
+                        sinomo_dfs::prepare_cluster_dfs_metadata_shard_publish_with_execution_exclusions(
+                            &data_dir,
+                            &cluster_paths,
+                            file_system_id,
+                            shard_id,
+                            &execution_exclusions,
+                            replication_options,
+                        )
+                        .map_err(|error| error.to_string())
+                    },
+                )
+                .await?;
+                let Some(plan) = plan else {
+                    return Ok(DfsMetadataJournalReplicationReport {
+                        outcomes: Vec::new(),
+                    });
+                };
+
+                // Keep the daemon's data-owner capability alive while the
+                // immutable plan is in flight, without occupying mutation
+                // admission for its potentially multi-second network budget.
+                // The outer blocking closure retains that capability even if
+                // the scheduler future is cancelled during runtime shutdown.
+                run_daemon_dfs_metadata_publish_blocking_execution(
+                    runtime,
+                    data_owner_lock,
+                    async move {
+                        sinomo_dfs::execute_prepared_cluster_dfs_metadata_publish_with_async_peer_transport(
+                            plan,
+                            async_peer_transport,
+                            replication_options,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())
+                    },
+                )
+                .await
             }
         },
         move |report| {
@@ -7396,6 +7516,139 @@ mod tests {
             !Arc::ptr_eq(&first, &other),
             "a blocked replica for one shard must not occupy another shard's reactor lane"
         );
+    }
+
+    #[test]
+    fn metadata_publish_admission_fences_planning_but_not_blocked_transport() {
+        struct ExecutionGuardDrop(Arc<AtomicBool>);
+
+        impl Drop for ExecutionGuardDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let runtime = daemon_test_runtime("metadata-publish-foreground-admission");
+        let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
+        let file_system_id = DfsFileSystemId::from_legacy_named("metadata-publish-admission-fs")
+            .expect("filesystem id");
+        let root_lane = DaemonDfsMutationLaneKey {
+            file_system_id: file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new("root"),
+        };
+        let services_lane = DaemonDfsMutationLaneKey {
+            file_system_id,
+            shard_id: DfsMetadataShardId::new("services"),
+        };
+
+        runtime.block_on(async {
+            let foreground_scope = DfsMessageExecutionScope::ExactShard {
+                file_system_id: root_lane.file_system_id.clone(),
+                shard_id: root_lane.shard_id.clone(),
+            };
+            let same_scheduler = Arc::clone(&scheduler);
+            let same_lane = root_lane.clone();
+            let execution_guard_dropped = Arc::new(AtomicBool::new(false));
+            let publisher_guard = ExecutionGuardDrop(Arc::clone(&execution_guard_dropped));
+            let (refresh_started_tx, refresh_started_rx) = tokio::sync::oneshot::channel();
+            let (release_refresh_tx, release_refresh_rx) = tokio::sync::oneshot::channel();
+            let (planned_tx, mut planned_rx) = tokio::sync::oneshot::channel();
+            let (transport_started_tx, transport_started_rx) = tokio::sync::oneshot::channel();
+            let (release_transport_tx, release_transport_rx) = tokio::sync::oneshot::channel();
+            let publisher = tokio::spawn(async move {
+                let _ = refresh_started_tx.send(());
+                release_refresh_rx
+                    .await
+                    .map_err(|_| "blocked KV refresh release was dropped".to_string())?;
+                run_daemon_dfs_metadata_publish_lane_planning_with_admission(
+                    same_scheduler,
+                    same_lane,
+                    move || {
+                        let _ = planned_tx.send(());
+                        Ok(())
+                    },
+                )
+                .await?;
+                run_daemon_dfs_metadata_publish_blocking_execution(
+                    tokio::runtime::Handle::current(),
+                    publisher_guard,
+                    async move {
+                        let _ = transport_started_tx.send(());
+                        release_transport_rx
+                            .await
+                            .map_err(|_| "blocked transport release was dropped".to_string())
+                    },
+                )
+                .await
+            });
+            refresh_started_rx
+                .await
+                .expect("publisher must enter its KV refresh phase");
+            let foreground = tokio::time::timeout(
+                Duration::from_secs(2),
+                scheduler.admit(&foreground_scope),
+            )
+            .await
+            .expect("blocked KV refresh must not retain same-shard admission")
+            .expect("foreground root admission");
+            release_refresh_tx.send(()).expect("release blocked KV refresh");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut planned_rx)
+                    .await
+                    .is_err(),
+                "same-shard publisher planning must wait until the foreground transaction releases admission"
+            );
+
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                run_daemon_dfs_metadata_publish_lane_planning_with_admission(
+                    Arc::clone(&scheduler),
+                    services_lane,
+                    || Ok(()),
+                ),
+            )
+            .await
+            .expect("disjoint-shard publisher must remain concurrent")
+            .expect("disjoint-shard publish");
+
+            drop(foreground);
+            tokio::time::timeout(Duration::from_secs(2), &mut planned_rx)
+                .await
+                .expect("same-shard publisher must resume after foreground completion")
+                .expect("same-shard planner signal");
+            transport_started_rx
+                .await
+                .expect("publisher must enter its transport phase");
+
+            let later_foreground = tokio::time::timeout(
+                Duration::from_secs(2),
+                scheduler.admit(&foreground_scope),
+            )
+            .await
+            .expect("blocked transport must not retain same-shard admission")
+            .expect("later foreground root admission");
+            drop(later_foreground);
+
+            publisher.abort();
+            assert!(
+                publisher.await.expect_err("publisher task should be cancelled").is_cancelled(),
+                "test must cancel the scheduler future while blocking execution continues"
+            );
+            assert!(
+                !execution_guard_dropped.load(Ordering::SeqCst),
+                "scheduler cancellation must not drop the execution capability while transport is active"
+            );
+            release_transport_tx
+                .send(())
+                .expect("release blocked transport");
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !execution_guard_dropped.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("execution capability must release after transport completion");
+        });
     }
 
     #[test]

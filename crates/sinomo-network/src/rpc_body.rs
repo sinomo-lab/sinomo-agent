@@ -2349,6 +2349,51 @@ pub struct ObjectRpcCall {
     pub body: ObjectRpcBodySource,
 }
 
+/// One encoded ordinary value that can produce independent RPC calls without
+/// re-serializing or duplicating its immutable wire bytes.
+///
+/// This is a deliberately bounded fan-out primitive rather than the default
+/// request path. It retains one complete encoded value, while each produced
+/// call remains credit-bounded as the shared bytes are copied into that
+/// connection's transport-owned slabs.
+#[derive(Clone)]
+pub struct ObjectRpcReplayableCall {
+    request: crate::ObjectRpcRequest,
+    value: Bytes,
+}
+
+impl fmt::Debug for ObjectRpcReplayableCall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObjectRpcReplayableCall")
+            .field("route", &self.request.route)
+            .field("category", &self.request.category)
+            .field("value_bytes", &self.value.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ObjectRpcReplayableCall {
+    /// Produces one independently consumable value call over the shared wire
+    /// representation.
+    pub fn call(&self) -> ObjectRpcCall {
+        ObjectRpcCall {
+            request: self.request.clone(),
+            body: ObjectRpcBodySource {
+                kind: ObjectRpcBodySourceKind::Bytes(ReplayableBytes {
+                    bytes: self.value.clone(),
+                }),
+                role: ObjectRpcBodyRole::Value,
+                lifetime_guards: Arc::new(Mutex::new(Vec::new())),
+            },
+        }
+    }
+
+    pub fn encoded_value_bytes(&self) -> usize {
+        self.value.len()
+    }
+}
+
 impl ObjectRpcCall {
     pub fn new(request: crate::ObjectRpcRequest, body: ObjectRpcBodySource) -> Self {
         Self {
@@ -2407,6 +2452,19 @@ impl ObjectRpcCall {
         Ok(Self {
             request: crate::ObjectRpcRequest::from_encoded_body(route, category, Vec::new()),
             body: ObjectRpcBodySource::sobj_shared_value(value)?,
+        })
+    }
+
+    /// Serializes one bounded ordinary value once for concurrent replay to
+    /// multiple targets.
+    pub fn encode_replayable_value<T: Serialize + ?Sized>(
+        route: impl Into<String>,
+        category: impl Into<String>,
+        value: &T,
+    ) -> Result<ObjectRpcReplayableCall, NetworkError> {
+        Ok(ObjectRpcReplayableCall {
+            request: crate::ObjectRpcRequest::from_encoded_body(route, category, Vec::new()),
+            value: Bytes::from(SinomoObjectCodec::network_frame().encode(value)?),
         })
     }
 
@@ -3712,6 +3770,54 @@ mod tests {
             "shared producer exceeded its current-plus-queued slab budget: {:?}",
             allocator.metrics()
         );
+    }
+
+    #[tokio::test]
+    async fn replayable_value_fanout_shares_one_encoding_across_independent_calls() {
+        let value = UnknownLengthMap {
+            payload: (0..(BODY_CHUNK_MAX * 3 + 173))
+                .map(|offset| (offset % 239) as u8)
+                .collect(),
+        };
+        let expected = crate::SinomoObjectCodec::network_frame()
+            .encode(&value)
+            .expect("encode contiguous reference");
+        let replayable = ObjectRpcCall::encode_replayable_value(
+            "/test/replayable-fanout",
+            "test.replayable-fanout",
+            &value,
+        )
+        .expect("prepare replayable call");
+        assert_eq!(replayable.encoded_value_bytes(), expected.len());
+
+        let pool = crate::owned_chunk::ChunkPool::new(8 * SECURE_WIRE_MAX, SECURE_WIRE_MAX, 0, 0);
+        let allocator = ChunkAllocator::new(pool, 2 * SECURE_WIRE_MAX, SECURE_WIRE_MAX);
+        let mut shared_pointer = None;
+        for call in [replayable.call(), replayable.call()] {
+            assert!(call.has_streamed_value_body());
+            let ObjectRpcBodySourceKind::Bytes(source) = &call.body.kind else {
+                panic!("replayable call must retain shared immutable bytes");
+            };
+            match shared_pointer {
+                Some(pointer) => assert_eq!(source.bytes.as_ptr(), pointer),
+                None => shared_pointer = Some(source.bytes.as_ptr()),
+            }
+
+            let mut producer = call
+                .body
+                .producer(BODY_CHUNK_MAX)
+                .expect("open replayable producer");
+            let mut actual = Vec::with_capacity(expected.len());
+            while let Some(chunk) = producer
+                .next_owned(&allocator)
+                .await
+                .expect("read replayable chunk")
+            {
+                actual.extend_from_slice(chunk.as_slice());
+            }
+            producer.finish().await.expect("finish replayable producer");
+            assert_eq!(actual, expected);
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
