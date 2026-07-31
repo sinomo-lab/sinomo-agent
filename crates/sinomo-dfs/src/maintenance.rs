@@ -321,6 +321,92 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_deta
     .await
 }
 
+/// Refresh cluster KV for maintenance and return the exact resulting bootstrap
+/// state.
+///
+/// A reusable backend must be selected only after this refresh so topology
+/// changes observed while maintenance waited for admission cannot run against
+/// a stale service generation.
+pub async fn refresh_cluster_dfs_maintenance_state_with_peer_transport(
+    runtime: &tokio::runtime::Handle,
+    cluster_paths: &ClusterPaths,
+    peer_transport: &dyn DfsPeerTransport,
+) -> Result<sinomo_core::ClusterBootstrapState, DfsError> {
+    refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport(
+        cluster_paths,
+        peer_transport,
+    )?;
+    sinomo_core::cluster::read_cluster_state_without_kv_async(runtime, cluster_paths)
+        .await
+        .map_err(DfsError::from_network)
+}
+
+/// Run one cluster maintenance tick against a reusable service after the
+/// caller refreshed cluster KV and captured the returned bootstrap state.
+///
+/// Keeping refresh and execution as distinct steps lets the daemon validate
+/// the cached backend generation against the exact post-refresh authority
+/// image before it transfers ownership into this cancellable future.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_cluster_dfs_maintenance_tick_with_reusable_service_until_hydration_cancelled<T>(
+    service: &mut NetworkedDfsService<T>,
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    state: sinomo_core::ClusterBootstrapState,
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    execution_exclusions: DfsMaintenanceExecutionExclusions,
+    committed_work_tracker: DfsCommittedWorkTracker,
+    should_cancel_hydration: &(dyn Fn() -> bool + Sync),
+    options: DfsMaintenanceTickOptions,
+) -> Result<Option<DfsMaintenanceTickReport>, DfsError>
+where
+    T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
+{
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| DfsError::Metadata {
+            message: source.to_string(),
+        })?;
+    if !cluster_paths.state.exists() {
+        return Ok(None);
+    }
+
+    service.refresh_control_plane_latest()?;
+    let local_node_id = state.local_node_id.clone();
+    let file_system = distributed_sifs(local_node_id.clone());
+    let metadata_shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
+    let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+
+    service.set_committed_work_tracker(committed_work_tracker);
+    if !service.hydrate_from_metadata_backend_for_commit_promotion_recovery_until_cancelled(
+        should_cancel_hydration,
+    )? {
+        return Ok(None);
+    }
+
+    let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
+    let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
+    let mut metadata_transport = AsyncDfsMetadataNodeTransport::new(
+        peer_node_ids,
+        async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
+    );
+    run_dfs_maintenance_tick_with_async_host_and_execution_exclusions(
+        service,
+        &mut maintenance_host,
+        &data_dir,
+        file_system.file_system_id,
+        &local_node_id,
+        metadata_shards,
+        &mut metadata_publisher_host,
+        &mut metadata_transport,
+        &execution_exclusions,
+        options,
+    )
+    .await
+    .map(Some)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional_detached_state(
     runtime: &tokio::runtime::Handle,

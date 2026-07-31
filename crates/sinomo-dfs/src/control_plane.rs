@@ -4631,7 +4631,14 @@ pub(crate) fn select_metadata_shard_config_for_path(
     select_metadata_shard_config_for_path_with_options(file_system_id, shards, path, false)
 }
 
-pub(crate) fn select_metadata_shard_config_for_path_strict_default_sifs_split(
+/// Select one metadata shard from an already-authoritative catalog while
+/// rejecting a partial default SIFS split.
+///
+/// This pure selector is useful to validate an immutable catalog snapshot
+/// without re-inserting its shard records into another KV store. Re-insertion
+/// would repeat activation validation and would also require copying unrelated
+/// authority evidence, such as member capability records.
+pub fn select_metadata_shard_config_for_path_strict_default_sifs_split(
     file_system_id: &DfsFileSystemId,
     shards: &[DfsMetadataShardConfig],
     path: &str,

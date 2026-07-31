@@ -1402,6 +1402,27 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(summary)
     }
 
+    /// Compute the operational metadata counts owned by this node's current
+    /// primary shards.
+    ///
+    /// A non-sharded backend is wholly local, so the default is the complete
+    /// summary. Topology-aware inspection backends override this to exclude
+    /// replica-only backlog without reopening a second subset of shard stores.
+    fn metadata_summary_for_local_primary_shards(&self) -> Result<DfsMetadataSummary> {
+        self.metadata_summary()
+    }
+
+    /// Compute the complete and local-primary operational summaries from one
+    /// coherent table observation.
+    ///
+    /// The default backend is wholly local, so both projections are identical.
+    /// Sharded backends override this to avoid rescanning primary tables after
+    /// building the complete operator summary.
+    fn metadata_status_summaries(&self) -> Result<(DfsMetadataSummary, DfsMetadataSummary)> {
+        let summary = self.metadata_summary()?;
+        Ok((summary.clone(), summary))
+    }
+
     /// Compute a metadata summary for one filesystem, returning `None` when
     /// the filesystem is unknown.
     fn metadata_summary_for_file_system(

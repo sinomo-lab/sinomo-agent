@@ -13,7 +13,8 @@ use std::time::UNIX_EPOCH;
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_records::DfsMetadataPrefixProof;
 use crate::metadata_table_store::{
-    metadata_table_checkpoint_log_path, metadata_table_path, metadata_table_snapshot_fingerprint,
+    MetadataTableStorageGeneration, metadata_table_checkpoint_log_path, metadata_table_path,
+    metadata_table_snapshot_fingerprint, metadata_table_storage_generation,
     read_metadata_table_state, read_metadata_table_state_lenient,
     replay_metadata_table_batches_from,
 };
@@ -28,6 +29,9 @@ thread_local! {
         const { std::cell::Cell::new(0) };
     static METADATA_CHECKPOINT_SNAPSHOT_DECODES: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static METADATA_CHECKPOINT_BORROW_VALIDATION_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -50,18 +54,93 @@ fn metadata_checkpoint_snapshot_decodes() -> usize {
     METADATA_CHECKPOINT_SNAPSHOT_DECODES.get()
 }
 
+#[cfg(test)]
+fn install_metadata_checkpoint_borrow_validation_hook(action: impl FnOnce() + 'static) {
+    METADATA_CHECKPOINT_BORROW_VALIDATION_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(action));
+    });
+}
+
+#[cfg(test)]
+fn run_metadata_checkpoint_borrow_validation_hook() {
+    let action = METADATA_CHECKPOINT_BORROW_VALIDATION_HOOK.with(|hook| hook.borrow_mut().take());
+    if let Some(action) = action {
+        action();
+    }
+}
+
 pub(crate) fn refresh_metadata_tables(
     root: &Path,
     tables: &mut DfsMetadataTables,
     table_log_offset: &mut u64,
+    table_log_journal_reference_replay_cost_bytes: &mut u64,
+    table_log_unpriced_namespace_prepare_references: &mut u64,
     materialized_through_sequence: &mut u64,
     table_snapshot_fingerprint: &mut Option<MetadataTableSnapshotFingerprint>,
     prefix_proof: &mut Option<DfsMetadataPrefixProof>,
 ) -> Result<()> {
+    refresh_metadata_tables_with_reader(
+        root,
+        tables,
+        table_log_offset,
+        table_log_journal_reference_replay_cost_bytes,
+        table_log_unpriced_namespace_prepare_references,
+        materialized_through_sequence,
+        table_snapshot_fingerprint,
+        prefix_proof,
+        read_metadata_table_state,
+    )
+}
+
+/// Refresh an inspection-only table image without repairing any durable
+/// metadata. In particular, full reloads must not truncate crash-torn table
+/// tails or persist snapshot verification records merely because a status
+/// reader observed a new checkpoint generation.
+pub(crate) fn refresh_metadata_tables_lenient(
+    root: &Path,
+    tables: &mut DfsMetadataTables,
+    table_log_offset: &mut u64,
+    table_log_journal_reference_replay_cost_bytes: &mut u64,
+    table_log_unpriced_namespace_prepare_references: &mut u64,
+    materialized_through_sequence: &mut u64,
+    table_snapshot_fingerprint: &mut Option<MetadataTableSnapshotFingerprint>,
+    prefix_proof: &mut Option<DfsMetadataPrefixProof>,
+) -> Result<()> {
+    refresh_metadata_tables_with_reader(
+        root,
+        tables,
+        table_log_offset,
+        table_log_journal_reference_replay_cost_bytes,
+        table_log_unpriced_namespace_prepare_references,
+        materialized_through_sequence,
+        table_snapshot_fingerprint,
+        prefix_proof,
+        read_metadata_table_state_lenient,
+    )
+}
+
+fn refresh_metadata_tables_with_reader<ReadState>(
+    root: &Path,
+    tables: &mut DfsMetadataTables,
+    table_log_offset: &mut u64,
+    table_log_journal_reference_replay_cost_bytes: &mut u64,
+    table_log_unpriced_namespace_prepare_references: &mut u64,
+    materialized_through_sequence: &mut u64,
+    table_snapshot_fingerprint: &mut Option<MetadataTableSnapshotFingerprint>,
+    prefix_proof: &mut Option<DfsMetadataPrefixProof>,
+    read_state: ReadState,
+) -> Result<()>
+where
+    ReadState: Fn(&Path) -> Result<DfsMetadataTableState> + Copy,
+{
     if metadata_table_checkpoint_log_path(root).is_file() {
-        let state = read_metadata_table_state(root)?;
+        let state = read_state(root)?;
         *tables = state.tables;
         *table_log_offset = state.table_log_offset;
+        *table_log_journal_reference_replay_cost_bytes =
+            state.table_log_journal_reference_replay_cost_bytes;
+        *table_log_unpriced_namespace_prepare_references =
+            state.table_log_unpriced_namespace_prepare_references;
         *materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
         *table_snapshot_fingerprint = state.snapshot_fingerprint;
         *prefix_proof = state.prefix_proof;
@@ -71,9 +150,12 @@ pub(crate) fn refresh_metadata_tables(
         root,
         tables,
         table_log_offset,
+        table_log_journal_reference_replay_cost_bytes,
+        table_log_unpriced_namespace_prepare_references,
         materialized_through_sequence,
         table_snapshot_fingerprint,
         prefix_proof,
+        read_state,
     )?;
     let path = metadata_table_path(root);
     let len = match fs::metadata(&path) {
@@ -87,9 +169,13 @@ pub(crate) fn refresh_metadata_tables(
         }
     };
     if len < *table_log_offset {
-        let state = read_metadata_table_state(root)?;
+        let state = read_state(root)?;
         *tables = state.tables;
         *table_log_offset = state.table_log_offset;
+        *table_log_journal_reference_replay_cost_bytes =
+            state.table_log_journal_reference_replay_cost_bytes;
+        *table_log_unpriced_namespace_prepare_references =
+            state.table_log_unpriced_namespace_prepare_references;
         *materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
         *table_snapshot_fingerprint = state.snapshot_fingerprint;
         *prefix_proof = state.prefix_proof;
@@ -100,6 +186,11 @@ pub(crate) fn refresh_metadata_tables(
     }
     let replay = replay_metadata_table_batches_from(root, &path, *table_log_offset, tables)?;
     *table_log_offset = replay.offset;
+    *table_log_journal_reference_replay_cost_bytes = table_log_journal_reference_replay_cost_bytes
+        .saturating_add(replay.journal_reference_replay_cost_bytes);
+    *table_log_unpriced_namespace_prepare_references =
+        table_log_unpriced_namespace_prepare_references
+            .saturating_add(replay.unpriced_namespace_prepare_references);
     if let Some(sequence) = replay.materialized_through_sequence {
         *materialized_through_sequence = (*materialized_through_sequence).max(sequence);
     }
@@ -115,12 +206,47 @@ pub(crate) fn current_tables_snapshot<'a>(
     table_log_offset: u64,
     materialized_through_sequence: u64,
     table_snapshot_fingerprint: &Option<MetadataTableSnapshotFingerprint>,
+    loaded_storage_generation: &Option<MetadataTableStorageGeneration>,
+    prefix_proof: &Option<DfsMetadataPrefixProof>,
     read_snapshot_cache: &Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
 ) -> Result<DfsMetadataTablesSnapshot<'a>> {
     #[cfg(test)]
     METADATA_DURABLE_TABLE_PROBES.set(METADATA_DURABLE_TABLE_PROBES.get().saturating_add(1));
     let checkpoint_fingerprint = metadata_table_checkpoint_fingerprint(root)?;
     if checkpoint_fingerprint.is_some() {
+        if let Some(loaded_storage_generation) = loaded_storage_generation
+            && prefix_proof.as_ref().is_some_and(|proof| {
+                proof.is_well_formed() && proof.journal_sequence == materialized_through_sequence
+            })
+        {
+            let generation_before = metadata_table_storage_generation(root)?;
+            if loaded_storage_generation
+                .permits_live_table_borrow(&generation_before, table_log_offset)
+            {
+                #[cfg(test)]
+                run_metadata_checkpoint_borrow_validation_hook();
+                let generation_after = metadata_table_storage_generation(root)?;
+                if generation_before == generation_after
+                    && loaded_storage_generation
+                        .permits_live_table_borrow(&generation_after, table_log_offset)
+                {
+                    return Ok(DfsMetadataTablesSnapshot::Borrowed(live_tables));
+                }
+                // A checkpoint rotation/replacement crossed the validation
+                // window. Do not consult a cache keyed by the generation
+                // sampled before that race; the stable table reader will
+                // restart around the durable transition and return one owned
+                // exact-cut image.
+                #[cfg(test)]
+                METADATA_CHECKPOINT_SNAPSHOT_DECODES
+                    .set(METADATA_CHECKPOINT_SNAPSHOT_DECODES.get().saturating_add(1));
+                return Ok(snapshot_from_state(
+                    read_snapshot_cache,
+                    read_metadata_table_state_lenient(root)?,
+                    metadata_table_checkpoint_fingerprint(root)?,
+                ));
+            }
+        }
         let path = metadata_table_path(root);
         let current_snapshot_fingerprint = metadata_table_snapshot_fingerprint(root)?;
         let table_log_offset = metadata_table_log_len(&path)?;
@@ -179,6 +305,10 @@ pub(crate) fn current_tables_snapshot<'a>(
                 let state = DfsMetadataTableState {
                     tables,
                     table_log_offset: replay.offset,
+                    table_log_journal_reference_replay_cost_bytes: replay
+                        .journal_reference_replay_cost_bytes,
+                    table_log_unpriced_namespace_prepare_references: replay
+                        .unpriced_namespace_prepare_references,
                     materialized_through_sequence: max_optional_sequence(
                         Some(materialized_through_sequence),
                         replay.materialized_through_sequence,
@@ -298,21 +428,31 @@ fn metadata_table_log_len(path: &Path) -> Result<u64> {
     }
 }
 
-fn reload_metadata_tables_if_snapshot_changed(
+fn reload_metadata_tables_if_snapshot_changed<ReadState>(
     root: &Path,
     tables: &mut DfsMetadataTables,
     table_log_offset: &mut u64,
+    table_log_journal_reference_replay_cost_bytes: &mut u64,
+    table_log_unpriced_namespace_prepare_references: &mut u64,
     materialized_through_sequence: &mut u64,
     table_snapshot_fingerprint: &mut Option<MetadataTableSnapshotFingerprint>,
     prefix_proof: &mut Option<DfsMetadataPrefixProof>,
-) -> Result<()> {
+    read_state: ReadState,
+) -> Result<()>
+where
+    ReadState: Fn(&Path) -> Result<DfsMetadataTableState>,
+{
     let current = metadata_table_snapshot_fingerprint(root)?;
     if current == *table_snapshot_fingerprint {
         return Ok(());
     }
-    let state = read_metadata_table_state(root)?;
+    let state = read_state(root)?;
     *tables = state.tables;
     *table_log_offset = state.table_log_offset;
+    *table_log_journal_reference_replay_cost_bytes =
+        state.table_log_journal_reference_replay_cost_bytes;
+    *table_log_unpriced_namespace_prepare_references =
+        state.table_log_unpriced_namespace_prepare_references;
     *materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
     *table_snapshot_fingerprint = state.snapshot_fingerprint;
     *prefix_proof = state.prefix_proof;
@@ -326,12 +466,14 @@ mod tests {
     use sinomo_core::node::NodeId;
 
     use super::*;
-    use crate::metadata_records::{DfsMetadataTableBatch, DfsMetadataTableOp};
+    use crate::metadata_records::{
+        DfsMetadataTableBatch, DfsMetadataTableOp, dfs_metadata_prefix_proof_seed,
+    };
     use crate::metadata_table_store::{
         append_metadata_table_batch, metadata_table_checkpoint_log_path, metadata_table_path,
         persist_metadata_table_snapshot, rotate_metadata_table_log_for_checkpoint,
     };
-    use crate::{DfsFileSystem, DfsFileSystemId};
+    use crate::{DfsFileSystem, DfsFileSystemId, DfsMetadataShardId};
 
     fn file_system(label: &str, display_name_bytes: usize) -> DfsFileSystem {
         DfsFileSystem {
@@ -344,12 +486,18 @@ mod tests {
     }
 
     fn append_file_system(root: &Path, sequence: u64, file_system: DfsFileSystem) -> u64 {
+        let prefix_proof = dfs_metadata_prefix_proof_seed(
+            &DfsMetadataShardId::new("shard-test"),
+            sequence,
+            &format!("checkpoint-read-fixture-{sequence}"),
+        );
         append_metadata_table_batch(
             root,
             &DfsMetadataTableBatch {
                 sequence,
                 ops: vec![DfsMetadataTableOp::PutFileSystem { file_system }],
-                prefix_proof: None,
+                prefix_proof: Some(prefix_proof),
+                journal_reference_replay_cost_bytes: 0,
             },
         )
         .expect("append metadata table batch")
@@ -380,6 +528,117 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_snapshot_borrows_matching_loaded_storage_generation_without_decode() {
+        let root =
+            sinomo_testdir::TestDir::new("sinomo-dfs-metadata-checkpoint-borrow-same-generation");
+        let checkpoint_file_system = file_system("checkpoint", 1);
+        setup_rotated_checkpoint(root.path(), checkpoint_file_system.clone());
+        let state =
+            read_metadata_table_state_lenient(root.path()).expect("load exact checkpoint state");
+        let loaded_storage_generation = Some(
+            metadata_table_storage_generation(root.path())
+                .expect("capture loaded checkpoint generation"),
+        );
+        let cache = Arc::new(Mutex::new(None));
+        reset_metadata_checkpoint_snapshot_decodes();
+
+        let snapshot = current_tables_snapshot(
+            root.path(),
+            &state.tables,
+            state.table_log_offset,
+            state.materialized_through_sequence.unwrap_or(0),
+            &state.snapshot_fingerprint,
+            &loaded_storage_generation,
+            &state.prefix_proof,
+            &cache,
+        )
+        .expect("borrow matching checkpoint generation");
+        match snapshot {
+            DfsMetadataTablesSnapshot::Borrowed(tables) => {
+                assert!(std::ptr::eq(tables, &state.tables));
+                assert!(
+                    tables
+                        .file_systems
+                        .contains_key(&checkpoint_file_system.file_system_id)
+                );
+            }
+            DfsMetadataTablesSnapshot::Shared(_) => {
+                panic!("an exact loaded checkpoint generation must borrow its live tables")
+            }
+        }
+        assert_eq!(metadata_checkpoint_snapshot_decodes(), 0);
+        assert!(
+            cache.lock().expect("snapshot cache").is_none(),
+            "borrowing the live checkpoint generation must not retain a second table image"
+        );
+    }
+
+    #[test]
+    fn checkpoint_snapshot_borrow_revalidates_concurrent_equal_length_replacement() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-metadata-checkpoint-borrow-race");
+        let original_checkpoint = file_system("original", 1);
+        setup_rotated_checkpoint(root.path(), original_checkpoint.clone());
+        let state =
+            read_metadata_table_state_lenient(root.path()).expect("load original checkpoint state");
+        let loaded_storage_generation = Some(
+            metadata_table_storage_generation(root.path())
+                .expect("capture original checkpoint generation"),
+        );
+
+        let replacement_root =
+            sinomo_testdir::TestDir::new("sinomo-dfs-metadata-checkpoint-borrow-race-replacement");
+        let replacement_checkpoint = file_system("replaced", 1);
+        append_file_system(replacement_root.path(), 1, replacement_checkpoint.clone());
+        let replacement_bytes =
+            fs::read(metadata_table_path(replacement_root.path())).expect("replacement bytes");
+        let checkpoint_path = metadata_table_checkpoint_log_path(root.path());
+        assert_eq!(
+            replacement_bytes.len() as u64,
+            fs::metadata(&checkpoint_path)
+                .expect("original checkpoint metadata")
+                .len(),
+            "race fixture must preserve checkpoint length so identity validation is load-bearing"
+        );
+        install_metadata_checkpoint_borrow_validation_hook({
+            let checkpoint_path = checkpoint_path.clone();
+            move || {
+                crate::metadata_io::write_file_atomic(&checkpoint_path, &replacement_bytes)
+                    .expect("replace checkpoint during borrow validation");
+            }
+        });
+
+        let cache = Arc::new(Mutex::new(None));
+        reset_metadata_checkpoint_snapshot_decodes();
+        let snapshot = current_tables_snapshot(
+            root.path(),
+            &state.tables,
+            state.table_log_offset,
+            state.materialized_through_sequence.unwrap_or(0),
+            &state.snapshot_fingerprint,
+            &loaded_storage_generation,
+            &state.prefix_proof,
+            &cache,
+        )
+        .expect("fall back after concurrent checkpoint replacement");
+        let tables = shared_tables(snapshot);
+        assert!(
+            tables
+                .file_systems
+                .contains_key(&replacement_checkpoint.file_system_id)
+        );
+        assert!(
+            !tables
+                .file_systems
+                .contains_key(&original_checkpoint.file_system_id)
+        );
+        assert_eq!(
+            metadata_checkpoint_snapshot_decodes(),
+            1,
+            "a raced checkpoint generation must take the owned decode path"
+        );
+    }
+
+    #[test]
     fn checkpoint_snapshot_cache_decodes_once_and_advances_active_suffix() {
         let root =
             sinomo_testdir::TestDir::new("sinomo-dfs-metadata-checkpoint-read-snapshot-cache");
@@ -398,6 +657,8 @@ mod tests {
                 0,
                 0,
                 &snapshot_fingerprint,
+                &None,
+                &None,
                 &cache,
             )
             .expect("read rotated checkpoint snapshot"),
@@ -417,6 +678,8 @@ mod tests {
                 0,
                 0,
                 &snapshot_fingerprint,
+                &None,
+                &None,
                 &cache,
             )
             .expect("reuse rotated checkpoint snapshot"),
@@ -433,6 +696,8 @@ mod tests {
                 0,
                 0,
                 &snapshot_fingerprint,
+                &None,
+                &None,
                 &cache,
             )
             .expect("advance cached snapshot through active suffix"),
@@ -478,6 +743,8 @@ mod tests {
                 0,
                 0,
                 &snapshot_fingerprint,
+                &None,
+                &None,
                 &cache,
             )
             .expect("cache original checkpoint generation"),
@@ -515,6 +782,8 @@ mod tests {
                 0,
                 0,
                 &snapshot_fingerprint,
+                &None,
+                &None,
                 &cache,
             )
             .expect("reload changed checkpoint generation"),
@@ -540,6 +809,8 @@ mod tests {
                 0,
                 0,
                 &snapshot_fingerprint,
+                &None,
+                &None,
                 &cache,
             )
             .expect("advance replacement checkpoint suffix"),
@@ -565,6 +836,8 @@ mod tests {
                 0,
                 0,
                 &snapshot_fingerprint,
+                &None,
+                &None,
                 &cache,
             )
             .expect("reload after active log shrink"),
@@ -590,6 +863,8 @@ mod tests {
                 0,
                 0,
                 &snapshot_fingerprint,
+                &None,
+                &None,
                 &cache,
             )
             .expect("invalidate checkpoint cache after removal"),

@@ -272,6 +272,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(self)
     }
 
+    /// Rebuild the lightweight service shell while retaining this exact
+    /// backend generation, transport, content store, and control-plane client.
+    ///
+    /// Broad maintenance temporarily hydrates complete object, intent, and
+    /// receipt state. A long-lived daemon request lane needs only the durable
+    /// backend plus filesystem and namespace guards between requests; keeping
+    /// the full hydrated projection would retain a second copy of accumulated
+    /// metadata. Consuming the service also makes it impossible for callers to
+    /// accidentally reuse pending in-memory operation state after maintenance.
+    pub fn into_lazy_metadata_backend_service(mut self) -> Result<Self, DfsError> {
+        let metadata_backend = self.metadata_backend.take();
+        let control_plane = self.control_plane.take();
+        let Self {
+            transport, content, ..
+        } = self;
+        let mut service = Self::new(transport, content);
+        service.control_plane = control_plane;
+        service.metadata_backend = metadata_backend;
+        service.hydrate_file_systems_from_metadata_backend()?;
+        Ok(service)
+    }
+
     pub fn node_id(&self) -> &NodeId {
         &self.node_id
     }

@@ -6,25 +6,210 @@
 
 #[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
 
 use sinomo_core::local::{LocalDataError, SinomoDataDir};
 use sinomo_core::network::ClusterPaths;
 use sinomo_core::node::NodeId;
 
+use crate::metadata_sharded_backend::routing_topology_history_path;
 use crate::{
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsConflictRecord, DfsError,
     DfsFileSystemConfig, DfsFileSystemId, DfsMetadataBackend, DfsMetadataShardConfig,
     DfsMetadataShardHeadWatermark, DfsMetadataShardId, DfsMetadataShardMembershipHandoff,
-    DfsObjectId, DfsOperatorFileSystemView, DfsOperatorInspector, DfsOperatorObjectView,
-    DfsOperatorRepairView, DfsOperatorStatus, DfsPinAddRequest, DfsPinMode, DfsPinRecord,
-    DfsPinStoreError, LocalDfsPinStore, LocalShardedMetadataBackend, LocalSobjMetadataBackend,
-    MetadataBackendError, default_dfs_repair_attempt_snapshot_path, metadata_shards_prefix,
-    read_dfs_repair_attempt_snapshot, resolve_dfs_conflicts, sifs_file_system_id,
-    use_dfs_conflict_version,
+    DfsMetadataSummary, DfsObjectId, DfsOperatorFileSystemView, DfsOperatorInspector,
+    DfsOperatorObjectView, DfsOperatorRepairView, DfsOperatorStatus, DfsPinAddRequest, DfsPinMode,
+    DfsPinRecord, DfsPinStoreError, LocalDfsPinStore, LocalShardedMetadataBackend,
+    LocalSobjMetadataBackend, MetadataBackendError, default_dfs_repair_attempt_snapshot_path,
+    metadata_shards_prefix, read_dfs_repair_attempt_snapshot, resolve_dfs_conflicts,
+    sifs_file_system_id, use_dfs_conflict_version,
 };
 
 const DFS_STATUS_REPAIR_ATTEMPT_SAMPLE_LIMIT: usize = 32;
+const DFS_METADATA_INSPECTION_CACHE_CAPACITY: usize = 4;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DfsMetadataInspectionIdentity {
+    Root {
+        metadata_root: PathBuf,
+    },
+    Sharded {
+        metadata_root: PathBuf,
+        local_node_id: NodeId,
+        shards: Vec<DfsMetadataShardConfig>,
+        routing_topology_generation: Option<DfsMetadataInspectionFileGeneration>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DfsMetadataInspectionFileGeneration {
+    is_file: bool,
+    len: u64,
+    modified_unix_nanos: Option<u128>,
+    created_unix_nanos: Option<u128>,
+    platform_identity: Option<String>,
+}
+
+fn dfs_metadata_inspection_file_generation(
+    path: &Path,
+) -> Result<Option<DfsMetadataInspectionFileGeneration>, DfsError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(metadata_inspection_cache_error(format!(
+                "cannot inspect DFS metadata topology generation {}: {source}",
+                path.display()
+            )));
+        }
+    };
+    let modified_unix_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    let created_unix_nanos = metadata
+        .created()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    #[cfg(unix)]
+    let platform_identity = {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(format!(
+            "unix:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec()
+        ))
+    };
+    #[cfg(not(unix))]
+    let platform_identity = None;
+    Ok(Some(DfsMetadataInspectionFileGeneration {
+        is_file: metadata.is_file(),
+        len: metadata.len(),
+        modified_unix_nanos,
+        created_unix_nanos,
+        platform_identity,
+    }))
+}
+
+#[cfg(test)]
+impl DfsMetadataInspectionIdentity {
+    fn metadata_root(&self) -> &Path {
+        match self {
+            Self::Root { metadata_root } | Self::Sharded { metadata_root, .. } => metadata_root,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CachedDfsMetadataInspectionBackend {
+    Root(LocalSobjMetadataBackend),
+    Sharded(LocalShardedMetadataBackend),
+}
+
+impl CachedDfsMetadataInspectionBackend {
+    fn open(identity: &DfsMetadataInspectionIdentity) -> Result<Self, DfsError> {
+        match identity {
+            DfsMetadataInspectionIdentity::Root { metadata_root } => {
+                open_root_local_metadata_backend_for_inspection(metadata_root.clone())
+                    .map(Self::Root)
+                    .map_err(Into::into)
+            }
+            DfsMetadataInspectionIdentity::Sharded {
+                metadata_root,
+                local_node_id,
+                shards,
+                ..
+            } => open_local_sharded_metadata_backend_for_inspection_at_node(
+                metadata_root.clone(),
+                shards.clone(),
+                local_node_id,
+            )
+            .map(Self::Sharded)
+            .map_err(Into::into),
+        }
+    }
+
+    fn begin_inspection_snapshot(&mut self) -> Result<(), DfsError> {
+        match self {
+            Self::Root(backend) => backend.begin_inspection_snapshot(),
+            Self::Sharded(backend) => backend.begin_inspection_snapshot(),
+        }
+        .map_err(Into::into)
+    }
+
+    fn end_inspection_snapshot(&mut self) {
+        match self {
+            Self::Root(backend) => backend.end_inspection_snapshot(),
+            Self::Sharded(backend) => backend.end_inspection_snapshot(),
+        }
+    }
+
+    fn as_metadata_backend(&self) -> &dyn DfsMetadataBackend {
+        match self {
+            Self::Root(backend) => backend,
+            Self::Sharded(backend) => backend,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CachedDfsMetadataInspection {
+    identity: DfsMetadataInspectionIdentity,
+    backend: CachedDfsMetadataInspectionBackend,
+}
+
+type DfsMetadataInspectionCacheSlot = Arc<Mutex<Option<CachedDfsMetadataInspection>>>;
+
+#[derive(Default)]
+struct DfsMetadataInspectionCache {
+    slots: BTreeMap<PathBuf, DfsMetadataInspectionCacheSlot>,
+    recency: VecDeque<PathBuf>,
+}
+
+impl DfsMetadataInspectionCache {
+    fn slot(&mut self, metadata_root: &Path) -> DfsMetadataInspectionCacheSlot {
+        let key = metadata_root.to_path_buf();
+        self.recency.retain(|existing| existing != &key);
+        self.recency.push_back(key.clone());
+        if let Some(slot) = self.slots.get(&key) {
+            return Arc::clone(slot);
+        }
+
+        while self.slots.len() >= DFS_METADATA_INSPECTION_CACHE_CAPACITY {
+            let Some(oldest) = self.recency.pop_front() else {
+                break;
+            };
+            self.slots.remove(&oldest);
+        }
+        let slot = Arc::new(Mutex::new(None));
+        self.slots.insert(key, Arc::clone(&slot));
+        slot
+    }
+
+    fn evict(&mut self, metadata_root: &Path) {
+        self.slots.remove(metadata_root);
+        self.recency.retain(|existing| existing != metadata_root);
+    }
+}
+
+fn dfs_metadata_inspection_cache() -> &'static Mutex<DfsMetadataInspectionCache> {
+    static CACHE: OnceLock<Mutex<DfsMetadataInspectionCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(DfsMetadataInspectionCache::default()))
+}
+
+fn metadata_inspection_cache_error(detail: impl Into<String>) -> DfsError {
+    DfsError::Metadata {
+        message: detail.into(),
+    }
+}
 
 /// Metadata backend root for the legacy single-shard local store.
 pub fn default_dfs_metadata_root(data_dir: &SinomoDataDir) -> PathBuf {
@@ -160,13 +345,6 @@ pub fn open_local_sharded_metadata_backend_for_replica_repair(
     LocalShardedMetadataBackend::new_with_replica_repair(root, shards, local_node_id)
 }
 
-pub fn open_local_sharded_metadata_backend_for_inspection(
-    root: impl Into<PathBuf>,
-    shards: Vec<DfsMetadataShardConfig>,
-) -> Result<LocalShardedMetadataBackend, MetadataBackendError> {
-    LocalShardedMetadataBackend::open_for_inspection(root, shards)
-}
-
 pub fn open_local_sharded_metadata_backend_for_inspection_at_node(
     root: impl Into<PathBuf>,
     shards: Vec<DfsMetadataShardConfig>,
@@ -252,6 +430,158 @@ pub fn open_cluster_aware_dfs_metadata_backend_for_inspection(
     open_root_local_metadata_backend_for_inspection(default_dfs_metadata_root(data_dir))
         .map(|backend| Box::new(backend) as Box<dyn DfsMetadataBackend>)
         .map_err(Into::into)
+}
+
+fn cluster_aware_dfs_metadata_inspection_identity(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+) -> Result<DfsMetadataInspectionIdentity, DfsError> {
+    if cluster_paths.state.exists() {
+        let shards = cluster_dfs_metadata_shards(cluster_paths, &sifs_file_system_id())?;
+        if !shards.is_empty() {
+            let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
+                .map_err(DfsError::from_network)?;
+            return Ok(DfsMetadataInspectionIdentity::Sharded {
+                metadata_root: default_dfs_metadata_shards_root(data_dir),
+                local_node_id: state.local_node_id,
+                shards,
+                routing_topology_generation: dfs_metadata_inspection_file_generation(
+                    &routing_topology_history_path(&default_dfs_metadata_shards_root(data_dir)),
+                )?,
+            });
+        }
+    }
+    Ok(DfsMetadataInspectionIdentity::Root {
+        metadata_root: default_dfs_metadata_root(data_dir),
+    })
+}
+
+#[cfg(test)]
+fn with_cached_dfs_metadata_inspection_identity<T>(
+    identity: DfsMetadataInspectionIdentity,
+    inspect: impl FnOnce(&dyn DfsMetadataBackend) -> Result<T, DfsError>,
+) -> Result<T, DfsError> {
+    let resolved_identity = identity.clone();
+    with_cached_dfs_metadata_inspection_identity_refreshing(
+        identity,
+        move || Ok(resolved_identity),
+        inspect,
+    )
+}
+
+#[cfg(test)]
+fn with_cached_dfs_metadata_inspection_identity_refreshing<T>(
+    initial_identity: DfsMetadataInspectionIdentity,
+    resolve_identity: impl FnOnce() -> Result<DfsMetadataInspectionIdentity, DfsError>,
+    inspect: impl FnOnce(&dyn DfsMetadataBackend) -> Result<T, DfsError>,
+) -> Result<T, DfsError> {
+    with_cached_dfs_metadata_inspection(
+        initial_identity.metadata_root().to_path_buf(),
+        resolve_identity,
+        inspect,
+    )
+}
+
+fn with_cached_dfs_metadata_inspection<T>(
+    cache_key: PathBuf,
+    resolve_identity: impl FnOnce() -> Result<DfsMetadataInspectionIdentity, DfsError>,
+    inspect: impl FnOnce(&dyn DfsMetadataBackend) -> Result<T, DfsError>,
+) -> Result<T, DfsError> {
+    let slot = {
+        let mut cache = dfs_metadata_inspection_cache().lock().map_err(|_| {
+            metadata_inspection_cache_error("DFS metadata inspection cache lock is poisoned")
+        })?;
+        cache.slot(&cache_key)
+    };
+    let mut slot = slot.lock().map_err(|_| {
+        metadata_inspection_cache_error("DFS metadata inspection backend lock is poisoned")
+    })?;
+    // Resolve topology only after serializing this data root. A request that
+    // waited behind a newer topology must not overwrite that newer cached
+    // generation with an identity it captured before waiting.
+    let identity = resolve_identity()?;
+
+    if slot
+        .as_ref()
+        .is_none_or(|cached| cached.identity != identity)
+    {
+        // Drop the old decoded image before opening a replacement so topology
+        // changes do not transiently retain two complete metadata generations.
+        *slot = None;
+        *slot = Some(CachedDfsMetadataInspection {
+            backend: CachedDfsMetadataInspectionBackend::open(&identity)?,
+            identity: identity.clone(),
+        });
+    }
+
+    let begin_result = slot
+        .as_mut()
+        .expect("cached DFS metadata inspection was initialized")
+        .backend
+        .begin_inspection_snapshot();
+    if let Err(refresh_error) = begin_result {
+        // A replaced snapshot or other cross-process generation race can make
+        // an incremental refresh fail. Discard the image and retry one cold,
+        // lenient inspection open. A second failure is authoritative to the
+        // caller; it must never be projected as an empty metadata store.
+        *slot = None;
+        let mut replacement = CachedDfsMetadataInspection {
+            backend: CachedDfsMetadataInspectionBackend::open(&identity).map_err(|open_error| {
+                metadata_inspection_cache_error(format!(
+                    "cannot refresh cached DFS metadata inspection ({refresh_error}); cold inspection reopen failed: {open_error}"
+                ))
+            })?,
+            identity,
+        };
+        replacement
+            .backend
+            .begin_inspection_snapshot()
+            .map_err(|retry_error| {
+                metadata_inspection_cache_error(format!(
+                    "cannot refresh cached DFS metadata inspection ({refresh_error}); cold inspection refresh failed: {retry_error}"
+                ))
+            })?;
+        *slot = Some(replacement);
+    }
+
+    let cached = slot
+        .as_mut()
+        .expect("cached DFS metadata inspection was initialized");
+    let result = inspect(cached.backend.as_metadata_backend());
+    cached.backend.end_inspection_snapshot();
+    result
+}
+
+/// Run one coherent, read-only inspection against a retained cluster-aware
+/// metadata image.
+///
+/// The image is refreshed incrementally from materialized table state and is
+/// invalidated by any exact shard topology or local-node change. The closure
+/// prevents callers from retaining or mutating the cached backend.
+pub fn with_cached_cluster_aware_dfs_metadata_inspection<T>(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    inspect: impl FnOnce(&dyn DfsMetadataBackend) -> Result<T, DfsError>,
+) -> Result<T, DfsError> {
+    with_cached_dfs_metadata_inspection(
+        data_dir.root(),
+        || cluster_aware_dfs_metadata_inspection_identity(data_dir, cluster_paths),
+        inspect,
+    )
+}
+
+/// Release the retained inspection image for this node's metadata root.
+///
+/// Writable maintenance may call this before opening a full backend
+/// generation when bounding peak memory matters more than the next warm
+/// observation.
+pub fn evict_cluster_aware_dfs_metadata_inspection_cache(data_dir: &SinomoDataDir) {
+    let Ok(mut cache) = dfs_metadata_inspection_cache().lock() else {
+        return;
+    };
+    cache.evict(&data_dir.root());
+    cache.evict(&default_dfs_metadata_root(data_dir));
+    cache.evict(&default_dfs_metadata_shards_root(data_dir));
 }
 
 pub fn open_cluster_sharded_dfs_metadata_backend(
@@ -514,19 +844,17 @@ pub fn inspect_cluster_aware_dfs_status(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
 ) -> Result<DfsOperatorStatus, DfsError> {
-    let metadata = open_cluster_aware_dfs_metadata_backend_for_inspection(data_dir, cluster_paths)?;
-    let mut status = DfsOperatorInspector::new(metadata.as_ref()).status()?;
+    let (mut status, primary_summary) =
+        with_cached_cluster_aware_dfs_metadata_inspection(data_dir, cluster_paths, |metadata| {
+            let (summary, primary_summary) = metadata.metadata_status_summaries()?;
+            Ok((
+                DfsOperatorInspector::new(metadata).status_from_summary(summary)?,
+                primary_summary,
+            ))
+        })?;
+    attach_primary_owned_operational_status(&mut status, &primary_summary);
     attach_cluster_aware_dfs_maintenance_observations(&mut status, data_dir)?;
     if let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths) {
-        let shards = cluster_dfs_metadata_shards(cluster_paths, &sifs_file_system_id())?;
-        if !shards.is_empty() {
-            attach_primary_owned_operational_status(
-                &mut status,
-                data_dir,
-                &state.local_node_id,
-                &shards,
-            )?;
-        }
         for shard in &mut status.metadata_shards {
             if shard.primary_node_id.as_ref() == Some(&state.local_node_id) {
                 shard.replay_cursors.clear();
@@ -540,34 +868,13 @@ pub fn inspect_cluster_aware_dfs_status(
 
 fn attach_primary_owned_operational_status(
     status: &mut DfsOperatorStatus,
-    data_dir: &SinomoDataDir,
-    local_node_id: &NodeId,
-    shards: &[DfsMetadataShardConfig],
-) -> Result<(), DfsError> {
-    let primary_shards = shards
-        .iter()
-        .filter(|shard| shard.primary_node_id == *local_node_id)
-        .cloned()
-        .collect::<Vec<_>>();
-    if primary_shards.is_empty() {
-        status.pending_write_count = 0;
-        status.open_conflict_count = 0;
-        status.pending_repair_count = 0;
-        status.pending_namespace_job_count = 0;
-        status.failed_namespace_job_count = 0;
-        return Ok(());
-    }
-    let primary_metadata = open_local_sharded_metadata_backend_for_inspection(
-        default_dfs_metadata_shards_root(data_dir),
-        primary_shards,
-    )?;
-    let primary_summary = primary_metadata.metadata_summary()?;
+    primary_summary: &DfsMetadataSummary,
+) {
     status.pending_write_count = primary_summary.pending_write_count;
     status.open_conflict_count = primary_summary.open_conflict_count;
     status.pending_repair_count = primary_summary.pending_repair_count;
     status.pending_namespace_job_count = primary_summary.pending_namespace_job_count;
     status.failed_namespace_job_count = primary_summary.failed_namespace_job_count;
-    Ok(())
 }
 
 fn attach_cluster_aware_dfs_maintenance_observations(
@@ -589,98 +896,115 @@ pub fn inspect_cluster_aware_dfs(
     cluster_paths: &ClusterPaths,
     request: DaemonDfsInspectionRequest,
 ) -> Result<DaemonDfsInspectionResponse, DfsError> {
-    let mut metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
-    let inspector = DfsOperatorInspector::new(metadata.as_ref());
-    Ok(match request {
-        DaemonDfsInspectionRequest::Status => {
-            let mut status = inspector.status()?;
-            attach_cluster_aware_dfs_maintenance_observations(&mut status, data_dir)?;
-            DaemonDfsInspectionResponse::Status { status }
-        }
-        DaemonDfsInspectionRequest::FileSystem { file_system_id } => {
-            DaemonDfsInspectionResponse::FileSystem {
-                file_system: inspector.file_system(&file_system_id)?,
-            }
-        }
-        DaemonDfsInspectionRequest::Path {
-            file_system_id,
-            path,
-        } => DaemonDfsInspectionResponse::Path {
-            object: inspector.object_by_path(&file_system_id, &path)?,
-        },
-        DaemonDfsInspectionRequest::Object { object_id } => DaemonDfsInspectionResponse::Object {
-            object: inspector.object(&object_id)?,
-        },
-        DaemonDfsInspectionRequest::Conflicts {
-            file_system_id,
-            object_id,
-            limit,
-            cursor,
-        } => {
-            let page = inspector.conflicts_page(
-                file_system_id.as_ref(),
-                object_id.as_ref(),
-                limit,
-                cursor.as_ref(),
-            )?;
-            DaemonDfsInspectionResponse::Conflicts {
-                conflicts: page.conflicts,
-                next_cursor: page.next_cursor,
-            }
-        }
+    match request {
+        DaemonDfsInspectionRequest::Status => Ok(DaemonDfsInspectionResponse::Status {
+            status: inspect_cluster_aware_dfs_status(data_dir, cluster_paths)?,
+        }),
         DaemonDfsInspectionRequest::ResolveConflicts {
             file_system_id,
             object_id,
             conflict_ids,
-        } => DaemonDfsInspectionResponse::ResolveConflicts {
-            report: resolve_dfs_conflicts(
-                metadata.as_mut(),
-                file_system_id.as_ref(),
-                object_id.as_ref(),
-                &conflict_ids,
-            )?,
-        },
-        DaemonDfsInspectionRequest::ConflictVersions {
-            object_id,
-            conflict_ids,
-        } => DaemonDfsInspectionResponse::ConflictVersions {
-            report: inspector.conflict_versions(&object_id, &conflict_ids)?,
-        },
+        } => {
+            let mut metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
+            Ok(DaemonDfsInspectionResponse::ResolveConflicts {
+                report: resolve_dfs_conflicts(
+                    metadata.as_mut(),
+                    file_system_id.as_ref(),
+                    object_id.as_ref(),
+                    &conflict_ids,
+                )?,
+            })
+        }
         DaemonDfsInspectionRequest::UseConflictVersion {
             object_id,
             version,
             conflict_ids,
-        } => DaemonDfsInspectionResponse::UseConflictVersion {
-            report: use_dfs_conflict_version(
-                metadata.as_mut(),
-                &object_id,
-                &version,
-                &conflict_ids,
-            )?,
-        },
-        DaemonDfsInspectionRequest::Repair {
-            file_system_id,
-            object_id,
-            limit,
-            cursor,
         } => {
-            let page = inspector.repairs_page(
-                file_system_id.as_ref(),
-                object_id.as_ref(),
-                limit,
-                cursor.as_ref(),
-            )?;
-            DaemonDfsInspectionResponse::Repair {
-                repairs: page.repairs,
-                next_cursor: page.next_cursor,
-            }
+            let mut metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
+            Ok(DaemonDfsInspectionResponse::UseConflictVersion {
+                report: use_dfs_conflict_version(
+                    metadata.as_mut(),
+                    &object_id,
+                    &version,
+                    &conflict_ids,
+                )?,
+            })
         }
-    })
+        read_only_request => {
+            with_cached_cluster_aware_dfs_metadata_inspection(data_dir, cluster_paths, |metadata| {
+                let inspector = DfsOperatorInspector::new(metadata);
+                Ok(match read_only_request {
+                    DaemonDfsInspectionRequest::Status
+                    | DaemonDfsInspectionRequest::ResolveConflicts { .. }
+                    | DaemonDfsInspectionRequest::UseConflictVersion { .. } => {
+                        unreachable!("status and mutations handled before inspection cache")
+                    }
+                    DaemonDfsInspectionRequest::FileSystem { file_system_id } => {
+                        DaemonDfsInspectionResponse::FileSystem {
+                            file_system: inspector.file_system(&file_system_id)?,
+                        }
+                    }
+                    DaemonDfsInspectionRequest::Path {
+                        file_system_id,
+                        path,
+                    } => DaemonDfsInspectionResponse::Path {
+                        object: inspector.object_by_path(&file_system_id, &path)?,
+                    },
+                    DaemonDfsInspectionRequest::Object { object_id } => {
+                        DaemonDfsInspectionResponse::Object {
+                            object: inspector.object(&object_id)?,
+                        }
+                    }
+                    DaemonDfsInspectionRequest::Conflicts {
+                        file_system_id,
+                        object_id,
+                        limit,
+                        cursor,
+                    } => {
+                        let page = inspector.conflicts_page(
+                            file_system_id.as_ref(),
+                            object_id.as_ref(),
+                            limit,
+                            cursor.as_ref(),
+                        )?;
+                        DaemonDfsInspectionResponse::Conflicts {
+                            conflicts: page.conflicts,
+                            next_cursor: page.next_cursor,
+                        }
+                    }
+                    DaemonDfsInspectionRequest::ConflictVersions {
+                        object_id,
+                        conflict_ids,
+                    } => DaemonDfsInspectionResponse::ConflictVersions {
+                        report: inspector.conflict_versions(&object_id, &conflict_ids)?,
+                    },
+                    DaemonDfsInspectionRequest::Repair {
+                        file_system_id,
+                        object_id,
+                        limit,
+                        cursor,
+                    } => {
+                        let page = inspector.repairs_page(
+                            file_system_id.as_ref(),
+                            object_id.as_ref(),
+                            limit,
+                            cursor.as_ref(),
+                        )?;
+                        DaemonDfsInspectionResponse::Repair {
+                            repairs: page.repairs,
+                            next_cursor: page.next_cursor,
+                        }
+                    }
+                })
+            })
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DfsFileSystem;
     use crate::control_plane::DfsMetadataShardAssignment;
     use sinomo_core::DfsObjectPolicy;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -731,6 +1055,229 @@ mod tests {
     }
 
     #[test]
+    fn cached_inspection_reuses_one_open_and_observes_external_table_suffix() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-dfs-cached-inspection-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let metadata_root = default_dfs_metadata_root(&data_dir);
+        let mut writer =
+            open_root_local_metadata_backend(metadata_root.clone()).expect("writer backend");
+
+        crate::metadata_backend::reset_metadata_backend_open_calls();
+        let identity = DfsMetadataInspectionIdentity::Root { metadata_root };
+        let initial_count =
+            with_cached_dfs_metadata_inspection_identity(identity.clone(), |metadata| {
+                Ok(metadata.metadata_summary()?.file_system_count)
+            })
+            .expect("initial cached inspection");
+        assert_eq!(initial_count, 0);
+
+        let file_system = DfsFileSystem {
+            file_system_id: DfsFileSystemId::from_legacy_named("cached-inspection-fs")
+                .expect("filesystem id"),
+            display_name: "Cached inspection".to_string(),
+            owner_node_id: test_node("cached_inspection_owner"),
+            subtree_policies: Vec::new(),
+        };
+        writer
+            .put_file_system(&file_system)
+            .expect("external writer append");
+
+        for _ in 0..2 {
+            let refreshed_count =
+                with_cached_dfs_metadata_inspection_identity(identity.clone(), |metadata| {
+                    Ok(metadata.metadata_summary()?.file_system_count)
+                })
+                .expect("refreshed cached inspection");
+            assert_eq!(refreshed_count, 1);
+        }
+        assert_eq!(
+            crate::metadata_backend::metadata_backend_open_calls(),
+            1,
+            "warm inspection must refresh the retained backend instead of decoding again"
+        );
+
+        evict_cluster_aware_dfs_metadata_inspection_cache(&data_dir);
+        drop(writer);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cached_inspection_reopens_on_exact_topology_change() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-dfs-cached-topology-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let local_node_id = test_node("cached_topology_local");
+        let mut shard = DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: local_node_id.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let metadata_root = default_dfs_metadata_shards_root(&data_dir);
+        drop(
+            open_local_sharded_metadata_backend(metadata_root.clone(), vec![shard.clone()])
+                .expect("initialize shard store"),
+        );
+
+        crate::metadata_backend::reset_metadata_backend_open_calls();
+        let routing_topology_generation =
+            dfs_metadata_inspection_file_generation(&routing_topology_history_path(&metadata_root))
+                .expect("routing topology generation");
+        let initial_identity = DfsMetadataInspectionIdentity::Sharded {
+            metadata_root: metadata_root.clone(),
+            local_node_id: local_node_id.clone(),
+            shards: vec![shard.clone()],
+            routing_topology_generation: routing_topology_generation.clone(),
+        };
+        for _ in 0..2 {
+            with_cached_dfs_metadata_inspection_identity(initial_identity.clone(), |metadata| {
+                metadata.metadata_summary().map(|_| ()).map_err(Into::into)
+            })
+            .expect("warm topology inspection");
+        }
+        shard.epoch = 2;
+        with_cached_dfs_metadata_inspection_identity(
+            DfsMetadataInspectionIdentity::Sharded {
+                metadata_root: metadata_root.clone(),
+                local_node_id: local_node_id.clone(),
+                shards: vec![shard.clone()],
+                routing_topology_generation: routing_topology_generation.clone(),
+            },
+            |metadata| metadata.metadata_summary().map(|_| ()).map_err(Into::into),
+        )
+        .expect("changed topology inspection");
+
+        let topology_path = routing_topology_history_path(&metadata_root);
+        let replacement_path = topology_path.with_extension("replacement.sobj");
+        fs::copy(&topology_path, &replacement_path).expect("copy topology generation");
+        fs::remove_file(&topology_path).expect("remove old topology generation");
+        fs::rename(&replacement_path, &topology_path).expect("replace topology generation");
+        let replaced_generation = dfs_metadata_inspection_file_generation(&topology_path)
+            .expect("replaced topology generation");
+        assert_ne!(replaced_generation, routing_topology_generation);
+        with_cached_dfs_metadata_inspection_identity(
+            DfsMetadataInspectionIdentity::Sharded {
+                metadata_root,
+                local_node_id,
+                shards: vec![shard],
+                routing_topology_generation: replaced_generation,
+            },
+            |metadata| metadata.metadata_summary().map(|_| ()).map_err(Into::into),
+        )
+        .expect("replaced topology history inspection");
+        assert_eq!(
+            crate::metadata_backend::metadata_backend_open_calls(),
+            3,
+            "warm topology, epoch change, and history replacement must each have exact reuse/invalidation"
+        );
+
+        evict_cluster_aware_dfs_metadata_inspection_cache(&data_dir);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cached_inspection_older_waiter_cannot_replace_newer_identity() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-dfs-cached-topology-waiter-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let local_node_id = test_node("cached_topology_waiter_local");
+        let older_shard = DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: local_node_id.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let metadata_root = default_dfs_metadata_shards_root(&data_dir);
+        drop(
+            open_local_sharded_metadata_backend(metadata_root.clone(), vec![older_shard.clone()])
+                .expect("initialize shard store"),
+        );
+        let routing_topology_generation =
+            dfs_metadata_inspection_file_generation(&routing_topology_history_path(&metadata_root))
+                .expect("routing topology generation");
+        let older_identity = DfsMetadataInspectionIdentity::Sharded {
+            metadata_root: metadata_root.clone(),
+            local_node_id: local_node_id.clone(),
+            shards: vec![older_shard.clone()],
+            routing_topology_generation: routing_topology_generation.clone(),
+        };
+        let newer_identity = DfsMetadataInspectionIdentity::Sharded {
+            metadata_root: metadata_root.clone(),
+            local_node_id,
+            shards: vec![DfsMetadataShardConfig {
+                epoch: 2,
+                ..older_shard
+            }],
+            routing_topology_generation,
+        };
+
+        crate::metadata_backend::reset_metadata_backend_open_calls();
+        with_cached_dfs_metadata_inspection_identity(newer_identity.clone(), |metadata| {
+            metadata.metadata_summary().map(|_| ()).map_err(Into::into)
+        })
+        .expect("install newer cached topology");
+        with_cached_dfs_metadata_inspection_identity_refreshing(
+            older_identity,
+            || Ok(newer_identity.clone()),
+            |metadata| metadata.metadata_summary().map(|_| ()).map_err(Into::into),
+        )
+        .expect("older waiter re-resolves after acquiring the cache slot");
+        assert_eq!(
+            crate::metadata_backend::metadata_backend_open_calls(),
+            1,
+            "an older waiter must reuse, not replace, the newer cached backend"
+        );
+        let slot = {
+            let mut cache = dfs_metadata_inspection_cache().lock().expect("cache lock");
+            cache.slot(&metadata_root)
+        };
+        assert_eq!(
+            slot.lock()
+                .expect("cache slot")
+                .as_ref()
+                .map(|cached| cached.identity.clone()),
+            Some(newer_identity),
+            "the cache must remain on the topology resolved after slot admission"
+        );
+
+        evict_cluster_aware_dfs_metadata_inspection_cache(&data_dir);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn primary_owned_operational_status_ignores_replica_only_backlog() {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -768,15 +1315,40 @@ mod tests {
             namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        let mut status = empty_status();
-
-        attach_primary_owned_operational_status(
-            &mut status,
-            &data_dir,
+        let shards = vec![local_primary, local_replica];
+        let metadata_root = default_dfs_metadata_shards_root(&data_dir);
+        drop(
+            open_local_sharded_metadata_backend(metadata_root.clone(), shards.clone())
+                .expect("initialize shard stores"),
+        );
+        let metadata = open_local_sharded_metadata_backend_for_inspection_at_node(
+            metadata_root,
+            shards,
             &local,
-            &[local_primary, local_replica],
         )
-        .expect("primary-owned status");
+        .expect("open all shards once");
+        crate::metadata_backend::reset_metadata_current_tables_snapshot_calls();
+        let (_, primary_summary) = metadata
+            .metadata_status_summaries()
+            .expect("combined status summaries");
+        assert_eq!(
+            crate::metadata_backend::metadata_current_tables_snapshot_calls(),
+            2,
+            "combined status summaries must scan every shard exactly once"
+        );
+        crate::metadata_backend::reset_metadata_current_tables_snapshot_calls();
+        let standalone_primary_summary = metadata
+            .metadata_summary_for_local_primary_shards()
+            .expect("primary-owned summary");
+        assert_eq!(
+            crate::metadata_backend::metadata_current_tables_snapshot_calls(),
+            1,
+            "the primary-owned summary must not scan the replica-only shard"
+        );
+        assert_eq!(standalone_primary_summary, primary_summary);
+
+        let mut status = empty_status();
+        attach_primary_owned_operational_status(&mut status, &primary_summary);
 
         assert_eq!(status.pending_write_count, 0);
         assert_eq!(status.open_conflict_count, 0);

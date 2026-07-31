@@ -2699,6 +2699,19 @@ pub(crate) struct DfsMetadataTableBatch {
     pub(crate) ops: Vec<DfsMetadataTableOp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) prefix_proof: Option<DfsMetadataPrefixProof>,
+    /// Estimated heap/decode work required to expand authoritative journal
+    /// references in this rebuildable table batch.
+    ///
+    /// This is deliberately an estimate rather than a second encoding of the
+    /// referenced payload. Older batches decode as zero; replay treats a
+    /// zero-cost journal reference as unpriced and checkpoints it
+    /// conservatively.
+    #[serde(default, skip_serializing_if = "metadata_table_replay_cost_is_zero")]
+    pub(crate) journal_reference_replay_cost_bytes: u64,
+}
+
+fn metadata_table_replay_cost_is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

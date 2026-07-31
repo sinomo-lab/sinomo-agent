@@ -28,7 +28,9 @@ use sinomo_runtime::dfs::{
     open_local_sharded_metadata_backend_for_replica_repair, open_root_local_metadata_backend,
     preview_placement_with_unavailable_nodes,
     publish_cluster_dfs_metadata_journal_with_peer_transports_async,
-    refresh_cluster_dfs_kv_snapshot_with_peer_transport, sifs_file_system_id,
+    refresh_cluster_dfs_kv_snapshot_with_peer_transport,
+    select_metadata_shard_config_for_path_strict_default_sifs_split, sifs_file_system_id,
+    with_cached_cluster_aware_dfs_metadata_inspection,
 };
 use sinomo_runtime::kv::{KvError, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
@@ -58,6 +60,21 @@ pub(crate) struct SifsFileManagerBackend {
     service: Mutex<NetworkedDfsService<DfsNodeTransport>>,
     peer_targets_refreshed_at: Mutex<Option<Instant>>,
     replica_candidates: Vec<NodeId>,
+}
+
+/// Narrow, metadata-less requester for the create-only DFS throughput probe.
+///
+/// This handle deliberately exposes only the three write stages used by
+/// `cluster.dfs.bulk-write`: create its parent directory, create files under a
+/// known parent, and hand post-commit maintenance back to the resident daemon.
+/// General SIFS callers must use [`SifsFileManagerBackend`], whose ordinary
+/// open always owns a durable metadata backend.
+#[derive(Debug)]
+pub(crate) struct SifsOneShotBulkCreateRequester {
+    data_dir: SinomoDataDir,
+    local_node_id: NodeId,
+    service: Mutex<NetworkedDfsService<DfsNodeTransport>>,
+    control_plane: SifsOneShotBulkCreateControlPlaneKvClient,
 }
 
 /// A metadata-only, observational SIFS view.
@@ -166,12 +183,16 @@ impl SifsFileManagerObservation {
     ) -> Result<Option<DfsOperatorObjectView>, String> {
         let path = normalize_sifs_path(path)?;
         let cluster_paths = ClusterPaths::new(&self.data_dir);
-        let metadata =
-            open_cluster_aware_dfs_metadata_backend_for_inspection(&self.data_dir, &cluster_paths)
-                .map_err(|error| format!("cannot open SIFS metadata for observation: {error}"))?;
-        sinomo_runtime::dfs::DfsOperatorInspector::new(metadata.as_ref())
-            .object_by_path(&sifs_file_system_id(), &path)
-            .map_err(|error| format!("cannot inspect SIFS path {path}: {error}"))
+        with_cached_cluster_aware_dfs_metadata_inspection(
+            &self.data_dir,
+            &cluster_paths,
+            |metadata| {
+                sinomo_runtime::dfs::DfsOperatorInspector::new(metadata)
+                    .object_by_path(&sifs_file_system_id(), &path)
+                    .map_err(Into::into)
+            },
+        )
+        .map_err(|error| format!("cannot inspect SIFS path {path}: {error}"))
     }
 
     pub(crate) fn operational_snapshot(
@@ -186,33 +207,39 @@ impl SifsFileManagerObservation {
         let operator_status =
             sinomo_runtime::dfs::inspect_cluster_aware_dfs_status(&self.data_dir, &cluster_paths)
                 .map_err(|error| format!("cannot read SIFS operator status: {error}"))?;
-        let metadata =
-            open_cluster_aware_dfs_metadata_backend_for_inspection(&self.data_dir, &cluster_paths)
-                .map_err(|error| format!("cannot open SIFS metadata for observation: {error}"))?;
 
-        let mut cross_shard_namespace_locks = BTreeSet::new();
-        let mut namespace_job_cursor = None;
-        loop {
-            let page = metadata
-                .list_namespace_jobs_page(namespace_job_cursor.as_ref(), NAMESPACE_JOB_PAGE_SIZE)
-                .map_err(|error| format!("cannot inspect SIFS namespace jobs: {error}"))?;
-            for job in page.jobs {
-                if job.status == DfsNamespaceJobStatus::Running
-                    && matches!(
-                        job.kind,
-                        DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
-                            | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
-                            | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
-                    )
-                {
-                    cross_shard_namespace_locks.insert((job.file_system_id, job.root_path));
+        let cross_shard_namespace_locks = with_cached_cluster_aware_dfs_metadata_inspection(
+            &self.data_dir,
+            &cluster_paths,
+            |metadata| {
+                let mut locks = BTreeSet::new();
+                let mut namespace_job_cursor = None;
+                loop {
+                    let page = metadata.list_namespace_jobs_page(
+                        namespace_job_cursor.as_ref(),
+                        NAMESPACE_JOB_PAGE_SIZE,
+                    )?;
+                    for job in page.jobs {
+                        if job.status == DfsNamespaceJobStatus::Running
+                            && matches!(
+                                job.kind,
+                                DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
+                                    | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
+                                    | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
+                            )
+                        {
+                            locks.insert((job.file_system_id, job.root_path));
+                        }
+                    }
+                    let Some(next_cursor) = page.next_cursor else {
+                        break;
+                    };
+                    namespace_job_cursor = Some(next_cursor);
                 }
-            }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            namespace_job_cursor = Some(next_cursor);
-        }
+                Ok(locks)
+            },
+        )
+        .map_err(|error| format!("cannot inspect SIFS namespace jobs: {error}"))?;
 
         let pending_metadata_replication_count = operator_status
             .metadata_shards
@@ -1340,6 +1367,7 @@ impl SifsFileManagerBackend {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn write_files_with_known_parents_deferred_publish_until(
         &self,
         files: &[(String, Vec<u8>)],
@@ -1967,6 +1995,213 @@ impl FileManagerBackend for SifsFileManagerBackend {
     }
 }
 
+impl SifsOneShotBulkCreateRequester {
+    pub(crate) fn open(data_dir: &SinomoDataDir) -> Result<Self, String> {
+        data_dir
+            .ensure_root_layout()
+            .map_err(|error| format!("cannot prepare Sinomo data directory: {error}"))?;
+        let cluster_paths = ClusterPaths::new(data_dir);
+        if !cluster_paths.state.exists() {
+            return Err(
+                "one-shot SIFS bulk create requires local cluster state and a resident daemon"
+                    .to_string(),
+            );
+        }
+
+        // A successful scoped daemon refresh is the freshness proof for the
+        // catalog consumed below. Unlike the general backend, this requester
+        // must never fall back to direct routing or an old local snapshot.
+        refresh_sifs_cluster_kv_snapshot(data_dir, &cluster_paths)?;
+        let state = cluster::read_cluster_state_without_kv(&cluster_paths)
+            .map_err(|error| format!("cannot read local cluster state: {error}"))?;
+        let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+        let local_node_id = state.local_node_id;
+
+        let peer_transport = sinomo_runtime::api::DaemonDfsPeerTransport::connect(data_dir.clone())
+            .map_err(|error| {
+                format!(
+                    "one-shot SIFS bulk create requires the resident daemon DFS transport: {error}"
+                )
+            })?;
+        let (sync_peer_transport, async_peer_transport) =
+            shared_sifs_peer_transports(peer_transport);
+        let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
+            .map_err(|error| format!("cannot open DFS content store: {error}"))?;
+
+        let control_plane = SifsOneShotBulkCreateControlPlaneKvClient::new(
+            data_dir,
+            &cluster_paths,
+            local_node_id.clone(),
+        );
+        // The scoped refresh above already installed the latest snapshot. Load
+        // that exact materialization without paying a second daemon barrier.
+        control_plane
+            .inner
+            .replace_cached_snapshot(false)
+            .map_err(|error| format!("cannot load one-shot DFS shard catalog: {error}"))?;
+        control_plane
+            .validate_cached_catalog()
+            .map_err(|error| format!("cannot validate one-shot DFS shard catalog: {error}"))?;
+
+        let mut service = NetworkedDfsService::new(
+            DfsNodeTransport::with_peer_transports_for_nodes(
+                local_node_id.clone(),
+                peer_node_ids,
+                sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
+                sync_peer_transport,
+                async_peer_transport,
+            ),
+            content,
+        )
+        .with_control_plane(control_plane.clone());
+        service
+            .bootstrap_distributed_sifs()
+            .map_err(|error| format!("cannot bootstrap one-shot SIFS bulk create: {error}"))?;
+
+        Ok(Self {
+            data_dir: data_dir.clone(),
+            local_node_id,
+            service: Mutex::new(service),
+            control_plane,
+        })
+    }
+
+    pub(crate) fn node_label(&self) -> String {
+        self.local_node_id.to_string()
+    }
+
+    fn validate_cached_authority(
+        &self,
+    ) -> Result<(Vec<NodeId>, Vec<DfsMetadataShardConfig>), String> {
+        // `open` acquired a fresh authoritative snapshot for this one-shot
+        // request. Reuse that installed generation across mkdir, create, and
+        // publication instead of paying three additional daemon/KV barriers.
+        //
+        // This does not weaken the authority fence: every actual
+        // control-plane refresh performed by the DFS service goes through the
+        // validating wrapper below, and stale routed epochs are rejected by
+        // the authoritative daemon. A stopped daemon also remains fatal
+        // because this requester has no direct peer-transport fallback.
+        let shards = self
+            .control_plane
+            .validated_cached_catalog()
+            .map_err(|error| format!("cannot validate one-shot DFS shard catalog: {error}"))?;
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        let state = cluster::read_cluster_state_without_kv(&cluster_paths)
+            .map_err(|error| format!("cannot read local cluster state: {error}"))?;
+        if state.local_node_id != self.local_node_id {
+            return Err(format!(
+                "one-shot SIFS bulk create is fenced because the local node identity changed from {} to {}",
+                self.local_node_id, state.local_node_id
+            ));
+        }
+        Ok((cluster_dfs_peer_node_ids(&state), shards))
+    }
+
+    fn lock_service_with_deadline(
+        &self,
+        deadline: Instant,
+    ) -> Result<std::sync::MutexGuard<'_, NetworkedDfsService<DfsNodeTransport>>, String> {
+        loop {
+            match self.service.try_lock() {
+                Ok(service) => return Ok(service),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err("one-shot SIFS bulk create service lock is poisoned".to_string());
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let remaining = sifs_operation_remaining(
+                        Some(deadline),
+                        "waiting for the one-shot SIFS bulk create service lock",
+                    )?
+                    .expect("deadline is present");
+                    std::thread::sleep(Duration::from_millis(1).min(remaining));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn create_dir_all_deferred_local_replay_until(
+        &self,
+        path: &str,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let path = normalize_sifs_path(path)?;
+        let parent = sifs_parent_path(&path);
+        let (peer_node_ids, shards) = self.validate_cached_authority()?;
+        validate_one_shot_bulk_create_paths(
+            &shards,
+            std::iter::once(path.as_str()).chain(parent.iter().map(String::as_str)),
+        )?;
+        let mut service = self.lock_service_with_deadline(deadline)?;
+        service.refresh_peer_targets(peer_node_ids);
+        let previous_deadline = service.set_transport_operation_deadline(Some(deadline));
+        let result = service
+            .posix_mkdir_all_without_local_replay(&path)
+            .map_err(|error| format!("cannot create SIFS directory {path}: {error}"));
+        service.set_transport_operation_deadline(previous_deadline);
+        result
+    }
+
+    pub(crate) fn write_files_with_known_parents_deferred_publish_until(
+        &self,
+        files: &[(String, Vec<u8>)],
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let normalized = files
+            .iter()
+            .map(|(path, bytes)| normalize_sifs_path(path).map(|path| (path, bytes.as_slice())))
+            .collect::<Result<Vec<_>, _>>()?;
+        sifs_operation_remaining(Some(deadline), "one-shot SIFS bulk create")?;
+        let (peer_node_ids, shards) = self.validate_cached_authority()?;
+        validate_one_shot_bulk_create_paths(
+            &shards,
+            normalized.iter().map(|(path, _)| path.as_str()),
+        )?;
+        let mut service = self.lock_service_with_deadline(deadline)?;
+        service.refresh_peer_targets(peer_node_ids);
+        let previous_deadline = service.set_transport_operation_deadline(Some(deadline));
+        let result = service
+            .posix_create_files_local_eventual_with_known_parents(
+                normalized
+                    .iter()
+                    .map(|(path, bytes)| (path.as_str(), *bytes)),
+            )
+            .map(|_| ())
+            .map_err(|error| format!("cannot write SIFS bulk batch: {error}"));
+        service.set_transport_operation_deadline(previous_deadline);
+        result
+    }
+
+    pub(crate) fn publish_metadata_after_mutation(&self) -> Result<(), String> {
+        let (peer_node_ids, _) = self.validate_cached_authority()?;
+        {
+            let mut service = self
+                .service
+                .lock()
+                .map_err(|_| "one-shot SIFS bulk create service lock is poisoned".to_string())?;
+            service.refresh_peer_targets(peer_node_ids);
+            service
+                .flush_detached_transport_sends()
+                .map_err(|error| error.to_string())?;
+            service
+                .process_incoming_until_pending_routed_writes_ready(
+                    network::DEFAULT_NETWORK_TIMEOUT,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        if !request_sifs_daemon_maintenance_refresh(
+            &self.data_dir,
+            SIFS_MAINTENANCE_REFRESH_TIMEOUT,
+        ) {
+            return Err(
+                "resident daemon became unavailable during one-shot SIFS bulk create maintenance handoff"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct SifsRpcRuntime {
     runtime: Arc<tokio::runtime::Runtime>,
@@ -2084,7 +2319,7 @@ fn open_sifs_service_read_only_until(
         };
     let mut service = NetworkedDfsService::new(
         DfsNodeTransport::with_peer_transports_for_nodes(
-            local_node_id,
+            local_node_id.clone(),
             peer_node_ids,
             sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
             sync_peer_transport,
@@ -2133,12 +2368,18 @@ fn open_sifs_service_with_hydration_until(
         SifsDfsPeerTransport::new(rpc_runtime.clone(), data_dir.clone())
             .with_operation_deadline(operation_deadline),
     );
-    let _ = refresh_sifs_cluster_kv_snapshot(data_dir, &cluster_paths);
+    let local_snapshot_refresh = refresh_sifs_cluster_kv_snapshot(data_dir, &cluster_paths);
     sifs_operation_remaining(operation_deadline, "refreshing the local cluster snapshot")?;
-    let _ = refresh_cluster_dfs_kv_snapshot_with_peer_transport(
-        &cluster_paths,
-        bootstrap_peer_transport,
-    );
+    if local_snapshot_refresh.is_err() {
+        // The scoped local-daemon refresh already falls back to reachable
+        // voters. Use the DFS transport only if that complete path failed;
+        // repeating both successful barriers made every one-shot SIFS open
+        // pay two cluster-KV round trips.
+        let _ = refresh_cluster_dfs_kv_snapshot_with_peer_transport(
+            &cluster_paths,
+            bootstrap_peer_transport,
+        );
+    }
     sifs_operation_remaining(operation_deadline, "refreshing the DFS cluster snapshot")?;
     let (local_node_id, peer_node_ids) = if cluster_paths.state.exists() {
         let state = cluster::read_cluster_state_without_kv(&cluster_paths)
@@ -2163,7 +2404,7 @@ fn open_sifs_service_with_hydration_until(
         };
     let mut service = NetworkedDfsService::new(
         DfsNodeTransport::with_peer_transports_for_nodes(
-            local_node_id,
+            local_node_id.clone(),
             peer_node_ids,
             sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
             sync_peer_transport,
@@ -2176,30 +2417,32 @@ fn open_sifs_service_with_hydration_until(
             service.with_control_plane(SifsControlPlaneKvClient::new(data_dir, &cluster_paths));
     }
     sifs_operation_remaining(operation_deadline, "opening DFS metadata shards")?;
-    let service =
-        if let Some(metadata) = open_sifs_sharded_metadata_backend(data_dir, &cluster_paths)? {
-            if hydrate_metadata {
-                service
-                    .with_metadata_backend(metadata)
-                    .map_err(|error| format!("cannot open sharded SIFS metadata: {error}"))?
-            } else {
-                service
-                    .with_metadata_backend_lazy(metadata)
-                    .map_err(|error| format!("cannot open sharded SIFS metadata: {error}"))?
-            }
+    let metadata_shards = read_sifs_metadata_shard_configs(&cluster_paths)?;
+    let service = if let Some(metadata) =
+        open_sifs_sharded_metadata_backend(data_dir, metadata_shards, &local_node_id)?
+    {
+        if hydrate_metadata {
+            service
+                .with_metadata_backend(metadata)
+                .map_err(|error| format!("cannot open sharded SIFS metadata: {error}"))?
         } else {
-            let metadata = open_root_local_metadata_backend(default_dfs_metadata_root(data_dir))
-                .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?;
-            if hydrate_metadata {
-                service
-                    .with_metadata_backend(metadata)
-                    .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?
-            } else {
-                service
-                    .with_metadata_backend_lazy(metadata)
-                    .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?
-            }
-        };
+            service
+                .with_metadata_backend_lazy(metadata)
+                .map_err(|error| format!("cannot open sharded SIFS metadata: {error}"))?
+        }
+    } else {
+        let metadata = open_root_local_metadata_backend(default_dfs_metadata_root(data_dir))
+            .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?;
+        if hydrate_metadata {
+            service
+                .with_metadata_backend(metadata)
+                .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?
+        } else {
+            service
+                .with_metadata_backend_lazy(metadata)
+                .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?
+        }
+    };
     sifs_operation_remaining(operation_deadline, "opening DFS metadata shards")?;
     let mut service = service;
     let previous_deadline =
@@ -2445,12 +2688,115 @@ impl DfsControlPlaneKvClient for SifsControlPlaneKvClient {
     }
 }
 
-fn open_sifs_sharded_metadata_backend(
-    data_dir: &SinomoDataDir,
+/// Control-plane client used by the metadata-less bulk requester.
+///
+/// The underlying client refreshes its immutable KV snapshot atomically. This
+/// wrapper validates each newly installed snapshot exactly once and refuses to
+/// expose it if the local node has become a metadata primary. That closes the
+/// authority-refresh race between the requester's explicit preflight and an
+/// internal DFS retry which refreshes shard routing.
+#[derive(Clone, Debug)]
+struct SifsOneShotBulkCreateControlPlaneKvClient {
+    inner: SifsControlPlaneKvClient,
+    local_node_id: NodeId,
+    validated_snapshot: Arc<Mutex<Option<Arc<KvSnapshot>>>>,
+}
+
+impl SifsOneShotBulkCreateControlPlaneKvClient {
+    fn new(data_dir: &SinomoDataDir, cluster_paths: &ClusterPaths, local_node_id: NodeId) -> Self {
+        Self {
+            inner: SifsControlPlaneKvClient::new(data_dir, cluster_paths),
+            local_node_id,
+            validated_snapshot: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn validate_cached_catalog(&self) -> Result<(), KvError> {
+        self.validated_cached_catalog().map(|_| ())
+    }
+
+    fn validated_cached_catalog(&self) -> Result<Vec<DfsMetadataShardConfig>, KvError> {
+        let (snapshot, shards) = self.cached_catalog()?;
+        {
+            let validated = self.validated_snapshot.lock().map_err(|_| {
+                self.inner
+                    .kv_error("DFS catalog validation lock is poisoned")
+            })?;
+            if validated
+                .as_ref()
+                .is_some_and(|validated| Arc::ptr_eq(validated, &snapshot))
+            {
+                return Ok(shards);
+            }
+        }
+
+        validate_one_shot_bulk_create_catalog(true, &self.local_node_id, &shards)
+            .map_err(|error| self.inner.kv_error(error))?;
+
+        *self.validated_snapshot.lock().map_err(|_| {
+            self.inner
+                .kv_error("DFS catalog validation lock is poisoned")
+        })? = Some(snapshot);
+        Ok(shards)
+    }
+
+    fn cached_catalog(&self) -> Result<(Arc<KvSnapshot>, Vec<DfsMetadataShardConfig>), KvError> {
+        let snapshot = self.inner.cached_snapshot()?.ok_or_else(|| {
+            self.inner
+                .kv_error("DFS metadata shard catalog is unavailable")
+        })?;
+        let entries = snapshot.range_prefix_limited(
+            &format!("{}/", metadata_shards_prefix(&sifs_file_system_id())),
+            sinomo_runtime::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+        )?;
+        let shards = decode_sifs_metadata_shard_configs(entries)
+            .map_err(|error| self.inner.kv_error(error))?;
+        Ok((snapshot, shards))
+    }
+
+    fn refresh_and_validate(&mut self) -> Result<(), KvError> {
+        self.inner.refresh_latest()?;
+        self.validate_cached_catalog()
+    }
+}
+
+impl DfsControlPlaneKvClient for SifsOneShotBulkCreateControlPlaneKvClient {
+    fn refresh_latest(&mut self) -> Result<(), KvError> {
+        self.refresh_and_validate()
+    }
+
+    fn get(&self, key: &str) -> Result<Option<sinomo_runtime::kv::KvEntry>, KvError> {
+        let value = self.inner.get(key)?;
+        self.validate_cached_catalog()?;
+        Ok(value)
+    }
+
+    fn range_prefix(&self, prefix: &str) -> Result<Vec<sinomo_runtime::kv::KvEntry>, KvError> {
+        let entries = self.inner.range_prefix(prefix)?;
+        self.validate_cached_catalog()?;
+        Ok(entries)
+    }
+
+    fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
+        self.validate_cached_catalog()?;
+        let revision = self.inner.put(key, value)?;
+        self.validate_cached_catalog()?;
+        Ok(revision)
+    }
+
+    fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+        self.validate_cached_catalog()?;
+        let response = self.inner.txn(txn)?;
+        self.validate_cached_catalog()?;
+        Ok(response)
+    }
+}
+
+fn read_sifs_metadata_shard_configs(
     cluster_paths: &ClusterPaths,
-) -> Result<Option<sinomo_runtime::dfs::LocalShardedMetadataBackend>, String> {
+) -> Result<Vec<DfsMetadataShardConfig>, String> {
     if !cluster_paths.state.exists() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let file_system_id = sifs_file_system_id();
     let entries = cluster::read_cluster_kv_latest_observed_prefix_entries(
@@ -2458,6 +2804,12 @@ fn open_sifs_sharded_metadata_backend(
         &format!("{}/", metadata_shards_prefix(&file_system_id)),
     )
     .map_err(|error| format!("cannot read DFS metadata shard config: {error}"))?;
+    decode_sifs_metadata_shard_configs(entries)
+}
+
+fn decode_sifs_metadata_shard_configs(
+    entries: Vec<sinomo_runtime::kv::KvEntry>,
+) -> Result<Vec<DfsMetadataShardConfig>, String> {
     let mut shards = Vec::new();
     for entry in entries {
         shards.push(
@@ -2467,15 +2819,93 @@ fn open_sifs_sharded_metadata_backend(
         );
     }
     shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
+    Ok(shards)
+}
+
+fn validate_one_shot_bulk_create_catalog(
+    daemon_backed_transport: bool,
+    local_node_id: &NodeId,
+    shards: &[DfsMetadataShardConfig],
+) -> Result<(), String> {
+    if !daemon_backed_transport {
+        return Err(
+            "one-shot SIFS bulk create requires the resident daemon DFS transport".to_string(),
+        );
+    }
+    if shards.is_empty() {
+        return Err(
+            "one-shot SIFS bulk create requires a nonempty metadata shard catalog".to_string(),
+        );
+    }
+    let file_system_id = sifs_file_system_id();
+    let mut shard_ids = BTreeSet::new();
+    for shard in shards {
+        if shard.file_system_id != file_system_id {
+            return Err(format!(
+                "one-shot SIFS bulk create catalog contains shard {} for filesystem {}",
+                shard.shard_id, shard.file_system_id
+            ));
+        }
+        if !shard_ids.insert(shard.shard_id.clone()) {
+            return Err(format!(
+                "one-shot SIFS bulk create catalog contains duplicate shard id {}",
+                shard.shard_id
+            ));
+        }
+    }
+    if let Some(shard) = shards
+        .iter()
+        .find(|shard| shard.primary_node_id == *local_node_id)
+    {
+        return Err(format!(
+            "one-shot SIFS bulk create is fenced because local node {local_node_id} is primary for metadata shard {} at epoch {}",
+            shard.shard_id, shard.epoch
+        ));
+    }
+    validate_one_shot_bulk_create_paths(
+        shards,
+        [
+            "/",
+            "/services/.catalog-coverage",
+            "/users/.catalog-coverage",
+        ],
+    )?;
+    Ok(())
+}
+
+fn validate_one_shot_bulk_create_paths<'a>(
+    shards: &[DfsMetadataShardConfig],
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    for path in paths {
+        if select_metadata_shard_config_for_path_strict_default_sifs_split(
+            &sifs_file_system_id(),
+            shards,
+            path,
+        )
+        .map_err(|error| format!("metadata shard catalog cannot route {path}: {error}"))?
+        .is_none()
+        {
+            return Err(format!(
+                "one-shot SIFS bulk create metadata shard catalog has no route for {path}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn open_sifs_sharded_metadata_backend(
+    data_dir: &SinomoDataDir,
+    shards: Vec<DfsMetadataShardConfig>,
+    local_node_id: &NodeId,
+) -> Result<Option<sinomo_runtime::dfs::LocalShardedMetadataBackend>, String> {
     if shards.is_empty() {
         return Ok(None);
     }
-    let state = cluster::read_cluster_state_without_kv(cluster_paths)
-        .map_err(|error| format!("cannot read local cluster state: {error}"))?;
     open_local_sharded_metadata_backend_for_replica_repair(
         default_dfs_metadata_shards_root(data_dir),
         shards,
-        &state.local_node_id,
+        local_node_id,
     )
     .map(Some)
     .map_err(|error| format!("cannot open DFS metadata shards: {error}"))
@@ -3528,6 +3958,170 @@ mod tests {
             "the SIFS RPC runtime must stay process-shared: per-open runtimes \
              deadlock whichever thread drops the last handle while a blocking \
              daemon probe or peer RPC is still in flight"
+        );
+    }
+
+    #[test]
+    fn one_shot_bulk_create_catalog_requires_daemon_and_no_local_primary() {
+        let primary = NodeId::from_legacy_named("node_stateless_primary").expect("primary");
+        let replica = NodeId::from_legacy_named("node_stateless_replica").expect("replica");
+        let outsider = NodeId::from_legacy_named("node_stateless_outsider").expect("outsider");
+        let shard = DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: primary.clone(),
+            replica_node_ids: vec![replica.clone()],
+            epoch: 1,
+            assignment: sinomo_runtime::dfs::DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+        };
+
+        assert!(
+            validate_one_shot_bulk_create_catalog(true, &outsider, std::slice::from_ref(&shard),)
+                .is_ok()
+        );
+        assert!(
+            validate_one_shot_bulk_create_catalog(false, &outsider, std::slice::from_ref(&shard),)
+                .is_err()
+        );
+        assert!(
+            validate_one_shot_bulk_create_catalog(true, &primary, std::slice::from_ref(&shard),)
+                .is_err()
+        );
+        assert!(
+            validate_one_shot_bulk_create_catalog(true, &replica, std::slice::from_ref(&shard),)
+                .is_ok()
+        );
+        assert!(validate_one_shot_bulk_create_catalog(true, &outsider, &[]).is_err());
+
+        let services = DfsMetadataShardConfig {
+            shard_id: "services".to_string(),
+            assignment: sinomo_runtime::dfs::DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/services".to_string(),
+            },
+            ..shard.clone()
+        };
+        let incomplete =
+            validate_one_shot_bulk_create_catalog(true, &outsider, &[shard.clone(), services])
+                .expect_err("a partial default SIFS split must not be treated as complete");
+        assert!(
+            incomplete.contains("cannot route /users"),
+            "unexpected incomplete-catalog fence: {incomplete}"
+        );
+
+        let duplicate =
+            validate_one_shot_bulk_create_catalog(true, &outsider, &[shard.clone(), shard])
+                .expect_err("duplicate shard ids must be rejected");
+        assert!(
+            duplicate.contains("duplicate shard id"),
+            "unexpected duplicate-catalog fence: {duplicate}"
+        );
+    }
+
+    #[test]
+    fn ordinary_sifs_backend_open_always_attaches_metadata() {
+        let root = temp_sifs_data_dir("ordinary-open-metadata");
+        let data_dir = SinomoDataDir::new(&root);
+        let backend = SifsFileManagerBackend::open(&data_dir).expect("ordinary SIFS backend");
+        assert!(
+            backend
+                .lock_service()
+                .expect("ordinary SIFS service")
+                .metadata_backend()
+                .is_some(),
+            "ordinary TUI/app/general backends must never use the metadata-less one-shot lane"
+        );
+    }
+
+    #[test]
+    fn one_shot_bulk_create_control_plane_refresh_fences_new_local_primary() {
+        let root = temp_sifs_data_dir("one-shot-authority-refresh");
+        let data_dir = SinomoDataDir::new(&root);
+        let mut shards = seed_observation_cluster(&data_dir);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let local_node_id = cluster::read_cluster_state_without_kv(&cluster_paths)
+            .expect("cluster state")
+            .local_node_id;
+        let remote_primary =
+            NodeId::from_legacy_named("node_one_shot_remote_primary").expect("remote primary");
+        for shard in &mut shards {
+            shard.primary_node_id = remote_primary.clone();
+            shard.replica_node_ids = vec![local_node_id.clone()];
+        }
+        write_metadata_shard_snapshot(&cluster_paths, &shards);
+
+        let control_plane = SifsOneShotBulkCreateControlPlaneKvClient::new(
+            &data_dir,
+            &cluster_paths,
+            local_node_id.clone(),
+        );
+        control_plane
+            .inner
+            .replace_cached_snapshot(false)
+            .expect("load remote-primary catalog");
+        control_plane
+            .validate_cached_catalog()
+            .expect("replica-only catalog is eligible");
+
+        shards[0].primary_node_id = local_node_id;
+        shards[0].epoch += 1;
+        write_metadata_shard_snapshot(&cluster_paths, &shards);
+        control_plane
+            .inner
+            .replace_cached_snapshot(false)
+            .expect("install reassigned catalog");
+        let error = control_plane
+            .validate_cached_catalog()
+            .expect_err("new local primary must fence the metadata-less requester");
+        assert!(
+            error.to_string().contains("is primary for metadata shard"),
+            "unexpected authority fence: {error}"
+        );
+    }
+
+    #[test]
+    fn one_shot_bulk_create_reuses_the_validated_installed_catalog() {
+        let root = temp_sifs_data_dir("one-shot-installed-catalog");
+        let data_dir = SinomoDataDir::new(&root);
+        let mut shards = seed_observation_cluster(&data_dir);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let local_node_id = cluster::read_cluster_state_without_kv(&cluster_paths)
+            .expect("cluster state")
+            .local_node_id;
+        let remote_primary =
+            NodeId::from_legacy_named("node_one_shot_cached_primary").expect("remote primary");
+        for shard in &mut shards {
+            shard.primary_node_id = remote_primary.clone();
+            shard.replica_node_ids = vec![local_node_id.clone()];
+        }
+        write_metadata_shard_snapshot(&cluster_paths, &shards);
+
+        let control_plane = SifsOneShotBulkCreateControlPlaneKvClient::new(
+            &data_dir,
+            &cluster_paths,
+            local_node_id,
+        );
+        control_plane
+            .inner
+            .replace_cached_snapshot(false)
+            .expect("install fresh catalog");
+        control_plane
+            .validate_cached_catalog()
+            .expect("validate fresh catalog");
+
+        let snapshot_path = cluster_paths.kv_paths().snapshot;
+        fs::remove_file(&snapshot_path).expect("remove materialized snapshot");
+        assert_eq!(
+            control_plane
+                .validated_cached_catalog()
+                .expect("reuse installed catalog"),
+            shards,
+            "mkdir, bulk create, and publish must share the generation validated at open"
+        );
+        assert!(
+            !snapshot_path.exists(),
+            "cached validation must not trigger another daemon/KV materialization"
         );
     }
 
@@ -4957,6 +5551,24 @@ mod tests {
                 .expect("seed metadata journal");
         }
         shards
+    }
+
+    fn write_metadata_shard_snapshot(
+        cluster_paths: &ClusterPaths,
+        shards: &[DfsMetadataShardConfig],
+    ) {
+        let mut kv = sinomo_runtime::kv::InProcessKvStore::new();
+        {
+            let mut control = DfsControlPlaneStore::new(&mut kv);
+            for shard in shards {
+                control.put_metadata_shard(shard).expect("metadata shard");
+            }
+        }
+        sinomo_runtime::kv::write_cluster_kv_snapshot(
+            &cluster_paths.kv_paths(),
+            &kv.try_snapshot().expect("KV snapshot"),
+        )
+        .expect("write metadata shard snapshot");
     }
 
     fn metadata_journal_heads(

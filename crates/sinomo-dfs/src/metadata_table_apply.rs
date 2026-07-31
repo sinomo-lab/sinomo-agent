@@ -4,11 +4,14 @@
 //! journal replay, recovery, and repair. This module centralizes the common
 //! append/apply/compact flow so those paths share the same durability behavior.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::DfsMetadataShardWriteFreeze;
 use crate::metadata_cursor::journal_write_lock_path;
@@ -20,24 +23,88 @@ use crate::metadata_journal::{
 use crate::metadata_lock::metadata_write_lock;
 use crate::metadata_records::{
     DFS_METADATA_PREFIX_PROOF_VERSION, DfsMetadataPrefixProof, DfsMetadataTableBatch,
-    DfsMetadataTableOp, dfs_metadata_prefix_proof_after,
+    DfsMetadataTableOp, DfsNamespacePrepareRecord, dfs_metadata_prefix_proof_after,
 };
+#[cfg(test)]
+use crate::metadata_table_store::rotate_metadata_table_log_for_checkpoint;
 use crate::metadata_table_store::{
-    append_metadata_table_batch, encode_metadata_table_snapshot,
+    append_metadata_table_batch, current_metadata_table_log_replay, encode_metadata_table_snapshot,
     install_encoded_metadata_table_snapshot, metadata_table_checkpoint_log_path,
     metadata_table_path, metadata_table_snapshot_fingerprint, persist_metadata_table_snapshot,
     read_metadata_table_checkpoint_state, remove_metadata_table_checkpoint_log,
-    rotate_metadata_table_log_for_checkpoint,
+    rotate_metadata_table_log_for_checkpoint_at_replay_boundary,
 };
 use crate::metadata_tables::{
     DfsMetadataTableRollback, DfsMetadataTables, MetadataTableSnapshotFingerprint,
 };
 
-static METADATA_TABLE_CHECKPOINT_WORKERS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+static METADATA_TABLE_CHECKPOINT_WORKERS: OnceLock<MetadataTableCheckpointWorkerRegistry> =
+    OnceLock::new();
+static METADATA_TABLE_LOGICAL_CHECKPOINT_FOLD: OnceLock<Mutex<()>> = OnceLock::new();
+#[cfg(test)]
+static METADATA_TABLE_LOGICAL_CHECKPOINT_FOLDS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static METADATA_TABLE_LOGICAL_CHECKPOINT_FOLDS_MAX: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(not(test))]
+const METADATA_TABLE_LOGICAL_CHECKPOINT_QUIET_PERIOD: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const METADATA_TABLE_LOGICAL_CHECKPOINT_QUIET_PERIOD: Duration = Duration::ZERO;
+
+#[derive(Clone, Copy, Debug)]
+struct MetadataTableCheckpointWorkerState {
+    revision: u64,
+    last_activity_at: Instant,
+    has_pending_namespace_prepares: bool,
+    physical_checkpoint_required: bool,
+    replay_pressure_boundary: Option<u64>,
+}
+
+#[derive(Default)]
+struct MetadataTableCheckpointWorkerRegistry {
+    workers: Mutex<BTreeMap<PathBuf, MetadataTableCheckpointWorkerState>>,
+    changed: Condvar,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MetadataTableCheckpointWorkerRequest {
+    revision: u64,
+    physical_checkpoint_required: bool,
+    replay_pressure_boundary: Option<u64>,
+}
+
+#[cfg(test)]
+struct MetadataTableLogicalCheckpointFoldObservation;
+
+#[cfg(test)]
+impl MetadataTableLogicalCheckpointFoldObservation {
+    fn enter() -> Self {
+        let active = METADATA_TABLE_LOGICAL_CHECKPOINT_FOLDS_ACTIVE
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        METADATA_TABLE_LOGICAL_CHECKPOINT_FOLDS_MAX.fetch_max(active, Ordering::SeqCst);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for MetadataTableLogicalCheckpointFoldObservation {
+    fn drop(&mut self) {
+        METADATA_TABLE_LOGICAL_CHECKPOINT_FOLDS_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+// This is a decode/allocation work estimate, not an encoded-size promise.
+// Counting already-built prepare records avoids rebuilding or serializing the
+// full authoritative body on the foreground path.
+const NAMESPACE_PREPARE_REPLAY_BASE_BYTES: u64 = 1_024;
+const NAMESPACE_PREPARE_REPLAY_BYTES_PER_RECORD: u64 = 256;
 
 pub(crate) struct TableMaterializationState<'a> {
     pub(crate) tables: &'a mut DfsMetadataTables,
     pub(crate) table_log_offset: &'a mut u64,
+    pub(crate) table_log_journal_reference_replay_cost_bytes: &'a mut u64,
+    pub(crate) table_log_unpriced_namespace_prepare_references: &'a mut u64,
     pub(crate) materialized_through_sequence: &'a mut u64,
     pub(crate) table_snapshot_fingerprint: &'a mut Option<MetadataTableSnapshotFingerprint>,
     pub(crate) prefix_proof: &'a mut Option<DfsMetadataPrefixProof>,
@@ -50,7 +117,7 @@ pub(crate) fn append_and_apply_table_ops(
     ops: Vec<DfsMetadataTableOp>,
     max_log_bytes: u64,
 ) -> Result<()> {
-    append_table_batch(root, state, sequence, ops, None, max_log_bytes, None)
+    append_table_batch(root, state, sequence, ops, None, None, max_log_bytes, None)
 }
 
 /// Append compact rebuildable operations while applying their already
@@ -65,6 +132,7 @@ pub(crate) fn append_and_apply_table_ops_with_persisted_ops(
     sequence: u64,
     persisted_ops: Vec<DfsMetadataTableOp>,
     apply_ops: Vec<DfsMetadataTableOp>,
+    journal_reference_replay_cost_bytes: Option<u64>,
     max_log_bytes: u64,
 ) -> Result<()> {
     append_table_batch(
@@ -73,6 +141,7 @@ pub(crate) fn append_and_apply_table_ops_with_persisted_ops(
         sequence,
         persisted_ops,
         Some(apply_ops),
+        journal_reference_replay_cost_bytes,
         max_log_bytes,
         None,
     )
@@ -91,6 +160,7 @@ pub(crate) fn append_preapplied_table_ops(
         state,
         sequence,
         ops,
+        None,
         None,
         max_log_bytes,
         Some(rollback),
@@ -117,7 +187,11 @@ pub(crate) fn compact_metadata_table_log_if_needed(
             });
         }
     };
-    if len <= max_log_bytes && !has_rotated_checkpoint {
+    if len <= max_log_bytes
+        && *state.table_log_journal_reference_replay_cost_bytes <= max_log_bytes
+        && *state.table_log_unpriced_namespace_prepare_references == 0
+        && !has_rotated_checkpoint
+    {
         return Ok(());
     }
     // Observable history transitions are authoritative journal mutations.
@@ -133,6 +207,8 @@ pub(crate) fn compact_metadata_table_log_if_needed(
     *state.table_log_offset = fs::metadata(&path)
         .map(|metadata| metadata.len())
         .map_err(|source| MetadataBackendError::Io { path, source })?;
+    *state.table_log_journal_reference_replay_cost_bytes = 0;
+    *state.table_log_unpriced_namespace_prepare_references = 0;
     let checkpoint_proof = state.prefix_proof.as_ref().ok_or_else(|| {
         MetadataBackendError::Serde(format!(
             "metadata table checkpoint at {} has no exact journal-prefix proof",
@@ -156,44 +232,117 @@ pub(crate) fn compact_metadata_table_log_if_needed(
 /// after the captured boundary.
 pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
     root: &Path,
+    tables: &DfsMetadataTables,
     max_log_bytes: u64,
+    table_log_offset: u64,
+    journal_reference_replay_cost_bytes: u64,
+    unpriced_namespace_prepare_references: u64,
 ) -> Result<()> {
-    if !metadata_table_checkpoint_log_path(root).is_file() {
-        let path = metadata_table_path(root);
-        let len = match fs::metadata(&path) {
-            Ok(metadata) => metadata.len(),
-            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(source) => {
-                return Err(MetadataBackendError::Io {
-                    path: path.clone(),
-                    source,
-                });
-            }
-        };
-        if len <= max_log_bytes {
-            return Ok(());
+    let replay_pressure_exceeded = journal_reference_replay_cost_bytes > max_log_bytes
+        || unpriced_namespace_prepare_references > 0;
+    let checkpoint_generation_present = metadata_table_checkpoint_log_path(root).is_file();
+    let path = metadata_table_path(root);
+    let len = match fs::metadata(&path) {
+        Ok(metadata) => metadata.len(),
+        Err(source)
+            if source.kind() == io::ErrorKind::NotFound && checkpoint_generation_present =>
+        {
+            0
         }
-    }
-
-    let root = root.to_path_buf();
-    let workers = METADATA_TABLE_CHECKPOINT_WORKERS.get_or_init(|| Mutex::new(BTreeSet::new()));
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(MetadataBackendError::Io {
+                path: path.clone(),
+                source,
+            });
+        }
+    };
+    let physical_checkpoint_required = len > max_log_bytes;
+    let has_pending_namespace_prepares = tables
+        .namespace_prepares
+        .values()
+        .any(|prepare| prepare.status == crate::DfsNamespacePrepareStatus::Prepared);
+    if !checkpoint_generation_present && !physical_checkpoint_required && !replay_pressure_exceeded
     {
-        let mut workers = workers
+        // A worker can already be waiting because a prepare landed in the
+        // active suffix while it folded the previous generation. Deliver the
+        // terminal transition and foreground activity even when that small
+        // suffix does not independently cross a checkpoint threshold.
+        if let Some(registry) = METADATA_TABLE_CHECKPOINT_WORKERS.get() {
+            let mut workers = registry
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(worker) = workers.get_mut(root) {
+                worker.revision = worker.revision.saturating_add(1);
+                worker.last_activity_at = Instant::now();
+                worker.has_pending_namespace_prepares = has_pending_namespace_prepares;
+                registry.changed.notify_all();
+            }
+        }
+        return Ok(());
+    }
+    let root = root.to_path_buf();
+    let registry = METADATA_TABLE_CHECKPOINT_WORKERS
+        .get_or_init(MetadataTableCheckpointWorkerRegistry::default);
+    {
+        let mut workers = registry
+            .workers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !workers.insert(root.clone()) {
+        if let Some(worker) = workers.get_mut(&root) {
+            worker.revision = worker.revision.saturating_add(1);
+            worker.last_activity_at = Instant::now();
+            worker.has_pending_namespace_prepares = has_pending_namespace_prepares;
+            // A checkpoint generation already owned by this process is not a
+            // second physical trigger. New appends during its fold land in
+            // the active suffix and merely extend the logical quiet period.
+            if physical_checkpoint_required {
+                worker.physical_checkpoint_required = true;
+                worker.replay_pressure_boundary = None;
+            } else if replay_pressure_exceeded && !worker.physical_checkpoint_required {
+                worker.replay_pressure_boundary = Some(table_log_offset);
+            }
+            registry.changed.notify_all();
             return Ok(());
         }
+        if !checkpoint_generation_present
+            && !physical_checkpoint_required
+            && has_pending_namespace_prepares
+        {
+            // A compact prepare reference is only an intermediate recovery
+            // dependency. Folding it while the transaction is still hidden
+            // makes every replica compete with the commit that will make it
+            // terminal. The commit/abort append observes the same accumulated
+            // pressure and schedules the eventual checkpoint.
+            return Ok(());
+        }
+        workers.insert(
+            root.clone(),
+            MetadataTableCheckpointWorkerState {
+                revision: 1,
+                last_activity_at: Instant::now(),
+                has_pending_namespace_prepares,
+                physical_checkpoint_required: checkpoint_generation_present
+                    || physical_checkpoint_required,
+                replay_pressure_boundary: (!checkpoint_generation_present
+                    && !physical_checkpoint_required
+                    && replay_pressure_exceeded)
+                    .then_some(table_log_offset),
+            },
+        );
     }
 
     let worker_root = root.clone();
     let spawn = std::thread::Builder::new()
         .name("sinomo-dfs-metadata-checkpoint".to_string())
         .spawn(move || {
-            let _registration =
-                MetadataTableCheckpointWorkerRegistration(worker_root.clone());
-            let result =
-                run_metadata_table_checkpoint_worker(&worker_root, max_log_bytes);
+            let mut registration =
+                MetadataTableCheckpointWorkerRegistration::new(worker_root.clone());
+            let result = run_coordinated_metadata_table_checkpoint_worker(
+                &worker_root,
+                max_log_bytes,
+            );
             if let Err(error) = result {
                 tracing::warn!(
                     target: "sinomo.dfs",
@@ -202,9 +351,11 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
                     "background metadata table checkpoint failed; durable journal replay remains authoritative"
                 );
             }
+            registration.unregister();
         });
     if let Err(source) = spawn {
-        workers
+        registry
+            .workers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&root);
@@ -218,23 +369,237 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
     Ok(())
 }
 
-struct MetadataTableCheckpointWorkerRegistration(PathBuf);
+struct MetadataTableCheckpointWorkerRegistration {
+    root: PathBuf,
+    registered: bool,
+}
+
+impl MetadataTableCheckpointWorkerRegistration {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            registered: true,
+        }
+    }
+
+    fn unregister(&mut self) {
+        if !self.registered {
+            return;
+        }
+        if let Some(registry) = METADATA_TABLE_CHECKPOINT_WORKERS.get() {
+            registry
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.root);
+            registry.changed.notify_all();
+        }
+        self.registered = false;
+    }
+}
 
 impl Drop for MetadataTableCheckpointWorkerRegistration {
     fn drop(&mut self) {
-        if let Some(workers) = METADATA_TABLE_CHECKPOINT_WORKERS.get() {
-            workers
+        self.unregister();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn wait_for_metadata_table_checkpoint_workers_for_test(root: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let running = METADATA_TABLE_CHECKPOINT_WORKERS
+            .get()
+            .is_some_and(|registry| {
+                registry
+                    .workers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .keys()
+                    .any(|worker_root| worker_root.starts_with(root))
+            });
+        if !running {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background checkpoint under {} did not finish",
+            root.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+fn next_metadata_table_checkpoint_worker_request(
+    root: &Path,
+) -> Option<MetadataTableCheckpointWorkerRequest> {
+    let registry = METADATA_TABLE_CHECKPOINT_WORKERS
+        .get_or_init(MetadataTableCheckpointWorkerRegistry::default);
+    let mut workers = registry
+        .workers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    loop {
+        let worker = *workers.get(root)?;
+        if worker.physical_checkpoint_required {
+            return Some(MetadataTableCheckpointWorkerRequest {
+                revision: worker.revision,
+                physical_checkpoint_required: true,
+                replay_pressure_boundary: None,
+            });
+        }
+        if worker.has_pending_namespace_prepares {
+            workers = registry
+                .changed
+                .wait(workers)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            continue;
+        }
+        let quiet_until = worker
+            .last_activity_at
+            .checked_add(METADATA_TABLE_LOGICAL_CHECKPOINT_QUIET_PERIOD)
+            .unwrap_or(worker.last_activity_at);
+        let now = Instant::now();
+        if now >= quiet_until {
+            return Some(MetadataTableCheckpointWorkerRequest {
+                revision: worker.revision,
+                physical_checkpoint_required: false,
+                replay_pressure_boundary: worker.replay_pressure_boundary,
+            });
+        }
+        let wait = quiet_until.saturating_duration_since(now);
+        let (next_workers, _) = registry
+            .changed
+            .wait_timeout(workers, wait)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        workers = next_workers;
+    }
+}
+
+fn claim_metadata_table_checkpoint_worker_request(
+    root: &Path,
+    request: MetadataTableCheckpointWorkerRequest,
+) -> bool {
+    let Some(registry) = METADATA_TABLE_CHECKPOINT_WORKERS.get() else {
+        return false;
+    };
+    let mut workers = registry
+        .workers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(worker) = workers.get_mut(root) else {
+        return false;
+    };
+    if worker.revision != request.revision {
+        return false;
+    }
+    if worker.physical_checkpoint_required {
+        if !request.physical_checkpoint_required {
+            return false;
+        }
+        // Consume this request before rotation. A later append that grows the
+        // new active suffix past the physical threshold sets it again and
+        // keeps this worker alive for one more immediate fold.
+        worker.physical_checkpoint_required = false;
+        return true;
+    }
+    !worker.has_pending_namespace_prepares
+        && Instant::now()
+            >= worker
+                .last_activity_at
+                .checked_add(METADATA_TABLE_LOGICAL_CHECKPOINT_QUIET_PERIOD)
+                .unwrap_or(worker.last_activity_at)
+}
+
+fn refresh_metadata_table_checkpoint_worker_for_active_suffix(
+    root: &Path,
+    max_log_bytes: u64,
+) -> Result<bool> {
+    let checkpoint_generation_present = metadata_table_checkpoint_log_path(root).is_file();
+    let replay = current_metadata_table_log_replay(root)?;
+    let physical_checkpoint_required = replay.offset > max_log_bytes;
+    let replay_pressure_exceeded = replay.journal_reference_replay_cost_bytes > max_log_bytes
+        || replay.unpriced_namespace_prepare_references > 0;
+    if !checkpoint_generation_present && !physical_checkpoint_required && !replay_pressure_exceeded
+    {
+        return Ok(false);
+    }
+    let Some(registry) = METADATA_TABLE_CHECKPOINT_WORKERS.get() else {
+        return Ok(false);
+    };
+    let mut workers = registry
+        .workers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(worker) = workers.get_mut(root) else {
+        return Ok(false);
+    };
+    worker.revision = worker.revision.saturating_add(1);
+    worker.last_activity_at = Instant::now();
+    worker.physical_checkpoint_required =
+        checkpoint_generation_present || physical_checkpoint_required;
+    worker.replay_pressure_boundary =
+        (!worker.physical_checkpoint_required && replay_pressure_exceeded).then_some(replay.offset);
+    registry.changed.notify_all();
+    Ok(true)
+}
+
+fn run_coordinated_metadata_table_checkpoint_worker(
+    root: &Path,
+    max_log_bytes: u64,
+) -> Result<bool> {
+    loop {
+        let Some(request) = next_metadata_table_checkpoint_worker_request(root) else {
+            return Ok(false);
+        };
+        let logical_fold = (!request.physical_checkpoint_required).then(|| {
+            METADATA_TABLE_LOGICAL_CHECKPOINT_FOLD
+                .get_or_init(|| Mutex::new(()))
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&self.0);
+        });
+        if !claim_metadata_table_checkpoint_worker_request(root, request) {
+            drop(logical_fold);
+            continue;
+        }
+        #[cfg(test)]
+        let _logical_fold_observation = (!request.physical_checkpoint_required)
+            .then(MetadataTableLogicalCheckpointFoldObservation::enter);
+        let result = run_metadata_table_checkpoint_worker(
+            root,
+            max_log_bytes,
+            request.replay_pressure_boundary,
+        );
+        #[cfg(test)]
+        drop(_logical_fold_observation);
+        drop(logical_fold);
+        match result {
+            Ok(checkpointed) => {
+                if !refresh_metadata_table_checkpoint_worker_for_active_suffix(root, max_log_bytes)?
+                {
+                    return Ok(checkpointed);
+                }
+                if !checkpointed {
+                    std::thread::yield_now();
+                }
+            }
+            Err(error) => return Err(error),
         }
     }
 }
 
-fn run_metadata_table_checkpoint_worker(root: &Path, max_log_bytes: u64) -> Result<bool> {
+fn run_metadata_table_checkpoint_worker(
+    root: &Path,
+    max_log_bytes: u64,
+    replay_pressure_boundary: Option<u64>,
+) -> Result<bool> {
     let snapshot_fingerprint = {
         let _write_lock = metadata_write_lock(root.to_path_buf(), journal_write_lock_path(root))?;
-        if !rotate_metadata_table_log_for_checkpoint(root, max_log_bytes)? {
+        if !rotate_metadata_table_log_for_checkpoint_at_replay_boundary(
+            root,
+            max_log_bytes,
+            replay_pressure_boundary,
+        )? {
             return Ok(false);
         }
         metadata_table_snapshot_fingerprint(root)?
@@ -406,12 +771,111 @@ fn advance_activated_handoff_rebind_checkpoint(
     Ok(())
 }
 
+fn namespace_prepare_replay_cost_bytes(prepare: &DfsNamespacePrepareRecord) -> u64 {
+    let record_count = prepare
+        .expected_object_versions
+        .len()
+        .saturating_add(prepare.expected_path_occupants.len())
+        .saturating_add(prepare.content_receipts.len())
+        .saturating_add(prepare.transaction.objects.len())
+        .saturating_add(prepare.transaction.versions.len())
+        .saturating_add(prepare.transaction.advisory_lock_states.len())
+        .saturating_add(usize::from(prepare.completed_request.is_some()))
+        .saturating_add(usize::from(prepare.completed_request_completion.is_some()));
+    NAMESPACE_PREPARE_REPLAY_BASE_BYTES.saturating_add(
+        u64::try_from(record_count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(NAMESPACE_PREPARE_REPLAY_BYTES_PER_RECORD),
+    )
+}
+
+fn namespace_prepare_reference_count(ops: &[DfsMetadataTableOp]) -> u64 {
+    u64::try_from(
+        ops.iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    DfsMetadataTableOp::PutNamespacePrepareJournalReference { .. }
+                )
+            })
+            .count(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn journal_reference_replay_cost_bytes(
+    persisted_ops: &[DfsMetadataTableOp],
+    semantic_ops: &[DfsMetadataTableOp],
+) -> u64 {
+    let reference_count = namespace_prepare_reference_count(persisted_ops);
+    if reference_count == 0 {
+        return 0;
+    }
+    let mut prepare_count = 0u64;
+    let mut replay_cost_bytes = 0u64;
+    for op in semantic_ops {
+        let DfsMetadataTableOp::PutNamespacePrepare { prepare } = op else {
+            continue;
+        };
+        prepare_count = prepare_count.saturating_add(1);
+        replay_cost_bytes =
+            replay_cost_bytes.saturating_add(namespace_prepare_replay_cost_bytes(prepare));
+    }
+    if prepare_count != reference_count {
+        // Persist a zero price for an unexpected reference shape. Replay will
+        // recognize it as unpriced and checkpoint the generation
+        // conservatively rather than trusting an incomplete estimate.
+        return 0;
+    }
+    replay_cost_bytes
+}
+
+fn reconcile_table_log_generation_after_background_checkpoint(
+    root: &Path,
+    state: &mut TableMaterializationState<'_>,
+) -> Result<()> {
+    let path = metadata_table_path(root);
+    let active_log_len = match fs::metadata(&path) {
+        Ok(metadata) => metadata.len(),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => 0,
+        Err(source) => {
+            return Err(MetadataBackendError::Io {
+                path: path.clone(),
+                source,
+            });
+        }
+    };
+    let snapshot_fingerprint = metadata_table_snapshot_fingerprint(root)?;
+    if active_log_len == *state.table_log_offset
+        && snapshot_fingerprint == *state.table_snapshot_fingerprint
+    {
+        return Ok(());
+    }
+    let replay = current_metadata_table_log_replay(root)?;
+    if replay.offset != active_log_len {
+        return Err(MetadataBackendError::Serde(format!(
+            "active metadata table log at {} has a torn tail at {} of {} bytes while rebasing after a background checkpoint",
+            path.display(),
+            replay.offset,
+            active_log_len
+        )));
+    }
+    *state.table_log_offset = replay.offset;
+    *state.table_log_journal_reference_replay_cost_bytes =
+        replay.journal_reference_replay_cost_bytes;
+    *state.table_log_unpriced_namespace_prepare_references =
+        replay.unpriced_namespace_prepare_references;
+    *state.table_snapshot_fingerprint = snapshot_fingerprint;
+    Ok(())
+}
+
 fn append_table_batch(
     root: &Path,
-    state: TableMaterializationState<'_>,
+    mut state: TableMaterializationState<'_>,
     sequence: u64,
     persisted_ops: Vec<DfsMetadataTableOp>,
     apply_ops: Option<Vec<DfsMetadataTableOp>>,
+    measured_journal_reference_replay_cost_bytes: Option<u64>,
     max_log_bytes: u64,
     mut rollback: Option<DfsMetadataTableRollback>,
 ) -> Result<()> {
@@ -420,7 +884,31 @@ fn append_table_batch(
             "metadata table batch {sequence} cannot combine preapplied rollback with separate apply operations"
         )));
     }
+    if let Err(error) = reconcile_table_log_generation_after_background_checkpoint(root, &mut state)
+    {
+        if let Some(rollback) = rollback.take() {
+            rollback.rollback(state.tables);
+        }
+        return Err(error);
+    }
     let validation_ops = apply_ops.as_deref().unwrap_or(&persisted_ops);
+    let reference_count = namespace_prepare_reference_count(&persisted_ops);
+    if reference_count == 0 && measured_journal_reference_replay_cost_bytes.is_some() {
+        return Err(MetadataBackendError::Serde(format!(
+            "metadata table batch {sequence} cannot price journal-reference replay without a journal reference"
+        )));
+    }
+    let structural_replay_cost_bytes =
+        journal_reference_replay_cost_bytes(&persisted_ops, validation_ops);
+    let journal_reference_replay_cost_bytes = measured_journal_reference_replay_cost_bytes
+        .map_or(structural_replay_cost_bytes, |measured| {
+            measured.max(structural_replay_cost_bytes)
+        });
+    let unpriced_namespace_prepare_references = if journal_reference_replay_cost_bytes == 0 {
+        reference_count
+    } else {
+        0
+    };
     if let Err(error) =
         validate_version_pin_removal_order(state.tables, validation_ops, rollback.is_some())
     {
@@ -479,6 +967,7 @@ fn append_table_batch(
         sequence,
         ops: persisted_ops,
         prefix_proof: Some(prefix_proof.clone()),
+        journal_reference_replay_cost_bytes,
     };
     let written = match append_metadata_table_batch(root, &batch) {
         Ok(written) => written,
@@ -490,13 +979,26 @@ fn append_table_batch(
         }
     };
     *state.table_log_offset = state.table_log_offset.saturating_add(written);
+    *state.table_log_journal_reference_replay_cost_bytes = state
+        .table_log_journal_reference_replay_cost_bytes
+        .saturating_add(batch.journal_reference_replay_cost_bytes);
+    *state.table_log_unpriced_namespace_prepare_references = state
+        .table_log_unpriced_namespace_prepare_references
+        .saturating_add(unpriced_namespace_prepare_references);
     if apply_after_append {
         for op in apply_ops.unwrap_or(batch.ops) {
             state.tables.apply_checked(op)?;
         }
     }
     *state.materialized_through_sequence = (*state.materialized_through_sequence).max(sequence);
-    schedule_metadata_table_checkpoint_if_needed(root, max_log_bytes)
+    schedule_metadata_table_checkpoint_if_needed(
+        root,
+        state.tables,
+        max_log_bytes,
+        *state.table_log_offset,
+        *state.table_log_journal_reference_replay_cost_bytes,
+        *state.table_log_unpriced_namespace_prepare_references,
+    )
 }
 
 fn validate_version_pin_removal_order(
@@ -587,12 +1089,16 @@ mod tests {
     use super::*;
     use crate::DfsFileSystemId;
     use crate::metadata_io::write_file_atomic;
+    use crate::metadata_journal::write_local_journal_entry;
     use crate::metadata_read_snapshot::current_tables_snapshot;
     use crate::metadata_records::{
-        DfsMetadataShardId, DfsNamespacePrepareRecord, DfsNamespacePrepareStatus,
-        DfsNamespaceTransaction, dfs_metadata_prefix_proof_seed,
+        DfsMetadataMutation, DfsMetadataShardId, DfsNamespacePrepareRecord,
+        DfsNamespacePrepareStatus, DfsNamespaceTransaction, dfs_metadata_prefix_proof_seed,
     };
-    use crate::metadata_table_store::{metadata_table_snapshot_path, read_metadata_table_state};
+    use crate::metadata_table_store::{
+        metadata_table_journal_reference_resolutions, metadata_table_snapshot_path,
+        read_metadata_table_state, reset_metadata_table_journal_reference_resolutions,
+    };
     use std::sync::{Arc, Mutex};
     use time::OffsetDateTime;
 
@@ -647,6 +1153,10 @@ mod tests {
         }
     }
 
+    fn wait_for_checkpoint_worker(root: &Path) {
+        wait_for_metadata_table_checkpoint_workers_for_test(root);
+    }
+
     #[test]
     fn compact_namespace_commit_reopens_from_materialized_table_log() {
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-table-semantic-reopen");
@@ -657,6 +1167,8 @@ mod tests {
         );
         let mut tables = DfsMetadataTables::default();
         let mut table_log_offset = 0;
+        let mut table_log_journal_reference_replay_cost_bytes = 0;
+        let mut table_log_unpriced_namespace_prepare_references = 0;
         let mut materialized_through_sequence = 0;
         let mut table_snapshot_fingerprint = None;
         let mut prefix_proof = Some(dfs_metadata_prefix_proof_seed(
@@ -669,6 +1181,10 @@ mod tests {
             TableMaterializationState {
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
+                table_log_journal_reference_replay_cost_bytes:
+                    &mut table_log_journal_reference_replay_cost_bytes,
+                table_log_unpriced_namespace_prepare_references:
+                    &mut table_log_unpriced_namespace_prepare_references,
                 materialized_through_sequence: &mut materialized_through_sequence,
                 table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
                 prefix_proof: &mut prefix_proof,
@@ -691,6 +1207,10 @@ mod tests {
             TableMaterializationState {
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
+                table_log_journal_reference_replay_cost_bytes:
+                    &mut table_log_journal_reference_replay_cost_bytes,
+                table_log_unpriced_namespace_prepare_references:
+                    &mut table_log_unpriced_namespace_prepare_references,
                 materialized_through_sequence: &mut materialized_through_sequence,
                 table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
                 prefix_proof: &mut prefix_proof,
@@ -721,6 +1241,320 @@ mod tests {
     }
 
     #[test]
+    fn compact_prepare_replay_pressure_defers_until_terminal_commit() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-table-reference-replay-pressure");
+        let shard_id = DfsMetadataShardId::new("shard_table_semantic_prepare");
+        let mut tables = DfsMetadataTables::default();
+        let mut table_log_offset = 0;
+        let mut table_log_journal_reference_replay_cost_bytes = 0;
+        let mut table_log_unpriced_namespace_prepare_references = 0;
+        let mut materialized_through_sequence = 0;
+        let mut table_snapshot_fingerprint = None;
+        let mut prefix_proof = Some(dfs_metadata_prefix_proof_seed(
+            &shard_id,
+            0,
+            "empty-reference-generation",
+        ));
+        let mut next_sequence = 1;
+        let max_replay_bytes = NAMESPACE_PREPARE_REPLAY_BASE_BYTES.saturating_sub(1);
+        let prepare = namespace_prepare(
+            "operation_replay_pressure",
+            DfsNamespacePrepareStatus::Prepared,
+        );
+        let entry = write_local_journal_entry(
+            root.path(),
+            &shard_id,
+            &mut next_sequence,
+            DfsMetadataMutation::put_namespace_prepare(&prepare),
+        )
+        .expect("append authoritative namespace prepare");
+        prefix_proof = Some(
+            dfs_metadata_prefix_proof_after(
+                prefix_proof.as_ref().expect("previous prefix proof"),
+                &entry,
+            )
+            .expect("extend exact prefix proof"),
+        );
+        let reference = DfsMetadataTableOp::PutNamespacePrepareJournalReference {
+            shard_id: shard_id.clone(),
+            journal_sequence: entry.sequence,
+            file_system_id: prepare.file_system_id.clone(),
+            operation_id: prepare.operation_id.clone(),
+            operation_digest: prepare.operation_digest.clone(),
+            owner_epoch: prepare.owner_epoch,
+            status: prepare.status.clone(),
+        };
+        append_and_apply_table_ops_with_persisted_ops(
+            root.path(),
+            TableMaterializationState {
+                tables: &mut tables,
+                table_log_offset: &mut table_log_offset,
+                table_log_journal_reference_replay_cost_bytes:
+                    &mut table_log_journal_reference_replay_cost_bytes,
+                table_log_unpriced_namespace_prepare_references:
+                    &mut table_log_unpriced_namespace_prepare_references,
+                materialized_through_sequence: &mut materialized_through_sequence,
+                table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
+                prefix_proof: &mut prefix_proof,
+            },
+            entry.sequence,
+            vec![reference],
+            vec![DfsMetadataTableOp::PutNamespacePrepare {
+                prepare: prepare.clone(),
+            }],
+            None,
+            max_replay_bytes,
+        )
+        .expect("append compact namespace prepare reference");
+
+        assert!(
+            table_log_offset <= max_replay_bytes,
+            "the compact table log itself should remain below the byte trigger: offset={table_log_offset} threshold={max_replay_bytes}"
+        );
+        assert!(
+            table_log_journal_reference_replay_cost_bytes > max_replay_bytes,
+            "the compact reference must cross the reconstructed replay-cost trigger"
+        );
+        assert_eq!(table_log_unpriced_namespace_prepare_references, 0);
+
+        wait_for_checkpoint_worker(root.path());
+        assert!(
+            !metadata_table_snapshot_path(root.path()).is_file(),
+            "logical pressure must not checkpoint a still-pending prepare"
+        );
+
+        let commit_entry = write_local_journal_entry(
+            root.path(),
+            &shard_id,
+            &mut next_sequence,
+            DfsMetadataMutation::commit_namespace_prepare(&prepare),
+        )
+        .expect("append authoritative namespace commit");
+        prefix_proof = Some(
+            dfs_metadata_prefix_proof_after(
+                prefix_proof.as_ref().expect("prepare prefix proof"),
+                &commit_entry,
+            )
+            .expect("extend commit prefix proof"),
+        );
+        append_and_apply_table_ops(
+            root.path(),
+            TableMaterializationState {
+                tables: &mut tables,
+                table_log_offset: &mut table_log_offset,
+                table_log_journal_reference_replay_cost_bytes:
+                    &mut table_log_journal_reference_replay_cost_bytes,
+                table_log_unpriced_namespace_prepare_references:
+                    &mut table_log_unpriced_namespace_prepare_references,
+                materialized_through_sequence: &mut materialized_through_sequence,
+                table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
+                prefix_proof: &mut prefix_proof,
+            },
+            commit_entry.sequence,
+            vec![namespace_prepare_commit_op(&prepare)],
+            max_replay_bytes,
+        )
+        .expect("append compact namespace commit");
+        assert!(
+            table_log_offset <= max_replay_bytes,
+            "the commit must exercise logical rather than physical pressure: offset={table_log_offset} threshold={max_replay_bytes}"
+        );
+
+        wait_for_checkpoint_worker(root.path());
+        assert!(
+            metadata_table_snapshot_path(root.path()).is_file(),
+            "the terminal commit must schedule a self-contained snapshot"
+        );
+        let first_snapshot =
+            fs::read(metadata_table_snapshot_path(root.path())).expect("first snapshot bytes");
+
+        let second_prepare = namespace_prepare(
+            "operation_replay_pressure_second_generation",
+            DfsNamespacePrepareStatus::Prepared,
+        );
+        let second_prepare_entry = write_local_journal_entry(
+            root.path(),
+            &shard_id,
+            &mut next_sequence,
+            DfsMetadataMutation::put_namespace_prepare(&second_prepare),
+        )
+        .expect("append second-generation authoritative prepare");
+        prefix_proof = Some(
+            dfs_metadata_prefix_proof_after(
+                prefix_proof.as_ref().expect("first commit prefix proof"),
+                &second_prepare_entry,
+            )
+            .expect("extend second-generation prepare prefix proof"),
+        );
+        append_and_apply_table_ops_with_persisted_ops(
+            root.path(),
+            TableMaterializationState {
+                tables: &mut tables,
+                table_log_offset: &mut table_log_offset,
+                table_log_journal_reference_replay_cost_bytes:
+                    &mut table_log_journal_reference_replay_cost_bytes,
+                table_log_unpriced_namespace_prepare_references:
+                    &mut table_log_unpriced_namespace_prepare_references,
+                materialized_through_sequence: &mut materialized_through_sequence,
+                table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
+                prefix_proof: &mut prefix_proof,
+            },
+            second_prepare_entry.sequence,
+            vec![DfsMetadataTableOp::PutNamespacePrepareJournalReference {
+                shard_id: shard_id.clone(),
+                journal_sequence: second_prepare_entry.sequence,
+                file_system_id: second_prepare.file_system_id.clone(),
+                operation_id: second_prepare.operation_id.clone(),
+                operation_digest: second_prepare.operation_digest.clone(),
+                owner_epoch: second_prepare.owner_epoch,
+                status: second_prepare.status.clone(),
+            }],
+            vec![DfsMetadataTableOp::PutNamespacePrepare {
+                prepare: second_prepare.clone(),
+            }],
+            None,
+            max_replay_bytes,
+        )
+        .expect("append second-generation compact prepare reference");
+        assert_eq!(
+            table_log_journal_reference_replay_cost_bytes,
+            namespace_prepare_replay_cost_bytes(&second_prepare),
+            "the live writer must rebase stale pressure counters onto the new active generation"
+        );
+        assert!(
+            table_log_offset <= max_replay_bytes,
+            "the second generation must remain below the physical trigger"
+        );
+        wait_for_checkpoint_worker(root.path());
+        assert_eq!(
+            fs::read(metadata_table_snapshot_path(root.path()))
+                .expect("snapshot after pending second generation"),
+            first_snapshot,
+            "the second pending prepare must not replace the first checkpoint"
+        );
+
+        let second_commit_entry = write_local_journal_entry(
+            root.path(),
+            &shard_id,
+            &mut next_sequence,
+            DfsMetadataMutation::commit_namespace_prepare(&second_prepare),
+        )
+        .expect("append second-generation authoritative commit");
+        prefix_proof = Some(
+            dfs_metadata_prefix_proof_after(
+                prefix_proof.as_ref().expect("second prepare prefix proof"),
+                &second_commit_entry,
+            )
+            .expect("extend second-generation commit prefix proof"),
+        );
+        append_and_apply_table_ops(
+            root.path(),
+            TableMaterializationState {
+                tables: &mut tables,
+                table_log_offset: &mut table_log_offset,
+                table_log_journal_reference_replay_cost_bytes:
+                    &mut table_log_journal_reference_replay_cost_bytes,
+                table_log_unpriced_namespace_prepare_references:
+                    &mut table_log_unpriced_namespace_prepare_references,
+                materialized_through_sequence: &mut materialized_through_sequence,
+                table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
+                prefix_proof: &mut prefix_proof,
+            },
+            second_commit_entry.sequence,
+            vec![namespace_prepare_commit_op(&second_prepare)],
+            max_replay_bytes,
+        )
+        .expect("append second-generation compact commit");
+        wait_for_checkpoint_worker(root.path());
+        assert_ne!(
+            fs::read(metadata_table_snapshot_path(root.path()))
+                .expect("second-generation snapshot bytes"),
+            first_snapshot,
+            "terminal second-generation pressure must publish another checkpoint"
+        );
+
+        reset_metadata_table_journal_reference_resolutions();
+        let reopened = read_metadata_table_state(root.path()).expect("reopen checkpointed tables");
+        assert_eq!(reopened.tables, tables);
+        assert_eq!(
+            metadata_table_journal_reference_resolutions(),
+            0,
+            "reopen must not resolve the checkpointed journal-reference suffix"
+        );
+        assert_eq!(
+            reopened.table_log_journal_reference_replay_cost_bytes, 0,
+            "the installed snapshot starts a fresh replay-pressure generation"
+        );
+    }
+
+    #[test]
+    fn legacy_unpriced_prepare_reference_is_checkpointed_conservatively() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-table-unpriced-reference");
+        let shard_id = DfsMetadataShardId::new("shard_table_semantic_prepare");
+        let prepare = namespace_prepare(
+            "operation_legacy_unpriced_reference",
+            DfsNamespacePrepareStatus::Committed,
+        );
+        let mut next_sequence = 1;
+        let entry = write_local_journal_entry(
+            root.path(),
+            &shard_id,
+            &mut next_sequence,
+            DfsMetadataMutation::put_namespace_prepare(&prepare),
+        )
+        .expect("append authoritative namespace prepare");
+        let prefix_proof = dfs_metadata_prefix_proof_after(
+            &dfs_metadata_prefix_proof_seed(&shard_id, 0, "empty-unpriced-generation"),
+            &entry,
+        )
+        .expect("extend exact prefix proof");
+        let legacy_batch = DfsMetadataTableBatch {
+            sequence: entry.sequence,
+            ops: vec![DfsMetadataTableOp::PutNamespacePrepareJournalReference {
+                shard_id,
+                journal_sequence: entry.sequence,
+                file_system_id: prepare.file_system_id.clone(),
+                operation_id: prepare.operation_id.clone(),
+                operation_digest: prepare.operation_digest.clone(),
+                owner_epoch: prepare.owner_epoch,
+                status: prepare.status.clone(),
+            }],
+            prefix_proof: Some(prefix_proof),
+            // Zero is omitted from the encoded record, matching batches
+            // written before replay-pressure accounting was introduced.
+            journal_reference_replay_cost_bytes: 0,
+        };
+        append_metadata_table_batch(root.path(), &legacy_batch)
+            .expect("append legacy compact table batch");
+
+        let state = read_metadata_table_state(root.path()).expect("replay legacy reference");
+        assert_eq!(state.table_log_journal_reference_replay_cost_bytes, 0);
+        assert_eq!(
+            state.table_log_unpriced_namespace_prepare_references, 1,
+            "a missing legacy estimate must never mean zero replay work"
+        );
+        schedule_metadata_table_checkpoint_if_needed(
+            root.path(),
+            &state.tables,
+            u64::MAX,
+            state.table_log_offset,
+            state.table_log_journal_reference_replay_cost_bytes,
+            state.table_log_unpriced_namespace_prepare_references,
+        )
+        .expect("schedule conservative legacy checkpoint");
+        wait_for_checkpoint_worker(root.path());
+
+        reset_metadata_table_journal_reference_resolutions();
+        let reopened = read_metadata_table_state(root.path()).expect("reopen legacy checkpoint");
+        assert_eq!(reopened.tables, state.tables);
+        assert_eq!(
+            metadata_table_journal_reference_resolutions(),
+            0,
+            "legacy references must be absorbed into the self-contained snapshot"
+        );
+    }
+
+    #[test]
     fn compact_namespace_commit_dependency_rejects_before_durable_append() {
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-table-semantic-missing-prepare");
         let prepare = namespace_prepare(
@@ -729,6 +1563,8 @@ mod tests {
         );
         let mut tables = DfsMetadataTables::default();
         let mut table_log_offset = 0;
+        let mut table_log_journal_reference_replay_cost_bytes = 0;
+        let mut table_log_unpriced_namespace_prepare_references = 0;
         let mut materialized_through_sequence = 0;
         let mut table_snapshot_fingerprint = None;
         let mut prefix_proof = Some(dfs_metadata_prefix_proof_seed(
@@ -742,6 +1578,10 @@ mod tests {
             TableMaterializationState {
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
+                table_log_journal_reference_replay_cost_bytes:
+                    &mut table_log_journal_reference_replay_cost_bytes,
+                table_log_unpriced_namespace_prepare_references:
+                    &mut table_log_unpriced_namespace_prepare_references,
                 materialized_through_sequence: &mut materialized_through_sequence,
                 table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
                 prefix_proof: &mut prefix_proof,
@@ -824,6 +1664,8 @@ mod tests {
         assert_ne!(tables, before);
 
         let mut table_log_offset = 0;
+        let mut table_log_journal_reference_replay_cost_bytes = 0;
+        let mut table_log_unpriced_namespace_prepare_references = 0;
         let mut materialized_through_sequence = 0;
         let mut table_snapshot_fingerprint = None;
         let mut prefix_proof = Some(dfs_metadata_prefix_proof_seed(
@@ -836,6 +1678,10 @@ mod tests {
             TableMaterializationState {
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
+                table_log_journal_reference_replay_cost_bytes:
+                    &mut table_log_journal_reference_replay_cost_bytes,
+                table_log_unpriced_namespace_prepare_references:
+                    &mut table_log_unpriced_namespace_prepare_references,
                 materialized_through_sequence: &mut materialized_through_sequence,
                 table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
                 prefix_proof: &mut prefix_proof,
@@ -863,6 +1709,8 @@ mod tests {
         assert_ne!(tables, before);
 
         let mut table_log_offset = 0;
+        let mut table_log_journal_reference_replay_cost_bytes = 0;
+        let mut table_log_unpriced_namespace_prepare_references = 0;
         let mut materialized_through_sequence = 0;
         let mut table_snapshot_fingerprint = None;
         let mut prefix_proof = None;
@@ -871,6 +1719,10 @@ mod tests {
             TableMaterializationState {
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
+                table_log_journal_reference_replay_cost_bytes:
+                    &mut table_log_journal_reference_replay_cost_bytes,
+                table_log_unpriced_namespace_prepare_references:
+                    &mut table_log_unpriced_namespace_prepare_references,
                 materialized_through_sequence: &mut materialized_through_sequence,
                 table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
                 prefix_proof: &mut prefix_proof,
@@ -902,6 +1754,8 @@ mod tests {
         assert_ne!(tables, before);
 
         let mut table_log_offset = 0;
+        let mut table_log_journal_reference_replay_cost_bytes = 0;
+        let mut table_log_unpriced_namespace_prepare_references = 0;
         let mut materialized_through_sequence = 0;
         let mut table_snapshot_fingerprint = None;
         let mut prefix_proof = Some(dfs_metadata_prefix_proof_seed(
@@ -914,6 +1768,10 @@ mod tests {
             TableMaterializationState {
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
+                table_log_journal_reference_replay_cost_bytes:
+                    &mut table_log_journal_reference_replay_cost_bytes,
+                table_log_unpriced_namespace_prepare_references:
+                    &mut table_log_unpriced_namespace_prepare_references,
                 materialized_through_sequence: &mut materialized_through_sequence,
                 table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
                 prefix_proof: &mut prefix_proof,
@@ -935,6 +1793,8 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-table-snapshot-prefix-crash-window");
         let mut tables = DfsMetadataTables::default();
         let mut table_log_offset = 0;
+        let mut table_log_journal_reference_replay_cost_bytes = 0;
+        let mut table_log_unpriced_namespace_prepare_references = 0;
         let mut materialized_through_sequence = 0;
         let mut table_snapshot_fingerprint = None;
         let mut prefix_proof = Some(dfs_metadata_prefix_proof_seed(
@@ -947,6 +1807,10 @@ mod tests {
             TableMaterializationState {
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
+                table_log_journal_reference_replay_cost_bytes:
+                    &mut table_log_journal_reference_replay_cost_bytes,
+                table_log_unpriced_namespace_prepare_references:
+                    &mut table_log_unpriced_namespace_prepare_references,
                 materialized_through_sequence: &mut materialized_through_sequence,
                 table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
                 prefix_proof: &mut prefix_proof,
@@ -986,6 +1850,8 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-table-background-checkpoint");
         let mut tables = DfsMetadataTables::default();
         let mut table_log_offset = 0;
+        let mut table_log_journal_reference_replay_cost_bytes = 0;
+        let mut table_log_unpriced_namespace_prepare_references = 0;
         let mut materialized_through_sequence = 0;
         let mut table_snapshot_fingerprint = None;
         let mut prefix_proof = Some(dfs_metadata_prefix_proof_seed(
@@ -1003,6 +1869,10 @@ mod tests {
             TableMaterializationState {
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
+                table_log_journal_reference_replay_cost_bytes:
+                    &mut table_log_journal_reference_replay_cost_bytes,
+                table_log_unpriced_namespace_prepare_references:
+                    &mut table_log_unpriced_namespace_prepare_references,
                 materialized_through_sequence: &mut materialized_through_sequence,
                 table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
                 prefix_proof: &mut prefix_proof,
@@ -1023,11 +1893,12 @@ mod tests {
         loop {
             let running = METADATA_TABLE_CHECKPOINT_WORKERS
                 .get()
-                .is_some_and(|workers| {
-                    workers
+                .is_some_and(|registry| {
+                    registry
+                        .workers
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .contains(root.path())
+                        .contains_key(root.path())
                 });
             if !running {
                 break;
@@ -1062,11 +1933,107 @@ mod tests {
     }
 
     #[test]
+    fn logical_checkpoint_folds_are_serialized_per_process() {
+        fn append_terminal_table_state(
+            root: &Path,
+            shard_id: &DfsMetadataShardId,
+            transaction_id: &str,
+        ) -> (DfsMetadataTables, u64) {
+            let mut tables = DfsMetadataTables::default();
+            let mut table_log_offset = 0;
+            let mut table_log_journal_reference_replay_cost_bytes = 0;
+            let mut table_log_unpriced_namespace_prepare_references = 0;
+            let mut materialized_through_sequence = 0;
+            let mut table_snapshot_fingerprint = None;
+            let mut prefix_proof =
+                Some(dfs_metadata_prefix_proof_seed(shard_id, 1, transaction_id));
+            append_and_apply_table_ops(
+                root,
+                TableMaterializationState {
+                    tables: &mut tables,
+                    table_log_offset: &mut table_log_offset,
+                    table_log_journal_reference_replay_cost_bytes:
+                        &mut table_log_journal_reference_replay_cost_bytes,
+                    table_log_unpriced_namespace_prepare_references:
+                        &mut table_log_unpriced_namespace_prepare_references,
+                    materialized_through_sequence: &mut materialized_through_sequence,
+                    table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
+                    prefix_proof: &mut prefix_proof,
+                },
+                1,
+                vec![namespace_transaction_op(transaction_id)],
+                u64::MAX,
+            )
+            .expect("append terminal table state");
+            (tables, table_log_offset)
+        }
+
+        let first = sinomo_testdir::TestDir::new("sinomo-dfs-table-logical-serial-first");
+        let second = sinomo_testdir::TestDir::new("sinomo-dfs-table-logical-serial-second");
+        let (first_tables, first_offset) = append_terminal_table_state(
+            first.path(),
+            &DfsMetadataShardId::new("shard_table_logical_serial_first"),
+            "txn_logical_serial_first",
+        );
+        let (second_tables, second_offset) = append_terminal_table_state(
+            second.path(),
+            &DfsMetadataShardId::new("shard_table_logical_serial_second"),
+            "txn_logical_serial_second",
+        );
+
+        let fold = METADATA_TABLE_LOGICAL_CHECKPOINT_FOLD
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        schedule_metadata_table_checkpoint_if_needed(
+            first.path(),
+            &first_tables,
+            u64::MAX - 1,
+            first_offset,
+            u64::MAX,
+            0,
+        )
+        .expect("schedule first logical fold");
+        schedule_metadata_table_checkpoint_if_needed(
+            second.path(),
+            &second_tables,
+            u64::MAX - 1,
+            second_offset,
+            u64::MAX,
+            0,
+        )
+        .expect("schedule second logical fold");
+        let registry = METADATA_TABLE_CHECKPOINT_WORKERS
+            .get()
+            .expect("checkpoint registry");
+        let workers = registry
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(workers.contains_key(first.path()));
+        assert!(workers.contains_key(second.path()));
+        drop(workers);
+        drop(fold);
+
+        wait_for_checkpoint_worker(first.path());
+        wait_for_checkpoint_worker(second.path());
+        assert!(metadata_table_snapshot_path(first.path()).is_file());
+        assert!(metadata_table_snapshot_path(second.path()).is_file());
+        assert_eq!(
+            METADATA_TABLE_LOGICAL_CHECKPOINT_FOLDS_MAX.load(Ordering::SeqCst),
+            1,
+            "logical snapshot folds must never overlap within one process"
+        );
+    }
+
+    #[test]
     fn checkpoint_install_preserves_records_appended_after_captured_boundary() {
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-table-checkpoint-suffix");
         let shard_id = DfsMetadataShardId::new("shard_table_suffix");
         let mut tables = DfsMetadataTables::default();
         let mut table_log_offset = 0;
+        let mut table_log_journal_reference_replay_cost_bytes = 0;
+        let mut table_log_unpriced_namespace_prepare_references = 0;
         let mut materialized_through_sequence = 0;
         let mut table_snapshot_fingerprint = None;
         let mut prefix_proof = Some(dfs_metadata_prefix_proof_seed(
@@ -1084,6 +2051,10 @@ mod tests {
             TableMaterializationState {
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
+                table_log_journal_reference_replay_cost_bytes:
+                    &mut table_log_journal_reference_replay_cost_bytes,
+                table_log_unpriced_namespace_prepare_references:
+                    &mut table_log_unpriced_namespace_prepare_references,
                 materialized_through_sequence: &mut materialized_through_sequence,
                 table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
                 prefix_proof: &mut prefix_proof,
@@ -1112,6 +2083,10 @@ mod tests {
             TableMaterializationState {
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
+                table_log_journal_reference_replay_cost_bytes:
+                    &mut table_log_journal_reference_replay_cost_bytes,
+                table_log_unpriced_namespace_prepare_references:
+                    &mut table_log_unpriced_namespace_prepare_references,
                 materialized_through_sequence: &mut materialized_through_sequence,
                 table_snapshot_fingerprint: &mut table_snapshot_fingerprint,
                 prefix_proof: &mut prefix_proof,
@@ -1129,9 +2104,17 @@ mod tests {
         // trusting the active log's reset byte length.
         let stale_tables = DfsMetadataTables::default();
         let read_cache = Arc::new(Mutex::new(None));
-        let during_checkpoint =
-            current_tables_snapshot(root.path(), &stale_tables, 0, 0, &None, &read_cache)
-                .expect("read across checkpoint generation");
+        let during_checkpoint = current_tables_snapshot(
+            root.path(),
+            &stale_tables,
+            0,
+            0,
+            &None,
+            &None,
+            &None,
+            &read_cache,
+        )
+        .expect("read across checkpoint generation");
         assert!(
             during_checkpoint
                 .namespace_transactions

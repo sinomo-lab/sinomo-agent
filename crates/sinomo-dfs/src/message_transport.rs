@@ -409,7 +409,7 @@ pub(crate) fn materialize_dfs_routed_call_sync(
     crate::body_rpc::attach_dfs_routed_message_attachment(message, attachment.descriptor, bytes)
 }
 
-async fn materialize_dfs_routed_call(
+pub(crate) async fn materialize_dfs_routed_call(
     call: DfsRoutedCall,
 ) -> Result<DfsRoutedMessage, NetworkError> {
     let DfsRoutedCall {
