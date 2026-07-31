@@ -1165,19 +1165,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if !namespace_operation_returns_synced_response_objects(operation) {
             return Ok(Vec::new());
         }
-        let pinned_backend = if let Some(backend) = self.metadata_backend.as_mut() {
-            backend.begin_consistent_read_snapshot()?;
-            true
-        } else {
-            false
+        let point_lookup_path = match operation {
+            DfsNamespaceOperation::LookupPath { path } => Some(path.as_str()),
+            _ => None,
         };
+        let pinned_backend = self.metadata_backend.is_some();
+        if let Some(backend) = self.metadata_backend.as_mut() {
+            if let Some(path) = point_lookup_path {
+                backend.begin_consistent_read_snapshot_for_path(file_system_id, path)?;
+            } else {
+                backend.begin_consistent_read_snapshot()?;
+            }
+        }
         let result =
             self.synced_namespace_objects_for_operation_from_pinned_view(file_system_id, operation);
         if pinned_backend {
-            self.metadata_backend
+            let backend = self
+                .metadata_backend
                 .as_mut()
-                .expect("pinned metadata backend remains installed")
-                .end_consistent_read_snapshot();
+                .expect("pinned metadata backend remains installed");
+            if let Some(path) = point_lookup_path {
+                backend.end_consistent_read_snapshot_for_path(file_system_id, path);
+            } else {
+                backend.end_consistent_read_snapshot();
+            }
         }
         result
     }

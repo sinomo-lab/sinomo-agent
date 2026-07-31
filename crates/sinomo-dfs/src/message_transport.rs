@@ -75,6 +75,29 @@ pub struct DfsRoutedSendOutcome {
     pub result: Result<(), NetworkError>,
 }
 
+/// One immutable metadata journal command shared by every target at the same
+/// replica cursor.
+///
+/// Authority prepares can be several MiB. Keeping the target set beside one
+/// owned command lets production transports encode and replay that value once
+/// without first deep-cloning it into a command per replica. A transport that
+/// cannot retain shared replayable values returns `None`; the service then
+/// materializes the ordinary per-target routed fallback commands.
+#[derive(Debug)]
+pub struct DfsMetadataJournalBatchDirectGroup {
+    pub target_node_ids: Vec<NodeId>,
+    pub command: DfsMetadataJournalBatchCommand,
+}
+
+impl DfsMetadataJournalBatchDirectGroup {
+    pub fn new(target_node_ids: Vec<NodeId>, command: DfsMetadataJournalBatchCommand) -> Self {
+        Self {
+            target_node_ids,
+            command,
+        }
+    }
+}
+
 impl DfsOutboundAttachment {
     pub fn from_reader(
         reader: ObjectVersionReader,
@@ -228,6 +251,49 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
             responses.push((target_node_id.clone(), response));
         }
         Ok(Some(responses))
+    }
+
+    /// Send one prepared metadata batch to several replicas while giving the
+    /// peer response phase a fresh relative budget.
+    ///
+    /// Production transports which encode large replayable calls should
+    /// override this method and begin `response_timeout` only after encoding.
+    /// The compatibility implementation scopes the shorter deadline around
+    /// the existing direct-send method and always restores the caller's
+    /// operation deadline before returning.
+    fn send_metadata_journal_batches_direct_with_response_timeout(
+        &mut self,
+        requests: &[(NodeId, DfsMetadataJournalBatchCommand)],
+        response_timeout: Duration,
+    ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
+        let requested_deadline = Instant::now()
+            .checked_add(response_timeout)
+            .unwrap_or_else(Instant::now);
+        let observed_previous_deadline = self.operation_deadline();
+        let effective_deadline = observed_previous_deadline
+            .map_or(requested_deadline, |deadline| {
+                deadline.min(requested_deadline)
+            });
+        let replaced_previous_deadline = self.set_operation_deadline(Some(effective_deadline));
+        let previous_deadline = replaced_previous_deadline.or(observed_previous_deadline);
+        let result = self.send_metadata_journal_batches_direct(requests);
+        self.set_operation_deadline(previous_deadline);
+        result
+    }
+
+    /// Send cursor-grouped metadata batches without cloning one large command
+    /// per target before the transport can construct a replayable value.
+    ///
+    /// The default deliberately reports the accelerator as unavailable. This
+    /// preserves compatibility for message-only and rolling-upgrade transports:
+    /// the caller retains the same exact per-target routed fallback and its
+    /// target-unique request identities.
+    fn send_grouped_metadata_journal_batches_direct_with_response_timeout(
+        &mut self,
+        _groups: &[DfsMetadataJournalBatchDirectGroup],
+        _response_timeout: Duration,
+    ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
+        Ok(None)
     }
 
     fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError>;

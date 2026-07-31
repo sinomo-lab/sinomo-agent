@@ -28,13 +28,13 @@ use sinomo_dfs::{
     DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardStatus,
     DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult,
     DfsMetadataSnapshotInstallSender, DfsMetadataSummary, DfsObjectId, DfsObjectMetadata,
-    DfsObjectVersionRecord, DfsOperatorInspector, DfsOperatorRepairView, DfsReplicaReceiptRecord,
-    DfsVersion, DfsWriteIntentRecord, DfsWriteIntentStatus, LocalSobjMetadataBackend,
-    cluster_dfs_all_file_system_configs, cluster_dfs_all_metadata_shard_head_watermarks,
-    cluster_dfs_all_metadata_shard_membership_handoffs, cluster_dfs_all_metadata_shards,
+    DfsObjectVersionRecord, DfsOperatorInspector, DfsOperatorRepairView, DfsRepairAttemptSnapshot,
+    DfsReplicaReceiptRecord, DfsVersion, DfsWriteIntentRecord, DfsWriteIntentStatus,
+    LocalSobjMetadataBackend, cluster_dfs_all_file_system_configs,
+    cluster_dfs_all_metadata_shard_head_watermarks, cluster_dfs_all_metadata_shards,
     default_dfs_content_root_catalog_store, default_dfs_metadata_root, distributed_sifs,
     distributed_sifs_bootstrap_objects, file_system_config_key, metadata_shard_key,
-    sifs_node_files_path,
+    sifs_node_files_path, write_dfs_repair_attempt_snapshot,
 };
 use sinomo_dfs::{
     DfsCommittedWorkTracker, DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture,
@@ -47,9 +47,9 @@ use sinomo_dfs::{
     DfsMetadataShardMembershipHandoff, DfsNodeDetachedSendState, DfsNodeDetachedSendWorker,
     DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport,
     DfsPeerTransportError, DfsPlacementReconciliationJob, DfsPlacementReconciliationState,
-    DfsRepairAttemptRecord, DfsRepairAttemptSnapshot, LocalContentStore, NetworkedDfsService,
-    default_dfs_repair_attempt_snapshot_path, dfs_message_execution_scope,
-    read_dfs_repair_attempt_snapshot, write_dfs_repair_attempt_snapshot,
+    DfsRepairAttemptRecord, LocalContentStore, LocalDfsRepairQueueStore, NetworkedDfsService,
+    cluster_dfs_all_metadata_shard_membership_handoffs, default_dfs_repair_attempt_snapshot_path,
+    dfs_message_execution_scope, read_dfs_repair_attempt_snapshot,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
@@ -705,7 +705,6 @@ static DAEMON_DFS_MAINTENANCE_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceL
 static DAEMON_DFS_REPAIR_QUEUE_NONEMPTY: OnceLock<Mutex<BTreeMap<PathBuf, bool>>> = OnceLock::new();
 #[cfg(test)]
 static DAEMON_DFS_MAINTENANCE_WAKE_COUNT: AtomicU64 = AtomicU64::new(0);
-static DAEMON_DFS_REPAIR_QUEUE_SNAPSHOT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static DAEMON_DFS_PLACEMENT_AUTHORITY_SESSION_ID: OnceLock<String> = OnceLock::new();
 static DAEMON_DFS_DATA_OWNER_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<DaemonDataOwnerLock>>>> =
     OnceLock::new();
@@ -2833,51 +2832,20 @@ fn daemon_dfs_maintenance_metadata_observation(
 /// This runs at the mutation's committed edge, before its live service lane is
 /// released. Existing retry/backoff state wins for an already queued target;
 /// maintenance remains the sole owner of advancing or clearing that state.
-/// The work is O(active repair targets) and never opens DFS metadata or content
-/// inventory.
+/// The framed append is proportional only to this message's newly committed
+/// targets and never reads or rewrites the accumulated queue.
 fn persist_daemon_dfs_repair_queue_records(
     data_dir: &SinomoDataDir,
     committed_records: Vec<DfsRepairAttemptRecord>,
-) -> Result<(), sinomo_dfs::DfsError> {
+) -> Result<usize, sinomo_dfs::DfsError> {
     if committed_records.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
-    let _guard = DAEMON_DFS_REPAIR_QUEUE_SNAPSHOT_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| sinomo_dfs::DfsError::Metadata {
-            message: "daemon DFS repair queue snapshot lock poisoned".to_string(),
-        })?;
-    let path = default_dfs_repair_attempt_snapshot_path(data_dir);
-    let existing_records = read_dfs_repair_attempt_snapshot(&path)?
-        .map(|snapshot| snapshot.records)
-        .unwrap_or_default();
-    let mut records_by_target = BTreeMap::<(String, NodeId), DfsRepairAttemptRecord>::new();
-    for record in existing_records {
-        records_by_target.insert(
-            (
-                record.intent_id.clone(),
-                record.missing_replica_node_id.clone(),
-            ),
-            record,
-        );
-    }
-    for record in committed_records {
-        records_by_target
-            .entry((
-                record.intent_id.clone(),
-                record.missing_replica_node_id.clone(),
-            ))
-            .or_insert(record);
-    }
-    write_dfs_repair_attempt_snapshot(
-        &path,
-        &DfsRepairAttemptSnapshot {
-            records: records_by_target.into_values().collect(),
-        },
-    )?;
+    let appended =
+        LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(data_dir))
+            .append_enqueues(committed_records)?;
     record_daemon_dfs_repair_queue_nonempty(data_dir, true);
-    Ok(())
+    Ok(appended)
 }
 
 /// Inspect only the bounded durable queues owned by normal reactive healing.
@@ -2928,6 +2896,18 @@ pub(crate) fn daemon_dfs_pending_reactive_maintenance_work(
             &placement_reconciliation_jobs,
             repair_attempt_records.len(),
         );
+    // Membership handoffs are a small, explicit control-plane work queue, not
+    // a DFS metadata inventory. A handoff may be staged while the previous
+    // maintenance generation is finishing; retaining it in this bounded
+    // classifier prevents the coalesced wake from being consumed after only
+    // the first shard/replica transition.
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+        .map_err(DaemonError::from)?;
+    let pending_local_membership_handoff_count =
+        cluster_dfs_all_metadata_shard_membership_handoffs(&cluster_paths)?
+            .into_iter()
+            .filter(|handoff| handoff.retiring_shard.primary_node_id == state.local_node_id)
+            .count();
 
     Ok(DaemonDfsPendingMaintenanceWork {
         pending_repair_count: repair_attempt_records.len(),
@@ -2935,6 +2915,7 @@ pub(crate) fn daemon_dfs_pending_reactive_maintenance_work(
         due_repair_attempt_count,
         next_repair_retry_unix_nanos,
         actionable_placement_reconciliation_count,
+        pending_local_membership_handoff_count,
         ..DaemonDfsPendingMaintenanceWork::default()
     })
 }
@@ -4461,7 +4442,7 @@ fn process_daemon_dfs_message_command_on_runtime(
         hydrate.as_micros(),
         trace_started.elapsed().as_millis()
     ));
-    let process_report = service_lane
+    let mut process_report = service_lane
         .service
         .process_message_command_report_with_preingested_blob(command, preingested_blob);
     let deferred_work = if is_read_only {
@@ -4479,19 +4460,19 @@ fn process_daemon_dfs_message_command_on_runtime(
                 })
             })
     };
-    let repair_queue_persistence_error = if !is_read_only
-        && (process_report.committed_work.repair_maintenance
-            || process_report.outcome.as_ref().is_ok_and(|result| {
-                sinomo_dfs::dfs_events_should_wake_repair_maintenance(&result.events)
-            })) {
-        persist_daemon_dfs_repair_queue_records(
-            data_dir,
-            service_lane.service.durable_repair_queue_records(),
-        )
-        .err()
+    let repair_queue_records = if is_read_only {
+        Vec::new()
     } else {
-        None
+        std::mem::take(&mut process_report.committed_repair_records)
     };
+    let repair_queue_record_count = repair_queue_records.len();
+    let repair_queue_started = Instant::now();
+    let repair_queue_persistence = if repair_queue_records.is_empty() {
+        Ok(0)
+    } else {
+        persist_daemon_dfs_repair_queue_records(data_dir, repair_queue_records)
+    };
+    let repair_queue_elapsed = repair_queue_started.elapsed();
     let process = process_started.elapsed();
     let (outbound_message_count, event_count) = process_report
         .outcome
@@ -4499,7 +4480,7 @@ fn process_daemon_dfs_message_command_on_runtime(
         .map(|result| (result.response.outbound_messages.len(), result.events.len()))
         .unwrap_or_default();
     daemon_dfs_perf_trace(format_args!(
-        "dfs-message-dispatch request={} read_lane={} peer_snapshot_ms={} ensure_ms={} cache_select_ms={} cache_select_us={} cache_lock_wait_ms={} cache_lock_wait_us={} lane_lock_wait_ms={} lane_lock_wait_us={} full_hydrate={} hydrate_ms={} hydrate_us={} process_ms={} process_us={} process_ok={} outbound_messages={} events={} total_ms={}",
+        "dfs-message-dispatch request={} read_lane={} peer_snapshot_ms={} ensure_ms={} cache_select_ms={} cache_select_us={} cache_lock_wait_ms={} cache_lock_wait_us={} lane_lock_wait_ms={} lane_lock_wait_us={} full_hydrate={} hydrate_ms={} hydrate_us={} process_ms={} process_us={} repair_queue_records={} repair_queue_appended={} repair_queue_ms={} repair_queue_us={} process_ok={} outbound_messages={} events={} total_ms={}",
         request_id,
         use_lightweight_read_lane,
         peer_snapshot_ms,
@@ -4515,13 +4496,20 @@ fn process_daemon_dfs_message_command_on_runtime(
         hydrate.as_micros(),
         process.as_millis(),
         process.as_micros(),
+        repair_queue_record_count,
+        repair_queue_persistence
+            .as_ref()
+            .copied()
+            .unwrap_or_default(),
+        repair_queue_elapsed.as_millis(),
+        repair_queue_elapsed.as_micros(),
         process_report.outcome.is_ok(),
         outbound_message_count,
         event_count,
         trace_started.elapsed().as_millis()
     ));
     drop(service_lane);
-    if let Some(error) = repair_queue_persistence_error {
+    if let Err(error) = repair_queue_persistence {
         tracing::error!(
             target: "sinomo.dfs.fault_healing",
             data_root = %cache_key.display(),
@@ -11879,6 +11867,74 @@ mod tests {
 
         assert!(pending.has_work());
         assert!(pending.should_trigger_background_maintenance());
+    }
+
+    #[test]
+    fn daemon_dfs_reactive_probe_retains_local_membership_handoff_wake() {
+        let root = temp_root("reactive-probe-membership-handoff");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let local_node_id =
+            NodeId::from_legacy_named("node_reactive_handoff_local").expect("local node");
+        let remote_node_id =
+            NodeId::from_legacy_named("node_reactive_handoff_remote").expect("remote node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_reactive_handoff").expect("cluster"),
+            "reactive handoff probe",
+            local_node_id.clone(),
+            "local",
+            "pk-local",
+            OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("write state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("sync raft");
+
+        let file_system_id = sinomo_dfs::sifs_file_system_id();
+        let retiring_shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: local_node_id.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        let handoff = DfsMetadataShardMembershipHandoff {
+            handoff_id: "reactive-handoff-root-2".to_string(),
+            desired_shard: DfsMetadataShardConfig {
+                replica_node_ids: vec![remote_node_id],
+                epoch: 2,
+                ..retiring_shard.clone()
+            },
+            retiring_shard,
+            required_prepared_sequence: 0,
+            required_head_watermark: None,
+            retiring_primary_fence: None,
+        };
+        append_cluster_raft_command(
+            &cluster_paths,
+            &local_node_id,
+            sinomo_core::kv::KvCommand::Op(
+                KvOp::put_serde(
+                    sinomo_dfs::metadata_shard_membership_handoff_key(&file_system_id, "root"),
+                    &handoff,
+                    None,
+                )
+                .expect("encode handoff"),
+            ),
+        )
+        .expect("append handoff");
+
+        let pending = daemon_dfs_pending_reactive_maintenance_work(&paths).expect("reactive probe");
+        assert_eq!(pending.pending_local_membership_handoff_count, 1);
+        assert!(pending.should_trigger_background_maintenance());
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

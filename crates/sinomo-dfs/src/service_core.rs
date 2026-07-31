@@ -312,6 +312,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub(crate) fn begin_message_committed_work(&mut self) {
         self.message_committed_work = DfsMessageCommittedWork::default();
+        self.coordinator.begin_message_repair_job_capture();
     }
 
     pub(crate) fn record_message_committed_work(&mut self, work: DfsMessageCommittedWork) {

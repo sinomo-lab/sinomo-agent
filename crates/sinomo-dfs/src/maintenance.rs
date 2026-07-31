@@ -814,19 +814,25 @@ pub struct DfsMetadataReplicationSuppressionSnapshot {
 #[derive(Clone, Debug)]
 pub struct LocalDfsMaintenanceHost {
     data_dir: SinomoDataDir,
+    repair_queue_store: crate::repair_queue_store::LocalDfsRepairQueueStore,
+    repair_queue_head_sequence: Option<u64>,
 }
 
 impl LocalDfsMaintenanceHost {
     pub fn new(data_dir: SinomoDataDir) -> Self {
-        Self { data_dir }
+        let repair_queue_store = crate::repair_queue_store::LocalDfsRepairQueueStore::new(
+            default_dfs_repair_attempt_snapshot_path(&data_dir),
+        );
+        repair_queue_store.reload_from_disk_on_next_access();
+        Self {
+            data_dir,
+            repair_queue_store,
+            repair_queue_head_sequence: None,
+        }
     }
 
     fn cursor_path(&self, file_system_id: &DfsFileSystemId) -> PathBuf {
         default_dfs_anti_entropy_cursor_path(&self.data_dir, file_system_id)
-    }
-
-    fn repair_attempt_path(&self) -> PathBuf {
-        default_dfs_repair_attempt_snapshot_path(&self.data_dir)
     }
 }
 
@@ -853,23 +859,44 @@ impl DfsMaintenanceHost for LocalDfsMaintenanceHost {
     }
 
     fn load_repair_attempt_records(&mut self) -> Result<Vec<DfsRepairAttemptRecord>, DfsError> {
-        read_dfs_repair_attempt_snapshot(&self.repair_attempt_path()).map(|snapshot| {
-            snapshot
-                .map(|snapshot| snapshot.records)
-                .unwrap_or_default()
-        })
+        let view = self.repair_queue_store.view()?;
+        self.repair_queue_head_sequence = Some(view.head_sequence);
+        Ok(view.records)
     }
 
     fn store_repair_attempt_records(
         &mut self,
         records: &[DfsRepairAttemptRecord],
     ) -> Result<(), DfsError> {
-        write_dfs_repair_attempt_snapshot(
-            &self.repair_attempt_path(),
-            &DfsRepairAttemptSnapshot {
-                records: records.to_vec(),
-            },
-        )
+        let expected_head_sequence = match self.repair_queue_head_sequence {
+            Some(sequence) => sequence,
+            None => self.repair_queue_store.view()?.head_sequence,
+        };
+        match self
+            .repair_queue_store
+            .reconcile(expected_head_sequence, records)?
+        {
+            crate::repair_queue_store::DfsRepairQueueReconcileOutcome::Applied {
+                head_sequence,
+                ..
+            } => {
+                self.repair_queue_head_sequence = Some(head_sequence);
+                self.repair_queue_store.compact_if_needed(
+                    crate::repair_queue_store::DfsRepairQueueCompactionOptions::default(),
+                )?;
+                Ok(())
+            }
+            crate::repair_queue_store::DfsRepairQueueReconcileOutcome::GenerationChanged {
+                current_head_sequence,
+            } => {
+                self.repair_queue_head_sequence = Some(current_head_sequence);
+                Err(DfsError::Metadata {
+                    message: format!(
+                        "DFS repair queue changed during maintenance: expected sequence {expected_head_sequence}, found {current_head_sequence}"
+                    ),
+                })
+            }
+        }
     }
 }
 
@@ -905,41 +932,24 @@ pub fn default_dfs_metadata_replication_suppression_snapshot_path(
 pub fn read_dfs_repair_attempt_snapshot(
     path: &Path,
 ) -> Result<Option<DfsRepairAttemptSnapshot>, DfsError> {
-    match std::fs::read(path) {
-        Ok(bytes) => sinomo_object_serde::from_bytes(&bytes)
-            .map(Some)
-            .map_err(|source| DfsError::Serialization {
-                message: format!(
-                    "DFS repair attempt snapshot object error at {}: {source}",
-                    path.display()
-                ),
-            }),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(DfsError::Metadata {
-            message: format!(
-                "could not read DFS repair attempt snapshot {}: {source}",
-                path.display()
-            ),
-        }),
-    }
+    let view = crate::repair_queue_store::LocalDfsRepairQueueStore::new(path).view()?;
+    Ok(
+        (view.head_sequence > 0 || !view.records.is_empty() || path.exists()).then_some(
+            DfsRepairAttemptSnapshot {
+                records: view.records,
+            },
+        ),
+    )
 }
 
 pub fn write_dfs_repair_attempt_snapshot(
     path: &Path,
     snapshot: &DfsRepairAttemptSnapshot,
 ) -> Result<(), DfsError> {
-    if snapshot.records.is_empty() {
-        return clear_dfs_cursor_file(path);
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| DfsError::Metadata {
-            message: format!(
-                "could not create DFS repair queue snapshot directory {}: {source}",
-                parent.display()
-            ),
-        })?;
-    }
-    crate::metadata_io::write_sobj_atomic(path, snapshot).map_err(DfsError::from)
+    let store = crate::repair_queue_store::LocalDfsRepairQueueStore::new(path);
+    store.replace_records(&snapshot.records)?;
+    store.compact_if_needed(crate::repair_queue_store::DfsRepairQueueCompactionOptions::force())?;
+    Ok(())
 }
 
 pub fn read_dfs_metadata_replication_suppression_snapshot(

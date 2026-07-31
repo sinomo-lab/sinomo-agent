@@ -14,6 +14,11 @@ use std::time::{Duration, Instant};
 use crate::*;
 
 const DFS_METADATA_AUTHORITY_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+/// Bound authority-side preparation when an inbound served request carries no
+/// caller deadline. Healthy operations finish far inside this cap; reaching it
+/// means the optional all-replica fast path should yield to the exact quorum
+/// fence instead of holding the served write lane indefinitely.
+const DFS_METADATA_AUTHORITY_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 // A large streamed prepare needs longer than an ordinary probe on a healthy
 // debug/WAN path, but this is only an optimization before the exact
 // operation-bound cluster-quorum fence. Waiting five seconds for one wedged
@@ -570,23 +575,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(BTreeSet::from([self.node_id.clone()]));
         }
 
-        let started_at = Instant::now();
-        let probe_deadline = Instant::now()
-            .checked_add(timeout)
+        let fallback_deadline = Instant::now()
+            .checked_add(DFS_METADATA_AUTHORITY_OPERATION_TIMEOUT)
             .unwrap_or_else(Instant::now);
-        let effective_deadline = self
+        let observed_previous_deadline = self.transport.operation_deadline();
+        let effective_operation_deadline = observed_previous_deadline
+            .map_or(fallback_deadline, |deadline| {
+                deadline.min(fallback_deadline)
+            });
+        let replaced_previous_deadline = self
             .transport
-            .operation_deadline()
-            .map_or(probe_deadline, |outer| outer.min(probe_deadline));
-        let previous_deadline = self
-            .transport
-            .set_operation_deadline(Some(effective_deadline));
+            .set_operation_deadline(Some(effective_operation_deadline));
+        let previous_deadline = replaced_previous_deadline.or(observed_previous_deadline);
         let result = self.try_all_metadata_shard_members_accept_fresh_authority(
             shard,
             operation,
             prepared_batch,
             targets,
-            started_at,
+            effective_operation_deadline,
             timeout,
         );
         self.transport.set_operation_deadline(previous_deadline);
@@ -602,13 +608,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation: &DfsMetadataAuthorityOperation,
         prepared_batch: &DfsMetadataJournalBatch,
         targets: BTreeSet<NodeId>,
-        started_at: Instant,
+        operation_deadline: Instant,
         timeout: Duration,
     ) -> Result<BTreeSet<NodeId>, DfsError> {
         let mut request_ids = Vec::with_capacity(targets.len());
         let mut request_targets = Vec::with_capacity(targets.len());
         let mut acknowledged_node_ids = BTreeSet::from([self.node_id.clone()]);
         let required_acknowledgements = targets.len() + 1;
+        if Instant::now() >= operation_deadline {
+            return Ok(acknowledged_node_ids);
+        }
         let prepared_prefix = self
             .metadata_backend
             .as_deref()
@@ -616,6 +625,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: "metadata authority probe has no durable metadata backend".to_string(),
             })?
             .metadata_prefix_proof(&prepared_batch.shard_id)?;
+        if Instant::now() >= operation_deadline {
+            return Ok(acknowledged_node_ids);
+        }
         let Some(prepared_prefix) = prepared_prefix.filter(|prefix| {
             prefix.is_well_formed() && prefix.journal_sequence == prepared_batch.next_after_sequence
         }) else {
@@ -624,55 +636,57 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(acknowledged_node_ids);
         };
         let result = (|| {
-            let mut authority_requests = Vec::with_capacity(targets.len());
-            let mut batches_by_replicated_through_sequence =
-                BTreeMap::<u64, Option<DfsMetadataJournalBatch>>::new();
-            let mut direct_wire_identities = BTreeMap::<u64, (String, String)>::new();
+            let mut targets_by_replicated_through_sequence = BTreeMap::<u64, Vec<NodeId>>::new();
             for target_node_id in targets {
-                if started_at.elapsed() >= timeout {
-                    break;
+                if Instant::now() >= operation_deadline {
+                    return Ok(acknowledged_node_ids);
                 }
                 let replicated_through_sequence = self
                     .metadata_authority_replicated_through_sequence_for_target(
                         &target_node_id,
                         prepared_batch,
                     )?;
-                let target_batch = match batches_by_replicated_through_sequence
+                if Instant::now() >= operation_deadline {
+                    return Ok(acknowledged_node_ids);
+                }
+                targets_by_replicated_through_sequence
                     .entry(replicated_through_sequence)
-                {
-                    std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        let batch = self.metadata_authority_batch_since(
-                            replicated_through_sequence,
-                            prepared_batch,
-                        )?;
-                        entry.insert(batch).clone()
-                    }
-                };
+                    .or_default()
+                    .push(target_node_id);
+            }
+
+            // Construct one owned command per distinct replica cursor. The
+            // production transport encodes it once and Arc-replays the body to
+            // every target in this group. Previously the service deep-cloned
+            // the same multi-megabyte prepare into one command per replica
+            // before the transport could discover that all values were equal.
+            let mut authority_groups =
+                Vec::with_capacity(targets_by_replicated_through_sequence.len());
+            for (replicated_through_sequence, target_node_ids) in
+                targets_by_replicated_through_sequence
+            {
+                let target_batch = self
+                    .metadata_authority_batch_since(replicated_through_sequence, prepared_batch)?;
+                if Instant::now() >= operation_deadline {
+                    return Ok(acknowledged_node_ids);
+                }
                 let Some(target_batch) = target_batch else {
                     // A member farther behind than one bounded catch-up batch
                     // cannot count toward this operation's full-shard proof.
                     // Background replication can close the gap independently.
                     continue;
                 };
-                let (request_id, probe_id) = direct_wire_identities
-                    .entry(replicated_through_sequence)
-                    .or_insert_with(|| {
-                        (
-                            self.next_request_id(),
-                            sinomo_core::Id::generate().to_string(),
-                        )
-                    })
-                    .clone();
+                let request_id = self.next_request_id();
+                let probe_id = sinomo_core::Id::generate().to_string();
                 let command = DfsMetadataJournalBatchCommand {
-                    request_id: request_id.clone(),
+                    request_id,
                     source_node_id: Some(self.node_id.clone()),
                     file_system_id: Some(shard.file_system_id.clone()),
                     authority_epoch: Some(shard.epoch),
                     verify_prefix_only: false,
                     prefix_probe: None,
                     authority_probe: Some(DfsMetadataAuthorityProbe {
-                        probe_id: probe_id.clone(),
+                        probe_id,
                         expected_shard: shard.clone(),
                         operation: operation.clone(),
                         prepared_prefix: Some(prepared_prefix.clone()),
@@ -683,129 +697,178 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     // the nonce and therefore cannot authorize publication.
                     batch: target_batch,
                 };
-                authority_requests.push((target_node_id, command));
+                authority_groups.push(DfsMetadataJournalBatchDirectGroup::new(
+                    target_node_ids,
+                    command,
+                ));
             }
+            // Replayable object-RPC construction can encode a multi-megabyte
+            // catch-up value. The duration-aware transport keeps that local
+            // work under `operation_deadline` and begins this shorter budget
+            // only after encoding, immediately before peer fan-out.
             match self
                 .transport
-                .send_metadata_journal_batches_direct(&authority_requests)
-            {
+                .send_grouped_metadata_journal_batches_direct_with_response_timeout(
+                    &authority_groups,
+                    timeout,
+                ) {
                 Ok(Some(responses)) => {
-                    for (target_node_id, command) in &authority_requests {
-                        let Some((_, response)) = responses
-                            .iter()
-                            .find(|(response_node_id, _)| response_node_id == target_node_id)
-                        else {
-                            continue;
-                        };
-                        let expected_confirmation_id = command
+                    for group in &authority_groups {
+                        let expected_confirmation_id = group
+                            .command
                             .authority_probe
                             .as_ref()
                             .and_then(metadata_authority_probe_confirmation_id);
-                        if response.request_id != command.request_id
-                            || response.shard_id != command.batch.shard_id
-                            || response.next_after_sequence != command.batch.next_after_sequence
-                            || response.result != DfsMetadataJournalBatchResult::Applied
-                            || response.verified_authority_probe_id.as_deref()
-                                != expected_confirmation_id.as_deref()
-                        {
-                            continue;
-                        }
-                        self.record_metadata_authority_replication_cursor(
-                            target_node_id,
-                            &command.batch.shard_id,
-                            command.batch.next_after_sequence,
-                        );
-                        acknowledged_node_ids.insert(target_node_id.clone());
-                    }
-                    return Ok(acknowledged_node_ids);
-                }
-                Ok(None) => {
-                    // Routed responses are correlated through one process-wide
-                    // pending map, so restore target-unique identities when
-                    // the replayable direct fan-out transport is unavailable.
-                    for (_, command) in &mut authority_requests {
-                        command.request_id = self.next_request_id();
-                        command
-                            .authority_probe
-                            .as_mut()
-                            .expect("authority request carries probe")
-                            .probe_id = sinomo_core::Id::generate().to_string();
-                    }
-                }
-                Err(_) => return Ok(acknowledged_node_ids),
-            }
-            for (target_node_id, command) in authority_requests {
-                let request_id = command.request_id.clone();
-                let confirmation_id = metadata_authority_probe_confirmation_id(
-                    command
-                        .authority_probe
-                        .as_ref()
-                        .expect("authority request carries probe"),
-                )
-                .expect("prepared authority probe has an exact prefix confirmation");
-                self.pending_metadata_authority_probes.insert(
-                    request_id.clone(),
-                    PendingMetadataAuthorityProbe {
-                        target_node_id: target_node_id.clone(),
-                        confirmation_id,
-                        expected_shard: shard.clone(),
-                    },
-                );
-                let sent = match self.send_dfs_message_if_routable(
-                    &target_node_id,
-                    DfsNetworkMessage::MetadataJournalBatch(command),
-                ) {
-                    Ok(sent) => sent,
-                    Err(DfsError::Network { .. }) => false,
-                    Err(error) => return Err(error),
-                };
-                if !sent {
-                    self.pending_metadata_authority_probes.remove(&request_id);
-                    continue;
-                }
-                request_ids.push(request_id.clone());
-                request_targets.push((request_id, target_node_id));
-            }
-            loop {
-                self.process_incoming()?;
-                let mut unresolved = false;
-                for (request_id, target_node_id) in &request_targets {
-                    match self.metadata_authority_probe_results.get(request_id) {
-                        Some(true) => {
+                        for target_node_id in &group.target_node_ids {
+                            let Some((_, response)) = responses
+                                .iter()
+                                .find(|(response_node_id, _)| response_node_id == target_node_id)
+                            else {
+                                continue;
+                            };
+                            if response.request_id != group.command.request_id
+                                || response.shard_id != group.command.batch.shard_id
+                                || response.next_after_sequence
+                                    != group.command.batch.next_after_sequence
+                                || response.result != DfsMetadataJournalBatchResult::Applied
+                                || response.verified_authority_probe_id.as_deref()
+                                    != expected_confirmation_id.as_deref()
+                            {
+                                continue;
+                            }
+                            self.record_metadata_authority_replication_cursor(
+                                target_node_id,
+                                &group.command.batch.shard_id,
+                                group.command.batch.next_after_sequence,
+                            );
                             acknowledged_node_ids.insert(target_node_id.clone());
                         }
-                        Some(false) => {}
-                        None => unresolved = true,
-                    }
-                }
-                if acknowledged_node_ids.len() == required_acknowledgements {
-                    let acknowledged_replicas = acknowledged_node_ids
-                        .iter()
-                        .filter(|id| *id != &self.node_id)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    for target_node_id in &acknowledged_replicas {
-                        self.record_metadata_authority_replication_cursor(
-                            target_node_id,
-                            &prepared_batch.shard_id,
-                            prepared_batch.next_after_sequence,
-                        );
                     }
                     return Ok(acknowledged_node_ids);
                 }
-                if !unresolved {
-                    return Ok(acknowledged_node_ids);
-                }
-                let elapsed = started_at.elapsed();
-                if elapsed >= timeout {
-                    return Ok(acknowledged_node_ids);
-                }
-                let wait =
-                    DFS_METADATA_AUTHORITY_PROBE_IDLE_WAIT.min(timeout.saturating_sub(elapsed));
-                self.transport
-                    .wait_for_incoming(wait)
-                    .map_err(DfsError::from_network)?;
+                Ok(None) => {}
+                Err(_) => return Ok(acknowledged_node_ids),
             }
+
+            // Routed responses are correlated through one process-wide pending
+            // map. Only transports without the grouped direct accelerator pay
+            // to materialize one command per target, each with a unique wire
+            // identity. Move the last command in each group to avoid retaining
+            // an otherwise unused extra copy even on this compatibility path.
+            let mut authority_requests = Vec::with_capacity(required_acknowledgements - 1);
+            for group in authority_groups {
+                let target_count = group.target_node_ids.len();
+                let mut shared_command = Some(group.command);
+                for (target_index, target_node_id) in group.target_node_ids.into_iter().enumerate()
+                {
+                    if Instant::now() >= operation_deadline {
+                        return Ok(acknowledged_node_ids);
+                    }
+                    let mut command = if target_index + 1 == target_count {
+                        shared_command
+                            .take()
+                            .expect("last routed target owns grouped authority command")
+                    } else {
+                        shared_command
+                            .as_ref()
+                            .expect("grouped authority command remains available")
+                            .clone()
+                    };
+                    command.request_id = self.next_request_id();
+                    command
+                        .authority_probe
+                        .as_mut()
+                        .expect("authority request carries probe")
+                        .probe_id = sinomo_core::Id::generate().to_string();
+                    authority_requests.push((target_node_id, command));
+                }
+            }
+            let response_deadline = Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(Instant::now)
+                .min(operation_deadline);
+            if Instant::now() >= response_deadline {
+                return Ok(acknowledged_node_ids);
+            }
+            let observed_previous_deadline = self.transport.operation_deadline();
+            let replaced_previous_deadline = self
+                .transport
+                .set_operation_deadline(Some(response_deadline));
+            let previous_deadline = replaced_previous_deadline.or(observed_previous_deadline);
+            let routed_result = (|| {
+                for (target_node_id, command) in authority_requests {
+                    let request_id = command.request_id.clone();
+                    let confirmation_id = metadata_authority_probe_confirmation_id(
+                        command
+                            .authority_probe
+                            .as_ref()
+                            .expect("authority request carries probe"),
+                    )
+                    .expect("prepared authority probe has an exact prefix confirmation");
+                    self.pending_metadata_authority_probes.insert(
+                        request_id.clone(),
+                        PendingMetadataAuthorityProbe {
+                            target_node_id: target_node_id.clone(),
+                            confirmation_id,
+                            expected_shard: shard.clone(),
+                        },
+                    );
+                    let sent = match self.send_dfs_message_if_routable(
+                        &target_node_id,
+                        DfsNetworkMessage::MetadataJournalBatch(command),
+                    ) {
+                        Ok(sent) => sent,
+                        Err(DfsError::Network { .. }) => false,
+                        Err(error) => return Err(error),
+                    };
+                    if !sent {
+                        self.pending_metadata_authority_probes.remove(&request_id);
+                        continue;
+                    }
+                    request_ids.push(request_id.clone());
+                    request_targets.push((request_id, target_node_id));
+                }
+                loop {
+                    self.process_incoming()?;
+                    let mut unresolved = false;
+                    for (request_id, target_node_id) in &request_targets {
+                        match self.metadata_authority_probe_results.get(request_id) {
+                            Some(true) => {
+                                acknowledged_node_ids.insert(target_node_id.clone());
+                            }
+                            Some(false) => {}
+                            None => unresolved = true,
+                        }
+                    }
+                    if acknowledged_node_ids.len() == required_acknowledgements {
+                        let acknowledged_replicas = acknowledged_node_ids
+                            .iter()
+                            .filter(|id| *id != &self.node_id)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for target_node_id in &acknowledged_replicas {
+                            self.record_metadata_authority_replication_cursor(
+                                target_node_id,
+                                &prepared_batch.shard_id,
+                                prepared_batch.next_after_sequence,
+                            );
+                        }
+                        return Ok(acknowledged_node_ids);
+                    }
+                    if !unresolved {
+                        return Ok(acknowledged_node_ids);
+                    }
+                    let Some(remaining) = response_deadline.checked_duration_since(Instant::now())
+                    else {
+                        return Ok(acknowledged_node_ids);
+                    };
+                    self.transport
+                        .wait_for_incoming(DFS_METADATA_AUTHORITY_PROBE_IDLE_WAIT.min(remaining))
+                        .map_err(DfsError::from_network)?;
+                }
+            })();
+            self.transport.set_operation_deadline(previous_deadline);
+            routed_result
         })();
         self.clear_metadata_authority_probe_requests(&request_ids);
         result
@@ -1338,10 +1401,16 @@ pub(crate) fn missing_metadata_shard_assignment(object: &DfsObjectMetadata) -> D
 }
 
 fn metadata_authority_payload_digest<T: serde::Serialize>(value: &T) -> Result<String, DfsError> {
-    let bytes = serde_json::to_vec(value).map_err(|source| DfsError::Serialization {
+    // Authority payloads can contain a complete bulk namespace transaction.
+    // Buffering their JSON first retained another multi-megabyte copy on both
+    // the primary and every replica solely to feed BLAKE3. `blake3::Hasher`
+    // implements `Write`, so stream the byte-identical serde representation
+    // directly into the digest instead.
+    let mut hasher = blake3::Hasher::new();
+    serde_json::to_writer(&mut hasher, value).map_err(|source| DfsError::Serialization {
         message: format!("encode DFS metadata authority operation: {source}"),
     })?;
-    Ok(content_hash(&bytes))
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
 pub(crate) fn metadata_authority_operation_for_intent(
@@ -1430,6 +1499,42 @@ pub(crate) fn metadata_authority_operation_for_namespace_prepare(
         file_system_id: prepare.file_system_id.clone(),
         prepare_sequence,
         payload_digest,
+    })
+}
+
+/// Build the authority identity for a newly-created namespace prepare whose
+/// canonical payload digest was computed by this process immediately before
+/// the same record was durably prepared.
+///
+/// Recovered or network-provided records must use
+/// [`metadata_authority_operation_for_namespace_prepare`] so their complete
+/// payload is independently rehashed. This narrow constructor avoids hashing
+/// a freshly-built multi-megabyte bulk transaction twice on the primary.
+pub(crate) fn metadata_authority_operation_for_prevalidated_namespace_prepare(
+    prepare: &DfsNamespacePrepareRecord,
+    prepare_sequence: u64,
+) -> Result<DfsMetadataAuthorityOperation, DfsError> {
+    let digest = prepare
+        .operation_digest
+        .strip_prefix("blake3:")
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if prepare_sequence == 0
+        || prepare.operation_id.trim().is_empty()
+        || prepare.status != DfsNamespacePrepareStatus::Prepared
+        || digest.is_none()
+    {
+        return Err(DfsError::Metadata {
+            message: format!(
+                "new namespace prepare {} has no prevalidated canonical authority identity",
+                prepare.operation_id
+            ),
+        });
+    }
+    Ok(DfsMetadataAuthorityOperation::NamespaceMutation {
+        operation_id: prepare.operation_id.clone(),
+        file_system_id: prepare.file_system_id.clone(),
+        prepare_sequence,
+        payload_digest: prepare.operation_digest.clone(),
     })
 }
 
@@ -1779,10 +1884,13 @@ mod authority_probe_tests {
         behavior: ProbeBehavior,
         direct_metadata_journal_batches: bool,
         direct_commands: Vec<DfsMetadataJournalBatchCommand>,
+        direct_group_target_counts: Vec<usize>,
         direct_next_after_sequence_override: Option<u64>,
         unroutable_node_ids: BTreeSet<NodeId>,
         incoming: VecDeque<DfsRoutedMessage>,
         sent: Arc<Mutex<Vec<DfsRoutedMessage>>>,
+        operation_deadline: Option<Instant>,
+        deadline_updates: Vec<Option<Instant>>,
     }
 
     impl AuthorityProbeTransport {
@@ -1792,10 +1900,13 @@ mod authority_probe_tests {
                 behavior,
                 direct_metadata_journal_batches: false,
                 direct_commands: Vec::new(),
+                direct_group_target_counts: Vec::new(),
                 direct_next_after_sequence_override: None,
                 unroutable_node_ids: BTreeSet::new(),
                 incoming: VecDeque::new(),
                 sent: Arc::new(Mutex::new(Vec::new())),
+                operation_deadline: None,
+                deadline_updates: Vec::new(),
             }
         }
     }
@@ -1906,12 +2017,45 @@ mod authority_probe_tests {
             }))
         }
 
+        fn send_grouped_metadata_journal_batches_direct_with_response_timeout(
+            &mut self,
+            groups: &[DfsMetadataJournalBatchDirectGroup],
+            _response_timeout: Duration,
+        ) -> Result<Option<Vec<(NodeId, DfsMetadataJournalBatchResponse)>>, NetworkError> {
+            if !self.direct_metadata_journal_batches {
+                return Ok(None);
+            }
+            self.direct_group_target_counts
+                .extend(groups.iter().map(|group| group.target_node_ids.len()));
+            let mut responses = Vec::new();
+            for group in groups {
+                for target_node_id in &group.target_node_ids {
+                    let Some(response) =
+                        self.send_metadata_journal_batch_direct(target_node_id, &group.command)?
+                    else {
+                        return Ok(None);
+                    };
+                    responses.push((target_node_id.clone(), response));
+                }
+            }
+            Ok(Some(responses))
+        }
+
         fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
             Ok(self.incoming.drain(..).collect())
         }
 
         fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
             Ok(Some(self.incoming.len()))
+        }
+
+        fn set_operation_deadline(&mut self, deadline: Option<Instant>) -> Option<Instant> {
+            self.deadline_updates.push(deadline);
+            std::mem::replace(&mut self.operation_deadline, deadline)
+        }
+
+        fn operation_deadline(&self) -> Option<Instant> {
+            self.operation_deadline
         }
     }
 
@@ -2163,9 +2307,15 @@ mod authority_probe_tests {
             .prepare_namespace_transaction(&prepare)
             .expect("persist namespace prepare");
         let prepare_sequence = entry.sequence;
-        let operation =
+        let independently_hashed =
             metadata_authority_operation_for_namespace_prepare(&prepare, prepare_sequence)
-                .expect("namespace authority operation");
+                .expect("independently hashed namespace authority operation");
+        let operation = metadata_authority_operation_for_prevalidated_namespace_prepare(
+            &prepare,
+            prepare_sequence,
+        )
+        .expect("prevalidated namespace authority operation");
+        assert_eq!(operation, independently_hashed);
         (
             operation,
             DfsMetadataJournalBatch {
@@ -2174,6 +2324,24 @@ mod authority_probe_tests {
                 next_after_sequence: prepare_sequence,
             },
         )
+    }
+
+    #[test]
+    fn streamed_authority_payload_digest_matches_legacy_buffered_bytes() {
+        let payload = (
+            "namespace-authority-streaming",
+            (0..512)
+                .map(|index| format!("object-{index:04}-{}", "x".repeat(128)))
+                .collect::<Vec<_>>(),
+            vec![7_u64, 11, 13, 17],
+        );
+        let buffered = serde_json::to_vec(&payload).expect("legacy buffered authority payload");
+        let expected = format!("blake3:{}", blake3::hash(&buffered).to_hex());
+
+        assert_eq!(
+            metadata_authority_payload_digest(&payload).expect("streamed authority digest"),
+            expected
+        );
     }
 
     fn persisted_small_namespace_authority_fixture(
@@ -2480,6 +2648,45 @@ mod authority_probe_tests {
     }
 
     #[test]
+    fn authority_probe_restores_caller_deadline_on_every_direct_outcome() {
+        for (case, direct, behavior) in [
+            ("direct-success", true, ProbeBehavior::Accept),
+            ("routed-fallback", false, ProbeBehavior::Accept),
+            ("direct-error", true, ProbeBehavior::Unroutable),
+        ] {
+            let replica = node(&format!("node_authority_deadline_{case}_replica"));
+            let (mut service, object, intent, shard, _, _) =
+                authority_fixture(behavior, vec![replica]);
+            service.transport.direct_metadata_journal_batches = direct;
+            let (operation, prepared_batch) =
+                prepared_authority_fixture(&mut service, &object, &intent, &shard);
+            let caller_deadline = Instant::now() + Duration::from_secs(2);
+            service.transport.operation_deadline = Some(caller_deadline);
+            service.transport.deadline_updates.clear();
+
+            service
+                .fresh_metadata_shard_authority_acknowledgements(
+                    &shard,
+                    &operation,
+                    &prepared_batch,
+                    DFS_METADATA_AUTHORITY_PROBE_TIMEOUT,
+                )
+                .expect("authority probe outcome");
+
+            assert_eq!(
+                service.transport.operation_deadline,
+                Some(caller_deadline),
+                "{case} must restore the caller's absolute deadline"
+            );
+            assert_eq!(
+                service.transport.deadline_updates.last(),
+                Some(&Some(caller_deadline)),
+                "{case} must finish by restoring the caller deadline"
+            );
+        }
+    }
+
+    #[test]
     fn malformed_direct_authority_next_sequence_cannot_advance_cursor() {
         let replica = node("node_malformed_direct_authority_cursor_replica");
         let (mut service, object, intent, shard, _, _) =
@@ -2757,6 +2964,10 @@ mod authority_probe_tests {
             DfsCanonicalAuthorization::FullShard { .. }
         ));
         assert_eq!(txn_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            service.transport.direct_group_target_counts,
+            vec![replicas.len()]
+        );
         assert_eq!(service.transport.direct_commands.len(), replicas.len());
         assert!(
             service

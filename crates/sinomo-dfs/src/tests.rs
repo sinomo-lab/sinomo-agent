@@ -35560,6 +35560,32 @@ fn sharded_lazy_reader_sees_sibling_visible_overwrite() {
 }
 
 #[test]
+fn sharded_point_lookup_snapshot_refreshes_only_the_routed_path_shard() {
+    let root = temp_root("sifs-sharded-point-lookup-snapshot");
+    let node = NodeId::from_legacy_named("node_sifs_sharded_point_snapshot").expect("node");
+    let shards = sifs_two_primary_shard_configs(&node, &node, 1, Vec::new(), Vec::new());
+    let mut backend =
+        open_local_sharded_metadata_backend(root.join("metadata"), shards).expect("metadata");
+    let file_system_id = sifs_file_system_id();
+
+    crate::metadata_sharded_backend::reset_sharded_consistent_read_snapshot_shards();
+    backend
+        .begin_consistent_read_snapshot_for_path(&file_system_id, "/services/point-lookup-parent")
+        .expect("path-scoped snapshot");
+    backend.end_consistent_read_snapshot_for_path(&file_system_id, "/services/point-lookup-parent");
+
+    assert_eq!(
+        crate::metadata_sharded_backend::sharded_consistent_read_snapshot_shards(),
+        vec![
+            DfsMetadataShardId::new("services"),
+            DfsMetadataShardId::new("root"),
+        ],
+        "one-path response hydration must retain the routing fallback without refreshing the unrelated users shard"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn lazy_metadata_hydration_restores_running_cross_shard_mutation_guards() {
     let root = temp_root("lazy-metadata-cross-shard-mutation-guards");
     let node = NodeId::from_legacy_named("node_lazy_cross_shard_guards").expect("node");
@@ -40715,10 +40741,13 @@ fn local_eventual_batch_shard_selection_lists_control_plane_once_for_bulk_paths(
         },
     };
     crate::metadata_backend::reset_metadata_current_tables_snapshot_calls();
+    crate::service_metadata::reset_namespace_prepare_expectation_capture_calls();
     let event = dfs
         .handle_namespace_request(requester.clone(), command.clone())
         .expect("commit local-eventual batch namespace request");
     let table_snapshot_calls = crate::metadata_backend::metadata_current_tables_snapshot_calls();
+    let expectation_capture_calls =
+        crate::service_metadata::namespace_prepare_expectation_capture_calls();
 
     assert!(matches!(
         event,
@@ -40736,6 +40765,10 @@ fn local_eventual_batch_shard_selection_lists_control_plane_once_for_bulk_paths(
         range_prefix_calls.load(Ordering::SeqCst),
         1,
         "bulk local-eventual shard selection must classify paths from one shard snapshot"
+    );
+    assert_eq!(
+        expectation_capture_calls, 1,
+        "bulk local-eventual validation and prepare must share one exact expectation capture"
     );
     assert!(
         dfs.backend_receipt_for_replica(&committed_object_id, &committed_version, &requester,)
@@ -45865,6 +45898,15 @@ fn served_routed_write_committed_work_tracks_only_authority_owned_repairs() {
             report.committed_work.repair_maintenance, expect_repair_maintenance,
             "only an authority-owned missing replica may retain repair work for {case}"
         );
+        assert_eq!(
+            report.committed_repair_records.len(),
+            usize::from(expect_repair_maintenance),
+            "the durable queue handoff must contain only repairs created by this message for {case}"
+        );
+        if let Some(record) = report.committed_repair_records.first() {
+            assert_eq!(record.attempts, 0);
+            assert!(!record.in_flight);
+        }
         assert!(!report.committed_work.metadata_replica_progress);
 
         std::fs::remove_dir_all(root).ok();
@@ -46151,6 +46193,11 @@ fn recovered_stage_response_committed_work_tracks_remaining_repairs_only() {
         assert_eq!(
             report.committed_work.repair_maintenance, expect_repair_maintenance,
             "a recovered receipt must retain repair work exactly while desired replicas remain for {case}"
+        );
+        assert_eq!(
+            report.committed_repair_records.len(),
+            usize::from(expect_repair_maintenance),
+            "the recovered commit must hand off only its newly created missing target for {case}"
         );
         assert!(matches!(
             recovered.write_outcome(&intent_id).expect("committed outcome"),

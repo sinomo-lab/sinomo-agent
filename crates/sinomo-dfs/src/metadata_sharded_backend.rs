@@ -216,6 +216,8 @@ const ROUTING_TOPOLOGY_HISTORY_LIMIT: usize = 4;
 thread_local! {
     static SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static SHARDED_CONSISTENT_READ_SNAPSHOT_SHARDS: std::cell::RefCell<Vec<DfsMetadataShardId>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -226,6 +228,16 @@ pub(crate) fn reset_sharded_metadata_object_id_lookup_count() {
 #[cfg(test)]
 pub(crate) fn sharded_metadata_object_id_lookup_count() -> usize {
     SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT.get()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_sharded_consistent_read_snapshot_shards() {
+    SHARDED_CONSISTENT_READ_SNAPSHOT_SHARDS.with(|shards| shards.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub(crate) fn sharded_consistent_read_snapshot_shards() -> Vec<DfsMetadataShardId> {
+    SHARDED_CONSISTENT_READ_SNAPSHOT_SHARDS.with(|shards| shards.borrow().clone())
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -673,6 +685,60 @@ impl LocalShardedMetadataBackend {
             }
         }
         Ok(shard_ids)
+    }
+
+    fn consistent_read_shard_ids_for_path(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Vec<DfsMetadataShardId>> {
+        let selected = self.select_shard_id_for_path(file_system_id, path)?;
+        let mut shard_ids = vec![selected.clone()];
+        shard_ids.extend(self.fallback_shard_ids_for_path(file_system_id, path, &selected)?);
+        if let Some(missing) = shard_ids
+            .iter()
+            .find(|shard_id| !self.shards.contains_key(*shard_id))
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "path {path} routed to unavailable local metadata shard {missing:?}"
+            )));
+        }
+        Ok(shard_ids)
+    }
+
+    fn begin_consistent_read_snapshot_for_shards(
+        &mut self,
+        shard_ids: &[DfsMetadataShardId],
+    ) -> Result<()> {
+        #[cfg(test)]
+        SHARDED_CONSISTENT_READ_SNAPSHOT_SHARDS
+            .with(|observed| observed.borrow_mut().extend_from_slice(shard_ids));
+        for (index, shard_id) in shard_ids.iter().enumerate() {
+            let begin = self
+                .shards
+                .get_mut(shard_id)
+                .expect("routed consistent-read shard remains installed")
+                .begin_consistent_read_snapshot();
+            if let Err(error) = begin {
+                for pinned_shard_id in &shard_ids[..index] {
+                    self.shards
+                        .get_mut(pinned_shard_id)
+                        .expect("pinned consistent-read shard remains installed")
+                        .end_consistent_read_snapshot();
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn end_consistent_read_snapshot_for_shards(&mut self, shard_ids: &[DfsMetadataShardId]) {
+        for shard_id in shard_ids {
+            self.shards
+                .get_mut(shard_id)
+                .expect("routed consistent-read shard remains installed")
+                .end_consistent_read_snapshot();
+        }
     }
 
     fn clear_routing_fallbacks_for_file_system(
@@ -1513,29 +1579,33 @@ impl LocalShardedMetadataBackend {
 impl DfsMetadataBackend for LocalShardedMetadataBackend {
     fn begin_consistent_read_snapshot(&mut self) -> Result<()> {
         let shard_ids = self.shards.keys().cloned().collect::<Vec<_>>();
-        for (index, shard_id) in shard_ids.iter().enumerate() {
-            let begin = self
-                .shards
-                .get_mut(shard_id)
-                .expect("collected shard id remains installed")
-                .begin_consistent_read_snapshot();
-            if let Err(error) = begin {
-                for pinned_shard_id in &shard_ids[..index] {
-                    self.shards
-                        .get_mut(pinned_shard_id)
-                        .expect("pinned shard remains installed")
-                        .end_consistent_read_snapshot();
-                }
-                return Err(error);
-            }
-        }
-        Ok(())
+        self.begin_consistent_read_snapshot_for_shards(&shard_ids)
     }
 
     fn end_consistent_read_snapshot(&mut self) {
-        for backend in self.shards.values_mut() {
-            backend.end_consistent_read_snapshot();
-        }
+        let shard_ids = self.shards.keys().cloned().collect::<Vec<_>>();
+        self.end_consistent_read_snapshot_for_shards(&shard_ids);
+    }
+
+    fn begin_consistent_read_snapshot_for_path(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<()> {
+        let shard_ids = self.consistent_read_shard_ids_for_path(file_system_id, path)?;
+        self.begin_consistent_read_snapshot_for_shards(&shard_ids)
+    }
+
+    fn end_consistent_read_snapshot_for_path(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) {
+        let Ok(shard_ids) = self.consistent_read_shard_ids_for_path(file_system_id, path) else {
+            debug_assert!(false, "path-scoped metadata read lost its routed shard");
+            return;
+        };
+        self.end_consistent_read_snapshot_for_shards(&shard_ids);
     }
 
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry> {

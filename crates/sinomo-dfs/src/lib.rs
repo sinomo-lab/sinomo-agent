@@ -68,6 +68,7 @@ mod posix_path;
 mod protocol;
 mod renewable_lease;
 mod repair;
+mod repair_queue_store;
 mod routes;
 mod service;
 mod service_async;
@@ -284,11 +285,13 @@ pub use maintenance::{
 pub(crate) use maintenance::{
     run_cluster_dfs_maintenance_tick, write_legacy_dfs_metadata_replication_cursor,
 };
-pub(crate) use message_transport::materialize_dfs_routed_call_sync;
 pub use message_transport::{
     AsyncDfsMessageTransport, DfsMessageTransport, DfsMessageTransportFuture,
     DfsOutboundAttachment, DfsRoutedCall, DfsRoutedSend, DfsRoutedSendOutcome,
     DfsTransportIdentity,
+};
+pub(crate) use message_transport::{
+    DfsMetadataJournalBatchDirectGroup, materialize_dfs_routed_call_sync,
 };
 pub use metadata_api::{
     DfsMetadataBackend, DfsMetadataReplicaIngestPermit, DfsMetadataShardWriteFreeze,
@@ -501,6 +504,11 @@ pub(crate) use repair::{
     repair_attempt_record_indicates_transient_route_failure,
     repair_error_indicates_transient_route_failure, repair_rejection_indicates_lost_authority,
     repair_rejection_indicates_stale_replica_base,
+};
+pub use repair_queue_store::{
+    DfsRepairQueueCompactionOptions, DfsRepairQueueCompactionReport, DfsRepairQueueKey,
+    DfsRepairQueueOperation, DfsRepairQueueReconcileOutcome, DfsRepairQueueView,
+    LocalDfsRepairQueueStore,
 };
 pub use routes::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_BULK_READ_RESPONSE_ROUTE, DFS_DATA_BULK_READ_ROUTE,

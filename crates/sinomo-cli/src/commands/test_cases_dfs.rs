@@ -3607,7 +3607,7 @@ struct DfsBulkWriteRequester {
 impl DfsBulkWriteRequester {
     fn open(ctx: &SinomoTestContext, overwrite_existing: bool) -> Result<Self, SinomoTestError> {
         let data_dir = SinomoDataDir::new(ctx.data_dir());
-        SifsOneShotBulkWriteRequester::open(&data_dir)
+        SifsOneShotBulkWriteRequester::open(&data_dir, ctx.authoritative_cluster_snapshot())
             .map(|requester| Self {
                 requester,
                 overwrite_existing,
@@ -3665,7 +3665,9 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     require_positive("files", files)?;
     require_positive("bytes", bytes)?;
 
+    let open_started = Instant::now();
     let backend = DfsBulkWriteRequester::open(ctx, overwrite_existing)?;
+    let open_elapsed = open_started.elapsed();
     let node = backend.node_label();
     let proc_io_before = current_proc_io();
     let mut mkdir_retries = DfsMutationRetryMetrics::default();
@@ -3729,6 +3731,7 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("bytes_per_file", bytes);
     ctx.record("overwrite_existing", overwrite_existing);
     ctx.record("total_bytes", total_bytes);
+    ctx.record("open_elapsed_ms", open_elapsed.as_millis() as u64);
     ctx.record("elapsed_ms", elapsed_ms);
     ctx.record("mkdir_elapsed_ms", mkdir_elapsed.as_millis() as u64);
     ctx.record(

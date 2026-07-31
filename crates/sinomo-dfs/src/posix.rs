@@ -2304,6 +2304,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut committed_metadata_paths = BTreeSet::new();
         for (metadata_authority, objects) in objects_by_metadata_authority {
             let group_prepare_started = Instant::now();
+            let trace_object_count = objects.len();
             let group_metadata_paths = objects
                 .iter()
                 .map(|object| object.path.clone())
@@ -2321,7 +2322,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &versions,
                 ),
                 file_system_id: sifs_file_system_id(),
-                objects: objects.clone(),
+                objects,
                 versions,
                 advisory_lock_states: Vec::new(),
                 created_at: time::OffsetDateTime::now_utc(),
@@ -2398,7 +2399,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.node_id,
                 trace_shard_id,
                 trace_remote,
-                objects.len(),
+                trace_object_count,
                 trace_write_count,
                 group_prepare_duration.as_micros(),
                 authority_commit_duration.as_millis(),

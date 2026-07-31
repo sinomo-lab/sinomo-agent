@@ -252,6 +252,31 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// End one bounded coherent-read scope opened above.
     fn end_consistent_read_snapshot(&mut self) {}
 
+    /// Pin the metadata generation needed to serve one exact namespace path.
+    ///
+    /// The default is deliberately conservative for unsharded and third-party
+    /// backends. A sharded router can override this to refresh only the active
+    /// path shard and any retained routing fallbacks instead of reopening every
+    /// unrelated shard for a point lookup.
+    fn begin_consistent_read_snapshot_for_path(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<()> {
+        let _ = (file_system_id, path);
+        self.begin_consistent_read_snapshot()
+    }
+
+    /// End a path-scoped coherent-read scope opened above.
+    fn end_consistent_read_snapshot_for_path(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) {
+        let _ = (file_system_id, path);
+        self.end_consistent_read_snapshot();
+    }
+
     /// Create or replace a filesystem record and journal the mutation.
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry>;
 
