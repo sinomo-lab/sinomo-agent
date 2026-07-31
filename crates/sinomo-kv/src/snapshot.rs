@@ -864,16 +864,29 @@ impl KvMaterializedCache {
         snapshot: &KvSnapshot,
         existing: Option<&KvSnapshot>,
     ) -> Result<bool, KvError> {
-        // Skip the rewrite when the durable key/value/lease state is unchanged, even
-        // if the snapshot revision, per-entry revision metadata, or watch-event tail
-        // advanced. Re-putting an identical value bumps modify_revision/version and
-        // appends events, which would otherwise rewrite the whole (~25 KiB+)
-        // materialized file for no durable change. The materialized snapshot is only
-        // a read cache rather than writable Raft state (the WAL and anchored Raft
-        // snapshots are the source of truth for revision/version/events), so
-        // persisting stale bookkeeping there is safe. Check before materializing
-        // `snapshot` so the common no-op path avoids cloning the full entry set.
         if existing.is_some_and(|existing| kv_snapshot_durable_eq(existing, snapshot)) {
+            return Ok(false);
+        }
+        let desired = self.materialized(snapshot);
+        self.write_and_cache_if_materialized_changed_locked(desired)?;
+        Ok(true)
+    }
+
+    fn write_raft_read_state_if_changed_against_locked(
+        &self,
+        snapshot: &KvSnapshot,
+        existing: Option<&KvSnapshot>,
+    ) -> Result<bool, KvError> {
+        // Skip the rewrite when the durable key/value/lease state is unchanged, even
+        // if revision, per-entry metadata, events, or the committed-request ledger
+        // advanced. Re-putting an identical value would otherwise rewrite the whole
+        // materialized file for no read-state change. This is safe only for routine
+        // local Raft publication: the WAL and anchored Raft snapshots retain exact
+        // revision/request identity. Imported snapshots use the strict comparator
+        // above because their committed-log generation arbitrates equal revisions.
+        if existing.is_some_and(|existing| {
+            kv_snapshot_materialized_read_state_eq(existing, snapshot)
+        }) {
             return Ok(false);
         }
         let desired = self.materialized(snapshot);
@@ -896,7 +909,7 @@ impl KvMaterializedCache {
         }
         #[cfg(test)]
         pause_materialized_cache_raft_write_after_compare_for_test(&self.path);
-        self.write_snapshot_if_changed_against_locked(snapshot, existing.as_deref())
+        self.write_raft_read_state_if_changed_against_locked(snapshot, existing.as_deref())
     }
 
     fn write_imported_snapshot_if_changed(&self, snapshot: &KvSnapshot) -> Result<bool, KvError> {
@@ -1268,6 +1281,12 @@ impl KvLocalCache {
 }
 
 pub fn kv_snapshot_durable_eq(left: &KvSnapshot, right: &KvSnapshot) -> bool {
+    kv_snapshot_materialized_read_state_eq(left, right)
+        && left.committed_requests == right.committed_requests
+        && left.expired_requests == right.expired_requests
+}
+
+fn kv_snapshot_materialized_read_state_eq(left: &KvSnapshot, right: &KvSnapshot) -> bool {
     if left.entries.len() != right.entries.len() || left.leases.len() != right.leases.len() {
         return false;
     }
@@ -1291,8 +1310,6 @@ pub fn kv_snapshot_durable_eq(left: &KvSnapshot, right: &KvSnapshot) -> bool {
         .iter()
         .map(|lease| (&lease.lease_id, lease.ttl_ticks, lease.remaining_ticks));
     left_leases.eq(right_leases)
-        && left.committed_requests == right.committed_requests
-        && left.expired_requests == right.expired_requests
 }
 
 /// Returns the monotonic generation available in the current `KvSnapshot`

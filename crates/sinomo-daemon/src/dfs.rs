@@ -19,15 +19,12 @@ use sinomo_core::node::NodeId;
 #[cfg(test)]
 use sinomo_dfs::DfsFileSystemConfig;
 use sinomo_dfs::{
-    ContentStoreError, ContentStoreGcOptions, ContentStoreStagingGcOptions,
-    ContentStoreVersionGcOptions, DfsCommittedWorkTracker, DfsConflictRecord, DfsConflictStatus,
-    DfsContentRootCatalogCollectionValidation, DfsContentRootCatalogIncompleteReason,
+    ContentStoreError, DfsCommittedWorkTracker, DfsConflictRecord, DfsConflictStatus,
     DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture, DfsDataPlaneResponse,
     DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions, DfsFileSystemId,
-    DfsInboundAttachment, DfsMaintenanceExecutionExclusions, DfsMaintenanceRunOptions,
-    DfsMaintenanceTickOptions, DfsMaintenanceTickReport, DfsMessageCommand,
-    DfsMessageCommittedWork, DfsMessageExecutionScope, DfsMessageProcessResult, DfsMessageResponse,
-    DfsMetadataBackend, DfsMetadataHistoryGcOptions, DfsMetadataHistoryGcReport,
+    DfsInboundAttachment, DfsMaintenanceExecutionExclusions, DfsMaintenanceTickOptions,
+    DfsMaintenanceTickReport, DfsMessageCommand, DfsMessageCommittedWork, DfsMessageExecutionScope,
+    DfsMessageProcessResult, DfsMessageResponse, DfsMetadataBackend,
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
     DfsMetadataPublishScheduleOptions, DfsMetadataPublishScheduleStart, DfsMetadataShardId,
     DfsMetadataShardMembershipHandoff, DfsMetadataShardStatus, DfsMetadataSummary,
@@ -35,23 +32,25 @@ use sinomo_dfs::{
     DfsNodeTransport, DfsObjectId, DfsObjectMetadata, DfsObjectRpcSendOptions,
     DfsObjectVersionRecord, DfsOperatorInspector, DfsOperatorRepairView, DfsPeerTransport,
     DfsPeerTransportError, DfsPlacementReconciliationJob, DfsPlacementReconciliationState,
-    DfsRepairAttemptRecord, DfsReplicaReceiptRecord, DfsTombstoneCompactionOptions,
-    DfsTombstoneCompactionReport, DfsVersion, DfsWriteIntentRecord, DfsWriteIntentStatus,
-    LocalContentStore, NetworkedDfsService, cluster_dfs_all_file_system_configs,
-    cluster_dfs_all_metadata_shard_head_watermarks,
-    cluster_dfs_all_metadata_shard_membership_handoffs, cluster_dfs_all_metadata_shards,
-    default_dfs_content_root_catalog_store, default_dfs_repair_attempt_snapshot_path,
-    dfs_message_execution_scope, read_dfs_repair_attempt_snapshot,
+    DfsRepairAttemptRecord, DfsReplicaReceiptRecord, DfsVersion, DfsWriteIntentRecord,
+    DfsWriteIntentStatus, LocalContentStore, NetworkedDfsService,
+    default_dfs_repair_attempt_snapshot_path, dfs_message_execution_scope,
+    read_dfs_repair_attempt_snapshot,
 };
 #[cfg(test)]
 use sinomo_dfs::{
-    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMetadataJournalBatchCommand,
-    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataJournalBatchSender,
-    DfsMetadataPeerTransportError, DfsMetadataShardAssignment, DfsMetadataShardConfig,
-    DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult,
-    DfsMetadataSnapshotInstallSender, LocalSobjMetadataBackend, default_dfs_metadata_root,
-    distributed_sifs, distributed_sifs_bootstrap_objects, file_system_config_key,
-    metadata_shard_key, sifs_node_files_path,
+    ContentStoreGcOptions, ContentStoreVersionGcOptions, DaemonDfsInspectionRequest,
+    DaemonDfsInspectionResponse, DfsContentRootCatalogCollectionValidation,
+    DfsContentRootCatalogIncompleteReason, DfsMaintenanceRunOptions,
+    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
+    DfsMetadataJournalBatchSender, DfsMetadataPeerTransportError, DfsMetadataShardAssignment,
+    DfsMetadataShardConfig, DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult,
+    DfsMetadataSnapshotInstallSender, LocalSobjMetadataBackend,
+    cluster_dfs_all_file_system_configs, cluster_dfs_all_metadata_shard_head_watermarks,
+    cluster_dfs_all_metadata_shard_membership_handoffs, cluster_dfs_all_metadata_shards,
+    default_dfs_content_root_catalog_store, default_dfs_metadata_root, distributed_sifs,
+    distributed_sifs_bootstrap_objects, file_system_config_key, metadata_shard_key,
+    sifs_node_files_path,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
@@ -75,10 +74,13 @@ const DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK: usize = 8;
 const DAEMON_DFS_TOMBSTONE_COMPACTION_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const DAEMON_DFS_TOMBSTONE_COMPACTION_MAX_RECORDS: u64 = 256;
 const DAEMON_DFS_METADATA_HISTORY_GC_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+#[cfg(test)]
 const DAEMON_DFS_METADATA_HISTORY_GC_MAX_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const DAEMON_DFS_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS: u64 = 2;
 const DAEMON_DFS_METADATA_HISTORY_GC_MAX_RECORDS: u64 = 256;
+#[cfg(test)]
 const DAEMON_DFS_METADATA_HISTORY_GC_RECORD_TRIGGER: u64 = 10_000;
+#[cfg(test)]
 const DAEMON_DFS_METADATA_HISTORY_GC_BYTES_TRIGGER: u64 = 64 * 1024 * 1024;
 const DAEMON_DFS_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS: u64 = 4_096;
 const DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
@@ -783,19 +785,6 @@ pub(crate) struct DaemonDfsPendingMaintenanceWork {
     pub actionable_placement_reconciliation_count: usize,
     pub metadata_replica_lag_count: usize,
     pub pending_local_membership_handoff_count: usize,
-    pub content_gc_expected_shard_count: usize,
-    pub content_gc_covered_shard_count: usize,
-    pub content_gc_catalog_age_nanos: Option<u64>,
-    pub content_gc_catalog_journal_lag: u64,
-    pub content_gc_catalog_blocked_reason_count: usize,
-    pub content_gc_catalog_blocked_reasons: Vec<DfsContentRootCatalogIncompleteReason>,
-    pub content_gc_scrub_blocked_issue_count: usize,
-    pub content_gc_version_candidate_count: usize,
-    pub content_gc_orphan_candidate_count: usize,
-    pub content_gc_due_maintenance_count: usize,
-    pub content_reservation_due_maintenance_count: usize,
-    pub content_gc_next_deadline_unix_nanos: Option<u64>,
-    pub durable_content_reservation_count: usize,
 }
 
 impl DaemonDfsPendingMaintenanceWork {
@@ -838,14 +827,6 @@ impl DaemonDfsPendingMaintenanceWork {
     pub(crate) fn has_deferred_work(&self) -> bool {
         self.deferred_work_count > 0
     }
-
-    pub(crate) fn should_run_content_gc(&self) -> bool {
-        self.content_gc_due_maintenance_count > 0
-    }
-
-    pub(crate) fn should_reconcile_content_reservations(&self) -> bool {
-        self.content_reservation_due_maintenance_count > 0
-    }
 }
 
 pub(crate) fn daemon_dfs_now_unix_nanos() -> u64 {
@@ -859,12 +840,14 @@ fn daemon_dfs_duration_nanos(duration: Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct DaemonDfsMetadataHistoryGcSchedule {
     due_record_count: usize,
     next_deadline_unix_nanos: Option<u64>,
 }
 
+#[cfg(test)]
 fn daemon_dfs_metadata_history_gc_schedule(
     projection: &sinomo_dfs::DfsMetadataHistoryGcReport,
     now_unix_nanos: u64,
@@ -2364,27 +2347,14 @@ fn daemon_dfs_pending_work_from_records(
         actionable_placement_reconciliation_count,
         metadata_replica_lag_count,
         pending_local_membership_handoff_count,
-        content_gc_expected_shard_count: 0,
-        content_gc_covered_shard_count: 0,
-        content_gc_catalog_age_nanos: None,
-        content_gc_catalog_journal_lag: 0,
-        content_gc_catalog_blocked_reason_count: 0,
-        content_gc_catalog_blocked_reasons: Vec::new(),
-        content_gc_scrub_blocked_issue_count: 0,
-        content_gc_version_candidate_count: 0,
-        content_gc_orphan_candidate_count: 0,
-        content_gc_due_maintenance_count: 0,
-        content_reservation_due_maintenance_count: 0,
-        content_gc_next_deadline_unix_nanos: None,
-        durable_content_reservation_count: 0,
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct DaemonDfsContentGcProjection {
     expected_shard_count: usize,
     covered_shard_count: usize,
-    catalog_age_nanos: Option<u64>,
     catalog_journal_lag: u64,
     blocked_reasons: Vec<DfsContentRootCatalogIncompleteReason>,
     scrub_blocked_issue_count: usize,
@@ -2395,6 +2365,7 @@ struct DaemonDfsContentGcProjection {
     next_deadline_unix_nanos: Option<u64>,
 }
 
+#[cfg(test)]
 fn daemon_dfs_version_gc_candidate_count(
     report: &sinomo_dfs::ContentStoreVersionGcReport,
 ) -> usize {
@@ -2407,6 +2378,7 @@ fn daemon_dfs_version_gc_candidate_count(
     .unwrap_or(usize::MAX)
 }
 
+#[cfg(test)]
 fn daemon_dfs_orphan_gc_candidate_count(report: &sinomo_dfs::ContentStoreGcReport) -> usize {
     usize::try_from(
         report
@@ -2419,6 +2391,7 @@ fn daemon_dfs_orphan_gc_candidate_count(report: &sinomo_dfs::ContentStoreGcRepor
     .unwrap_or(usize::MAX)
 }
 
+#[cfg(test)]
 fn daemon_dfs_content_gc_blocked_reason_requires_refresh(
     reason: &DfsContentRootCatalogIncompleteReason,
 ) -> bool {
@@ -2461,6 +2434,7 @@ fn daemon_dfs_content_gc_blocked_reason_requires_refresh(
     }
 }
 
+#[cfg(test)]
 fn daemon_dfs_content_gc_blocked_reason_is_ordinary_head_advance(
     reason: &DfsContentRootCatalogIncompleteReason,
 ) -> bool {
@@ -2476,6 +2450,7 @@ fn daemon_dfs_content_gc_blocked_reason_is_ordinary_head_advance(
     }
 }
 
+#[cfg(test)]
 fn daemon_dfs_content_gc_projection(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -2546,7 +2521,6 @@ fn daemon_dfs_content_gc_projection(
     let mut projection = DaemonDfsContentGcProjection {
         expected_shard_count: validation.expected_shard_count(),
         covered_shard_count: validation.covered_shard_count(),
-        catalog_age_nanos: Some(validation.catalog_age_nanos()),
         catalog_journal_lag: validation.max_journal_lag_entries(),
         blocked_reasons: validation.reasons().to_vec(),
         ..DaemonDfsContentGcProjection::default()
@@ -2693,8 +2667,6 @@ fn daemon_dfs_content_gc_projection(
 #[derive(Debug)]
 struct DaemonDfsMaintenanceMetadataObservation {
     summary: DfsMetadataSummary,
-    tombstone_projection: DfsTombstoneCompactionReport,
-    metadata_history_projection: DfsMetadataHistoryGcReport,
     metadata_shard_statuses: Vec<DfsMetadataShardStatus>,
     write_intents: Vec<DfsWriteIntentRecord>,
     repair_views: Vec<DfsOperatorRepairView>,
@@ -2706,25 +2678,12 @@ struct DaemonDfsMaintenanceMetadataObservation {
 fn daemon_dfs_maintenance_metadata_observation(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
-    now_unix_nanos: u64,
 ) -> Result<DaemonDfsMaintenanceMetadataObservation, DaemonError> {
     sinomo_dfs::with_cached_cluster_aware_dfs_metadata_inspection(
         data_dir,
         cluster_paths,
         |metadata| {
             let summary = metadata.metadata_summary()?;
-            let tombstone_projection = metadata.tombstone_compaction_projection(
-                DfsTombstoneCompactionOptions::dry_run(DAEMON_DFS_TOMBSTONE_COMPACTION_MIN_AGE)
-                    .with_now_unix_nanos(now_unix_nanos),
-            )?;
-            let metadata_history_projection = metadata.metadata_history_gc_projection(
-                DfsMetadataHistoryGcOptions::dry_run(
-                    DAEMON_DFS_METADATA_HISTORY_GC_MIN_AGE,
-                    DAEMON_DFS_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS,
-                )
-                .with_max_removals(DAEMON_DFS_METADATA_HISTORY_GC_MAX_RECORDS)
-                .with_now_unix_nanos(now_unix_nanos),
-            )?;
             let metadata_shard_statuses = metadata.metadata_shard_statuses()?;
             let write_intents = if summary.pending_write_count > 0 {
                 metadata.all_intents()?
@@ -2793,8 +2752,6 @@ fn daemon_dfs_maintenance_metadata_observation(
 
             Ok(DaemonDfsMaintenanceMetadataObservation {
                 summary,
-                tombstone_projection,
-                metadata_history_projection,
                 metadata_shard_statuses,
                 write_intents,
                 repair_views,
@@ -2817,43 +2774,20 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         return Ok(DaemonDfsPendingMaintenanceWork::default());
     }
     let now_unix_nanos = daemon_dfs_now_unix_nanos();
-    // Scheduling observes one coherent, incrementally refreshed table image.
-    // Clone only the bounded records needed below, then release the cache
-    // before content scans, cluster-KV reads, and network-health projection.
+    // Routine scheduling observes only indexed metadata work queues and their
+    // bounded retry records. Content-store inventory (reservations, manifests,
+    // versions, blobs, and orphan observations) is deliberately excluded:
+    // those O(total-content) scans belong to explicit disaster recovery, never
+    // to daemon startup, notification handling, or an idle safety poll.
     let DaemonDfsMaintenanceMetadataObservation {
         summary,
-        tombstone_projection,
-        metadata_history_projection,
         metadata_shard_statuses,
         write_intents,
         repair_views,
         actionable_conflict_count,
         receipt_records,
         lookups,
-    } = daemon_dfs_maintenance_metadata_observation(&data_dir, &cluster_paths, now_unix_nanos)?;
-    let metadata_history_schedule = daemon_dfs_metadata_history_gc_schedule(
-        &metadata_history_projection,
-        now_unix_nanos,
-        DAEMON_DFS_METADATA_HISTORY_GC_RECORD_TRIGGER,
-        DAEMON_DFS_METADATA_HISTORY_GC_BYTES_TRIGGER,
-        DAEMON_DFS_METADATA_HISTORY_GC_MAX_AGE,
-    );
-    let lifecycle_options = DfsMaintenanceRunOptions::default();
-    let content = LocalContentStore::open_for_inspection(data_dir.dfs_dir().join("content"));
-    let staging_projection = content.collect_stale_staging(
-        ContentStoreStagingGcOptions::dry_run(lifecycle_options.stale_staging_min_age),
-    )?;
-    let content_reservations = content.content_reservation_roots()?;
-    let durable_content_reservation_count =
-        usize::try_from(content_reservations.reservation_count).unwrap_or(usize::MAX);
-    let content_gc_projection = daemon_dfs_content_gc_projection(
-        &data_dir,
-        &cluster_paths,
-        &content,
-        &content_reservations,
-        lifecycle_options,
-        now_unix_nanos,
-    )?;
+    } = daemon_dfs_maintenance_metadata_observation(&data_dir, &cluster_paths)?;
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .map_err(DaemonError::from)?;
     let pending_local_membership_handoff_count =
@@ -2898,7 +2832,7 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         &offline_node_ids,
         &state.local_node_id,
     );
-    let mut work = daemon_dfs_pending_work_from_records(
+    let work = daemon_dfs_pending_work_from_records(
         summary.pending_write_count,
         summary.pending_repair_count,
         summary.pending_namespace_job_count,
@@ -2915,57 +2849,6 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         &state.local_node_id,
         pending_local_membership_handoff_count,
         now_unix_nanos,
-    );
-    work.due_time_based_maintenance_count = work
-        .due_time_based_maintenance_count
-        .saturating_add(
-            usize::try_from(tombstone_projection.eligible_tombstone_count).unwrap_or(usize::MAX),
-        )
-        .saturating_add(metadata_history_schedule.due_record_count)
-        .saturating_add(
-            usize::try_from(staging_projection.eligible_staging_count).unwrap_or(usize::MAX),
-        )
-        .saturating_add(content_gc_projection.due_maintenance_count)
-        .saturating_add(content_gc_projection.reservation_due_maintenance_count);
-    work.next_time_based_maintenance_unix_nanos = work
-        .next_time_based_maintenance_unix_nanos
-        .into_iter()
-        .chain(tombstone_projection.next_eligible_at_unix_nanos)
-        .chain(metadata_history_schedule.next_deadline_unix_nanos)
-        .chain(staging_projection.next_eligible_at_unix_nanos)
-        .chain(content_gc_projection.next_deadline_unix_nanos)
-        .min();
-    work.content_gc_expected_shard_count = content_gc_projection.expected_shard_count;
-    work.content_gc_covered_shard_count = content_gc_projection.covered_shard_count;
-    work.content_gc_catalog_age_nanos = content_gc_projection.catalog_age_nanos;
-    work.content_gc_catalog_journal_lag = content_gc_projection.catalog_journal_lag;
-    work.content_gc_catalog_blocked_reason_count = content_gc_projection.blocked_reasons.len();
-    work.content_gc_catalog_blocked_reasons = content_gc_projection.blocked_reasons;
-    work.content_gc_scrub_blocked_issue_count = content_gc_projection.scrub_blocked_issue_count;
-    work.content_gc_version_candidate_count = content_gc_projection.version_candidate_count;
-    work.content_gc_orphan_candidate_count = content_gc_projection.orphan_candidate_count;
-    work.content_gc_due_maintenance_count = content_gc_projection.due_maintenance_count;
-    work.content_reservation_due_maintenance_count =
-        content_gc_projection.reservation_due_maintenance_count;
-    work.content_gc_next_deadline_unix_nanos = content_gc_projection.next_deadline_unix_nanos;
-    work.durable_content_reservation_count = durable_content_reservation_count;
-    tracing::debug!(
-        target: "sinomo.dfs.maintenance",
-        content_gc_covered_shard_count = work.content_gc_covered_shard_count,
-        content_gc_expected_shard_count = work.content_gc_expected_shard_count,
-        content_gc_catalog_age_nanos = ?work.content_gc_catalog_age_nanos,
-        content_gc_catalog_journal_lag = work.content_gc_catalog_journal_lag,
-        content_gc_catalog_blocked_reason_count = work.content_gc_catalog_blocked_reason_count,
-        content_gc_catalog_blocked_reasons = ?work.content_gc_catalog_blocked_reasons,
-        content_gc_scrub_blocked_issue_count = work.content_gc_scrub_blocked_issue_count,
-        content_gc_version_candidate_count = work.content_gc_version_candidate_count,
-        content_gc_orphan_candidate_count = work.content_gc_orphan_candidate_count,
-        content_gc_due_maintenance_count = work.content_gc_due_maintenance_count,
-        content_reservation_due_maintenance_count =
-            work.content_reservation_due_maintenance_count,
-        content_gc_next_deadline_unix_nanos = ?work.content_gc_next_deadline_unix_nanos,
-        durable_content_reservation_count = work.durable_content_reservation_count,
-        "projected daemon DFS content GC maintenance"
     );
     Ok(work)
 }
@@ -6029,6 +5912,13 @@ pub(crate) enum DaemonDfsMaintenanceTickOutcome {
     Deferred,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonDfsMaintenanceKind {
+    Routine,
+    #[cfg(test)]
+    ExplicitDisasterRecovery,
+}
+
 #[derive(Debug)]
 enum DaemonDfsMaintenancePreemptionOutcome<T> {
     Finished(T),
@@ -6062,8 +5952,6 @@ where
 pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
-    content_gc_requested: bool,
-    content_reservation_reconciliation_requested: bool,
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
@@ -6091,8 +5979,7 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
                 data_dir.clone(),
                 cluster_paths.clone(),
                 runtime,
-                content_gc_requested,
-                content_reservation_reconciliation_requested,
+                DaemonDfsMaintenanceKind::Routine,
                 committed_work_tracker.clone(),
                 &mut deferred_work,
                 &foreground_preemption,
@@ -6147,8 +6034,7 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
     runtime: &tokio::runtime::Handle,
-    content_gc_requested: bool,
-    content_reservation_reconciliation_requested: bool,
+    maintenance_kind: DaemonDfsMaintenanceKind,
     committed_work_tracker: DfsCommittedWorkTracker,
     deferred_work: &mut Option<(Arc<DaemonDfsDetachedSendRuntime>, DfsNodeDetachedSendWorker)>,
     foreground_preemption: &DaemonDfsMaintenanceForegroundPreemption,
@@ -6194,10 +6080,13 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     } = lane;
     let authority_generation_before_maintenance = metadata_authority_generation.generation();
     let async_peer_transport = daemon_dfs_async_peer_transport(&data_dir, runtime);
-    let options = daemon_dfs_maintenance_tick_options_for_content_gc(
-        content_gc_requested,
-        content_reservation_reconciliation_requested,
-    );
+    let options = match maintenance_kind {
+        DaemonDfsMaintenanceKind::Routine => daemon_dfs_routine_maintenance_tick_options(),
+        #[cfg(test)]
+        DaemonDfsMaintenanceKind::ExplicitDisasterRecovery => {
+            daemon_dfs_explicit_disaster_recovery_tick_options(true, true)
+        }
+    };
     let maintenance_result =
         sinomo_dfs::run_cluster_dfs_maintenance_tick_with_reusable_service_until_hydration_cancelled(
             &mut maintenance_service,
@@ -6448,8 +6337,6 @@ fn daemon_dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport
 pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
     paths: DaemonPaths,
     runtime: tokio::runtime::Handle,
-    content_gc_requested: bool,
-    content_reservation_reconciliation_requested: bool,
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let tick_runtime = runtime.clone();
     let data_owner_lock = daemon_dfs_data_owner_lock(&paths)?;
@@ -6458,8 +6345,6 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
         runtime.block_on(run_daemon_dfs_maintenance_tick_on_runtime(
             &paths,
             &tick_runtime,
-            content_gc_requested,
-            content_reservation_reconciliation_requested,
         ))
     })
     .await
@@ -6469,35 +6354,26 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
     })?
 }
 
-#[cfg(test)]
-fn daemon_dfs_maintenance_tick_options() -> DfsMaintenanceTickOptions {
-    daemon_dfs_maintenance_tick_options_for_content_gc(true, true)
-}
-
-fn daemon_dfs_maintenance_tick_options_for_content_gc(
-    content_gc_requested: bool,
-    content_reservation_reconciliation_requested: bool,
-) -> DfsMaintenanceTickOptions {
+fn daemon_dfs_routine_maintenance_tick_options() -> DfsMaintenanceTickOptions {
     let mut options = DfsMaintenanceTickOptions::default();
     options.repair_max_jobs = DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK;
-    options.lifecycle.compact_tombstones = true;
+    // Routine repair/namespace maintenance consumes bounded authoritative
+    // queues. Every lifecycle inventory below can walk O(total metadata or
+    // content), so the production daemon tick cannot enable any of them.
+    options.lifecycle.repair_metadata = false;
+    options.lifecycle.cleanup_stale_staging = false;
+    options.lifecycle.compact_tombstones = false;
     options.lifecycle.tombstone_compaction_min_age = DAEMON_DFS_TOMBSTONE_COMPACTION_MIN_AGE;
     options.lifecycle.tombstone_compaction_max_records =
         DAEMON_DFS_TOMBSTONE_COMPACTION_MAX_RECORDS;
-    options.lifecycle.collect_metadata_history = true;
+    options.lifecycle.collect_metadata_history = false;
     options.lifecycle.metadata_history_gc_min_age = DAEMON_DFS_METADATA_HISTORY_GC_MIN_AGE;
     options.lifecycle.metadata_history_gc_keep_latest_versions =
         DAEMON_DFS_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS;
     options.lifecycle.metadata_history_gc_max_records = DAEMON_DFS_METADATA_HISTORY_GC_MAX_RECORDS;
-    // The pre-launch durable-work projection enables content GC only when its
-    // catalog or collectors have due work. Namespace, repair, and replication
-    // maintenance must not amplify into an unrelated all-shard root refresh.
-    // A race that makes content work due after the projection is picked up by
-    // the ordinary follow-up probe; destructive collection remains fail closed.
-    options.lifecycle.collect_content_versions = content_gc_requested;
-    options.lifecycle.collect_orphan_content = content_gc_requested;
-    options.lifecycle.reconcile_content_reservations =
-        content_gc_requested || content_reservation_reconciliation_requested;
+    options.lifecycle.collect_content_versions = false;
+    options.lifecycle.collect_orphan_content = false;
+    options.lifecycle.reconcile_content_reservations = false;
     options
         .lifecycle
         .content_reservation_reconciliation_max_records =
@@ -6507,6 +6383,23 @@ fn daemon_dfs_maintenance_tick_options_for_content_gc(
     // duplicate their outbound RPCs.
     options.publish_metadata = false;
     options.metadata_replication = daemon_dfs_metadata_replication_options();
+    options
+}
+
+#[cfg(test)]
+fn daemon_dfs_explicit_disaster_recovery_tick_options(
+    content_gc_requested: bool,
+    content_reservation_reconciliation_requested: bool,
+) -> DfsMaintenanceTickOptions {
+    let mut options = daemon_dfs_routine_maintenance_tick_options();
+    let inventory_requested = content_gc_requested || content_reservation_reconciliation_requested;
+    options.lifecycle.repair_metadata = inventory_requested;
+    options.lifecycle.cleanup_stale_staging = inventory_requested;
+    options.lifecycle.compact_tombstones = inventory_requested;
+    options.lifecycle.collect_metadata_history = inventory_requested;
+    options.lifecycle.collect_content_versions = content_gc_requested;
+    options.lifecycle.collect_orphan_content = content_gc_requested;
+    options.lifecycle.reconcile_content_reservations = inventory_requested;
     options
 }
 
@@ -8062,8 +7955,7 @@ mod tests {
             data_dir,
             cluster_paths.clone(),
             runtime.handle(),
-            true,
-            true,
+            DaemonDfsMaintenanceKind::ExplicitDisasterRecovery,
             DfsCommittedWorkTracker::new(),
             &mut deferred_work,
             &foreground_preemption,
@@ -8418,9 +8310,10 @@ mod tests {
     }
 
     #[test]
-    fn daemon_dfs_metadata_publish_uses_daemon_bounds() {
+    fn daemon_dfs_explicit_recovery_uses_bounds_and_routine_work_skips_inventory() {
+        let explicit_recovery = daemon_dfs_explicit_disaster_recovery_tick_options(true, true);
         assert_eq!(
-            daemon_dfs_maintenance_tick_options().metadata_replication,
+            explicit_recovery.metadata_replication,
             daemon_dfs_metadata_replication_options()
         );
         assert_eq!(
@@ -8428,27 +8321,19 @@ mod tests {
             DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET
         );
         assert_eq!(
-            daemon_dfs_maintenance_tick_options().repair_max_jobs,
+            explicit_recovery.repair_max_jobs,
             DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK
         );
-        assert!(
-            daemon_dfs_maintenance_tick_options()
-                .lifecycle
-                .compact_tombstones
-        );
+        assert!(explicit_recovery.lifecycle.compact_tombstones);
         assert_eq!(
-            daemon_dfs_maintenance_tick_options()
-                .lifecycle
-                .tombstone_compaction_min_age,
+            explicit_recovery.lifecycle.tombstone_compaction_min_age,
             DAEMON_DFS_TOMBSTONE_COMPACTION_MIN_AGE
         );
         assert_eq!(
-            daemon_dfs_maintenance_tick_options()
-                .lifecycle
-                .tombstone_compaction_max_records,
+            explicit_recovery.lifecycle.tombstone_compaction_max_records,
             DAEMON_DFS_TOMBSTONE_COMPACTION_MAX_RECORDS
         );
-        let lifecycle = daemon_dfs_maintenance_tick_options().lifecycle;
+        let lifecycle = explicit_recovery.lifecycle.clone();
         assert!(lifecycle.collect_metadata_history);
         assert_eq!(
             lifecycle.metadata_history_gc_min_age,
@@ -8472,27 +8357,30 @@ mod tests {
             lifecycle.content_reservation_reconciliation_max_records,
             DAEMON_DFS_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS
         );
-        let unrelated_work =
-            daemon_dfs_maintenance_tick_options_for_content_gc(false, false).lifecycle;
+        let unrelated_work = daemon_dfs_routine_maintenance_tick_options().lifecycle;
+        assert!(!unrelated_work.repair_metadata);
+        assert!(!unrelated_work.cleanup_stale_staging);
+        assert!(!unrelated_work.compact_tombstones);
+        assert!(!unrelated_work.collect_metadata_history);
         assert!(!unrelated_work.collect_content_versions);
         assert!(!unrelated_work.collect_orphan_content);
         assert!(!unrelated_work.reconcile_content_reservations);
-        assert!(
-            unrelated_work.collect_metadata_history,
-            "content admission must not suppress independent metadata GC"
-        );
         let reservation_only =
-            daemon_dfs_maintenance_tick_options_for_content_gc(false, true).lifecycle;
+            daemon_dfs_explicit_disaster_recovery_tick_options(false, true).lifecycle;
+        assert!(reservation_only.repair_metadata);
+        assert!(reservation_only.cleanup_stale_staging);
+        assert!(reservation_only.compact_tombstones);
+        assert!(reservation_only.collect_metadata_history);
         assert!(!reservation_only.collect_content_versions);
         assert!(!reservation_only.collect_orphan_content);
         assert!(reservation_only.reconcile_content_reservations);
         let destructive_only =
-            daemon_dfs_maintenance_tick_options_for_content_gc(true, false).lifecycle;
+            daemon_dfs_explicit_disaster_recovery_tick_options(true, false).lifecycle;
         assert!(destructive_only.collect_content_versions);
         assert!(destructive_only.collect_orphan_content);
         assert!(destructive_only.reconcile_content_reservations);
         assert!(
-            !daemon_dfs_maintenance_tick_options().publish_metadata,
+            !explicit_recovery.publish_metadata,
             "broad maintenance must not race retained exact-shard publishers"
         );
         assert_eq!(
@@ -8856,13 +8744,6 @@ mod tests {
             covered_reservation.reservation_due_maintenance_count, 1,
             "catalog-covered reservations must request only bounded local reconciliation"
         );
-        let reservation_only_work = DaemonDfsPendingMaintenanceWork {
-            content_reservation_due_maintenance_count: 1,
-            ..DaemonDfsPendingMaintenanceWork::default()
-        };
-        assert!(!reservation_only_work.should_run_content_gc());
-        assert!(reservation_only_work.should_reconcile_content_reservations());
-
         default_dfs_content_root_catalog_store(&content_root)
             .install_test_catalog_at(complete_catalog.clone(), generated_at_unix_nanos)
             .expect("restore catalog without rejected reservation");
@@ -9092,8 +8973,12 @@ mod tests {
         let paths = DaemonPaths::with_root(data_dir.root().join("daemon"));
         let pending = daemon_dfs_pending_maintenance_work(&paths).expect("pending maintenance");
         assert_eq!(
-            pending.content_gc_next_deadline_unix_nanos, parked.next_deadline_unix_nanos,
-            "the content-GC deadline must remain attributable after scheduler aggregation"
+            pending.due_time_based_maintenance_count, 0,
+            "routine scheduling must not import a content-inventory deadline"
+        );
+        assert!(
+            !pending.should_trigger_background_maintenance(),
+            "an explicit disaster-recovery projection must not leak into routine scheduling"
         );
     }
 
@@ -11627,19 +11512,10 @@ mod tests {
         assert_eq!(pending.pending_namespace_job_count, 0);
         assert_eq!(pending.metadata_replica_lag_count, 2);
         assert_eq!(pending.pending_local_membership_handoff_count, 0);
-        assert_eq!(pending.due_time_based_maintenance_count, 1);
-        assert_eq!(pending.content_gc_expected_shard_count, 2);
-        assert_eq!(pending.content_gc_covered_shard_count, 0);
-        assert_eq!(
-            pending.content_gc_catalog_blocked_reasons,
-            vec![DfsContentRootCatalogIncompleteReason::CatalogNotDurablyInstalled]
-        );
-        assert!(pending.should_trigger_background_maintenance());
-        let mut metadata_lag_only = pending.clone();
-        metadata_lag_only.due_time_based_maintenance_count = 0;
+        assert_eq!(pending.due_time_based_maintenance_count, 0);
         assert!(
-            !metadata_lag_only.should_trigger_background_maintenance(),
-            "metadata lag alone is observable but owned by retained exact-shard publishers: {metadata_lag_only:#?}"
+            !pending.should_trigger_background_maintenance(),
+            "metadata lag alone is observable but owned by retained exact-shard publishers: {pending:#?}"
         );
         let DaemonDfsInspectionResponse::FileSystem {
             file_system: Some(file_system_view),

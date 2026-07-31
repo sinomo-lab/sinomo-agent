@@ -45,14 +45,9 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt as _;
 
-// Notifications make newly committed DFS work cheap to discover, but they are
-// advisory process-local edges. Keep a bounded read-only projection probe so a
-// mutation committed through another process, or racing a consumed edge, cannot
-// leave durable replica work parked indefinitely.
-const DAEMON_DFS_DURABLE_SAFETY_REPROBE_INTERVAL: Duration = Duration::from_secs(30);
 // Durable work that is known but currently cannot run (for example, a repair
-// whose target is offline) retains its longer retry cadence. The durable safety
-// probe below caps that cadence only for discovering newly committed work.
+// whose target is offline) retains a bounded retry cadence. Quiet nodes park:
+// an O(total-state) inventory is not an acceptable liveness probe.
 const DAEMON_DFS_DEFERRED_WORK_REPROBE_INTERVAL: Duration = Duration::from_secs(300);
 const DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 pub const DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(30);
@@ -1802,16 +1797,9 @@ fn daemon_dfs_initial_maintenance_phase(paths: &DaemonPaths) -> Result<Duration,
 fn spawn_daemon_dfs_maintenance_task(
     paths: DaemonPaths,
     runtime: tokio::runtime::Handle,
-    content_gc_requested: bool,
-    content_reservation_reconciliation_requested: bool,
 ) -> OwnedDaemonDfsMaintenanceTask {
     OwnedDaemonDfsMaintenanceTask::new(tokio::spawn(
-        run_daemon_dfs_maintenance_tick_in_blocking_task(
-            paths,
-            runtime,
-            content_gc_requested,
-            content_reservation_reconciliation_requested,
-        ),
+        run_daemon_dfs_maintenance_tick_in_blocking_task(paths, runtime),
     ))
 }
 
@@ -1920,11 +1908,7 @@ fn daemon_dfs_maintenance_probe_decision(
                     .then_some(DAEMON_DFS_DEFERRED_WORK_REPROBE_INTERVAL),
             )
             .min();
-        Some(
-            projected_delay
-                .unwrap_or(DAEMON_DFS_DURABLE_SAFETY_REPROBE_INTERVAL)
-                .min(DAEMON_DFS_DURABLE_SAFETY_REPROBE_INTERVAL),
-        )
+        projected_delay
     };
     DaemonDfsMaintenanceProbeDecision {
         trigger_maintenance,
@@ -2183,9 +2167,9 @@ async fn run_daemon_background_maintenance_loop(
     let mut last_dfs_maintenance = maintenance_started
         .checked_sub(DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL)
         .unwrap_or(maintenance_started);
-    // Probe once immediately after startup. Successful quiet probes choose an
-    // adaptive next deadline; only probe failures retain the short safety
-    // retry cadence.
+    // Probe once after startup to recover bounded durable work queues. A quiet
+    // result parks indefinitely; committed-edge notifications and exact retry
+    // deadlines are the normal wake sources.
     let mut next_dfs_maintenance_probe = Some(maintenance_started);
     #[cfg(feature = "sandbox")]
     let mut last_sandbox_lifecycle_maintenance = maintenance_started
@@ -2453,12 +2437,6 @@ async fn run_daemon_background_maintenance_loop(
                     None
                 }
             };
-            let content_gc_requested = work
-                .as_ref()
-                .is_some_and(DaemonDfsPendingMaintenanceWork::should_run_content_gc);
-            let content_reservation_reconciliation_requested = work.as_ref().is_some_and(
-                DaemonDfsPendingMaintenanceWork::should_reconcile_content_reservations,
-            );
             let decision = daemon_dfs_maintenance_revalidation_decision(
                 Instant::now(),
                 daemon_dfs_now_unix_nanos(),
@@ -2477,12 +2455,8 @@ async fn run_daemon_background_maintenance_loop(
             ) {
                 let dfs_paths = paths.clone();
                 let dfs_runtime = runtime.clone();
-                dfs_maintenance_task = Some(spawn_daemon_dfs_maintenance_task(
-                    dfs_paths,
-                    dfs_runtime,
-                    content_gc_requested,
-                    content_reservation_reconciliation_requested,
-                ));
+                dfs_maintenance_task =
+                    Some(spawn_daemon_dfs_maintenance_task(dfs_paths, dfs_runtime));
                 dfs_triggered_maintenance_requested = false;
                 dfs_immediate_continuation_requested = false;
             }
@@ -8951,7 +8925,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_dfs_idle_work_parks_with_read_only_safety_probe() {
+    fn daemon_dfs_idle_work_parks_without_an_inventory_probe() {
         let observed_at = Instant::now();
         let decision = daemon_dfs_maintenance_probe_decision(
             observed_at,
@@ -8961,13 +8935,7 @@ mod tests {
 
         assert!(!decision.trigger_maintenance);
         assert!(!decision.immediate_continuation);
-        assert_eq!(
-            decision
-                .next_probe_at
-                .expect("durable safety probe")
-                .duration_since(observed_at),
-            DAEMON_DFS_DURABLE_SAFETY_REPROBE_INTERVAL
-        );
+        assert_eq!(decision.next_probe_at, None);
         assert!(
             !daemon_dfs_maintenance_should_launch(true, false),
             "an idle projection must never acquire the DFS lane or distributed lease"
@@ -8975,7 +8943,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_dfs_deferred_work_keeps_durable_safety_reprobe() {
+    fn daemon_dfs_deferred_work_keeps_its_bounded_retry() {
         let observed_at = Instant::now();
         let decision = daemon_dfs_maintenance_probe_decision(
             observed_at,
@@ -8994,7 +8962,7 @@ mod tests {
                 .next_probe_at
                 .expect("deferred work deadline")
                 .duration_since(observed_at),
-            DAEMON_DFS_DURABLE_SAFETY_REPROBE_INTERVAL
+            DAEMON_DFS_DEFERRED_WORK_REPROBE_INTERVAL
         );
     }
 
@@ -9028,7 +8996,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_dfs_probe_caps_far_deadline_for_new_durable_work() {
+    fn daemon_dfs_probe_preserves_far_durable_work_deadline() {
         let observed_at = Instant::now();
         let observed_at_unix_nanos = 1_000_000_000;
         let retry_delay = Duration::from_secs(900);
@@ -9052,7 +9020,7 @@ mod tests {
                 .next_probe_at
                 .expect("far repair deadline")
                 .duration_since(observed_at),
-            DAEMON_DFS_DURABLE_SAFETY_REPROBE_INTERVAL
+            retry_delay
         );
     }
 
@@ -9174,15 +9142,7 @@ mod tests {
 
         assert!(!decision.trigger_maintenance);
         assert!(!decision.immediate_continuation);
-        let next_probe_at = decision.next_probe_at.expect("durable safety probe");
-        assert_eq!(
-            next_probe_at.duration_since(observed_at),
-            DAEMON_DFS_DURABLE_SAFETY_REPROBE_INTERVAL
-        );
-        assert!(!daemon_dfs_maintenance_probe_is_due(
-            observed_at,
-            Some(next_probe_at)
-        ));
+        assert_eq!(decision.next_probe_at, None);
     }
 
     #[test]
@@ -9200,13 +9160,7 @@ mod tests {
             "foreground preemption alone must not create triggered DFS work"
         );
         assert!(!decision.immediate_continuation);
-        assert_eq!(
-            decision
-                .next_probe_at
-                .expect("durable safety probe")
-                .duration_since(observed_at),
-            DAEMON_DFS_DURABLE_SAFETY_REPROBE_INTERVAL
-        );
+        assert_eq!(decision.next_probe_at, None);
     }
 
     #[test]
@@ -9431,13 +9385,7 @@ mod tests {
         );
         assert!(!cleared.trigger_maintenance);
         assert!(!cleared.immediate_continuation);
-        assert_eq!(
-            cleared
-                .next_probe_at
-                .expect("durable safety probe")
-                .duration_since(observed_at),
-            DAEMON_DFS_DURABLE_SAFETY_REPROBE_INTERVAL
-        );
+        assert_eq!(cleared.next_probe_at, None);
     }
 
     #[test]

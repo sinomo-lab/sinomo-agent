@@ -10813,7 +10813,24 @@ mod tests {
             .expect("append no-effect command");
         assert_eq!(no_effect_commit.snapshot.revision, KvRevision(1));
         assert!(no_effect_commit.events.is_empty());
-        assert!(no_effect_wrote_snapshot);
+        assert!(
+            !no_effect_wrote_snapshot,
+            "committed request-ledger churn must not rewrite an unchanged materialized read model"
+        );
+        let cached_after_no_effect = read_cluster_kv_cached_snapshot(&paths)
+            .expect("cached snapshot after no-effect commit");
+        assert_eq!(
+            cached_after_no_effect
+                .get("/raft-store/command")
+                .expect("cached command after no-effect commit")
+                .value,
+            b"value".to_vec()
+        );
+        assert!(
+            kv_snapshot_materialized_generation(&cached_after_no_effect)
+                < kv_snapshot_materialized_generation(&no_effect_commit.snapshot),
+            "the materialized read cache may retain stale request-ledger bookkeeping while Raft advances"
+        );
 
         let exact_request = KvCommandRequest::new(KvRequestId::generate(), put);
         store
