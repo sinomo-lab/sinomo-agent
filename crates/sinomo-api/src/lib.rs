@@ -37,6 +37,9 @@ pub const DAEMON_RPC_CATEGORY: &str = "daemon";
 pub const DAEMON_STATUS_ROUTE: &str = "/daemon/status";
 pub const DAEMON_SHUTDOWN_ROUTE: &str = "/daemon/shutdown";
 pub const DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE: &str = "/daemon/cluster/maintenance-refresh";
+pub const DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE: &str = "/daemon/dfs/repair-queue/recover";
+pub const DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ACKNOWLEDGEMENT: &str =
+    "acknowledge-explicit-full-metadata-repair-queue-recovery";
 pub const DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE: &str =
     "/daemon/cluster/local-connectivity-reload";
 pub const DAEMON_NETWORK_CHUNK_METRICS_ROUTE: &str = "/daemon/network/chunk-metrics";
@@ -754,6 +757,22 @@ pub struct DaemonClusterMaintenanceRefreshRequest;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonClusterMaintenanceRefreshResponse;
+
+/// Explicit operator request to reconstruct a lost DFS repair queue.
+///
+/// This is intentionally separate from routine maintenance: reconstructing
+/// identities which predate the durable queue requires a full metadata hydrate.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsRepairQueueRecoveryRequest {
+    pub acknowledgement: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsRepairQueueRecoveryResponse {
+    pub completed: bool,
+    pub reached_limit: bool,
+    pub remaining_queued_repairs: usize,
+}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonLocalConnectivityReloadRequest;

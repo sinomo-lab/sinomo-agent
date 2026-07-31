@@ -10159,6 +10159,7 @@ fn dfs_maintenance_tick_observations_summarize_actionable_report() {
         }],
         repair_attempts_before: Vec::new(),
         repair_attempts_after: Vec::new(),
+        repair_budget_exhausted: false,
         metadata_replication: DfsMetadataJournalReplicationReport {
             outcomes: vec![
                 DfsMetadataJournalReplicationOutcome::Applied {
@@ -26200,6 +26201,20 @@ fn stateless_repair_response_restores_pending_write_without_inflight_request() {
     let object = recovered.metadata().object(&object_id).expect("object");
     assert!(object.current_locations.contains(&owner));
     assert!(object.current_locations.contains(&replica));
+    drop(recovered);
+
+    let mut reopened = networked_sifs_with_backend(&root, owner);
+    let scheduled = reopened
+        .retry_pending_repairs_bounded_with_attempts(1, &durable_repair_queue)
+        .expect("classify stale durable repair queue record");
+    assert!(
+        scheduled.is_empty(),
+        "a receipt-settled repair must not be rescheduled from a stale durable queue record"
+    );
+    assert!(
+        reopened.durable_repair_queue_records().is_empty(),
+        "a receipt-settled durable queue record must be pruned during reactive restore"
+    );
     std::fs::remove_dir_all(root).ok();
 }
 

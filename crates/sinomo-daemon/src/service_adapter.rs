@@ -85,9 +85,9 @@ use crate::{
     DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE, DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
     DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE, DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
     DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE,
-    DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE, DAEMON_NETWORK_CHUNK_METRICS_ROUTE,
-    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
-    DAEMON_STATUS_ROUTE,
+    DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE, DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
+    DAEMON_NETWORK_CHUNK_METRICS_ROUTE, DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
+    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE,
 };
 use sinomo_config::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_SEARCH_ROUTE, CONFIG_SET_ROUTE, ConfigRegistry,
@@ -152,7 +152,22 @@ static DAEMON_CLUSTER_NETWORK_PING_NODE_IDS: OnceLock<
 > = OnceLock::new();
 
 fn daemon_error(error: DaemonError) -> ServiceError {
-    ServiceError::Service(error.to_string())
+    match error {
+        // Preserve control-plane error identity across the service registry and
+        // Object RPC response boundary. Cluster forwarding relies on an
+        // authenticated non-leader rejection remaining `ClusterReadOnly` so it
+        // can clear a stale durable leader hint and campaign. Flattening this
+        // into `ServiceError::Service` turns it into a generic parse error and
+        // can leave every voter permanently suppressing elections after the
+        // recorded leader restarts.
+        DaemonError::ClusterReadOnly { detail } => {
+            ServiceError::Network(NetworkError::ClusterReadOnly { detail })
+        }
+        DaemonError::AuthDenied => ServiceError::Network(NetworkError::AuthDenied),
+        DaemonError::AuthExpired => ServiceError::Network(NetworkError::AuthExpired),
+        DaemonError::ClusterOrphan => ServiceError::Network(NetworkError::ClusterOrphan),
+        other => ServiceError::Service(other.to_string()),
+    }
 }
 
 fn require_service_runtime<'a>(
@@ -630,6 +645,7 @@ impl Service for DaemonControlService {
             DAEMON_STATUS_ROUTE,
             DAEMON_SHUTDOWN_ROUTE,
             DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
+            DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE,
             DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
             DAEMON_NETWORK_CHUNK_METRICS_ROUTE,
             DAEMON_OBJECT_RPC_FORWARD_ROUTE,
@@ -643,6 +659,7 @@ impl Service for DaemonControlService {
             if route.route == DAEMON_OBJECT_RPC_FORWARD_ROUTE
                 || route.route == DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE
                 || route.route == DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE
+                || route.route == DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE
                 || route.route == DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE
                 || route.route == DAEMON_NETWORK_CHUNK_METRICS_ROUTE
             {
@@ -737,6 +754,29 @@ impl Service for DaemonControlService {
                     )?;
                     ServiceDisposition::Continue
                 }
+                DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE => {
+                    let recovery: crate::DaemonDfsRepairQueueRecoveryRequest =
+                        ctx.decode_request_body(&request).await?;
+                    if recovery.acknowledgement
+                        != crate::DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ACKNOWLEDGEMENT
+                    {
+                        return Err(ServiceError::Service(format!(
+                            "DFS repair queue recovery requires acknowledgement `{}`",
+                            crate::DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ACKNOWLEDGEMENT
+                        )));
+                    }
+                    let runtime = require_service_runtime(
+                        runtime.as_ref(),
+                        "DFS repair queue disaster recovery",
+                    )?;
+                    let response = crate::dfs::run_daemon_dfs_repair_queue_recovery_on_runtime(
+                        &paths, runtime,
+                    )
+                    .await
+                    .map_err(daemon_error)?;
+                    ctx.respond_value(DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE, response)?;
+                    ServiceDisposition::Continue
+                }
                 DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE => {
                     let _: crate::DaemonLocalConnectivityReloadRequest =
                         ctx.decode_request_body(&request).await?;
@@ -745,6 +785,11 @@ impl Service for DaemonControlService {
                     sinomo_core::network::invalidate_local_cluster_connectivity_cache(
                         &cluster_paths,
                     )?;
+                    // A repaired route can unblock durable DFS transfers even
+                    // when no new filesystem mutation occurs. Re-run only the
+                    // bounded reactive queues after invalidating the stale
+                    // projection.
+                    crate::dfs::notify_daemon_dfs_maintenance_work();
                     ctx.respond_value(
                         DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
                         crate::DaemonLocalConnectivityReloadResponse,
@@ -7235,6 +7280,22 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[test]
+    fn daemon_error_preserves_cluster_control_plane_identity() {
+        assert!(matches!(
+            daemon_error(DaemonError::ClusterReadOnly {
+                detail: "forwarded authoritative cluster KV read reached a non-leader voter"
+                    .to_string(),
+            }),
+            ServiceError::Network(NetworkError::ClusterReadOnly { detail })
+                if detail.contains("non-leader voter")
+        ));
+        assert!(matches!(
+            daemon_error(DaemonError::AuthDenied),
+            ServiceError::Network(NetworkError::AuthDenied)
+        ));
+    }
+
     fn remote_cluster_kv_auth_fixture() -> (
         sinomo_core::kv::InProcessKvStore,
         ServiceSigner,
@@ -9250,6 +9311,51 @@ mod tests {
     }
 
     #[test]
+    fn daemon_dfs_repair_queue_recovery_rejects_missing_acknowledgement() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-repair-recovery-ack");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let registry = ServiceRegistry::builder()
+            .register(DaemonControlService {
+                paths: paths.clone(),
+                runtime: Some(runtime.handle().clone()),
+            })
+            .build();
+        let host = test_service_host(&root, registry);
+        let mut request = ObjectRpcRequest::encode_body(
+            DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE,
+            DAEMON_RPC_CATEGORY,
+            &crate::DaemonDfsRepairQueueRecoveryRequest {
+                acknowledgement: String::new(),
+            },
+        )
+        .expect("request");
+        request.auth = Some(
+            crate::auth::sign_daemon_rpc_request_from_data_dir(&data_dir, &request)
+                .expect("sign DFS repair recovery request"),
+        );
+        let authenticated =
+            authenticate_daemon_control_request_via_registry(&paths, &request, &host)
+                .expect("authenticate local DFS repair recovery request");
+        assert_eq!(authenticated.signer, DaemonSignerAuthority::Local);
+        annotate_daemon_service_request(&mut request, &authenticated);
+
+        let error = runtime
+            .block_on(call_value_service_host_async(&host, request))
+            .expect_err("missing recovery acknowledgement must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("DFS repair queue recovery requires acknowledgement"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn daemon_local_connectivity_reload_rpc_dispatches() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-connectivity-reload");
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -9265,6 +9371,7 @@ mod tests {
             })
             .build();
         let host = test_service_host(&root, registry);
+        let initial_dfs_wakes = crate::dfs::daemon_dfs_maintenance_wake_count();
 
         let response = runtime
             .block_on(call_value_service_host_async(&host, {
@@ -9283,6 +9390,10 @@ mod tests {
         response
             .decode_body::<crate::DaemonLocalConnectivityReloadResponse>()
             .expect("decode connectivity reload response");
+        assert!(
+            crate::dfs::daemon_dfs_maintenance_wake_count() > initial_dfs_wakes,
+            "a connectivity reload must wake connectivity-blocked DFS repair work"
+        );
     }
 
     #[test]

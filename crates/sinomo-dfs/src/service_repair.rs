@@ -1744,7 +1744,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     fn restore_repair_attempt_records(&mut self, records: &[DfsRepairAttemptRecord]) {
         self.repair_attempt_records.clear();
+        let active_repair_targets = self
+            .coordinator
+            .repair_jobs()
+            .iter()
+            .map(|job| (job.intent_id.clone(), job.missing_replica_node_id.clone()))
+            .collect::<BTreeSet<_>>();
         for record in records {
+            if !active_repair_targets.contains(&(
+                record.intent_id.clone(),
+                record.missing_replica_node_id.clone(),
+            )) {
+                // The durable queue is a restart cursor for an authoritative
+                // repair job, not an independent source of repair authority.
+                // A receipt can settle that job before this node consumes its
+                // queued retry. Do not resurrect the already-cleared target
+                // from stale retry/backoff bookkeeping.
+                continue;
+            }
             let Some(pending) = self.pending_writes.get_mut(&record.intent_id) else {
                 continue;
             };

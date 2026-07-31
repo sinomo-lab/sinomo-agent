@@ -462,9 +462,7 @@ impl Deref for DaemonDfsMessageServiceLaneHandle {
 #[derive(Debug)]
 struct DaemonDfsDetachedSendRuntime {
     state: DfsNodeDetachedSendState,
-    #[cfg(test)]
     recovery_scan_generation: AtomicU64,
-    #[cfg(test)]
     metadata_authority_generation: OnceLock<Arc<DaemonDfsMetadataAuthorityGeneration>>,
     message_worker_active: AtomicBool,
     message_worker_schedule: Mutex<DaemonDfsDetachedWorkerSchedule>,
@@ -502,9 +500,7 @@ impl DaemonDfsDetachedSendRuntime {
     fn new() -> Self {
         Self {
             state: DfsNodeDetachedSendState::new(),
-            #[cfg(test)]
             recovery_scan_generation: AtomicU64::new(0),
-            #[cfg(test)]
             metadata_authority_generation: OnceLock::new(),
             message_worker_active: AtomicBool::new(false),
             message_worker_schedule: Mutex::new(DaemonDfsDetachedWorkerSchedule::default()),
@@ -706,6 +702,9 @@ static DAEMON_DFS_DETACHED_SEND_RUNTIMES: OnceLock<
     Mutex<BTreeMap<DaemonDfsDetachedSendRuntimeKey, Arc<DaemonDfsDetachedSendRuntime>>>,
 > = OnceLock::new();
 static DAEMON_DFS_MAINTENANCE_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
+static DAEMON_DFS_REPAIR_QUEUE_NONEMPTY: OnceLock<Mutex<BTreeMap<PathBuf, bool>>> = OnceLock::new();
+#[cfg(test)]
+static DAEMON_DFS_MAINTENANCE_WAKE_COUNT: AtomicU64 = AtomicU64::new(0);
 static DAEMON_DFS_REPAIR_QUEUE_SNAPSHOT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static DAEMON_DFS_PLACEMENT_AUTHORITY_SESSION_ID: OnceLock<String> = OnceLock::new();
 static DAEMON_DFS_DATA_OWNER_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<DaemonDataOwnerLock>>>> =
@@ -1647,7 +1646,54 @@ pub(crate) fn daemon_dfs_maintenance_notify() -> Arc<tokio::sync::Notify> {
 }
 
 pub(crate) fn notify_daemon_dfs_maintenance_work() {
+    #[cfg(test)]
+    DAEMON_DFS_MAINTENANCE_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
     daemon_dfs_maintenance_notify().notify_one();
+}
+
+fn record_daemon_dfs_repair_queue_nonempty(data_dir: &SinomoDataDir, nonempty: bool) {
+    DAEMON_DFS_REPAIR_QUEUE_NONEMPTY
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(data_dir.root(), nonempty);
+}
+
+fn refresh_daemon_dfs_repair_queue_nonempty(
+    data_dir: &SinomoDataDir,
+) -> Result<bool, sinomo_dfs::DfsError> {
+    let nonempty =
+        read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(data_dir))?
+            .is_some_and(|snapshot| !snapshot.records.is_empty());
+    record_daemon_dfs_repair_queue_nonempty(data_dir, nonempty);
+    Ok(nonempty)
+}
+
+/// Return the process-local queue state sampled at startup, a committed repair
+/// edge, or the end of the previous bounded maintenance pass.
+///
+/// Connectivity generation changes use this to wake only a repair executor
+/// whose external route blocker may have cleared. An empty cluster must not
+/// turn routine route refreshes into broad DFS maintenance passes.
+pub(crate) fn daemon_dfs_repair_queue_work_is_known(paths: &DaemonPaths) -> bool {
+    let Some(data_root) = paths.root.parent() else {
+        return false;
+    };
+    DAEMON_DFS_REPAIR_QUEUE_NONEMPTY
+        .get()
+        .and_then(|states| {
+            states
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(data_root)
+                .copied()
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn daemon_dfs_maintenance_wake_count() -> u64 {
+    DAEMON_DFS_MAINTENANCE_WAKE_COUNT.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -2829,7 +2875,9 @@ fn persist_daemon_dfs_repair_queue_records(
         &DfsRepairAttemptSnapshot {
             records: records_by_target.into_values().collect(),
         },
-    )
+    )?;
+    record_daemon_dfs_repair_queue_nonempty(data_dir, true);
+    Ok(())
 }
 
 /// Inspect only the bounded durable queues owned by normal reactive healing.
@@ -2851,6 +2899,7 @@ pub(crate) fn daemon_dfs_pending_reactive_maintenance_work(
         read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))?
             .map(|snapshot| snapshot.records)
             .unwrap_or_default();
+    record_daemon_dfs_repair_queue_nonempty(&data_dir, !repair_attempt_records.is_empty());
     let due_repair_attempt_count = repair_attempt_records
         .iter()
         .filter(|record| {
@@ -3751,7 +3800,6 @@ fn daemon_dfs_metadata_authority_generation_for_identity(
     Ok(generation)
 }
 
-#[cfg(test)]
 fn daemon_dfs_retained_metadata_authority_generation(
     detached_send_runtime: &DaemonDfsDetachedSendRuntime,
     cluster_paths: &ClusterPaths,
@@ -4045,7 +4093,6 @@ fn open_daemon_dfs_message_content_read_lane_with_content(
     }))
 }
 
-#[cfg(test)]
 struct DaemonDfsCommitPromotionRecovery {
     detached_runtime: Arc<DaemonDfsDetachedSendRuntime>,
     worker: DfsNodeDetachedSendWorker,
@@ -4063,7 +4110,6 @@ struct DaemonDfsCommitPromotionRecovery {
 /// fence another node out of unrelated cluster maintenance. An empty committed
 /// shard topology is transient bootstrap state, so it leaves recovery
 /// incomplete for the next maintenance tick.
-#[cfg(test)]
 fn prepare_daemon_dfs_commit_promotion_recovery(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -6073,8 +6119,11 @@ pub(crate) enum DaemonDfsMaintenanceTickOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DaemonDfsMaintenanceKind {
     Routine,
-    #[cfg(test)]
-    ExplicitDisasterRecovery,
+    ExplicitDisasterRecovery {
+        content_gc_requested: bool,
+        content_reservation_reconciliation_requested: bool,
+        commit_promotion_recovery_requested: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -6111,6 +6160,65 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
+    run_daemon_dfs_maintenance_tick_kind_on_runtime(
+        paths,
+        runtime,
+        DaemonDfsMaintenanceKind::Routine,
+    )
+    .await
+}
+
+pub(crate) async fn run_daemon_dfs_repair_queue_recovery_on_runtime(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+) -> Result<crate::DaemonDfsRepairQueueRecoveryResponse, DaemonError> {
+    let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
+    tracing::warn!(
+        target: "sinomo.dfs.fault_healing",
+        data_root = %data_dir.root().display(),
+        "operator requested explicit full-metadata DFS repair queue recovery"
+    );
+    let outcome = run_daemon_dfs_maintenance_tick_kind_on_runtime(
+        paths,
+        runtime,
+        DaemonDfsMaintenanceKind::ExplicitDisasterRecovery {
+            content_gc_requested: false,
+            content_reservation_reconciliation_requested: false,
+            commit_promotion_recovery_requested: false,
+        },
+    )
+    .await?;
+    let remaining_queued_repairs =
+        read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))?
+            .map(|snapshot| snapshot.records.len())
+            .unwrap_or_default();
+    let (completed, reached_limit) = match outcome {
+        DaemonDfsMaintenanceTickOutcome::Completed { reached_limit } => (true, reached_limit),
+        DaemonDfsMaintenanceTickOutcome::Deferred => (false, false),
+    };
+    if remaining_queued_repairs > 0 || !completed {
+        notify_daemon_dfs_maintenance_work();
+    }
+    tracing::warn!(
+        target: "sinomo.dfs.fault_healing",
+        data_root = %data_dir.root().display(),
+        completed,
+        reached_limit,
+        remaining_queued_repairs,
+        "explicit full-metadata DFS repair queue recovery finished"
+    );
+    Ok(crate::DaemonDfsRepairQueueRecoveryResponse {
+        completed,
+        reached_limit,
+        remaining_queued_repairs,
+    })
+}
+
+async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+    maintenance_kind: DaemonDfsMaintenanceKind,
+) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
@@ -6137,7 +6245,7 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
                 data_dir.clone(),
                 cluster_paths.clone(),
                 runtime,
-                DaemonDfsMaintenanceKind::Routine,
+                maintenance_kind,
                 committed_work_tracker.clone(),
                 &mut deferred_work,
                 &foreground_preemption,
@@ -6177,15 +6285,27 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
         &[],
     );
     release_daemon_dfs_idle_allocator_pages();
-    match maintenance_result {
+    let outcome = match maintenance_result {
         DaemonDfsMaintenancePreemptionOutcome::Finished(result) => {
             let reached_limit = result?;
-            Ok(DaemonDfsMaintenanceTickOutcome::Completed { reached_limit })
+            DaemonDfsMaintenanceTickOutcome::Completed { reached_limit }
         }
         DaemonDfsMaintenancePreemptionOutcome::ForegroundWaiting => {
-            Ok(DaemonDfsMaintenanceTickOutcome::Deferred)
+            DaemonDfsMaintenanceTickOutcome::Deferred
         }
+    };
+    if let Err(error) = refresh_daemon_dfs_repair_queue_nonempty(&data_dir) {
+        // Retain fail-open wake eligibility. A queue whose snapshot cannot be
+        // observed must never be mistaken for proof that repair work is empty.
+        record_daemon_dfs_repair_queue_nonempty(&data_dir, true);
+        tracing::warn!(
+            target: "sinomo.dfs.fault_healing",
+            data_root = %data_dir.root().display(),
+            error = %error,
+            "could not refresh bounded DFS repair queue state after maintenance"
+        );
     }
+    Ok(outcome)
 }
 
 async fn run_daemon_dfs_maintenance_tick_with_admission(
@@ -6237,7 +6357,6 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
         metadata_hydrated: service_was_fully_hydrated,
         ..
     } = lane;
-    #[cfg(test)]
     let authority_generation_before_maintenance = metadata_authority_generation.generation();
     let async_peer_transport = daemon_dfs_async_peer_transport(&data_dir, runtime);
     let maintenance_result = match maintenance_kind {
@@ -6256,8 +6375,11 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
             .map(Some)
             .map_err(DaemonError::from)
         }
-        #[cfg(test)]
-        DaemonDfsMaintenanceKind::ExplicitDisasterRecovery => {
+        DaemonDfsMaintenanceKind::ExplicitDisasterRecovery {
+            content_gc_requested,
+            content_reservation_reconciliation_requested,
+            ..
+        } => {
             sinomo_dfs::run_cluster_dfs_maintenance_tick_with_reusable_service_until_hydration_cancelled(
                 &mut maintenance_service,
                 data_dir.clone(),
@@ -6271,18 +6393,20 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
                         || metadata_authority_generation.generation()
                             != authority_generation_before_maintenance
                 },
-                daemon_dfs_explicit_disaster_recovery_tick_options(true, true),
+                daemon_dfs_explicit_disaster_recovery_tick_options(
+                    content_gc_requested,
+                    content_reservation_reconciliation_requested,
+                ),
             )
             .await
             .map_err(DaemonError::from)
         }
     };
     match &maintenance_result {
-        #[cfg(test)]
         Ok(Some(_))
             if matches!(
                 maintenance_kind,
-                DaemonDfsMaintenanceKind::ExplicitDisasterRecovery
+                DaemonDfsMaintenanceKind::ExplicitDisasterRecovery { .. }
             ) =>
         {
             let authority_generation_after_maintenance = metadata_authority_generation.generation();
@@ -6296,11 +6420,10 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
                     .store(authority_generation_after_maintenance, Ordering::Release);
             }
         }
-        #[cfg(test)]
         Err(_)
             if matches!(
                 maintenance_kind,
-                DaemonDfsMaintenanceKind::ExplicitDisasterRecovery
+                DaemonDfsMaintenanceKind::ExplicitDisasterRecovery { .. }
             ) =>
         {
             // A disaster-recovery hydrate can repair a durable intent before
@@ -6319,11 +6442,10 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
         match maintenance_service.operational_metrics() {
             Ok(metrics) if metrics.authoritative_write_frozen_shard_count == 0 => {
                 let reset_to_lazy = service_was_fully_hydrated;
-                #[cfg(test)]
                 let reset_to_lazy = reset_to_lazy
                     || matches!(
                         maintenance_kind,
-                        DaemonDfsMaintenanceKind::ExplicitDisasterRecovery
+                        DaemonDfsMaintenanceKind::ExplicitDisasterRecovery { .. }
                     );
                 if reset_to_lazy {
                     match maintenance_service.into_lazy_metadata_backend_service() {
@@ -6362,10 +6484,12 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
         drop(maintenance_service);
         None
     };
-    #[cfg(test)]
     if matches!(
         maintenance_kind,
-        DaemonDfsMaintenanceKind::ExplicitDisasterRecovery
+        DaemonDfsMaintenanceKind::ExplicitDisasterRecovery {
+            commit_promotion_recovery_requested: true,
+            ..
+        }
     ) {
         let promotion_recovery_started = Instant::now();
         match prepare_daemon_dfs_commit_promotion_recovery(&data_dir, &cluster_paths, runtime) {
@@ -6525,7 +6649,10 @@ fn daemon_dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport
                 })
     });
 
-    namespace_job_limit_reached || placement_page_remaining || lifecycle_limit_reached
+    namespace_job_limit_reached
+        || placement_page_remaining
+        || lifecycle_limit_reached
+        || report.repair_budget_exhausted
 }
 
 /// Run the complete DFS maintenance future from Tokio's blocking pool.
@@ -6586,7 +6713,6 @@ fn daemon_dfs_routine_maintenance_tick_options() -> DfsMaintenanceTickOptions {
     options
 }
 
-#[cfg(test)]
 fn daemon_dfs_explicit_disaster_recovery_tick_options(
     content_gc_requested: bool,
     content_reservation_reconciliation_requested: bool,
@@ -8155,7 +8281,11 @@ mod tests {
             data_dir,
             cluster_paths.clone(),
             runtime.handle(),
-            DaemonDfsMaintenanceKind::ExplicitDisasterRecovery,
+            DaemonDfsMaintenanceKind::ExplicitDisasterRecovery {
+                content_gc_requested: true,
+                content_reservation_reconciliation_requested: true,
+                commit_promotion_recovery_requested: true,
+            },
             DfsCommittedWorkTracker::new(),
             &mut deferred_work,
             &foreground_preemption,
@@ -9345,6 +9475,7 @@ mod tests {
                 followup_events: Vec::new(),
                 repair_attempts_before: Vec::new(),
                 repair_attempts_after: Vec::new(),
+                repair_budget_exhausted: false,
                 metadata_replication: DfsMetadataJournalReplicationReport {
                     outcomes: Vec::new(),
                 },
@@ -9368,6 +9499,13 @@ mod tests {
         assert!(
             daemon_dfs_maintenance_report_reached_limit(&bounded_namespace),
             "a completed bounded job plus an explicitly skipped running job owns continuation"
+        );
+
+        let mut bounded_repairs = empty_report();
+        bounded_repairs.repair_budget_exhausted = true;
+        assert!(
+            daemon_dfs_maintenance_report_reached_limit(&bounded_repairs),
+            "an immediately runnable repair remainder owns continuation"
         );
 
         let mut no_progress_compaction = empty_report();
@@ -10133,6 +10271,10 @@ mod tests {
 
         let pending = daemon_dfs_pending_reactive_maintenance_work(&paths).expect("reactive probe");
         assert_eq!(pending, DaemonDfsPendingMaintenanceWork::default());
+        assert!(
+            !daemon_dfs_repair_queue_work_is_known(&paths),
+            "an empty startup queue must not make connectivity refresh launch DFS maintenance"
+        );
 
         let retry_target =
             NodeId::from_legacy_named("node_reactive_retry_target").expect("retry target");
@@ -10196,6 +10338,10 @@ mod tests {
         assert_eq!(pending.pending_repair_count, 2);
         assert_eq!(pending.due_repair_attempt_count, 1);
         assert!(pending.should_trigger_background_maintenance());
+        assert!(
+            daemon_dfs_repair_queue_work_is_known(&paths),
+            "the bounded queue sample must retain blocker-clear wake eligibility"
+        );
     }
 
     #[test]

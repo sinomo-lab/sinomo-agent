@@ -7,7 +7,8 @@ use crate::dfs::{
     DaemonDfsMaintenanceTickOutcome, DaemonDfsPendingMaintenanceWork,
     daemon_dfs_maintenance_notify, daemon_dfs_node_transport, daemon_dfs_node_transport_on_runtime,
     daemon_dfs_now_unix_nanos, daemon_dfs_pending_reactive_maintenance_work,
-    evict_daemon_dfs_message_service_cache_on_shutdown,
+    daemon_dfs_repair_queue_work_is_known, evict_daemon_dfs_message_service_cache_on_shutdown,
+    notify_daemon_dfs_maintenance_work,
     notify_daemon_dfs_metadata_publish_route_generation_on_runtime,
     register_daemon_dfs_data_owner_lock, run_daemon_dfs_maintenance_tick_in_blocking_task,
 };
@@ -650,6 +651,14 @@ fn notify_daemon_dfs_metadata_publish_route_generation(
     source: &'static str,
     generation: u64,
 ) {
+    // The same route-generation edge that re-dirties retained metadata
+    // publishers also clears the only external blocker for connectivity-
+    // parked content repairs. Wake an executor only when the bounded durable
+    // queue is known non-empty; ordinary route refreshes on a healthy/empty
+    // cluster must not launch a broad DFS maintenance pass.
+    if daemon_dfs_repair_queue_work_is_known(paths) {
+        notify_daemon_dfs_maintenance_work();
+    }
     match notify_daemon_dfs_metadata_publish_route_generation_on_runtime(paths, runtime) {
         Ok(0) => {}
         Ok(lanes) => tracing::debug!(
@@ -1993,8 +2002,8 @@ fn daemon_dfs_failed_maintenance_decision(
 
 fn daemon_dfs_maintenance_notification_decision(
     _observed_at: Instant,
-    triggered_maintenance_requested: bool,
-    immediate_continuation_requested: bool,
+    _triggered_maintenance_requested: bool,
+    _immediate_continuation_requested: bool,
     next_probe_at: Option<Instant>,
 ) -> DaemonDfsMaintenanceProbeDecision {
     // Notifications are committed queue edges. The normal pass is reactive
@@ -2002,7 +2011,11 @@ fn daemon_dfs_maintenance_notification_decision(
     // be launched directly without an O(total-state) classifier.
     DaemonDfsMaintenanceProbeDecision {
         trigger_maintenance: true,
-        immediate_continuation: triggered_maintenance_requested && immediate_continuation_requested,
+        // A committed queue edge is the ownership transfer from a completed
+        // request to its background executor. It must not pay the generic
+        // maintenance interval or startup phase before making its first
+        // bounded attempt.
+        immediate_continuation: true,
         next_probe_at,
     }
 }
@@ -2028,16 +2041,15 @@ fn daemon_dfs_maintenance_due_in(
     immediate_continuation_requested: bool,
 ) -> Option<Duration> {
     triggered_maintenance_requested.then(|| {
+        if immediate_continuation_requested {
+            return Duration::ZERO;
+        }
         let startup_remaining = initial_not_before.saturating_duration_since(now);
-        let interval_remaining = if immediate_continuation_requested {
-            Duration::ZERO
-        } else {
-            daemon_maintenance_interval_remaining(
-                now,
-                last_maintenance,
-                DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL,
-            )
-        };
+        let interval_remaining = daemon_maintenance_interval_remaining(
+            now,
+            last_maintenance,
+            DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL,
+        );
         startup_remaining.max(interval_remaining)
     })
 }
@@ -2305,6 +2317,12 @@ async fn run_daemon_background_maintenance_loop(
             let completed_outcome = completed_task.join(label.as_str()).await;
             match completed_outcome {
                 Some(outcome) => {
+                    // A committed repair/namespace edge can arrive while the
+                    // previous bounded pass is still running. The notifier
+                    // owns an immediate continuation independently of the
+                    // older pass's report; do not demote that new work to the
+                    // ordinary maintenance interval at join time.
+                    let committed_edge_latched = dfs_immediate_continuation_requested;
                     let probe_paths = paths.clone();
                     let work = match tokio::task::spawn_blocking(move || {
                         daemon_dfs_pending_reactive_maintenance_work(&probe_paths)
@@ -2325,12 +2343,15 @@ async fn run_daemon_background_maintenance_loop(
                             None
                         }
                     };
-                    let decision = daemon_dfs_maintenance_completion_decision(
+                    let mut decision = daemon_dfs_maintenance_completion_decision(
                         outcome,
                         Instant::now(),
                         daemon_dfs_now_unix_nanos(),
                         work,
                     );
+                    if committed_edge_latched && decision.trigger_maintenance {
+                        decision.immediate_continuation = true;
+                    }
                     dfs_triggered_maintenance_requested = decision.trigger_maintenance;
                     dfs_immediate_continuation_requested = decision.immediate_continuation;
                     next_dfs_maintenance_probe = decision.next_probe_at;
@@ -9054,7 +9075,7 @@ mod tests {
     }
 
     #[test]
-    fn dfs_maintenance_notification_launches_only_the_reactive_pass() {
+    fn dfs_maintenance_notification_launches_reactive_work_immediately() {
         let observed_at = Instant::now();
         let mut next_probe_at = None;
         let triggered_maintenance_requested = false;
@@ -9071,8 +9092,22 @@ mod tests {
             notification.trigger_maintenance,
             "a committed queue edge must launch reactive maintenance without a metadata inventory"
         );
-        assert!(!notification.immediate_continuation);
+        assert!(
+            notification.immediate_continuation,
+            "a committed edge transfers ready work directly to the post-response executor"
+        );
         assert_eq!(next_probe_at, None);
+        assert_eq!(
+            daemon_dfs_maintenance_due_in(
+                observed_at,
+                observed_at + Duration::from_secs(60),
+                observed_at,
+                notification.trigger_maintenance,
+                notification.immediate_continuation,
+            ),
+            Some(Duration::ZERO),
+            "reactive work must not wait for startup phasing or the generic maintenance interval"
+        );
 
         let decision = daemon_dfs_failed_maintenance_decision(
             observed_at,
@@ -9272,8 +9307,8 @@ mod tests {
             .expect("startup deadline");
         assert_eq!(
             daemon_dfs_maintenance_due_in(observed_at, startup_not_before, observed_at, true, true),
-            Some(startup_delay),
-            "even an owned continuation must respect the startup phase"
+            Some(Duration::ZERO),
+            "an owned reactive continuation bypasses startup phasing"
         );
     }
 

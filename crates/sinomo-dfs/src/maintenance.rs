@@ -771,6 +771,9 @@ pub struct DfsRepairAttemptRecord {
     pub last_error: Option<String>,
 }
 
+const DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY: &str =
+    "repair execution blocked: target has no currently usable cluster route";
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DfsConflictMaintenanceReport {
     pub scanned_open_conflict_count: usize,
@@ -1670,6 +1673,41 @@ impl DfsMaintenanceExecutionExclusions {
     pub fn is_empty(&self) -> bool {
         self.target_node_ids.is_empty()
     }
+
+    /// Never defer a newly committed repair solely from a cached reachability
+    /// projection. Its first bounded send is the evidence which establishes
+    /// whether the target is actually blocked; older work with a concrete
+    /// failure remains parked until the routing generation changes.
+    fn allowing_unattempted_repairs(&self, records: &[DfsRepairAttemptRecord]) -> Self {
+        let first_attempt_targets = records
+            .iter()
+            .filter(|record| record.attempts == 0)
+            .map(|record| record.missing_replica_node_id.clone())
+            .collect::<BTreeSet<_>>();
+        Self::new(
+            self.target_node_ids
+                .iter()
+                .filter(|target| !first_attempt_targets.contains(*target))
+                .cloned(),
+        )
+    }
+}
+
+fn mark_connectivity_blocked_dfs_repair_attempt_records(
+    records: &mut [DfsRepairAttemptRecord],
+    execution_exclusions: &DfsMaintenanceExecutionExclusions,
+) {
+    for record in records {
+        if !execution_exclusions.contains(&record.missing_replica_node_id)
+            || record.next_retry_unix_nanos == u64::MAX
+        {
+            continue;
+        }
+        record.in_flight = false;
+        record.next_retry_unix_nanos = u64::MAX;
+        record.transfer_request_id = None;
+        record.last_error = Some(DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY.to_string());
+    }
 }
 
 pub(crate) fn merge_parked_dfs_repair_attempt_records(
@@ -1726,6 +1764,9 @@ pub struct DfsMaintenanceTickReport {
     pub followup_events: Vec<NetworkedDfsServiceEvent>,
     pub repair_attempts_before: Vec<DfsRepairAttemptRecord>,
     pub repair_attempts_after: Vec<DfsRepairAttemptRecord>,
+    /// This bounded pass stopped while another repair record was immediately
+    /// runnable. The daemon may continue without its ordinary retry gate.
+    pub repair_budget_exhausted: bool,
     pub metadata_replication: DfsMetadataJournalReplicationReport,
 }
 
@@ -2156,6 +2197,7 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
         lifecycle_reports.push(content_gc);
     }
     let durable_repair_queue_before = maintenance_host.load_repair_attempt_records()?;
+    let repair_queue_count_before = durable_repair_queue_before.len();
     let scheduled_repairs = service.retry_pending_repairs_bounded_with_attempts(
         options.repair_max_jobs,
         &durable_repair_queue_before,
@@ -2167,7 +2209,15 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
     let followup_events = service.process_incoming_until_quiescent()?;
     service.observe_repair_maintenance_events(&followup_events);
     let repair_attempts_after = service.active_repair_attempt_records();
-    maintenance_host.store_repair_attempt_records(&service.durable_repair_queue_records())?;
+    let durable_repair_queue_after = service.durable_repair_queue_records();
+    let repair_budget_exhausted = options.repair_max_jobs > 0
+        && options.repair_max_jobs != usize::MAX
+        && repair_queue_count_before >= options.repair_max_jobs
+        && durable_repair_queue_after.iter().any(|record| {
+            record.next_retry_unix_nanos != u64::MAX
+                && record.next_retry_unix_nanos <= dfs_now_unix_nanos()
+        });
+    maintenance_host.store_repair_attempt_records(&durable_repair_queue_after)?;
     let metadata_replication = if options.publish_metadata {
         publish_dfs_metadata_journal_with_host(
             file_system_id,
@@ -2192,6 +2242,7 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
         followup_events,
         repair_attempts_before,
         repair_attempts_after,
+        repair_budget_exhausted,
         metadata_replication,
     })
 }
@@ -2207,6 +2258,58 @@ mod causal_time_tests {
         dfs_content_root_catalog_topology_digest_with_file_systems,
     };
     use sinomo_core::DfsObjectPolicy;
+
+    fn repair_attempt_for_connectivity_test(
+        target: NodeId,
+        attempts: u32,
+    ) -> DfsRepairAttemptRecord {
+        DfsRepairAttemptRecord {
+            intent_id: "intent-reactive-connectivity".to_string(),
+            object_id: DfsObjectId::from_legacy_named("object-reactive-connectivity")
+                .expect("object id"),
+            version: DfsVersion::from_legacy_named("version-reactive-connectivity")
+                .expect("version"),
+            content_hash: "blake3:reactive-connectivity".to_string(),
+            missing_replica_node_id: target,
+            attempts,
+            in_flight: false,
+            last_attempt_unix_nanos: 0,
+            next_retry_unix_nanos: dfs_now_unix_nanos(),
+            transfer_request_id: None,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn connectivity_projection_cannot_defer_the_first_bounded_repair_attempt() {
+        let target = NodeId::from_legacy_named("node-reactive-connectivity").expect("target node");
+        let exclusions = DfsMaintenanceExecutionExclusions::new([target.clone()]);
+        let unattempted = repair_attempt_for_connectivity_test(target.clone(), 0);
+        let effective = exclusions.allowing_unattempted_repairs(std::slice::from_ref(&unattempted));
+
+        assert!(
+            !effective.contains(&target),
+            "cached reachability alone must not park newly committed repair work"
+        );
+
+        let attempted = repair_attempt_for_connectivity_test(target.clone(), 1);
+        let effective = exclusions.allowing_unattempted_repairs(std::slice::from_ref(&attempted));
+        assert!(
+            effective.contains(&target),
+            "a target with an actual failed attempt may remain connectivity-parked"
+        );
+
+        let mut records = vec![attempted];
+        mark_connectivity_blocked_dfs_repair_attempt_records(&mut records, &exclusions);
+        assert_eq!(records[0].next_retry_unix_nanos, u64::MAX);
+        assert!(!records[0].in_flight);
+        assert_eq!(records[0].transfer_request_id, None);
+        assert_eq!(
+            records[0].last_error.as_deref(),
+            Some(DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY),
+            "a deferred record must carry its concrete blocker"
+        );
+    }
 
     #[test]
     fn default_catalog_page_budget_preserves_the_bounded_root_capacity() {
@@ -2429,16 +2532,20 @@ where
         }
     }
     let durable_repair_queue_before = maintenance_host.load_repair_attempt_records()?;
+    let repair_execution_exclusions =
+        execution_exclusions.allowing_unattempted_repairs(&durable_repair_queue_before);
     let (parked_repair_attempts, eligible_repair_attempts): (Vec<_>, Vec<_>) =
         durable_repair_queue_before
             .iter()
             .cloned()
-            .partition(|record| execution_exclusions.contains(&record.missing_replica_node_id));
+            .partition(|record| {
+                repair_execution_exclusions.contains(&record.missing_replica_node_id)
+            });
     let scheduled_repairs = service
         .retry_pending_repairs_async_bounded_with_attempts_and_execution_exclusions(
             options.repair_max_jobs,
             &eligible_repair_attempts,
-            execution_exclusions,
+            &repair_execution_exclusions,
         )
         .await?;
     let followup_events = service.process_incoming_async_until_quiescent().await?;
@@ -2449,18 +2556,33 @@ where
         .iter()
         .map(|job| (job.intent_id.clone(), job.missing_replica_node_id.clone()))
         .collect::<BTreeSet<_>>();
-    let durable_repair_queue_after = merge_parked_dfs_repair_attempt_records(
+    let mut durable_repair_queue_after = merge_parked_dfs_repair_attempt_records(
         service.durable_repair_queue_records(),
         parked_repair_attempts.clone(),
         &active_repair_keys,
-        execution_exclusions,
+        &repair_execution_exclusions,
     );
-    let repair_attempts_after = merge_parked_dfs_repair_attempt_records(
+    let mut repair_attempts_after = merge_parked_dfs_repair_attempt_records(
         service.active_repair_attempt_records(),
         parked_repair_attempts,
         &active_repair_keys,
+        &repair_execution_exclusions,
+    );
+    mark_connectivity_blocked_dfs_repair_attempt_records(
+        &mut durable_repair_queue_after,
         execution_exclusions,
     );
+    mark_connectivity_blocked_dfs_repair_attempt_records(
+        &mut repair_attempts_after,
+        execution_exclusions,
+    );
+    let repair_budget_exhausted = options.repair_max_jobs > 0
+        && options.repair_max_jobs != usize::MAX
+        && eligible_repair_attempts.len() >= options.repair_max_jobs
+        && durable_repair_queue_after.iter().any(|record| {
+            record.next_retry_unix_nanos != u64::MAX
+                && record.next_retry_unix_nanos <= dfs_now_unix_nanos()
+        });
     let repair_attempts_before = durable_repair_queue_before
         .into_iter()
         .filter(|record| record.attempts > 0)
@@ -2493,6 +2615,7 @@ where
         followup_events,
         repair_attempts_before,
         repair_attempts_after,
+        repair_budget_exhausted,
         metadata_replication,
     })
 }
