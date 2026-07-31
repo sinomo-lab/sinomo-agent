@@ -25,6 +25,7 @@ use crate::control_plane::{
 use crate::intent::write_intent_status_is_active;
 use crate::metadata_api::{
     DfsMetadataBackend, DfsMetadataReplicaIngestPermit, DfsMetadataShardWriteFreeze,
+    DfsNamespaceRequestAdmissionSnapshot,
 };
 use crate::metadata_backend::LocalSobjMetadataBackend;
 use crate::metadata_error::{MetadataBackendError, Result};
@@ -83,6 +84,130 @@ fn is_source_eviction_tombstone(object: &DfsObjectMetadata) -> bool {
             object.tombstone_provenance.as_ref(),
             Some(crate::DfsTombstoneProvenance::SourceEviction { .. })
         )
+}
+
+/// Whether applying a journal mutation can change the authoritative visible
+/// shard for one of its object identities.
+///
+/// A hidden prepare reserves/recovery-protects its transaction but deliberately
+/// does not publish its proposed objects. Reconciling those IDs here would scan
+/// every local shard once per proposed object only to remove an absent index.
+fn mutation_changes_visible_object_placement(mutation: &DfsMetadataMutation) -> bool {
+    !matches!(
+        mutation,
+        DfsMetadataMutation::PutNamespacePrepare {
+            status: DfsNamespacePrepareStatus::Prepared | DfsNamespacePrepareStatus::Aborted,
+            ..
+        }
+    )
+}
+
+fn journal_batch_visible_object_placement_ids(
+    batch: &DfsMetadataJournalBatch,
+) -> BTreeSet<DfsObjectId> {
+    batch
+        .entries
+        .iter()
+        .filter(|entry| mutation_changes_visible_object_placement(&entry.mutation))
+        .flat_map(|entry| entry.mutation.affected_object_ids())
+        .collect()
+}
+
+#[cfg(test)]
+mod visible_placement_tests {
+    use super::*;
+    use time::OffsetDateTime;
+
+    fn namespace_prepare_batch(
+        status: DfsNamespacePrepareStatus,
+    ) -> (DfsMetadataJournalBatch, DfsObjectId) {
+        let file_system_id = crate::sifs_file_system_id();
+        let shard_id = DfsMetadataShardId::new("root");
+        let object_id = DfsObjectId::from_legacy_named("object_hidden_prepare").expect("object id");
+        let prepare = DfsNamespacePrepareRecord {
+            operation_id: "hidden-prepare".to_string(),
+            file_system_id: file_system_id.clone(),
+            shard_id: shard_id.clone(),
+            owner_epoch: 7,
+            operation_digest: "blake3:hidden-prepare".to_string(),
+            expected_object_versions: vec![DfsNamespaceObjectVersionExpectation {
+                object_id: object_id.clone(),
+                expected_version: None,
+            }],
+            expected_path_occupants: Vec::new(),
+            content_receipts: Vec::new(),
+            transaction: DfsNamespaceTransaction {
+                transaction_id: "hidden-prepare-transaction".to_string(),
+                file_system_id: file_system_id.clone(),
+                objects: Vec::new(),
+                versions: Vec::new(),
+                advisory_lock_states: Vec::new(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            },
+            completed_request: None,
+            completed_request_completion: None,
+            status: status.clone(),
+        };
+        (
+            DfsMetadataJournalBatch {
+                shard_id: shard_id.clone(),
+                entries: vec![DfsMetadataJournalEntry {
+                    shard_id,
+                    sequence: 1,
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                    mutation: DfsMetadataMutation::PutNamespacePrepare {
+                        file_system_id,
+                        operation_id: prepare.operation_id.clone(),
+                        status,
+                        prepare: Some(prepare),
+                        packed_prepare_v1: None,
+                    },
+                }],
+                next_after_sequence: 1,
+            },
+            object_id,
+        )
+    }
+
+    #[test]
+    fn hidden_namespace_prepares_do_not_schedule_visible_placement_reconciliation() {
+        for status in [
+            DfsNamespacePrepareStatus::Prepared,
+            DfsNamespacePrepareStatus::Aborted,
+        ] {
+            let (batch, _) = namespace_prepare_batch(status);
+            assert!(journal_batch_visible_object_placement_ids(&batch).is_empty());
+        }
+
+        let (committed, object_id) = namespace_prepare_batch(DfsNamespacePrepareStatus::Committed);
+        assert_eq!(
+            journal_batch_visible_object_placement_ids(&committed),
+            BTreeSet::from([object_id.clone()]),
+            "legacy committed prepares publish their transaction"
+        );
+
+        let compact_commit = DfsMetadataJournalBatch {
+            shard_id: DfsMetadataShardId::new("root"),
+            entries: vec![DfsMetadataJournalEntry {
+                shard_id: DfsMetadataShardId::new("root"),
+                sequence: 2,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                mutation: DfsMetadataMutation::CommitNamespacePrepare {
+                    file_system_id: crate::sifs_file_system_id(),
+                    operation_id: "hidden-prepare".to_string(),
+                    operation_digest: "blake3:hidden-prepare".to_string(),
+                    owner_epoch: 7,
+                    object_ids: vec![object_id.clone()],
+                },
+            }],
+            next_after_sequence: 2,
+        };
+        assert_eq!(
+            journal_batch_visible_object_placement_ids(&compact_commit),
+            BTreeSet::from([object_id]),
+            "compact commits make the prepared objects visible"
+        );
+    }
 }
 
 const ROUTING_TOPOLOGY_HISTORY_LIMIT: usize = 4;
@@ -3686,21 +3811,27 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         shard_id: &DfsMetadataShardId,
         request: &DfsNamespaceRequestRecord,
     ) -> Result<DfsMetadataJournalEntry> {
-        let durable_shard_id = if let Some(existing) =
-            self.get_namespace_request(&request.requester_node_id, &request.request_id)?
-        {
-            Some(existing.authority_shard_id)
-        } else {
-            self.get_namespace_request_receipt(&request.requester_node_id, &request.request_id)?
-                .map(|receipt| receipt.authority_shard_id)
-        };
-        if durable_shard_id.is_none()
-            && self.namespace_request_history_expired_on_shard(
+        let admission = self.namespace_request_admission_snapshot(
+            shard_id,
+            &request.requester_node_id,
+            &request.request_id,
+        )?;
+        let durable_shard_id = admission
+            .request
+            .map(|existing| existing.authority_shard_id)
+            .or_else(|| admission.receipt.map(|receipt| receipt.authority_shard_id));
+        let history_expired = if durable_shard_id.is_none() && admission.prepared.is_some() {
+            // Preserve the legacy write-path rule: a hidden prepare does not
+            // itself bypass an already-evicted request identity.
+            self.namespace_request_history_expired_on_shard(
                 shard_id,
                 &request.requester_node_id,
                 &request.request_id,
             )?
-        {
+        } else {
+            admission.history_expired
+        };
+        if durable_shard_id.is_none() && history_expired {
             return Err(MetadataBackendError::Serde(format!(
                 "namespace request {}/{} idempotency history expired or is unknown",
                 request.requester_node_id, request.request_id
@@ -3774,6 +3905,60 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             }
         }
         Ok(false)
+    }
+
+    fn namespace_request_admission_snapshot(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        requester_node_id: &NodeId,
+        request_id: &str,
+    ) -> Result<DfsNamespaceRequestAdmissionSnapshot> {
+        self.shard_backend(shard_id)?;
+        let mut request = None;
+        let mut receipt = None;
+        let mut prepared = None;
+        let mut history_expired = false;
+        for (history_shard_id, backend) in &mut self.shards {
+            let local = backend.namespace_request_admission_snapshot(
+                history_shard_id,
+                requester_node_id,
+                request_id,
+            )?;
+            if let Some(found) = local.request {
+                if request.is_some() {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "namespace request {requester_node_id}/{request_id} exists on multiple local shards"
+                    )));
+                }
+                request = Some(found);
+            }
+            if let Some(found) = local.receipt {
+                if receipt.is_some() {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "namespace request receipt {requester_node_id}/{request_id} exists on multiple local shards"
+                    )));
+                }
+                receipt = Some(found);
+            }
+            if let Some(found) = local.prepared {
+                if prepared.is_some() {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "pending namespace request {requester_node_id}/{request_id} owns prepared transactions on multiple local shards"
+                    )));
+                }
+                prepared = Some(found);
+            }
+            history_expired |= local.history_expired;
+        }
+        if request.is_some() || receipt.is_some() || prepared.is_some() {
+            history_expired = false;
+        }
+        Ok(DfsNamespaceRequestAdmissionSnapshot {
+            request,
+            receipt,
+            prepared,
+            history_expired,
+        })
     }
 
     fn list_namespace_requests(&self) -> Result<Vec<DfsNamespaceRequestRecord>> {
@@ -4489,11 +4674,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
-        let affected_object_ids = batch
-            .entries
-            .iter()
-            .flat_map(|entry| entry.mutation.affected_object_ids())
-            .collect::<BTreeSet<_>>();
+        let affected_object_ids = journal_batch_visible_object_placement_ids(batch);
         let applied = self
             .shard_backend_mut(&batch.shard_id)?
             .apply_journal_batch(batch)?;
@@ -4507,11 +4688,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         batch: &DfsMetadataJournalBatch,
     ) -> Result<usize> {
         self.require_replica_ingest_permit_for_shard(permit, &batch.shard_id)?;
-        let affected_object_ids = batch
-            .entries
-            .iter()
-            .flat_map(|entry| entry.mutation.affected_object_ids())
-            .collect::<BTreeSet<_>>();
+        let affected_object_ids = journal_batch_visible_object_placement_ids(batch);
         let applied = self
             .shard_backend_mut(&batch.shard_id)?
             .apply_journal_batch_with_replica_permit(permit, batch)?;

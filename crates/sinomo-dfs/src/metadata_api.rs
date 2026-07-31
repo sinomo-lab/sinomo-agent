@@ -88,6 +88,21 @@ pub struct DfsMetadataReplicaIngestPermit {
     pending_primary_handoff_id: Option<String>,
 }
 
+/// One bounded durable view used to admit an idempotent namespace request.
+///
+/// Admission needs several related indexes. Reading each index through an
+/// independently refreshed shard snapshot can decode the same checkpoint
+/// repeatedly and, more importantly, can observe different durable
+/// generations. Durable sharded backends return all evidence from one stable
+/// table image per retained shard.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DfsNamespaceRequestAdmissionSnapshot {
+    pub request: Option<DfsNamespaceRequestRecord>,
+    pub receipt: Option<DfsNamespaceRequestReceipt>,
+    pub prepared: Option<DfsNamespacePrepareRecord>,
+    pub history_expired: bool,
+}
+
 impl DfsMetadataReplicaIngestPermit {
     /// Mint evidence only after the caller has validated all four values
     /// against the same exact committed shard assignment.
@@ -1707,6 +1722,40 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     ) -> Result<bool> {
         let _ = (shard_id, requester_node_id, request_id);
         Ok(false)
+    }
+
+    /// Read all durable idempotency evidence needed to admit one namespace
+    /// request from a single coherent metadata generation.
+    ///
+    /// Sharded implementations inspect each locally retained shard once and
+    /// read all indexes from that table image. This compatibility
+    /// implementation preserves existing backend behavior; durable local
+    /// backends override it with a single table snapshot per shard.
+    fn namespace_request_admission_snapshot(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        requester_node_id: &NodeId,
+        request_id: &str,
+    ) -> Result<DfsNamespaceRequestAdmissionSnapshot> {
+        let receipt = self.get_namespace_request_receipt(requester_node_id, request_id)?;
+        let request = self.get_namespace_request(requester_node_id, request_id)?;
+        let prepared =
+            self.get_prepared_namespace_prepare_for_request(requester_node_id, request_id)?;
+        let history_expired = if receipt.is_none() && request.is_none() && prepared.is_none() {
+            self.namespace_request_history_expired_on_shard(
+                shard_id,
+                requester_node_id,
+                request_id,
+            )?
+        } else {
+            false
+        };
+        Ok(DfsNamespaceRequestAdmissionSnapshot {
+            request,
+            receipt,
+            prepared,
+            history_expired,
+        })
     }
 
     /// Return durable routed namespace requests for bounded autonomous

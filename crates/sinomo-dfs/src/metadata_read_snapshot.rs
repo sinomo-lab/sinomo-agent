@@ -45,12 +45,12 @@ pub(crate) fn metadata_durable_table_probes() -> usize {
 }
 
 #[cfg(test)]
-fn reset_metadata_checkpoint_snapshot_decodes() {
+pub(crate) fn reset_metadata_checkpoint_snapshot_decodes() {
     METADATA_CHECKPOINT_SNAPSHOT_DECODES.set(0);
 }
 
 #[cfg(test)]
-fn metadata_checkpoint_snapshot_decodes() -> usize {
+pub(crate) fn metadata_checkpoint_snapshot_decodes() -> usize {
     METADATA_CHECKPOINT_SNAPSHOT_DECODES.get()
 }
 
@@ -570,6 +570,239 @@ mod tests {
         assert!(
             cache.lock().expect("snapshot cache").is_none(),
             "borrowing the live checkpoint generation must not retain a second table image"
+        );
+    }
+
+    #[test]
+    fn checkpoint_snapshot_borrows_exact_active_log_rotation_without_decode() {
+        let root =
+            sinomo_testdir::TestDir::new("sinomo-dfs-metadata-checkpoint-borrow-active-rotation");
+        let checkpoint_file_system = file_system("checkpoint", 1);
+        persist_metadata_table_snapshot(root.path(), &DfsMetadataTables::default(), None, None)
+            .expect("persist empty metadata snapshot");
+        append_file_system(root.path(), 1, checkpoint_file_system.clone());
+        let state =
+            read_metadata_table_state_lenient(root.path()).expect("load active table generation");
+        let loaded_storage_generation =
+            metadata_table_storage_generation(root.path()).expect("capture active generation");
+        assert!(
+            rotate_metadata_table_log_for_checkpoint(root.path(), 0)
+                .expect("rotate active table generation"),
+            "non-empty active table log must rotate"
+        );
+
+        let cache = Arc::new(Mutex::new(None));
+        reset_metadata_checkpoint_snapshot_decodes();
+        let snapshot = current_tables_snapshot(
+            root.path(),
+            &state.tables,
+            state.table_log_offset,
+            state.materialized_through_sequence.unwrap_or(0),
+            &state.snapshot_fingerprint,
+            &Some(loaded_storage_generation),
+            &state.prefix_proof,
+            &cache,
+        )
+        .expect("borrow exact active-to-checkpoint rotation");
+        match snapshot {
+            DfsMetadataTablesSnapshot::Borrowed(tables) => {
+                assert!(std::ptr::eq(tables, &state.tables));
+                assert!(
+                    tables
+                        .file_systems
+                        .contains_key(&checkpoint_file_system.file_system_id)
+                );
+            }
+            DfsMetadataTablesSnapshot::Shared(_) => {
+                panic!("an exact active-to-checkpoint rotation must borrow its live tables")
+            }
+        }
+        assert_eq!(metadata_checkpoint_snapshot_decodes(), 0);
+        assert!(
+            cache.lock().expect("snapshot cache").is_none(),
+            "borrowing the rotated live generation must not retain a second table image"
+        );
+    }
+
+    #[test]
+    fn checkpoint_snapshot_rotation_borrow_revalidates_concurrent_active_suffix() {
+        let root =
+            sinomo_testdir::TestDir::new("sinomo-dfs-metadata-checkpoint-rotation-suffix-race");
+        let checkpoint_file_system = file_system("checkpoint", 1);
+        let suffix_file_system = file_system("suffix", 1);
+        persist_metadata_table_snapshot(root.path(), &DfsMetadataTables::default(), None, None)
+            .expect("persist empty metadata snapshot");
+        append_file_system(root.path(), 1, checkpoint_file_system.clone());
+        let state =
+            read_metadata_table_state_lenient(root.path()).expect("load active table generation");
+        let loaded_storage_generation =
+            metadata_table_storage_generation(root.path()).expect("capture active generation");
+        assert!(
+            rotate_metadata_table_log_for_checkpoint(root.path(), 0)
+                .expect("rotate active table generation"),
+            "non-empty active table log must rotate"
+        );
+        install_metadata_checkpoint_borrow_validation_hook({
+            let root = root.path().to_path_buf();
+            let suffix_file_system = suffix_file_system.clone();
+            move || {
+                append_file_system(&root, 2, suffix_file_system);
+            }
+        });
+
+        let cache = Arc::new(Mutex::new(None));
+        reset_metadata_checkpoint_snapshot_decodes();
+        let snapshot = current_tables_snapshot(
+            root.path(),
+            &state.tables,
+            state.table_log_offset,
+            state.materialized_through_sequence.unwrap_or(0),
+            &state.snapshot_fingerprint,
+            &Some(loaded_storage_generation),
+            &state.prefix_proof,
+            &cache,
+        )
+        .expect("fall back after concurrent active suffix");
+        let tables = shared_tables(snapshot);
+        assert!(
+            tables
+                .file_systems
+                .contains_key(&checkpoint_file_system.file_system_id)
+        );
+        assert!(
+            tables
+                .file_systems
+                .contains_key(&suffix_file_system.file_system_id)
+        );
+        assert_eq!(
+            metadata_checkpoint_snapshot_decodes(),
+            1,
+            "a concurrent active suffix must take the owned exact-cut path"
+        );
+    }
+
+    #[test]
+    fn checkpoint_snapshot_rotation_rejects_unobserved_pre_rotation_append() {
+        let root = sinomo_testdir::TestDir::new(
+            "sinomo-dfs-metadata-checkpoint-rotation-unobserved-prefix",
+        );
+        let observed_file_system = file_system("observed", 1);
+        let unobserved_file_system = file_system("unseen", 1);
+        persist_metadata_table_snapshot(root.path(), &DfsMetadataTables::default(), None, None)
+            .expect("persist empty metadata snapshot");
+        append_file_system(root.path(), 1, observed_file_system.clone());
+        let state =
+            read_metadata_table_state_lenient(root.path()).expect("load active table generation");
+        let loaded_storage_generation =
+            metadata_table_storage_generation(root.path()).expect("capture active generation");
+        append_file_system(root.path(), 2, unobserved_file_system.clone());
+        assert!(
+            rotate_metadata_table_log_for_checkpoint(root.path(), 0)
+                .expect("rotate extended active table generation"),
+            "non-empty active table log must rotate"
+        );
+
+        let cache = Arc::new(Mutex::new(None));
+        reset_metadata_checkpoint_snapshot_decodes();
+        let snapshot = current_tables_snapshot(
+            root.path(),
+            &state.tables,
+            state.table_log_offset,
+            state.materialized_through_sequence.unwrap_or(0),
+            &state.snapshot_fingerprint,
+            &Some(loaded_storage_generation),
+            &state.prefix_proof,
+            &cache,
+        )
+        .expect("fall back for unobserved pre-rotation append");
+        let tables = shared_tables(snapshot);
+        assert!(
+            tables
+                .file_systems
+                .contains_key(&observed_file_system.file_system_id)
+        );
+        assert!(
+            tables
+                .file_systems
+                .contains_key(&unobserved_file_system.file_system_id)
+        );
+        assert_eq!(
+            metadata_checkpoint_snapshot_decodes(),
+            1,
+            "checkpoint length mismatch must take the owned exact-cut path"
+        );
+    }
+
+    #[test]
+    fn checkpoint_snapshot_rotation_borrow_revalidates_equal_length_replacement() {
+        let root = sinomo_testdir::TestDir::new(
+            "sinomo-dfs-metadata-checkpoint-rotation-replacement-race",
+        );
+        let original_checkpoint = file_system("original", 1);
+        persist_metadata_table_snapshot(root.path(), &DfsMetadataTables::default(), None, None)
+            .expect("persist empty metadata snapshot");
+        append_file_system(root.path(), 1, original_checkpoint.clone());
+        let state =
+            read_metadata_table_state_lenient(root.path()).expect("load active table generation");
+        let loaded_storage_generation =
+            metadata_table_storage_generation(root.path()).expect("capture active generation");
+        assert!(
+            rotate_metadata_table_log_for_checkpoint(root.path(), 0)
+                .expect("rotate active table generation"),
+            "non-empty active table log must rotate"
+        );
+
+        let replacement_root = sinomo_testdir::TestDir::new(
+            "sinomo-dfs-metadata-checkpoint-rotation-replacement-source",
+        );
+        let replacement_checkpoint = file_system("replaced", 1);
+        append_file_system(replacement_root.path(), 1, replacement_checkpoint.clone());
+        let replacement_bytes =
+            fs::read(metadata_table_path(replacement_root.path())).expect("replacement bytes");
+        let checkpoint_path = metadata_table_checkpoint_log_path(root.path());
+        assert_eq!(
+            replacement_bytes.len() as u64,
+            fs::metadata(&checkpoint_path)
+                .expect("original checkpoint metadata")
+                .len(),
+            "replacement fixture must preserve length so file identity is load-bearing"
+        );
+        install_metadata_checkpoint_borrow_validation_hook({
+            let checkpoint_path = checkpoint_path.clone();
+            move || {
+                crate::metadata_io::write_file_atomic(&checkpoint_path, &replacement_bytes)
+                    .expect("replace checkpoint during rotation borrow validation");
+            }
+        });
+
+        let cache = Arc::new(Mutex::new(None));
+        reset_metadata_checkpoint_snapshot_decodes();
+        let snapshot = current_tables_snapshot(
+            root.path(),
+            &state.tables,
+            state.table_log_offset,
+            state.materialized_through_sequence.unwrap_or(0),
+            &state.snapshot_fingerprint,
+            &Some(loaded_storage_generation),
+            &state.prefix_proof,
+            &cache,
+        )
+        .expect("fall back after concurrent checkpoint replacement");
+        let tables = shared_tables(snapshot);
+        assert!(
+            tables
+                .file_systems
+                .contains_key(&replacement_checkpoint.file_system_id)
+        );
+        assert!(
+            !tables
+                .file_systems
+                .contains_key(&original_checkpoint.file_system_id)
+        );
+        assert_eq!(
+            metadata_checkpoint_snapshot_decodes(),
+            1,
+            "a raced checkpoint replacement must take the owned exact-cut path"
         );
     }
 

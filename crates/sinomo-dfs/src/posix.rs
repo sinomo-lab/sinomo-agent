@@ -62,7 +62,7 @@ use crate::posix_object::{
 };
 use crate::posix_path::{
     join_posix_path, normalize_posix_path, normalize_posix_path_with_trailing_directory,
-    parent_posix_path, posix_path_is_at_or_under_prefix,
+    parent_posix_path, posix_path_is_at_or_under_prefix, resolve_posix_symlink_target,
 };
 use crate::{
     DfsControlPlaneStore, DfsError, DfsFileSystem, DfsLocalEventualBatchWriteProof,
@@ -133,6 +133,22 @@ struct PosixBulkLocalWrite<'a> {
     link_count_hint: Option<u64>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct PosixBulkAuthoritativeLookup {
+    exact_objects_by_path: BTreeMap<String, DfsObjectMetadata>,
+    /// Authority-derived object-id-to-path hints. These are never consumed as
+    /// target metadata until an exact lookup at the hinted path's current
+    /// shard authority returns the same object id.
+    hardlink_target_hints: BTreeMap<DfsObjectId, DfsObjectMetadata>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PosixBulkAuthoritativePrefetch {
+    objects_by_path: BTreeMap<String, DfsObjectMetadata>,
+    /// Lexical link path to the exact-shard-revalidated target path/object.
+    resolved_link_targets: BTreeMap<String, (String, DfsObjectMetadata)>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PosixBulkParentTouch {
     path: String,
@@ -159,7 +175,10 @@ fn posix_error_is_retryable_write_serialization(error: &DfsPosixError) -> bool {
 }
 
 fn posix_error_is_concurrent_create_winner(error: &DfsPosixError) -> bool {
-    matches!(error, DfsPosixError::Dfs(DfsError::AlreadyExists { .. }))
+    matches!(
+        error,
+        DfsPosixError::AlreadyExists { .. } | DfsPosixError::Dfs(DfsError::AlreadyExists { .. })
+    )
 }
 
 fn posix_error_is_routed_namespace_unavailable(error: &DfsPosixError) -> bool {
@@ -1452,6 +1471,331 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok((path, parent))
     }
 
+    /// Fetch the exact current parent and child records needed by a
+    /// metadata-less bulk overwrite requester.
+    ///
+    /// The ordinary service prepares against its pinned local metadata
+    /// backend. A one-shot routed requester deliberately has no such backend,
+    /// so treating an empty memory overlay as authoritative would turn every
+    /// overwrite into an occupied create. Group exact-path lookups by current
+    /// metadata primary and retain the returned records only for this prepare
+    /// attempt. A conflict retries this whole function and therefore refreshes
+    /// the child versions without materializing a durable local mirror.
+    fn route_authoritative_bulk_lookup_paths(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        primary_node_id: NodeId,
+        requested_paths: BTreeSet<String>,
+    ) -> Result<PosixBulkAuthoritativeLookup> {
+        let objects = self
+            .route_namespace_lookup_paths_to_metadata_primary(
+                file_system_id.clone(),
+                primary_node_id,
+                requested_paths.iter().cloned().collect(),
+                POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+            )
+            .map_err(DfsPosixError::from)?;
+        let mut lookup = PosixBulkAuthoritativeLookup::default();
+        let mut extras = Vec::new();
+        for object in objects {
+            if object.file_system_id != *file_system_id {
+                return Err(DfsPosixError::Dfs(DfsError::Distributed {
+                    message: format!(
+                        "bulk overwrite authority returned object {} for unexpected filesystem {}",
+                        object.object_id, object.file_system_id
+                    ),
+                }));
+            }
+            if requested_paths.contains(&object.path) {
+                let path = object.path.clone();
+                if lookup
+                    .exact_objects_by_path
+                    .insert(path.clone(), object)
+                    .is_some()
+                {
+                    return Err(DfsPosixError::Dfs(DfsError::Distributed {
+                        message: format!(
+                            "bulk overwrite authority returned duplicate metadata for {path}"
+                        ),
+                    }));
+                }
+            } else {
+                extras.push(object);
+            }
+        }
+
+        let allowed_hint_ids = lookup
+            .exact_objects_by_path
+            .values()
+            .filter(|object| object.kind == DfsObjectKind::Hardlink)
+            .filter_map(|object| object.link_target_object_id.clone())
+            .collect::<BTreeSet<_>>();
+        for hint in extras {
+            if !allowed_hint_ids.contains(&hint.object_id) {
+                return Err(DfsPosixError::Dfs(DfsError::Distributed {
+                    message: format!(
+                        "bulk overwrite authority returned unreferenced object {} at {}",
+                        hint.object_id, hint.path
+                    ),
+                }));
+            }
+            if lookup
+                .hardlink_target_hints
+                .insert(hint.object_id.clone(), hint)
+                .is_some()
+            {
+                return Err(DfsPosixError::Dfs(DfsError::Distributed {
+                    message: "bulk overwrite authority returned a duplicate hardlink target hint"
+                        .to_string(),
+                }));
+            }
+        }
+        Ok(lookup)
+    }
+
+    fn exact_authoritative_bulk_lookup(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+        metadata_shards: &[DfsMetadataShardConfig],
+    ) -> Result<PosixBulkAuthoritativeLookup> {
+        let shard = self
+            .select_sifs_metadata_shard_for_path_from_snapshot(path, metadata_shards)?
+            .ok_or_else(|| {
+                DfsPosixError::Dfs(DfsError::Distributed {
+                    message: format!(
+                        "clustered bulk overwrite target {path} has no metadata shard assignment"
+                    ),
+                })
+            })?;
+        self.route_authoritative_bulk_lookup_paths(
+            file_system_id,
+            shard.primary_node_id,
+            BTreeSet::from([path.to_string()]),
+        )
+    }
+
+    fn resolve_authoritative_bulk_hardlink_target(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        link_path: &str,
+        mut object: DfsObjectMetadata,
+        mut hints: BTreeMap<DfsObjectId, DfsObjectMetadata>,
+        metadata_shards: &[DfsMetadataShardConfig],
+    ) -> Result<(String, DfsObjectMetadata)> {
+        let mut target_path = link_path.to_string();
+        for _ in 0..16 {
+            if object.kind != DfsObjectKind::Hardlink {
+                return Ok((target_path, object));
+            }
+            let target_object_id = object.link_target_object_id.clone().ok_or_else(|| {
+                DfsPosixError::Dfs(DfsError::Distributed {
+                    message: format!(
+                        "authoritative hardlink at {link_path} has no target object id"
+                    ),
+                })
+            })?;
+            let hint = hints.remove(&target_object_id).ok_or_else(|| {
+                DfsPosixError::Dfs(DfsError::Distributed {
+                    message: format!(
+                        "authoritative lookup for hardlink {link_path} did not include a target routing hint for {target_object_id}"
+                    ),
+                })
+            })?;
+            target_path = normalize_posix_path(&hint.path)?;
+            let mut target_lookup = self.exact_authoritative_bulk_lookup(
+                file_system_id,
+                &target_path,
+                metadata_shards,
+            )?;
+            for (object_id, target_hint) in target_lookup.hardlink_target_hints {
+                if hints.insert(object_id.clone(), target_hint).is_some() {
+                    return Err(DfsPosixError::Dfs(DfsError::Distributed {
+                        message: format!(
+                            "authoritative lookup returned duplicate routing hint for {object_id}"
+                        ),
+                    }));
+                }
+            }
+            object = target_lookup
+                .exact_objects_by_path
+                .remove(&target_path)
+                .ok_or_else(|| DfsPosixError::NotFound {
+                    path: target_path.clone(),
+                })?;
+            if object.object_id != target_object_id {
+                return Err(DfsPosixError::Conflict {
+                    path: link_path.to_string(),
+                    reason: format!(
+                        "hardlink target hint named {target_object_id}, but current path {} names {}",
+                        target_path, object.object_id
+                    ),
+                });
+            }
+            if object.kind == DfsObjectKind::Tombstone {
+                return Err(DfsPosixError::NotFound {
+                    path: link_path.to_string(),
+                });
+            }
+        }
+        Err(DfsPosixError::InvalidPath {
+            path: link_path.to_string(),
+        })
+    }
+
+    fn resolve_authoritative_bulk_link_target(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        link_path: &str,
+        object: DfsObjectMetadata,
+        hints: BTreeMap<DfsObjectId, DfsObjectMetadata>,
+        metadata_shards: &[DfsMetadataShardConfig],
+    ) -> Result<(String, DfsObjectMetadata)> {
+        let mut resolution_path = link_path.to_string();
+        let (mut metadata_path, mut object) = self.resolve_authoritative_bulk_hardlink_target(
+            file_system_id,
+            &resolution_path,
+            object,
+            hints,
+            metadata_shards,
+        )?;
+        for _ in 0..40 {
+            if object.kind != DfsObjectKind::Symlink {
+                return Ok((metadata_path, object));
+            }
+            let outcome = self.read_object_metadata_or_fetch_remote_without_cache(&object)?;
+            let target =
+                self.symlink_target_from_distributed_read_outcome(&resolution_path, outcome)?;
+            resolution_path = resolve_posix_symlink_target(&resolution_path, &target)?;
+            let mut target_lookup = self.exact_authoritative_bulk_lookup(
+                file_system_id,
+                &resolution_path,
+                metadata_shards,
+            )?;
+            object = target_lookup
+                .exact_objects_by_path
+                .remove(&resolution_path)
+                .ok_or_else(|| DfsPosixError::NotFound {
+                    path: resolution_path.clone(),
+                })?;
+            if object.kind == DfsObjectKind::Tombstone {
+                return Err(DfsPosixError::NotFound {
+                    path: resolution_path,
+                });
+            }
+            (metadata_path, object) = self.resolve_authoritative_bulk_hardlink_target(
+                file_system_id,
+                &resolution_path,
+                object,
+                target_lookup.hardlink_target_hints,
+                metadata_shards,
+            )?;
+        }
+        Err(DfsPosixError::InvalidPath {
+            path: link_path.to_string(),
+        })
+    }
+
+    fn prefetch_authoritative_bulk_overwrite_objects(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        normalized_files: &[(String, String, &[u8])],
+        metadata_shards: Option<&[DfsMetadataShardConfig]>,
+    ) -> Result<Option<PosixBulkAuthoritativePrefetch>> {
+        if self.metadata_backend.is_some() {
+            return Ok(None);
+        }
+        let Some(metadata_shards) = metadata_shards else {
+            // A standalone in-memory service has no routed authority. Its
+            // memory overlay remains the complete namespace view.
+            return Ok(None);
+        };
+
+        let trace_started = Instant::now();
+        let mut paths_by_primary = BTreeMap::<NodeId, BTreeSet<String>>::new();
+        let mut requested_paths = BTreeSet::new();
+        for (parent, child_name, _) in normalized_files {
+            for path in [parent.clone(), join_posix_path(parent, child_name)] {
+                if !requested_paths.insert(path.clone()) {
+                    continue;
+                }
+                let shard = self
+                    .select_sifs_metadata_shard_for_path_from_snapshot(&path, metadata_shards)?
+                    .ok_or_else(|| {
+                        DfsPosixError::Dfs(DfsError::Distributed {
+                            message: format!(
+                                "clustered bulk overwrite path {path} has no metadata shard assignment"
+                            ),
+                        })
+                    })?;
+                paths_by_primary
+                    .entry(shard.primary_node_id)
+                    .or_default()
+                    .insert(path);
+            }
+        }
+
+        let mut objects_by_path = BTreeMap::new();
+        let mut hardlink_target_hints = BTreeMap::new();
+        for (primary_node_id, paths) in paths_by_primary {
+            let lookup =
+                self.route_authoritative_bulk_lookup_paths(file_system_id, primary_node_id, paths)?;
+            for (path, object) in lookup.exact_objects_by_path {
+                if objects_by_path.insert(path.clone(), object).is_some() {
+                    return Err(DfsPosixError::Dfs(DfsError::Distributed {
+                        message: format!(
+                            "bulk overwrite authority returned duplicate metadata for {path}"
+                        ),
+                    }));
+                }
+            }
+            for (object_id, hint) in lookup.hardlink_target_hints {
+                if hardlink_target_hints
+                    .insert(object_id.clone(), hint)
+                    .is_some()
+                {
+                    return Err(DfsPosixError::Dfs(DfsError::Distributed {
+                        message: format!(
+                            "bulk overwrite authorities returned duplicate routing hints for {object_id}"
+                        ),
+                    }));
+                }
+            }
+        }
+        let link_objects = objects_by_path
+            .iter()
+            .filter(|(_, object)| {
+                matches!(
+                    object.kind,
+                    DfsObjectKind::Symlink | DfsObjectKind::Hardlink
+                )
+            })
+            .map(|(path, object)| (path.clone(), object.clone()))
+            .collect::<Vec<_>>();
+        let mut resolved_link_targets = BTreeMap::new();
+        for (path, object) in link_objects {
+            let resolved = self.resolve_authoritative_bulk_link_target(
+                file_system_id,
+                &path,
+                object,
+                hardlink_target_hints.clone(),
+                metadata_shards,
+            )?;
+            resolved_link_targets.insert(path, resolved);
+        }
+        crate::dfs_perf_trace(format_args!(
+            "bulk-overwrite-prefetch paths={} objects={} resolved_links={} elapsed_ms={}",
+            requested_paths.len(),
+            objects_by_path.len(),
+            resolved_link_targets.len(),
+            trace_started.elapsed().as_millis()
+        ));
+        Ok(Some(PosixBulkAuthoritativePrefetch {
+            objects_by_path,
+            resolved_link_targets,
+        }))
+    }
+
     pub fn posix_write_files_local_eventual_with_known_parents<'a, I>(
         &mut self,
         files: I,
@@ -1463,8 +1807,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         for attempt in 0..POSIX_BULK_PARENT_RETRY_ATTEMPTS {
             match self.posix_write_files_local_eventual_with_known_parents_once(&files, attempt > 0)
             {
-                Err(DfsPosixError::Conflict { .. })
-                    if attempt + 1 < POSIX_BULK_PARENT_RETRY_ATTEMPTS => {}
+                Err(error)
+                    if attempt + 1 < POSIX_BULK_PARENT_RETRY_ATTEMPTS
+                        && (matches!(&error, DfsPosixError::Conflict { .. })
+                            || posix_error_is_concurrent_create_winner(&error)) => {}
                 result => return result,
             }
         }
@@ -1480,12 +1826,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(Vec::new());
         }
 
-        // Resolve parents before pinning the local metadata generation. Parent
-        // resolution may need a remote freshness pull, which can ingest newer
-        // metadata locally; no backend mutation may happen inside the bounded
-        // consistent-read scope below.
+        // Normalize the complete request before fetching one authoritative
+        // parent/child projection for a metadata-less requester.
         let mut normalized_files = Vec::with_capacity(files.len());
-        let mut resolved_parents = BTreeMap::<String, (String, DfsObjectMetadata)>::new();
         for &(path, bytes) in files {
             let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
             if requires_directory {
@@ -1503,11 +1846,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let Some(parent) = parent_posix_path(&path) else {
                 return Err(DfsPosixError::IsDirectory { path });
             };
-            if !resolved_parents.contains_key(&parent) {
-                let resolved =
-                    self.resolve_posix_bulk_parent(&parent, require_authoritative_parents)?;
-                resolved_parents.insert(parent.clone(), resolved);
-            }
             let Some((_, child_name)) = path.rsplit_once('/') else {
                 return Err(DfsPosixError::InvalidPath { path });
             };
@@ -1515,6 +1853,44 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
 
         let metadata_shard_snapshot = self.refresh_sifs_metadata_shards()?;
+        let file_system_id = sifs_file_system_id();
+        let authoritative_prefetched_objects = self.prefetch_authoritative_bulk_overwrite_objects(
+            &file_system_id,
+            &normalized_files,
+            metadata_shard_snapshot.as_deref(),
+        )?;
+        // Resolve parents before pinning the local metadata generation. Parent
+        // resolution may need a remote freshness pull, which can ingest newer
+        // metadata locally; no backend mutation may happen inside the bounded
+        // consistent-read scope below.
+        let mut resolved_parents = BTreeMap::<String, (String, DfsObjectMetadata)>::new();
+        for (parent, _, _) in &normalized_files {
+            if resolved_parents.contains_key(parent) {
+                continue;
+            }
+            let resolved = match authoritative_prefetched_objects.as_ref() {
+                Some(prefetch) => {
+                    let Some(parent_object) = prefetch.objects_by_path.get(parent).cloned() else {
+                        return Err(DfsPosixError::MissingParent {
+                            path: parent.clone(),
+                        });
+                    };
+                    if parent_object.kind == DfsObjectKind::Tombstone {
+                        return Err(DfsPosixError::MissingParent {
+                            path: parent.clone(),
+                        });
+                    }
+                    if parent_object.kind != DfsObjectKind::Directory {
+                        return Err(DfsPosixError::NotDirectory {
+                            path: parent.clone(),
+                        });
+                    }
+                    (parent.clone(), parent_object)
+                }
+                None => self.resolve_posix_bulk_parent(parent, require_authoritative_parents)?,
+            };
+            resolved_parents.insert(parent.clone(), resolved);
+        }
         let pinned_metadata_snapshot = if let Some(backend) = self.metadata_backend.as_mut() {
             backend
                 .begin_consistent_read_snapshot()
@@ -1529,7 +1905,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         #[cfg(test)]
         let table_snapshot_calls_before =
             crate::metadata_backend::metadata_current_tables_snapshot_calls();
-        let file_system_id = sifs_file_system_id();
         let preparation = (|| {
             // The pre-pin walk may have synchronized a remote parent, but it
             // cannot prove that parent is still live in the generation used
@@ -1537,12 +1912,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // once, then use that exact pinned object for parent touches.
             let mut pinned_parents = BTreeMap::<String, (String, DfsObjectMetadata)>::new();
             for (parent, (resolved_parent, _)) in &resolved_parents {
-                let Some(parent_object) = self.lookup_metadata_path_for_local_overwrite(
-                    &file_system_id,
-                    resolved_parent,
-                    false,
-                )?
-                else {
+                let parent_object = match authoritative_prefetched_objects.as_ref() {
+                    Some(prefetch) => prefetch.objects_by_path.get(resolved_parent).cloned(),
+                    None => self.lookup_metadata_path_for_local_overwrite(
+                        &file_system_id,
+                        resolved_parent,
+                        false,
+                    )?,
+                };
+                let Some(parent_object) = parent_object else {
                     return Err(DfsPosixError::MissingParent {
                         path: resolved_parent.clone(),
                     });
@@ -1568,16 +1946,60 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .get(parent)
                     .expect("bulk parent was revalidated in pinned metadata generation");
                 let path = join_posix_path(resolved_parent, child_name);
+                let mut metadata_path = path.clone();
                 let mut link_count_hint = None;
-                let (object, expected_base_version, touch_parent_on_create) = match self
-                    .lookup_metadata_path_for_local_overwrite(&file_system_id, &path, true)?
+                let observed_object = match authoritative_prefetched_objects.as_ref() {
+                    Some(prefetch) => prefetch.objects_by_path.get(&path).cloned(),
+                    None => {
+                        self.lookup_metadata_path_for_local_overwrite(&file_system_id, &path, true)?
+                    }
+                };
+                let (object, expected_base_version, touch_parent_on_create) = match observed_object
                 {
                     Some(object) if object.kind == DfsObjectKind::Directory => {
                         return Err(DfsPosixError::IsDirectory { path });
                     }
-                    Some(object) if object.kind == DfsObjectKind::Symlink => return Ok(None),
+                    Some(object) if object.kind == DfsObjectKind::Symlink => {
+                        let Some(prefetch) = authoritative_prefetched_objects.as_ref() else {
+                            return Ok(None);
+                        };
+                        let (target_path, object) = prefetch
+                            .resolved_link_targets
+                            .get(&path)
+                            .cloned()
+                            .ok_or_else(|| {
+                                DfsPosixError::Dfs(DfsError::Distributed {
+                                    message: format!(
+                                        "authoritative bulk prefetch did not resolve symlink {path}"
+                                    ),
+                                })
+                            })?;
+                        metadata_path = target_path;
+                        let base = Some(object.version.clone());
+                        (object, base, false)
+                    }
                     Some(object) if object.kind == DfsObjectKind::Hardlink => {
-                        let object = self.resolve_hardlink_target(&object)?;
+                        let object = if let Some(prefetch) =
+                            authoritative_prefetched_objects.as_ref()
+                        {
+                            let (target_path, object) = prefetch
+                                .resolved_link_targets
+                                .get(&path)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    DfsPosixError::Dfs(DfsError::Distributed {
+                                        message: format!(
+                                            "authoritative bulk prefetch did not resolve hardlink {path}"
+                                        ),
+                                    })
+                                })?;
+                            metadata_path = target_path;
+                            object
+                        } else {
+                            let object = self.resolve_hardlink_target(&object)?;
+                            metadata_path = object.path.clone();
+                            object
+                        };
                         let base = Some(object.version.clone());
                         (object, base, false)
                     }
@@ -1612,9 +2034,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     return Ok(None);
                 }
                 let metadata_shard = match metadata_shard_snapshot.as_deref() {
-                    Some(shards) => {
-                        self.select_sifs_metadata_shard_for_path_from_snapshot(&path, shards)?
-                    }
+                    Some(shards) => self.select_sifs_metadata_shard_for_path_from_snapshot(
+                        &metadata_path,
+                        shards,
+                    )?,
                     None => None,
                 };
                 let parent_touch = if touch_parent_on_create {
@@ -1966,7 +2389,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     selected_shard,
                 )
                 .map(drop)
-                .map_err(DfsPosixError::from)
             };
             let authority_commit_duration = authority_commit_started.elapsed();
             authority_commit_elapsed =
@@ -3273,11 +3695,17 @@ mod replica_candidate_tests {
 
     #[test]
     fn concurrent_create_winner_is_retried_only_by_nonexclusive_writes() {
-        let error = DfsPosixError::Dfs(DfsError::AlreadyExists {
-            path: "/notes/shared.md".to_string(),
-        });
-        assert!(posix_error_is_concurrent_create_winner(&error));
-        assert!(!posix_error_is_retryable_write_serialization(&error));
+        for error in [
+            DfsPosixError::AlreadyExists {
+                path: "/notes/shared.md".to_string(),
+            },
+            DfsPosixError::Dfs(DfsError::AlreadyExists {
+                path: "/notes/shared.md".to_string(),
+            }),
+        ] {
+            assert!(posix_error_is_concurrent_create_winner(&error));
+            assert!(!posix_error_is_retryable_write_serialization(&error));
+        }
     }
 
     #[test]

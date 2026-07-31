@@ -7,19 +7,29 @@
 
 use sinomo_core::DfsObjectPolicy;
 use sinomo_core::node::NodeId;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::*;
 
 const DFS_METADATA_AUTHORITY_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
-const DFS_METADATA_AUTHORITY_LARGE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+// A large streamed prepare needs longer than an ordinary probe on a healthy
+// debug/WAN path, but this is only an optimization before the exact
+// operation-bound cluster-quorum fence. Waiting five seconds for one wedged
+// sibling made a single batch exceed seven seconds once the fallback ran.
+const DFS_METADATA_AUTHORITY_LARGE_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const DFS_METADATA_AUTHORITY_PROBE_IDLE_WAIT: Duration = Duration::from_millis(5);
 const DFS_METADATA_AUTHORITY_LARGE_NAMESPACE_RECORDS: usize = 256;
 
 static DFS_METADATA_SHARD_PUBLICATION_LOCKS: OnceLock<(Mutex<BTreeSet<String>>, Condvar)> =
     OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static DFS_METADATA_AUTHORITY_BATCH_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 fn metadata_authority_probe_timeout(
     shard: &DfsMetadataShardConfig,
@@ -615,20 +625,45 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let result = (|| {
             let mut authority_requests = Vec::with_capacity(targets.len());
+            let mut batches_by_replicated_through_sequence =
+                BTreeMap::<u64, Option<DfsMetadataJournalBatch>>::new();
+            let mut direct_wire_identities = BTreeMap::<u64, (String, String)>::new();
             for target_node_id in targets {
                 if started_at.elapsed() >= timeout {
                     break;
                 }
-                let Some(target_batch) =
-                    self.metadata_authority_batch_for_target(&target_node_id, prepared_batch)?
-                else {
+                let replicated_through_sequence = self
+                    .metadata_authority_replicated_through_sequence_for_target(
+                        &target_node_id,
+                        prepared_batch,
+                    )?;
+                let target_batch = match batches_by_replicated_through_sequence
+                    .entry(replicated_through_sequence)
+                {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        let batch = self.metadata_authority_batch_since(
+                            replicated_through_sequence,
+                            prepared_batch,
+                        )?;
+                        entry.insert(batch).clone()
+                    }
+                };
+                let Some(target_batch) = target_batch else {
                     // A member farther behind than one bounded catch-up batch
                     // cannot count toward this operation's full-shard proof.
                     // Background replication can close the gap independently.
                     continue;
                 };
-                let request_id = self.next_request_id();
-                let probe_id = sinomo_core::Id::generate().to_string();
+                let (request_id, probe_id) = direct_wire_identities
+                    .entry(replicated_through_sequence)
+                    .or_insert_with(|| {
+                        (
+                            self.next_request_id(),
+                            sinomo_core::Id::generate().to_string(),
+                        )
+                    })
+                    .clone();
                 let command = DfsMetadataJournalBatchCommand {
                     request_id: request_id.clone(),
                     source_node_id: Some(self.node_id.clone()),
@@ -666,7 +701,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             .authority_probe
                             .as_ref()
                             .and_then(metadata_authority_probe_confirmation_id);
-                        if response.result != DfsMetadataJournalBatchResult::Applied
+                        if response.request_id != command.request_id
+                            || response.shard_id != command.batch.shard_id
+                            || response.next_after_sequence != command.batch.next_after_sequence
+                            || response.result != DfsMetadataJournalBatchResult::Applied
                             || response.verified_authority_probe_id.as_deref()
                                 != expected_confirmation_id.as_deref()
                         {
@@ -675,13 +713,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         self.record_metadata_authority_replication_cursor(
                             target_node_id,
                             &command.batch.shard_id,
-                            response.next_after_sequence,
+                            command.batch.next_after_sequence,
                         );
                         acknowledged_node_ids.insert(target_node_id.clone());
                     }
                     return Ok(acknowledged_node_ids);
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    // Routed responses are correlated through one process-wide
+                    // pending map, so restore target-unique identities when
+                    // the replayable direct fan-out transport is unavailable.
+                    for (_, command) in &mut authority_requests {
+                        command.request_id = self.next_request_id();
+                        command
+                            .authority_probe
+                            .as_mut()
+                            .expect("authority request carries probe")
+                            .probe_id = sinomo_core::Id::generate().to_string();
+                    }
+                }
                 Err(_) => return Ok(acknowledged_node_ids),
             }
             for (target_node_id, command) in authority_requests {
@@ -761,11 +811,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         result
     }
 
+    #[cfg(test)]
     pub(crate) fn metadata_authority_batch_for_target(
         &self,
         target_node_id: &NodeId,
         prepared_batch: &DfsMetadataJournalBatch,
     ) -> Result<Option<DfsMetadataJournalBatch>, DfsError> {
+        let replicated_through_sequence = self
+            .metadata_authority_replicated_through_sequence_for_target(
+                target_node_id,
+                prepared_batch,
+            )?;
+        self.metadata_authority_batch_since(replicated_through_sequence, prepared_batch)
+    }
+
+    fn metadata_authority_replicated_through_sequence_for_target(
+        &self,
+        target_node_id: &NodeId,
+        prepared_batch: &DfsMetadataJournalBatch,
+    ) -> Result<u64, DfsError> {
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Err(DfsError::Metadata {
                 message: "metadata authority probe has no durable metadata backend".to_string(),
@@ -779,12 +843,44 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .copied()
             .unwrap_or(0)
             .max(durable_replicated_through_sequence);
+        Ok(replicated_through_sequence)
+    }
+
+    fn metadata_authority_batch_since(
+        &self,
+        replicated_through_sequence: u64,
+        prepared_batch: &DfsMetadataJournalBatch,
+    ) -> Result<Option<DfsMetadataJournalBatch>, DfsError> {
         if replicated_through_sequence >= prepared_batch.next_after_sequence {
             // Exact retries still carry the prepare entry so a current peer can
             // re-read it and echo the fresh request nonce without mutating its
             // replay cursor.
             return Ok(Some(prepared_batch.clone()));
         }
+        let prepared_batch_is_exact_suffix =
+            prepared_batch.entries.first().is_some_and(|entry| {
+                entry.sequence == replicated_through_sequence.saturating_add(1)
+            }) && prepared_batch
+                .entries
+                .last()
+                .is_some_and(|entry| entry.sequence == prepared_batch.next_after_sequence)
+                && prepared_batch
+                    .entries
+                    .windows(2)
+                    .all(|entries| entries[1].sequence == entries[0].sequence.saturating_add(1));
+        if prepared_batch_is_exact_suffix {
+            // The foreground authority path already owns this exact decoded
+            // suffix. Re-reading it from the journal serializes and decodes the
+            // same multi-megabyte prepare before any network work can begin.
+            return Ok(Some(prepared_batch.clone()));
+        }
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Err(DfsError::Metadata {
+                message: "metadata authority probe has no durable metadata backend".to_string(),
+            });
+        };
+        #[cfg(test)]
+        DFS_METADATA_AUTHORITY_BATCH_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
         let Some(batch) = backend.journal_batch_for_shard_since_limited(
             &prepared_batch.shard_id,
             replicated_through_sequence,
@@ -812,15 +908,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shard_id: &DfsMetadataShardId,
         replayed_through_sequence: u64,
     ) {
-        let cursor = self
-            .metadata_replication_cursors
-            .entry((target_node_id.clone(), shard_id.clone()))
-            .or_insert(0);
-        *cursor = (*cursor).max(replayed_through_sequence);
+        let acknowledged_sequence = {
+            let cursor = self
+                .metadata_replication_cursors
+                .entry((target_node_id.clone(), shard_id.clone()))
+                .or_insert(0);
+            *cursor = (*cursor).max(replayed_through_sequence);
+            *cursor
+        };
         // The fresh receiver nonce and full-shard proof authorize this request.
         // This sender-side cursor only avoids resending an acknowledged prefix;
-        // background journal publication checkpoints it durably. A crash before
-        // that checkpoint safely resends an idempotent prefix.
+        // persist it immediately so the fenced background publisher observes
+        // the prepare acknowledgement and starts with the later commit suffix.
+        //
+        // Cursor persistence remains best effort: the receiver has already
+        // durably applied and verified this prefix, so turning a local advisory
+        // checkpoint failure into a rejected foreground operation would report
+        // false failure after successful replication. A crash or write failure
+        // safely resends the idempotent prefix.
+        let Some(backend) = self.metadata_backend.as_mut() else {
+            return;
+        };
+        if let Err(error) =
+            backend.put_metadata_replication_cursor(target_node_id, shard_id, acknowledged_sequence)
+        {
+            dfs_perf_trace(format_args!(
+                "metadata_authority action=cursor_checkpoint_failed target={} shard={} acknowledged_sequence={} error={}",
+                target_node_id, shard_id.0, acknowledged_sequence, error
+            ));
+        }
     }
 
     fn clear_metadata_authority_probe_requests(&mut self, request_ids: &[String]) {
@@ -1661,6 +1777,9 @@ mod authority_probe_tests {
     struct AuthorityProbeTransport {
         local_node_id: NodeId,
         behavior: ProbeBehavior,
+        direct_metadata_journal_batches: bool,
+        direct_commands: Vec<DfsMetadataJournalBatchCommand>,
+        direct_next_after_sequence_override: Option<u64>,
         unroutable_node_ids: BTreeSet<NodeId>,
         incoming: VecDeque<DfsRoutedMessage>,
         sent: Arc<Mutex<Vec<DfsRoutedMessage>>>,
@@ -1671,6 +1790,9 @@ mod authority_probe_tests {
             Self {
                 local_node_id,
                 behavior,
+                direct_metadata_journal_batches: false,
+                direct_commands: Vec::new(),
+                direct_next_after_sequence_override: None,
                 unroutable_node_ids: BTreeSet::new(),
                 incoming: VecDeque::new(),
                 sent: Arc::new(Mutex::new(Vec::new())),
@@ -1738,6 +1860,50 @@ mod authority_probe_tests {
                 ),
             });
             Ok(())
+        }
+
+        fn send_metadata_journal_batch_direct(
+            &mut self,
+            target_node_id: &NodeId,
+            command: &DfsMetadataJournalBatchCommand,
+        ) -> Result<Option<DfsMetadataJournalBatchResponse>, NetworkError> {
+            if !self.direct_metadata_journal_batches {
+                return Ok(None);
+            }
+            self.direct_commands.push(command.clone());
+            if self.behavior == ProbeBehavior::Unroutable
+                || self.unroutable_node_ids.contains(target_node_id)
+            {
+                return Err(NetworkError::UnknownNode {
+                    node_id: target_node_id.clone(),
+                });
+            }
+            let Some(probe) = command.authority_probe.as_ref() else {
+                return Ok(None);
+            };
+            if self.behavior == ProbeBehavior::Capture {
+                return Ok(None);
+            }
+            let accepted = self.behavior == ProbeBehavior::Accept;
+            Ok(Some(DfsMetadataJournalBatchResponse {
+                request_id: command.request_id.clone(),
+                shard_id: command.batch.shard_id.clone(),
+                next_after_sequence: self
+                    .direct_next_after_sequence_override
+                    .unwrap_or(command.batch.next_after_sequence),
+                applied_entries: 0,
+                verified_prefix_only: false,
+                verified_authority_probe_id: accepted
+                    .then(|| metadata_authority_probe_confirmation_id(probe))
+                    .flatten(),
+                result: if accepted {
+                    DfsMetadataJournalBatchResult::Applied
+                } else {
+                    DfsMetadataJournalBatchResult::Rejected {
+                        reason: "stale authority".to_string(),
+                    }
+                },
+            }))
         }
 
         fn drain_incoming_messages(&mut self) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
@@ -2280,6 +2446,162 @@ mod authority_probe_tests {
     }
 
     #[test]
+    fn direct_full_shard_authority_ack_checkpoints_replication_cursor_durably() {
+        let replica = node("node_direct_authority_cursor_replica");
+        let (mut service, object, intent, shard, txn_calls, _) =
+            authority_fixture(ProbeBehavior::Accept, vec![replica.clone()]);
+        service.transport.direct_metadata_journal_batches = true;
+        let sent = Arc::clone(&service.transport.sent);
+        let (operation, prepared_batch) =
+            prepared_authority_fixture(&mut service, &object, &intent, &shard);
+
+        let authorization = service
+            .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
+            .expect("direct full-shard authority");
+
+        assert!(matches!(
+            authorization,
+            DfsCanonicalAuthorization::FullShard { .. }
+        ));
+        assert_eq!(txn_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            sent.lock().expect("sent messages").is_empty(),
+            "the direct acknowledgement must not fall back to routed messaging"
+        );
+        assert_eq!(
+            service
+                .metadata_backend
+                .as_ref()
+                .expect("metadata backend")
+                .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
+                .expect("durable direct authority cursor"),
+            prepared_batch.next_after_sequence
+        );
+    }
+
+    #[test]
+    fn malformed_direct_authority_next_sequence_cannot_advance_cursor() {
+        let replica = node("node_malformed_direct_authority_cursor_replica");
+        let (mut service, object, intent, shard, _, _) =
+            authority_fixture(ProbeBehavior::Accept, vec![replica.clone()]);
+        service.transport.direct_metadata_journal_batches = true;
+        let (operation, prepared_batch) =
+            prepared_authority_fixture(&mut service, &object, &intent, &shard);
+        service.transport.direct_next_after_sequence_override =
+            Some(prepared_batch.next_after_sequence.saturating_add(10_000));
+
+        let acknowledged = service
+            .fresh_metadata_shard_authority_acknowledgements(
+                &shard,
+                &operation,
+                &prepared_batch,
+                DFS_METADATA_AUTHORITY_PROBE_TIMEOUT,
+            )
+            .expect("malformed response is ignored");
+
+        assert_eq!(acknowledged, BTreeSet::from([service.node_id.clone()]));
+        assert_eq!(
+            service
+                .metadata_backend
+                .as_ref()
+                .expect("metadata backend")
+                .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
+                .expect("durable cursor after malformed response"),
+            0,
+            "an untrusted response must not advance beyond the command's primary journal head"
+        );
+        assert!(
+            !service
+                .metadata_replication_cursors
+                .contains_key(&(replica, prepared_batch.shard_id)),
+            "the in-memory optimization cursor must reject the malformed response too"
+        );
+    }
+
+    #[test]
+    fn routed_full_shard_authority_ack_checkpoints_replication_cursor_durably() {
+        let replica = node("node_routed_authority_cursor_replica");
+        let (mut service, object, intent, shard, txn_calls, _) =
+            authority_fixture(ProbeBehavior::Accept, vec![replica.clone()]);
+        let sent = Arc::clone(&service.transport.sent);
+        let (operation, prepared_batch) =
+            prepared_authority_fixture(&mut service, &object, &intent, &shard);
+
+        let authorization = service
+            .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
+            .expect("routed full-shard authority");
+
+        assert!(matches!(
+            authorization,
+            DfsCanonicalAuthorization::FullShard { .. }
+        ));
+        assert_eq!(txn_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            sent.lock().expect("sent messages").len(),
+            1,
+            "message-only transport should exercise the routed acknowledgement path"
+        );
+        assert_eq!(
+            service
+                .metadata_backend
+                .as_ref()
+                .expect("metadata backend")
+                .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
+                .expect("durable routed authority cursor"),
+            prepared_batch.next_after_sequence
+        );
+    }
+
+    #[test]
+    fn exact_authority_retry_preserves_the_monotonic_durable_cursor() {
+        let replica = node("node_exact_authority_retry_cursor_replica");
+        let (mut service, object, intent, shard, _, _) =
+            authority_fixture(ProbeBehavior::Accept, vec![replica.clone()]);
+        let (operation, prepared_batch) =
+            prepared_authority_fixture(&mut service, &object, &intent, &shard);
+        service
+            .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
+            .expect("initial full-shard authority");
+        DFS_METADATA_AUTHORITY_BATCH_READS.with(|reads| reads.set(0));
+
+        let retry_authorization = service
+            .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
+            .expect("exact full-shard authority retry");
+
+        assert!(matches!(
+            retry_authorization,
+            DfsCanonicalAuthorization::FullShard { .. }
+        ));
+        assert_eq!(
+            DFS_METADATA_AUTHORITY_BATCH_READS.with(std::cell::Cell::get),
+            0,
+            "an exact retry should reuse its prepared batch instead of rereading the journal"
+        );
+        service.record_metadata_authority_replication_cursor(
+            &replica,
+            &prepared_batch.shard_id,
+            prepared_batch.next_after_sequence.saturating_sub(1),
+        );
+        assert_eq!(
+            service
+                .metadata_backend
+                .as_ref()
+                .expect("metadata backend")
+                .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
+                .expect("monotonic durable authority cursor"),
+            prepared_batch.next_after_sequence,
+            "an older acknowledgement must not regress the durable cursor"
+        );
+        assert_eq!(
+            service
+                .metadata_replication_cursors
+                .get(&(replica, prepared_batch.shard_id.clone())),
+            Some(&prepared_batch.next_after_sequence),
+            "the in-memory optimization cursor must remain monotonic too"
+        );
+    }
+
+    #[test]
     fn partial_shard_authority_uses_operation_bound_kv_fallback() {
         let replica_a = node("node_authority_probe_quorum_replica_a");
         let replica_b = node("node_authority_probe_quorum_replica_b");
@@ -2319,7 +2641,7 @@ mod authority_probe_tests {
         ];
         let expected_probe_count = replicas.len();
         let (mut service, object, _, shard, txn_calls, _) =
-            authority_fixture(ProbeBehavior::Accept, replicas);
+            authority_fixture(ProbeBehavior::Accept, replicas.clone());
         let sent = Arc::clone(&service.transport.sent);
         let (operation, prepared_batch) =
             prepared_namespace_authority_fixture(&mut service, &object, &shard, 257);
@@ -2345,6 +2667,104 @@ mod authority_probe_tests {
             service
                 .validate_canonical_authorization(&authorization, &operation)
                 .expect("full-shard evidence remains subject to canonical revalidation"),
+        );
+    }
+
+    #[test]
+    fn authority_fanout_reuses_exact_prepared_suffix_for_five_equal_cursors() {
+        let replicas = (0..5)
+            .map(|index| node(&format!("node_shared_authority_cursor_replica_{index}")))
+            .collect::<Vec<_>>();
+        let expected_probe_count = replicas.len();
+        let (mut service, object, _, shard, txn_calls, _) =
+            authority_fixture(ProbeBehavior::Accept, replicas.clone());
+        let sent = Arc::clone(&service.transport.sent);
+        let (operation, prepared_batch) =
+            prepared_namespace_authority_fixture(&mut service, &object, &shard, 257);
+        for replica in &replicas {
+            service.record_metadata_authority_replication_cursor(
+                replica,
+                &prepared_batch.shard_id,
+                prepared_batch.next_after_sequence.saturating_sub(1),
+            );
+        }
+        DFS_METADATA_AUTHORITY_BATCH_READS.with(|reads| reads.set(0));
+
+        let authorization = service
+            .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
+            .expect("equal replica cursors should reuse the decoded prepared suffix");
+
+        assert!(matches!(
+            authorization,
+            DfsCanonicalAuthorization::FullShard { .. }
+        ));
+        assert_eq!(txn_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            DFS_METADATA_AUTHORITY_BATCH_READS.with(std::cell::Cell::get),
+            0,
+            "the decoded prepared suffix should be reused without rereading the journal"
+        );
+        let sent = sent.lock().expect("sent messages");
+        let commands = sent
+            .iter()
+            .filter_map(|message| match &message.message {
+                DfsNetworkMessage::MetadataJournalBatch(command) => Some(command),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(commands.len(), expected_probe_count);
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.request_id.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            expected_probe_count,
+            "shared batch construction must retain per-target request identities"
+        );
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.batch == commands[0].batch),
+            "equal cursors should receive the same exact bounded journal batch"
+        );
+    }
+
+    #[test]
+    fn direct_authority_fanout_coalesces_equal_suffixes_into_one_wire_value() {
+        let replicas = (0..5)
+            .map(|index| node(&format!("node_replayable_authority_replica_{index}")))
+            .collect::<Vec<_>>();
+        let (mut service, object, _, shard, txn_calls, _) =
+            authority_fixture(ProbeBehavior::Accept, replicas.clone());
+        service.transport.direct_metadata_journal_batches = true;
+        let (operation, prepared_batch) =
+            prepared_namespace_authority_fixture(&mut service, &object, &shard, 257);
+        for replica in &replicas {
+            service.record_metadata_authority_replication_cursor(
+                replica,
+                &prepared_batch.shard_id,
+                prepared_batch.next_after_sequence.saturating_sub(1),
+            );
+        }
+
+        let authorization = service
+            .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
+            .expect("direct equal-suffix authority");
+
+        assert!(matches!(
+            authorization,
+            DfsCanonicalAuthorization::FullShard { .. }
+        ));
+        assert_eq!(txn_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service.transport.direct_commands.len(), replicas.len());
+        assert!(
+            service
+                .transport
+                .direct_commands
+                .iter()
+                .all(|command| command == &service.transport.direct_commands[0]),
+            "equal direct suffixes must share request/probe identity so transport encoding can be replayed"
         );
     }
 

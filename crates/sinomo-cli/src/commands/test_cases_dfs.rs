@@ -52,7 +52,7 @@
 use crate::app_api::SifsBrowser;
 use crate::file_manager::FileManagerBackend;
 use crate::sifs_file_manager::{
-    SifsFileManagerBackend, SifsFileManagerObservation, SifsOneShotBulkCreateRequester,
+    SifsFileManagerBackend, SifsFileManagerObservation, SifsOneShotBulkWriteRequester,
 };
 use sinomo_runtime::api::DaemonApiClient;
 use sinomo_runtime::cluster;
@@ -3599,42 +3599,33 @@ fn run_small_file_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     )))
 }
 
-enum DfsBulkWriteRequester {
-    CreateOnly(SifsOneShotBulkCreateRequester),
-    Overwrite(SifsFileManagerBackend),
+struct DfsBulkWriteRequester {
+    requester: SifsOneShotBulkWriteRequester,
+    overwrite_existing: bool,
 }
 
 impl DfsBulkWriteRequester {
     fn open(ctx: &SinomoTestContext, overwrite_existing: bool) -> Result<Self, SinomoTestError> {
-        if overwrite_existing {
-            return open_backend(ctx).map(Self::Overwrite);
-        }
         let data_dir = SinomoDataDir::new(ctx.data_dir());
-        SifsOneShotBulkCreateRequester::open(&data_dir)
-            .map(Self::CreateOnly)
+        SifsOneShotBulkWriteRequester::open(&data_dir)
+            .map(|requester| Self {
+                requester,
+                overwrite_existing,
+            })
             .map_err(|error| {
                 SinomoTestError::failed(format!(
-                    "cannot open one-shot SIFS bulk create requester: {error}"
+                    "cannot open one-shot SIFS bulk write requester: {error}"
                 ))
             })
     }
 
     fn node_label(&self) -> String {
-        match self {
-            Self::CreateOnly(requester) => requester.node_label(),
-            Self::Overwrite(backend) => backend.node_label(),
-        }
+        self.requester.node_label()
     }
 
     fn create_dir_all_until(&self, path: &str, deadline: Instant) -> Result<(), String> {
-        match self {
-            Self::CreateOnly(requester) => {
-                requester.create_dir_all_deferred_local_replay_until(path, deadline)
-            }
-            Self::Overwrite(backend) => {
-                backend.create_dir_all_deferred_local_replay_until(path, deadline)
-            }
-        }
+        self.requester
+            .create_dir_all_deferred_local_replay_until(path, deadline)
     }
 
     fn write_files_until(
@@ -3642,20 +3633,16 @@ impl DfsBulkWriteRequester {
         files: &[(String, Vec<u8>)],
         deadline: Instant,
     ) -> Result<(), String> {
-        match self {
-            Self::CreateOnly(requester) => {
-                requester.write_files_with_known_parents_deferred_publish_until(files, deadline)
-            }
-            Self::Overwrite(backend) => backend
-                .write_files_with_known_parents_deferred_publish_mode_until(files, true, deadline),
-        }
+        self.requester
+            .write_files_with_known_parents_deferred_publish_mode_until(
+                files,
+                self.overwrite_existing,
+                deadline,
+            )
     }
 
     fn publish_metadata_after_mutation(&self) -> Result<(), String> {
-        match self {
-            Self::CreateOnly(requester) => requester.publish_metadata_after_mutation(),
-            Self::Overwrite(backend) => backend.publish_metadata_after_mutation(),
-        }
+        self.requester.publish_metadata_after_mutation()
     }
 }
 

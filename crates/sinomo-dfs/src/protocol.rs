@@ -226,7 +226,9 @@ pub struct DfsNamespaceCommand {
     pub file_system_id: DfsFileSystemId,
     pub requesting_node_id: NodeId,
     /// False when the requester only needs the operation result and will not
-    /// replay response journals locally.
+    /// replay response journals or consume mutation path objects locally.
+    /// Lookup and explicit sync operations still return their requested path
+    /// objects without journal replay.
     #[serde(
         default = "default_include_metadata_journal_batches",
         skip_serializing_if = "bool_is_true"

@@ -6,7 +6,7 @@
 
 use crate::metadata_keys::{
     bucket_dirfrag_id, dentry_key, dirfrag_hash_range, normalize_path, object_inode_id,
-    parent_inode_id, path_record_for_object,
+    path_record_for_object,
 };
 use crate::metadata_records::{
     DfsDirFragmentId, DfsDirFragmentRecord, DfsInodeRecord, DfsMetadataTableOp, DfsPathRecord,
@@ -66,30 +66,40 @@ pub(crate) fn object_index_table_ops_with_previous(
 ) -> Vec<DfsMetadataTableOp> {
     let object = normalized_object_metadata(object);
     let inode = DfsInodeRecord::from(&object);
+    // Build the normalized path, parent inode, and name hash once. Bulk
+    // namespace transactions commonly materialize thousands of siblings, so
+    // repeating path normalization and the parent-path hash for each lookup is
+    // measurable in the foreground commit path.
+    let base_path_record = path_record_for_object(&object);
     let previous_path_record = previous.map(|previous| {
         stored_path_record_for_object(tables, previous)
             .unwrap_or_else(|| path_record_for_object(previous))
     });
     let existing_path_record = tables
         .paths
-        .get(&(object.file_system_id.clone(), normalize_path(&object.path)))
+        .get(&(
+            base_path_record.file_system_id.clone(),
+            base_path_record.path.clone(),
+        ))
         .cloned();
-    let path_record = if object.kind == DfsObjectKind::Tombstone {
-        path_record_for_object(&object)
+    let (path_record, selected_root_dirfrag) = if object.kind == DfsObjectKind::Tombstone {
+        (base_path_record, None)
     } else if let Some(previous_path_record) = previous_path_record.as_ref()
         && previous_path_record.file_system_id == object.file_system_id
-        && previous_path_record.path == normalize_path(&object.path)
-        && previous_path_record.parent_inode_id
-            == parent_inode_id(&object.file_system_id, &normalize_path(&object.path))
+        && previous_path_record.path == base_path_record.path
+        && previous_path_record.parent_inode_id == base_path_record.parent_inode_id
     {
-        let mut path_record = path_record_for_object(&object);
+        let mut path_record = base_path_record;
         path_record.dirfrag_id = previous_path_record.dirfrag_id.clone();
-        path_record
+        (path_record, None)
     } else {
-        path_record_for_new_dentry(tables, &object)
+        path_record_for_new_dentry(tables, base_path_record)
     };
 
-    let mut table_ops = Vec::new();
+    // A normal live object emits exactly six index operations. Reserve a
+    // little headroom for replacement/removal operations without making every
+    // sibling grow its temporary vector from zero through two allocations.
+    let mut table_ops = Vec::with_capacity(8);
     let mut removed_dentry = None::<DfsPathRecord>;
     if let Some(previous_target_object_id) =
         previous.and_then(|previous| previous.link_target_object_id.as_ref())
@@ -170,14 +180,23 @@ pub(crate) fn object_index_table_ops_with_previous(
         removed.parent_inode_id == path_record.parent_inode_id
             && removed.dirfrag_id == path_record.dirfrag_id
     });
-    let dirfrag = read_or_create_dirfrag(
-        tables,
-        &path_record.file_system_id,
-        &path_record.parent_inode_id,
-        &path_record.dirfrag_id,
-        Some(path_record.name_hash),
-        !tables.dentries.contains_key(&dentry_key(&path_record)) && !removed_from_new_dirfrag,
-    );
+    let increment_entry_count =
+        !tables.dentries.contains_key(&dentry_key(&path_record)) && !removed_from_new_dirfrag;
+    let dirfrag = if let Some(mut root_dirfrag) = selected_root_dirfrag {
+        if increment_entry_count {
+            root_dirfrag.entry_count = root_dirfrag.entry_count.saturating_add(1);
+        }
+        root_dirfrag
+    } else {
+        read_or_create_dirfrag(
+            tables,
+            &path_record.file_system_id,
+            &path_record.parent_inode_id,
+            &path_record.dirfrag_id,
+            Some(path_record.name_hash),
+            increment_entry_count,
+        )
+    };
     table_ops.push(DfsMetadataTableOp::PutPath {
         path_record: path_record.clone(),
     });
@@ -226,9 +245,8 @@ fn stored_path_record_for_object(
 
 fn path_record_for_new_dentry(
     tables: &DfsMetadataTables,
-    object: &DfsObjectMetadata,
-) -> DfsPathRecord {
-    let mut path_record = path_record_for_object(object);
+    mut path_record: DfsPathRecord,
+) -> (DfsPathRecord, Option<DfsDirFragmentRecord>) {
     let root_dirfrag = read_or_create_dirfrag(
         tables,
         &path_record.file_system_id,
@@ -239,8 +257,13 @@ fn path_record_for_new_dentry(
     );
     if root_dirfrag.entry_count >= root_dirfrag.split_after_count {
         path_record.dirfrag_id = bucket_dirfrag_id(path_record.name_hash);
+        (path_record, None)
+    } else {
+        // The selected fragment is the record we just read. Return it so the
+        // caller can apply the entry-count delta without a second tree lookup
+        // and clone for every sibling.
+        (path_record, Some(root_dirfrag))
     }
-    path_record
 }
 
 fn read_or_create_dirfrag(
@@ -320,6 +343,23 @@ mod tests {
         }
     }
 
+    fn sibling_object(index: usize, path: &str) -> DfsObjectMetadata {
+        let mut object = object(path);
+        object.object_id = object_id(&format!("obj_object_index_sibling_{index}"));
+        object.version = version(&format!("version_object_index_sibling_{index}"));
+        object
+    }
+
+    fn apply_object_indexes(
+        tables: &mut DfsMetadataTables,
+        object: &DfsObjectMetadata,
+        previous: Option<&DfsObjectMetadata>,
+    ) {
+        for op in object_index_table_ops_with_previous(tables, object, previous) {
+            tables.apply(op);
+        }
+    }
+
     #[test]
     fn object_index_ops_materialize_new_file_indexes() {
         let object = object("/docs/readme.md");
@@ -343,9 +383,7 @@ mod tests {
     fn object_index_materialized_check_requires_dentry_for_live_file() {
         let object = object("/docs/readme.md");
         let mut tables = DfsMetadataTables::default();
-        for op in object_index_table_ops_with_previous(&tables, &object, None) {
-            tables.apply(op);
-        }
+        apply_object_indexes(&mut tables, &object, None);
 
         assert!(object_indexes_are_materialized(&tables, &object));
         let path_record = path_record_for_object(&object);
@@ -357,9 +395,7 @@ mod tests {
     fn tombstone_with_new_object_id_removes_existing_path_dentry() {
         let object = object("/docs/readme.md");
         let mut tables = DfsMetadataTables::default();
-        for op in object_index_table_ops_with_previous(&tables, &object, None) {
-            tables.apply(op);
-        }
+        apply_object_indexes(&mut tables, &object, None);
         let live_path_record = path_record_for_object(&object);
         assert!(tables.dentries.contains_key(&dentry_key(&live_path_record)));
 
@@ -371,9 +407,7 @@ mod tests {
         tombstone.current_locations = vec![node("node_owner")];
         tombstone.version = version("version_object_index_tombstone");
 
-        for op in object_index_table_ops_with_previous(&tables, &tombstone, None) {
-            tables.apply(op);
-        }
+        apply_object_indexes(&mut tables, &tombstone, None);
 
         assert!(!tables.dentries.contains_key(&dentry_key(&live_path_record)));
         let tombstone_path_record = path_record_for_object(&tombstone);
@@ -383,6 +417,117 @@ mod tests {
                 .get(&(tombstone.file_system_id.clone(), tombstone_path_record.path))
                 .map(|record| record.object_id.clone()),
             Some(tombstone.object_id)
+        );
+    }
+
+    #[test]
+    fn bulk_sibling_indexes_materialize_once_and_retry_without_growing_dirfrag() {
+        const SIBLING_COUNT: usize = 1_024;
+
+        let mut tables = DfsMetadataTables::default();
+        for index in 0..SIBLING_COUNT {
+            let object = sibling_object(index, &format!("//bulk/file-{index:04}//"));
+            apply_object_indexes(&mut tables, &object, None);
+        }
+
+        assert_eq!(tables.objects.len(), SIBLING_COUNT);
+        assert_eq!(tables.file_system_objects.len(), SIBLING_COUNT);
+        assert_eq!(tables.paths.len(), SIBLING_COUNT);
+        assert_eq!(tables.inodes.len(), SIBLING_COUNT);
+        assert_eq!(tables.dentries.len(), SIBLING_COUNT);
+        assert_eq!(tables.dirfrags.len(), 1);
+
+        let first = sibling_object(0, "//bulk/file-0000//");
+        let first_path = path_record_for_object(&first);
+        assert_eq!(first_path.path, "bulk/file-0000");
+        let root_dirfrag_id = DfsDirFragmentId::new("root");
+        let root_key = (first_path.parent_inode_id.clone(), root_dirfrag_id.clone());
+        assert_eq!(
+            tables
+                .dirfrags
+                .get(&root_key)
+                .map(|dirfrag| dirfrag.entry_count),
+            Some(SIBLING_COUNT as u64)
+        );
+        assert!(tables.dentries.contains_key(&dentry_key(&first_path)));
+
+        let previous = tables
+            .objects
+            .get(&first.object_id)
+            .cloned()
+            .expect("first sibling is materialized");
+        apply_object_indexes(&mut tables, &first, Some(&previous));
+
+        assert_eq!(tables.objects.len(), SIBLING_COUNT);
+        assert_eq!(tables.dentries.len(), SIBLING_COUNT);
+        assert_eq!(
+            tables
+                .dirfrags
+                .get(&root_key)
+                .map(|dirfrag| dirfrag.entry_count),
+            Some(SIBLING_COUNT as u64)
+        );
+    }
+
+    #[test]
+    fn new_dentries_cross_from_root_to_bucket_at_split_boundary() {
+        let mut tables = DfsMetadataTables::default();
+        let first = sibling_object(1, "/split/first");
+        let first_path = path_record_for_object(&first);
+        let root_dirfrag_id = DfsDirFragmentId::new("root");
+        let root_key = (first_path.parent_inode_id.clone(), root_dirfrag_id.clone());
+        let mut root_dirfrag = read_or_create_dirfrag(
+            &tables,
+            &first_path.file_system_id,
+            &first_path.parent_inode_id,
+            &root_dirfrag_id,
+            None,
+            false,
+        );
+        root_dirfrag.entry_count = DEFAULT_DIRFRAG_SPLIT_AFTER_COUNT - 1;
+        tables.dirfrags.insert(root_key.clone(), root_dirfrag);
+
+        apply_object_indexes(&mut tables, &first, None);
+        assert_eq!(
+            tables
+                .paths
+                .get(&(first.file_system_id.clone(), first_path.path.clone()))
+                .map(|path| path.dirfrag_id.clone()),
+            Some(root_dirfrag_id)
+        );
+        assert_eq!(
+            tables
+                .dirfrags
+                .get(&root_key)
+                .map(|dirfrag| dirfrag.entry_count),
+            Some(DEFAULT_DIRFRAG_SPLIT_AFTER_COUNT)
+        );
+
+        let second = sibling_object(2, "/split/second");
+        let second_path = path_record_for_object(&second);
+        let bucket_dirfrag_id = bucket_dirfrag_id(second_path.name_hash);
+        apply_object_indexes(&mut tables, &second, None);
+
+        assert_eq!(
+            tables
+                .paths
+                .get(&(second.file_system_id.clone(), second_path.path.clone()))
+                .map(|path| path.dirfrag_id.clone()),
+            Some(bucket_dirfrag_id.clone())
+        );
+        assert_eq!(
+            tables
+                .dirfrags
+                .get(&root_key)
+                .map(|dirfrag| dirfrag.entry_count),
+            Some(DEFAULT_DIRFRAG_SPLIT_AFTER_COUNT)
+        );
+        assert_eq!(
+            tables
+                .dirfrags
+                .get(&(second_path.parent_inode_id, bucket_dirfrag_id))
+                .map(|dirfrag| dirfrag.entry_count),
+            Some(1)
         );
     }
 }

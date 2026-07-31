@@ -7,9 +7,9 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Seek, SeekFrom};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
@@ -19,9 +19,9 @@ use time::OffsetDateTime;
 
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_io::{
-    create_dir_all, encode_sobj, metadata_durable_file_error, read_dir, read_sobj,
-    read_sobj_optional, read_sobj_tree, remove_file_if_exists, sync_dir, write_file_atomic,
-    write_sobj_atomic,
+    StagedFileReplacement, create_dir_all, encode_sobj, metadata_durable_file_error, read_dir,
+    read_sobj, read_sobj_optional, read_sobj_tree, remove_file_if_exists, stage_file_replacement,
+    sync_dir, write_file_atomic, write_sobj_atomic,
 };
 use crate::metadata_journal::segmented_journal_entry_at_sequence;
 use crate::metadata_keys::path_record_for_object;
@@ -43,6 +43,7 @@ use crate::{DfsFileSystem, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVer
 
 pub(crate) const LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 1;
 pub(crate) const METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 2;
+const METADATA_TABLE_SNAPSHOT_STAGE_STALE_AFTER: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MetadataTableFileGeneration {
@@ -60,6 +61,12 @@ pub(crate) struct MetadataTableStorageGeneration {
     active_log: Option<MetadataTableFileGeneration>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MetadataTableLiveBorrowKind {
+    Unchanged,
+    CheckpointRotation,
+}
+
 impl MetadataTableFileGeneration {
     fn is_same_file_as(&self, other: &Self) -> bool {
         if self.is_file != other.is_file {
@@ -69,6 +76,13 @@ impl MetadataTableFileGeneration {
             (Some(left), Some(right)) => left == right,
             _ => self == other,
         }
+    }
+
+    fn has_same_platform_identity_as(&self, other: &Self) -> bool {
+        matches!(
+            (&self.platform_identity, &other.platform_identity),
+            (Some(left), Some(right)) if left == right
+        )
     }
 }
 
@@ -90,16 +104,60 @@ impl MetadataTableStorageGeneration {
     /// The active log may have grown through writes performed by that same
     /// backend, so its file identity is stable while `table_log_offset` proves
     /// the exact materialized prefix represented by the live tables.
-    pub(crate) fn permits_live_table_borrow(&self, current: &Self, table_log_offset: u64) -> bool {
-        self.snapshot == current.snapshot
-            && self.checkpoint_log == current.checkpoint_log
+    pub(crate) fn live_table_borrow_kind(
+        &self,
+        current: &Self,
+        table_log_offset: u64,
+    ) -> Option<MetadataTableLiveBorrowKind> {
+        if self.snapshot != current.snapshot {
+            return None;
+        }
+        let unchanged_generation = self.checkpoint_log == current.checkpoint_log
             && match (&self.active_log, &current.active_log) {
                 (Some(loaded), Some(current)) => {
                     loaded.is_same_file_as(current) && current.len == table_log_offset
                 }
                 (None, None) => table_log_offset == 0,
                 _ => false,
-            }
+            };
+        if unchanged_generation {
+            return Some(MetadataTableLiveBorrowKind::Unchanged);
+        }
+
+        // A checkpoint worker atomically renames the active log to the
+        // checkpoint pathname, then publishes a new empty active log. The
+        // loaded backend's exact in-memory tables remain valid across that
+        // representation-only transition when the renamed file is precisely
+        // the prefix it materialized and no newer active suffix exists.
+        //
+        // File identity is load-bearing: equal length alone cannot distinguish
+        // a renamed generation from an unrelated replacement. Callers also
+        // sample and compare the complete storage generation before and after
+        // borrowing, so a concurrent suffix append or checkpoint replacement
+        // takes the stable owned-snapshot fallback.
+        let checkpoint_rotation = self.checkpoint_log.is_none()
+            && match (
+                &self.active_log,
+                &current.checkpoint_log,
+                &current.active_log,
+            ) {
+                (Some(loaded_active), Some(current_checkpoint), Some(current_active)) => {
+                    table_log_offset > 0
+                        && loaded_active.is_file
+                        && current_checkpoint.is_file
+                        && current_active.is_file
+                        && loaded_active.has_same_platform_identity_as(current_checkpoint)
+                        && current_checkpoint.len == table_log_offset
+                        && current_active.len == 0
+                }
+                _ => false,
+            };
+        checkpoint_rotation.then_some(MetadataTableLiveBorrowKind::CheckpointRotation)
+    }
+
+    pub(crate) fn permits_live_table_borrow(&self, current: &Self, table_log_offset: u64) -> bool {
+        self.live_table_borrow_kind(current, table_log_offset)
+            .is_some()
     }
 }
 
@@ -1064,6 +1122,7 @@ pub(crate) fn rotate_metadata_table_log_for_checkpoint_at_replay_boundary(
     Ok(true)
 }
 
+#[cfg(test)]
 pub(crate) fn install_encoded_metadata_table_snapshot(
     root: &Path,
     snapshot_bytes: &[u8],
@@ -1072,6 +1131,114 @@ pub(crate) fn install_encoded_metadata_table_snapshot(
     // normal read path may issue a verification receipt after checking the
     // embedded semantic fingerprint.
     write_file_atomic(&metadata_table_snapshot_path(root), snapshot_bytes)
+}
+
+/// A fully encoded and synced checkpoint snapshot that is not visible yet.
+///
+/// Callers stage this after folding the immutable checkpoint generation, then
+/// enter the shard writer critical section, revalidate the snapshot/checkpoint
+/// generation, and install it with [`install_staged_metadata_table_snapshot`].
+#[derive(Debug)]
+pub(crate) struct StagedMetadataTableSnapshot {
+    replacement: StagedFileReplacement,
+}
+
+pub(crate) fn stage_encoded_metadata_table_snapshot(
+    root: &Path,
+    checkpoint_sequence: u64,
+    snapshot_bytes: Vec<u8>,
+) -> Result<StagedMetadataTableSnapshot> {
+    let stale_before = SystemTime::now()
+        .checked_sub(METADATA_TABLE_SNAPSHOT_STAGE_STALE_AFTER)
+        .unwrap_or(UNIX_EPOCH);
+    if let Err(error) = remove_metadata_table_snapshot_stages_older_than(root, stale_before) {
+        tracing::warn!(
+            target: "sinomo.dfs",
+            root = %root.display(),
+            %error,
+            "could not remove stale unpublished metadata snapshot stages"
+        );
+    }
+    let replacement = stage_file_replacement(
+        &metadata_table_snapshot_path(root),
+        &snapshot_bytes,
+        &format!("checkpoint-{checkpoint_sequence}"),
+    )?;
+    // The large encoded Vec is intentionally consumed here. Only the synced
+    // staging file remains while the caller waits to reacquire the shard lock.
+    Ok(StagedMetadataTableSnapshot { replacement })
+}
+
+pub(crate) fn install_staged_metadata_table_snapshot(
+    staged: StagedMetadataTableSnapshot,
+) -> Result<()> {
+    staged.replacement.install()
+}
+
+#[cfg(test)]
+impl StagedMetadataTableSnapshot {
+    fn path(&self) -> &Path {
+        self.replacement.path()
+    }
+}
+
+fn remove_metadata_table_snapshot_stages_older_than(
+    root: &Path,
+    stale_before: SystemTime,
+) -> Result<usize> {
+    let snapshot_path = metadata_table_snapshot_path(root);
+    let parent = snapshot_path.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        return Ok(0);
+    }
+    let snapshot_name = snapshot_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("metadata");
+    let prefix = format!(".{snapshot_name}.checkpoint-");
+    let mut removed = 0_usize;
+    for entry in read_dir(parent)? {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || !name.ends_with(".stage") {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|source| MetadataBackendError::Io {
+                path: entry.path(),
+                source,
+            })?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|source| MetadataBackendError::Io {
+                path: entry.path(),
+                source,
+            })?;
+        if !metadata
+            .modified()
+            .ok()
+            .is_some_and(|modified| modified <= stale_before)
+        {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => removed = removed.saturating_add(1),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(MetadataBackendError::Io {
+                    path: entry.path(),
+                    source,
+                });
+            }
+        }
+    }
+    Ok(removed)
 }
 
 pub(crate) fn remove_metadata_table_checkpoint_log(root: &Path) -> Result<()> {
@@ -1324,6 +1491,40 @@ struct BorrowedMetadataTableSnapshot<'a> {
     prefix_proof: Option<&'a DfsMetadataPrefixProof>,
 }
 
+struct Blake3Writer {
+    hasher: blake3::Hasher,
+}
+
+impl Blake3Writer {
+    fn new() -> Self {
+        Self {
+            hasher: blake3::Hasher::new(),
+        }
+    }
+
+    fn finalize(self) -> blake3::Hash {
+        self.hasher.finalize()
+    }
+}
+
+impl Write for Blake3Writer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.hasher.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn streamed_json_blake3(value: &impl Serialize) -> Result<blake3::Hash> {
+    let mut writer = Blake3Writer::new();
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
+    Ok(writer.finalize())
+}
+
 impl Serialize for BorrowedMetadataTableSnapshot<'_> {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
@@ -1401,9 +1602,10 @@ pub(crate) fn encode_metadata_table_snapshot(
         prefix_proof: None,
         tables,
     };
-    let encoded = serde_json::to_vec(&semantic_snapshot)
-        .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
-    let semantic_state_fingerprint = format!("blake3:{}", blake3::hash(&encoded).to_hex());
+    let semantic_state_fingerprint = format!(
+        "blake3:{}",
+        streamed_json_blake3(&semantic_snapshot)?.to_hex()
+    );
     let snapshot = BorrowedMetadataTableSnapshot {
         format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
         materialized_through_sequence,
@@ -1885,6 +2087,105 @@ fn load_legacy_metadata_tables(root: &Path) -> Result<DfsMetadataTables> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_semantic_snapshot_fingerprint_preserves_historical_json_bytes() {
+        let tables = DfsMetadataTables::default();
+        let semantic_snapshot = BorrowedMetadataTableSnapshot {
+            format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+            materialized_through_sequence: Some(7),
+            tables: &tables,
+            semantic_state_fingerprint: None,
+            prefix_proof: None,
+        };
+        let historical_bytes =
+            serde_json::to_vec(&semantic_snapshot).expect("encode historical semantic JSON");
+        let streamed =
+            streamed_json_blake3(&semantic_snapshot).expect("stream semantic JSON fingerprint");
+        assert_eq!(streamed, blake3::hash(&historical_bytes));
+
+        let snapshot_bytes = encode_metadata_table_snapshot(&tables, Some(7), None)
+            .expect("encode snapshot with streamed fingerprint");
+        let snapshot: DfsMetadataTableSnapshot =
+            sinomo_object_serde::from_bytes(&snapshot_bytes).expect("decode encoded snapshot");
+        let expected = format!("blake3:{}", blake3::hash(&historical_bytes).to_hex());
+        assert_eq!(
+            snapshot.semantic_state_fingerprint.as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn staged_snapshot_is_invisible_until_atomic_install() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-table-staged-snapshot");
+        let tables = DfsMetadataTables::default();
+        persist_metadata_table_snapshot(root.path(), &tables, Some(1), None)
+            .expect("persist current snapshot");
+        let replacement = encode_metadata_table_snapshot(&tables, Some(2), None)
+            .expect("encode replacement snapshot");
+        let staged = stage_encoded_metadata_table_snapshot(root.path(), 2, replacement)
+            .expect("stage replacement snapshot");
+        assert!(staged.path().is_file());
+        assert_eq!(
+            read_metadata_table_state_lenient(root.path())
+                .expect("read before install")
+                .materialized_through_sequence,
+            Some(1)
+        );
+
+        install_staged_metadata_table_snapshot(staged).expect("install staged snapshot");
+        assert_eq!(
+            read_metadata_table_state_lenient(root.path())
+                .expect("read after install")
+                .materialized_through_sequence,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn stale_and_crash_orphan_snapshot_stages_never_replace_current_state() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-table-stale-snapshot-stage");
+        let tables = DfsMetadataTables::default();
+        persist_metadata_table_snapshot(root.path(), &tables, Some(1), None)
+            .expect("persist current snapshot");
+        let stale_bytes =
+            encode_metadata_table_snapshot(&tables, Some(2), None).expect("encode stale snapshot");
+        let stale = stage_encoded_metadata_table_snapshot(root.path(), 2, stale_bytes.clone())
+            .expect("stage stale snapshot");
+        let stale_path = stale.path().to_path_buf();
+
+        let current_bytes =
+            encode_metadata_table_snapshot(&tables, Some(3), None).expect("encode newer snapshot");
+        install_encoded_metadata_table_snapshot(root.path(), &current_bytes)
+            .expect("install newer snapshot");
+        drop(stale);
+        assert!(
+            !stale_path.exists(),
+            "discarded stale stage must be cleaned"
+        );
+
+        let orphan = stage_encoded_metadata_table_snapshot(root.path(), 4, stale_bytes)
+            .expect("stage crash orphan");
+        let orphan_path = orphan.path().to_path_buf();
+        std::mem::forget(orphan);
+        assert!(orphan_path.is_file());
+        assert_eq!(
+            read_metadata_table_state_lenient(root.path())
+                .expect("restart-style read with orphan stage")
+                .materialized_through_sequence,
+            Some(3),
+            "loaders must ignore an unpublished stage left by a crash"
+        );
+        assert_eq!(
+            remove_metadata_table_snapshot_stages_older_than(
+                root.path(),
+                SystemTime::now() + Duration::from_secs(1),
+            )
+            .expect("reap crash orphan"),
+            1
+        );
+        assert!(!orphan_path.exists());
+    }
 
     #[test]
     fn table_state_read_restarts_when_checkpoint_generation_is_retired_before_open() {

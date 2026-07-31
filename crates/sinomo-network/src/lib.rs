@@ -297,7 +297,7 @@ pub use rpc::{
 };
 pub use rpc_body::{
     ObjectRpcBodyChunk, ObjectRpcBodySource, ObjectRpcCall, ObjectRpcIncomingBody,
-    ObjectRpcIncomingRequest, ObjectRpcOutgoingResponse, ObjectRpcResult,
+    ObjectRpcIncomingRequest, ObjectRpcOutgoingResponse, ObjectRpcReplayableCall, ObjectRpcResult,
 };
 pub use rpc_future::ClusterMembershipRpcFuture;
 pub use service_rpc_stream::{serve_service_rpc_peer_stream, serve_service_rpc_stream};

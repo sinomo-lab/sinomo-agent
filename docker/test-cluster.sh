@@ -140,6 +140,7 @@
 #   SINOMO_TEST_HOST_TIMEOUT_GRACE          host cleanup grace beyond the container timeout (default 5)
 #   SINOMO_TEST_NETWORK_PARTITION_SECONDS   seconds to keep node6 disconnected in network-heal leg (default 5)
 #   SINOMO_TEST_NETWORK_ONLY=1              stop after network/KV baselines and DFS readiness/mutation/convergence gates
+#   SINOMO_TEST_DFS_READY_ONLY=1            stop after initial DFS readiness/mutation/convergence gates
 #   SINOMO_TEST_CLUSTER_KV_ONLY=1           run only the stabilized cluster-KV benchmark suite
 #   SINOMO_TEST_PJDFSTEST_ONLY=1            run only the external pjdfstest mounted-filesystem lane
 #   SINOMO_TEST_FORMATION_ONLY=1            stop after the ten-second formation gate and optional captures
@@ -181,6 +182,7 @@ FORMATION_WAIT=10
 FORMATION_POLL_MILLIS=100
 FORMATION_OBSERVE="${SINOMO_TEST_FORMATION_OBSERVE:-0}"
 FORMATION_ONLY="${SINOMO_TEST_FORMATION_ONLY:-0}"
+DFS_READY_ONLY="${SINOMO_TEST_DFS_READY_ONLY:-0}"
 CLUSTER_KV_ONLY="${SINOMO_TEST_CLUSTER_KV_ONLY:-0}"
 PJDFSTEST_ONLY="${SINOMO_TEST_PJDFSTEST_ONLY:-0}"
 PJDFSTEST_PROFILE="${SINOMO_PJDFSTEST_PROFILE:-full}"
@@ -479,6 +481,21 @@ validate_formation_observation_config() {
       return 1
       ;;
   esac
+  case "$DFS_READY_ONLY" in
+    0|1) ;;
+    *)
+      log "SINOMO_TEST_DFS_READY_ONLY must be 0 or 1, got: $DFS_READY_ONLY"
+      return 1
+      ;;
+  esac
+  if [ "$DFS_READY_ONLY" = 1 ] \
+    && { [ "$FORMATION_ONLY" = 1 ] \
+      || [ "$CLUSTER_KV_ONLY" = 1 ] \
+      || [ "$PJDFSTEST_ONLY" = 1 ] \
+      || [ "${SINOMO_TEST_NETWORK_ONLY:-0}" = 1 ]; }; then
+    log "SINOMO_TEST_DFS_READY_ONLY is mutually exclusive with formation-only, cluster-KV-only, pjdfstest-only, and network-only lanes"
+    return 1
+  fi
   case "$FORMATION_OBSERVE" in
     0) return 0 ;;
     1) ;;
@@ -3901,6 +3918,10 @@ fi
 if ! wait_for_dfs_converged; then
   FAILED_SCENARIOS="pre-benchmark-dfs-post-daemon-mutation-convergence"
   exit 1
+fi
+if [ "$DFS_READY_ONLY" = 1 ]; then
+  log "RESULT: PASS — DFS readiness, daemon mutation, and convergence gates green (probe reports in $ARTIFACTS)"
+  exit 0
 fi
 
 if [ "$PJDFSTEST_ONLY" = 1 ]; then

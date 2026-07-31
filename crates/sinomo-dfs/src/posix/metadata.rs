@@ -1015,7 +1015,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(count)
     }
 
-    pub(super) fn object_by_id(
+    pub(crate) fn object_by_id(
         &self,
         object_id: &DfsObjectId,
     ) -> Result<Option<DfsObjectMetadata>> {

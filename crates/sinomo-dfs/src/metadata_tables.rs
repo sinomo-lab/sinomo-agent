@@ -4,6 +4,8 @@
 //! table maps, secondary indexes, and rollback bookkeeping used while
 //! materializing journal entries.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::sync::Arc;
@@ -35,6 +37,42 @@ use crate::metadata_records::{
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
 };
+
+#[cfg(test)]
+thread_local! {
+    static NAMESPACE_COMMIT_ROLLBACK_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
+    static NAMESPACE_COMMIT_DIRECT_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
+    static NAMESPACE_PREPARE_ROLLBACK_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
+    static NAMESPACE_PREPARE_POST_APPEND_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_namespace_commit_materialization_counters() {
+    NAMESPACE_COMMIT_ROLLBACK_MATERIALIZATIONS.set(0);
+    NAMESPACE_COMMIT_DIRECT_MATERIALIZATIONS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn namespace_commit_materialization_counters() -> (usize, usize) {
+    (
+        NAMESPACE_COMMIT_ROLLBACK_MATERIALIZATIONS.get(),
+        NAMESPACE_COMMIT_DIRECT_MATERIALIZATIONS.get(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn reset_namespace_prepare_materialization_counters() {
+    NAMESPACE_PREPARE_ROLLBACK_MATERIALIZATIONS.set(0);
+    NAMESPACE_PREPARE_POST_APPEND_MATERIALIZATIONS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn namespace_prepare_materialization_counters() -> (usize, usize) {
+    (
+        NAMESPACE_PREPARE_ROLLBACK_MATERIALIZATIONS.get(),
+        NAMESPACE_PREPARE_POST_APPEND_MATERIALIZATIONS.get(),
+    )
+}
 
 fn completed_namespace_request_outcome_matches(
     left: &DfsNamespaceRequestRecord,
@@ -299,6 +337,14 @@ impl DfsMetadataTables {
                 owner_epoch,
             ),
             op => {
+                #[cfg(test)]
+                if matches!(&op, DfsMetadataTableOp::PutNamespacePrepare { .. }) {
+                    NAMESPACE_PREPARE_POST_APPEND_MATERIALIZATIONS.set(
+                        NAMESPACE_PREPARE_POST_APPEND_MATERIALIZATIONS
+                            .get()
+                            .saturating_add(1),
+                    );
+                }
                 self.apply(op);
                 Ok(())
             }
@@ -357,6 +403,12 @@ impl DfsMetadataTables {
             self.apply_with_rollback(op, rollback);
             return Ok(());
         };
+        #[cfg(test)]
+        NAMESPACE_COMMIT_ROLLBACK_MATERIALIZATIONS.set(
+            NAMESPACE_COMMIT_ROLLBACK_MATERIALIZATIONS
+                .get()
+                .saturating_add(1),
+        );
         let mut prepare =
             self.committed_namespace_prepare(&operation_id, &operation_digest, owner_epoch)?;
         for receipt in &prepare.content_receipts {
@@ -458,6 +510,12 @@ impl DfsMetadataTables {
         operation_digest: &str,
         owner_epoch: u64,
     ) -> Result<()> {
+        #[cfg(test)]
+        NAMESPACE_COMMIT_DIRECT_MATERIALIZATIONS.set(
+            NAMESPACE_COMMIT_DIRECT_MATERIALIZATIONS
+                .get()
+                .saturating_add(1),
+        );
         let mut prepare =
             self.committed_namespace_prepare(operation_id, operation_digest, owner_epoch)?;
         for receipt in &prepare.content_receipts {
@@ -1767,6 +1825,12 @@ impl DfsMetadataTableRollback {
                 }
             }
             DfsMetadataTableOp::PutNamespacePrepare { prepare } => {
+                #[cfg(test)]
+                NAMESPACE_PREPARE_ROLLBACK_MATERIALIZATIONS.set(
+                    NAMESPACE_PREPARE_ROLLBACK_MATERIALIZATIONS
+                        .get()
+                        .saturating_add(1),
+                );
                 record_rollback_value(
                     &mut self.namespace_prepares,
                     &tables.namespace_prepares,

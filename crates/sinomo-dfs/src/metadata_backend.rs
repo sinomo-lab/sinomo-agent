@@ -21,7 +21,7 @@ use crate::content_root_catalog::{
 use crate::control_plane::{DfsMetadataNamespacePrepareCodec, DfsMetadataShardConfig};
 use crate::metadata_api::{
     DfsMetadataBackend, DfsMetadataReplicaIngestPermit, DfsMetadataShardWriteFreeze,
-    namespace_prepare_expectations_from_lookups,
+    DfsNamespaceRequestAdmissionSnapshot, namespace_prepare_expectations_from_lookups,
 };
 use crate::metadata_cursor;
 use crate::metadata_error::{MetadataBackendError, Result};
@@ -181,7 +181,9 @@ struct MetadataRecoveryPassTimings {
 struct PlannedWrittenJournalTableOps {
     applied: usize,
     last_materialized_sequence: u64,
+    journal_reference_replay_cost_bytes: u64,
     table_ops: Vec<DfsMetadataTableOp>,
+    post_append_ops: Vec<DfsMetadataTableOp>,
     rollback: DfsMetadataTableRollback,
 }
 
@@ -1412,6 +1414,15 @@ fn validate_namespace_prepare_expectations(
             .get(&expected.object_id)
             .map(|object| object.version.clone());
         if current != expected.expected_version {
+            if let (Some(expected_version), Some(current_version)) =
+                (&expected.expected_version, &current)
+            {
+                return Err(MetadataBackendError::Conflict {
+                    object_id: expected.object_id.clone(),
+                    expected: expected_version.clone(),
+                    current: current_version.clone(),
+                });
+            }
             return Err(MetadataBackendError::Serde(format!(
                 "namespace prepare {} object {} version expectation changed: expected {:?}, current {:?}",
                 prepare.operation_id, expected.object_id, expected.expected_version, current
@@ -2731,11 +2742,15 @@ impl LocalSobjMetadataBackend {
         }
 
         let mut table_ops = Vec::new();
+        let mut post_append_ops = Vec::new();
         let mut rollback = DfsMetadataTableRollback::default();
+        let mut journal_reference_replay_cost_bytes = 0;
         let (applied, table_sequence) = match self.plan_replayed_journal_entries_into_batch(
             replay_entries.iter().copied(),
             &mut table_ops,
+            &mut post_append_ops,
             &mut rollback,
+            &mut journal_reference_replay_cost_bytes,
         ) {
             Ok(result) => result,
             Err(error) => {
@@ -2744,7 +2759,15 @@ impl LocalSobjMetadataBackend {
             }
         };
         let previous_prefix_proof = self.prefix_proof.replace(candidate_prefix_proof);
-        if let Err(error) = self.append_preapplied_table_ops(table_sequence, table_ops, rollback) {
+        if let Err(error) = self
+            .append_preapplied_table_ops_with_journal_reference_replay_cost_and_post_append_ops(
+                table_sequence,
+                table_ops,
+                post_append_ops,
+                journal_reference_replay_cost_bytes,
+                rollback,
+            )
+        {
             self.prefix_proof = previous_prefix_proof;
             return Err(error);
         }
@@ -3104,11 +3127,16 @@ impl LocalSobjMetadataBackend {
         entry: &DfsMetadataJournalEntry,
     ) -> Result<bool> {
         let mut table_ops = Vec::new();
+        let mut post_append_ops = Vec::new();
         let mut rollback = DfsMetadataTableRollback::default();
+        let mut journal_reference_replay_cost_bytes = 0;
         let changed = match self.materialize_replayed_journal_entry_into_batch(
             entry,
             &mut table_ops,
+            &mut post_append_ops,
             &mut rollback,
+            &mut journal_reference_replay_cost_bytes,
+            true,
         ) {
             Ok(changed) => changed,
             Err(error) => {
@@ -3119,7 +3147,13 @@ impl LocalSobjMetadataBackend {
         if !changed {
             return Ok(false);
         }
-        self.append_preapplied_table_ops(entry.sequence, table_ops, rollback)?;
+        self.append_preapplied_table_ops_with_journal_reference_replay_cost_and_post_append_ops(
+            entry.sequence,
+            table_ops,
+            post_append_ops,
+            journal_reference_replay_cost_bytes,
+            rollback,
+        )?;
         Ok(true)
     }
 
@@ -3127,13 +3161,24 @@ impl LocalSobjMetadataBackend {
         &mut self,
         entries: impl IntoIterator<Item = &'a DfsMetadataJournalEntry>,
         table_ops: &mut Vec<DfsMetadataTableOp>,
+        post_append_ops: &mut Vec<DfsMetadataTableOp>,
         rollback: &mut DfsMetadataTableRollback,
+        journal_reference_replay_cost_bytes: &mut u64,
     ) -> Result<(usize, u64)> {
+        let entries = entries.into_iter().collect::<Vec<_>>();
         let mut changed_count = 0usize;
         let mut last_materialized_sequence = 0u64;
-        for entry in entries {
+        let entry_count = entries.len();
+        for (index, entry) in entries.into_iter().enumerate() {
             last_materialized_sequence = entry.sequence;
-            if self.materialize_replayed_journal_entry_into_batch(entry, table_ops, rollback)? {
+            if self.materialize_replayed_journal_entry_into_batch(
+                entry,
+                table_ops,
+                post_append_ops,
+                rollback,
+                journal_reference_replay_cost_bytes,
+                index.saturating_add(1) == entry_count,
+            )? {
                 changed_count = changed_count.saturating_add(1);
             }
         }
@@ -3145,10 +3190,17 @@ impl LocalSobjMetadataBackend {
         entries: &[DfsMetadataJournalEntry],
     ) -> Result<PlannedWrittenJournalTableOps> {
         let mut table_ops = Vec::new();
+        let mut post_append_ops = Vec::new();
         let mut rollback = DfsMetadataTableRollback::default();
+        let mut journal_reference_replay_cost_bytes = 0;
         let (applied, last_materialized_sequence) = match self
-            .plan_replayed_journal_entries_into_batch(entries, &mut table_ops, &mut rollback)
-        {
+            .plan_replayed_journal_entries_into_batch(
+                entries,
+                &mut table_ops,
+                &mut post_append_ops,
+                &mut rollback,
+                &mut journal_reference_replay_cost_bytes,
+            ) {
             Ok(result) => result,
             Err(error) => {
                 rollback.rollback(&mut self.tables);
@@ -3158,7 +3210,9 @@ impl LocalSobjMetadataBackend {
         Ok(PlannedWrittenJournalTableOps {
             applied,
             last_materialized_sequence,
+            journal_reference_replay_cost_bytes,
             table_ops,
+            post_append_ops,
             rollback,
         })
     }
@@ -3169,11 +3223,13 @@ impl LocalSobjMetadataBackend {
     ) -> Result<usize> {
         let planned = self.plan_written_journal_entries_table_ops(entries)?;
         let applied = planned.applied;
-        self.append_preapplied_table_ops_for_written_entries(
+        self.append_preapplied_table_ops_for_written_entries_with_journal_reference_replay_cost(
             entries,
             planned.last_materialized_sequence,
             planned.table_ops,
+            planned.post_append_ops,
             planned.rollback,
+            planned.journal_reference_replay_cost_bytes,
         )?;
         Ok(applied)
     }
@@ -3185,7 +3241,32 @@ impl LocalSobjMetadataBackend {
         table_ops: Vec<DfsMetadataTableOp>,
         rollback: DfsMetadataTableRollback,
     ) -> Result<()> {
-        self.append_preapplied_table_ops(table_sequence, table_ops, rollback)?;
+        self.append_preapplied_table_ops_for_written_entries_with_journal_reference_replay_cost(
+            entries,
+            table_sequence,
+            table_ops,
+            Vec::new(),
+            rollback,
+            0,
+        )
+    }
+
+    fn append_preapplied_table_ops_for_written_entries_with_journal_reference_replay_cost(
+        &mut self,
+        entries: &[DfsMetadataJournalEntry],
+        table_sequence: u64,
+        table_ops: Vec<DfsMetadataTableOp>,
+        post_append_ops: Vec<DfsMetadataTableOp>,
+        rollback: DfsMetadataTableRollback,
+        journal_reference_replay_cost_bytes: u64,
+    ) -> Result<()> {
+        self.append_preapplied_table_ops_with_journal_reference_replay_cost_and_post_append_ops(
+            table_sequence,
+            table_ops,
+            post_append_ops,
+            journal_reference_replay_cost_bytes,
+            rollback,
+        )?;
         if let Some(last_sequence) = entries.last().map(|entry| entry.sequence) {
             self.checkpoint_local_materialization_cursor_if_due(last_sequence)?;
         }
@@ -3196,7 +3277,10 @@ impl LocalSobjMetadataBackend {
         &mut self,
         entry: &DfsMetadataJournalEntry,
         table_ops: &mut Vec<DfsMetadataTableOp>,
+        post_append_ops: &mut Vec<DfsMetadataTableOp>,
         rollback: &mut DfsMetadataTableRollback,
+        journal_reference_replay_cost_bytes: &mut u64,
+        defer_trailing_resolved_op: bool,
     ) -> Result<bool> {
         match &entry.mutation {
             DfsMetadataMutation::PutFileSystem {
@@ -3901,16 +3985,33 @@ impl LocalSobjMetadataBackend {
                     return Ok(false);
                 }
                 let prepare_reference = namespace_prepare_journal_reference(entry, &prepare)?;
+                let defer_resolved_prepare = defer_trailing_resolved_op
+                    && matches!(status, DfsNamespacePrepareStatus::Prepared)
+                    && matches!(
+                        ops.last(),
+                        Some(DfsMetadataTableOp::PutNamespacePrepare { .. })
+                    );
                 let mut persisted_prepare_reference = false;
                 for op in ops {
                     if matches!(&op, DfsMetadataTableOp::PutNamespacePrepare { .. }) {
-                        self.plan_preapplied_table_op(op, table_ops, rollback);
-                        let persisted = table_ops.last_mut().ok_or_else(|| {
-                            MetadataBackendError::Serde(format!(
-                                "journal namespace prepare {operation_id} did not append its preapplied table operation"
-                            ))
-                        })?;
-                        *persisted = prepare_reference.clone();
+                        if defer_resolved_prepare {
+                            if !post_append_ops.is_empty() {
+                                return Err(MetadataBackendError::Serde(
+                                    "metadata journal batch cannot defer more than one resolved namespace operation"
+                                        .to_string(),
+                                ));
+                            }
+                            table_ops.push(prepare_reference.clone());
+                            post_append_ops.push(op);
+                        } else {
+                            self.plan_preapplied_table_op(op, table_ops, rollback);
+                            let persisted = table_ops.last_mut().ok_or_else(|| {
+                                MetadataBackendError::Serde(format!(
+                                    "journal namespace prepare {operation_id} did not append its preapplied table operation"
+                                ))
+                            })?;
+                            *persisted = prepare_reference.clone();
+                        }
                         persisted_prepare_reference = true;
                     } else if matches!(&op, DfsMetadataTableOp::CommitNamespacePrepare { .. }) {
                         self.tables
@@ -3925,6 +4026,10 @@ impl LocalSobjMetadataBackend {
                         "journal namespace prepare {operation_id} did not materialize a journal-referenced prepare"
                     )));
                 }
+                *journal_reference_replay_cost_bytes = journal_reference_replay_cost_bytes
+                    .saturating_add(metadata_table_apply::namespace_prepare_replay_cost_bytes(
+                        &prepare,
+                    ));
                 Ok(true)
             }
             DfsMetadataMutation::CommitNamespacePrepare {
@@ -3946,8 +4051,22 @@ impl LocalSobjMetadataBackend {
                 if ops.is_empty() {
                     return Ok(false);
                 }
+                let defer_compact_marker = defer_trailing_resolved_op
+                    && ops.len() == 1
+                    && matches!(
+                        ops.first(),
+                        Some(DfsMetadataTableOp::CommitNamespacePrepare { .. })
+                    );
                 for op in ops {
-                    if matches!(op, DfsMetadataTableOp::CommitNamespacePrepare { .. }) {
+                    if defer_compact_marker {
+                        if !post_append_ops.is_empty() {
+                            return Err(MetadataBackendError::Serde(format!(
+                                "metadata journal batch cannot defer more than one compact namespace commit"
+                            )));
+                        }
+                        table_ops.push(op.clone());
+                        post_append_ops.push(op);
+                    } else if matches!(op, DfsMetadataTableOp::CommitNamespacePrepare { .. }) {
                         self.tables
                             .apply_checked_with_rollback(op.clone(), rollback)?;
                         table_ops.push(op);
@@ -4405,6 +4524,7 @@ impl LocalSobjMetadataBackend {
         prepare: &DfsNamespacePrepareRecord,
         apply_ops: Vec<DfsMetadataTableOp>,
     ) -> Result<DfsMetadataJournalEntry> {
+        let trace_started = Instant::now();
         let mutation = match self.namespace_prepare_codec {
             DfsMetadataNamespacePrepareCodec::Legacy => {
                 DfsMetadataMutation::put_namespace_prepare(prepare)
@@ -4418,16 +4538,42 @@ impl LocalSobjMetadataBackend {
                 })?
             }
         };
+        let pack_ms = trace_started.elapsed().as_millis();
+        let journal_started = Instant::now();
         let (entry, journal_record_bytes) =
             self.write_journal_unlocked_with_record_bytes(mutation)?;
+        let journal_ms = journal_started.elapsed().as_millis();
+        let persisted_started = Instant::now();
+        let apply_op_count = apply_ops.len();
         let persisted_ops = namespace_prepare_persisted_table_ops(&entry, &apply_ops)?;
+        let persisted_ms = persisted_started.elapsed().as_millis();
+        let table_started = Instant::now();
         self.append_and_apply_table_ops_with_persisted_ops(
             entry.sequence,
             persisted_ops,
             apply_ops,
             journal_record_bytes,
         )?;
+        let table_ms = table_started.elapsed().as_millis();
+        let checkpoint_started = Instant::now();
         self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
+        let checkpoint_ms = checkpoint_started.elapsed().as_millis();
+        metadata_backend_perf_trace(format_args!(
+            "metadata-write-namespace-prepare shard={} operation={} objects={} versions={} receipts={} apply_ops={} journal_bytes={} pack_ms={} journal_ms={} persisted_ms={} table_ms={} checkpoint_ms={} total_ms={}",
+            self.shard_id.0,
+            prepare.operation_id,
+            prepare.transaction.objects.len(),
+            prepare.transaction.versions.len(),
+            prepare.content_receipts.len(),
+            apply_op_count,
+            journal_record_bytes,
+            pack_ms,
+            journal_ms,
+            persisted_ms,
+            table_ms,
+            checkpoint_ms,
+            trace_started.elapsed().as_millis()
+        ));
         Ok(entry)
     }
 
@@ -5396,6 +5542,66 @@ impl LocalSobjMetadataBackend {
         )
     }
 
+    fn append_preapplied_table_ops_with_journal_reference_replay_cost(
+        &mut self,
+        sequence: u64,
+        ops: Vec<DfsMetadataTableOp>,
+        journal_reference_replay_cost_bytes: u64,
+        rollback: DfsMetadataTableRollback,
+    ) -> Result<()> {
+        if journal_reference_replay_cost_bytes == 0 {
+            return self.append_preapplied_table_ops(sequence, ops, rollback);
+        }
+        let root = self.root.clone();
+        metadata_table_apply::append_preapplied_table_ops_with_journal_reference_replay_cost(
+            &root,
+            self.table_materialization_state(),
+            sequence,
+            ops,
+            journal_reference_replay_cost_bytes,
+            DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES,
+            rollback,
+        )
+    }
+
+    fn append_preapplied_table_ops_with_journal_reference_replay_cost_and_post_append_ops(
+        &mut self,
+        sequence: u64,
+        ops: Vec<DfsMetadataTableOp>,
+        mut post_append_ops: Vec<DfsMetadataTableOp>,
+        journal_reference_replay_cost_bytes: u64,
+        rollback: DfsMetadataTableRollback,
+    ) -> Result<()> {
+        if post_append_ops.is_empty() {
+            return self.append_preapplied_table_ops_with_journal_reference_replay_cost(
+                sequence,
+                ops,
+                journal_reference_replay_cost_bytes,
+                rollback,
+            );
+        }
+        if post_append_ops.len() != 1 {
+            rollback.rollback(&mut self.tables);
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata table batch {sequence} cannot defer more than one post-append operation"
+            )));
+        }
+        let trailing_apply_op = post_append_ops
+            .pop()
+            .expect("one post-append operation checked above");
+        let root = self.root.clone();
+        metadata_table_apply::append_preapplied_table_ops_then_apply_trailing_resolved_op(
+            &root,
+            self.table_materialization_state(),
+            sequence,
+            ops,
+            trailing_apply_op,
+            journal_reference_replay_cost_bytes,
+            DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES,
+            rollback,
+        )
+    }
+
     fn compact_metadata_table_log_if_needed(&mut self, max_log_bytes: u64) -> Result<()> {
         let root = self.root.clone();
         metadata_table_apply::compact_metadata_table_log_if_needed(
@@ -5421,6 +5627,37 @@ impl LocalSobjMetadataBackend {
 
     fn refresh_metadata_tables(&mut self) -> Result<()> {
         if self.replica_repair_only {
+            return Ok(());
+        }
+        let current_storage_generation = metadata_table_storage_generation(&self.root)?;
+        let live_borrow_kind = self.table_storage_generation.as_ref().and_then(|loaded| {
+            loaded.live_table_borrow_kind(&current_storage_generation, self.table_log_offset)
+        });
+        if let Some(live_borrow_kind) = live_borrow_kind
+            && self.prefix_proof.as_ref().is_some_and(|proof| {
+                proof.is_well_formed()
+                    && proof.journal_sequence == self.materialized_through_sequence
+            })
+        {
+            // A checkpoint worker may have atomically renamed the exact active
+            // log represented by these live tables into the immutable
+            // checkpoint pathname. The storage-generation proof above binds
+            // that rename by file identity and exact length. Re-adopt the new
+            // representation instead of decoding the rotated log (and every
+            // large namespace-prepare reference in it) before the next write.
+            if live_borrow_kind
+                == crate::metadata_table_store::MetadataTableLiveBorrowKind::CheckpointRotation
+            {
+                // The represented prefix now lives in the immutable checkpoint
+                // log, while the current active log is proven empty. Rebase all
+                // active-suffix accounting before the next append; retaining
+                // the pre-rotation offset or replay pressure would double-count
+                // the checkpoint body and immediately schedule another fold.
+                self.table_log_offset = 0;
+                self.table_log_journal_reference_replay_cost_bytes = 0;
+                self.table_log_unpriced_namespace_prepare_references = 0;
+            }
+            self.table_storage_generation = Some(current_storage_generation);
             return Ok(());
         }
         metadata_read_snapshot::refresh_metadata_tables(
@@ -7983,14 +8220,19 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         &mut self,
         prepare: &DfsNamespacePrepareRecord,
     ) -> Result<DfsMetadataJournalEntry> {
+        let trace_started = Instant::now();
+        let lock_started = Instant::now();
         let _lock = self.begin_metadata_write()?;
+        let lock_ms = lock_started.elapsed().as_millis();
         if prepare.status != DfsNamespacePrepareStatus::Prepared {
             return Err(MetadataBackendError::Serde(format!(
                 "namespace prepare {} must enter with prepared status",
                 prepare.operation_id
             )));
         }
+        let normalize_started = Instant::now();
         let prepare = normalized_namespace_prepare(prepare);
+        let normalize_ms = normalize_started.elapsed().as_millis();
         if let Some(receipt) = self
             .tables
             .namespace_prepare_receipts
@@ -8047,6 +8289,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 }],
             );
         }
+        let plan_started = Instant::now();
         let mut table_ops =
             namespace_prepare_table_ops_for_record(&self.tables, &self.shard_id, &prepare)?;
         if table_ops.is_empty() {
@@ -8054,7 +8297,24 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 prepare: prepare.clone(),
             });
         }
-        self.write_namespace_prepare_and_materialize_unlocked(&prepare, table_ops)
+        let plan_ms = plan_started.elapsed().as_millis();
+        let write_started = Instant::now();
+        let entry = self.write_namespace_prepare_and_materialize_unlocked(&prepare, table_ops)?;
+        let write_ms = write_started.elapsed().as_millis();
+        metadata_backend_perf_trace(format_args!(
+            "metadata-prepare-namespace-transaction shard={} operation={} objects={} versions={} receipts={} lock_ms={} normalize_ms={} plan_ms={} write_ms={} total_ms={}",
+            self.shard_id.0,
+            prepare.operation_id,
+            prepare.transaction.objects.len(),
+            prepare.transaction.versions.len(),
+            prepare.content_receipts.len(),
+            lock_ms,
+            normalize_ms,
+            plan_ms,
+            write_ms,
+            trace_started.elapsed().as_millis()
+        ));
+        Ok(entry)
     }
 
     fn rebind_prepared_namespace_transaction(
@@ -8138,7 +8398,11 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         expected_operation_digest: &str,
         expected_owner_epoch: u64,
     ) -> Result<DfsMetadataJournalEntry> {
+        let trace_started = Instant::now();
+        let lock_started = Instant::now();
         let _lock = self.begin_metadata_write()?;
+        let lock_ms = lock_started.elapsed().as_millis();
+        let lookup_started = Instant::now();
         if let Some(receipt) = self
             .tables
             .namespace_prepare_receipts
@@ -8178,6 +8442,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                     ))
                 }
             })?;
+        let lookup_ms = lookup_started.elapsed().as_millis();
         if prepare.operation_digest != expected_operation_digest
             || prepare.owner_epoch != expected_owner_epoch
         {
@@ -8199,19 +8464,30 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             // that exact prepared body instead of encoding every derived table
             // operation again. The journal remains the source of truth across
             // a table append failure or crash.
+            let shape_started = Instant::now();
             validate_namespace_prepare_shape(&self.tables, &self.shard_id, &prepare)?;
+            let shape_ms = shape_started.elapsed().as_millis();
+            let expectations_started = Instant::now();
             validate_namespace_prepare_expectations(&self.tables, &prepare)?;
+            let expectations_ms = expectations_started.elapsed().as_millis();
+            let overlap_started = Instant::now();
             validate_namespace_prepare_does_not_overlap(&self.tables, &prepare)?;
+            let overlap_ms = overlap_started.elapsed().as_millis();
+            let preconditions_started = Instant::now();
             validate_namespace_transaction_preconditions(&self.tables, &prepare.transaction)?;
+            let preconditions_ms = preconditions_started.elapsed().as_millis();
 
+            let journal_started = Instant::now();
             let entry = self
                 .write_journal_unlocked(DfsMetadataMutation::commit_namespace_prepare(&prepare))?;
+            let journal_ms = journal_started.elapsed().as_millis();
             // The preceding Prepared table record already owns the complete
             // transaction, receipt set, and routed-request evidence. Persist
             // one semantic commit marker, then expand it directly into the
             // in-memory indexes. This avoids encoding the same 4k-file batch
             // as tens of thousands of derived table operations while keeping
             // the authoritative journal and crash replay exact.
+            let table_started = Instant::now();
             self.append_and_apply_table_ops(
                 entry.sequence,
                 vec![DfsMetadataTableOp::CommitNamespacePrepare {
@@ -8220,7 +8496,28 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                     owner_epoch: prepare.owner_epoch,
                 }],
             )?;
+            let table_ms = table_started.elapsed().as_millis();
+            let checkpoint_started = Instant::now();
             self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
+            let checkpoint_ms = checkpoint_started.elapsed().as_millis();
+            metadata_backend_perf_trace(format_args!(
+                "metadata-commit-namespace-prepare shard={} operation={} objects={} versions={} receipts={} lock_ms={} lookup_ms={} shape_ms={} expectations_ms={} overlap_ms={} preconditions_ms={} journal_ms={} table_ms={} checkpoint_ms={} total_ms={}",
+                self.shard_id.0,
+                operation_id,
+                prepare.transaction.objects.len(),
+                prepare.transaction.versions.len(),
+                prepare.content_receipts.len(),
+                lock_ms,
+                lookup_ms,
+                shape_ms,
+                expectations_ms,
+                overlap_ms,
+                preconditions_ms,
+                journal_ms,
+                table_ms,
+                checkpoint_ms,
+                trace_started.elapsed().as_millis()
+            ));
             return Ok(entry);
         }
 
@@ -8653,6 +8950,59 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         Ok(tables.namespace_request_history_expired(requester_node_id, request_id))
     }
 
+    fn namespace_request_admission_snapshot(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        requester_node_id: &NodeId,
+        request_id: &str,
+    ) -> Result<DfsNamespaceRequestAdmissionSnapshot> {
+        if shard_id != &self.shard_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace request admission shard {} does not match backend shard {}",
+                shard_id.0, self.shard_id.0
+            )));
+        }
+        let tables = self.current_tables_snapshot()?;
+        let request_key = (requester_node_id.clone(), request_id.to_string());
+        let request = tables.namespace_requests.get(&request_key).cloned();
+        let receipt = tables.namespace_request_receipts.get(&request_key).cloned();
+        let prepared = match tables.namespace_prepare_request_owners.get(&request_key) {
+            None => None,
+            Some(operation_ids) if operation_ids.len() != 1 => {
+                return Err(MetadataBackendError::Serde(format!(
+                    "pending namespace request {requester_node_id}/{request_id} owns {} prepared transactions",
+                    operation_ids.len()
+                )));
+            }
+            Some(operation_ids) => {
+                let operation_id = operation_ids
+                    .first()
+                    .expect("non-empty request prepare owner index");
+                Some(
+                    tables
+                        .namespace_prepares
+                        .get(operation_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            MetadataBackendError::Serde(format!(
+                                "pending namespace request {requester_node_id}/{request_id} indexes missing prepare {operation_id}"
+                            ))
+                        })?,
+                )
+            }
+        };
+        let history_expired = request.is_none()
+            && receipt.is_none()
+            && prepared.is_none()
+            && tables.namespace_request_history_expired(requester_node_id, request_id);
+        Ok(DfsNamespaceRequestAdmissionSnapshot {
+            request,
+            receipt,
+            prepared,
+            history_expired,
+        })
+    }
+
     fn list_namespace_requests(&self) -> Result<Vec<DfsNamespaceRequestRecord>> {
         let tables = self.current_tables_snapshot()?;
         Ok(tables.namespace_requests.values().cloned().collect())
@@ -9062,7 +9412,12 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         shard_id: &DfsMetadataShardId,
         next_after_sequence: u64,
     ) -> Result<()> {
-        let _lock = self.begin_metadata_write_allow_frozen()?;
+        // Replica acknowledgement cursors are independent durable sidecars:
+        // they neither observe nor mutate the materialized metadata tables.
+        // Serialize their read-max-write update with other shard writers, but
+        // do not refresh/replay a potentially large rotated checkpoint merely
+        // to advance one monotonic cursor.
+        let _lock = self.metadata_write_lock()?;
         metadata_cursor::put_metadata_replication_cursor(
             &self.root,
             target_node_id,
@@ -9094,7 +9449,11 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         &mut self,
         floor: &DfsMetadataAuthorityAckFloor,
     ) -> Result<()> {
-        let _lock = self.begin_metadata_write_allow_frozen()?;
+        // This acknowledgement floor is a monotonic durable sidecar. The
+        // caller has already verified the exact prepared operation and prefix;
+        // persisting that evidence must not rebuild a rotated materialized
+        // table generation a second time.
+        let _lock = self.metadata_write_lock()?;
         metadata_cursor::put_metadata_authority_ack_floor(&self.root, floor)
     }
 
@@ -11172,6 +11531,7 @@ mod tests {
         let config = shard_config(&shard_id.0, DfsMetadataShardAssignment::Root);
         let mut replica = LocalShardedMetadataBackend::new(&replica_root, vec![config.clone()])
             .expect("sharded replica");
+        crate::metadata_tables::reset_namespace_commit_materialization_counters();
         replica
             .apply_journal_batch(&DfsMetadataJournalBatch {
                 shard_id: shard_id.clone(),
@@ -11179,6 +11539,11 @@ mod tests {
                 entries,
             })
             .expect("incremental sharded replica replay");
+        assert_eq!(
+            crate::metadata_tables::namespace_commit_materialization_counters(),
+            (0, 1),
+            "a trailing compact replica commit must materialize only after its table marker is durable"
+        );
         assert_eq!(
             replica
                 .get_object(&current.object_id)
@@ -11216,6 +11581,634 @@ mod tests {
                 .expect("reopened replica object"),
             Some(committed)
         );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn incremental_replica_replay_applies_commit_before_trailing_prepare() {
+        let root = temp_root("replica_commit_then_trailing_prepare");
+        let source_root = root.join("source");
+        let replica_root = root.join("replica");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+
+        let current_a = object(version("version_commit_then_prepare_a_1"));
+        let mut committed_a = current_a.clone();
+        committed_a.version = version("version_commit_then_prepare_a_2");
+        committed_a.mode = 0o600;
+        let prepare_a = namespace_prepare(
+            "operation-commit-then-prepare-a",
+            &shard_id.0,
+            &current_a,
+            committed_a.clone(),
+        );
+
+        let mut current_b = object(version("version_commit_then_prepare_b_1"));
+        current_b.object_id =
+            DfsObjectId::from_legacy_named("obj_commit_then_prepare_b").expect("object id");
+        current_b.path = "services/commit-then-prepare-b".to_string();
+        let mut prepared_b = current_b.clone();
+        prepared_b.version = version("version_commit_then_prepare_b_2");
+        prepared_b.mode = 0o640;
+        let prepare_b = namespace_prepare(
+            "operation-commit-then-prepare-b",
+            &shard_id.0,
+            &current_b,
+            prepared_b,
+        );
+
+        let mut source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &source_root).expect("source");
+        source.put_file_system(&file_system()).expect("filesystem");
+        source.put_object(&current_a).expect("current object a");
+        source.put_object(&current_b).expect("current object b");
+        source
+            .prepare_namespace_transaction(&prepare_a)
+            .expect("prepare transaction a");
+        source
+            .commit_prepared_namespace_transaction(
+                &prepare_a.operation_id,
+                &prepare_a.operation_digest,
+                prepare_a.owner_epoch,
+            )
+            .expect("commit transaction a");
+        source
+            .prepare_namespace_transaction(&prepare_b)
+            .expect("prepare transaction b");
+
+        let mut entries = source.journal_since(0).expect("source journal");
+        let tail = entries.split_off(entries.len().saturating_sub(2));
+        assert!(matches!(
+            tail[0].mutation,
+            DfsMetadataMutation::CommitNamespacePrepare { .. }
+        ));
+        assert!(matches!(
+            tail[1].mutation,
+            DfsMetadataMutation::PutNamespacePrepare { .. }
+        ));
+        let prefix_sequence = entries.last().expect("replica prefix").sequence;
+
+        let mut replica =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &replica_root).expect("replica");
+        replica
+            .apply_journal_batch(&DfsMetadataJournalBatch {
+                shard_id: shard_id.clone(),
+                next_after_sequence: prefix_sequence,
+                entries,
+            })
+            .expect("replicate dependency prefix");
+        let tail_sequence = tail.last().expect("replay tail").sequence;
+        replica
+            .apply_journal_batch(&DfsMetadataJournalBatch {
+                shard_id: shard_id.clone(),
+                next_after_sequence: tail_sequence,
+                entries: tail,
+            })
+            .expect("replay commit followed by trailing prepare");
+        assert_eq!(
+            replica.get_object(&current_a.object_id).expect("object a"),
+            Some(committed_a.clone())
+        );
+        assert_eq!(
+            replica
+                .get_namespace_prepare(&prepare_b.operation_id)
+                .expect("prepare b")
+                .map(|record| record.status),
+            Some(DfsNamespacePrepareStatus::Prepared)
+        );
+
+        drop(replica);
+        let replica =
+            LocalSobjMetadataBackend::new(shard_id, &replica_root).expect("reopened replica");
+        assert_eq!(
+            replica
+                .get_object(&current_a.object_id)
+                .expect("reopened object a"),
+            Some(committed_a)
+        );
+        assert_eq!(
+            replica
+                .get_namespace_prepare(&prepare_b.operation_id)
+                .expect("reopened prepare b")
+                .map(|record| record.status),
+            Some(DfsNamespacePrepareStatus::Prepared)
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn incremental_replica_replay_applies_commit_before_trailing_commit() {
+        let root = temp_root("replica_commit_then_trailing_commit");
+        let source_root = root.join("source");
+        let replica_root = root.join("replica");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+
+        let current_a = object(version("version_two_commits_a_1"));
+        let mut committed_a = current_a.clone();
+        committed_a.version = version("version_two_commits_a_2");
+        committed_a.mode = 0o600;
+        let prepare_a = namespace_prepare(
+            "operation-two-commits-a",
+            &shard_id.0,
+            &current_a,
+            committed_a.clone(),
+        );
+
+        let mut current_b = object(version("version_two_commits_b_1"));
+        current_b.object_id =
+            DfsObjectId::from_legacy_named("obj_two_commits_b").expect("object id");
+        current_b.path = "services/two-commits-b".to_string();
+        let mut committed_b = current_b.clone();
+        committed_b.version = version("version_two_commits_b_2");
+        committed_b.mode = 0o640;
+        let prepare_b = namespace_prepare(
+            "operation-two-commits-b",
+            &shard_id.0,
+            &current_b,
+            committed_b.clone(),
+        );
+
+        let mut source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &source_root).expect("source");
+        source.put_file_system(&file_system()).expect("filesystem");
+        source.put_object(&current_a).expect("current object a");
+        source.put_object(&current_b).expect("current object b");
+        source
+            .prepare_namespace_transaction(&prepare_a)
+            .expect("prepare transaction a");
+        source
+            .prepare_namespace_transaction(&prepare_b)
+            .expect("prepare transaction b");
+        source
+            .commit_prepared_namespace_transaction(
+                &prepare_a.operation_id,
+                &prepare_a.operation_digest,
+                prepare_a.owner_epoch,
+            )
+            .expect("commit transaction a");
+        source
+            .commit_prepared_namespace_transaction(
+                &prepare_b.operation_id,
+                &prepare_b.operation_digest,
+                prepare_b.owner_epoch,
+            )
+            .expect("commit transaction b");
+
+        let mut entries = source.journal_since(0).expect("source journal");
+        let tail = entries.split_off(entries.len().saturating_sub(2));
+        assert!(tail.iter().all(|entry| matches!(
+            entry.mutation,
+            DfsMetadataMutation::CommitNamespacePrepare { .. }
+        )));
+        let prefix_sequence = entries.last().expect("replica prefix").sequence;
+
+        let mut replica =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &replica_root).expect("replica");
+        replica
+            .apply_journal_batch(&DfsMetadataJournalBatch {
+                shard_id: shard_id.clone(),
+                next_after_sequence: prefix_sequence,
+                entries,
+            })
+            .expect("replicate dependency prefix");
+        let tail_sequence = tail.last().expect("replay tail").sequence;
+        replica
+            .apply_journal_batch(&DfsMetadataJournalBatch {
+                shard_id: shard_id.clone(),
+                next_after_sequence: tail_sequence,
+                entries: tail,
+            })
+            .expect("replay two compact commits");
+        assert_eq!(
+            replica.get_object(&current_a.object_id).expect("object a"),
+            Some(committed_a.clone())
+        );
+        assert_eq!(
+            replica.get_object(&current_b.object_id).expect("object b"),
+            Some(committed_b.clone())
+        );
+
+        drop(replica);
+        let replica =
+            LocalSobjMetadataBackend::new(shard_id, &replica_root).expect("reopened replica");
+        assert_eq!(
+            replica
+                .get_object(&current_a.object_id)
+                .expect("reopened object a"),
+            Some(committed_a)
+        );
+        assert_eq!(
+            replica
+                .get_object(&current_b.object_id)
+                .expect("reopened object b"),
+            Some(committed_b)
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn compact_namespace_commit_replica_table_append_failure_retries_without_rollback_materialization()
+     {
+        let root = temp_root("local_backend_compact_commit_replica_table_append_failure");
+        let source_root = root.join("source");
+        let replica_root = root.join("replica");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let current = object(version("version_compact_commit_append_failure_1"));
+        let mut committed = current.clone();
+        committed.version = version("version_compact_commit_append_failure_2");
+        committed.mode = 0o600;
+        let prepare = namespace_prepare(
+            "operation-compact-commit-append-failure",
+            &shard_id.0,
+            &current,
+            committed.clone(),
+        );
+
+        let mut source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &source_root).expect("source");
+        source.put_file_system(&file_system()).expect("filesystem");
+        source.put_object(&current).expect("current object");
+        source
+            .prepare_namespace_transaction(&prepare)
+            .expect("prepared transaction");
+        source
+            .commit_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect("compact commit");
+        let mut entries = source.journal_since(0).expect("source journal");
+        let commit_entry = entries.pop().expect("compact commit journal entry");
+        assert!(matches!(
+            commit_entry.mutation,
+            DfsMetadataMutation::CommitNamespacePrepare { .. }
+        ));
+        let prepared_sequence = entries.last().expect("prepared prefix").sequence;
+
+        let mut replica =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &replica_root).expect("replica");
+        replica
+            .apply_journal_batch(&DfsMetadataJournalBatch {
+                shard_id: shard_id.clone(),
+                next_after_sequence: prepared_sequence,
+                entries,
+            })
+            .expect("replicate prepared prefix");
+        replica
+            .persist_current_metadata_checkpoint_unlocked()
+            .expect("checkpoint prepared prefix before injected table failure");
+
+        let table_path = metadata_table_path(&replica_root);
+        let writable_permissions = fs::metadata(&table_path)
+            .expect("empty materialized table log metadata")
+            .permissions();
+        let mut readonly_permissions = writable_permissions.clone();
+        readonly_permissions.set_readonly(true);
+        fs::set_permissions(&table_path, readonly_permissions)
+            .expect("block compact commit table append");
+        crate::metadata_tables::reset_namespace_commit_materialization_counters();
+        let commit_batch = DfsMetadataJournalBatch {
+            shard_id: shard_id.clone(),
+            next_after_sequence: commit_entry.sequence,
+            entries: vec![commit_entry.clone()],
+        };
+        let error = replica
+            .apply_journal_batch(&commit_batch)
+            .expect_err("blocked table append must reject compact replica commit");
+        assert!(matches!(error, MetadataBackendError::Io { .. }));
+        assert_eq!(
+            crate::metadata_tables::namespace_commit_materialization_counters(),
+            (0, 0),
+            "a failed table append must not materialize or roll back the compact commit"
+        );
+        assert_eq!(
+            replica.tables.objects.get(&current.object_id),
+            Some(&current),
+            "the failed append must leave the preexisting object visible"
+        );
+        assert_eq!(
+            replica
+                .tables
+                .namespace_prepares
+                .get(&prepare.operation_id)
+                .map(|record| record.status.clone()),
+            Some(DfsNamespacePrepareStatus::Prepared),
+            "the failed append must leave the durable prepare uncommitted"
+        );
+        assert_eq!(
+            replica.materialized_through_sequence, prepared_sequence,
+            "a journal-only compact commit must not advance table materialization"
+        );
+        assert_eq!(
+            replica.journal_last_sequence(),
+            commit_entry.sequence,
+            "the authoritative replica journal remains durable for retry"
+        );
+
+        fs::set_permissions(&table_path, writable_permissions)
+            .expect("restore materialized table log permissions");
+        replica
+            .apply_journal_batch(&commit_batch)
+            .expect("same-instance compact commit retry");
+        assert_eq!(
+            crate::metadata_tables::namespace_commit_materialization_counters(),
+            (0, 1),
+            "the successful retry must use one post-append materialization"
+        );
+        assert_eq!(
+            replica
+                .get_object(&current.object_id)
+                .expect("visible object after compact commit retry"),
+            Some(committed.clone())
+        );
+
+        drop(replica);
+        let replica =
+            LocalSobjMetadataBackend::new(shard_id, &replica_root).expect("reopened replica");
+        assert_eq!(
+            replica
+                .get_object(&current.object_id)
+                .expect("reopened compact commit object"),
+            Some(committed)
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn large_prepare_only_replica_replay_materializes_after_table_append_without_rollback() {
+        const OBJECT_COUNT: usize = 1024;
+
+        let root = temp_root("large_prepare_only_post_append_replica_replay");
+        let source_root = root.join("source");
+        let replica_root = root.join("replica");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+
+        let mut source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &source_root).expect("source");
+        source.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV1);
+        source.put_file_system(&file_system()).expect("filesystem");
+        let initial_entries = source.journal_since(0).expect("initial source journal");
+        let initial_sequence = initial_entries
+            .last()
+            .expect("initial journal head")
+            .sequence;
+
+        let mut prepare = DfsNamespacePrepareRecord {
+            operation_id: "operation-large-prepare-only-replay".to_string(),
+            file_system_id: file_system_id(),
+            shard_id: shard_id.clone(),
+            owner_epoch: 7,
+            operation_digest: String::new(),
+            expected_object_versions: Vec::with_capacity(OBJECT_COUNT),
+            expected_path_occupants: Vec::with_capacity(OBJECT_COUNT),
+            content_receipts: Vec::new(),
+            transaction: DfsNamespaceTransaction {
+                transaction_id: "transaction:large-prepare-only-replay".to_string(),
+                file_system_id: file_system_id(),
+                objects: Vec::with_capacity(OBJECT_COUNT),
+                versions: Vec::new(),
+                advisory_lock_states: Vec::new(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            },
+            completed_request: None,
+            completed_request_completion: None,
+            status: DfsNamespacePrepareStatus::Prepared,
+        };
+        for index in 0..OBJECT_COUNT {
+            let mut prepared_object =
+                object(version(&format!("version_large_prepare_only_{index:04}")));
+            prepared_object.object_id =
+                DfsObjectId::from_legacy_named(format!("obj_large_prepare_only_{index:04}"))
+                    .expect("prepared object id");
+            prepared_object.path = format!("/services/large-prepare-only/{index:04}");
+            prepare
+                .expected_object_versions
+                .push(DfsNamespaceObjectVersionExpectation {
+                    object_id: prepared_object.object_id.clone(),
+                    expected_version: None,
+                });
+            prepare
+                .expected_path_occupants
+                .push(DfsNamespacePathOccupantExpectation {
+                    path: prepared_object.path.clone(),
+                    expected_object_id: None,
+                });
+            prepare.transaction.objects.push(prepared_object);
+        }
+        prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+                .expect("large prepare digest");
+        source
+            .prepare_namespace_transaction(&prepare)
+            .expect("source large prepare");
+        let prepare_entries = source
+            .journal_since(initial_sequence)
+            .expect("large prepare source journal");
+        assert_eq!(prepare_entries.len(), 1);
+        assert!(matches!(
+            prepare_entries[0].mutation,
+            DfsMetadataMutation::PutNamespacePrepare {
+                prepare: None,
+                packed_prepare_v1: Some(_),
+                status: DfsNamespacePrepareStatus::Prepared,
+                ..
+            }
+        ));
+
+        let mut replica =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &replica_root).expect("replica");
+        replica
+            .apply_journal_batch(&DfsMetadataJournalBatch {
+                shard_id: shard_id.clone(),
+                next_after_sequence: initial_sequence,
+                entries: initial_entries,
+            })
+            .expect("replicate initial filesystem");
+        replica
+            .persist_current_metadata_checkpoint_unlocked()
+            .expect("checkpoint initial replica state");
+
+        crate::metadata_tables::reset_namespace_prepare_materialization_counters();
+        let prepare_sequence = prepare_entries[0].sequence;
+        replica
+            .apply_journal_batch(&DfsMetadataJournalBatch {
+                shard_id: shard_id.clone(),
+                next_after_sequence: prepare_sequence,
+                entries: prepare_entries,
+            })
+            .expect("replicate large prepare only batch");
+        assert_eq!(
+            crate::metadata_tables::namespace_prepare_materialization_counters(),
+            (0, 1),
+            "the trailing full prepare must not build an O(objects) rollback image"
+        );
+        let installed = replica
+            .tables
+            .namespace_prepares
+            .get(&prepare.operation_id)
+            .expect("installed hidden prepare");
+        assert_eq!(installed.status, DfsNamespacePrepareStatus::Prepared);
+        assert_eq!(installed.transaction.objects.len(), OBJECT_COUNT);
+        assert!(
+            replica
+                .tables
+                .objects
+                .get(&prepare.transaction.objects[0].object_id)
+                .is_none(),
+            "prepared objects must remain hidden"
+        );
+        assert_eq!(replica.materialized_through_sequence, prepare_sequence);
+
+        drop(replica);
+        let replica =
+            LocalSobjMetadataBackend::new(shard_id, &replica_root).expect("reopened replica");
+        let reopened = replica
+            .tables
+            .namespace_prepares
+            .get(&prepare.operation_id)
+            .expect("reopened hidden prepare");
+        assert_eq!(reopened.status, DfsNamespacePrepareStatus::Prepared);
+        assert_eq!(reopened.transaction.objects.len(), OBJECT_COUNT);
+        assert!(
+            replica
+                .tables
+                .objects
+                .get(&prepare.transaction.objects[0].object_id)
+                .is_none(),
+            "table reference replay must preserve hidden prepare semantics"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn packed_replica_prepare_commit_prices_replay_before_checkpointing() {
+        let root = temp_root("packed_replica_prepare_commit_replay_cost");
+        let source_root = root.join("source");
+        let replica_root = root.join("replica");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let current = object(version("version_packed_replica_cost_base"));
+        let mut committed = current.clone();
+        committed.version = version("version_packed_replica_cost_committed");
+        committed.mode = 0o600;
+
+        let mut source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &source_root).expect("source");
+        source.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV1);
+        source.put_file_system(&file_system()).expect("filesystem");
+        source.put_object(&current).expect("current object");
+        let initial_entries = source.journal_since(0).expect("initial source journal");
+        let initial_sequence = initial_entries
+            .last()
+            .expect("initial journal head")
+            .sequence;
+
+        let mut replica =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &replica_root).expect("replica");
+        replica
+            .apply_journal_batch(&DfsMetadataJournalBatch {
+                shard_id: shard_id.clone(),
+                next_after_sequence: initial_sequence,
+                entries: initial_entries,
+            })
+            .expect("replicate initial namespace");
+        replica
+            .compact_metadata_table_log_if_needed(0)
+            .expect("checkpoint initial replica state");
+        let baseline_snapshot = fs::read(metadata_table_snapshot_path(&replica_root))
+            .expect("initial replica snapshot");
+        assert_eq!(replica.table_log_offset, 0);
+
+        let mut prepare = namespace_prepare(
+            "operation-packed-replica-cost",
+            &shard_id.0,
+            &current,
+            committed.clone(),
+        );
+        for index in 0..64 {
+            prepare
+                .expected_path_occupants
+                .push(DfsNamespacePathOccupantExpectation {
+                    path: format!("/absent/packed-replica-cost/{index:02}"),
+                    expected_object_id: None,
+                });
+        }
+        prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+                .expect("expanded prepare digest");
+        source
+            .prepare_namespace_transaction(&prepare)
+            .expect("packed source prepare");
+        source
+            .commit_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect("compact source commit");
+        let terminal_entries = source
+            .journal_since(initial_sequence)
+            .expect("terminal source journal");
+        assert_eq!(terminal_entries.len(), 2);
+        assert!(matches!(
+            terminal_entries[0].mutation,
+            DfsMetadataMutation::PutNamespacePrepare {
+                prepare: None,
+                packed_prepare_v1: Some(_),
+                ..
+            }
+        ));
+
+        replica
+            .apply_journal_batch(&DfsMetadataJournalBatch {
+                shard_id,
+                next_after_sequence: terminal_entries
+                    .last()
+                    .expect("terminal journal head")
+                    .sequence,
+                entries: terminal_entries,
+            })
+            .expect("replicate packed prepare and compact commit");
+        let expected_replay_cost =
+            metadata_table_apply::namespace_prepare_replay_cost_bytes(&prepare);
+        assert_eq!(
+            replica.table_log_journal_reference_replay_cost_bytes, expected_replay_cost,
+            "replica replay must price the already-decoded prepare reference"
+        );
+        assert_eq!(
+            replica.table_log_unpriced_namespace_prepare_references, 0,
+            "a freshly replicated prepare reference must never be marked unpriced"
+        );
+        assert!(
+            replica.table_log_offset < expected_replay_cost,
+            "the fixture must distinguish logical replay pressure from physical table-log bytes"
+        );
+        assert!(expected_replay_cost < DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES);
+
+        metadata_table_apply::wait_for_metadata_table_checkpoint_workers_for_test(&replica_root);
+        assert_eq!(
+            fs::read(metadata_table_snapshot_path(&replica_root))
+                .expect("snapshot after below-threshold replay"),
+            baseline_snapshot,
+            "a terminal replicated prepare must not checkpoint solely because its reference was unpriced"
+        );
+
+        metadata_table_apply::schedule_metadata_table_checkpoint_if_needed(
+            &replica_root,
+            &replica.tables,
+            expected_replay_cost.saturating_sub(1),
+            replica.table_log_offset,
+            replica.table_log_journal_reference_replay_cost_bytes,
+            replica.table_log_unpriced_namespace_prepare_references,
+        )
+        .expect("schedule accumulated replay-pressure checkpoint");
+        metadata_table_apply::wait_for_metadata_table_checkpoint_workers_for_test(&replica_root);
+        assert_ne!(
+            fs::read(metadata_table_snapshot_path(&replica_root))
+                .expect("snapshot after accumulated replay pressure"),
+            baseline_snapshot,
+            "the ordinary accumulated replay-cost threshold must still checkpoint terminal state"
+        );
+
         cleanup(&root);
     }
 
@@ -12249,11 +13242,16 @@ mod tests {
         let stale_error = backend
             .prepare_namespace_transaction(&stale)
             .expect_err("stale object version must reject prepare");
-        assert!(
-            stale_error
-                .to_string()
-                .contains("version expectation changed")
-        );
+        assert!(matches!(
+            stale_error,
+            MetadataBackendError::Conflict {
+                ref object_id,
+                ref expected,
+                current: ref current_version,
+            } if object_id == &current.object_id
+                && expected == &version("version_prepare_stale")
+                && current_version == &version("version_prepare_race_1")
+        ));
 
         let mut overlap = prepare.clone();
         overlap.operation_id = "operation-overlap".to_string();
@@ -12287,11 +13285,16 @@ mod tests {
                 prepare.owner_epoch,
             )
             .expect_err("commit must revalidate the prepared expectations");
-        assert!(
-            commit_error
-                .to_string()
-                .contains("version expectation changed")
-        );
+        assert!(matches!(
+            commit_error,
+            MetadataBackendError::Conflict {
+                ref object_id,
+                ref expected,
+                current: ref current_version,
+            } if object_id == &raced.object_id
+                && expected == &version("version_prepare_race_1")
+                && current_version == &version("version_prepare_race_3")
+        ));
         assert_eq!(
             backend.get_object(&raced.object_id).expect("raced object"),
             Some(raced)
@@ -17428,6 +18431,188 @@ mod tests {
     }
 
     #[test]
+    fn namespace_request_admission_snapshot_polls_one_durable_generation() {
+        let root = temp_root("namespace_request_admission_snapshot");
+        let mut backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("metadata backend");
+        let requester =
+            NodeId::from_legacy_named("namespace-admission-requester").expect("requester");
+
+        crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+        let admission = backend
+            .namespace_request_admission_snapshot(
+                &DfsMetadataShardId::new("shard-root"),
+                &requester,
+                "request-fresh",
+            )
+            .expect("namespace admission snapshot");
+
+        assert_eq!(
+            admission,
+            crate::DfsNamespaceRequestAdmissionSnapshot::default()
+        );
+        assert_eq!(
+            crate::metadata_read_snapshot::metadata_durable_table_probes(),
+            1,
+            "request, receipt, prepare, and retention-floor evidence must share one durable generation probe"
+        );
+
+        crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+        let _ = backend
+            .get_namespace_request_receipt(&requester, "request-fresh")
+            .expect("standalone receipt lookup");
+        let _ = backend
+            .get_namespace_request(&requester, "request-fresh")
+            .expect("standalone request lookup");
+        let _ = backend
+            .get_prepared_namespace_prepare_for_request(&requester, "request-fresh")
+            .expect("standalone prepare lookup");
+        let _ = backend
+            .namespace_request_history_expired_on_shard(
+                &DfsMetadataShardId::new("shard-root"),
+                &requester,
+                "request-fresh",
+            )
+            .expect("standalone retention-floor lookup");
+        assert_eq!(
+            crate::metadata_read_snapshot::metadata_durable_table_probes(),
+            4,
+            "the regression fixture must exercise the four formerly independent durable probes"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn namespace_request_admission_borrows_rotated_checkpoint_without_decode() {
+        let root = temp_root("namespace_request_admission_rotated_checkpoint");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let mut backend =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("metadata backend");
+        let mut stored_file_system = file_system();
+        backend
+            .put_file_system(&stored_file_system)
+            .expect("materialize active table log");
+        stored_file_system.display_name = "updated before rotation".to_string();
+        backend
+            .put_file_system(&stored_file_system)
+            .expect("advance active table generation");
+        {
+            let _lock = backend.metadata_write_lock().expect("metadata writer lock");
+            assert!(
+                crate::metadata_table_store::rotate_metadata_table_log_for_checkpoint(&root, 0)
+                    .expect("rotate active table generation"),
+                "the non-empty active table log must rotate"
+            );
+        }
+        let requester =
+            NodeId::from_legacy_named("rotated-admission-requester").expect("requester");
+
+        crate::metadata_read_snapshot::reset_metadata_checkpoint_snapshot_decodes();
+        crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+        let admission = backend
+            .namespace_request_admission_snapshot(&shard_id, &requester, "request-after-rotation")
+            .expect("namespace admission after checkpoint rotation");
+
+        assert_eq!(
+            admission,
+            crate::DfsNamespaceRequestAdmissionSnapshot::default()
+        );
+        assert_eq!(
+            crate::metadata_read_snapshot::metadata_durable_table_probes(),
+            1
+        );
+        assert_eq!(
+            crate::metadata_read_snapshot::metadata_checkpoint_snapshot_decodes(),
+            0,
+            "a representation-only active-log rotation must not decode the accumulated checkpoint on admission"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_namespace_request_admission_pins_each_shard_once() {
+        let root = temp_root("sharded_namespace_request_admission_snapshot");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+                shard_config(
+                    "users",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/users".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded metadata backend");
+        let requester =
+            NodeId::from_legacy_named("sharded-admission-requester").expect("requester");
+
+        crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+        let admission = backend
+            .namespace_request_admission_snapshot(
+                &DfsMetadataShardId::new("services"),
+                &requester,
+                "request-fresh",
+            )
+            .expect("sharded namespace admission snapshot");
+        assert_eq!(
+            admission,
+            crate::DfsNamespaceRequestAdmissionSnapshot::default()
+        );
+        assert_eq!(
+            crate::metadata_read_snapshot::metadata_durable_table_probes(),
+            3,
+            "all admission indexes must share one durable probe per retained shard"
+        );
+
+        crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+        let _ = backend
+            .get_namespace_request_receipt(&requester, "request-fresh")
+            .expect("standalone sharded receipt lookup");
+        let _ = backend
+            .get_namespace_request(&requester, "request-fresh")
+            .expect("standalone sharded request lookup");
+        let _ = backend
+            .get_prepared_namespace_prepare_for_request(&requester, "request-fresh")
+            .expect("standalone sharded prepare lookup");
+        let _ = backend
+            .namespace_request_history_expired_on_shard(
+                &DfsMetadataShardId::new("services"),
+                &requester,
+                "request-fresh",
+            )
+            .expect("standalone sharded retention-floor lookup");
+        assert_eq!(
+            crate::metadata_read_snapshot::metadata_durable_table_probes(),
+            12,
+            "the regression fixture must cover four independent probes across three shards"
+        );
+
+        let pending = namespace_request(90, DfsNamespaceRequestStatus::Pending);
+        crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+        backend
+            .put_namespace_request_on_shard(&DfsMetadataShardId::new("root"), &pending)
+            .expect("persist request through combined admission");
+        assert_eq!(
+            crate::metadata_read_snapshot::metadata_durable_table_probes(),
+            3,
+            "request persistence must reuse the combined one-probe-per-shard admission"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn local_backend_serializes_concurrent_metadata_writers() {
         let root = temp_root("local_backend_serializes_concurrent_metadata_writers");
         let mut backend =
@@ -21384,6 +22569,233 @@ mod tests {
             42,
             "older acknowledgements must not move a durable replication cursor backwards"
         );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn metadata_writer_adopts_rotated_live_generation_without_prepare_reference_replay() {
+        let root = temp_root("local_backend_writer_adopts_rotated_generation");
+        let shard_id = DfsMetadataShardId::new("root");
+        let current = object(version("version_rotated_writer_base"));
+        let mut committed = current.clone();
+        committed.version = version("version_rotated_writer_committed");
+        committed.mode = 0o600;
+        let prepare = namespace_prepare(
+            "operation-rotated-writer",
+            &shard_id.0,
+            &current,
+            committed.clone(),
+        );
+        let mut backend = LocalSobjMetadataBackend::new(shard_id, &root).expect("backend");
+        backend.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV1);
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        backend
+            .prepare_namespace_transaction(&prepare)
+            .expect("durable prepare");
+        backend
+            .commit_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect("compact commit");
+        assert_eq!(
+            backend
+                .get_object(&current.object_id)
+                .expect("committed object"),
+            Some(committed.clone())
+        );
+        {
+            let _lock = backend.metadata_write_lock().expect("metadata writer lock");
+            assert!(
+                crate::metadata_table_store::rotate_metadata_table_log_for_checkpoint(&root, 0)
+                    .expect("rotate table generation")
+            );
+        }
+        assert!(metadata_table_checkpoint_log_path(&root).is_file());
+
+        crate::metadata_table_store::reset_metadata_table_journal_reference_resolutions();
+        let mut updated_file_system = file_system();
+        updated_file_system.display_name = "updated after checkpoint rotation".to_string();
+        backend
+            .put_file_system(&updated_file_system)
+            .expect("write after representation-only rotation");
+
+        let active_table_log_len = fs::metadata(metadata_table_path(&root))
+            .expect("active table log metadata")
+            .len();
+        assert_eq!(
+            backend.table_log_offset, active_table_log_len,
+            "checkpoint adoption must rebase active-log accounting before the first new append"
+        );
+        assert_eq!(
+            backend.table_log_journal_reference_replay_cost_bytes, 0,
+            "the new active suffix contains no journal-reference replay debt"
+        );
+        assert_eq!(
+            backend.table_log_unpriced_namespace_prepare_references, 0,
+            "the new active suffix contains no unpriced namespace prepares"
+        );
+        assert_eq!(
+            crate::metadata_table_store::metadata_table_journal_reference_resolutions(),
+            0,
+            "the writer already materialized the exact rotated generation and must not decode its namespace prepares again"
+        );
+        assert_eq!(
+            backend
+                .get_file_system(&updated_file_system.file_system_id)
+                .expect("updated filesystem"),
+            Some(updated_file_system)
+        );
+        assert_eq!(
+            backend
+                .get_object(&current.object_id)
+                .expect("preserved committed object"),
+            Some(committed),
+            "adopting the rotated representation must preserve the materialized namespace"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn metadata_authority_ack_floor_put_skips_rotated_table_generation_refresh() {
+        let root = temp_root("local_backend_metadata_authority_floor_rotated");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        backend
+            .put_file_system(&file_system())
+            .expect("materialize table log before rotation");
+        {
+            let _lock = backend.metadata_write_lock().expect("metadata writer lock");
+            assert!(
+                crate::metadata_table_store::rotate_metadata_table_log_for_checkpoint(&root, 0)
+                    .expect("rotate table generation")
+            );
+        }
+        assert!(metadata_table_checkpoint_log_path(&root).is_file());
+        let durable_generation_before =
+            metadata_table_storage_generation(&root).expect("durable table generation");
+        let cached_generation_before = backend.table_storage_generation.clone();
+        let tables_before = backend.tables.clone();
+        let table_log_offset_before = backend.table_log_offset;
+        let materialized_sequence_before = backend.materialized_through_sequence;
+        let prefix_proof_before = backend.prefix_proof.clone();
+        let floor = DfsMetadataAuthorityAckFloor {
+            shard_id: shard_id.clone(),
+            journal_sequence: materialized_sequence_before,
+        };
+
+        backend
+            .put_metadata_authority_ack_floor(&floor)
+            .expect("advance authority acknowledgement floor without table refresh");
+
+        assert_eq!(
+            metadata_table_storage_generation(&root).expect("unchanged durable generation"),
+            durable_generation_before,
+            "authority acknowledgement sidecars must not replace table files"
+        );
+        assert_eq!(
+            backend.table_storage_generation, cached_generation_before,
+            "authority acknowledgement sidecars must not adopt or replay the rotated table generation"
+        );
+        assert_eq!(backend.tables, tables_before);
+        assert_eq!(backend.table_log_offset, table_log_offset_before);
+        assert_eq!(
+            backend.materialized_through_sequence,
+            materialized_sequence_before
+        );
+        assert_eq!(backend.prefix_proof, prefix_proof_before);
+        assert_eq!(
+            backend
+                .metadata_authority_ack_floor(&shard_id)
+                .expect("persisted authority acknowledgement floor"),
+            Some(floor)
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn metadata_replication_cursor_put_skips_rotated_table_generation_refresh() {
+        let root = temp_root("local_backend_metadata_replication_cursor_rotated");
+        let target_node_id = node("node_rotated_cursor_target");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        backend
+            .put_file_system(&file_system())
+            .expect("materialize table log before rotation");
+        {
+            let _lock = backend.metadata_write_lock().expect("metadata writer lock");
+            assert!(
+                crate::metadata_table_store::rotate_metadata_table_log_for_checkpoint(&root, 0)
+                    .expect("rotate table generation")
+            );
+        }
+        assert!(metadata_table_checkpoint_log_path(&root).is_file());
+        let durable_generation_before =
+            metadata_table_storage_generation(&root).expect("durable table generation");
+        let cached_generation_before = backend.table_storage_generation.clone();
+        let tables_before = backend.tables.clone();
+        let table_log_offset_before = backend.table_log_offset;
+        let replay_cost_before = backend.table_log_journal_reference_replay_cost_bytes;
+        let unpriced_references_before = backend.table_log_unpriced_namespace_prepare_references;
+        let materialized_sequence_before = backend.materialized_through_sequence;
+        let prefix_proof_before = backend.prefix_proof.clone();
+        let snapshot_fingerprint_before = backend.table_snapshot_fingerprint.clone();
+
+        crate::metadata_read_snapshot::reset_metadata_checkpoint_snapshot_decodes();
+        crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+        backend
+            .put_metadata_replication_cursor(&target_node_id, &shard_id, 42)
+            .expect("advance cursor without table refresh");
+        backend
+            .put_metadata_replication_cursor(&target_node_id, &shard_id, 7)
+            .expect("ignore stale cursor without table refresh");
+
+        assert_eq!(
+            crate::metadata_read_snapshot::metadata_checkpoint_snapshot_decodes(),
+            0,
+            "cursor sidecar updates must not decode a rotated table checkpoint"
+        );
+        assert_eq!(
+            crate::metadata_read_snapshot::metadata_durable_table_probes(),
+            0,
+            "cursor sidecar updates must not poll or refresh materialized tables"
+        );
+        assert_eq!(
+            metadata_table_storage_generation(&root).expect("unchanged durable generation"),
+            durable_generation_before,
+            "cursor sidecars must not replace snapshot, checkpoint, or active table files"
+        );
+        assert_eq!(backend.table_storage_generation, cached_generation_before);
+        assert_eq!(backend.tables, tables_before);
+        assert_eq!(backend.table_log_offset, table_log_offset_before);
+        assert_eq!(
+            backend.table_log_journal_reference_replay_cost_bytes,
+            replay_cost_before
+        );
+        assert_eq!(
+            backend.table_log_unpriced_namespace_prepare_references,
+            unpriced_references_before
+        );
+        assert_eq!(
+            backend.materialized_through_sequence,
+            materialized_sequence_before
+        );
+        assert_eq!(backend.prefix_proof, prefix_proof_before);
+        assert_eq!(
+            backend.table_snapshot_fingerprint,
+            snapshot_fingerprint_before
+        );
+        assert_eq!(
+            backend
+                .metadata_replication_cursor(&target_node_id, &shard_id)
+                .expect("monotonic rotated cursor"),
+            42
+        );
+
         cleanup(&root);
     }
 

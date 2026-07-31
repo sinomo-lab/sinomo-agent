@@ -65,19 +65,20 @@ pub(crate) struct SifsFileManagerBackend {
     replica_candidates: Vec<NodeId>,
 }
 
-/// Narrow, metadata-less requester for the create-only DFS throughput probe.
+/// Narrow, metadata-less requester for the one-shot DFS throughput probe.
 ///
 /// This handle deliberately exposes only the three write stages used by
-/// `cluster.dfs.bulk-write`: create its parent directory, create files under a
-/// known parent, and hand post-commit maintenance back to the resident daemon.
+/// `cluster.dfs.bulk-write`: create its parent directory, create or replace
+/// files under a known parent, and hand post-commit maintenance back to the
+/// resident daemon.
 /// General SIFS callers must use [`SifsFileManagerBackend`], whose ordinary
 /// open always owns a durable metadata backend.
 #[derive(Debug)]
-pub(crate) struct SifsOneShotBulkCreateRequester {
+pub(crate) struct SifsOneShotBulkWriteRequester {
     data_dir: SinomoDataDir,
     local_node_id: NodeId,
     service: Mutex<NetworkedDfsService<DfsNodeTransport>>,
-    control_plane: SifsOneShotBulkCreateControlPlaneKvClient,
+    control_plane: SifsOneShotBulkWriteControlPlaneKvClient,
 }
 
 /// A metadata-only, observational SIFS view.
@@ -1434,6 +1435,7 @@ impl SifsFileManagerBackend {
         self.write_files_with_known_parents_deferred_publish_mode_until(files, false, deadline)
     }
 
+    #[cfg(test)]
     pub(crate) fn write_files_with_known_parents_deferred_publish_mode_until(
         &self,
         files: &[(String, Vec<u8>)],
@@ -1447,6 +1449,7 @@ impl SifsFileManagerBackend {
         )
     }
 
+    #[cfg(test)]
     fn write_files_with_known_parents_deferred_publish_with_deadline(
         &self,
         files: &[(String, Vec<u8>)],
@@ -2053,7 +2056,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     }
 }
 
-impl SifsOneShotBulkCreateRequester {
+impl SifsOneShotBulkWriteRequester {
     pub(crate) fn open(data_dir: &SinomoDataDir) -> Result<Self, String> {
         data_dir
             .ensure_root_layout()
@@ -2061,7 +2064,7 @@ impl SifsOneShotBulkCreateRequester {
         let cluster_paths = ClusterPaths::new(data_dir);
         if !cluster_paths.state.exists() {
             return Err(
-                "one-shot SIFS bulk create requires local cluster state and a resident daemon"
+                "one-shot SIFS bulk write requires local cluster state and a resident daemon"
                     .to_string(),
             );
         }
@@ -2078,7 +2081,7 @@ impl SifsOneShotBulkCreateRequester {
         let peer_transport = sinomo_runtime::api::DaemonDfsPeerTransport::connect(data_dir.clone())
             .map_err(|error| {
                 format!(
-                    "one-shot SIFS bulk create requires the resident daemon DFS transport: {error}"
+                    "one-shot SIFS bulk write requires the resident daemon DFS transport: {error}"
                 )
             })?;
         let (sync_peer_transport, async_peer_transport) =
@@ -2086,7 +2089,7 @@ impl SifsOneShotBulkCreateRequester {
         let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
             .map_err(|error| format!("cannot open DFS content store: {error}"))?;
 
-        let control_plane = SifsOneShotBulkCreateControlPlaneKvClient::new(
+        let control_plane = SifsOneShotBulkWriteControlPlaneKvClient::new(
             data_dir,
             &cluster_paths,
             local_node_id.clone(),
@@ -2114,7 +2117,7 @@ impl SifsOneShotBulkCreateRequester {
         .with_control_plane(control_plane.clone());
         service
             .bootstrap_distributed_sifs()
-            .map_err(|error| format!("cannot bootstrap one-shot SIFS bulk create: {error}"))?;
+            .map_err(|error| format!("cannot bootstrap one-shot SIFS bulk write: {error}"))?;
 
         Ok(Self {
             data_dir: data_dir.clone(),
@@ -2149,7 +2152,7 @@ impl SifsOneShotBulkCreateRequester {
             .map_err(|error| format!("cannot read local cluster state: {error}"))?;
         if state.local_node_id != self.local_node_id {
             return Err(format!(
-                "one-shot SIFS bulk create is fenced because the local node identity changed from {} to {}",
+                "one-shot SIFS bulk write is fenced because the local node identity changed from {} to {}",
                 self.local_node_id, state.local_node_id
             ));
         }
@@ -2164,12 +2167,12 @@ impl SifsOneShotBulkCreateRequester {
             match self.service.try_lock() {
                 Ok(service) => return Ok(service),
                 Err(std::sync::TryLockError::Poisoned(_)) => {
-                    return Err("one-shot SIFS bulk create service lock is poisoned".to_string());
+                    return Err("one-shot SIFS bulk write service lock is poisoned".to_string());
                 }
                 Err(std::sync::TryLockError::WouldBlock) => {
                     let remaining = sifs_operation_remaining(
                         Some(deadline),
-                        "waiting for the one-shot SIFS bulk create service lock",
+                        "waiting for the one-shot SIFS bulk write service lock",
                     )?
                     .expect("deadline is present");
                     std::thread::sleep(Duration::from_millis(1).min(remaining));
@@ -2186,7 +2189,7 @@ impl SifsOneShotBulkCreateRequester {
         let path = normalize_sifs_path(path)?;
         let parent = sifs_parent_path(&path);
         let (peer_node_ids, shards) = self.validate_cached_authority()?;
-        validate_one_shot_bulk_create_paths(
+        validate_one_shot_bulk_write_paths(
             &shards,
             std::iter::once(path.as_str()).chain(parent.iter().map(String::as_str)),
         )?;
@@ -2200,32 +2203,35 @@ impl SifsOneShotBulkCreateRequester {
         result
     }
 
-    pub(crate) fn write_files_with_known_parents_deferred_publish_until(
+    pub(crate) fn write_files_with_known_parents_deferred_publish_mode_until(
         &self,
         files: &[(String, Vec<u8>)],
+        overwrite_existing: bool,
         deadline: Instant,
     ) -> Result<(), String> {
         let normalized = files
             .iter()
             .map(|(path, bytes)| normalize_sifs_path(path).map(|path| (path, bytes.as_slice())))
             .collect::<Result<Vec<_>, _>>()?;
-        sifs_operation_remaining(Some(deadline), "one-shot SIFS bulk create")?;
+        sifs_operation_remaining(Some(deadline), "one-shot SIFS bulk write")?;
         let (peer_node_ids, shards) = self.validate_cached_authority()?;
-        validate_one_shot_bulk_create_paths(
+        validate_one_shot_bulk_write_paths(
             &shards,
             normalized.iter().map(|(path, _)| path.as_str()),
         )?;
         let mut service = self.lock_service_with_deadline(deadline)?;
         service.refresh_peer_targets(peer_node_ids);
         let previous_deadline = service.set_transport_operation_deadline(Some(deadline));
-        let result = service
-            .posix_create_files_local_eventual_with_known_parents(
-                normalized
-                    .iter()
-                    .map(|(path, bytes)| (path.as_str(), *bytes)),
-            )
-            .map(|_| ())
-            .map_err(|error| format!("cannot write SIFS bulk batch: {error}"));
+        let files = normalized
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), *bytes));
+        let result = if overwrite_existing {
+            service.posix_write_files_local_eventual_with_known_parents(files)
+        } else {
+            service.posix_create_files_local_eventual_with_known_parents(files)
+        }
+        .map(|_| ())
+        .map_err(|error| format!("cannot write SIFS bulk batch: {error}"));
         service.set_transport_operation_deadline(previous_deadline);
         result
     }
@@ -2236,7 +2242,7 @@ impl SifsOneShotBulkCreateRequester {
             let mut service = self
                 .service
                 .lock()
-                .map_err(|_| "one-shot SIFS bulk create service lock is poisoned".to_string())?;
+                .map_err(|_| "one-shot SIFS bulk write service lock is poisoned".to_string())?;
             service.refresh_peer_targets(peer_node_ids);
             service
                 .flush_detached_transport_sends()
@@ -2252,7 +2258,7 @@ impl SifsOneShotBulkCreateRequester {
             SIFS_MAINTENANCE_REFRESH_TIMEOUT,
         ) {
             return Err(
-                "resident daemon became unavailable during one-shot SIFS bulk create maintenance handoff"
+                "resident daemon became unavailable during one-shot SIFS bulk write maintenance handoff"
                     .to_string(),
             );
         }
@@ -2734,13 +2740,13 @@ impl DfsControlPlaneKvClient for SifsControlPlaneKvClient {
 /// authority-refresh race between the requester's explicit preflight and an
 /// internal DFS retry which refreshes shard routing.
 #[derive(Clone, Debug)]
-struct SifsOneShotBulkCreateControlPlaneKvClient {
+struct SifsOneShotBulkWriteControlPlaneKvClient {
     inner: SifsControlPlaneKvClient,
     local_node_id: NodeId,
     validated_snapshot: Arc<Mutex<Option<Arc<KvSnapshot>>>>,
 }
 
-impl SifsOneShotBulkCreateControlPlaneKvClient {
+impl SifsOneShotBulkWriteControlPlaneKvClient {
     fn new(data_dir: &SinomoDataDir, cluster_paths: &ClusterPaths, local_node_id: NodeId) -> Self {
         Self {
             inner: SifsControlPlaneKvClient::new(data_dir, cluster_paths),
@@ -2768,7 +2774,7 @@ impl SifsOneShotBulkCreateControlPlaneKvClient {
             }
         }
 
-        validate_one_shot_bulk_create_catalog(true, &self.local_node_id, &shards)
+        validate_one_shot_bulk_write_catalog(true, &self.local_node_id, &shards)
             .map_err(|error| self.inner.kv_error(error))?;
 
         *self.validated_snapshot.lock().map_err(|_| {
@@ -2798,7 +2804,7 @@ impl SifsOneShotBulkCreateControlPlaneKvClient {
     }
 }
 
-impl DfsControlPlaneKvClient for SifsOneShotBulkCreateControlPlaneKvClient {
+impl DfsControlPlaneKvClient for SifsOneShotBulkWriteControlPlaneKvClient {
     fn refresh_latest(&mut self) -> Result<(), KvError> {
         self.refresh_and_validate()
     }
@@ -2860,19 +2866,19 @@ fn decode_sifs_metadata_shard_configs(
     Ok(shards)
 }
 
-fn validate_one_shot_bulk_create_catalog(
+fn validate_one_shot_bulk_write_catalog(
     daemon_backed_transport: bool,
     local_node_id: &NodeId,
     shards: &[DfsMetadataShardConfig],
 ) -> Result<(), String> {
     if !daemon_backed_transport {
         return Err(
-            "one-shot SIFS bulk create requires the resident daemon DFS transport".to_string(),
+            "one-shot SIFS bulk write requires the resident daemon DFS transport".to_string(),
         );
     }
     if shards.is_empty() {
         return Err(
-            "one-shot SIFS bulk create requires a nonempty metadata shard catalog".to_string(),
+            "one-shot SIFS bulk write requires a nonempty metadata shard catalog".to_string(),
         );
     }
     let file_system_id = sifs_file_system_id();
@@ -2880,13 +2886,13 @@ fn validate_one_shot_bulk_create_catalog(
     for shard in shards {
         if shard.file_system_id != file_system_id {
             return Err(format!(
-                "one-shot SIFS bulk create catalog contains shard {} for filesystem {}",
+                "one-shot SIFS bulk write catalog contains shard {} for filesystem {}",
                 shard.shard_id, shard.file_system_id
             ));
         }
         if !shard_ids.insert(shard.shard_id.clone()) {
             return Err(format!(
-                "one-shot SIFS bulk create catalog contains duplicate shard id {}",
+                "one-shot SIFS bulk write catalog contains duplicate shard id {}",
                 shard.shard_id
             ));
         }
@@ -2896,11 +2902,11 @@ fn validate_one_shot_bulk_create_catalog(
         .find(|shard| shard.primary_node_id == *local_node_id)
     {
         return Err(format!(
-            "one-shot SIFS bulk create is fenced because local node {local_node_id} is primary for metadata shard {} at epoch {}",
+            "one-shot SIFS bulk write is fenced because local node {local_node_id} is primary for metadata shard {} at epoch {}",
             shard.shard_id, shard.epoch
         ));
     }
-    validate_one_shot_bulk_create_paths(
+    validate_one_shot_bulk_write_paths(
         shards,
         [
             "/",
@@ -2911,7 +2917,7 @@ fn validate_one_shot_bulk_create_catalog(
     Ok(())
 }
 
-fn validate_one_shot_bulk_create_paths<'a>(
+fn validate_one_shot_bulk_write_paths<'a>(
     shards: &[DfsMetadataShardConfig],
     paths: impl IntoIterator<Item = &'a str>,
 ) -> Result<(), String> {
@@ -2925,7 +2931,7 @@ fn validate_one_shot_bulk_create_paths<'a>(
         .is_none()
         {
             return Err(format!(
-                "one-shot SIFS bulk create metadata shard catalog has no route for {path}"
+                "one-shot SIFS bulk write metadata shard catalog has no route for {path}"
             ));
         }
     }
@@ -4003,7 +4009,7 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_bulk_create_catalog_requires_daemon_and_no_local_primary() {
+    fn one_shot_bulk_write_catalog_requires_daemon_and_no_local_primary() {
         let primary = NodeId::from_legacy_named("node_stateless_primary").expect("primary");
         let replica = NodeId::from_legacy_named("node_stateless_replica").expect("replica");
         let outsider = NodeId::from_legacy_named("node_stateless_outsider").expect("outsider");
@@ -4019,22 +4025,22 @@ mod tests {
         };
 
         assert!(
-            validate_one_shot_bulk_create_catalog(true, &outsider, std::slice::from_ref(&shard),)
+            validate_one_shot_bulk_write_catalog(true, &outsider, std::slice::from_ref(&shard),)
                 .is_ok()
         );
         assert!(
-            validate_one_shot_bulk_create_catalog(false, &outsider, std::slice::from_ref(&shard),)
+            validate_one_shot_bulk_write_catalog(false, &outsider, std::slice::from_ref(&shard),)
                 .is_err()
         );
         assert!(
-            validate_one_shot_bulk_create_catalog(true, &primary, std::slice::from_ref(&shard),)
+            validate_one_shot_bulk_write_catalog(true, &primary, std::slice::from_ref(&shard),)
                 .is_err()
         );
         assert!(
-            validate_one_shot_bulk_create_catalog(true, &replica, std::slice::from_ref(&shard),)
+            validate_one_shot_bulk_write_catalog(true, &replica, std::slice::from_ref(&shard),)
                 .is_ok()
         );
-        assert!(validate_one_shot_bulk_create_catalog(true, &outsider, &[]).is_err());
+        assert!(validate_one_shot_bulk_write_catalog(true, &outsider, &[]).is_err());
 
         let services = DfsMetadataShardConfig {
             shard_id: "services".to_string(),
@@ -4044,7 +4050,7 @@ mod tests {
             ..shard.clone()
         };
         let incomplete =
-            validate_one_shot_bulk_create_catalog(true, &outsider, &[shard.clone(), services])
+            validate_one_shot_bulk_write_catalog(true, &outsider, &[shard.clone(), services])
                 .expect_err("a partial default SIFS split must not be treated as complete");
         assert!(
             incomplete.contains("cannot route /users"),
@@ -4052,7 +4058,7 @@ mod tests {
         );
 
         let duplicate =
-            validate_one_shot_bulk_create_catalog(true, &outsider, &[shard.clone(), shard])
+            validate_one_shot_bulk_write_catalog(true, &outsider, &[shard.clone(), shard])
                 .expect_err("duplicate shard ids must be rejected");
         assert!(
             duplicate.contains("duplicate shard id"),
@@ -4076,7 +4082,7 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_bulk_create_control_plane_refresh_fences_new_local_primary() {
+    fn one_shot_bulk_write_control_plane_refresh_fences_new_local_primary() {
         let root = temp_sifs_data_dir("one-shot-authority-refresh");
         let data_dir = SinomoDataDir::new(&root);
         let mut shards = seed_observation_cluster(&data_dir);
@@ -4092,7 +4098,7 @@ mod tests {
         }
         write_metadata_shard_snapshot(&cluster_paths, &shards);
 
-        let control_plane = SifsOneShotBulkCreateControlPlaneKvClient::new(
+        let control_plane = SifsOneShotBulkWriteControlPlaneKvClient::new(
             &data_dir,
             &cluster_paths,
             local_node_id.clone(),
@@ -4122,7 +4128,7 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_bulk_create_reuses_the_validated_installed_catalog() {
+    fn one_shot_bulk_write_reuses_the_validated_installed_catalog() {
         let root = temp_sifs_data_dir("one-shot-installed-catalog");
         let data_dir = SinomoDataDir::new(&root);
         let mut shards = seed_observation_cluster(&data_dir);
@@ -4138,11 +4144,8 @@ mod tests {
         }
         write_metadata_shard_snapshot(&cluster_paths, &shards);
 
-        let control_plane = SifsOneShotBulkCreateControlPlaneKvClient::new(
-            &data_dir,
-            &cluster_paths,
-            local_node_id,
-        );
+        let control_plane =
+            SifsOneShotBulkWriteControlPlaneKvClient::new(&data_dir, &cluster_paths, local_node_id);
         control_plane
             .inner
             .replace_cached_snapshot(false)

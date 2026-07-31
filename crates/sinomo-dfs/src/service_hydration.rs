@@ -930,6 +930,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let affected_object_ids = batch
                 .entries
                 .iter()
+                // A prepare is deliberately hidden. Its expected and proposed
+                // objects are dependency identities, not visible service-state
+                // mutations, so reloading each one here turns a 4K-file prepare
+                // into 4K durable table probes without changing the cache.
+                .filter(|entry| {
+                    !matches!(
+                        &entry.mutation,
+                        DfsMetadataMutation::PutNamespacePrepare { .. }
+                    )
+                })
                 .flat_map(|entry| entry.mutation.affected_object_ids())
                 .collect::<BTreeSet<_>>();
             for object_id in affected_object_ids {

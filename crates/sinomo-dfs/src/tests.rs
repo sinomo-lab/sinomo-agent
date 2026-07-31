@@ -13577,7 +13577,7 @@ fn metadata_journal_compact_namespace_commit_refreshes_affected_service_objects(
     prepare.operation_digest =
         crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
             .expect("prepare digest");
-    backend
+    let prepare_entry = backend
         .prepare_namespace_transaction(&prepare)
         .expect("prepared transaction");
     let commit_entry = backend
@@ -13604,6 +13604,23 @@ fn metadata_journal_compact_namespace_commit_refreshes_affected_service_objects(
     assert_eq!(dfs.metadata.object(&current.object_id), Some(&current));
 
     dfs.metadata_backend = Some(Box::new(backend));
+    crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+    dfs.apply_metadata_journal_batch_to_service_state(&DfsMetadataJournalBatch {
+        shard_id: shard_id.clone(),
+        next_after_sequence: prepare_entry.sequence,
+        entries: vec![prepare_entry],
+    })
+    .expect("hidden prepare service replay");
+    assert_eq!(
+        crate::metadata_read_snapshot::metadata_durable_table_probes(),
+        0,
+        "a hidden prepare must not reload every expected/proposed object from durable metadata"
+    );
+    assert_eq!(
+        dfs.metadata.object(&current.object_id),
+        Some(&current),
+        "hidden prepare replay must not change visible service state"
+    );
     dfs.apply_metadata_journal_batch_to_service_state(&DfsMetadataJournalBatch {
         shard_id,
         next_after_sequence: commit_entry.sequence,
@@ -39349,6 +39366,292 @@ fn sifs_cluster_bulk_local_eventual_remote_primary_large_batch_is_fully_visible(
 }
 
 #[test]
+fn sifs_cluster_metadata_less_bulk_overwrite_prefetches_authoritative_children() {
+    let mut cluster = sifs_two_primary_cluster("sifs-bulk-metadata-less-overwrite");
+    let remote_dir = "/services/bulk-metadata-less-overwrite";
+    cluster
+        .services_primary
+        .posix_mkdir_all(remote_dir)
+        .expect("remote bulk parent");
+    sifs_two_primary_publish_until(&mut cluster, "metadata-less overwrite parent", |cluster| {
+        cluster.replica.posix_stat(remote_dir).is_ok()
+    });
+
+    let SifsTwoPrimaryCluster {
+        root,
+        services_primary,
+        mut replica,
+        ..
+    } = cluster;
+    let stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&stop);
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+
+    let files = (0..16)
+        .map(|index| {
+            (
+                format!("{remote_dir}/file-{index:03}.bin"),
+                format!("initial-{index:03}").into_bytes(),
+                format!("replacement-{index:03}").into_bytes(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let created = replica
+        .posix_create_files_local_eventual_with_known_parents(
+            files
+                .iter()
+                .map(|(path, initial, _)| (path.as_str(), initial.as_slice())),
+        )
+        .expect("initial remote-primary bulk create");
+    let created_versions = created
+        .iter()
+        .map(|stat| (stat.object_id.clone(), stat.version.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let parent_object_id = replica
+        .posix_stat(remote_dir)
+        .expect("metadata-less overwrite parent before eviction")
+        .object_id;
+
+    // Match a newly opened one-shot CLI requester: retain the content store,
+    // but remove the parent and every child from the memory overlay and drop
+    // the durable metadata backend. The overwrite must discover the exact
+    // parent and child object/version identities from the metadata authority
+    // in one bounded LookupPaths request.
+    replica.metadata.remove_object(&parent_object_id);
+    for stat in &created {
+        replica.metadata.remove_object(&stat.object_id);
+    }
+    replica.metadata_backend = None;
+    assert!(
+        replica
+            .metadata
+            .object_by_normalized_posix_path(&sifs_file_system_id(), remote_dir)
+            .is_none(),
+        "test requester unexpectedly retained parent metadata"
+    );
+    for (path, _, _) in &files {
+        assert!(
+            replica
+                .metadata
+                .object_by_normalized_posix_path(&sifs_file_system_id(), path)
+                .is_none(),
+            "test requester unexpectedly retained child metadata for {path}"
+        );
+    }
+
+    let overwritten = replica
+        .posix_write_files_local_eventual_with_known_parents(
+            files
+                .iter()
+                .map(|(path, _, replacement)| (path.as_str(), replacement.as_slice())),
+        )
+        .expect("metadata-less remote-primary bulk overwrite");
+    assert_eq!(overwritten.len(), files.len());
+    for ((path, _, replacement), stat) in files.iter().zip(&overwritten) {
+        assert_eq!(stat.path, *path);
+        assert_eq!(
+            stat.object_id,
+            created
+                .iter()
+                .find(|created| created.path == *path)
+                .expect("created object")
+                .object_id
+        );
+        assert_ne!(
+            stat.version,
+            *created_versions
+                .get(&stat.object_id)
+                .expect("created object version")
+        );
+        assert_eq!(
+            stat.content_hash.as_deref(),
+            Some(content_hash(replacement).as_str()),
+            "metadata-less overwrite returned the wrong content for {path}"
+        );
+    }
+
+    stop.store(true, Ordering::SeqCst);
+    let services_primary = services_thread.join().expect("services primary thread");
+    for (path, _, replacement) in &files {
+        assert_eq!(
+            services_primary
+                .posix_stat(path)
+                .expect("stat authoritative overwrite")
+                .content_hash
+                .as_deref(),
+            Some(content_hash(replacement).as_str()),
+            "metadata authority retained the wrong content generation for {path}"
+        );
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_cluster_metadata_less_bulk_overwrite_follows_authoritative_symlink() {
+    let mut cluster = sifs_two_primary_cluster("sifs-bulk-metadata-less-symlink");
+    let remote_dir = "/services/bulk-metadata-less-symlink";
+    let target = "/services/bulk-metadata-less-symlink/target.txt";
+    let link = "/services/bulk-metadata-less-symlink/link.txt";
+    cluster
+        .services_primary
+        .posix_mkdir_all(remote_dir)
+        .expect("remote symlink parent");
+    sifs_two_primary_publish_until(&mut cluster, "metadata-less symlink parent", |cluster| {
+        cluster.replica.posix_stat(remote_dir).is_ok()
+    });
+
+    let SifsTwoPrimaryCluster {
+        root,
+        services_primary,
+        replica_node,
+        mut replica,
+        ..
+    } = cluster;
+    let stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&stop);
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+    let options = DfsWriteOptions::replicated_eventual(vec![replica_node]);
+    replica
+        .posix_write_file(target, b"before", options.clone())
+        .expect("write symlink target");
+    replica
+        .posix_symlink("target.txt", link, options)
+        .expect("create symlink");
+    let target_before = replica.posix_stat(target).expect("stat symlink target");
+    let link_before = replica
+        .posix_lstat_distributed(link)
+        .expect("lstat symlink before metadata eviction");
+    assert_eq!(link_before.kind, DfsObjectKind::Symlink);
+    let parent_id = replica
+        .posix_stat(remote_dir)
+        .expect("stat symlink parent")
+        .object_id;
+
+    for object_id in [&parent_id, &target_before.object_id, &link_before.object_id] {
+        replica.metadata.remove_object(object_id);
+    }
+    replica.metadata_backend = None;
+
+    let stat = replica
+        .posix_write_files_local_eventual_with_known_parents([(
+            link,
+            b"through authoritative symlink".as_slice(),
+        )])
+        .expect("metadata-less write through authoritative symlink")
+        .pop()
+        .expect("symlink write stat");
+    assert_eq!(stat.path, link);
+    assert_eq!(stat.object_id, target_before.object_id);
+    assert_eq!(
+        replica
+            .posix_read_file_distributed(target)
+            .expect("read symlink target"),
+        b"through authoritative symlink"
+    );
+    let link_after = replica
+        .posix_lstat_distributed(link)
+        .expect("lstat symlink after overwrite");
+    assert_eq!(link_after.kind, DfsObjectKind::Symlink);
+    assert_eq!(link_after.object_id, link_before.object_id);
+
+    stop.store(true, Ordering::SeqCst);
+    let services_primary = services_thread.join().expect("services primary thread");
+    assert_eq!(
+        services_primary
+            .posix_stat(target)
+            .expect("authoritative symlink target stat")
+            .content_hash
+            .as_deref(),
+        Some(content_hash(b"through authoritative symlink").as_str())
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_cluster_metadata_less_bulk_overwrite_follows_revalidated_hardlink_target() {
+    let mut cluster = sifs_two_primary_cluster("sifs-bulk-metadata-less-hardlink");
+    let remote_dir = "/services/bulk-metadata-less-hardlink";
+    let target = "/services/bulk-metadata-less-hardlink/target.txt";
+    let link = "/services/bulk-metadata-less-hardlink/link.txt";
+    cluster
+        .services_primary
+        .posix_mkdir_all(remote_dir)
+        .expect("remote hardlink parent");
+    sifs_two_primary_publish_until(&mut cluster, "metadata-less hardlink parent", |cluster| {
+        cluster.replica.posix_stat(remote_dir).is_ok()
+    });
+
+    let SifsTwoPrimaryCluster {
+        root,
+        services_primary,
+        replica_node,
+        mut replica,
+        ..
+    } = cluster;
+    let stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&stop);
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+    let options = DfsWriteOptions::replicated_eventual(vec![replica_node]);
+    replica
+        .posix_write_file(target, b"before", options)
+        .expect("write hardlink target");
+    replica
+        .posix_hardlink(target, link)
+        .expect("create hardlink");
+    let target_before = replica.posix_stat(target).expect("stat hardlink target");
+    let link_before = replica
+        .posix_namespace_lstat_distributed(link)
+        .expect("lstat hardlink before metadata eviction");
+    assert_eq!(link_before.kind, DfsObjectKind::Hardlink);
+    let parent_id = replica
+        .posix_stat(remote_dir)
+        .expect("stat hardlink parent")
+        .object_id;
+
+    for object_id in [&parent_id, &target_before.object_id, &link_before.object_id] {
+        replica.metadata.remove_object(object_id);
+    }
+    replica.metadata_backend = None;
+
+    let stat = replica
+        .posix_write_files_local_eventual_with_known_parents([(
+            link,
+            b"through authoritative hardlink".as_slice(),
+        )])
+        .expect("metadata-less write through authoritative hardlink")
+        .pop()
+        .expect("hardlink write stat");
+    assert_eq!(stat.path, link);
+    assert_eq!(stat.object_id, target_before.object_id);
+    assert_eq!(
+        replica
+            .posix_read_file_distributed(target)
+            .expect("read hardlink target"),
+        b"through authoritative hardlink"
+    );
+    stop.store(true, Ordering::SeqCst);
+    let services_primary = services_thread.join().expect("services primary thread");
+    let link_after = services_primary
+        .posix_namespace_lstat(link)
+        .expect("authoritative hardlink after overwrite");
+    assert_eq!(link_after.kind, DfsObjectKind::Hardlink);
+    assert_eq!(link_after.object_id, link_before.object_id);
+    assert_eq!(
+        services_primary
+            .posix_stat(target)
+            .expect("authoritative hardlink target stat")
+            .content_hash
+            .as_deref(),
+        Some(content_hash(b"through authoritative hardlink").as_str())
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn sifs_cluster_bulk_create_rebases_stale_parent_on_authority() {
     let mut cluster = sifs_two_primary_cluster("sifs-bulk-stale-parent-rebase");
     let parent_path = "/services/bulk-stale-parent";
@@ -39529,6 +39832,10 @@ fn routed_namespace_without_local_replay_omits_response_journal_batches() {
     assert!(
         responses[0].metadata_journal_batches.is_empty(),
         "no-local-replay namespace response must not carry journal batches"
+    );
+    assert!(
+        responses[0].synced_path_object.is_none() && responses[0].synced_path_objects.is_empty(),
+        "no-local-replay namespace response must not refresh and return path objects"
     );
 
     std::fs::remove_dir_all(&root).ok();
@@ -40081,6 +40388,208 @@ fn routed_namespace_cursor_snapshot_uses_cached_state_not_backend_status() {
 }
 
 #[test]
+fn local_eventual_prepare_race_preserves_typed_conflict_in_routed_response() {
+    let root = temp_root("local-eventual-prepare-race-conflict");
+    let primary = NodeId::from_legacy_named("node_prepare_race_primary").expect("primary");
+    let requester = NodeId::from_legacy_named("node_prepare_race_requester").expect("requester");
+    let shards = sifs_two_primary_shard_configs(
+        &primary,
+        &primary,
+        1,
+        vec![requester.clone()],
+        vec![requester.clone()],
+    );
+    let mut kv = InProcessKvStore::new();
+    {
+        let mut control = DfsControlPlaneStore::new(&mut kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                primary.clone(),
+            )))
+            .expect("sifs filesystem config");
+        for shard in &shards {
+            control.put_metadata_shard(shard).expect("metadata shard");
+        }
+    }
+
+    let network = InProcessNetwork::new();
+    let _requester_transport = network.add_node(requester.clone());
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(primary.clone()),
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_control_plane(kv)
+    .with_metadata_backend(
+        open_local_sharded_metadata_backend(root.join("metadata"), shards)
+            .expect("metadata backend"),
+    )
+    .expect("metadata backend attach");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+
+    let path = "/services/prepare-race.bin";
+    let object_id =
+        DfsObjectId::from_legacy_named("obj_prepare_race").expect("prepare-race object");
+    let base_version =
+        DfsVersion::from_legacy_named("version_prepare_race_base").expect("base version");
+    let target_version =
+        DfsVersion::from_legacy_named("version_prepare_race_target").expect("target version");
+    let raced_version =
+        DfsVersion::from_legacy_named("version_prepare_race_winner").expect("winner version");
+    let mut current = DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id: sifs_file_system_id(),
+        path: path.to_string(),
+        kind: DfsObjectKind::File,
+        tombstone_provenance: None,
+        owner_node_id: requester.clone(),
+        current_locations: vec![requester.clone()],
+        content_hash: Some(content_hash(b"prepare-race base")),
+        content_size_bytes: Some(b"prepare-race base".len() as u64),
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 1,
+        modified_at_unix_nanos: 1,
+        created_at_unix_nanos: 1,
+        changed_at_unix_nanos: 1,
+        version: base_version.clone(),
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: Some(EventId::generate()),
+    };
+    dfs.metadata_backend
+        .as_mut()
+        .expect("metadata backend")
+        .put_object(&current)
+        .expect("seed current object");
+    dfs.metadata
+        .add_object(current.clone())
+        .expect("seed current service object");
+
+    let target_event_id = EventId::generate();
+    let mut target = current.clone();
+    target.version = target_version.clone();
+    target.content_hash = Some(content_hash(b"prepare-race target"));
+    target.content_size_bytes = Some(b"prepare-race target".len() as u64);
+    target.modified_at_unix_nanos = 2;
+    target.changed_at_unix_nanos = 2;
+    target.last_modified_by_event_id = Some(target_event_id.clone());
+    let versions = vec![object_version_record(&target, target.content_size_bytes)];
+    let transaction = DfsNamespaceTransaction {
+        transaction_id: namespace_transaction_id_for_batch(
+            "visible-batch",
+            &sifs_file_system_id(),
+            std::slice::from_ref(&target),
+            &versions,
+        ),
+        file_system_id: sifs_file_system_id(),
+        objects: vec![target.clone()],
+        versions,
+        advisory_lock_states: Vec::new(),
+        created_at: OffsetDateTime::UNIX_EPOCH,
+    };
+    let writes = vec![DfsLocalEventualBatchWriteProof {
+        expected_base_version: Some(base_version.clone()),
+        expected_parent_object_id: None,
+        expected_parent_version: None,
+        receipt: DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                committed_version: target_version.clone(),
+                owner_node_id: primary.clone(),
+                event_id: target_event_id,
+            },
+            replica_node_id: requester.clone(),
+            content_hash: target.content_hash.clone(),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        },
+    }];
+
+    current.version = raced_version.clone();
+    current.content_hash = Some(content_hash(b"prepare-race winner"));
+    current.content_size_bytes = Some(b"prepare-race winner".len() as u64);
+    current.modified_at_unix_nanos = 3;
+    current.changed_at_unix_nanos = 3;
+    current.last_modified_by_event_id = Some(EventId::generate());
+    let raced = current;
+    let _hook = crate::service_metadata::install_namespace_prepare_after_expectations_test_hook(
+        move |backend| {
+            backend
+                .put_object(&raced)
+                .expect("install concurrent winner after expectation capture");
+        },
+    );
+
+    let command = DfsNamespaceCommand {
+        request_id: "dfs_net_req_prepare_race_conflict".to_string(),
+        file_system_id: sifs_file_system_id(),
+        requesting_node_id: requester.clone(),
+        include_metadata_journal_batches: false,
+        metadata_journal_after_sequences: Vec::new(),
+        authority_shards: Vec::new(),
+        operation: DfsNamespaceOperation::CommitLocalEventualBatch {
+            transaction: transaction.clone(),
+            writes,
+        },
+    };
+    let event = dfs
+        .handle_namespace_request(requester, command)
+        .expect("serve raced local-eventual batch");
+    let (reason, posix_error) = match event {
+        NetworkedDfsServiceEvent::RemoteNamespaceServed {
+            result:
+                DfsNamespaceResult::Rejected {
+                    reason,
+                    posix_error,
+                    ..
+                },
+            ..
+        } => (reason, posix_error),
+        other => panic!("expected typed prepare conflict, got {other:?}"),
+    };
+    assert!(matches!(
+        &posix_error,
+        Some(DfsNamespacePosixError::Conflict {
+            path: conflict_path,
+            reason,
+        }) if conflict_path == path
+            && reason.contains(base_version.as_str())
+            && reason.contains(raced_version.as_str())
+    ));
+    assert!(matches!(
+        crate::posix_model::posix_error_for_namespace_rejection(reason, posix_error),
+        DfsPosixError::Conflict {
+            path: conflict_path,
+            ..
+        } if conflict_path == path
+    ));
+    assert_eq!(
+        dfs.metadata_backend
+            .as_ref()
+            .expect("metadata backend")
+            .get_object(&object_id)
+            .expect("current object lookup")
+            .expect("current object")
+            .version,
+        raced_version,
+        "the rejected target must not overwrite the concurrent winner"
+    );
+    assert!(
+        dfs.metadata_backend
+            .as_ref()
+            .expect("metadata backend")
+            .get_namespace_transaction(&transaction.transaction_id)
+            .expect("transaction lookup")
+            .is_none(),
+        "a precondition conflict must reject before journaling the transaction"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn local_eventual_batch_shard_selection_lists_control_plane_once_for_bulk_paths() {
     let root = temp_root("local-eventual-batch-shard-selection-once");
     let primary = NodeId::from_legacy_named("node_apply_txn_primary").expect("primary");
@@ -40219,9 +40728,9 @@ fn local_eventual_batch_shard_selection_lists_control_plane_once_for_bulk_paths(
         }
     ));
     assert!(
-        table_snapshot_calls <= 32,
+        table_snapshot_calls <= 10,
         "64-file local-eventual validation opened {table_snapshot_calls} metadata table \
-         snapshots; validation should use a bounded number of coherent bulk snapshots"
+         snapshots; the atomically fused terminal receipt must not be rescanned across every shard"
     );
     assert_eq!(
         range_prefix_calls.load(Ordering::SeqCst),
@@ -40248,6 +40757,119 @@ fn local_eventual_batch_shard_selection_lists_control_plane_once_for_bulk_paths(
             ..
         }
     ));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn routed_local_eventual_batch_preserves_stale_child_as_typed_conflict() {
+    let root = temp_root("local-eventual-batch-stale-child-conflict");
+    let primary = NodeId::from_legacy_named("node_stale_child_primary").expect("primary");
+    let requester = NodeId::from_legacy_named("node_stale_child_requester").expect("requester");
+    let file_system = file_system(primary.clone());
+    let mut current = file_metadata(requester.clone());
+    current.file_system_id = file_system.file_system_id.clone();
+    current.object_id = DfsObjectId::from_legacy_named("object_stale_child").expect("object id");
+    current.path = "/services/stale-child.txt".to_string();
+    current.policy = DfsObjectPolicy::ReplicatedEventual;
+    current.content_hash = Some(content_hash(b"authority-current"));
+    current.content_size_bytes = Some(17);
+    current.version =
+        DfsVersion::from_legacy_named("version_stale_child_current").expect("version");
+
+    let mut backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+            .expect("metadata backend");
+    backend.put_file_system(&file_system).expect("filesystem");
+    backend.put_object(&current).expect("current child");
+
+    let mut proposed = current.clone();
+    proposed.version =
+        DfsVersion::from_legacy_named("version_stale_child_proposed").expect("version");
+    proposed.content_hash = Some(content_hash(b"stale-proposal"));
+    proposed.content_size_bytes = Some(14);
+    proposed.modified_at_unix_nanos = 2;
+    proposed.changed_at_unix_nanos = 2;
+    proposed.last_modified_by_event_id = Some(EventId::generate());
+    let transaction = DfsNamespaceTransaction {
+        transaction_id: "transaction-stale-child".to_string(),
+        file_system_id: file_system.file_system_id.clone(),
+        objects: vec![proposed.clone()],
+        versions: vec![object_version_record(
+            &proposed,
+            proposed.content_size_bytes,
+        )],
+        advisory_lock_states: Vec::new(),
+        created_at: OffsetDateTime::UNIX_EPOCH,
+    };
+    let writes = vec![DfsLocalEventualBatchWriteProof {
+        expected_base_version: Some(
+            DfsVersion::from_legacy_named("version_stale_child_observed").expect("version"),
+        ),
+        expected_parent_object_id: None,
+        expected_parent_version: None,
+        receipt: DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: file_system.file_system_id.clone(),
+                object_id: proposed.object_id.clone(),
+                committed_version: proposed.version.clone(),
+                owner_node_id: primary.clone(),
+                event_id: proposed
+                    .last_modified_by_event_id
+                    .clone()
+                    .expect("write event"),
+            },
+            replica_node_id: requester.clone(),
+            content_hash: proposed.content_hash.clone(),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        },
+    }];
+
+    let network = InProcessNetwork::new();
+    let _requester_transport = network.add_node(requester.clone());
+    let mut service = NetworkedDfsService::new(
+        network.add_node(primary),
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_metadata_backend(backend)
+    .expect("metadata-backed service");
+    let event = service
+        .handle_namespace_request(
+            requester.clone(),
+            DfsNamespaceCommand {
+                request_id: "request-stale-child".to_string(),
+                file_system_id: file_system.file_system_id.clone(),
+                requesting_node_id: requester,
+                include_metadata_journal_batches: false,
+                metadata_journal_after_sequences: Vec::new(),
+                authority_shards: Vec::new(),
+                operation: DfsNamespaceOperation::CommitLocalEventualBatch {
+                    transaction,
+                    writes,
+                },
+            },
+        )
+        .expect("stale child response");
+
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::RemoteNamespaceServed {
+            result: DfsNamespaceResult::Rejected {
+                posix_error: Some(DfsNamespacePosixError::Conflict { ref path, .. }),
+                ..
+            },
+            ..
+        } if path == &current.path
+    ));
+    assert_eq!(
+        service
+            .metadata_backend()
+            .expect("metadata backend")
+            .get_object(&current.object_id)
+            .expect("current child"),
+        Some(current),
+        "stale validation must not mutate authoritative metadata"
+    );
 
     std::fs::remove_dir_all(root).ok();
 }

@@ -7,7 +7,9 @@ use crate::{
     DfsMetadataSnapshotInstallResponse, DfsNamespaceCommand, DfsNamespaceOperation,
     DfsNetworkMessage, DfsOperatorStatus, DfsRoutedMessage, DfsSmokeReport,
 };
-use sinomo_core::network::{NetworkError, ObjectRpcCall, ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_core::network::{
+    NetworkError, ObjectRpcCall, ObjectRpcReplayableCall, ObjectRpcRequest, ObjectRpcResponse,
+};
 use sinomo_core::node::NodeId;
 
 pub const DFS_RPC_CATEGORY: &str = "dfs";
@@ -530,6 +532,18 @@ pub fn dfs_metadata_journal_batch_rpc_call(
     command: &DfsMetadataJournalBatchCommand,
 ) -> Result<ObjectRpcCall, NetworkError> {
     ObjectRpcCall::encode_borrowed_value(
+        DFS_METADATA_JOURNAL_BATCH_ROUTE,
+        DFS_RPC_CATEGORY,
+        command,
+    )
+}
+
+/// Encodes a bounded metadata-journal command once for direct fan-out to
+/// replicas that need the same exact journal suffix.
+pub fn dfs_metadata_journal_batch_replayable_rpc_call(
+    command: &DfsMetadataJournalBatchCommand,
+) -> Result<ObjectRpcReplayableCall, NetworkError> {
+    ObjectRpcCall::encode_replayable_value(
         DFS_METADATA_JOURNAL_BATCH_ROUTE,
         DFS_RPC_CATEGORY,
         command,

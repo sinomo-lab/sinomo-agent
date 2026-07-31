@@ -17,8 +17,8 @@ use sinomo_core::network::ClusterPaths;
 #[cfg(test)]
 use sinomo_core::network::ObjectRpcRequest;
 use sinomo_core::network::{
-    NetworkError, ObjectRpcBodySource, ObjectRpcCall, ObjectRpcIncomingBody, ObjectRpcResponse,
-    ObjectRpcResult, SinomoObjectCodec,
+    NetworkError, ObjectRpcBodySource, ObjectRpcCall, ObjectRpcIncomingBody,
+    ObjectRpcReplayableCall, ObjectRpcResponse, ObjectRpcResult, SinomoObjectCodec,
 };
 use sinomo_core::node::NodeId;
 
@@ -34,9 +34,10 @@ use crate::{
     decode_dfs_metadata_journal_batch_rpc_response, dfs_direct_read_request_from_read_request,
     dfs_direct_read_response_from_rpc_result, dfs_direct_read_rpc_call,
     dfs_message_is_read_only_request, dfs_message_rpc_call, dfs_message_rpc_request,
-    dfs_metadata_journal_batch_rpc_call, dfs_network_message_allows_write_repair_progress,
-    dfs_perf_trace, dfs_perf_trace_enabled, dfs_rejection_is_commit_content_repair_pending,
-    dfs_rejection_is_replica_not_desired, retained_networked_dfs_service_events,
+    dfs_metadata_journal_batch_replayable_rpc_call, dfs_metadata_journal_batch_rpc_call,
+    dfs_network_message_allows_write_repair_progress, dfs_perf_trace, dfs_perf_trace_enabled,
+    dfs_rejection_is_commit_content_repair_pending, dfs_rejection_is_replica_not_desired,
+    retained_networked_dfs_service_events,
 };
 #[cfg(test)]
 use crate::{
@@ -60,10 +61,11 @@ const DFS_METADATA_CHECKPOINT_DIRECT_MAX_INFLIGHT: usize = 2;
 const DFS_METADATA_AUTHORITY_DIRECT_MAX_INFLIGHT: usize = 8;
 /// Keep one slow checkpoint replica from holding a served mutation lane.
 const DFS_METADATA_CHECKPOINT_DIRECT_FANOUT_BUDGET: Duration = Duration::from_millis(250);
-/// Large namespace prepares use segmented value bodies and need enough time to
-/// reach healthy WAN replicas before falling back to the degraded KV fence.
-/// The operation-wide authority deadline remains the tighter normal bound.
-const DFS_METADATA_AUTHORITY_DIRECT_FANOUT_BUDGET: Duration = Duration::from_secs(5);
+/// Large namespace prepares use segmented value bodies, but direct fan-out is
+/// only an optimization before the exact operation-bound cluster-quorum fence.
+/// Bound a wedged sibling independently so it cannot add five seconds before
+/// the safe fallback even starts.
+const DFS_METADATA_AUTHORITY_DIRECT_FANOUT_BUDGET: Duration = Duration::from_secs(1);
 /// Refinement of retry cooling in `replica_promotion_outbox.qnt`.
 ///
 /// Failed replay-safe post-response work is intentionally ineligible for a
@@ -772,13 +774,14 @@ struct DfsPreparedMetadataJournalBatchRpc {
     request_id: String,
     shard_id: crate::DfsMetadataShardId,
     next_after_sequence: u64,
-    command: DfsMetadataJournalBatchCommand,
+    authority_fanout: bool,
+    replayable_call: Arc<ObjectRpcReplayableCall>,
     options: DfsObjectRpcSendOptions,
 }
 
 impl DfsPreparedMetadataJournalBatchRpc {
     fn call(&self) -> Result<ObjectRpcCall, NetworkError> {
-        dfs_metadata_journal_batch_rpc_call(&self.command)
+        Ok(self.replayable_call.call())
     }
 
     fn finish(
@@ -2992,6 +2995,36 @@ fn record_direct_metadata_journal_fanout_outcome(
     }
 }
 
+fn trace_direct_metadata_journal_fanout_peer_outcome(
+    target_node_id: &NodeId,
+    shard_id: &crate::DfsMetadataShardId,
+    next_after_sequence: u64,
+    authority_fanout: bool,
+    started_at: Instant,
+    outcome: &Result<(NodeId, DfsMetadataJournalBatchResponse), NetworkError>,
+) {
+    if !dfs_perf_trace_enabled() {
+        return;
+    }
+    let elapsed_us = started_at.elapsed().as_micros();
+    match outcome {
+        Ok((_, response)) => dfs_perf_trace(format_args!(
+            "direct-metadata-journal-fanout-peer target={} shard={} next_after_sequence={} authority={} elapsed_us={} outcome=response result={:?} verified_authority={}",
+            target_node_id,
+            shard_id.0,
+            next_after_sequence,
+            authority_fanout,
+            elapsed_us,
+            response.result,
+            response.verified_authority_probe_id.is_some(),
+        )),
+        Err(error) => dfs_perf_trace(format_args!(
+            "direct-metadata-journal-fanout-peer target={} shard={} next_after_sequence={} authority={} elapsed_us={} outcome=error error={error}",
+            target_node_id, shard_id.0, next_after_sequence, authority_fanout, elapsed_us,
+        )),
+    }
+}
+
 async fn send_direct_metadata_journal_fanout_async(
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     prepared: Vec<DfsPreparedMetadataJournalBatchRpc>,
@@ -3011,11 +3044,37 @@ async fn send_direct_metadata_journal_fanout_async(
             };
             let peer_transport = Arc::clone(&peer_transport);
             workers.spawn(async move {
-                let call = prepared.call()?;
-                let rpc_response = peer_transport
-                    .call_object_rpc_async(&prepared.target_node_id, call, prepared.options)
-                    .await;
-                prepared.finish(rpc_response)
+                let trace_context = dfs_perf_trace_enabled().then(|| {
+                    (
+                        Instant::now(),
+                        prepared.target_node_id.clone(),
+                        prepared.shard_id.clone(),
+                        prepared.next_after_sequence,
+                        prepared.authority_fanout,
+                    )
+                });
+                let outcome = match prepared.call() {
+                    Ok(call) => {
+                        let rpc_response = peer_transport
+                            .call_object_rpc_async(&prepared.target_node_id, call, prepared.options)
+                            .await;
+                        prepared.finish(rpc_response)
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Some((started_at, target_node_id, shard_id, sequence, authority)) =
+                    trace_context
+                {
+                    trace_direct_metadata_journal_fanout_peer_outcome(
+                        &target_node_id,
+                        &shard_id,
+                        sequence,
+                        authority,
+                        started_at,
+                        &outcome,
+                    );
+                }
+                outcome
             });
         }
         if workers.is_empty() {
@@ -3119,6 +3178,15 @@ fn send_direct_metadata_journal_fanout_blocking(
                     let Some(prepared) = prepared else {
                         break;
                     };
+                    let trace_context = dfs_perf_trace_enabled().then(|| {
+                        (
+                            Instant::now(),
+                            prepared.target_node_id.clone(),
+                            prepared.shard_id.clone(),
+                            prepared.next_after_sequence,
+                            prepared.authority_fanout,
+                        )
+                    });
                     let outcome = match prepared.call() {
                         Ok(call) => {
                             let rpc_response = peer_transport.call_object_rpc(
@@ -3130,6 +3198,18 @@ fn send_direct_metadata_journal_fanout_blocking(
                         }
                         Err(error) => Err(error),
                     };
+                    if let Some((started_at, target_node_id, shard_id, sequence, authority)) =
+                        trace_context
+                    {
+                        trace_direct_metadata_journal_fanout_peer_outcome(
+                            &target_node_id,
+                            &shard_id,
+                            sequence,
+                            authority,
+                            started_at,
+                            &outcome,
+                        );
+                    }
                     if canceled.load(AtomicOrdering::Acquire) || Instant::now() >= deadline {
                         break;
                     }
@@ -3337,7 +3417,7 @@ impl DfsMessageTransport for DfsNodeTransport {
         };
         let fanout_deadline = Instant::now() + fanout_budget;
         // The authority caller installs its operation-specific deadline before
-        // entering this transport: 250 ms for ordinary prepares and 5 seconds
+        // entering this transport: 250 ms for ordinary prepares and 1 second
         // for large streamed prepares. Clamp the fanout scheduler itself as
         // well as each RPC's send options so a queued ordinary probe cannot
         // inherit the large-prepare outer cap.
@@ -3345,7 +3425,8 @@ impl DfsMessageTransport for DfsNodeTransport {
             .operation_deadline
             .map_or(fanout_deadline, |deadline| deadline.min(fanout_deadline));
         let mut prepared = Vec::with_capacity(requests.len());
-        for (target_node_id, command) in requests {
+        let mut replayable_groups = Vec::<(usize, Arc<ObjectRpcReplayableCall>)>::new();
+        for (request_index, (target_node_id, command)) in requests.iter().enumerate() {
             if target_node_id == &self.local_node_id
                 || !self.known_remote_nodes.contains(target_node_id)
             {
@@ -3364,15 +3445,38 @@ impl DfsMessageTransport for DfsNodeTransport {
                     .overall_timeout
                     .map_or(remaining, |timeout| timeout.min(remaining)),
             );
+            let replayable_call = replayable_groups
+                .iter()
+                .find(|(prior_index, _)| &requests[*prior_index].1 == command)
+                .map(|(_, call)| Arc::clone(call));
+            let replayable_call = match replayable_call {
+                Some(call) => call,
+                None => {
+                    let call = Arc::new(dfs_metadata_journal_batch_replayable_rpc_call(command)?);
+                    replayable_groups.push((request_index, Arc::clone(&call)));
+                    call
+                }
+            };
             prepared.push(DfsPreparedMetadataJournalBatchRpc {
                 target_node_id: target_node_id.clone(),
                 request_id: command.request_id.clone(),
                 shard_id: command.batch.shard_id.clone(),
                 next_after_sequence: command.batch.next_after_sequence,
-                command: command.clone(),
+                authority_fanout: command.authority_probe.is_some(),
+                replayable_call,
                 options,
             });
         }
+        dfs_perf_trace(format_args!(
+            "direct-metadata-journal-fanout-encoding authority={} requests={} distinct_values={} encoded_bytes={}",
+            authority_fanout,
+            prepared.len(),
+            replayable_groups.len(),
+            replayable_groups
+                .iter()
+                .map(|(_, call)| call.encoded_value_bytes())
+                .sum::<usize>(),
+        ));
 
         if let (Some(async_peer_transport), Ok(runtime)) =
             (async_peer_transport, tokio::runtime::Handle::try_current())

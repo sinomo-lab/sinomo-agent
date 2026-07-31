@@ -3048,11 +3048,15 @@ pub(crate) fn object_version_record(
 
 pub(crate) fn normalized_object_metadata(object: &DfsObjectMetadata) -> DfsObjectMetadata {
     let mut object = object.clone();
+    normalize_object_metadata_in_place(&mut object);
+    object
+}
+
+fn normalize_object_metadata_in_place(object: &mut DfsObjectMetadata) {
     normalize_node_locations(&mut object.current_locations);
     if object.kind != crate::DfsObjectKind::Tombstone {
         object.tombstone_provenance = None;
     }
-    object
 }
 
 pub(crate) fn normalized_version_record(
@@ -3067,8 +3071,13 @@ pub(crate) fn normalized_namespace_transaction(
     transaction: &DfsNamespaceTransaction,
 ) -> DfsNamespaceTransaction {
     let mut transaction = transaction.clone();
+    normalize_namespace_transaction_in_place(&mut transaction);
+    transaction
+}
+
+fn normalize_namespace_transaction_in_place(transaction: &mut DfsNamespaceTransaction) {
     for object in &mut transaction.objects {
-        *object = normalized_object_metadata(object);
+        normalize_object_metadata_in_place(object);
     }
     for version in &mut transaction.versions {
         normalize_node_locations(&mut version.locations);
@@ -3076,14 +3085,13 @@ pub(crate) fn normalized_namespace_transaction(
     for state in &mut transaction.advisory_lock_states {
         state.authority_rebind_required = true;
     }
-    transaction
 }
 
 pub(crate) fn normalized_namespace_prepare(
     prepare: &DfsNamespacePrepareRecord,
 ) -> DfsNamespacePrepareRecord {
     let mut prepare = prepare.clone();
-    prepare.transaction = normalized_namespace_transaction(&prepare.transaction);
+    normalize_namespace_transaction_in_place(&mut prepare.transaction);
     for expected in &mut prepare.expected_path_occupants {
         expected.path = crate::metadata_keys::normalize_path(&expected.path);
     }
@@ -3183,6 +3191,78 @@ mod tests {
             created_at: OffsetDateTime::UNIX_EPOCH,
             visible: true,
         }
+    }
+
+    #[test]
+    fn namespace_prepare_normalization_is_idempotent_and_does_not_mutate_input() {
+        let mut object = object(version("version_normalize_prepare"));
+        object.current_locations = vec![
+            node("node_z"),
+            node("node_a"),
+            node("node_z"),
+            node("node_owner"),
+        ];
+        let mut version_record = version_record(&object);
+        version_record.locations = object.current_locations.clone();
+        let prepare = DfsNamespacePrepareRecord {
+            operation_id: "operation-normalize-prepare".to_string(),
+            file_system_id: file_system_id(),
+            shard_id: DfsMetadataShardId::new("root"),
+            owner_epoch: 1,
+            operation_digest: "blake3:normalize-prepare".to_string(),
+            expected_object_versions: vec![DfsNamespaceObjectVersionExpectation {
+                object_id: object.object_id.clone(),
+                expected_version: None,
+            }],
+            expected_path_occupants: vec![
+                DfsNamespacePathOccupantExpectation {
+                    path: "/docs//z".to_string(),
+                    expected_object_id: None,
+                },
+                DfsNamespacePathOccupantExpectation {
+                    path: "/docs/./a".to_string(),
+                    expected_object_id: None,
+                },
+            ],
+            content_receipts: Vec::new(),
+            transaction: DfsNamespaceTransaction {
+                transaction_id: "transaction-normalize-prepare".to_string(),
+                file_system_id: file_system_id(),
+                objects: vec![object],
+                versions: vec![version_record],
+                advisory_lock_states: Vec::new(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            },
+            completed_request: None,
+            completed_request_completion: None,
+            status: DfsNamespacePrepareStatus::Prepared,
+        };
+        let original = prepare.clone();
+
+        let normalized = normalized_namespace_prepare(&prepare);
+        assert_eq!(prepare, original, "normalization must preserve its input");
+        assert_eq!(
+            normalized_namespace_prepare(&normalized),
+            normalized,
+            "normalization must be idempotent"
+        );
+        let expected_locations = vec![node("node_z"), node("node_a"), node("node_owner")];
+        assert_eq!(
+            normalized.transaction.objects[0].current_locations,
+            expected_locations
+        );
+        assert_eq!(
+            normalized.transaction.versions[0].locations,
+            expected_locations
+        );
+        assert_eq!(
+            normalized
+                .expected_path_occupants
+                .iter()
+                .map(|expected| expected.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["docs/./a", "docs//z"]
+        );
     }
 
     #[test]
