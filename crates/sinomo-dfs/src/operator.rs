@@ -3,9 +3,9 @@
 use crate::metadata_pages::{collect_metadata_pages, walk_metadata_pages};
 use crate::{
     DfsConflictPageCursor, DfsConflictRecord, DfsConflictStatus, DfsFileSystem, DfsMetadataBackend,
-    DfsMetadataShardStatus, DfsObjectMetadata, DfsObjectPageCursor, DfsObjectVersionRecord,
-    DfsRepairAttemptRecord, DfsReplicaReceiptRecord, DfsWriteIntentRecord, DfsWriteIntentStatus,
-    MetadataBackendError,
+    DfsMetadataShardStatus, DfsMetadataSummary, DfsObjectMetadata, DfsObjectPageCursor,
+    DfsObjectVersionRecord, DfsRepairAttemptRecord, DfsReplicaReceiptRecord, DfsWriteIntentRecord,
+    DfsWriteIntentStatus, MetadataBackendError,
 };
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -288,6 +288,13 @@ impl<'a> DfsOperatorInspector<'a> {
 
     pub fn status(&self) -> Result<DfsOperatorStatus, MetadataBackendError> {
         let summary = self.backend.metadata_summary()?;
+        self.status_from_summary(summary)
+    }
+
+    pub(crate) fn status_from_summary(
+        &self,
+        summary: DfsMetadataSummary,
+    ) -> Result<DfsOperatorStatus, MetadataBackendError> {
         Ok(DfsOperatorStatus {
             file_system_count: summary.file_system_count,
             object_count: summary.object_count,

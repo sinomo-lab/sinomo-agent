@@ -6989,6 +6989,173 @@ impl DfsTransportIdentity for DfsNodeServedMessageTransport {
     }
 }
 
+impl AsyncDfsMessageTransport for DfsNodeServedMessageTransport {
+    fn local_node_id(&self) -> &NodeId {
+        DfsTransportIdentity::local_node_id(self)
+    }
+
+    fn send_routed_call_async<'a>(
+        &'a mut self,
+        target_node_id: &'a NodeId,
+        call: DfsRoutedCall,
+    ) -> DfsMessageTransportFuture<'a, Result<(), NetworkError>> {
+        Box::pin(async move {
+            let DfsRoutedCall {
+                message,
+                attachment,
+            } = call;
+            if &message.target_node_id != target_node_id {
+                return Err(NetworkError::FrameTargetMismatch {
+                    requested_target_node_id: target_node_id.clone(),
+                    frame_target_node_id: message.target_node_id.clone(),
+                });
+            }
+            if target_node_id == &self.local_node_id {
+                let message =
+                    crate::message_transport::materialize_dfs_routed_call(DfsRoutedCall {
+                        message,
+                        attachment,
+                    })
+                    .await?;
+                self.inbound_messages.push_back(message);
+                return Ok(());
+            }
+            if self
+                .return_node_id
+                .as_ref()
+                .is_some_and(|return_node_id| target_node_id == return_node_id)
+                && dfs_network_message_can_return_to_served_caller(&message.message)
+            {
+                if attachment.is_some() && self.outbound_attachment.is_some() {
+                    return Err(NetworkError::Serialization {
+                        detail: "DFS served response attempted to return more than one attachment"
+                            .to_string(),
+                    });
+                }
+                self.outbound_messages.push(message);
+                if let Some(attachment) = attachment {
+                    self.outbound_attachment = Some(attachment);
+                }
+                return Ok(());
+            }
+            self.node_transport
+                .send_routed_call_to_peer_async(
+                    target_node_id,
+                    DfsRoutedCall {
+                        message,
+                        attachment,
+                    },
+                    true,
+                )
+                .await
+        })
+    }
+
+    fn send_routed_calls_bounded_async<'a>(
+        &'a mut self,
+        requests: Vec<DfsRoutedSend>,
+        max_inflight: usize,
+    ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedSendOutcome>, NetworkError>> {
+        Box::pin(async move {
+            let request_count = requests.len();
+            let mut outcomes = std::iter::repeat_with(|| None)
+                .take(request_count)
+                .collect::<Vec<Option<DfsRoutedSendOutcome>>>();
+            let mut peer_requests = Vec::new();
+
+            for (index, request) in requests.into_iter().enumerate() {
+                let handled_by_served_lane =
+                    request.target_node_id == self.local_node_id
+                        || (self.return_node_id.as_ref().is_some_and(|return_node_id| {
+                            &request.target_node_id == return_node_id
+                        }) && dfs_network_message_can_return_to_served_caller(
+                            &request.call.message.message,
+                        ));
+                if handled_by_served_lane {
+                    let target_node_id = request.target_node_id;
+                    let result = self
+                        .send_routed_call_async(&target_node_id, request.call)
+                        .await;
+                    outcomes[index] = Some(DfsRoutedSendOutcome {
+                        target_node_id,
+                        result,
+                    });
+                } else {
+                    peer_requests.push((index, request));
+                }
+            }
+
+            if !peer_requests.is_empty() {
+                let peer_indexes = peer_requests
+                    .iter()
+                    .map(|(index, request)| (*index, request.target_node_id.clone()))
+                    .collect::<Vec<_>>();
+                let peer_outcomes = self
+                    .node_transport
+                    .send_routed_calls_bounded_async(
+                        peer_requests
+                            .into_iter()
+                            .map(|(_, request)| request)
+                            .collect(),
+                        max_inflight,
+                    )
+                    .await?;
+                if peer_outcomes.len() != peer_indexes.len() {
+                    return Err(NetworkError::Serialization {
+                        detail: "DFS served async call fan-out returned the wrong outcome count"
+                            .to_string(),
+                    });
+                }
+                for ((index, expected_target), outcome) in
+                    peer_indexes.into_iter().zip(peer_outcomes)
+                {
+                    if outcome.target_node_id != expected_target {
+                        return Err(NetworkError::Serialization {
+                            detail: format!(
+                                "DFS served async call fan-out expected target {expected_target}, got {}",
+                                outcome.target_node_id
+                            ),
+                        });
+                    }
+                    outcomes[index] = Some(outcome);
+                }
+            }
+
+            outcomes
+                .into_iter()
+                .map(|outcome| {
+                    outcome.ok_or_else(|| NetworkError::Serialization {
+                        detail: "DFS served async call fan-out omitted an outcome".to_string(),
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn drain_incoming_messages_async<'a>(
+        &'a mut self,
+    ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedMessage>, NetworkError>> {
+        Box::pin(async move {
+            let mut messages = self.inbound_messages.drain(..).collect::<Vec<_>>();
+            messages.extend(self.node_transport.drain_incoming_messages_async().await?);
+            Ok(messages)
+        })
+    }
+
+    fn pending_incoming_count_async<'a>(
+        &'a mut self,
+    ) -> DfsMessageTransportFuture<'a, Result<Option<usize>, NetworkError>> {
+        Box::pin(async move {
+            let nested = self
+                .node_transport
+                .pending_incoming_count_async()
+                .await?
+                .unwrap_or_default();
+            Ok(Some(self.inbound_messages.len().saturating_add(nested)))
+        })
+    }
+}
+
 impl DfsMessageTransport for DfsNodeServedMessageTransport {
     fn send_routed_call(
         &mut self,

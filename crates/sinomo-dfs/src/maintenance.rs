@@ -38,11 +38,11 @@ use crate::{
     async_dfs_metadata_snapshot_install_sender_from_peer_transport,
     cluster_dfs_all_file_system_configs, cluster_dfs_all_metadata_shard_head_watermarks,
     cluster_dfs_all_metadata_shard_membership_handoffs, cluster_dfs_all_metadata_shards,
-    cluster_dfs_metadata_shards, cluster_dfs_peer_node_ids, dfs_message_sender_from_peer_transport,
-    dfs_metadata_journal_batch_sender_from_peer_transport, dfs_metadata_replication_notice_lines,
-    dfs_metadata_replication_sent_count, dfs_metadata_snapshot_install_sender_from_peer_transport,
-    dfs_now_unix_nanos, dfs_path_safe_segment, distributed_sifs,
-    open_cluster_dfs_service_with_message_sender,
+    cluster_dfs_metadata_shards, cluster_dfs_peer_node_ids, default_dfs_content_root_catalog_store,
+    dfs_message_sender_from_peer_transport, dfs_metadata_journal_batch_sender_from_peer_transport,
+    dfs_metadata_replication_notice_lines, dfs_metadata_replication_sent_count,
+    dfs_metadata_snapshot_install_sender_from_peer_transport, dfs_now_unix_nanos,
+    dfs_path_safe_segment, distributed_sifs, open_cluster_dfs_service_with_message_sender,
     open_cluster_dfs_service_with_peer_transports_for_nodes,
     open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state,
     open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state_until_cancelled,
@@ -319,6 +319,92 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_deta
         options,
     )
     .await
+}
+
+/// Refresh cluster KV for maintenance and return the exact resulting bootstrap
+/// state.
+///
+/// A reusable backend must be selected only after this refresh so topology
+/// changes observed while maintenance waited for admission cannot run against
+/// a stale service generation.
+pub async fn refresh_cluster_dfs_maintenance_state_with_peer_transport(
+    runtime: &tokio::runtime::Handle,
+    cluster_paths: &ClusterPaths,
+    peer_transport: &dyn DfsPeerTransport,
+) -> Result<sinomo_core::ClusterBootstrapState, DfsError> {
+    refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport(
+        cluster_paths,
+        peer_transport,
+    )?;
+    sinomo_core::cluster::read_cluster_state_without_kv_async(runtime, cluster_paths)
+        .await
+        .map_err(DfsError::from_network)
+}
+
+/// Run one cluster maintenance tick against a reusable service after the
+/// caller refreshed cluster KV and captured the returned bootstrap state.
+///
+/// Keeping refresh and execution as distinct steps lets the daemon validate
+/// the cached backend generation against the exact post-refresh authority
+/// image before it transfers ownership into this cancellable future.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_cluster_dfs_maintenance_tick_with_reusable_service_until_hydration_cancelled<T>(
+    service: &mut NetworkedDfsService<T>,
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    state: sinomo_core::ClusterBootstrapState,
+    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    execution_exclusions: DfsMaintenanceExecutionExclusions,
+    committed_work_tracker: DfsCommittedWorkTracker,
+    should_cancel_hydration: &(dyn Fn() -> bool + Sync),
+    options: DfsMaintenanceTickOptions,
+) -> Result<Option<DfsMaintenanceTickReport>, DfsError>
+where
+    T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
+{
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| DfsError::Metadata {
+            message: source.to_string(),
+        })?;
+    if !cluster_paths.state.exists() {
+        return Ok(None);
+    }
+
+    service.refresh_control_plane_latest()?;
+    let local_node_id = state.local_node_id.clone();
+    let file_system = distributed_sifs(local_node_id.clone());
+    let metadata_shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
+    let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+
+    service.set_committed_work_tracker(committed_work_tracker);
+    if !service.hydrate_from_metadata_backend_for_commit_promotion_recovery_until_cancelled(
+        should_cancel_hydration,
+    )? {
+        return Ok(None);
+    }
+
+    let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
+    let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
+    let mut metadata_transport = AsyncDfsMetadataNodeTransport::new(
+        peer_node_ids,
+        async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
+    );
+    run_dfs_maintenance_tick_with_async_host_and_execution_exclusions(
+        service,
+        &mut maintenance_host,
+        &data_dir,
+        file_system.file_system_id,
+        &local_node_id,
+        metadata_shards,
+        &mut metadata_publisher_host,
+        &mut metadata_transport,
+        &execution_exclusions,
+        options,
+    )
+    .await
+    .map(Some)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1096,6 +1182,7 @@ pub struct DfsMaintenanceRunOptions {
     pub content_orphan_gc_max_records: u64,
     pub content_root_catalog_max_age: Duration,
     pub content_root_catalog_max_pages_per_shard: usize,
+    pub reconcile_content_reservations: bool,
     pub content_reservation_rejection_grace: Duration,
     pub content_reservation_reconciliation_max_records: u64,
 }
@@ -1127,6 +1214,7 @@ impl Default for DfsMaintenanceRunOptions {
             content_root_catalog_max_age: DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_AGE,
             content_root_catalog_max_pages_per_shard:
                 DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_PAGES_PER_SHARD,
+            reconcile_content_reservations: false,
             content_reservation_rejection_grace: DEFAULT_DFS_CONTENT_RESERVATION_REJECTION_GRACE,
             content_reservation_reconciliation_max_records:
                 DEFAULT_DFS_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS,
@@ -1265,7 +1353,9 @@ pub fn run_dfs_lifecycle_maintenance_with_host<T: DfsMessageTransport>(
 }
 
 fn dfs_content_gc_requested(options: DfsMaintenanceRunOptions) -> bool {
-    options.collect_content_versions || options.collect_orphan_content
+    options.collect_content_versions
+        || options.collect_orphan_content
+        || options.reconcile_content_reservations
 }
 
 fn dfs_metadata_lifecycle_options(
@@ -1273,6 +1363,7 @@ fn dfs_metadata_lifecycle_options(
 ) -> DfsMaintenanceRunOptions {
     options.collect_content_versions = false;
     options.collect_orphan_content = false;
+    options.reconcile_content_reservations = false;
     options
 }
 
@@ -1322,21 +1413,27 @@ fn dfs_content_gc_lifecycle_options(
             None => orphan_gc,
         }
     });
-    let content_reservation_reconciliation =
-        catalog_observation
-            .as_ref()
-            .map(|(generation, _, installed_at_unix_nanos)| {
-                // The reconciliation option predates the distinction between
-                // remote generation time and local installation time. Its
-                // timestamp is causal evidence, so pass the sealed local
-                // installation observation.
-                ContentStoreReservationReconciliationOptions::bounded(
-                    *installed_at_unix_nanos,
-                    options.content_reservation_rejection_grace,
-                    options.content_reservation_reconciliation_max_records,
-                )
-                .with_catalog_generation(generation.clone())
-            });
+    let reconcile_content_reservations = options.reconcile_content_reservations
+        || options.collect_content_versions
+        || options.collect_orphan_content;
+    let content_reservation_reconciliation = reconcile_content_reservations
+        .then(|| {
+            catalog_observation
+                .as_ref()
+                .map(|(generation, _, installed_at_unix_nanos)| {
+                    // The reconciliation option predates the distinction between
+                    // remote generation time and local installation time. Its
+                    // timestamp is causal evidence, so pass the sealed local
+                    // installation observation.
+                    ContentStoreReservationReconciliationOptions::bounded(
+                        *installed_at_unix_nanos,
+                        options.content_reservation_rejection_grace,
+                        options.content_reservation_reconciliation_max_records,
+                    )
+                    .with_catalog_generation(generation.clone())
+                })
+        })
+        .flatten();
 
     DfsLifecycleMaintenanceOptions {
         version_gc,
@@ -1345,6 +1442,57 @@ fn dfs_content_gc_lifecycle_options(
         content_reservation_reconciliation,
         ..DfsLifecycleMaintenanceOptions::default()
     }
+}
+
+fn run_dfs_content_reservation_reconciliation_with_installed_catalog<T: DfsMessageTransport>(
+    service: &mut NetworkedDfsService<T>,
+    content_root: &Path,
+    options: DfsMaintenanceRunOptions,
+) -> Result<Option<DfsLifecycleMaintenanceReport>, DfsError> {
+    let catalog = match default_dfs_content_root_catalog_store(content_root).load() {
+        Ok(Some(catalog)) => catalog,
+        Ok(None) => {
+            crate::dfs_perf_trace(format_args!(
+                "content-reservation-catalog-reuse-miss reason=not-installed"
+            ));
+            return Ok(None);
+        }
+        Err(error) => {
+            crate::dfs_perf_trace(format_args!(
+                "content-reservation-catalog-reuse-miss reason=load-error error={error}"
+            ));
+            return Ok(None);
+        }
+    };
+    if !catalog.is_durably_installed() || !catalog.is_complete() {
+        crate::dfs_perf_trace(format_args!(
+            "content-reservation-catalog-reuse-miss reason=incomplete"
+        ));
+        return Ok(None);
+    }
+    let catalog_generation = catalog.generation_fingerprint()?;
+    let catalog_versions = catalog
+        .protected_version_pairs()
+        .expect("complete installed content-root catalog has version roots");
+    let report = service.reconcile_content_reservations_from_installed_catalog(
+        &catalog_versions,
+        &catalog_generation,
+        options.content_reservation_reconciliation_max_records,
+    )?;
+    let reconciliation = report
+        .content_reservation_reconciliation
+        .as_ref()
+        .expect("reservation-only reconciliation returns its report");
+    crate::dfs_perf_trace(format_args!(
+        "content-reservation-catalog-reuse catalog_generation={} catalog_versions={} examined={} released_covered={} remaining={} has_more={}",
+        catalog_generation,
+        catalog_versions.len(),
+        reconciliation.examined_reservation_count,
+        reconciliation.released_catalog_covered_count,
+        reconciliation.remaining_after_batch_count,
+        reconciliation.has_more
+    ));
+    Ok(Some(report))
 }
 
 fn run_dfs_content_gc_with_catalog<T: DfsMessageTransport>(
@@ -1358,6 +1506,16 @@ fn run_dfs_content_gc_with_catalog<T: DfsMessageTransport>(
 ) -> Result<Option<DfsLifecycleMaintenanceReport>, DfsError> {
     if !dfs_content_gc_requested(options) {
         return Ok(None);
+    }
+
+    let destructive_content_gc_requested =
+        options.collect_content_versions || options.collect_orphan_content;
+    if !destructive_content_gc_requested {
+        return run_dfs_content_reservation_reconciliation_with_installed_catalog(
+            service,
+            content_root,
+            options,
+        );
     }
 
     let validation = match service.refresh_content_root_catalog(
@@ -2068,6 +2226,11 @@ mod causal_time_tests {
                 Duration::from_nanos(100),
             )
             .expect("validate catalog");
+        let content_gc_options = DfsMaintenanceRunOptions {
+            collect_content_versions: true,
+            reconcile_content_reservations: true,
+            ..DfsMaintenanceRunOptions::default()
+        };
         assert!(validation.is_collection_authorized());
         assert_eq!(
             validation.catalog_generated_at_unix_nanos(),
@@ -2078,13 +2241,7 @@ mod causal_time_tests {
             Some(installed_at_unix_nanos)
         );
 
-        let options = dfs_content_gc_lifecycle_options(
-            DfsMaintenanceRunOptions {
-                collect_content_versions: true,
-                ..DfsMaintenanceRunOptions::default()
-            },
-            validation,
-        );
+        let options = dfs_content_gc_lifecycle_options(content_gc_options, validation);
         assert_eq!(
             options
                 .version_gc

@@ -6888,6 +6888,98 @@ fn content_root_catalog_refresh_failure_durably_invalidates_previous_catalog() {
     std::fs::remove_dir_all(root).ok();
 }
 
+#[test]
+fn content_root_catalog_continuations_do_not_repeat_control_plane_refresh() {
+    let root = temp_root("content-root-catalog-control-plane-once");
+    let primary = NodeId::from_legacy_named("node_catalog_primary").expect("primary");
+    let file_system = file_system(primary.clone());
+    let file_system_config = DfsFileSystemConfig::from(&file_system);
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: Vec::new(),
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let current_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    current_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&file_system_config)
+            .expect("filesystem config");
+        control.put_metadata_shard(&shard).expect("metadata shard");
+    });
+
+    let mut metadata =
+        open_root_local_metadata_backend(root.join("metadata")).expect("metadata backend");
+    metadata
+        .put_file_system(&file_system)
+        .expect("metadata filesystem");
+    let mut object = file_metadata(primary.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    metadata.put_object(&object).expect("metadata object");
+    for index in 0..1_100_u64 {
+        metadata
+            .put_version(&DfsObjectVersionRecord {
+                file_system_id: file_system.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                version: DfsVersion::from_legacy_named(format!(
+                    "version_catalog_control_plane_{index:04}"
+                ))
+                .expect("catalog version"),
+                content_hash: Some(format!("blake3:{index:064x}")),
+                size_bytes: Some(index),
+                locations: vec![primary.clone()],
+                created_by_event_id: None,
+                created_at: OffsetDateTime::UNIX_EPOCH
+                    + time::Duration::seconds(index.try_into().expect("timestamp")),
+                visible: true,
+            })
+            .expect("metadata version");
+    }
+
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let control_plane = RefreshingDfsControlPlaneKvClient::new(
+        InProcessKvStore::new(),
+        current_kv,
+        Arc::clone(&refreshes),
+    );
+    let network = InProcessNetwork::new();
+    let content_root = root.join("content");
+    let content = LocalContentStore::new(&content_root).expect("content");
+    let mut service = NetworkedDfsService::new(network.add_node(primary), content)
+        .with_control_plane(control_plane)
+        .with_metadata_backend(metadata)
+        .expect("metadata service");
+    refreshes.store(0, Ordering::SeqCst);
+
+    let catalog = service
+        .refresh_content_root_catalog(
+            std::slice::from_ref(&file_system_config),
+            std::slice::from_ref(&shard),
+            &[],
+            &content_root,
+            &[],
+            16,
+        )
+        .expect("multi-page catalog refresh");
+    assert!(catalog.is_complete());
+    assert!(
+        catalog.fragments()[0].entries.len() > DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT,
+        "fixture must require a continuation page"
+    );
+    assert_eq!(
+        refreshes.load(Ordering::SeqCst),
+        3,
+        "refresh should read topology before and after the drain and prove authority once, not once per page"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
 fn drain_dfs_messages(
     transport: &mut sinomo_core::network::InProcessTransport,
 ) -> Vec<DfsNetworkMessage> {
@@ -7181,6 +7273,75 @@ fn lifecycle_maintenance_runs_version_blob_and_tombstone_collection() {
             .expect("compacted tombstone marker")
             .kind,
         DfsObjectKind::Tombstone
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn installed_catalog_reconciliation_only_releases_positively_covered_reservations() {
+    let root = temp_root("installed-catalog-positive-reservation-reconciliation");
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let covered = content
+        .put_object_version(
+            "catalog-covered-object",
+            "version_1",
+            b"catalog-covered bytes",
+        )
+        .expect("put catalog-covered version");
+    let uncovered = content
+        .put_object_version(
+            "catalog-uncovered-object",
+            "version_1",
+            b"catalog-uncovered bytes",
+        )
+        .expect("put catalog-uncovered version");
+    let node_id = NodeId::from_legacy_named("node_installed_catalog_reconciliation").expect("node");
+    let network = InProcessNetwork::new();
+    let mut dfs = NetworkedDfsService::new(network.add_node(node_id), content);
+    let catalog_versions =
+        BTreeSet::from([("catalog-covered-object".to_owned(), "version_1".to_owned())]);
+
+    let report = dfs
+        .reconcile_content_reservations_from_installed_catalog(
+            &catalog_versions,
+            "installed-catalog-generation",
+            u64::MAX,
+        )
+        .expect("reconcile reservations from installed catalog");
+    let reconciliation = report
+        .content_reservation_reconciliation
+        .expect("reservation reconciliation report");
+    assert_eq!(reconciliation.reservation_count, 2);
+    assert_eq!(reconciliation.examined_reservation_count, 2);
+    assert_eq!(reconciliation.released_catalog_covered_count, 1);
+    assert_eq!(reconciliation.released_rejected_count, 0);
+    assert_eq!(reconciliation.retained_catalog_too_old_count, 1);
+
+    let reservations = dfs
+        .content
+        .content_reservation_roots()
+        .expect("remaining reservations");
+    assert_eq!(reservations.reservation_count, 1);
+    assert_eq!(
+        reservations.reservations[0].identity.object_id,
+        "catalog-uncovered-object"
+    );
+    dfs.content
+        .read_manifest("catalog-covered-object", "version_1")
+        .expect("positive reconciliation must not collect covered manifests");
+    dfs.content
+        .read_manifest("catalog-uncovered-object", "version_1")
+        .expect("uncovered reservations must remain protected");
+    assert!(
+        dfs.content
+            .has_blob(&covered.content_hash)
+            .expect("covered blob remains")
+    );
+    assert!(
+        dfs.content
+            .has_blob(&uncovered.content_hash)
+            .expect("uncovered blob remains")
     );
 
     std::fs::remove_dir_all(root).ok();

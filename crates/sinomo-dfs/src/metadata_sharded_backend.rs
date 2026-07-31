@@ -111,7 +111,7 @@ struct DfsMetadataRoutingTopologyHistory {
     fallbacks: Vec<Vec<DfsMetadataShardConfig>>,
 }
 
-fn routing_topology_history_path(root: &std::path::Path) -> PathBuf {
+pub(crate) fn routing_topology_history_path(root: &std::path::Path) -> PathBuf {
     root.join("shard-index").join("routing-topologies.sobj")
 }
 
@@ -352,6 +352,35 @@ impl LocalShardedMetadataBackend {
 
     pub(crate) fn shard_ids(&self) -> Vec<DfsMetadataShardId> {
         self.shards.keys().cloned().collect()
+    }
+
+    /// Refresh and pin every inspection-only shard without taking writer locks
+    /// or running authoritative recovery.
+    pub(crate) fn begin_inspection_snapshot(&mut self) -> Result<()> {
+        let shard_ids = self.shards.keys().cloned().collect::<Vec<_>>();
+        for (index, shard_id) in shard_ids.iter().enumerate() {
+            let begin = self
+                .shards
+                .get_mut(shard_id)
+                .expect("collected shard id remains installed")
+                .begin_inspection_snapshot();
+            if let Err(error) = begin {
+                for pinned_shard_id in &shard_ids[..index] {
+                    self.shards
+                        .get_mut(pinned_shard_id)
+                        .expect("pinned inspection shard remains installed")
+                        .end_inspection_snapshot();
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn end_inspection_snapshot(&mut self) {
+        for backend in self.shards.values_mut() {
+            backend.end_inspection_snapshot();
+        }
     }
 
     fn shard_is_local_authoritative_primary(&self, shard_id: &DfsMetadataShardId) -> bool {
@@ -3999,18 +4028,51 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn metadata_summary(&self) -> Result<DfsMetadataSummary> {
-        let mut summary = DfsMetadataSummary {
-            file_system_count: self.list_file_systems()?.len(),
-            ..DfsMetadataSummary::default()
-        };
+        self.metadata_status_summaries().map(|(summary, _)| summary)
+    }
+
+    fn metadata_summary_for_local_primary_shards(&self) -> Result<DfsMetadataSummary> {
+        let mut summary = DfsMetadataSummary::default();
+        let mut file_system_ids = BTreeSet::new();
         for (shard_id, backend) in &self.shards {
+            if !self.shard_is_local_authoritative_primary(shard_id) {
+                continue;
+            }
+            if let Some(config) = self.shard_configs.get(&shard_id.0) {
+                file_system_ids.insert(config.file_system_id.clone());
+            }
             let tables = backend.current_tables_snapshot()?;
             let shard_summary = metadata_summary_from_tables(&tables, |object| {
                 self.object_is_listable_from_shard(object, shard_id)
             })?;
             accumulate_metadata_summary_detail_counts(&mut summary, &shard_summary);
         }
+        summary.file_system_count = file_system_ids.len();
         Ok(summary)
+    }
+
+    fn metadata_status_summaries(&self) -> Result<(DfsMetadataSummary, DfsMetadataSummary)> {
+        let mut summary = DfsMetadataSummary::default();
+        let mut primary_summary = DfsMetadataSummary::default();
+        let mut file_system_ids = BTreeSet::new();
+        let mut primary_file_system_ids = BTreeSet::new();
+        for (shard_id, backend) in &self.shards {
+            let tables = backend.current_tables_snapshot()?;
+            file_system_ids.extend(tables.file_systems.keys().cloned());
+            let shard_summary = metadata_summary_from_tables(&tables, |object| {
+                self.object_is_listable_from_shard(object, shard_id)
+            })?;
+            accumulate_metadata_summary_detail_counts(&mut summary, &shard_summary);
+            if self.shard_is_local_authoritative_primary(shard_id) {
+                if let Some(config) = self.shard_configs.get(&shard_id.0) {
+                    primary_file_system_ids.insert(config.file_system_id.clone());
+                }
+                accumulate_metadata_summary_detail_counts(&mut primary_summary, &shard_summary);
+            }
+        }
+        summary.file_system_count = file_system_ids.len();
+        primary_summary.file_system_count = primary_file_system_ids.len();
+        Ok((summary, primary_summary))
     }
 
     fn metadata_summary_for_file_system(

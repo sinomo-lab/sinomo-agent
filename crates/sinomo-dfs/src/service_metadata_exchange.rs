@@ -466,7 +466,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         {
                             // The catalog wire shape predates the larger page
                             // limit. During a rolling upgrade an older primary
-                            // safely rejects 1,024 entries, so retry the first
+                            // safely rejects the larger request, so retry the first
                             // page at the historical 256-entry contract. Any
                             // second failure remains fail-closed.
                             request.max_entries = DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES;
@@ -569,6 +569,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .min()
             .unwrap_or_else(crate::metadata_tombstone::metadata_now_unix_nanos);
         let identity_count = identities.len();
+        let catalog_complete = fragments
+            .iter()
+            .all(DfsContentRootCatalogFragment::is_complete);
         let catalog = DfsContentRootCatalog::from_topology_fragments(
             expected_topology_digest,
             expected_topology.file_system_ids(),
@@ -586,7 +589,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             identity_count,
             total_pages,
             total_entries,
-            catalog.is_complete(),
+            catalog_complete,
             trace_started.elapsed().as_millis()
         ));
         Ok(catalog)
@@ -598,9 +601,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsContentRootCatalogPage, DfsError> {
         request.validate()?;
         let generated_at_unix_nanos = crate::metadata_tombstone::metadata_now_unix_nanos();
-        self.refresh_control_plane_latest()?;
-
-        let Some(control_plane) = self.control_plane.as_mut() else {
+        if request.identity.primary_node_id != self.node_id {
             return Ok(DfsContentRootCatalogPage::incomplete_for_request(
                 request,
                 DfsContentRootCatalogIncompleteReason::NotAuthoritativePrimary {
@@ -609,50 +610,62 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 },
                 generated_at_unix_nanos,
             ));
-        };
-        let store = DfsControlPlaneStore::new(control_plane.as_mut());
-        let current = store.get_metadata_shard(
-            &request.identity.file_system_id,
-            &request.identity.shard_id.0,
-        )?;
-        let Some(current) = current else {
-            return Ok(DfsContentRootCatalogPage::incomplete_for_request(
-                request,
-                DfsContentRootCatalogIncompleteReason::UnknownShard,
-                generated_at_unix_nanos,
-            ));
-        };
-        let current_identity = DfsContentRootCatalogShardIdentity::from_config(&current);
-        if current_identity != request.identity {
-            return Ok(DfsContentRootCatalogPage::incomplete_for_request(
-                request,
-                DfsContentRootCatalogIncompleteReason::AuthorityChanged {
-                    observed: Some(current_identity),
-                },
-                generated_at_unix_nanos,
-            ));
         }
-        if current.primary_node_id != self.node_id {
-            return Ok(DfsContentRootCatalogPage::incomplete_for_request(
-                request,
-                DfsContentRootCatalogIncompleteReason::NotAuthoritativePrimary {
-                    local_node_id: Some(self.node_id.clone()),
-                    primary_node_id: current.primary_node_id,
-                },
-                generated_at_unix_nanos,
-            ));
-        }
-        if let Some(handoff) = store.get_metadata_shard_membership_handoff(
-            &request.identity.file_system_id,
-            &request.identity.shard_id.0,
-        )? {
-            return Ok(DfsContentRootCatalogPage::incomplete_for_request(
-                request,
-                DfsContentRootCatalogIncompleteReason::MembershipHandoffFrozen {
-                    handoff_id: Some(handoff.handoff_id),
-                },
-                generated_at_unix_nanos,
-            ));
+
+        if request.after.is_none() {
+            // Establish authority and handoff state from the latest cluster-KV
+            // view once, before creating the immutable exact-cut snapshot.
+            // Continuations are already bound to that snapshot's sequence,
+            // fingerprint, timestamp, and cursor. They remain protected by
+            // the per-page durable backend freeze check below and by the
+            // caller's final topology refresh, so another remote KV round trip
+            // per catalog page adds no authority evidence.
+            self.refresh_control_plane_latest()?;
+
+            let Some(control_plane) = self.control_plane.as_mut() else {
+                return Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                    request,
+                    DfsContentRootCatalogIncompleteReason::NotAuthoritativePrimary {
+                        local_node_id: Some(self.node_id.clone()),
+                        primary_node_id: request.identity.primary_node_id.clone(),
+                    },
+                    generated_at_unix_nanos,
+                ));
+            };
+            let store = DfsControlPlaneStore::new(control_plane.as_mut());
+            let current = store.get_metadata_shard(
+                &request.identity.file_system_id,
+                &request.identity.shard_id.0,
+            )?;
+            let Some(current) = current else {
+                return Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                    request,
+                    DfsContentRootCatalogIncompleteReason::UnknownShard,
+                    generated_at_unix_nanos,
+                ));
+            };
+            let current_identity = DfsContentRootCatalogShardIdentity::from_config(&current);
+            if current_identity != request.identity {
+                return Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                    request,
+                    DfsContentRootCatalogIncompleteReason::AuthorityChanged {
+                        observed: Some(current_identity),
+                    },
+                    generated_at_unix_nanos,
+                ));
+            }
+            if let Some(handoff) = store.get_metadata_shard_membership_handoff(
+                &request.identity.file_system_id,
+                &request.identity.shard_id.0,
+            )? {
+                return Ok(DfsContentRootCatalogPage::incomplete_for_request(
+                    request,
+                    DfsContentRootCatalogIncompleteReason::MembershipHandoffFrozen {
+                        handoff_id: Some(handoff.handoff_id),
+                    },
+                    generated_at_unix_nanos,
+                ));
+            }
         }
 
         let Some(backend) = self.metadata_backend.as_mut() else {
@@ -674,7 +687,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         match backend.content_root_catalog_page(request) {
             Ok(page) => {
-                page.validate_for_request(request)?;
+                page.validate_shape_for_request(request)?;
                 Ok(page)
             }
             Err(_) => Ok(DfsContentRootCatalogPage::incomplete_for_request(

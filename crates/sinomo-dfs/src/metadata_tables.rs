@@ -104,6 +104,8 @@ pub(crate) struct DfsMetadataTables {
 pub(crate) struct DfsMetadataTableState {
     pub(crate) tables: DfsMetadataTables,
     pub(crate) table_log_offset: u64,
+    pub(crate) table_log_journal_reference_replay_cost_bytes: u64,
+    pub(crate) table_log_unpriced_namespace_prepare_references: u64,
     pub(crate) materialized_through_sequence: Option<u64>,
     pub(crate) snapshot_format_version: Option<u16>,
     pub(crate) snapshot_fingerprint: Option<MetadataTableSnapshotFingerprint>,
@@ -143,6 +145,8 @@ impl Deref for DfsMetadataTablesSnapshot<'_> {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MetadataTableReplay {
     pub(crate) offset: u64,
+    pub(crate) journal_reference_replay_cost_bytes: u64,
+    pub(crate) unpriced_namespace_prepare_references: u64,
     pub(crate) materialized_through_sequence: Option<u64>,
     pub(crate) prefix_proof: Option<DfsMetadataPrefixProof>,
 }

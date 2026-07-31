@@ -28,12 +28,12 @@ pub const DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION: u32 = 1;
 pub const DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES: usize = 256;
 /// Preferred encoded size for ordinary catalog pages.
 ///
-/// Current version/content-hash roots fit roughly 1,024 entries inside this
+/// Current version/content-hash roots fit roughly 2,048 entries inside this
 /// target. The hard encoded ceiling below remains authoritative when unusually
 /// long roots make the entry-count estimate inaccurate.
-pub const DFS_CONTENT_ROOT_CATALOG_TARGET_PAGE_BYTES: usize = 128 * 1024;
+pub const DFS_CONTENT_ROOT_CATALOG_TARGET_PAGE_BYTES: usize = 224 * 1024;
 pub const DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES: usize = 256 * 1024;
-pub const DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT: usize = 1024;
+pub const DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT: usize = 2048;
 pub const DEFAULT_DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRIES: usize =
     DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT;
 const DFS_METADATA_PREFIX_PROOF_DIGEST_PREFIX: &str = "dfs-metadata-prefix-v1:blake3:";
@@ -392,6 +392,27 @@ impl DfsContentRootCatalogPage {
         &self,
         request: &DfsContentRootCatalogPageRequest,
     ) -> Result<(), MetadataBackendError> {
+        self.validate_shape_for_request(request)?;
+        let encoded_size_bytes = self.encoded_size_bytes()?;
+        if encoded_size_bytes > DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES {
+            return Err(catalog_error(format!(
+                "DFS content-root catalog page encodes to {encoded_size_bytes} bytes, exceeding the {}-byte transport budget",
+                DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate the page's authority, durable cut, ordering, and cursor
+    /// contract without serializing the full page again.
+    ///
+    /// Producers enforce the encoded byte ceiling while constructing a page,
+    /// and untrusted network responses use `validate_for_request`. Internal
+    /// fragment assembly can use this shape-only path after either boundary.
+    pub(crate) fn validate_shape_for_request(
+        &self,
+        request: &DfsContentRootCatalogPageRequest,
+    ) -> Result<(), MetadataBackendError> {
         request.validate()?;
         self.identity.validate()?;
         if self.identity != request.identity {
@@ -480,13 +501,6 @@ impl DfsContentRootCatalogPage {
                 }
             }
         }
-        let encoded_size_bytes = self.encoded_size_bytes()?;
-        if encoded_size_bytes > DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES {
-            return Err(catalog_error(format!(
-                "DFS content-root catalog page encodes to {encoded_size_bytes} bytes, exceeding the {}-byte transport budget",
-                DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES
-            )));
-        }
         Ok(())
     }
 }
@@ -548,7 +562,7 @@ impl DfsContentRootCatalogFragmentBuilder {
                 "DFS content-root catalog fragment contains pages after completion",
             ));
         }
-        page.validate_for_request(&self.request)?;
+        page.validate_shape_for_request(&self.request)?;
         self.page_count = self.page_count.saturating_add(1);
         self.generated_at_unix_nanos = self
             .generated_at_unix_nanos
@@ -1045,6 +1059,10 @@ impl DfsContentRootCatalog {
                 "incomplete DFS content-root catalog has no generation fingerprint",
             ));
         }
+        self.generation_fingerprint_assuming_complete()
+    }
+
+    fn generation_fingerprint_assuming_complete(&self) -> Result<String, MetadataBackendError> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"sinomo-dfs-content-root-catalog-generation\0v1\0");
         hasher.update(&DFS_CONTENT_ROOT_CATALOG_FORMAT_VERSION.to_be_bytes());
@@ -1067,6 +1085,25 @@ impl DfsContentRootCatalog {
         Ok(hasher.finalize().to_hex().to_string())
     }
 
+    fn protection_assuming_complete(&self) -> DfsMetadataContentProtection {
+        let mut versions = BTreeSet::new();
+        let mut content_hashes = BTreeSet::new();
+        for entry in self.fragments.iter().flat_map(|fragment| &fragment.entries) {
+            match entry {
+                DfsContentRootCatalogEntry::Version(identity) => {
+                    versions.insert(identity.clone());
+                }
+                DfsContentRootCatalogEntry::ContentHash(content_hash) => {
+                    content_hashes.insert(content_hash.clone());
+                }
+            }
+        }
+        DfsMetadataContentProtection {
+            versions: versions.into_iter().collect(),
+            content_hashes: content_hashes.into_iter().collect(),
+        }
+    }
+
     pub fn protected_versions(&self) -> Option<BTreeSet<DfsMetadataVersionIdentity>> {
         self.is_complete().then(|| {
             self.fragments
@@ -1074,6 +1111,22 @@ impl DfsContentRootCatalog {
                 .flat_map(|fragment| &fragment.entries)
                 .filter_map(|entry| match entry {
                     DfsContentRootCatalogEntry::Version(identity) => Some(identity.clone()),
+                    DfsContentRootCatalogEntry::ContentHash(_) => None,
+                })
+                .collect()
+        })
+    }
+
+    pub fn protected_version_pairs(&self) -> Option<BTreeSet<(String, String)>> {
+        self.is_complete().then(|| {
+            self.fragments
+                .iter()
+                .flat_map(|fragment| &fragment.entries)
+                .filter_map(|entry| match entry {
+                    DfsContentRootCatalogEntry::Version(identity) => Some((
+                        identity.object_id.as_str().to_string(),
+                        identity.version.as_str().to_string(),
+                    )),
                     DfsContentRootCatalogEntry::ContentHash(_) => None,
                 })
                 .collect()
@@ -1442,23 +1495,12 @@ impl DfsContentRootCatalog {
             validation.catalog_age_nanos = catalog_age_nanos;
             return Ok(validation);
         }
-        let protection = DfsMetadataContentProtection {
-            versions: self
-                .protected_versions()
-                .expect("validated complete catalog has version roots")
-                .into_iter()
-                .collect(),
-            content_hashes: self
-                .protected_content_hashes()
-                .expect("validated complete catalog has content-hash roots")
-                .into_iter()
-                .collect(),
-        };
+        let protection = self.protection_assuming_complete();
         Ok(DfsContentRootCatalogCollectionValidation {
             collection_authorized: true,
             protection: Some(protection),
             reasons: Vec::new(),
-            catalog_generation: Some(self.generation_fingerprint()?),
+            catalog_generation: Some(self.generation_fingerprint_assuming_complete()?),
             catalog_generated_at_unix_nanos: Some(self.generated_at_unix_nanos),
             catalog_installed_at_unix_nanos: self.installed_at_unix_nanos,
             covered_shard_count,
@@ -1604,22 +1646,59 @@ fn watermark_identity(
 pub fn dfs_content_root_catalog_entries(
     protection: &DfsMetadataContentProtection,
 ) -> Vec<DfsContentRootCatalogEntry> {
+    dfs_content_root_catalog_entries_owned(protection.clone())
+}
+
+pub(crate) fn dfs_content_root_catalog_entries_owned(
+    protection: DfsMetadataContentProtection,
+) -> Vec<DfsContentRootCatalogEntry> {
     let mut entries = protection
         .versions
-        .iter()
-        .cloned()
+        .into_iter()
         .map(DfsContentRootCatalogEntry::Version)
         .chain(
             protection
                 .content_hashes
-                .iter()
-                .cloned()
+                .into_iter()
                 .map(DfsContentRootCatalogEntry::ContentHash),
         )
         .collect::<Vec<_>>();
     entries.sort();
     entries.dedup();
     entries
+}
+
+/// Converts protection roots that are already strictly ordered and unique.
+///
+/// Authoritative metadata-table protection is assembled through `BTreeSet`s,
+/// so sorting the combined catalog roots again adds an avoidable O(n log n)
+/// pass to every accumulated-state refresh. Keep the general public converter
+/// defensive while allowing that canonical producer to take the linear path.
+pub(crate) fn dfs_content_root_catalog_entries_from_canonical_protection(
+    protection: DfsMetadataContentProtection,
+) -> Vec<DfsContentRootCatalogEntry> {
+    debug_assert!(
+        protection.versions.windows(2).all(|pair| pair[0] < pair[1]),
+        "canonical content-root versions must be strictly ordered"
+    );
+    debug_assert!(
+        protection
+            .content_hashes
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "canonical content-root hashes must be strictly ordered"
+    );
+    protection
+        .versions
+        .into_iter()
+        .map(DfsContentRootCatalogEntry::Version)
+        .chain(
+            protection
+                .content_hashes
+                .into_iter()
+                .map(DfsContentRootCatalogEntry::ContentHash),
+        )
+        .collect()
 }
 
 pub fn dfs_content_root_catalog_topology_digest(

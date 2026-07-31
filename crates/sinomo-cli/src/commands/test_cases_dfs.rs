@@ -51,7 +51,9 @@
 
 use crate::app_api::SifsBrowser;
 use crate::file_manager::FileManagerBackend;
-use crate::sifs_file_manager::{SifsFileManagerBackend, SifsFileManagerObservation};
+use crate::sifs_file_manager::{
+    SifsFileManagerBackend, SifsFileManagerObservation, SifsOneShotBulkCreateRequester,
+};
 use sinomo_runtime::api::DaemonApiClient;
 use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
@@ -3597,6 +3599,66 @@ fn run_small_file_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     )))
 }
 
+enum DfsBulkWriteRequester {
+    CreateOnly(SifsOneShotBulkCreateRequester),
+    Overwrite(SifsFileManagerBackend),
+}
+
+impl DfsBulkWriteRequester {
+    fn open(ctx: &SinomoTestContext, overwrite_existing: bool) -> Result<Self, SinomoTestError> {
+        if overwrite_existing {
+            return open_backend(ctx).map(Self::Overwrite);
+        }
+        let data_dir = SinomoDataDir::new(ctx.data_dir());
+        SifsOneShotBulkCreateRequester::open(&data_dir)
+            .map(Self::CreateOnly)
+            .map_err(|error| {
+                SinomoTestError::failed(format!(
+                    "cannot open one-shot SIFS bulk create requester: {error}"
+                ))
+            })
+    }
+
+    fn node_label(&self) -> String {
+        match self {
+            Self::CreateOnly(requester) => requester.node_label(),
+            Self::Overwrite(backend) => backend.node_label(),
+        }
+    }
+
+    fn create_dir_all_until(&self, path: &str, deadline: Instant) -> Result<(), String> {
+        match self {
+            Self::CreateOnly(requester) => {
+                requester.create_dir_all_deferred_local_replay_until(path, deadline)
+            }
+            Self::Overwrite(backend) => {
+                backend.create_dir_all_deferred_local_replay_until(path, deadline)
+            }
+        }
+    }
+
+    fn write_files_until(
+        &self,
+        files: &[(String, Vec<u8>)],
+        deadline: Instant,
+    ) -> Result<(), String> {
+        match self {
+            Self::CreateOnly(requester) => {
+                requester.write_files_with_known_parents_deferred_publish_until(files, deadline)
+            }
+            Self::Overwrite(backend) => backend
+                .write_files_with_known_parents_deferred_publish_mode_until(files, true, deadline),
+        }
+    }
+
+    fn publish_metadata_after_mutation(&self) -> Result<(), String> {
+        match self {
+            Self::CreateOnly(requester) => requester.publish_metadata_after_mutation(),
+            Self::Overwrite(backend) => backend.publish_metadata_after_mutation(),
+        }
+    }
+}
+
 fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let base = ctx
         .required_parameter("base")?
@@ -3616,7 +3678,7 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     require_positive("files", files)?;
     require_positive("bytes", bytes)?;
 
-    let backend = open_backend(ctx)?;
+    let backend = DfsBulkWriteRequester::open(ctx, overwrite_existing)?;
     let node = backend.node_label();
     let proc_io_before = current_proc_io();
     let mut mkdir_retries = DfsMutationRetryMetrics::default();
@@ -3626,7 +3688,7 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let deadline = started + timeout;
     let mkdir_result = retry_bulk_mutation_with_metrics(
         deadline,
-        || backend.create_dir_all_deferred_local_replay_until(&base, deadline),
+        || backend.create_dir_all_until(&base, deadline),
         || format!("cannot create SIFS directory {base}"),
         &mut mkdir_retries,
     );
@@ -3642,15 +3704,7 @@ fn run_bulk_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let write_started = Instant::now();
     let write_result = retry_bulk_mutation_with_metrics(
         deadline,
-        || {
-            if overwrite_existing {
-                backend.write_files_with_known_parents_deferred_publish_mode_until(
-                    &batch, true, deadline,
-                )
-            } else {
-                backend.write_files_with_known_parents_deferred_publish_until(&batch, deadline)
-            }
-        },
+        || backend.write_files_until(&batch, deadline),
         || format!("cannot write SIFS bulk batch under {base}"),
         &mut write_retries,
     );

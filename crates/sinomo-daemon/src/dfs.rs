@@ -27,16 +27,18 @@ use sinomo_dfs::{
     DfsInboundAttachment, DfsMaintenanceExecutionExclusions, DfsMaintenanceRunOptions,
     DfsMaintenanceTickOptions, DfsMaintenanceTickReport, DfsMessageCommand,
     DfsMessageCommittedWork, DfsMessageExecutionScope, DfsMessageProcessResult, DfsMessageResponse,
-    DfsMetadataBackend, DfsMetadataHistoryGcOptions, DfsMetadataJournalReplicationOptions,
-    DfsMetadataJournalReplicationReport, DfsMetadataPublishScheduleOptions,
-    DfsMetadataPublishScheduleStart, DfsMetadataShardId, DfsMetadataShardMembershipHandoff,
-    DfsMetadataShardStatus, DfsNodeDetachedSendState, DfsNodeDetachedSendWorker,
-    DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectMetadata, DfsObjectRpcSendOptions,
-    DfsOperatorInspector, DfsOperatorRepairView, DfsPeerTransport, DfsPeerTransportError,
-    DfsPlacementReconciliationJob, DfsPlacementReconciliationState, DfsRepairAttemptRecord,
-    DfsReplicaReceiptRecord, DfsTombstoneCompactionOptions, DfsWriteIntentRecord,
-    DfsWriteIntentStatus, LocalContentStore, NetworkedDfsService,
-    cluster_dfs_all_file_system_configs, cluster_dfs_all_metadata_shard_head_watermarks,
+    DfsMetadataBackend, DfsMetadataHistoryGcOptions, DfsMetadataHistoryGcReport,
+    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
+    DfsMetadataPublishScheduleOptions, DfsMetadataPublishScheduleStart, DfsMetadataShardId,
+    DfsMetadataShardMembershipHandoff, DfsMetadataShardStatus, DfsMetadataSummary,
+    DfsNodeDetachedSendState, DfsNodeDetachedSendWorker, DfsNodeServedMessageTransport,
+    DfsNodeTransport, DfsObjectId, DfsObjectMetadata, DfsObjectRpcSendOptions,
+    DfsObjectVersionRecord, DfsOperatorInspector, DfsOperatorRepairView, DfsPeerTransport,
+    DfsPeerTransportError, DfsPlacementReconciliationJob, DfsPlacementReconciliationState,
+    DfsRepairAttemptRecord, DfsReplicaReceiptRecord, DfsTombstoneCompactionOptions,
+    DfsTombstoneCompactionReport, DfsVersion, DfsWriteIntentRecord, DfsWriteIntentStatus,
+    LocalContentStore, NetworkedDfsService, cluster_dfs_all_file_system_configs,
+    cluster_dfs_all_metadata_shard_head_watermarks,
     cluster_dfs_all_metadata_shard_membership_handoffs, cluster_dfs_all_metadata_shards,
     default_dfs_content_root_catalog_store, default_dfs_repair_attempt_snapshot_path,
     dfs_message_execution_scope, read_dfs_repair_attempt_snapshot,
@@ -47,9 +49,9 @@ use sinomo_dfs::{
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataJournalBatchSender,
     DfsMetadataPeerTransportError, DfsMetadataShardAssignment, DfsMetadataShardConfig,
     DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult,
-    DfsMetadataSnapshotInstallSender, DfsObjectVersionRecord, LocalSobjMetadataBackend,
-    default_dfs_metadata_root, distributed_sifs, distributed_sifs_bootstrap_objects,
-    file_system_config_key, metadata_shard_key, sifs_node_files_path,
+    DfsMetadataSnapshotInstallSender, LocalSobjMetadataBackend, default_dfs_metadata_root,
+    distributed_sifs, distributed_sifs_bootstrap_objects, file_system_config_key,
+    metadata_shard_key, sifs_node_files_path,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
@@ -78,6 +80,7 @@ const DAEMON_DFS_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS: u64 = 2;
 const DAEMON_DFS_METADATA_HISTORY_GC_MAX_RECORDS: u64 = 256;
 const DAEMON_DFS_METADATA_HISTORY_GC_RECORD_TRIGGER: u64 = 10_000;
 const DAEMON_DFS_METADATA_HISTORY_GC_BYTES_TRIGGER: u64 = 64 * 1024 * 1024;
+const DAEMON_DFS_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS: u64 = 4_096;
 const DAEMON_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
 // A replica journal apply is durable WAN work. Give daemon maintenance a larger
 // response budget than the library default while keeping foreground publication
@@ -425,8 +428,20 @@ fn daemon_dfs_metadata_authority_snapshot_watcher(
 #[derive(Debug)]
 struct DaemonDfsMessageServiceLane {
     service: DaemonDfsMessageService,
+    peer_node_ids: Vec<NodeId>,
     last_metadata_refresh: Instant,
     metadata_hydrated: bool,
+}
+
+impl DaemonDfsMessageServiceLane {
+    fn refresh_peer_targets(&mut self, peer_node_ids: Vec<NodeId>) {
+        if self.peer_node_ids == peer_node_ids {
+            return;
+        }
+        self.service
+            .refresh_message_peer_targets(peer_node_ids.clone());
+        self.peer_node_ids = peer_node_ids;
+    }
 }
 
 #[derive(Debug)]
@@ -509,6 +524,15 @@ struct DaemonDfsMessageServiceCacheEntry {
     /// already carry the selected version and content identity, so serving
     /// them must not open or rebind a metadata backend on the RPC path.
     content_read_service: Option<Arc<DaemonDfsMessageServiceLaneHandle>>,
+}
+
+#[derive(Debug)]
+struct DaemonDfsMaintenanceServiceLane {
+    signature: DaemonDfsMessageServiceSignature,
+    metadata_authority_generation: Arc<DaemonDfsMetadataAuthorityGeneration>,
+    peer_node_ids: Vec<NodeId>,
+    lane: DaemonDfsMessageServiceLane,
+    detached_send_runtime: Arc<DaemonDfsDetachedSendRuntime>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -768,6 +792,8 @@ pub(crate) struct DaemonDfsPendingMaintenanceWork {
     pub content_gc_scrub_blocked_issue_count: usize,
     pub content_gc_version_candidate_count: usize,
     pub content_gc_orphan_candidate_count: usize,
+    pub content_gc_due_maintenance_count: usize,
+    pub content_reservation_due_maintenance_count: usize,
     pub content_gc_next_deadline_unix_nanos: Option<u64>,
     pub durable_content_reservation_count: usize,
 }
@@ -811,6 +837,14 @@ impl DaemonDfsPendingMaintenanceWork {
 
     pub(crate) fn has_deferred_work(&self) -> bool {
         self.deferred_work_count > 0
+    }
+
+    pub(crate) fn should_run_content_gc(&self) -> bool {
+        self.content_gc_due_maintenance_count > 0
+    }
+
+    pub(crate) fn should_reconcile_content_reservations(&self) -> bool {
+        self.content_reservation_due_maintenance_count > 0
     }
 }
 
@@ -1714,14 +1748,85 @@ fn daemon_dfs_maintenance_execution_exclusions(
     DfsMaintenanceExecutionExclusions::new(daemon_dfs_offline_node_ids(cluster_paths, state))
 }
 
-fn daemon_dfs_intents_without_recovery_source(
+#[derive(Clone, Debug)]
+enum DaemonDfsMetadataLookup<T> {
+    Found(T),
+    Missing,
+    Unavailable,
+}
+
+trait DaemonDfsMetadataLookupSource {
+    fn object_lookup(&self, object_id: &DfsObjectId) -> DaemonDfsMetadataLookup<DfsObjectMetadata>;
+
+    fn version_lookup(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+    ) -> DaemonDfsMetadataLookup<DfsObjectVersionRecord>;
+}
+
+impl<T> DaemonDfsMetadataLookupSource for T
+where
+    T: DfsMetadataBackend + ?Sized,
+{
+    fn object_lookup(&self, object_id: &DfsObjectId) -> DaemonDfsMetadataLookup<DfsObjectMetadata> {
+        match self.get_object(object_id) {
+            Ok(Some(object)) => DaemonDfsMetadataLookup::Found(object),
+            Ok(None) => DaemonDfsMetadataLookup::Missing,
+            Err(_) => DaemonDfsMetadataLookup::Unavailable,
+        }
+    }
+
+    fn version_lookup(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+    ) -> DaemonDfsMetadataLookup<DfsObjectVersionRecord> {
+        match self.get_version(object_id, version) {
+            Ok(Some(version)) => DaemonDfsMetadataLookup::Found(version),
+            Ok(None) => DaemonDfsMetadataLookup::Missing,
+            Err(_) => DaemonDfsMetadataLookup::Unavailable,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DaemonDfsMetadataLookups {
+    objects: BTreeMap<DfsObjectId, DaemonDfsMetadataLookup<DfsObjectMetadata>>,
+    versions: BTreeMap<(DfsObjectId, DfsVersion), DaemonDfsMetadataLookup<DfsObjectVersionRecord>>,
+}
+
+impl DaemonDfsMetadataLookupSource for DaemonDfsMetadataLookups {
+    fn object_lookup(&self, object_id: &DfsObjectId) -> DaemonDfsMetadataLookup<DfsObjectMetadata> {
+        self.objects
+            .get(object_id)
+            .cloned()
+            .unwrap_or(DaemonDfsMetadataLookup::Unavailable)
+    }
+
+    fn version_lookup(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+    ) -> DaemonDfsMetadataLookup<DfsObjectVersionRecord> {
+        self.versions
+            .get(&(object_id.clone(), version.clone()))
+            .cloned()
+            .unwrap_or(DaemonDfsMetadataLookup::Unavailable)
+    }
+}
+
+fn daemon_dfs_intents_without_recovery_source<M>(
     data_dir: &SinomoDataDir,
-    metadata: &dyn DfsMetadataBackend,
+    metadata: &M,
     write_intents: &[DfsWriteIntentRecord],
     receipt_records: &[DfsReplicaReceiptRecord],
     offline_node_ids: &BTreeSet<NodeId>,
     local_node_id: &NodeId,
-) -> BTreeSet<String> {
+) -> BTreeSet<String>
+where
+    M: DaemonDfsMetadataLookupSource + ?Sized,
+{
     if !write_intents.iter().any(|intent| {
         matches!(
             intent.status,
@@ -1758,8 +1863,8 @@ fn daemon_dfs_intents_without_recovery_source(
             )
         })
         .filter(|intent| {
-            let is_invisible_create = match metadata.get_object(&intent.object_id) {
-                Ok(Some(object))
+            let is_invisible_create = match metadata.object_lookup(&intent.object_id) {
+                DaemonDfsMetadataLookup::Found(object)
                     if object.file_system_id == intent.file_system_id
                         && object.version == intent.target_version =>
                 {
@@ -1768,12 +1873,16 @@ fn daemon_dfs_intents_without_recovery_source(
                     // hash disagreement; neither path needs a content source.
                     return false;
                 }
-                Ok(Some(object)) if object.file_system_id == intent.file_system_id => false,
-                Ok(Some(_)) => return false,
-                Ok(None) => true,
+                DaemonDfsMetadataLookup::Found(object)
+                    if object.file_system_id == intent.file_system_id =>
+                {
+                    false
+                }
+                DaemonDfsMetadataLookup::Found(_) => return false,
+                DaemonDfsMetadataLookup::Missing => true,
                 // Storage inspection is advisory scheduling state. Fail open
                 // rather than hiding work behind an ambiguous metadata error.
-                Err(_) => return false,
+                DaemonDfsMetadataLookup::Unavailable => return false,
             };
             let Some(content_hash) = intent.content_hash.as_ref() else {
                 // Hydration cannot reconstruct a pending write without either
@@ -1793,15 +1902,15 @@ fn daemon_dfs_intents_without_recovery_source(
                 Err(_) => return false,
             };
             let has_durable_size_hint =
-                match metadata.get_version(&intent.object_id, &intent.target_version) {
-                    Ok(Some(version))
+                match metadata.version_lookup(&intent.object_id, &intent.target_version) {
+                    DaemonDfsMetadataLookup::Found(version)
                         if version.content_hash.as_ref() == Some(content_hash)
                             && version.size_bytes.is_some() =>
                     {
                         true
                     }
-                    Ok(_) => false,
-                    Err(_) => return false,
+                    DaemonDfsMetadataLookup::Found(_) | DaemonDfsMetadataLookup::Missing => false,
+                    DaemonDfsMetadataLookup::Unavailable => return false,
                 };
             let matching_receipt_node_ids = receipts_by_version
                 .get(&(
@@ -1876,14 +1985,17 @@ fn daemon_dfs_intents_without_recovery_source(
         .collect()
 }
 
-fn daemon_dfs_repairs_without_recovery_source(
+fn daemon_dfs_repairs_without_recovery_source<M>(
     data_dir: &SinomoDataDir,
-    metadata: &dyn DfsMetadataBackend,
+    metadata: &M,
     repair_views: &[DfsOperatorRepairView],
     receipt_records: &[DfsReplicaReceiptRecord],
     offline_node_ids: &BTreeSet<NodeId>,
     local_node_id: &NodeId,
-) -> BTreeSet<(String, NodeId)> {
+) -> BTreeSet<(String, NodeId)>
+where
+    M: DaemonDfsMetadataLookupSource + ?Sized,
+{
     if repair_views.is_empty() {
         return BTreeSet::new();
     }
@@ -1935,8 +2047,8 @@ fn daemon_dfs_repairs_without_recovery_source(
             if has_reachable_receipt {
                 return false;
             }
-            match metadata.get_object(&repair.object_id) {
-                Ok(Some(object))
+            match metadata.object_lookup(&repair.object_id) {
+                DaemonDfsMetadataLookup::Found(object)
                     if object.file_system_id == repair.file_system_id
                         && object.version == repair.version
                         && object.content_hash.as_ref() == Some(content_hash) =>
@@ -1950,8 +2062,8 @@ fn daemon_dfs_repairs_without_recovery_source(
                 // The repair view may have become stale between the operator
                 // scan and this lookup. Let maintenance reconcile/remove it
                 // instead of classifying the stale record as source-less.
-                Ok(_) => false,
-                Err(_) => false,
+                DaemonDfsMetadataLookup::Found(_) | DaemonDfsMetadataLookup::Missing => false,
+                DaemonDfsMetadataLookup::Unavailable => false,
             }
         })
         .map(|repair| {
@@ -1966,7 +2078,7 @@ fn daemon_dfs_repairs_without_recovery_source(
 fn daemon_dfs_actionable_conflict_count(
     metadata: &dyn DfsMetadataBackend,
     conflicts: &[DfsConflictRecord],
-) -> Result<usize, DaemonError> {
+) -> Result<usize, sinomo_dfs::MetadataBackendError> {
     let mut actionable = 0usize;
     for conflict in conflicts
         .iter()
@@ -2261,6 +2373,8 @@ fn daemon_dfs_pending_work_from_records(
         content_gc_scrub_blocked_issue_count: 0,
         content_gc_version_candidate_count: 0,
         content_gc_orphan_candidate_count: 0,
+        content_gc_due_maintenance_count: 0,
+        content_reservation_due_maintenance_count: 0,
         content_gc_next_deadline_unix_nanos: None,
         durable_content_reservation_count: 0,
     }
@@ -2277,6 +2391,7 @@ struct DaemonDfsContentGcProjection {
     version_candidate_count: usize,
     orphan_candidate_count: usize,
     due_maintenance_count: usize,
+    reservation_due_maintenance_count: usize,
     next_deadline_unix_nanos: Option<u64>,
 }
 
@@ -2343,6 +2458,21 @@ fn daemon_dfs_content_gc_blocked_reason_requires_refresh(
         | DfsContentRootCatalogIncompleteReason::CatalogBehindHeadWatermark { .. }
         | DfsContentRootCatalogIncompleteReason::HeadWatermarkFingerprintChanged { .. }
         | DfsContentRootCatalogIncompleteReason::MalformedCatalog { .. } => true,
+    }
+}
+
+fn daemon_dfs_content_gc_blocked_reason_is_ordinary_head_advance(
+    reason: &DfsContentRootCatalogIncompleteReason,
+) -> bool {
+    match reason {
+        DfsContentRootCatalogIncompleteReason::CatalogBehindHeadWatermark { .. } => true,
+        DfsContentRootCatalogIncompleteReason::ShardIncomplete { reasons, .. } => {
+            !reasons.is_empty()
+                && reasons
+                    .iter()
+                    .all(daemon_dfs_content_gc_blocked_reason_is_ordinary_head_advance)
+        }
+        _ => false,
     }
 }
 
@@ -2422,6 +2552,35 @@ fn daemon_dfs_content_gc_projection(
         ..DaemonDfsContentGcProjection::default()
     };
     if !validation.is_collection_authorized() {
+        let only_ordinary_head_advance = !validation.reasons().is_empty()
+            && validation
+                .reasons()
+                .iter()
+                .all(daemon_dfs_content_gc_blocked_reason_is_ordinary_head_advance);
+        if only_ordinary_head_advance && catalog_refresh_deadline > now_unix_nanos {
+            let catalog_versions = catalog
+                .protected_version_pairs()
+                .expect("a behind-head catalog with otherwise complete coverage has version roots");
+            projection.reservation_due_maintenance_count = reservations
+                .reservations
+                .iter()
+                .filter(|reservation| {
+                    catalog_versions.contains(&(
+                        reservation.identity.object_id.clone(),
+                        reservation.identity.version.clone(),
+                    ))
+                })
+                .count();
+            // A newer quorum head is normal during sustained writes. The old
+            // catalog cannot authorize deletion, but durable reservations
+            // protect every post-catalog publication. Historical positive
+            // coverage remains sufficient to release exact covered
+            // reservations; it can never reject an uncovered reservation or
+            // authorize deletion. Coalesce only the destructive refresh to
+            // the existing bounded expiry deadline.
+            projection.next_deadline_unix_nanos = Some(catalog_refresh_deadline);
+            return Ok(projection);
+        }
         let repairable_block = validation
             .reasons()
             .iter()
@@ -2489,29 +2648,33 @@ fn daemon_dfs_content_gc_projection(
         .chain(orphan_projection.next_eligible_at_unix_nanos)
         .min();
 
-    let catalog_versions = protection
-        .versions
-        .iter()
-        .map(|identity| {
-            (
-                identity.object_id.as_str().to_string(),
-                identity.version.as_str().to_string(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
     for reservation in &reservations.reservations {
-        let covered = catalog_versions.contains(&(
-            reservation.identity.object_id.clone(),
-            reservation.identity.version.clone(),
-        ));
+        let covered = protection
+            .versions
+            .binary_search_by(|identity| {
+                identity
+                    .object_id
+                    .as_str()
+                    .cmp(reservation.identity.object_id.as_str())
+                    .then_with(|| {
+                        identity
+                            .version
+                            .as_str()
+                            .cmp(reservation.identity.version.as_str())
+                    })
+            })
+            .is_ok();
         let rejection_deadline =
             reservation
                 .reserved_at_unix_nanos
                 .saturating_add(daemon_dfs_duration_nanos(
                     lifecycle_options.content_reservation_rejection_grace,
                 ));
-        if covered
-            || catalog_installed_at_unix_nanos > rejection_deadline
+        if covered {
+            projection.reservation_due_maintenance_count = projection
+                .reservation_due_maintenance_count
+                .saturating_add(1);
+        } else if catalog_installed_at_unix_nanos > rejection_deadline
             || now_unix_nanos >= rejection_deadline
         {
             projection.due_maintenance_count = projection.due_maintenance_count.saturating_add(1);
@@ -2527,6 +2690,123 @@ fn daemon_dfs_content_gc_projection(
     Ok(projection)
 }
 
+#[derive(Debug)]
+struct DaemonDfsMaintenanceMetadataObservation {
+    summary: DfsMetadataSummary,
+    tombstone_projection: DfsTombstoneCompactionReport,
+    metadata_history_projection: DfsMetadataHistoryGcReport,
+    metadata_shard_statuses: Vec<DfsMetadataShardStatus>,
+    write_intents: Vec<DfsWriteIntentRecord>,
+    repair_views: Vec<DfsOperatorRepairView>,
+    actionable_conflict_count: usize,
+    receipt_records: Vec<DfsReplicaReceiptRecord>,
+    lookups: DaemonDfsMetadataLookups,
+}
+
+fn daemon_dfs_maintenance_metadata_observation(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    now_unix_nanos: u64,
+) -> Result<DaemonDfsMaintenanceMetadataObservation, DaemonError> {
+    sinomo_dfs::with_cached_cluster_aware_dfs_metadata_inspection(
+        data_dir,
+        cluster_paths,
+        |metadata| {
+            let summary = metadata.metadata_summary()?;
+            let tombstone_projection = metadata.tombstone_compaction_projection(
+                DfsTombstoneCompactionOptions::dry_run(DAEMON_DFS_TOMBSTONE_COMPACTION_MIN_AGE)
+                    .with_now_unix_nanos(now_unix_nanos),
+            )?;
+            let metadata_history_projection = metadata.metadata_history_gc_projection(
+                DfsMetadataHistoryGcOptions::dry_run(
+                    DAEMON_DFS_METADATA_HISTORY_GC_MIN_AGE,
+                    DAEMON_DFS_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS,
+                )
+                .with_max_removals(DAEMON_DFS_METADATA_HISTORY_GC_MAX_RECORDS)
+                .with_now_unix_nanos(now_unix_nanos),
+            )?;
+            let metadata_shard_statuses = metadata.metadata_shard_statuses()?;
+            let write_intents = if summary.pending_write_count > 0 {
+                metadata.all_intents()?
+            } else {
+                Vec::new()
+            };
+            let repair_views = if summary.pending_repair_count > 0 {
+                DfsOperatorInspector::new(metadata).repairs(None, None)?
+            } else {
+                Vec::new()
+            };
+            let conflicts = if summary.open_conflict_count > 0 {
+                metadata.all_conflicts()?
+            } else {
+                Vec::new()
+            };
+            let actionable_conflict_count =
+                daemon_dfs_actionable_conflict_count(metadata, &conflicts)?;
+
+            let mut receipt_records = Vec::new();
+            let mut receipt_versions = BTreeSet::new();
+            for intent in write_intents.iter().filter(|intent| {
+                matches!(
+                    &intent.status,
+                    DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+                )
+            }) {
+                if receipt_versions
+                    .insert((intent.object_id.clone(), intent.target_version.clone()))
+                {
+                    receipt_records.extend(
+                        metadata.receipts_for_version(&intent.object_id, &intent.target_version)?,
+                    );
+                }
+            }
+            for repair in &repair_views {
+                if receipt_versions.insert((repair.object_id.clone(), repair.version.clone())) {
+                    receipt_records
+                        .extend(metadata.receipts_for_version(&repair.object_id, &repair.version)?);
+                }
+            }
+
+            let mut object_ids = BTreeSet::new();
+            let mut version_ids = BTreeSet::new();
+            for intent in write_intents.iter().filter(|intent| {
+                matches!(
+                    &intent.status,
+                    DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+                )
+            }) {
+                object_ids.insert(intent.object_id.clone());
+                version_ids.insert((intent.object_id.clone(), intent.target_version.clone()));
+            }
+            for repair in &repair_views {
+                object_ids.insert(repair.object_id.clone());
+            }
+            let mut lookups = DaemonDfsMetadataLookups::default();
+            for object_id in object_ids {
+                let lookup = metadata.object_lookup(&object_id);
+                lookups.objects.insert(object_id, lookup);
+            }
+            for (object_id, version) in version_ids {
+                let lookup = metadata.version_lookup(&object_id, &version);
+                lookups.versions.insert((object_id, version), lookup);
+            }
+
+            Ok(DaemonDfsMaintenanceMetadataObservation {
+                summary,
+                tombstone_projection,
+                metadata_history_projection,
+                metadata_shard_statuses,
+                write_intents,
+                repair_views,
+                actionable_conflict_count,
+                receipt_records,
+                lookups,
+            })
+        },
+    )
+    .map_err(Into::into)
+}
+
 pub(crate) fn daemon_dfs_pending_maintenance_work(
     paths: &DaemonPaths,
 ) -> Result<DaemonDfsPendingMaintenanceWork, DaemonError> {
@@ -2536,28 +2816,21 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
     if !cluster_paths.state.exists() {
         return Ok(DaemonDfsPendingMaintenanceWork::default());
     }
-    // This is a scheduling observation, not a recovery or mutation boundary.
-    // Inspection mode still reads the latest durable tables, but it does not
-    // take write locks, migrate/replay recovery state, or repair cursors on
-    // every background probe.
-    let metadata = sinomo_dfs::open_cluster_aware_dfs_metadata_backend_for_inspection(
-        &data_dir,
-        &cluster_paths,
-    )?;
-    let summary = metadata.metadata_summary()?;
     let now_unix_nanos = daemon_dfs_now_unix_nanos();
-    let tombstone_projection = metadata.tombstone_compaction_projection(
-        DfsTombstoneCompactionOptions::dry_run(DAEMON_DFS_TOMBSTONE_COMPACTION_MIN_AGE)
-            .with_now_unix_nanos(now_unix_nanos),
-    )?;
-    let metadata_history_projection = metadata.metadata_history_gc_projection(
-        DfsMetadataHistoryGcOptions::dry_run(
-            DAEMON_DFS_METADATA_HISTORY_GC_MIN_AGE,
-            DAEMON_DFS_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS,
-        )
-        .with_max_removals(DAEMON_DFS_METADATA_HISTORY_GC_MAX_RECORDS)
-        .with_now_unix_nanos(now_unix_nanos),
-    )?;
+    // Scheduling observes one coherent, incrementally refreshed table image.
+    // Clone only the bounded records needed below, then release the cache
+    // before content scans, cluster-KV reads, and network-health projection.
+    let DaemonDfsMaintenanceMetadataObservation {
+        summary,
+        tombstone_projection,
+        metadata_history_projection,
+        metadata_shard_statuses,
+        write_intents,
+        repair_views,
+        actionable_conflict_count,
+        receipt_records,
+        lookups,
+    } = daemon_dfs_maintenance_metadata_observation(&data_dir, &cluster_paths, now_unix_nanos)?;
     let metadata_history_schedule = daemon_dfs_metadata_history_gc_schedule(
         &metadata_history_projection,
         now_unix_nanos,
@@ -2583,7 +2856,6 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
     )?;
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .map_err(DaemonError::from)?;
-    let metadata_shard_statuses = metadata.metadata_shard_statuses()?;
     let pending_local_membership_handoff_count =
         daemon_dfs_local_membership_handoff_keys(&metadata_shard_statuses, &state.local_node_id)
             .into_iter()
@@ -2596,23 +2868,6 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))?
             .map(|snapshot| snapshot.records)
             .unwrap_or_default();
-    let write_intents = if summary.pending_write_count > 0 {
-        metadata.all_intents()?
-    } else {
-        Vec::new()
-    };
-    let repair_views = if summary.pending_repair_count > 0 {
-        DfsOperatorInspector::new(metadata.as_ref()).repairs(None, None)?
-    } else {
-        Vec::new()
-    };
-    let conflicts = if summary.open_conflict_count > 0 {
-        metadata.all_conflicts()?
-    } else {
-        Vec::new()
-    };
-    let actionable_conflict_count =
-        daemon_dfs_actionable_conflict_count(metadata.as_ref(), &conflicts)?;
     let placement_reconciliation_jobs =
         sinomo_core::cluster::read_cluster_kv_latest_observed_prefix_entries(
             &cluster_paths,
@@ -2626,29 +2881,10 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
             &placement_reconciliation_jobs,
             summary.pending_repair_count,
         );
-    let mut receipt_records = Vec::new();
-    let mut receipt_versions = BTreeSet::new();
-    for intent in write_intents.iter().filter(|intent| {
-        matches!(
-            &intent.status,
-            DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
-        )
-    }) {
-        if receipt_versions.insert((intent.object_id.clone(), intent.target_version.clone())) {
-            receipt_records
-                .extend(metadata.receipts_for_version(&intent.object_id, &intent.target_version)?);
-        }
-    }
-    for repair in &repair_views {
-        if receipt_versions.insert((repair.object_id.clone(), repair.version.clone())) {
-            receipt_records
-                .extend(metadata.receipts_for_version(&repair.object_id, &repair.version)?);
-        }
-    }
     let offline_node_ids = daemon_dfs_offline_node_ids(&cluster_paths, &state);
     let intents_without_recovery_source = daemon_dfs_intents_without_recovery_source(
         &data_dir,
-        metadata.as_ref(),
+        &lookups,
         &write_intents,
         &receipt_records,
         &offline_node_ids,
@@ -2656,7 +2892,7 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
     );
     let repairs_without_recovery_source = daemon_dfs_repairs_without_recovery_source(
         &data_dir,
-        metadata.as_ref(),
+        &lookups,
         &repair_views,
         &receipt_records,
         &offline_node_ids,
@@ -2689,7 +2925,8 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         .saturating_add(
             usize::try_from(staging_projection.eligible_staging_count).unwrap_or(usize::MAX),
         )
-        .saturating_add(content_gc_projection.due_maintenance_count);
+        .saturating_add(content_gc_projection.due_maintenance_count)
+        .saturating_add(content_gc_projection.reservation_due_maintenance_count);
     work.next_time_based_maintenance_unix_nanos = work
         .next_time_based_maintenance_unix_nanos
         .into_iter()
@@ -2707,6 +2944,9 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
     work.content_gc_scrub_blocked_issue_count = content_gc_projection.scrub_blocked_issue_count;
     work.content_gc_version_candidate_count = content_gc_projection.version_candidate_count;
     work.content_gc_orphan_candidate_count = content_gc_projection.orphan_candidate_count;
+    work.content_gc_due_maintenance_count = content_gc_projection.due_maintenance_count;
+    work.content_reservation_due_maintenance_count =
+        content_gc_projection.reservation_due_maintenance_count;
     work.content_gc_next_deadline_unix_nanos = content_gc_projection.next_deadline_unix_nanos;
     work.durable_content_reservation_count = durable_content_reservation_count;
     tracing::debug!(
@@ -2720,6 +2960,9 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         content_gc_scrub_blocked_issue_count = work.content_gc_scrub_blocked_issue_count,
         content_gc_version_candidate_count = work.content_gc_version_candidate_count,
         content_gc_orphan_candidate_count = work.content_gc_orphan_candidate_count,
+        content_gc_due_maintenance_count = work.content_gc_due_maintenance_count,
+        content_reservation_due_maintenance_count =
+            work.content_reservation_due_maintenance_count,
         content_gc_next_deadline_unix_nanos = ?work.content_gc_next_deadline_unix_nanos,
         durable_content_reservation_count = work.durable_content_reservation_count,
         "projected daemon DFS content GC maintenance"
@@ -2771,28 +3014,173 @@ fn evict_daemon_dfs_message_service_cache(data_dir: &SinomoDataDir) -> Result<bo
     Ok(removed)
 }
 
-fn evict_daemon_dfs_message_mutation_service_cache(
+fn take_daemon_dfs_message_mutation_service_for_maintenance(
     data_dir: &SinomoDataDir,
-) -> Result<bool, DaemonError> {
-    let cache_key = data_dir.root();
-    let mut cache =
-        daemon_dfs_message_service_cache()
-            .lock()
-            .map_err(|_| DaemonError::Network {
-                address: "DFS message service cache".to_string(),
-                detail: "DFS message service cache is poisoned".to_string(),
-            })?;
-    let removed = cache
-        .get_mut(&cache_key)
-        .and_then(|entry| entry.primary_service.take())
-        .is_some();
-    if removed {
-        tracing::info!(
-            data_root = %cache_key.display(),
-            "released daemon DFS mutation service before maintenance"
-        );
+    cluster_paths: &ClusterPaths,
+    cluster_state: &sinomo_core::ClusterBootstrapState,
+    runtime: &tokio::runtime::Handle,
+) -> Result<DaemonDfsMaintenanceServiceLane, sinomo_dfs::DfsError> {
+    let peer_node_ids = sinomo_dfs::cluster_dfs_peer_node_ids(cluster_state);
+    let metadata_authority_generation = daemon_dfs_metadata_authority_generation_for_identity(
+        cluster_paths,
+        &cluster_state.cluster_id,
+        &cluster_state.local_node_id,
+        Some(runtime),
+    )?;
+    if let Some(snapshot) =
+        sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(cluster_paths)
+            .map_err(daemon_dfs_network_error)?
+    {
+        // The filesystem watcher is deliberately debounced. Maintenance has
+        // just refreshed cluster KV synchronously, so observe that exact image
+        // before deciding whether an existing backend generation is reusable.
+        metadata_authority_generation.observe(snapshot.as_ref());
     }
-    Ok(removed)
+    let signature = DaemonDfsMessageServiceSignature {
+        cluster_id: cluster_state.cluster_id.clone(),
+        local_node_id: cluster_state.local_node_id.clone(),
+        kv_snapshot_available: cluster_paths.kv_paths().snapshot.exists(),
+        metadata_authority_generation: metadata_authority_generation.generation(),
+    };
+    let cache_key = data_dir.root();
+    let cached = {
+        let mut cache = daemon_dfs_message_service_cache()
+            .lock()
+            .map_err(|_| daemon_dfs_cache_lock_error())?;
+        let stale = cache.get(&cache_key).is_some_and(|entry| {
+            entry.signature != signature
+                || !Arc::ptr_eq(
+                    &entry.metadata_authority_generation,
+                    &metadata_authority_generation,
+                )
+        });
+        if stale {
+            drop(cache.remove(&cache_key));
+        }
+        let entry = cache
+            .entry(cache_key)
+            .or_insert_with(|| DaemonDfsMessageServiceCacheEntry {
+                signature: signature.clone(),
+                metadata_authority_generation: Arc::clone(&metadata_authority_generation),
+                peer_node_ids: peer_node_ids.clone(),
+                primary_service: None,
+                lightweight_read_service: None,
+                content_read_service: None,
+            });
+        entry.peer_node_ids.clone_from(&peer_node_ids);
+        entry.primary_service.take()
+    };
+
+    let handle = match cached {
+        Some(handle) => handle,
+        None => {
+            let content_store =
+                sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+            open_daemon_dfs_message_service_lane_with_content(
+                data_dir,
+                cluster_paths,
+                &signature.local_node_id,
+                peer_node_ids.clone(),
+                runtime,
+                content_store,
+            )?
+        }
+    };
+    let handle = Arc::try_unwrap(handle).map_err(|_| sinomo_dfs::DfsError::Network {
+        message:
+            "daemon DFS mutation lane remained referenced after exclusive maintenance admission"
+                .to_string(),
+    })?;
+    let DaemonDfsMessageServiceLaneHandle {
+        lane,
+        detached_send_runtime,
+    } = handle;
+    let mut lane = lane
+        .into_inner()
+        .map_err(|_| daemon_dfs_cache_lock_error())?;
+    lane.refresh_peer_targets(peer_node_ids.clone());
+    Ok(DaemonDfsMaintenanceServiceLane {
+        signature,
+        metadata_authority_generation,
+        peer_node_ids,
+        lane,
+        detached_send_runtime,
+    })
+}
+
+fn restore_daemon_dfs_message_mutation_service_after_maintenance(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    runtime: &tokio::runtime::Handle,
+    mut retained: DaemonDfsMaintenanceServiceLane,
+) -> Result<bool, sinomo_dfs::DfsError> {
+    let Some(peer_snapshot) = read_daemon_dfs_message_peer_snapshot(cluster_paths)? else {
+        return Ok(false);
+    };
+    let metadata_authority_generation = daemon_dfs_metadata_authority_generation_for_identity(
+        cluster_paths,
+        &peer_snapshot.cluster_id,
+        &peer_snapshot.local_node_id,
+        Some(runtime),
+    )?;
+    if let Some(snapshot) =
+        sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(cluster_paths)
+            .map_err(daemon_dfs_network_error)?
+    {
+        metadata_authority_generation.observe(snapshot.as_ref());
+    }
+    let current_signature = DaemonDfsMessageServiceSignature {
+        cluster_id: peer_snapshot.cluster_id,
+        local_node_id: peer_snapshot.local_node_id,
+        kv_snapshot_available: peer_snapshot.kv_snapshot_available,
+        metadata_authority_generation: metadata_authority_generation.generation(),
+    };
+    if current_signature != retained.signature
+        || !Arc::ptr_eq(
+            &metadata_authority_generation,
+            &retained.metadata_authority_generation,
+        )
+    {
+        return Ok(false);
+    }
+    if retained
+        .lane
+        .service
+        .operational_metrics()?
+        .authoritative_write_frozen_shard_count
+        != 0
+    {
+        return Ok(false);
+    }
+    retained
+        .lane
+        .refresh_peer_targets(peer_snapshot.peer_node_ids.clone());
+    retained
+        .peer_node_ids
+        .clone_from(&peer_snapshot.peer_node_ids);
+
+    let cache_key = data_dir.root();
+    let mut cache = daemon_dfs_message_service_cache()
+        .lock()
+        .map_err(|_| daemon_dfs_cache_lock_error())?;
+    let Some(entry) = cache.get_mut(&cache_key) else {
+        return Ok(false);
+    };
+    if entry.signature != retained.signature
+        || !Arc::ptr_eq(
+            &entry.metadata_authority_generation,
+            &retained.metadata_authority_generation,
+        )
+        || entry.primary_service.is_some()
+    {
+        return Ok(false);
+    }
+    entry.peer_node_ids.clone_from(&retained.peer_node_ids);
+    entry.primary_service = Some(Arc::new(DaemonDfsMessageServiceLaneHandle {
+        lane: Mutex::new(retained.lane),
+        detached_send_runtime: retained.detached_send_runtime,
+    }));
+    Ok(true)
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -3582,7 +3970,7 @@ fn open_daemon_dfs_message_service_lane_with_content(
     let transport =
         DfsNodeServedMessageTransport::new_with_peer_transports_for_nodes_and_detached_state(
             local_node_id.clone(),
-            peer_node_ids,
+            peer_node_ids.clone(),
             daemon_dfs_blocking_peer_transport_on_runtime(data_dir, runtime),
             daemon_dfs_async_peer_transport(data_dir, runtime),
             sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
@@ -3600,6 +3988,7 @@ fn open_daemon_dfs_message_service_lane_with_content(
     Ok(Arc::new(DaemonDfsMessageServiceLaneHandle {
         lane: Mutex::new(DaemonDfsMessageServiceLane {
             service,
+            peer_node_ids,
             last_metadata_refresh: Instant::now(),
             // Routed mutations and namespace operations check the exact shard
             // marker and rebind only when that shard is actually frozen. An
@@ -3623,7 +4012,7 @@ fn open_daemon_dfs_message_content_read_lane_with_content(
     let transport =
         DfsNodeServedMessageTransport::new_with_peer_transports_for_nodes_and_detached_state(
             local_node_id.clone(),
-            peer_node_ids,
+            peer_node_ids.clone(),
             daemon_dfs_blocking_peer_transport_on_runtime(data_dir, runtime),
             daemon_dfs_async_peer_transport(data_dir, runtime),
             sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
@@ -3632,6 +4021,7 @@ fn open_daemon_dfs_message_content_read_lane_with_content(
     Ok(Arc::new(DaemonDfsMessageServiceLaneHandle {
         lane: Mutex::new(DaemonDfsMessageServiceLane {
             service: NetworkedDfsService::new(transport, content),
+            peer_node_ids,
             last_metadata_refresh: Instant::now(),
             metadata_hydrated: false,
         }),
@@ -3855,9 +4245,9 @@ fn process_daemon_dfs_message_command_on_runtime(
             kv_snapshot_available: peer_snapshot.kv_snapshot_available,
             metadata_authority_generation: metadata_authority_generation.generation(),
         };
-        let should_rebuild = cache.get(&cache_key).is_none_or(|entry| {
-            entry.signature != signature || entry.peer_node_ids != peer_node_ids
-        });
+        let should_rebuild = cache
+            .get(&cache_key)
+            .is_none_or(|entry| entry.signature != signature);
         if should_rebuild {
             // The cached lane may contain a fully hydrated all-shard view.
             // Release the superseded generation before opening its replacement
@@ -3886,6 +4276,7 @@ fn process_daemon_dfs_message_command_on_runtime(
         let entry = cache
             .get_mut(&cache_key)
             .expect("daemon DFS message cache entry inserted");
+        entry.peer_node_ids.clone_from(&peer_node_ids);
         let service = if use_content_read_lane {
             if entry.content_read_service.is_none() {
                 let content_store =
@@ -3967,6 +4358,7 @@ fn process_daemon_dfs_message_command_on_runtime(
         .lock()
         .map_err(|_| daemon_dfs_cache_lock_error())?;
     let lane_lock_wait = lane_lock_wait_started.elapsed();
+    service_lane.refresh_peer_targets(peer_node_ids);
     let hydrate_started = Instant::now();
     let mut hydrated_metadata = false;
     if requires_full_metadata_hydrate
@@ -5658,9 +6050,11 @@ where
         }
         result = &mut maintenance => DaemonDfsMaintenancePreemptionOutcome::Finished(result),
     };
-    // `maintenance` owns the broad tick's `NetworkedDfsService`. Destroy it
-    // here, while the caller still owns the sole message-execution permit, so
-    // foreground admission can never overlap a live maintenance generation.
+    // A preempted or failed future owns and destroys the broad tick's
+    // `NetworkedDfsService` here. A successful future may return a reset,
+    // backend-bearing lane to the cache before this sole message-execution
+    // permit is released, so foreground admission still cannot overlap a live
+    // maintenance generation.
     drop(maintenance);
     outcome
 }
@@ -5668,6 +6062,8 @@ where
 pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
+    content_gc_requested: bool,
+    content_reservation_reconciliation_requested: bool,
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
@@ -5677,10 +6073,6 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
             reached_limit: false,
         });
     }
-    let cluster_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
-        .map_err(DaemonError::from)?;
-    let execution_exclusions =
-        daemon_dfs_maintenance_execution_exclusions(&cluster_paths, &cluster_state);
     // Publish maintenance interest before cluster/local admission. A
     // foreground request that queues anywhere behind this pass can then ask it
     // to yield once its current synchronous poll reaches an await boundary.
@@ -5698,9 +6090,9 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
             run_daemon_dfs_maintenance_tick_with_admission(
                 data_dir.clone(),
                 cluster_paths.clone(),
-                cluster_state,
-                execution_exclusions,
                 runtime,
+                content_gc_requested,
+                content_reservation_reconciliation_requested,
                 committed_work_tracker.clone(),
                 &mut deferred_work,
                 &foreground_preemption,
@@ -5708,11 +6100,13 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
             .await
         })
         .await;
-    // The preemption helper has already dropped the entire maintenance future
-    // (and its backend-bearing service) before this permit is released. Local
-    // mutation therefore remains single-generation even when a repair or
-    // metadata RPC is cancelled to admit foreground work. Those sends are
-    // replay-safe; return Deferred below so durable work is retried promptly.
+    // The preemption helper has already completed or dropped the entire
+    // maintenance future before this permit is released. On success it may
+    // have restored a reset backend-bearing request lane; on preemption/error
+    // the owned lane was destroyed. Local mutation therefore remains
+    // single-generation even when a repair or metadata RPC is cancelled to
+    // admit foreground work. Those sends are replay-safe; return Deferred
+    // below so durable work is retried promptly.
     drop(message_execution_guard);
     drop(lifecycle_guard);
     drop(foreground_preemption);
@@ -5752,51 +6146,72 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
 async fn run_daemon_dfs_maintenance_tick_with_admission(
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
-    cluster_state: sinomo_core::ClusterBootstrapState,
-    execution_exclusions: DfsMaintenanceExecutionExclusions,
     runtime: &tokio::runtime::Handle,
+    content_gc_requested: bool,
+    content_reservation_reconciliation_requested: bool,
     committed_work_tracker: DfsCommittedWorkTracker,
     deferred_work: &mut Option<(Arc<DaemonDfsDetachedSendRuntime>, DfsNodeDetachedSendWorker)>,
     foreground_preemption: &DaemonDfsMaintenanceForegroundPreemption,
 ) -> Result<bool, DaemonError> {
-    // Broad maintenance owns the mutation generation, but the independently
-    // locked lightweight lane contains no hydrated all-shard view and serves
-    // immutable targeted reads. Retaining it avoids a full metadata rescan
-    // after every quiet maintenance tick.
-    evict_daemon_dfs_message_mutation_service_cache(&data_dir)?;
+    // The scheduler's retained read-only image is useful between probes, but a
+    // broad writable generation will decode the same tables. Release it first
+    // so accumulated metadata does not double peak RSS during recovery.
+    sinomo_dfs::evict_cluster_aware_dfs_metadata_inspection_cache(&data_dir);
     if let Some(stats) = crate::process_idle_stats() {
         stats.incr_disk_reads_dfs_metadata();
     }
-    let detached_send_runtime = daemon_dfs_detached_send_runtime_for_identity(
-        &data_dir,
-        &cluster_state.cluster_id,
-        &cluster_state.local_node_id,
-    )
-    .map_err(DaemonError::from)?;
-    let metadata_authority_generation = daemon_dfs_retained_metadata_authority_generation(
-        detached_send_runtime.as_ref(),
-        &cluster_paths,
-        &cluster_state.cluster_id,
-        &cluster_state.local_node_id,
-        Some(runtime),
-    )
-    .map_err(DaemonError::from)?;
-    let authority_generation_before_maintenance = metadata_authority_generation.generation();
     let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, runtime);
+    let cluster_state = sinomo_dfs::refresh_cluster_dfs_maintenance_state_with_peer_transport(
+        runtime,
+        &cluster_paths,
+        peer_transport.as_ref(),
+    )
+    .await
+    .map_err(DaemonError::from)?;
+    let execution_exclusions =
+        daemon_dfs_maintenance_execution_exclusions(&cluster_paths, &cluster_state);
+    // Transfer the mutation lane only after refreshing KV and re-reading the
+    // admitted cluster identity. The owned lane remains inside this
+    // cancellable future, so preemption destroys it before the execution
+    // permit can be released.
+    let retained_lane = take_daemon_dfs_message_mutation_service_for_maintenance(
+        &data_dir,
+        &cluster_paths,
+        &cluster_state,
+        runtime,
+    )
+    .map_err(DaemonError::from)?;
+    let DaemonDfsMaintenanceServiceLane {
+        signature,
+        metadata_authority_generation,
+        peer_node_ids,
+        lane,
+        detached_send_runtime,
+    } = retained_lane;
+    let DaemonDfsMessageServiceLane {
+        service: mut maintenance_service,
+        ..
+    } = lane;
+    let authority_generation_before_maintenance = metadata_authority_generation.generation();
     let async_peer_transport = daemon_dfs_async_peer_transport(&data_dir, runtime);
-    let options = daemon_dfs_maintenance_tick_options();
+    let options = daemon_dfs_maintenance_tick_options_for_content_gc(
+        content_gc_requested,
+        content_reservation_reconciliation_requested,
+    );
     let maintenance_result =
-        sinomo_dfs::run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions_and_committed_work_tracker_until_hydration_cancelled(
-            runtime,
+        sinomo_dfs::run_cluster_dfs_maintenance_tick_with_reusable_service_until_hydration_cancelled(
+            &mut maintenance_service,
             data_dir.clone(),
             cluster_paths.clone(),
-            peer_transport,
+            cluster_state,
             async_peer_transport,
-            detached_send_runtime.state.clone(),
             execution_exclusions,
             committed_work_tracker,
-            &|| foreground_preemption.is_requested(),
-            daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(runtime)),
+            &|| {
+                foreground_preemption.is_requested()
+                    || metadata_authority_generation.generation()
+                        != authority_generation_before_maintenance
+            },
             options,
         )
         .await
@@ -5824,6 +6239,46 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
         }
         Ok(None) => {}
     }
+    // A successful broad tick leaves a complete accumulated metadata
+    // projection in memory. Collapse it back to the ordinary lazy request
+    // shell while retaining the exact open backend. Any error, cancellation,
+    // or frozen primary drops the lane instead.
+    let reusable_service = if matches!(&maintenance_result, Ok(Some(_))) {
+        match maintenance_service.operational_metrics() {
+            Ok(metrics) if metrics.authoritative_write_frozen_shard_count == 0 => {
+                match maintenance_service.into_lazy_metadata_backend_service() {
+                    Ok(service) => Some(service),
+                    Err(error) => {
+                        tracing::warn!(
+                            data_root = %data_dir.root().display(),
+                            "dropping daemon DFS maintenance service after lazy reset failed: {error}"
+                        );
+                        None
+                    }
+                }
+            }
+            Ok(metrics) => {
+                tracing::info!(
+                    data_root = %data_dir.root().display(),
+                    frozen_shard_count = metrics.authoritative_write_frozen_shard_count,
+                    "dropping daemon DFS maintenance service while an authoritative shard is frozen"
+                );
+                drop(maintenance_service);
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
+                    data_root = %data_dir.root().display(),
+                    "dropping daemon DFS maintenance service after frozen-shard validation failed: {error}"
+                );
+                drop(maintenance_service);
+                None
+            }
+        }
+    } else {
+        drop(maintenance_service);
+        None
+    };
     let promotion_recovery_started = Instant::now();
     match prepare_daemon_dfs_commit_promotion_recovery(&data_dir, &cluster_paths, runtime) {
         Ok(DaemonDfsCommitPromotionRecovery {
@@ -5848,6 +6303,39 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
         "commit-promotion-recovery maintenance_ms={}",
         promotion_recovery_started.elapsed().as_millis()
     ));
+    if let Some(service) = reusable_service {
+        let retained = DaemonDfsMaintenanceServiceLane {
+            signature,
+            metadata_authority_generation,
+            peer_node_ids: peer_node_ids.clone(),
+            lane: DaemonDfsMessageServiceLane {
+                service,
+                peer_node_ids,
+                last_metadata_refresh: Instant::now(),
+                metadata_hydrated: false,
+            },
+            detached_send_runtime,
+        };
+        match restore_daemon_dfs_message_mutation_service_after_maintenance(
+            &data_dir,
+            &cluster_paths,
+            runtime,
+            retained,
+        ) {
+            Ok(true) => tracing::debug!(
+                data_root = %data_dir.root().display(),
+                "restored daemon DFS mutation service after maintenance"
+            ),
+            Ok(false) => tracing::info!(
+                data_root = %data_dir.root().display(),
+                "dropped daemon DFS mutation service after maintenance identity changed"
+            ),
+            Err(error) => tracing::warn!(
+                data_root = %data_dir.root().display(),
+                "dropping daemon DFS mutation service after maintenance validation failed: {error}"
+            ),
+        }
+    }
     let report = maintenance_result?;
     let Some(report) = report else {
         return Ok(false);
@@ -5935,6 +6423,12 @@ fn daemon_dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport
                 .as_ref()
                 .is_some_and(|gc| gc.max_removals_reached && gc.applied_record_count() > 0)
             || lifecycle
+                .content_reservation_reconciliation
+                .as_ref()
+                .is_some_and(|reconciliation| {
+                    reconciliation.has_more && reconciliation.examined_reservation_count > 0
+                })
+            || lifecycle
                 .tombstone_compaction
                 .as_ref()
                 .is_some_and(|compaction| {
@@ -5954,6 +6448,8 @@ fn daemon_dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport
 pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
     paths: DaemonPaths,
     runtime: tokio::runtime::Handle,
+    content_gc_requested: bool,
+    content_reservation_reconciliation_requested: bool,
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let tick_runtime = runtime.clone();
     let data_owner_lock = daemon_dfs_data_owner_lock(&paths)?;
@@ -5962,6 +6458,8 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
         runtime.block_on(run_daemon_dfs_maintenance_tick_on_runtime(
             &paths,
             &tick_runtime,
+            content_gc_requested,
+            content_reservation_reconciliation_requested,
         ))
     })
     .await
@@ -5971,7 +6469,15 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
     })?
 }
 
+#[cfg(test)]
 fn daemon_dfs_maintenance_tick_options() -> DfsMaintenanceTickOptions {
+    daemon_dfs_maintenance_tick_options_for_content_gc(true, true)
+}
+
+fn daemon_dfs_maintenance_tick_options_for_content_gc(
+    content_gc_requested: bool,
+    content_reservation_reconciliation_requested: bool,
+) -> DfsMaintenanceTickOptions {
     let mut options = DfsMaintenanceTickOptions::default();
     options.repair_max_jobs = DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK;
     options.lifecycle.compact_tombstones = true;
@@ -5983,12 +6489,19 @@ fn daemon_dfs_maintenance_tick_options() -> DfsMaintenanceTickOptions {
     options.lifecycle.metadata_history_gc_keep_latest_versions =
         DAEMON_DFS_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS;
     options.lifecycle.metadata_history_gc_max_records = DAEMON_DFS_METADATA_HISTORY_GC_MAX_RECORDS;
-    // The lifecycle implementation refreshes and validates a durable
-    // all-filesystem root catalog after metadata GC. These requests are safe to
-    // leave enabled: missing, incomplete, stale, or mismatched coverage makes
-    // the destructive collectors fail closed while retaining projections.
-    options.lifecycle.collect_content_versions = true;
-    options.lifecycle.collect_orphan_content = true;
+    // The pre-launch durable-work projection enables content GC only when its
+    // catalog or collectors have due work. Namespace, repair, and replication
+    // maintenance must not amplify into an unrelated all-shard root refresh.
+    // A race that makes content work due after the projection is picked up by
+    // the ordinary follow-up probe; destructive collection remains fail closed.
+    options.lifecycle.collect_content_versions = content_gc_requested;
+    options.lifecycle.collect_orphan_content = content_gc_requested;
+    options.lifecycle.reconcile_content_reservations =
+        content_gc_requested || content_reservation_reconciliation_requested;
+    options
+        .lifecycle
+        .content_reservation_reconciliation_max_records =
+        DAEMON_DFS_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS;
     // Metadata cursor ownership belongs exclusively to retained exact-shard
     // publisher lanes. A broad maintenance pass must not race those lanes or
     // duplicate their outbound RPCs.
@@ -7542,19 +8055,15 @@ mod tests {
     ) -> Result<(), DaemonError> {
         let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
         let cluster_paths = ClusterPaths::new(&data_dir);
-        let cluster_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
-            .map_err(DaemonError::from)?;
-        let execution_exclusions =
-            daemon_dfs_maintenance_execution_exclusions(&cluster_paths, &cluster_state);
         let foreground_preemption =
             daemon_dfs_message_execution_gate(&data_dir)?.begin_maintenance_interest();
         let mut deferred_work = None;
         let result = runtime.block_on(run_daemon_dfs_maintenance_tick_with_admission(
             data_dir,
             cluster_paths.clone(),
-            cluster_state,
-            execution_exclusions,
             runtime.handle(),
+            true,
+            true,
             DfsCommittedWorkTracker::new(),
             &mut deferred_work,
             &foreground_preemption,
@@ -7958,6 +8467,30 @@ mod tests {
         assert!(DAEMON_DFS_METADATA_HISTORY_GC_BYTES_TRIGGER > 0);
         assert!(lifecycle.collect_content_versions);
         assert!(lifecycle.collect_orphan_content);
+        assert!(lifecycle.reconcile_content_reservations);
+        assert_eq!(
+            lifecycle.content_reservation_reconciliation_max_records,
+            DAEMON_DFS_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS
+        );
+        let unrelated_work =
+            daemon_dfs_maintenance_tick_options_for_content_gc(false, false).lifecycle;
+        assert!(!unrelated_work.collect_content_versions);
+        assert!(!unrelated_work.collect_orphan_content);
+        assert!(!unrelated_work.reconcile_content_reservations);
+        assert!(
+            unrelated_work.collect_metadata_history,
+            "content admission must not suppress independent metadata GC"
+        );
+        let reservation_only =
+            daemon_dfs_maintenance_tick_options_for_content_gc(false, true).lifecycle;
+        assert!(!reservation_only.collect_content_versions);
+        assert!(!reservation_only.collect_orphan_content);
+        assert!(reservation_only.reconcile_content_reservations);
+        let destructive_only =
+            daemon_dfs_maintenance_tick_options_for_content_gc(true, false).lifecycle;
+        assert!(destructive_only.collect_content_versions);
+        assert!(destructive_only.collect_orphan_content);
+        assert!(destructive_only.reconcile_content_reservations);
         assert!(
             !daemon_dfs_maintenance_tick_options().publish_metadata,
             "broad maintenance must not race retained exact-shard publishers"
@@ -8068,6 +8601,36 @@ mod tests {
                 "{reason:?} must request a fresh authoritative catalog immediately"
             );
         }
+        let ordinary_advance = DfsContentRootCatalogIncompleteReason::CatalogBehindHeadWatermark {
+            identity: sinomo_dfs::DfsContentRootCatalogShardIdentity {
+                file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
+                shard_id: DfsMetadataShardId::new("root"),
+                primary_node_id: NodeId::from_legacy_named("node_catalog").expect("primary"),
+                epoch: 1,
+            },
+            catalog_journal_sequence: 1,
+            watermark_journal_sequence: 2,
+        };
+        assert!(daemon_dfs_content_gc_blocked_reason_is_ordinary_head_advance(&ordinary_advance));
+        assert!(
+            !daemon_dfs_content_gc_blocked_reason_is_ordinary_head_advance(
+                &DfsContentRootCatalogIncompleteReason::ShardIncomplete {
+                    identity: sinomo_dfs::DfsContentRootCatalogShardIdentity {
+                        file_system_id: DfsFileSystemId::from_legacy_named("sifs")
+                            .expect("filesystem"),
+                        shard_id: DfsMetadataShardId::new("root"),
+                        primary_node_id: NodeId::from_legacy_named("node_catalog")
+                            .expect("primary"),
+                        epoch: 1,
+                    },
+                    reasons: vec![
+                        ordinary_advance,
+                        DfsContentRootCatalogIncompleteReason::StateFingerprintChanged,
+                    ],
+                }
+            ),
+            "a mixed head-advance and fingerprint failure must remain immediately repairable"
+        );
     }
 
     #[test]
@@ -8204,7 +8767,7 @@ mod tests {
         )
         .expect("complete catalog");
         default_dfs_content_root_catalog_store(&content_root)
-            .install_test_catalog_at(complete_catalog, generated_at_unix_nanos)
+            .install_test_catalog_at(complete_catalog.clone(), generated_at_unix_nanos)
             .expect("install complete catalog");
         let mut lifecycle = DfsMaintenanceRunOptions::default();
         lifecycle.content_version_gc_min_age = Duration::ZERO;
@@ -8227,8 +8790,201 @@ mod tests {
         assert_eq!(complete.version_candidate_count, 1);
         assert_eq!(complete.orphan_candidate_count, 1);
         assert!(complete.due_maintenance_count >= 2);
+        assert_eq!(complete.reservation_due_maintenance_count, 0);
         assert!(complete.next_deadline_unix_nanos.is_some());
 
+        let covered_object_id =
+            DfsObjectId::from_legacy_named("covered-reservation-object").expect("object id");
+        let covered_version =
+            DfsVersion::from_legacy_named("covered-reservation-version").expect("version");
+        let covered_content_hash = format!("blake3:{}", "2".repeat(64));
+        let covered_catalog = sinomo_dfs::DfsContentRootCatalog::from_fragments(
+            topology_digest.clone(),
+            vec![identity.clone()],
+            generated_at_unix_nanos,
+            vec![sinomo_dfs::DfsContentRootCatalogFragment {
+                identity: identity.clone(),
+                topology_digest: topology_digest.clone(),
+                generated_at_unix_nanos,
+                coverage: sinomo_dfs::DfsContentRootCatalogCoverage::Complete {
+                    prefix_proof_version: sinomo_dfs::DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
+                    journal_sequence: watermark.journal_sequence,
+                    state_fingerprint: watermark.state_fingerprint.clone(),
+                },
+                entries: vec![sinomo_dfs::DfsContentRootCatalogEntry::Version(
+                    sinomo_dfs::DfsMetadataVersionIdentity::new(
+                        covered_object_id.clone(),
+                        covered_version.clone(),
+                    ),
+                )],
+            }],
+        )
+        .expect("covered-reservation catalog");
+        default_dfs_content_root_catalog_store(&content_root)
+            .install_test_catalog_at(covered_catalog, generated_at_unix_nanos)
+            .expect("install covered-reservation catalog");
+        let covered_reservations = sinomo_dfs::ContentStoreReservationRoots {
+            reservation_count: 1,
+            reservations: vec![sinomo_dfs::ContentStoreReservationRecord {
+                identity: sinomo_dfs::ContentStoreReservationIdentity {
+                    object_id: covered_object_id.as_str().to_string(),
+                    version: covered_version.as_str().to_string(),
+                    content_hash: covered_content_hash.clone(),
+                },
+                reserved_at_unix_nanos: generated_at_unix_nanos,
+            }],
+            versions: BTreeSet::from([(
+                covered_object_id.as_str().to_string(),
+                covered_version.as_str().to_string(),
+            )]),
+            content_hashes: BTreeSet::from([covered_content_hash]),
+        };
+        let covered_reservation = daemon_dfs_content_gc_projection(
+            &data_dir,
+            &cluster_paths,
+            &content,
+            &covered_reservations,
+            lifecycle,
+            daemon_dfs_now_unix_nanos(),
+        )
+        .expect("covered-reservation projection");
+        assert_eq!(
+            covered_reservation.due_maintenance_count, complete.due_maintenance_count,
+            "catalog-covered reservations must not request destructive GC or another catalog refresh"
+        );
+        assert_eq!(
+            covered_reservation.reservation_due_maintenance_count, 1,
+            "catalog-covered reservations must request only bounded local reconciliation"
+        );
+        let reservation_only_work = DaemonDfsPendingMaintenanceWork {
+            content_reservation_due_maintenance_count: 1,
+            ..DaemonDfsPendingMaintenanceWork::default()
+        };
+        assert!(!reservation_only_work.should_run_content_gc());
+        assert!(reservation_only_work.should_reconcile_content_reservations());
+
+        default_dfs_content_root_catalog_store(&content_root)
+            .install_test_catalog_at(complete_catalog.clone(), generated_at_unix_nanos)
+            .expect("restore catalog without rejected reservation");
+        let rejected_object_id = "rejected-reservation-object".to_string();
+        let rejected_version = "rejected-reservation-version".to_string();
+        let rejection_grace_nanos =
+            daemon_dfs_duration_nanos(lifecycle.content_reservation_rejection_grace);
+        let rejected_reservations = sinomo_dfs::ContentStoreReservationRoots {
+            reservation_count: 1,
+            reservations: vec![sinomo_dfs::ContentStoreReservationRecord {
+                identity: sinomo_dfs::ContentStoreReservationIdentity {
+                    object_id: rejected_object_id.clone(),
+                    version: rejected_version.clone(),
+                    content_hash: format!("blake3:{}", "3".repeat(64)),
+                },
+                reserved_at_unix_nanos: generated_at_unix_nanos
+                    .saturating_sub(rejection_grace_nanos.saturating_add(1)),
+            }],
+            versions: BTreeSet::from([(rejected_object_id, rejected_version)]),
+            content_hashes: BTreeSet::new(),
+        };
+        let rejected_reservation = daemon_dfs_content_gc_projection(
+            &data_dir,
+            &cluster_paths,
+            &content,
+            &rejected_reservations,
+            lifecycle,
+            daemon_dfs_now_unix_nanos(),
+        )
+        .expect("rejection-due reservation projection");
+        assert_eq!(
+            rejected_reservation.due_maintenance_count,
+            complete.due_maintenance_count.saturating_add(1),
+            "an uncovered reservation with durable rejection evidence must request a fresh destructive pass"
+        );
+        assert_eq!(
+            rejected_reservation.reservation_due_maintenance_count, 0,
+            "rejection requires refreshed catalog admission rather than reuse-only reconciliation"
+        );
+
+        let behind_catalog = sinomo_dfs::DfsContentRootCatalog::from_fragments(
+            topology_digest.clone(),
+            vec![identity.clone()],
+            generated_at_unix_nanos,
+            vec![sinomo_dfs::DfsContentRootCatalogFragment {
+                identity: identity.clone(),
+                topology_digest: topology_digest.clone(),
+                generated_at_unix_nanos,
+                coverage: sinomo_dfs::DfsContentRootCatalogCoverage::Complete {
+                    prefix_proof_version: sinomo_dfs::DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
+                    journal_sequence: watermark.journal_sequence.saturating_sub(1),
+                    state_fingerprint: format!("dfs-metadata-prefix-v1:blake3:{}", "1".repeat(64)),
+                },
+                entries: vec![sinomo_dfs::DfsContentRootCatalogEntry::Version(
+                    sinomo_dfs::DfsMetadataVersionIdentity::new(covered_object_id, covered_version),
+                )],
+            }],
+        )
+        .expect("behind catalog");
+        default_dfs_content_root_catalog_store(&content_root)
+            .install_test_catalog_at(behind_catalog, generated_at_unix_nanos)
+            .expect("install behind catalog");
+        let coalesced_now = generated_at_unix_nanos.saturating_add(1);
+        let behind = daemon_dfs_content_gc_projection(
+            &data_dir,
+            &cluster_paths,
+            &content,
+            &covered_reservations,
+            lifecycle,
+            coalesced_now,
+        )
+        .expect("behind-head projection");
+        assert_eq!(behind.catalog_journal_lag, 1);
+        assert_eq!(
+            behind.due_maintenance_count, 0,
+            "ordinary head churn must not immediately fan out another full catalog refresh"
+        );
+        assert_eq!(
+            behind.reservation_due_maintenance_count, 1,
+            "historical positive coverage must keep draining reservations while destructive refresh is coalesced"
+        );
+        assert_eq!(
+            behind.next_deadline_unix_nanos,
+            Some(
+                generated_at_unix_nanos.saturating_add(daemon_dfs_duration_nanos(
+                    lifecycle.content_root_catalog_max_age,
+                ))
+            )
+        );
+        let repeated = daemon_dfs_content_gc_projection(
+            &data_dir,
+            &cluster_paths,
+            &content,
+            &covered_reservations,
+            lifecycle,
+            coalesced_now.saturating_add(1),
+        )
+        .expect("repeated behind-head projection");
+        assert_eq!(
+            repeated.next_deadline_unix_nanos, behind.next_deadline_unix_nanos,
+            "head-lag coalescing must retain one absolute deadline"
+        );
+        let refresh_deadline = behind
+            .next_deadline_unix_nanos
+            .expect("coalesced refresh deadline");
+        let expired = daemon_dfs_content_gc_projection(
+            &data_dir,
+            &cluster_paths,
+            &content,
+            &covered_reservations,
+            lifecycle,
+            refresh_deadline,
+        )
+        .expect("expired behind-head projection");
+        assert!(
+            expired.due_maintenance_count > 0,
+            "the bounded coalescing deadline must make refresh due"
+        );
+
+        default_dfs_content_root_catalog_store(&content_root)
+            .install_test_catalog_at(complete_catalog, generated_at_unix_nanos)
+            .expect("restore complete catalog");
         std::fs::write(
             content_root
                 .join("objects")
@@ -8574,6 +9330,32 @@ mod tests {
         assert!(daemon_dfs_maintenance_report_reached_limit(
             &no_progress_history_gc
         ));
+
+        let mut reservation_batch = empty_report();
+        reservation_batch
+            .lifecycle_reports
+            .push(sinomo_dfs::DfsLifecycleMaintenanceReport {
+                content_reservation_reconciliation: Some(
+                    sinomo_dfs::ContentStoreReservationReconciliationReport {
+                        has_more: true,
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            });
+        assert!(
+            !daemon_dfs_maintenance_report_reached_limit(&reservation_batch),
+            "an empty reservation batch must not spin an immediate continuation"
+        );
+        reservation_batch.lifecycle_reports[0]
+            .content_reservation_reconciliation
+            .as_mut()
+            .expect("reservation reconciliation report")
+            .examined_reservation_count = 1;
+        assert!(
+            daemon_dfs_maintenance_report_reached_limit(&reservation_batch),
+            "a bounded reservation batch with remaining identities must drain immediately"
+        );
     }
 
     fn test_default_cluster_bootstrap_host(
@@ -12535,21 +13317,235 @@ mod tests {
                     .expect("lightweight read lane"),
             )
         };
+        let lane_open_count_before_maintenance =
+            daemon_dfs_test_message_service_lane_open_count(&data_dir);
         let weak_primary = Arc::downgrade(&primary_service);
         let weak_read = Arc::downgrade(&read_service);
         drop(primary_service);
-        assert!(
-            evict_daemon_dfs_message_mutation_service_cache(&data_dir)
-                .expect("evict mutation message cache"),
-            "maintenance must release the mutable message lane"
-        );
+        run_daemon_dfs_maintenance_body_for_test(&paths, &runtime)
+            .expect("successful maintenance tick");
         assert!(
             weak_primary.upgrade().is_none(),
-            "maintenance must collect the cached backend before opening its own"
+            "maintenance transfers ownership out of the old cache handle"
         );
         assert!(
             weak_read.upgrade().is_some(),
             "maintenance must preserve the independently locked lightweight read lane"
+        );
+        {
+            let cache = daemon_dfs_message_service_cache()
+                .lock()
+                .expect("cache lock");
+            let lane = cache
+                .get(&cache_key)
+                .expect("cache entry")
+                .primary_service
+                .as_ref()
+                .expect("restored mutation service")
+                .lock()
+                .expect("restored mutation service lock");
+            assert!(
+                !lane.metadata_hydrated,
+                "maintenance must collapse the full projection before restoring the lane"
+            );
+            assert!(
+                lane.service
+                    .metadata()
+                    .object(&unrelated_object_id)
+                    .is_none(),
+                "restored maintenance lane must not retain accumulated object metadata"
+            );
+        }
+        assert_eq!(
+            daemon_dfs_test_message_service_lane_open_count(&data_dir),
+            lane_open_count_before_maintenance,
+            "successful maintenance must not open another backend-bearing lane"
+        );
+
+        let mut second_write = test_dfs_write_routed_message(
+            &remote,
+            &local,
+            3,
+            "/services/daemon-write-after-maintenance.txt",
+        );
+        let DfsNetworkMessage::DistributedWriteRequest(write) = &mut second_write.message else {
+            panic!("distributed write request");
+        };
+        write.desired_replica_nodes = vec![local.clone()];
+        write
+            .object_metadata
+            .as_mut()
+            .expect("write object metadata")
+            .current_locations = vec![local.clone()];
+        handle_daemon_dfs_message_on_runtime(
+            &paths,
+            test_dfs_message_command("dfs_message_write_after_maintenance", second_write),
+            runtime.handle(),
+        )
+        .expect("distributed write after maintenance");
+        assert_eq!(
+            daemon_dfs_test_message_service_lane_open_count(&data_dir),
+            lane_open_count_before_maintenance,
+            "the first post-maintenance mutation must not reopen metadata"
+        );
+
+        let repair_snapshot = sinomo_dfs::default_dfs_repair_attempt_snapshot_path(&data_dir);
+        fs::create_dir_all(
+            repair_snapshot
+                .parent()
+                .expect("repair snapshot parent directory"),
+        )
+        .expect("create repair snapshot directory");
+        fs::write(&repair_snapshot, b"invalid repair snapshot").expect("corrupt repair snapshot");
+        let error = run_daemon_dfs_maintenance_body_for_test(&paths, &runtime)
+            .expect_err("corrupt repair state must fail maintenance");
+        assert!(
+            error.to_string().contains("repair"),
+            "unexpected maintenance error: {error}"
+        );
+        {
+            let cache = daemon_dfs_message_service_cache()
+                .lock()
+                .expect("cache lock");
+            assert!(
+                cache
+                    .get(&cache_key)
+                    .expect("cache entry")
+                    .primary_service
+                    .is_none(),
+                "failed maintenance must drop its backend-bearing mutation lane"
+            );
+        }
+        fs::remove_file(&repair_snapshot).expect("remove corrupt repair snapshot");
+
+        let mut third_write = test_dfs_write_routed_message(
+            &remote,
+            &local,
+            4,
+            "/services/daemon-write-after-failed-maintenance.txt",
+        );
+        let DfsNetworkMessage::DistributedWriteRequest(write) = &mut third_write.message else {
+            panic!("distributed write request");
+        };
+        write.desired_replica_nodes = vec![local.clone()];
+        write
+            .object_metadata
+            .as_mut()
+            .expect("write object metadata")
+            .current_locations = vec![local.clone()];
+        handle_daemon_dfs_message_on_runtime(
+            &paths,
+            test_dfs_message_command("dfs_message_write_after_failed_maintenance", third_write),
+            runtime.handle(),
+        )
+        .expect("distributed write after failed maintenance");
+        assert_eq!(
+            daemon_dfs_test_message_service_lane_open_count(&data_dir),
+            lane_open_count_before_maintenance.saturating_add(1),
+            "the first mutation after failed maintenance must open a new lane"
+        );
+
+        let current_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+            .expect("cluster state before peer-only maintenance refresh");
+        let retained = take_daemon_dfs_message_mutation_service_for_maintenance(
+            &data_dir,
+            &cluster_paths,
+            &current_state,
+            runtime.handle(),
+        )
+        .expect("take mutation lane before peer-only refresh");
+        let added_peer =
+            NodeId::from_legacy_named("node_dfs_protocol_added_peer").expect("added peer");
+        let mut changed_state = current_state;
+        changed_state
+            .members
+            .push(test_remote_cluster_member_with_endpoint(
+                &changed_state.cluster_id,
+                &added_peer,
+                "127.0.0.2:9",
+            ));
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &changed_state)
+            .expect("write peer-only cluster-state change");
+        assert!(
+            restore_daemon_dfs_message_mutation_service_after_maintenance(
+                &data_dir,
+                &cluster_paths,
+                runtime.handle(),
+                retained,
+            )
+            .expect("restore mutation lane after peer-only refresh"),
+            "peer membership changes must refresh, not discard, the retained mutation lane"
+        );
+        {
+            let cache = daemon_dfs_message_service_cache()
+                .lock()
+                .expect("cache lock");
+            let entry = cache.get(&cache_key).expect("cache entry");
+            let lane = entry
+                .primary_service
+                .as_ref()
+                .expect("restored mutation lane")
+                .lock()
+                .expect("mutation lane lock");
+            assert!(
+                lane.peer_node_ids.contains(&added_peer),
+                "the retained mutation lane must install the current peer targets"
+            );
+        }
+        assert_eq!(
+            daemon_dfs_test_message_service_lane_open_count(&data_dir),
+            lane_open_count_before_maintenance.saturating_add(1),
+            "peer-only maintenance refresh must retain the open metadata backend"
+        );
+
+        let current_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+            .expect("current cluster state");
+        let retained = take_daemon_dfs_message_mutation_service_for_maintenance(
+            &data_dir,
+            &cluster_paths,
+            &current_state,
+            runtime.handle(),
+        )
+        .expect("take mutation lane for authority-change validation");
+        let changed_root_shard = DfsMetadataShardConfig {
+            epoch: root_shard.epoch.saturating_add(1),
+            ..root_shard
+        };
+        append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
+                    metadata_shard_key(
+                        &changed_root_shard.file_system_id,
+                        &changed_root_shard.shard_id,
+                    ),
+                    &changed_root_shard,
+                    None,
+                )
+                .expect("changed root shard op"),
+            ),
+        )
+        .expect("commit changed root shard");
+        assert!(
+            !restore_daemon_dfs_message_mutation_service_after_maintenance(
+                &data_dir,
+                &cluster_paths,
+                runtime.handle(),
+                retained,
+            )
+            .expect("validate changed maintenance signature"),
+            "authority changes must reject a maintenance lane captured from the old generation"
+        );
+        assert!(
+            daemon_dfs_message_service_cache()
+                .lock()
+                .expect("cache lock")
+                .get(&cache_key)
+                .expect("cache entry")
+                .primary_service
+                .is_none(),
+            "a rejected authority generation must leave the mutation lane empty"
         );
         drop(read_service);
         assert!(
@@ -12675,6 +13671,89 @@ mod tests {
             daemon_dfs_test_message_service_lane_open_count(&SinomoDataDir::new(&data_root)),
             1,
             "lightweight reads should open only their targeted lane"
+        );
+    }
+
+    #[test]
+    fn daemon_dfs_peer_membership_refresh_reuses_lightweight_lane() {
+        let root = temp_root("daemon_dfs_message_peer_refresh");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let local = NodeId::from_legacy_named("node_dfs_peer_refresh_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_dfs_peer_refresh_remote").expect("remote");
+        let added = NodeId::from_legacy_named("node_dfs_peer_refresh_added").expect("added");
+        write_test_cluster_state_with_remote_endpoint(&data_root, &local, &remote, "127.0.0.1:9");
+        let runtime = daemon_test_runtime("daemon-dfs-message-peer-refresh");
+
+        handle_daemon_dfs_message_on_runtime(
+            &paths,
+            test_dfs_message_command(
+                "dfs_message_peer_refresh_1",
+                test_dfs_lookup_routed_message(&remote, &local, 1, "/services/peer-refresh-1.txt"),
+            ),
+            runtime.handle(),
+        )
+        .expect("initial lookup");
+        let cache_key = data_dir.root();
+        let read_service = {
+            let cache = daemon_dfs_message_service_cache()
+                .lock()
+                .expect("cache lock");
+            Arc::clone(
+                cache
+                    .get(&cache_key)
+                    .expect("cache entry")
+                    .lightweight_read_service
+                    .as_ref()
+                    .expect("lightweight read lane"),
+            )
+        };
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_dfs_protocol")
+                .expect("cluster");
+        write_test_cluster_state_with_members(
+            &data_root,
+            &local,
+            vec![
+                test_remote_cluster_member_with_endpoint(&cluster_id, &remote, "127.0.0.1:9"),
+                test_remote_cluster_member_with_endpoint(&cluster_id, &added, "127.0.0.2:9"),
+            ],
+        );
+        handle_daemon_dfs_message_on_runtime(
+            &paths,
+            test_dfs_message_command(
+                "dfs_message_peer_refresh_2",
+                test_dfs_lookup_routed_message(&remote, &local, 2, "/services/peer-refresh-2.txt"),
+            ),
+            runtime.handle(),
+        )
+        .expect("lookup after peer addition");
+        {
+            let cache = daemon_dfs_message_service_cache()
+                .lock()
+                .expect("cache lock");
+            let entry = cache.get(&cache_key).expect("cache entry");
+            let current = entry
+                .lightweight_read_service
+                .as_ref()
+                .expect("lightweight read lane");
+            assert!(
+                Arc::ptr_eq(&read_service, current),
+                "peer addition must not reopen the lightweight metadata backend"
+            );
+            let lane = current.lock().expect("lightweight lane lock");
+            assert!(lane.peer_node_ids.contains(&remote));
+            assert!(lane.peer_node_ids.contains(&added));
+        }
+        assert_eq!(
+            daemon_dfs_test_message_service_lane_open_count(&data_dir),
+            1,
+            "peer membership changes must keep the one open metadata backend"
+        );
+        assert!(
+            evict_daemon_dfs_message_service_cache(&data_dir).expect("evict message cache"),
+            "test cleanup must release the cached lane"
         );
     }
 
@@ -15159,10 +16238,19 @@ mod tests {
         remote_node_id: &NodeId,
         address: &str,
     ) {
-        let now = OffsetDateTime::now_utc();
         let cluster_id =
             sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_dfs_protocol")
                 .expect("cluster");
+        let remote = test_remote_cluster_member_with_endpoint(&cluster_id, remote_node_id, address);
+        write_test_cluster_state_with_members(data_root, local_node_id, vec![remote]);
+    }
+
+    fn test_remote_cluster_member_with_endpoint(
+        cluster_id: &sinomo_core::node::ClusterId,
+        remote_node_id: &NodeId,
+        address: &str,
+    ) -> sinomo_core::ClusterMemberRecord {
+        let now = OffsetDateTime::now_utc();
         let mut remote = sinomo_core::ClusterMemberRecord::local_non_voting(
             cluster_id.clone(),
             remote_node_id.clone(),
@@ -15179,7 +16267,7 @@ mod tests {
                 address.to_string(),
                 5,
             ));
-        write_test_cluster_state_with_members(data_root, local_node_id, vec![remote]);
+        remote
     }
 
     fn write_test_cluster_state_with_members(

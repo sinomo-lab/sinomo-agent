@@ -160,6 +160,7 @@ pub use control_plane::{
     metadata_shard_membership_handoff_proof_key, metadata_shards_prefix,
     placement_authority_permit_key, placement_reconciliation_activity_index_key,
     placement_reconciliation_key, placement_reconciliations_prefix,
+    select_metadata_shard_config_for_path_strict_default_sifs_split,
 };
 #[cfg(test)]
 pub(crate) use default_cluster::run_default_cluster_dfs_smoke;
@@ -227,15 +228,15 @@ pub use local_state::{
     cluster_dfs_all_metadata_shard_membership_handoffs, cluster_dfs_all_metadata_shards,
     cluster_dfs_metadata_shards, default_dfs_metadata_root, default_dfs_metadata_shards_root,
     default_dfs_pin_root, dfs_import_metadata_root, dfs_import_namespace_root, dfs_import_root,
-    inspect_cluster_aware_dfs, inspect_cluster_aware_dfs_status, inspect_dfs_conflicts,
-    inspect_dfs_file_system, inspect_dfs_object, inspect_dfs_path, inspect_dfs_repairs,
-    inspect_dfs_status, list_local_dfs_pins, local_dfs_metadata_shard_path,
-    open_cluster_aware_dfs_metadata_backend,
+    evict_cluster_aware_dfs_metadata_inspection_cache, inspect_cluster_aware_dfs,
+    inspect_cluster_aware_dfs_status, inspect_dfs_conflicts, inspect_dfs_file_system,
+    inspect_dfs_object, inspect_dfs_path, inspect_dfs_repairs, inspect_dfs_status,
+    list_local_dfs_pins, local_dfs_metadata_shard_path, open_cluster_aware_dfs_metadata_backend,
     open_cluster_aware_dfs_metadata_backend_for_inspection,
     open_cluster_sharded_dfs_metadata_backend, open_local_metadata_shard_backend,
     open_local_sharded_metadata_backend, open_local_sharded_metadata_backend_for_replica_repair,
     open_root_local_metadata_backend, remove_local_dfs_pin, resolve_dfs_metadata_root,
-    resolve_dfs_pin_root,
+    resolve_dfs_pin_root, with_cached_cluster_aware_dfs_metadata_inspection,
 };
 pub(crate) use maintenance::record_anti_entropy_issue;
 pub use maintenance::{
@@ -265,13 +266,15 @@ pub use maintenance::{
     legacy_dfs_metadata_replication_cursor_path, migrate_legacy_dfs_metadata_replication_cursor,
     put_local_dfs_metadata_replication_suppression, read_dfs_anti_entropy_cursor,
     read_dfs_metadata_replication_suppression_snapshot, read_dfs_repair_attempt_snapshot,
+    refresh_cluster_dfs_maintenance_state_with_peer_transport,
     run_cluster_dfs_maintenance_tick_with_async_peer_transport,
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state,
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions,
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions_and_committed_work_tracker,
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions_and_committed_work_tracker_until_hydration_cancelled,
-    run_cluster_dfs_maintenance_tick_with_peer_transport, run_dfs_lifecycle_maintenance_with_host,
-    run_dfs_maintenance_tick_with_async_host,
+    run_cluster_dfs_maintenance_tick_with_peer_transport,
+    run_cluster_dfs_maintenance_tick_with_reusable_service_until_hydration_cancelled,
+    run_dfs_lifecycle_maintenance_with_host, run_dfs_maintenance_tick_with_async_host,
     run_dfs_maintenance_tick_with_async_host_and_execution_exclusions,
     run_dfs_maintenance_tick_with_host, write_dfs_anti_entropy_cursor,
     write_dfs_metadata_replication_suppression_snapshot, write_dfs_repair_attempt_snapshot,

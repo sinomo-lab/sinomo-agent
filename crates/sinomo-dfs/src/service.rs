@@ -21,20 +21,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::direct_read::handle_dfs_direct_read_request_with_initialized_content_store;
-use crate::local_state::open_cluster_aware_dfs_metadata_backend_for_inspection;
 use crate::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_SERVICE_ROUTES, DFS_DIRECT_READ_ROUTE,
     DFS_INSPECTION_ROUTE, DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
     DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse,
-    DfsFileSystemId, DfsMessageCommand, DfsMessageResponse, DfsMetadataBackend,
-    DfsMetadataJournalBatchCommand, DfsMetadataReplicaShardContext, DfsMetadataShardConfig,
-    DfsMetadataShardId, DfsMetadataShardMembershipHandoff, DfsMetadataSnapshotInstallCommand,
-    DfsOperatorInspector, DfsOperatorStatus, DfsOutboundAttachment, DfsSmokeReport,
-    LocalContentStore, default_dfs_metadata_root, default_dfs_metadata_shards_root,
-    dfs_module_surfaces, dfs_route_is_message_data_plane, inspect_cluster_aware_dfs_status,
-    metadata_shard_key, metadata_shard_membership_handoff_key, metadata_shards_prefix,
-    open_local_sharded_metadata_backend, open_root_local_metadata_backend, resolve_dfs_conflicts,
-    sifs_file_system_id, use_dfs_conflict_version,
+    DfsFileSystemId, DfsMessageCommand, DfsMessageResponse, DfsMetadataJournalBatchCommand,
+    DfsMetadataReplicaShardContext, DfsMetadataShardConfig, DfsMetadataShardId,
+    DfsMetadataShardMembershipHandoff, DfsMetadataSnapshotInstallCommand, DfsOperatorStatus,
+    DfsOutboundAttachment, DfsSmokeReport, LocalContentStore, dfs_module_surfaces,
+    dfs_route_is_message_data_plane, inspect_cluster_aware_dfs, inspect_cluster_aware_dfs_status,
+    metadata_shard_key, metadata_shard_membership_handoff_key,
 };
 use sinomo_core::local::SinomoDataDir;
 #[cfg(test)]
@@ -499,38 +495,6 @@ fn service_error(error: impl std::fmt::Display) -> ServiceError {
     ServiceError::Service(error.to_string())
 }
 
-/// Open the DFS metadata backend for `data_dir`: the sharded backend when cluster state
-/// is present on disk (reading shard configs from the local cluster-KV snapshot),
-/// otherwise the local-owned root backend.
-fn open_metadata_backend(
-    data_dir: &SinomoDataDir,
-) -> Result<Box<dyn DfsMetadataBackend>, ServiceError> {
-    let cluster_paths = ClusterPaths::new(data_dir);
-    if cluster_paths.state.exists() {
-        let file_system_id = sifs_file_system_id();
-        let mut shards = sinomo_core::kv::read_cluster_kv_prefix_entries(
-            &cluster_paths.kv_paths(),
-            &format!("{}/", metadata_shards_prefix(&file_system_id)),
-        )?
-        .into_iter()
-        .map(|entry| entry.decode::<DfsMetadataShardConfig>())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(service_error)?;
-        shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
-        if !shards.is_empty() {
-            let backend = open_local_sharded_metadata_backend(
-                default_dfs_metadata_shards_root(data_dir),
-                shards,
-            )
-            .map_err(service_error)?;
-            return Ok(Box::new(backend));
-        }
-    }
-    open_root_local_metadata_backend(default_dfs_metadata_root(data_dir))
-        .map(|backend| Box::new(backend) as Box<dyn DfsMetadataBackend>)
-        .map_err(service_error)
-}
-
 /// Build the DFS operator status, then trim shard detail to the local node's role.
 fn dfs_status(data_dir: &SinomoDataDir) -> Result<DfsOperatorStatus, ServiceError> {
     let started_at = Instant::now();
@@ -562,110 +526,8 @@ fn dfs_inspection(
             status: dfs_status(data_dir)?,
         });
     }
-    let mut metadata = if matches!(
-        &request,
-        DaemonDfsInspectionRequest::ResolveConflicts { .. }
-            | DaemonDfsInspectionRequest::UseConflictVersion { .. }
-    ) {
-        open_metadata_backend(data_dir)?
-    } else {
-        let cluster_paths = ClusterPaths::new(data_dir);
-        open_cluster_aware_dfs_metadata_backend_for_inspection(data_dir, &cluster_paths)
-            .map_err(service_error)?
-    };
-    let inspector = DfsOperatorInspector::new(metadata.as_ref());
-    let response = match request {
-        DaemonDfsInspectionRequest::Status => unreachable!("status handled before backend open"),
-        DaemonDfsInspectionRequest::FileSystem { file_system_id } => {
-            DaemonDfsInspectionResponse::FileSystem {
-                file_system: inspector
-                    .file_system(&file_system_id)
-                    .map_err(service_error)?,
-            }
-        }
-        DaemonDfsInspectionRequest::Path {
-            file_system_id,
-            path,
-        } => DaemonDfsInspectionResponse::Path {
-            object: inspector
-                .object_by_path(&file_system_id, &path)
-                .map_err(service_error)?,
-        },
-        DaemonDfsInspectionRequest::Object { object_id } => DaemonDfsInspectionResponse::Object {
-            object: inspector.object(&object_id).map_err(service_error)?,
-        },
-        DaemonDfsInspectionRequest::Conflicts {
-            file_system_id,
-            object_id,
-            limit,
-            cursor,
-        } => {
-            let page = inspector
-                .conflicts_page(
-                    file_system_id.as_ref(),
-                    object_id.as_ref(),
-                    limit,
-                    cursor.as_ref(),
-                )
-                .map_err(service_error)?;
-            DaemonDfsInspectionResponse::Conflicts {
-                conflicts: page.conflicts,
-                next_cursor: page.next_cursor,
-            }
-        }
-        DaemonDfsInspectionRequest::ResolveConflicts {
-            file_system_id,
-            object_id,
-            conflict_ids,
-        } => {
-            let report = resolve_dfs_conflicts(
-                metadata.as_mut(),
-                file_system_id.as_ref(),
-                object_id.as_ref(),
-                &conflict_ids,
-            )
-            .map_err(service_error)?;
-            DaemonDfsInspectionResponse::ResolveConflicts { report }
-        }
-        DaemonDfsInspectionRequest::ConflictVersions {
-            object_id,
-            conflict_ids,
-        } => DaemonDfsInspectionResponse::ConflictVersions {
-            report: inspector
-                .conflict_versions(&object_id, &conflict_ids)
-                .map_err(service_error)?,
-        },
-        DaemonDfsInspectionRequest::UseConflictVersion {
-            object_id,
-            version,
-            conflict_ids,
-        } => {
-            let report =
-                use_dfs_conflict_version(metadata.as_mut(), &object_id, &version, &conflict_ids)
-                    .map_err(service_error)?;
-            DaemonDfsInspectionResponse::UseConflictVersion { report }
-        }
-        DaemonDfsInspectionRequest::Repair {
-            file_system_id,
-            object_id,
-            limit,
-            cursor,
-        } => {
-            let page = inspector
-                .repairs_page(
-                    file_system_id.as_ref(),
-                    object_id.as_ref(),
-                    limit,
-                    cursor.as_ref(),
-                )
-                .map_err(service_error)?;
-            DaemonDfsInspectionResponse::Repair {
-                repairs: page.repairs,
-                next_cursor: page.next_cursor,
-            }
-        }
-    };
-    Ok(response)
+    let cluster_paths = ClusterPaths::new(data_dir);
+    inspect_cluster_aware_dfs(data_dir, &cluster_paths, request).map_err(service_error)
 }
 
 async fn authoritative_metadata_replica_shard_context(
@@ -774,14 +636,14 @@ mod tests {
     use super::*;
     use crate::{DFS_OBJECT_RPC_ROUTES, DFS_RPC_CATEGORY};
     use crate::{
-        DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsFileSystem,
+        DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsFileSystem, DfsMetadataBackend,
         DfsMetadataJournalBatch, DfsMetadataJournalBatchResponse,
         DfsMetadataJournalReplicationReport, DfsMetadataShardAssignment, DfsMetadataShardId,
         DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
         DfsMetadataSnapshotInstallResult, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
         DfsObjectVersionRecord, DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsSmokeAttempt,
         DfsVersion, DfsWriteIntentRecord, DfsWriteIntentStatus, LocalSobjMetadataBackend,
-        metadata_shard_key, sifs_file_system_id,
+        default_dfs_metadata_shards_root, metadata_shard_key, sifs_file_system_id,
     };
     use sinomo_core::DfsObjectPolicy;
     use sinomo_core::cluster::ClusterKvPathsExt;

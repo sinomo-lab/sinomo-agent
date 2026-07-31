@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -22,12 +22,19 @@ use crate::metadata_records::{
 
 pub(crate) const JOURNAL_SEGMENT_ENTRY_LIMIT: u64 = 8192;
 const JOURNAL_SEGMENT_INDEX_CACHE_LIMIT: usize = 256;
+// Point lookups may name multi-megabyte namespace records. Keep their decoded
+// form under a deliberately small process-wide LRU so repeated table replay
+// does not trade CPU amplification for unbounded resident memory.
+const JOURNAL_SEGMENT_DECODED_CACHE_ENTRY_LIMIT: usize = 16;
+const JOURNAL_SEGMENT_DECODED_CACHE_BYTE_LIMIT: u64 = 32 * 1024 * 1024;
 
 #[cfg(test)]
 thread_local! {
     static METADATA_JOURNAL_SEGMENT_SCAN_CALLS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     static METADATA_JOURNAL_DECODED_RECORDS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static METADATA_JOURNAL_DECODED_CACHE_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
@@ -49,6 +56,33 @@ fn reset_metadata_journal_decoded_records() {
 #[cfg(test)]
 fn metadata_journal_decoded_records() -> usize {
     METADATA_JOURNAL_DECODED_RECORDS.get()
+}
+
+#[cfg(test)]
+fn reset_metadata_journal_decoded_cache_hits() {
+    METADATA_JOURNAL_DECODED_CACHE_HITS.set(0);
+}
+
+#[cfg(test)]
+fn metadata_journal_decoded_cache_hits() -> usize {
+    METADATA_JOURNAL_DECODED_CACHE_HITS.get()
+}
+
+#[cfg(test)]
+fn metadata_journal_decoded_cache_usage(path: &Path) -> (usize, u64) {
+    let cache = journal_segment_index_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache
+        .decoded_entries
+        .iter()
+        .filter(|(key, _)| key.path == path)
+        .fold((0_usize, 0_u64), |(entries, bytes), (_, cached)| {
+            (
+                entries.saturating_add(1),
+                bytes.saturating_add(cached.record_bytes),
+            )
+        })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,11 +173,30 @@ struct JournalSegmentEntryOffset {
 
 #[derive(Clone, Debug)]
 struct JournalSegmentIndex {
+    content_generation: u64,
     identity: JournalSegmentFileIdentity,
     observed_file_len: u64,
     modified: Option<SystemTime>,
     indexed_bytes: u64,
     entries: Vec<JournalSegmentEntryOffset>,
+}
+
+impl JournalSegmentIndex {
+    fn record_bytes(&self, expected: JournalSegmentEntryOffset) -> Option<u64> {
+        let position = self
+            .entries
+            .binary_search_by_key(&expected.record_start, |entry| entry.record_start)
+            .ok()?;
+        (self.entries[position].sequence == expected.sequence)
+            .then_some(())
+            .and_then(|()| {
+                self.entries
+                    .get(position.saturating_add(1))
+                    .map(|next| next.record_start)
+                    .unwrap_or(self.indexed_bytes)
+                    .checked_sub(expected.record_start)
+            })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -152,10 +205,27 @@ struct CachedJournalSegmentIndex {
     last_used: u64,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct JournalSegmentDecodedEntryKey {
+    path: PathBuf,
+    content_generation: u64,
+    record_start: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CachedJournalSegmentDecodedEntry {
+    sequence: u64,
+    record_bytes: u64,
+    entry: Arc<DfsMetadataJournalEntry>,
+    last_used: u64,
+}
+
 #[derive(Debug, Default)]
 struct JournalSegmentIndexCache {
     generation: u64,
     entries: BTreeMap<PathBuf, CachedJournalSegmentIndex>,
+    decoded_entry_bytes: u64,
+    decoded_entries: BTreeMap<JournalSegmentDecodedEntryKey, CachedJournalSegmentDecodedEntry>,
 }
 
 fn journal_segment_index_cache() -> &'static Mutex<JournalSegmentIndexCache> {
@@ -174,12 +244,51 @@ fn cached_journal_segment_index(path: &Path) -> Option<JournalSegmentIndex> {
     Some(cached.index.clone())
 }
 
-fn cache_journal_segment_index(path: PathBuf, index: JournalSegmentIndex) {
+fn remove_cached_journal_segment_decoded_entries(
+    cache: &mut JournalSegmentIndexCache,
+    path: &Path,
+) {
+    let mut removed_bytes = 0_u64;
+    cache.decoded_entries.retain(|key, cached| {
+        let retain = key.path != path;
+        if !retain {
+            removed_bytes = removed_bytes.saturating_add(cached.record_bytes);
+        }
+        retain
+    });
+    cache.decoded_entry_bytes = cache.decoded_entry_bytes.saturating_sub(removed_bytes);
+}
+
+fn remove_cached_journal_segment(
+    cache: &mut JournalSegmentIndexCache,
+    path: &Path,
+) -> Option<CachedJournalSegmentIndex> {
+    remove_cached_journal_segment_decoded_entries(cache, path);
+    cache.entries.remove(path)
+}
+
+fn cache_journal_segment_index(
+    path: PathBuf,
+    mut index: JournalSegmentIndex,
+) -> JournalSegmentIndex {
     let mut cache = journal_segment_index_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.generation = cache.generation.saturating_add(1);
     let generation = cache.generation;
+    if index.content_generation == 0 {
+        index.content_generation = generation;
+        remove_cached_journal_segment_decoded_entries(&mut cache, &path);
+    } else if cache
+        .entries
+        .get(&path)
+        .is_some_and(|cached| cached.index.content_generation != index.content_generation)
+    {
+        // A concurrent reader has already installed a newer view of this
+        // path. Do not let a stale append-extension overwrite it or populate
+        // decoded entries under its obsolete generation.
+        return index;
+    }
     if !cache.entries.contains_key(&path)
         && cache.entries.len() >= JOURNAL_SEGMENT_INDEX_CACHE_LIMIT
         && let Some(evicted) = cache
@@ -188,12 +297,107 @@ fn cache_journal_segment_index(path: PathBuf, index: JournalSegmentIndex) {
             .min_by_key(|(_, cached)| cached.last_used)
             .map(|(path, _)| path.clone())
     {
-        cache.entries.remove(&evicted);
+        remove_cached_journal_segment(&mut cache, &evicted);
     }
     cache.entries.insert(
         path,
         CachedJournalSegmentIndex {
-            index,
+            index: index.clone(),
+            last_used: generation,
+        },
+    );
+    index
+}
+
+fn cached_journal_segment_decoded_entry(
+    path: &Path,
+    index: &JournalSegmentIndex,
+    expected: JournalSegmentEntryOffset,
+) -> Option<Arc<DfsMetadataJournalEntry>> {
+    let mut cache = journal_segment_index_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !cache
+        .entries
+        .get(path)
+        .is_some_and(|cached| cached.index.content_generation == index.content_generation)
+    {
+        return None;
+    }
+    cache.generation = cache.generation.saturating_add(1);
+    let generation = cache.generation;
+    let key = JournalSegmentDecodedEntryKey {
+        path: path.to_owned(),
+        content_generation: index.content_generation,
+        record_start: expected.record_start,
+    };
+    let cached = cache.decoded_entries.get_mut(&key)?;
+    if cached.sequence != expected.sequence {
+        return None;
+    }
+    cached.last_used = generation;
+    Some(Arc::clone(&cached.entry))
+}
+
+fn cache_journal_segment_decoded_entry(
+    path: &Path,
+    index: &JournalSegmentIndex,
+    expected: JournalSegmentEntryOffset,
+    record_bytes: u64,
+    entry: &DfsMetadataJournalEntry,
+) {
+    if record_bytes == 0 || record_bytes > JOURNAL_SEGMENT_DECODED_CACHE_BYTE_LIMIT {
+        return;
+    }
+    let decoded = Arc::new(entry.clone());
+    let mut cache = journal_segment_index_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !cache.entries.get(path).is_some_and(|cached| {
+        cached.index.content_generation == index.content_generation
+            && cached.index.entries.iter().any(|offset| {
+                offset.sequence == expected.sequence && offset.record_start == expected.record_start
+            })
+    }) {
+        return;
+    }
+    cache.generation = cache.generation.saturating_add(1);
+    let generation = cache.generation;
+    let key = JournalSegmentDecodedEntryKey {
+        path: path.to_owned(),
+        content_generation: index.content_generation,
+        record_start: expected.record_start,
+    };
+    if let Some(replaced) = cache.decoded_entries.remove(&key) {
+        cache.decoded_entry_bytes = cache
+            .decoded_entry_bytes
+            .saturating_sub(replaced.record_bytes);
+    }
+    while cache.decoded_entries.len() >= JOURNAL_SEGMENT_DECODED_CACHE_ENTRY_LIMIT
+        || cache.decoded_entry_bytes.saturating_add(record_bytes)
+            > JOURNAL_SEGMENT_DECODED_CACHE_BYTE_LIMIT
+    {
+        let Some(evicted) = cache
+            .decoded_entries
+            .iter()
+            .min_by_key(|(_, cached)| cached.last_used)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        if let Some(evicted) = cache.decoded_entries.remove(&evicted) {
+            cache.decoded_entry_bytes = cache
+                .decoded_entry_bytes
+                .saturating_sub(evicted.record_bytes);
+        }
+    }
+    cache.decoded_entry_bytes = cache.decoded_entry_bytes.saturating_add(record_bytes);
+    cache.decoded_entries.insert(
+        key,
+        CachedJournalSegmentDecodedEntry {
+            sequence: expected.sequence,
+            record_bytes,
+            entry: decoded,
             last_used: generation,
         },
     );
@@ -201,11 +405,12 @@ fn cache_journal_segment_index(path: PathBuf, index: JournalSegmentIndex) {
 
 #[cfg(test)]
 fn reset_journal_segment_index_cache() {
-    journal_segment_index_cache()
+    let mut cache = journal_segment_index_cache()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entries
-        .clear();
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.entries.clear();
+    cache.decoded_entries.clear();
+    cache.decoded_entry_bytes = 0;
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -407,6 +612,16 @@ pub(crate) fn append_segmented_journal_entry(
     root: &Path,
     entry: &DfsMetadataJournalEntry,
 ) -> Result<()> {
+    append_segmented_journal_entry_with_record_bytes(root, entry).map(|_| ())
+}
+
+/// Append and return the exact length-prefixed bytes written for this journal
+/// record. Callers may persist that already-measured size as rebuild replay
+/// pressure without encoding the authoritative mutation a second time.
+pub(crate) fn append_segmented_journal_entry_with_record_bytes(
+    root: &Path,
+    entry: &DfsMetadataJournalEntry,
+) -> Result<u64> {
     let bytes = sinomo_object_serde::to_bytes(entry, 1, LengthMode::U32)
         .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
     u32::try_from(bytes.len()).map_err(|_| {
@@ -430,7 +645,7 @@ pub(crate) fn append_segmented_journal_entry(
         durable_file::DurableAppendFileOptions::new().without_parent_sync(),
     )
     .map_err(metadata_durable_file_error)?;
-    durable_file::append_length_prefixed_records(
+    let record_bytes = durable_file::append_length_prefixed_records(
         &mut append.file,
         &path,
         [bytes.as_slice()],
@@ -441,7 +656,7 @@ pub(crate) fn append_segmented_journal_entry(
     if !existed && let Some(parent) = path.parent() {
         sync_dir(parent)?;
     }
-    Ok(())
+    Ok(record_bytes)
 }
 
 pub(crate) fn append_segmented_journal_entries(
@@ -526,12 +741,23 @@ pub(crate) fn append_segmented_journal_entries(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn write_local_journal_entry(
     root: &Path,
     shard_id: &DfsMetadataShardId,
     next_sequence: &mut u64,
     mutation: DfsMetadataMutation,
 ) -> Result<DfsMetadataJournalEntry> {
+    write_local_journal_entry_with_record_bytes(root, shard_id, next_sequence, mutation)
+        .map(|(entry, _)| entry)
+}
+
+pub(crate) fn write_local_journal_entry_with_record_bytes(
+    root: &Path,
+    shard_id: &DfsMetadataShardId,
+    next_sequence: &mut u64,
+    mutation: DfsMetadataMutation,
+) -> Result<(DfsMetadataJournalEntry, u64)> {
     let sequence = (*next_sequence).max(1);
     let entry = DfsMetadataJournalEntry {
         shard_id: shard_id.clone(),
@@ -539,9 +765,9 @@ pub(crate) fn write_local_journal_entry(
         created_at: time::OffsetDateTime::now_utc(),
         mutation,
     };
-    append_segmented_journal_entry(root, &entry)?;
+    let record_bytes = append_segmented_journal_entry_with_record_bytes(root, &entry)?;
     *next_sequence = sequence.saturating_add(1);
-    Ok(entry)
+    Ok((entry, record_bytes))
 }
 
 pub(crate) fn write_local_journal_entries(
@@ -922,6 +1148,21 @@ fn segmented_journal_entries_since_limited(
     Ok(entries)
 }
 
+fn journal_segment_file_matches_index(
+    file: &fs::File,
+    path: &Path,
+    index: &JournalSegmentIndex,
+) -> Result<bool> {
+    let metadata = file.metadata().map_err(|source| MetadataBackendError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    Ok(index.content_generation != 0
+        && index.identity == JournalSegmentFileIdentity::from_file_metadata(file, &metadata)
+        && index.observed_file_len == metadata.len()
+        && index.modified == metadata.modified().ok())
+}
+
 pub(crate) fn read_segmented_journal_file_since_limited(
     path: &Path,
     after_sequence: u64,
@@ -962,6 +1203,7 @@ pub(crate) fn read_segmented_journal_file_since_limited(
         cached.expect("cache hit or extension requires a cached index")
     } else {
         JournalSegmentIndex {
+            content_generation: 0,
             identity: identity.clone(),
             observed_file_len: 0,
             modified: None,
@@ -1016,7 +1258,7 @@ pub(crate) fn read_segmented_journal_file_since_limited(
         index.identity = identity;
         index.observed_file_len = file_bytes;
         index.modified = modified;
-        cache_journal_segment_index(path.to_owned(), index.clone());
+        index = cache_journal_segment_index(path.to_owned(), index);
     }
 
     let first_entry = index
@@ -1029,11 +1271,31 @@ pub(crate) fn read_segmented_journal_file_since_limited(
     let all_selected_were_refreshed = selected
         .iter()
         .all(|offset| refreshed_entries.contains_key(&offset.record_start));
+    let use_decoded_cache = selected.len() == 1
+        && max_entries == 1
+        && journal_segment_file_matches_index(&file, path, &index)?;
+    let mut decoded_cache_hit = false;
     let entries = if all_selected_were_refreshed {
-        selected
+        let entries = selected
             .iter()
             .filter_map(|offset| refreshed_entries.remove(&offset.record_start))
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        if use_decoded_cache
+            && let (Some(expected), Some(entry)) = (selected.first().copied(), entries.first())
+            && let Some(record_bytes) = index.record_bytes(expected)
+        {
+            cache_journal_segment_decoded_entry(path, &index, expected, record_bytes, entry);
+        }
+        entries
+    } else if use_decoded_cache
+        && let Some(expected) = selected.first().copied()
+        && let Some(cached) = cached_journal_segment_decoded_entry(path, &index, expected)
+    {
+        decoded_cache_hit = true;
+        #[cfg(test)]
+        METADATA_JOURNAL_DECODED_CACHE_HITS
+            .set(METADATA_JOURNAL_DECODED_CACHE_HITS.get().saturating_add(1));
+        vec![cached.as_ref().clone()]
     } else if let Some(first) = selected.first() {
         file.seek(SeekFrom::Start(first.record_start))
             .map_err(|source| MetadataBackendError::Io {
@@ -1064,11 +1326,22 @@ pub(crate) fn read_segmented_journal_file_since_limited(
             }
             entries.push(entry);
         }
-        scanned_bytes = scanned_bytes.saturating_add(
-            file.stream_position()
-                .unwrap_or(selected_scan_start)
-                .saturating_sub(selected_scan_start),
-        );
+        let selected_scan_end = file.stream_position().unwrap_or(selected_scan_start);
+        scanned_bytes =
+            scanned_bytes.saturating_add(selected_scan_end.saturating_sub(selected_scan_start));
+        if selected.len() == 1
+            && max_entries == 1
+            && journal_segment_file_matches_index(&file, path, &index)?
+            && let (Some(expected), Some(entry)) = (selected.first().copied(), entries.first())
+        {
+            cache_journal_segment_decoded_entry(
+                path,
+                &index,
+                expected,
+                selected_scan_end.saturating_sub(selected_scan_start),
+                entry,
+            );
+        }
         entries
     } else {
         Vec::new()
@@ -1085,6 +1358,7 @@ pub(crate) fn read_segmented_journal_file_since_limited(
         decoded_records,
         returned_entries = entries.len(),
         cache_hit,
+        decoded_cache_hit,
         index_extended = can_extend,
         index_rebuilt,
         total_ms = trace_started.elapsed().as_millis(),
@@ -1216,7 +1490,7 @@ pub(crate) fn prune_segmented_journal_before_checkpoint(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for path in &removed_paths {
-            cache.entries.remove(path);
+            remove_cached_journal_segment(&mut cache, path);
         }
     }
     sync_dir(&segments_dir)?;
@@ -1226,6 +1500,14 @@ pub(crate) fn prune_segmented_journal_before_checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn journal_cache_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn test_journal_entry(sequence: u64) -> DfsMetadataJournalEntry {
         DfsMetadataJournalEntry {
@@ -1244,6 +1526,7 @@ mod tests {
 
     #[test]
     fn recovered_tail_hint_skips_unchanged_highest_segment_scan() {
+        let _cache_guard = journal_cache_test_guard();
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-journal-tail-hint");
         for sequence in 1..=128 {
             append_segmented_journal_entry(root.path(), &test_journal_entry(sequence))
@@ -1540,6 +1823,7 @@ mod tests {
 
     #[test]
     fn durable_journal_tail_reuses_segment_offsets_and_indexes_only_appends() {
+        let _cache_guard = journal_cache_test_guard();
         let root = std::env::temp_dir().join(format!(
             "sinomo-dfs-journal-index-{}-{}",
             std::process::id(),
@@ -1592,7 +1876,205 @@ mod tests {
     }
 
     #[test]
+    fn point_lookup_reuses_only_the_current_segment_generation() {
+        let _cache_guard = journal_cache_test_guard();
+        let root = sinomo_testdir::TestDir::new("dfs-journal-decoded-point-cache");
+        for sequence in 1..=3 {
+            append_segmented_journal_entry(root.path(), &test_journal_entry(sequence))
+                .expect("append journal entry");
+        }
+        let segment_path = root
+            .join("journal")
+            .join("segments")
+            .join(format!("{:020}.slog", 1));
+
+        reset_journal_segment_index_cache();
+        reset_metadata_journal_decoded_records();
+        reset_metadata_journal_decoded_cache_hits();
+        let expected = segmented_journal_entry_at_sequence(root.path(), 2)
+            .expect("initial point lookup")
+            .expect("journal entry");
+        assert_eq!(metadata_journal_decoded_records(), 3);
+        assert_eq!(metadata_journal_decoded_cache_hits(), 0);
+
+        reset_metadata_journal_decoded_records();
+        reset_metadata_journal_decoded_cache_hits();
+        assert_eq!(
+            segmented_journal_entry_at_sequence(root.path(), 2)
+                .expect("cached point lookup")
+                .as_ref(),
+            Some(&expected)
+        );
+        assert_eq!(
+            metadata_journal_decoded_records(),
+            0,
+            "an unchanged point lookup must not deserialize the record again"
+        );
+        assert_eq!(metadata_journal_decoded_cache_hits(), 1);
+
+        let supports_append_extension = cached_journal_segment_index(&segment_path)
+            .expect("cached segment index")
+            .identity
+            .supports_append_extension();
+        append_segmented_journal_entry(root.path(), &test_journal_entry(4))
+            .expect("append journal tail");
+        reset_metadata_journal_decoded_records();
+        reset_metadata_journal_decoded_cache_hits();
+        assert_eq!(
+            segmented_journal_entry_at_sequence(root.path(), 2)
+                .expect("point lookup after append")
+                .as_ref(),
+            Some(&expected)
+        );
+        if supports_append_extension {
+            assert_eq!(
+                metadata_journal_decoded_records(),
+                1,
+                "verified append growth must decode only the new suffix"
+            );
+            assert_eq!(metadata_journal_decoded_cache_hits(), 1);
+        } else {
+            assert_eq!(metadata_journal_decoded_records(), 4);
+            assert_eq!(metadata_journal_decoded_cache_hits(), 0);
+        }
+
+        let mut replacement = test_journal_entry(2);
+        replacement.shard_id = DfsMetadataShardId::new("replacement");
+        remove_file_if_exists(&segment_path).expect("rotate segment");
+        append_segmented_journal_entry(root.path(), &replacement).expect("write replacement");
+        reset_metadata_journal_decoded_records();
+        reset_metadata_journal_decoded_cache_hits();
+        assert_eq!(
+            segmented_journal_entry_at_sequence(root.path(), 2)
+                .expect("replacement point lookup")
+                .as_ref(),
+            Some(&replacement),
+            "a replacement file must never reuse the prior decoded generation"
+        );
+        assert_eq!(metadata_journal_decoded_records(), 1);
+        assert_eq!(metadata_journal_decoded_cache_hits(), 0);
+
+        fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&segment_path)
+            .expect("truncate segment");
+        append_segmented_journal_entry(root.path(), &test_journal_entry(1))
+            .expect("write truncated generation");
+        reset_metadata_journal_decoded_records();
+        reset_metadata_journal_decoded_cache_hits();
+        assert!(
+            segmented_journal_entry_at_sequence(root.path(), 2)
+                .expect("truncated point lookup")
+                .is_none(),
+            "a cached record beyond the new durable tail must disappear"
+        );
+        assert_eq!(metadata_journal_decoded_records(), 1);
+        assert_eq!(metadata_journal_decoded_cache_hits(), 0);
+    }
+
+    #[test]
+    fn point_lookup_cache_preserves_torn_tail_recovery() {
+        use std::io::Write;
+
+        let _cache_guard = journal_cache_test_guard();
+        let root = sinomo_testdir::TestDir::new("dfs-journal-decoded-torn-tail");
+        let first = test_journal_entry(1);
+        let second = test_journal_entry(2);
+        append_segmented_journal_entry(root.path(), &first).expect("append first entry");
+        let segment_path = root
+            .join("journal")
+            .join("segments")
+            .join(format!("{:020}.slog", 1));
+
+        reset_journal_segment_index_cache();
+        segmented_journal_entry_at_sequence(root.path(), 1)
+            .expect("prime point cache")
+            .expect("first entry");
+
+        let second_bytes = sinomo_object_serde::to_bytes(&second, 1, LengthMode::U32)
+            .expect("encode second entry");
+        let second_len = u32::try_from(second_bytes.len()).expect("bounded test entry");
+        let split = second_bytes.len() / 2;
+        {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&segment_path)
+                .expect("open torn tail");
+            file.write_all(&second_len.to_le_bytes())
+                .expect("write record length");
+            file.write_all(&second_bytes[..split])
+                .expect("write partial record");
+            file.sync_all().expect("sync partial record");
+        }
+
+        reset_metadata_journal_decoded_records();
+        reset_metadata_journal_decoded_cache_hits();
+        assert_eq!(
+            segmented_journal_entry_at_sequence(root.path(), 1)
+                .expect("lookup before torn tail")
+                .as_ref(),
+            Some(&first)
+        );
+        assert_eq!(metadata_journal_decoded_records(), 0);
+        assert_eq!(metadata_journal_decoded_cache_hits(), 1);
+
+        {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&segment_path)
+                .expect("open tail completion");
+            file.write_all(&second_bytes[split..])
+                .expect("complete record");
+            file.sync_all().expect("sync complete record");
+        }
+        reset_metadata_journal_decoded_records();
+        reset_metadata_journal_decoded_cache_hits();
+        assert_eq!(
+            segmented_journal_entry_at_sequence(root.path(), 2)
+                .expect("lookup completed tail")
+                .as_ref(),
+            Some(&second),
+            "completing a torn record must rebuild from the last complete boundary"
+        );
+        assert_eq!(metadata_journal_decoded_records(), 2);
+        assert_eq!(metadata_journal_decoded_cache_hits(), 0);
+    }
+
+    #[test]
+    fn decoded_point_cache_is_process_bounded() {
+        let _cache_guard = journal_cache_test_guard();
+        let root = sinomo_testdir::TestDir::new("dfs-journal-decoded-cache-bound");
+        let entry_count = JOURNAL_SEGMENT_DECODED_CACHE_ENTRY_LIMIT + 1;
+        for sequence in 1..=u64::try_from(entry_count).expect("test entry count") {
+            append_segmented_journal_entry(root.path(), &test_journal_entry(sequence))
+                .expect("append bounded-cache entry");
+        }
+        let segment_path = root
+            .join("journal")
+            .join("segments")
+            .join(format!("{:020}.slog", 1));
+
+        reset_journal_segment_index_cache();
+        read_segmented_journal_file_since_limited(
+            &segment_path,
+            u64::try_from(entry_count).expect("test entry count"),
+            1,
+        )
+        .expect("prime offset index");
+        for sequence in 1..=u64::try_from(entry_count).expect("test entry count") {
+            segmented_journal_entry_at_sequence(root.path(), sequence)
+                .expect("bounded point lookup")
+                .expect("journal entry");
+        }
+        let (cached_entries, cached_bytes) = metadata_journal_decoded_cache_usage(&segment_path);
+        assert!(cached_entries <= JOURNAL_SEGMENT_DECODED_CACHE_ENTRY_LIMIT);
+        assert!(cached_bytes <= JOURNAL_SEGMENT_DECODED_CACHE_BYTE_LIMIT);
+    }
+
+    #[test]
     fn replay_persists_new_suffix_without_decoding_existing_segment() {
+        let _cache_guard = journal_cache_test_guard();
         let root = std::env::temp_dir().join(format!(
             "sinomo-dfs-journal-replay-suffix-{}-{}",
             std::process::id(),
