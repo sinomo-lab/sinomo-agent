@@ -1710,6 +1710,33 @@ fn mark_connectivity_blocked_dfs_repair_attempt_records(
     }
 }
 
+fn dfs_repair_attempt_is_eligible_without_execution_projection(
+    record: &DfsRepairAttemptRecord,
+) -> bool {
+    // The synchronous maintenance API has no current connectivity projection
+    // with which to prove that a durable blocker cleared. A MAX deadline is
+    // the explicit parked/suppressed marker, so it cannot contribute to the
+    // bounded executable queue until a projection-aware path admits it.
+    record.next_retry_unix_nanos != u64::MAX
+}
+
+fn dfs_repair_maintenance_budget_exhausted(
+    repair_max_jobs: usize,
+    eligible_repair_count_before: usize,
+    scheduled_repair_count: usize,
+    durable_repair_queue_after: &[DfsRepairAttemptRecord],
+    now_unix_nanos: u64,
+) -> bool {
+    repair_max_jobs > 0
+        && repair_max_jobs != usize::MAX
+        && eligible_repair_count_before >= repair_max_jobs
+        && scheduled_repair_count > 0
+        && durable_repair_queue_after.iter().any(|record| {
+            record.next_retry_unix_nanos != u64::MAX
+                && record.next_retry_unix_nanos <= now_unix_nanos
+        })
+}
+
 pub(crate) fn merge_parked_dfs_repair_attempt_records(
     active_records: Vec<DfsRepairAttemptRecord>,
     parked_records: Vec<DfsRepairAttemptRecord>,
@@ -2198,7 +2225,10 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
         lifecycle_reports.push(content_gc);
     }
     let durable_repair_queue_before = maintenance_host.load_repair_attempt_records()?;
-    let repair_queue_count_before = durable_repair_queue_before.len();
+    let eligible_repair_count_before = durable_repair_queue_before
+        .iter()
+        .filter(|record| dfs_repair_attempt_is_eligible_without_execution_projection(record))
+        .count();
     let scheduled_repairs = service.retry_pending_repairs_bounded_with_attempts(
         options.repair_max_jobs,
         &durable_repair_queue_before,
@@ -2211,14 +2241,13 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
     service.observe_repair_maintenance_events(&followup_events);
     let repair_attempts_after = service.active_repair_attempt_records();
     let durable_repair_queue_after = service.durable_repair_queue_records();
-    let repair_budget_exhausted = options.repair_max_jobs > 0
-        && options.repair_max_jobs != usize::MAX
-        && repair_queue_count_before >= options.repair_max_jobs
-        && !scheduled_repairs.is_empty()
-        && durable_repair_queue_after.iter().any(|record| {
-            record.next_retry_unix_nanos != u64::MAX
-                && record.next_retry_unix_nanos <= dfs_now_unix_nanos()
-        });
+    let repair_budget_exhausted = dfs_repair_maintenance_budget_exhausted(
+        options.repair_max_jobs,
+        eligible_repair_count_before,
+        scheduled_repairs.len(),
+        &durable_repair_queue_after,
+        dfs_now_unix_nanos(),
+    );
     maintenance_host.store_repair_attempt_records(&durable_repair_queue_after)?;
     let metadata_replication = if options.publish_metadata {
         publish_dfs_metadata_journal_with_host(
@@ -2310,6 +2339,47 @@ mod causal_time_tests {
             records[0].last_error.as_deref(),
             Some(DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY),
             "a deferred record must carry its concrete blocker"
+        );
+    }
+
+    #[test]
+    fn sync_repair_budget_excludes_durably_parked_records() {
+        let runnable_target =
+            NodeId::from_legacy_named("node-sync-budget-runnable").expect("runnable target");
+        let parked_target =
+            NodeId::from_legacy_named("node-sync-budget-parked").expect("parked target");
+        let now = dfs_now_unix_nanos();
+        let mut runnable = repair_attempt_for_connectivity_test(runnable_target, 1);
+        runnable.next_retry_unix_nanos = now;
+        let mut parked = repair_attempt_for_connectivity_test(parked_target, 1);
+        parked.next_retry_unix_nanos = u64::MAX;
+        parked.last_error = Some(DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY.to_string());
+        let queue_before = [runnable.clone(), parked];
+        let eligible_count = queue_before
+            .iter()
+            .filter(|record| dfs_repair_attempt_is_eligible_without_execution_projection(record))
+            .count();
+
+        assert_eq!(eligible_count, 1);
+        assert!(
+            !dfs_repair_maintenance_budget_exhausted(
+                2,
+                eligible_count,
+                1,
+                std::slice::from_ref(&runnable),
+                now,
+            ),
+            "parked work cannot make a partially used sync budget look exhausted"
+        );
+        assert!(
+            dfs_repair_maintenance_budget_exhausted(
+                1,
+                eligible_count,
+                1,
+                std::slice::from_ref(&runnable),
+                now,
+            ),
+            "the same queue must report exhaustion when its executable work fills the budget"
         );
     }
 
@@ -2578,14 +2648,13 @@ where
         &mut repair_attempts_after,
         execution_exclusions,
     );
-    let repair_budget_exhausted = options.repair_max_jobs > 0
-        && options.repair_max_jobs != usize::MAX
-        && eligible_repair_attempts.len() >= options.repair_max_jobs
-        && !scheduled_repairs.is_empty()
-        && durable_repair_queue_after.iter().any(|record| {
-            record.next_retry_unix_nanos != u64::MAX
-                && record.next_retry_unix_nanos <= dfs_now_unix_nanos()
-        });
+    let repair_budget_exhausted = dfs_repair_maintenance_budget_exhausted(
+        options.repair_max_jobs,
+        eligible_repair_attempts.len(),
+        scheduled_repairs.len(),
+        &durable_repair_queue_after,
+        dfs_now_unix_nanos(),
+    );
     let repair_attempts_before = durable_repair_queue_before
         .into_iter()
         .filter(|record| record.attempts > 0)
