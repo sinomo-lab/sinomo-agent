@@ -137,6 +137,48 @@ fn metadata_table_perf_trace(args: std::fmt::Arguments<'_>) {
     tracing::trace!(target: "sinomo.dfs.perf", detail = %args, "dfs metadata table store perf");
 }
 
+#[cfg(unix)]
+fn metadata_table_file_platform_identity(_path: &Path, metadata: &fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    Some(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn metadata_table_file_platform_identity(path: &Path, _metadata: &fs::Metadata) -> Option<String> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = fs::File::open(path).ok()?;
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // SAFETY: `file` owns a live OS handle and `information` points to writable
+    // storage for the exact structure required by GetFileInformationByHandle.
+    let has_information = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle() as HANDLE, information.as_mut_ptr()) != 0
+    };
+    if !has_information {
+        return None;
+    }
+    // SAFETY: a successful GetFileInformationByHandle call initialized the
+    // complete BY_HANDLE_FILE_INFORMATION value.
+    let information = unsafe { information.assume_init() };
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Some(format!(
+        "windows:{}:{file_index}",
+        information.dwVolumeSerialNumber
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn metadata_table_file_platform_identity(_path: &Path, _metadata: &fs::Metadata) -> Option<String> {
+    None
+}
+
 fn metadata_table_file_generation(path: &Path) -> Result<Option<MetadataTableFileGeneration>> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -158,21 +200,7 @@ fn metadata_table_file_generation(path: &Path) -> Result<Option<MetadataTableFil
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos());
-    #[cfg(unix)]
-    let platform_identity = {
-        use std::os::unix::fs::MetadataExt as _;
-        Some(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
-    };
-    #[cfg(not(any(unix, windows)))]
-    let platform_identity = None;
-    #[cfg(windows)]
-    let platform_identity = {
-        use std::os::windows::fs::MetadataExt as _;
-        metadata
-            .volume_serial_number()
-            .zip(metadata.file_index())
-            .map(|(volume, index)| format!("windows:{volume}:{index}"))
-    };
+    let platform_identity = metadata_table_file_platform_identity(path, &metadata);
     Ok(Some(MetadataTableFileGeneration {
         is_file: metadata.is_file(),
         len: metadata.len(),
