@@ -34,6 +34,18 @@ static DFS_METADATA_SHARD_PUBLICATION_LOCKS: OnceLock<(Mutex<BTreeSet<String>>, 
 thread_local! {
     static DFS_METADATA_AUTHORITY_BATCH_READS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static DFS_NAMESPACE_PREPARE_CANONICAL_DIGEST_PASSES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_namespace_prepare_canonical_digest_passes() {
+    DFS_NAMESPACE_PREPARE_CANONICAL_DIGEST_PASSES.with(|passes| passes.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn namespace_prepare_canonical_digest_passes() -> usize {
+    DFS_NAMESPACE_PREPARE_CANONICAL_DIGEST_PASSES.with(std::cell::Cell::get)
 }
 
 fn metadata_authority_probe_timeout(
@@ -74,7 +86,12 @@ fn metadata_authority_probe_timeout(
     {
         return DFS_METADATA_AUTHORITY_PROBE_TIMEOUT;
     }
-    let Ok(Some(prepare)) = entry.mutation.namespace_prepare_payload_ref() else {
+    // `prepared_batch` is the exact locally-authored suffix returned by the
+    // backend after this process prepared the operation. Its packed body was
+    // validated while it was built and persisted; timeout selection only
+    // needs its bounded identity and row count, so do not rescan every packed
+    // column before the real replica apply validates the wire value.
+    let Some(prepare) = entry.mutation.namespace_prepare_payload_ref_prevalidated() else {
         return DFS_METADATA_AUTHORITY_PROBE_TIMEOUT;
     };
     if prepare.validate_file_system_scope(file_system_id).is_err()
@@ -1480,6 +1497,10 @@ pub(crate) fn metadata_namespace_prepare_payload_digest(
 pub(crate) fn metadata_namespace_prepare_payload_digest_normalized(
     prepare: &DfsNamespacePrepareRecord,
 ) -> Result<String, DfsError> {
+    #[cfg(test)]
+    DFS_NAMESPACE_PREPARE_CANONICAL_DIGEST_PASSES.with(|passes| {
+        passes.set(passes.get().saturating_add(1));
+    });
     metadata_authority_payload_digest(&(
         &prepare.operation_id,
         &prepare.file_system_id,
@@ -1641,12 +1662,43 @@ pub(crate) fn metadata_authority_probe_confirmation_id(
     ))
 }
 
-pub(crate) fn verify_persisted_metadata_authority_probe(
+/// Verify an authority probe immediately after applying its journal batch.
+///
+/// A newly applied PackedV2 prepare carries compact evidence computed from the
+/// exact canonical allocation installed into the table. Reuse that evidence
+/// instead of fetching, cloning, normalizing, and hashing the full prepare a
+/// second time. Duplicate delivery and recovery intentionally carry no fresh
+/// evidence and retain the durable-table fallback.
+pub(crate) fn verify_persisted_metadata_authority_probe_after_apply(
     backend: &dyn DfsMetadataBackend,
     shard: &DfsMetadataShardConfig,
     probe: &DfsMetadataAuthorityProbe,
+    apply_report: &DfsMetadataReplicaApplyReport,
 ) -> Result<String, DfsError> {
-    verify_persisted_metadata_authority_operation(backend, shard, &probe.operation)?;
+    let operation_verified = apply_report
+        .namespace_authority_proof_for(shard, &probe.operation)
+        .is_some();
+    verify_persisted_metadata_authority_probe_inner(backend, shard, probe, operation_verified)
+}
+
+fn verify_persisted_metadata_authority_probe_inner(
+    backend: &dyn DfsMetadataBackend,
+    shard: &DfsMetadataShardConfig,
+    probe: &DfsMetadataAuthorityProbe,
+    operation_verified: bool,
+) -> Result<String, DfsError> {
+    if operation_verified {
+        if !metadata_authority_operation_is_well_formed_for_shard(&probe.operation, shard) {
+            return Err(DfsError::Metadata {
+                message: format!(
+                    "metadata authority operation is not valid for shard {} epoch {}",
+                    shard.shard_id, shard.epoch
+                ),
+            });
+        }
+    } else {
+        verify_persisted_metadata_authority_operation(backend, shard, &probe.operation)?;
+    }
     let confirmation_id = metadata_authority_probe_confirmation_id(probe).ok_or_else(|| {
         DfsError::Metadata {
             message: format!(
@@ -3020,9 +3072,15 @@ mod authority_probe_tests {
         };
         entry.mutation = DfsMetadataMutation::put_namespace_prepare_packed_v1(&prepare)
             .expect("pack namespace prepare");
+        crate::metadata_records::reset_namespace_prepare_payload_validation_passes();
         assert_eq!(
             metadata_authority_probe_timeout(&shard, &operation, &prepared_batch),
             DFS_METADATA_AUTHORITY_LARGE_PROBE_TIMEOUT
+        );
+        assert_eq!(
+            crate::metadata_records::namespace_prepare_payload_validation_passes(),
+            0,
+            "locally-authored timeout selection must not rescan a packed prepare"
         );
 
         let authorization = service

@@ -448,30 +448,17 @@ pub(crate) fn dfs_network_message_response_retry_safe(message: &DfsNetworkMessag
     )
 }
 
-fn dfs_network_message_requires_full_metadata_hydrate(message: &DfsNetworkMessage) -> bool {
-    match message {
-        // Ordinary networked reads carry the exact version and content hash
-        // selected by the requester. The serving node can validate and stream
-        // that immutable blob directly; rebuilding the complete metadata view
-        // would add no authority or freshness evidence and can exceed the RPC
-        // budget on slower filesystems. Only the metadata-dependent form needs
-        // the legacy object lookup path.
-        DfsNetworkMessage::ReadRequest(request) => {
-            request.version.is_none() || request.content_hash.is_none()
-        }
-        // Every bulk item has a mandatory version, hash, and size.
-        DfsNetworkMessage::BulkReadRequest(_) => false,
-        _ => false,
-    }
-}
-
-pub fn dfs_message_requires_full_metadata_hydrate(command: &DfsMessageCommand) -> bool {
-    dfs_network_message_requires_full_metadata_hydrate(&command.routed_message.message)
+pub fn dfs_message_requires_full_metadata_hydrate(_command: &DfsMessageCommand) -> bool {
+    // Every routed operation now resolves the exact records it needs from the
+    // authoritative backend. In particular, legacy unhinted reads use the same
+    // targeted object lookup as namespace reads; no message requires rebuilding
+    // the complete in-memory metadata projection before it can be served.
+    false
 }
 
 /// Backward-compatible name for callers that classify daemon message commands.
-/// This now means a full backend hydrate; distributed writes perform targeted
-/// metadata validation inside the write path instead.
+/// Distributed operations perform targeted metadata validation in their own
+/// paths, so this compatibility classifier is always false.
 pub fn dfs_message_requires_fresh_metadata(command: &DfsMessageCommand) -> bool {
     dfs_message_requires_full_metadata_hydrate(command)
 }

@@ -1359,14 +1359,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
 
-        let apply_result = self
-            .metadata_backend
-            .as_mut()
-            .expect("metadata backend checked above")
-            .apply_journal_batch_with_replica_permit(&permit, &command.batch);
+        let apply_result = {
+            let backend = self
+                .metadata_backend
+                .as_mut()
+                .expect("metadata backend checked above");
+            if command.authority_probe.is_some() {
+                backend.apply_journal_batch_with_replica_permit_report(&permit, &command.batch)
+            } else {
+                backend
+                    .apply_journal_batch_with_replica_permit(&permit, &command.batch)
+                    .map(DfsMetadataReplicaApplyReport::without_authority_proofs)
+            }
+        };
 
         match apply_result {
-            Ok(applied_entries) => {
+            Ok(apply_report) => {
+                let applied_entries = apply_report.applied_entries();
                 // A successful backend apply is the durable replica-progress
                 // boundary. Record it before authority-proof persistence,
                 // service-state hydration, or ACK delivery so a later error
@@ -1383,10 +1392,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .as_mut()
                         .expect("metadata backend checked above");
                     let verification =
-                        crate::service_replica::verify_persisted_metadata_authority_probe(
+                        crate::service_replica::verify_persisted_metadata_authority_probe_after_apply(
                             backend.as_ref(),
                             &probe.expected_shard,
                             probe,
+                            &apply_report,
                         )
                         .and_then(|confirmation_id| {
                             backend
@@ -1421,7 +1431,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 } else {
                     None
                 };
-                self.apply_metadata_journal_batch_to_service_state(&command.batch)?;
+                self.observe_replicated_metadata_journal_batch(&command.batch)?;
                 let _ = self.send_dfs_message_if_routable(
                     &source_node_id,
                     DfsNetworkMessage::MetadataJournalBatchResponse(

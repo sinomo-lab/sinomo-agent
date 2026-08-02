@@ -119,10 +119,12 @@ use sinomo_core::network::{
     ObjectRpcIncomingRequest, ObjectRpcOutgoingResponse, ObjectRpcRequest, ObjectRpcResponse,
     cluster_directory_for, cluster_route_next_hop,
 };
+#[cfg(test)]
+use sinomo_core::service::ServiceRegistryBuilder;
 use sinomo_core::service::{
     ClusterAccess, ResponseSink, Service, ServiceBodyMode, ServiceContext, ServiceDisposition,
-    ServiceError, ServiceFuture, ServiceRegistry, ServiceRegistryBuilder,
-    ServiceRegistrySnapshotStore, ServiceRoute, ServiceSigner,
+    ServiceError, ServiceFuture, ServiceRegistry, ServiceRegistrySnapshotStore, ServiceRoute,
+    ServiceSigner,
 };
 use sinomo_dfs::register_services as register_dfs_services;
 use sinomo_module::{MODULE_NATIVE_DYLIB_CANCEL_ROUTE, MODULE_RPC_CATEGORY};
@@ -2912,9 +2914,36 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsBrowserControlPlaneKvClien
     }
 }
 
+#[derive(Default)]
+struct DaemonDfsBrowserBackendSlot {
+    backend: Mutex<Option<Arc<DaemonDfsBrowserBackend>>>,
+}
+
 static DAEMON_DFS_BROWSER_BACKENDS: OnceLock<
-    Mutex<HashMap<PathBuf, Arc<DaemonDfsBrowserBackend>>>,
+    Mutex<HashMap<PathBuf, Arc<DaemonDfsBrowserBackendSlot>>>,
 > = OnceLock::new();
+
+#[cfg(test)]
+static DAEMON_DFS_BROWSER_BACKEND_OPEN_COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn record_daemon_dfs_browser_backend_open(data_dir: &SinomoDataDir) {
+    let counts = DAEMON_DFS_BROWSER_BACKEND_OPEN_COUNTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut counts = counts.lock().expect("DFS browser open-count lock");
+    *counts.entry(data_dir.root()).or_default() += 1;
+}
+
+#[cfg(test)]
+fn daemon_dfs_browser_backend_open_count(data_dir: &SinomoDataDir) -> usize {
+    DAEMON_DFS_BROWSER_BACKEND_OPEN_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("DFS browser open-count lock")
+        .get(&data_dir.root())
+        .copied()
+        .unwrap_or_default()
+}
 
 // Browser reads run on blocking workers because the DFS POSIX surface is
 // synchronous. A remote content fetch can consume the full 30-second POSIX
@@ -2932,6 +2961,8 @@ impl DaemonDfsBrowserBackend {
         data_dir: SinomoDataDir,
         runtime: &tokio::runtime::Handle,
     ) -> Result<Self, ServiceError> {
+        #[cfg(test)]
+        record_daemon_dfs_browser_backend_open(&data_dir);
         let cluster_paths = ClusterPaths::new(&data_dir);
         let control_plane = cluster_paths.kv_paths().snapshot.exists().then(|| {
             Box::new(DaemonDfsBrowserControlPlaneKvClient::new(
@@ -2960,22 +2991,27 @@ impl DaemonDfsBrowserBackend {
     ) -> Result<Arc<Self>, ServiceError> {
         let root = data_dir.root();
         let cache = DAEMON_DFS_BROWSER_BACKENDS.get_or_init(|| Mutex::new(HashMap::new()));
-        {
-            let guard = cache.lock().map_err(|source| {
+        let slot = {
+            let mut guard = cache.lock().map_err(|source| {
                 ServiceError::Service(format!("DFS browser backend cache lock failed: {source}"))
             })?;
-            if let Some(backend) = guard.get(&root) {
-                return Ok(Arc::clone(backend));
-            }
-        }
-
-        let backend = Arc::new(Self::open((*data_dir).clone(), runtime)?);
-        let mut guard = cache.lock().map_err(|source| {
-            ServiceError::Service(format!("DFS browser backend cache lock failed: {source}"))
+            Arc::clone(
+                guard
+                    .entry(root)
+                    .or_insert_with(|| Arc::new(DaemonDfsBrowserBackendSlot::default())),
+            )
+        };
+        let mut initialized = slot.backend.lock().map_err(|source| {
+            ServiceError::Service(format!(
+                "DFS browser backend initialization lock failed: {source}"
+            ))
         })?;
-        Ok(Arc::clone(
-            guard.entry(root).or_insert_with(|| Arc::clone(&backend)),
-        ))
+        if let Some(backend) = initialized.as_ref() {
+            return Ok(Arc::clone(backend));
+        }
+        let backend = Arc::new(Self::open((*data_dir).clone(), runtime)?);
+        *initialized = Some(Arc::clone(&backend));
+        Ok(backend)
     }
 
     fn lock_service(
@@ -3050,8 +3086,13 @@ impl DaemonDfsBrowserBackend {
 
     fn health_summary(&self) -> Result<crate::DaemonDfsBrowserHealthSummary, ServiceError> {
         let cluster_paths = ClusterPaths::new(&self.data_dir);
-        let status = sinomo_dfs::inspect_cluster_aware_dfs_status(&self.data_dir, &cluster_paths)
-            .map_err(dfs_browser_service_error)?;
+        let service = self.lock_service_for_read()?;
+        let metadata = service.metadata_backend().ok_or_else(|| {
+            ServiceError::Service("DFS browser metadata backend is unavailable".to_string())
+        })?;
+        let status =
+            sinomo_dfs::inspect_dfs_status_from_metadata(&self.data_dir, &cluster_paths, metadata)
+                .map_err(dfs_browser_service_error)?;
         Ok(daemon_dfs_browser_health_summary(status))
     }
 
@@ -5418,7 +5459,7 @@ fn daemon_service_registry(
     service_hooks: &[crate::DaemonServiceRegistryHook],
 ) -> ServiceRegistry {
     let event_hub = Arc::new(DaemonEventHub::new());
-    let mut builder: ServiceRegistryBuilder = register_dfs_services(ServiceRegistry::builder());
+    let mut builder = ServiceRegistry::builder();
     if observe_module_should_register(paths) {
         builder = sinomo_observe::register_services(builder);
     }
@@ -5461,27 +5502,13 @@ fn daemon_service_registry(
         })
         .register(RolloutBinaryService {
             paths: paths.clone(),
-        })
-        .register(DaemonDfsBrowserService {
-            runtime: service_runtime.cloned(),
-            event_hub,
         });
-    // Main and shadow share the data-dir build root. Only the main daemon may
-    // own its durable build state or administer DFS placement authority; the
-    // shadow keeps rollout recovery services but must neither serve nor
-    // advertise those main-owner routes.
-    let builder = if crate::daemon_paths_are_shadow(paths) {
-        builder
-    } else {
-        builder
-            .register(crate::build_service::DaemonBuildService::new(paths))
-            .register(DaemonDfsPlacementAuthorityAdminService {
-                paths: paths.clone(),
-                runtime: service_runtime.cloned(),
-            })
-    };
+    // Both daemon processes authenticate as the same cluster node, so a peer
+    // request may arrive over either process's network session. Keep the DFS
+    // protocol route set identical on both registries; otherwise route selection
+    // can turn a healthy replica or metadata primary into an "unknown route".
     let builder = if let Some(runtime) = service_runtime {
-        sinomo_dfs::register_data_plane_services(
+        sinomo_dfs::register_services_with_data_plane_host(
             builder,
             Arc::new(DaemonDfsDataPlaneHost::new_on_runtime(
                 paths.clone(),
@@ -5489,15 +5516,32 @@ fn daemon_service_registry(
             )),
         )
     } else {
-        builder
+        register_dfs_services(builder)
     };
-    let mut builder = sinomo_sandbox::register_services_with_factory(
-        builder,
-        Arc::new(DaemonSandboxBackendFactory {
-            paths: paths.clone(),
-            runtime: service_runtime.cloned(),
-        }),
-    );
+    // Main and shadow share the data-dir build root. Only the main daemon owns
+    // local UI/control services whose state is not part of the peer DFS protocol.
+    let builder = if crate::daemon_paths_are_shadow(paths) {
+        builder
+    } else {
+        let builder = builder
+            .register(DaemonDfsBrowserService {
+                runtime: service_runtime.cloned(),
+                event_hub,
+            })
+            .register(crate::build_service::DaemonBuildService::new(paths))
+            .register(DaemonDfsPlacementAuthorityAdminService {
+                paths: paths.clone(),
+                runtime: service_runtime.cloned(),
+            });
+        sinomo_sandbox::register_services_with_factory(
+            builder,
+            Arc::new(DaemonSandboxBackendFactory {
+                paths: paths.clone(),
+                runtime: service_runtime.cloned(),
+            }),
+        )
+    };
+    let mut builder = builder;
     for hook in service_hooks {
         builder = hook.register(builder);
     }
@@ -8205,6 +8249,54 @@ mod tests {
             !root.join("dfs").exists(),
             "the fail-closed compatibility route must not even open the DFS backend"
         );
+    }
+
+    #[test]
+    fn dfs_browser_concurrent_first_open_initializes_one_backend_per_data_root() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-browser-concurrent-first-open");
+        let data_dir = Arc::new(SinomoDataDir::new(&root));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let worker_count = 8;
+        let start = Arc::new(std::sync::Barrier::new(worker_count));
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let data_dir = Arc::clone(&data_dir);
+            let start = Arc::clone(&start);
+            let runtime = runtime.handle().clone();
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)
+                    .expect("open cached DFS browser backend")
+            }));
+        }
+        let backends = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("browser open worker"))
+            .collect::<Vec<_>>();
+
+        assert!(
+            backends
+                .iter()
+                .skip(1)
+                .all(|backend| Arc::ptr_eq(&backends[0], backend)),
+            "every concurrent caller must receive the same retained backend"
+        );
+        assert_eq!(
+            daemon_dfs_browser_backend_open_count(data_dir.as_ref()),
+            1,
+            "the per-root initialization slot must prevent discarded duplicate backend opens"
+        );
+        backends[0]
+            .health_summary()
+            .expect("health reuses the retained browser metadata backend");
+        backends[0]
+            .health_summary()
+            .expect("repeated health reuses the retained browser metadata backend");
+        assert_eq!(daemon_dfs_browser_backend_open_count(data_dir.as_ref()), 1);
     }
 
     #[test]
@@ -12131,8 +12223,7 @@ mod tests {
     }
 
     #[test]
-    fn only_main_registry_hosts_build_and_placement_authority_routes_while_shadow_keeps_rollout_routes()
-     {
+    fn main_and_shadow_share_peer_dfs_routes_but_only_main_hosts_local_services() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-main-shadow-build-routes");
         let data_dir = SinomoDataDir::new(&root);
         let main_paths = DaemonPaths::new(&data_dir);
@@ -12155,6 +12246,34 @@ mod tests {
                 "shadow registry must not own {route}"
             );
         }
+        for route in sinomo_dfs::DFS_OBJECT_RPC_ROUTES {
+            assert!(
+                main_registry.owns(route),
+                "main registry should own DFS route {route}"
+            );
+            assert!(
+                shadow_registry.owns(route),
+                "shadow registry should own peer DFS route {route}"
+            );
+        }
+        for route in DAEMON_DFS_BROWSER_ROUTES {
+            assert!(
+                main_registry.owns(route),
+                "main registry should own DFS browser route {route}"
+            );
+            assert!(
+                !shadow_registry.owns(route),
+                "shadow registry must not own DFS browser route {route}"
+            );
+        }
+        assert!(
+            main_registry.owns(sinomo_sandbox::SANDBOX_STATUS_ROUTE),
+            "main registry should own clustered sandbox routes"
+        );
+        assert!(
+            !shadow_registry.owns(sinomo_sandbox::SANDBOX_STATUS_ROUTE),
+            "shadow registry must not own sandbox routes backed by DFS"
+        );
         assert!(
             main_registry.owns(DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE),
             "main registry should own DFS placement-authority administration"
@@ -12193,6 +12312,38 @@ mod tests {
                 "shadow host must not advertise {route}"
             );
         }
+        for route in sinomo_dfs::DFS_OBJECT_RPC_ROUTES {
+            assert!(
+                main_host.object_rpc_route_descriptor(route).is_some(),
+                "main host should advertise DFS route {route}"
+            );
+            assert!(
+                shadow_host.object_rpc_route_descriptor(route).is_some(),
+                "shadow host should advertise peer DFS route {route}"
+            );
+        }
+        for route in DAEMON_DFS_BROWSER_ROUTES {
+            assert!(
+                main_host.object_rpc_route_descriptor(route).is_some(),
+                "main host should advertise DFS browser route {route}"
+            );
+            assert!(
+                shadow_host.object_rpc_route_descriptor(route).is_none(),
+                "shadow host must not advertise DFS browser route {route}"
+            );
+        }
+        assert!(
+            main_host
+                .object_rpc_route_descriptor(sinomo_sandbox::SANDBOX_STATUS_ROUTE)
+                .is_some(),
+            "main host should advertise clustered sandbox routes"
+        );
+        assert!(
+            shadow_host
+                .object_rpc_route_descriptor(sinomo_sandbox::SANDBOX_STATUS_ROUTE)
+                .is_none(),
+            "shadow host must not advertise sandbox routes backed by DFS"
+        );
         let placement_authority = main_host
             .object_rpc_route_descriptor(DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE)
             .expect("main placement-authority descriptor");

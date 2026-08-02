@@ -1025,7 +1025,10 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
         }),
     );
     assert!(dfs_message_is_read_only_request(&read));
-    assert!(dfs_message_requires_full_metadata_hydrate(&read));
+    assert!(
+        !dfs_message_requires_full_metadata_hydrate(&read),
+        "legacy unhinted reads use a targeted authoritative object lookup"
+    );
 
     let hinted_read = test_dfs_message_command_from_message(
         &local,
@@ -6132,6 +6135,139 @@ fn metadata_store_path_index_matches_scan_semantics() {
 
 fn temp_root(name: &str) -> sinomo_testdir::TestDir {
     sinomo_testdir::TestDir::new(&format!("sinomo-dfs-{name}"))
+}
+
+#[test]
+fn read_only_backend_attachment_skips_bootstrap_scans_and_serves_targeted_reads() {
+    let root = temp_root("read-only-backend-attachment");
+    let node_id = NodeId::from_legacy_named("node_read_only_attachment").expect("node");
+    let shard_id = DfsMetadataShardId::new("root");
+    let file_system = DfsFileSystem::sifs(node_id.clone());
+    let extra_file_system = DfsFileSystem {
+        file_system_id: DfsFileSystemId::from_legacy_named("read-only-extra-fs")
+            .expect("extra filesystem"),
+        display_name: "Must not be bootstrapped".to_string(),
+        owner_node_id: node_id.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let mut object = file_metadata(node_id.clone());
+    object.object_id =
+        DfsObjectId::from_legacy_named("object_read_only_attachment").expect("object");
+    object.file_system_id = file_system.file_system_id.clone();
+    object.path = "/services/read-only-attachment.txt".to_string();
+    object.version =
+        DfsVersion::from_legacy_named("version_read_only_attachment").expect("version");
+    object.content_hash = Some("blake3:read-only-attachment".to_string());
+    object.content_size_bytes = Some(17);
+
+    let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("metadata"))
+        .expect("metadata backend");
+    backend
+        .put_file_system(&file_system)
+        .expect("SIFS filesystem");
+    backend
+        .put_file_system(&extra_file_system)
+        .expect("extra filesystem");
+    backend.put_object(&object).expect("object metadata");
+    backend
+        .put_namespace_job(&DfsNamespaceJobRecord {
+            job_id: "job_read_only_attachment".to_string(),
+            file_system_id: file_system.file_system_id.clone(),
+            origin: None,
+            kind: DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries,
+            status: DfsNamespaceJobStatus::Running,
+            root_path: "/services/read-only-attachment.txt".to_string(),
+            target_path: Some("/users/read-only-attachment.txt".to_string()),
+            pending_frames: Vec::new(),
+            processed_object_count: 0,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            completed_at: None,
+            failure_reason: None,
+        })
+        .expect("running namespace job");
+
+    let network = InProcessNetwork::new();
+    let content = LocalContentStore::new(root.join("content")).expect("content store");
+    let mut service = NetworkedDfsService::new(network.add_node(node_id.clone()), content)
+        .with_boxed_metadata_backend_for_read_only_requests(Box::new(backend));
+
+    assert_eq!(
+        service.metadata.filesystems.len(),
+        1,
+        "read-only attachment must retain only the constructor's SIFS identity"
+    );
+    assert!(
+        !service
+            .metadata
+            .filesystems
+            .contains_key(&extra_file_system.file_system_id),
+        "read-only attachment must not enumerate the durable filesystem table"
+    );
+    assert!(service.metadata.objects.is_empty());
+    assert!(
+        service.cross_shard_namespace_locks.is_empty(),
+        "read-only attachment must not scan running namespace jobs"
+    );
+    assert!(
+        service.local_metadata_journal_cursors.is_empty(),
+        "read-only attachment must not scan every shard head"
+    );
+
+    let looked_up = service
+        .authoritative_metadata_object_for_path(&file_system.file_system_id, &object.path)
+        .expect("targeted path lookup")
+        .expect("durable path object");
+    assert_eq!(looked_up.object_id, object.object_id);
+    let read = service
+        .current_read_object_metadata(&object.object_id)
+        .expect("targeted object read");
+    assert_eq!(read.version, object.version);
+
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: shard_id.0.clone(),
+        primary_node_id: node_id.clone(),
+        replica_node_ids: Vec::new(),
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let file_system_config = DfsFileSystemConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        display_name: file_system.display_name.clone(),
+        owner_node_id: node_id,
+        subtree_policies: file_system.subtree_policies.clone(),
+    };
+    let request = DfsContentRootCatalogPageRequest {
+        identity: DfsContentRootCatalogShardIdentity::from_config(&shard),
+        expected_topology_digest: dfs_content_root_catalog_topology_digest_with_file_systems(
+            std::slice::from_ref(&file_system_config),
+            std::slice::from_ref(&shard),
+        )
+        .expect("topology digest"),
+        minimum_journal_sequence: 0,
+        minimum_state_fingerprint: None,
+        after: None,
+        max_entries: 32,
+    };
+    let page = service
+        .metadata_backend
+        .as_mut()
+        .expect("attached metadata backend")
+        .content_root_catalog_page(&request)
+        .expect("targeted content-root catalog page");
+    assert!(page.is_complete());
+    assert!(page.entries.contains(&DfsContentRootCatalogEntry::Version(
+        DfsMetadataVersionIdentity::new(object.object_id.clone(), object.version.clone())
+    )));
+    assert!(
+        page.entries
+            .contains(&DfsContentRootCatalogEntry::ContentHash(
+                object.content_hash.expect("content hash")
+            ))
+    );
 }
 
 fn open_shared_metadata_posix_service(
@@ -11819,6 +11955,150 @@ fn networked_metadata_journal_batch_refreshes_stale_receiver_authority() {
 }
 
 #[test]
+fn replica_journal_ingest_keeps_visible_namespace_in_backend_not_service_mirror() {
+    const OBJECT_COUNT: usize = 4_096;
+
+    let root = temp_root("replica-journal-does-not-mirror-visible-namespace");
+    let primary =
+        NodeId::from_legacy_named("node_replica_no_mirror_primary").expect("primary node id");
+    let replica =
+        NodeId::from_legacy_named("node_replica_no_mirror_receiver").expect("replica node id");
+    let file_system = file_system(primary.clone());
+    let shard_id = DfsMetadataShardId::new("root");
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: shard_id.0.clone(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![replica.clone()],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .put_metadata_shard(&shard)
+            .expect("metadata shard")
+    });
+
+    let mut source = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source-metadata"))
+        .expect("source metadata");
+    source
+        .put_file_system(&file_system)
+        .expect("source filesystem");
+    let mut objects = Vec::with_capacity(OBJECT_COUNT);
+    for index in 0..OBJECT_COUNT {
+        let mut object = file_metadata(primary.clone());
+        object.file_system_id = file_system.file_system_id.clone();
+        object.object_id =
+            DfsObjectId::from_legacy_named(format!("obj_replica_no_mirror_{index:04}"))
+                .expect("object id");
+        object.path = format!("/services/replica-no-mirror/{index:04}.txt");
+        objects.push(object);
+    }
+    let probe_object = objects[OBJECT_COUNT / 2].clone();
+    source
+        .apply_namespace_transaction(&DfsNamespaceTransaction {
+            transaction_id: "namespace_tx_replica_no_mirror".to_string(),
+            file_system_id: file_system.file_system_id.clone(),
+            objects,
+            versions: Vec::new(),
+            advisory_lock_states: Vec::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        })
+        .expect("bulk namespace transaction");
+    let guarded_path = "/services/replica-no-mirror/guarded";
+    source
+        .put_namespace_job(&DfsNamespaceJobRecord {
+            job_id: "job_replica_no_mirror_guard".to_string(),
+            file_system_id: file_system.file_system_id.clone(),
+            origin: None,
+            kind: DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries,
+            status: DfsNamespaceJobStatus::Running,
+            root_path: guarded_path.to_string(),
+            target_path: Some("/users/replica-no-mirror/guarded".to_string()),
+            pending_frames: Vec::new(),
+            processed_object_count: 0,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            completed_at: None,
+            failure_reason: None,
+        })
+        .expect("running namespace job");
+    let batch = source
+        .journal_batch_since_limited(0, 8, 64 * 1024 * 1024)
+        .expect("source journal")
+        .expect("source journal batch");
+
+    let receiver = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("receiver-metadata"))
+        .expect("receiver metadata");
+    let mut service = NetworkedDfsService::new(
+        DroppingSendTransport {
+            local_node_id: replica,
+        },
+        LocalContentStore::new(root.join("content")).expect("content store"),
+    )
+    .with_control_plane(control_plane)
+    .with_metadata_backend(receiver)
+    .expect("receiver service");
+
+    let event = service
+        .handle_metadata_journal_batch(
+            primary.clone(),
+            DfsMetadataJournalBatchCommand {
+                request_id: "request-replica-no-mirror".to_string(),
+                source_node_id: Some(primary),
+                file_system_id: Some(file_system.file_system_id.clone()),
+                authority_epoch: Some(shard.epoch),
+                verify_prefix_only: false,
+                prefix_probe: None,
+                authority_probe: None,
+                batch: batch.clone(),
+            },
+        )
+        .expect("replica journal ingest");
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::MetadataJournalBatchApplied { .. }
+    ));
+    assert!(
+        service.metadata().objects.is_empty(),
+        "replica ingest must not retain a second visible-object namespace"
+    );
+    assert_eq!(
+        service
+            .metadata_backend()
+            .expect("receiver backend")
+            .get_object_by_path(&file_system.file_system_id, &probe_object.path)
+            .expect("durable path lookup"),
+        Some(probe_object.clone()),
+        "the durable replica tables remain the exact read source"
+    );
+    assert_eq!(
+        service
+            .current_read_object_metadata(&probe_object.object_id)
+            .expect("service targeted backend read"),
+        probe_object,
+        "targeted service reads must not depend on the removed replica mirror"
+    );
+    assert!(matches!(
+        service.ensure_path_not_in_cross_shard_flight(
+            &file_system.file_system_id,
+            &format!("{guarded_path}/child.txt"),
+        ),
+        Err(DfsError::Busy { .. })
+    ));
+    assert_eq!(
+        service.local_metadata_journal_cursors.get(&shard_id),
+        Some(&batch.next_after_sequence),
+        "replica observation must still advance the service replay cursor"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn replica_command_refreshes_stale_receiver_authority_before_cache_decisions() {
     let root = temp_root("replica-command-refreshes-stale-authority");
     let primary =
@@ -12108,7 +12388,7 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
         replica_node_ids: vec![replica.clone()],
         epoch: 4,
         assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: Default::default(),
+        namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV2,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let context = DfsMetadataReplicaShardContext {
@@ -12118,6 +12398,7 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
     };
     let mut source = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source"))
         .expect("source metadata backend");
+    source.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV2);
     source
         .put_file_system(&file_system)
         .expect("source filesystem");
@@ -12170,6 +12451,15 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
         .expect("source journal")
         .expect("source journal batch");
     assert!(!batch.entries.is_empty());
+    assert!(batch.entries.iter().any(|entry| matches!(
+        entry.mutation,
+        DfsMetadataMutation::PutNamespacePrepare {
+            prepare: None,
+            packed_prepare_v1: None,
+            packed_prepare_v2: Some(_),
+            ..
+        }
+    )));
     let authority_sequence = batch.next_after_sequence;
     let prepared_prefix = source
         .metadata_prefix_proof()
@@ -12191,6 +12481,7 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
     let confirmation_id =
         crate::service_replica::metadata_authority_probe_confirmation_id(&authority_probe)
             .expect("prefix-bound authority confirmation");
+    crate::service_replica::reset_namespace_prepare_canonical_digest_passes();
     let response = process_dfs_metadata_journal_batch(
         &mut receiver,
         Some(&context),
@@ -12209,6 +12500,11 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
     assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
     assert!(response.applied_entries > 0);
     assert_eq!(response.verified_authority_probe_id, Some(confirmation_id));
+    assert_eq!(
+        crate::service_replica::namespace_prepare_canonical_digest_passes(),
+        1,
+        "standalone PackedV2 apply and authority ACK must share one canonical digest"
+    );
     assert_eq!(
         receiver
             .metadata_authority_ack_floor(&DfsMetadataShardId::new("root"))
@@ -12616,6 +12912,7 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
 
     let mut source = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source"))
         .expect("source backend");
+    source.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV2);
     source
         .put_file_system(&file_system)
         .expect("source filesystem");
@@ -12798,6 +13095,19 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
             prepare_entry.sequence,
         )
         .expect("authority operation");
+    assert!(matches!(
+        authority_batch.entries.as_slice(),
+        [DfsMetadataJournalEntry {
+            mutation: DfsMetadataMutation::PutNamespacePrepare {
+                prepare: None,
+                packed_prepare_v1: None,
+                packed_prepare_v2: Some(_),
+                ..
+            },
+            ..
+        }]
+    ));
+    crate::service_replica::reset_namespace_prepare_canonical_digest_passes();
     let authority_event = service
         .handle_metadata_journal_batch(
             primary.clone(),
@@ -12822,6 +13132,11 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
         authority_event,
         NetworkedDfsServiceEvent::MetadataJournalBatchApplied { .. }
     ));
+    assert_eq!(
+        crate::service_replica::namespace_prepare_canonical_digest_passes(),
+        1,
+        "in-service PackedV2 apply and authority ACK must share one canonical digest"
+    );
     assert_eq!(
         service
             .metadata_backend

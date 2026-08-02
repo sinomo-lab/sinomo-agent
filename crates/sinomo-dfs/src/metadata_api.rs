@@ -141,6 +141,111 @@ pub struct DfsMetadataReplicaIngestPermit {
     pending_primary_handoff_id: Option<String>,
 }
 
+/// Compact evidence derived from a newly materialized namespace prepare.
+///
+/// The replica backend creates this only after decoding the journal payload,
+/// independently hashing the resulting canonical record, and durably applying
+/// the corresponding table batch. It lets the immediate authority ACK reuse
+/// that work instead of cloning, normalizing, and hashing the complete prepare
+/// again. A retry that applies no new entry carries no such proof and therefore
+/// falls back to the ordinary durable-table verification path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DfsValidatedNamespaceAuthorityProof {
+    file_system_id: DfsFileSystemId,
+    shard_id: DfsMetadataShardId,
+    owner_epoch: u64,
+    operation_id: String,
+    status: DfsNamespacePrepareStatus,
+    prepare_sequence: u64,
+    payload_digest: String,
+}
+
+impl DfsValidatedNamespaceAuthorityProof {
+    pub(crate) fn from_canonical_prepare(
+        prepare: &DfsNamespacePrepareRecord,
+        prepare_sequence: u64,
+        canonical_payload_digest: String,
+    ) -> Option<Self> {
+        (prepare_sequence > 0 && prepare.operation_digest == canonical_payload_digest).then(|| {
+            Self {
+                file_system_id: prepare.file_system_id.clone(),
+                shard_id: prepare.shard_id.clone(),
+                owner_epoch: prepare.owner_epoch,
+                operation_id: prepare.operation_id.clone(),
+                status: prepare.status.clone(),
+                prepare_sequence,
+                payload_digest: canonical_payload_digest,
+            }
+        })
+    }
+
+    pub(crate) fn confirms(
+        &self,
+        shard: &DfsMetadataShardConfig,
+        operation: &crate::DfsMetadataAuthorityOperation,
+    ) -> bool {
+        let crate::DfsMetadataAuthorityOperation::NamespaceMutation {
+            operation_id,
+            file_system_id,
+            prepare_sequence,
+            payload_digest,
+        } = operation
+        else {
+            return false;
+        };
+        self.status == DfsNamespacePrepareStatus::Prepared
+            && self.file_system_id == shard.file_system_id
+            && self.shard_id.0 == shard.shard_id
+            && self.owner_epoch == shard.epoch
+            && &self.operation_id == operation_id
+            && &self.file_system_id == file_system_id
+            && self.prepare_sequence == *prepare_sequence
+            && &self.payload_digest == payload_digest
+    }
+}
+
+/// Result of one replica journal apply plus any proof computed from entries
+/// that became durable during that exact call.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DfsMetadataReplicaApplyReport {
+    applied_entries: usize,
+    namespace_authority_proof: Option<DfsValidatedNamespaceAuthorityProof>,
+}
+
+impl DfsMetadataReplicaApplyReport {
+    pub(crate) fn without_authority_proofs(applied_entries: usize) -> Self {
+        Self {
+            applied_entries,
+            namespace_authority_proof: None,
+        }
+    }
+
+    pub(crate) fn with_namespace_authority_proof(
+        applied_entries: usize,
+        namespace_authority_proof: Option<DfsValidatedNamespaceAuthorityProof>,
+    ) -> Self {
+        Self {
+            applied_entries,
+            namespace_authority_proof,
+        }
+    }
+
+    pub(crate) fn applied_entries(&self) -> usize {
+        self.applied_entries
+    }
+
+    pub(crate) fn namespace_authority_proof_for(
+        &self,
+        shard: &DfsMetadataShardConfig,
+        operation: &crate::DfsMetadataAuthorityOperation,
+    ) -> Option<&DfsValidatedNamespaceAuthorityProof> {
+        self.namespace_authority_proof
+            .as_ref()
+            .filter(|proof| proof.confirms(shard, operation))
+    }
+}
+
 /// One bounded durable view used to admit an idempotent namespace request.
 ///
 /// Admission needs several related indexes. Reading each index through an
@@ -2099,13 +2204,6 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(None)
     }
 
-    /// Whether any shard opened by this backend has a durable membership
-    /// handoff marker. Cached service lanes use this bounded local check to
-    /// avoid a cluster control-plane refresh on the marker-free cold path.
-    fn has_any_metadata_shard_write_freeze(&self) -> Result<bool> {
-        Ok(false)
-    }
-
     /// Whether this backend instance is currently fenced from authoritative
     /// shard mutations. An activated durable marker still fences an
     /// independently opened lane until exact completion evidence rebinds that
@@ -2289,6 +2387,21 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         batch: &DfsMetadataJournalBatch,
     ) -> Result<usize> {
         self.apply_journal_batch(batch)
+    }
+
+    /// Apply a replicated batch and return compact authority evidence derived
+    /// from records newly materialized by this exact call.
+    ///
+    /// Backends that do not retain the decoded apply result use the compatible
+    /// default below. Callers then verify an authority probe from durable tables
+    /// exactly as before.
+    fn apply_journal_batch_with_replica_permit_report(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+    ) -> Result<DfsMetadataReplicaApplyReport> {
+        self.apply_journal_batch_with_replica_permit(permit, batch)
+            .map(DfsMetadataReplicaApplyReport::without_authority_proofs)
     }
 
     /// Replace local metadata tables with a replicated snapshot.

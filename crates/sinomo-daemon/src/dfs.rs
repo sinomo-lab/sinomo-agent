@@ -19,6 +19,8 @@ use sinomo_core::node::NodeId;
 #[cfg(test)]
 use sinomo_dfs::DfsFileSystemConfig;
 #[cfg(test)]
+use sinomo_dfs::LocalContentStore;
+#[cfg(test)]
 use sinomo_dfs::{
     ContentStoreError, ContentStoreGcOptions, ContentStoreVersionGcOptions,
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsConflictRecord, DfsConflictStatus,
@@ -47,7 +49,7 @@ use sinomo_dfs::{
     DfsMetadataShardMembershipHandoff, DfsNodeDetachedSendState, DfsNodeDetachedSendWorker,
     DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport,
     DfsPeerTransportError, DfsPlacementReconciliationJob, DfsPlacementReconciliationState,
-    DfsRepairAttemptRecord, LocalContentStore, LocalDfsRepairQueueStore, NetworkedDfsService,
+    DfsRepairAttemptRecord, LocalDfsRepairQueueStore, NetworkedDfsService,
     cluster_dfs_all_metadata_shard_membership_handoffs, default_dfs_repair_attempt_snapshot_path,
     dfs_message_execution_scope, read_dfs_repair_attempt_snapshot,
 };
@@ -67,7 +69,6 @@ use time::OffsetDateTime;
 // defensive catch-up for out-of-band metadata writes, and doing it every few
 // seconds makes multi-node DFS writes pay repeated disk scans while a request is
 // still in flight.
-const DAEMON_DFS_MESSAGE_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DAEMON_DFS_PROMOTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const DAEMON_DFS_REPAIR_MAX_JOBS_PER_TICK: usize = 8;
 const DAEMON_DFS_TOMBSTONE_COMPACTION_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -548,8 +549,6 @@ fn daemon_dfs_metadata_authority_snapshot_watcher(
 struct DaemonDfsMessageServiceLane {
     service: DaemonDfsMessageService,
     peer_node_ids: Vec<NodeId>,
-    last_metadata_refresh: Instant,
-    metadata_hydrated: bool,
 }
 
 impl DaemonDfsMessageServiceLane {
@@ -631,6 +630,10 @@ struct DaemonDfsMessageServiceCacheEntry {
     signature: DaemonDfsMessageServiceSignature,
     metadata_authority_generation: Arc<DaemonDfsMetadataAuthorityGeneration>,
     peer_node_ids: Vec<NodeId>,
+    /// One initialized content-store generation shared by every service lane.
+    /// Clones retain the same bounded manifest and packed-index caches and avoid
+    /// repeating the 256-shard layout and reservation publication fences.
+    content_store: sinomo_dfs::LocalContentStore,
     /// Lazily opened mutation/full-hydrate lane. Maintenance drops only this
     /// lane so its broad metadata generation cannot overlap mutable message
     /// state.
@@ -679,6 +682,9 @@ impl DaemonDfsMutationLaneKey {
 struct DaemonDfsMutationScheduler {
     global: Arc<tokio::sync::RwLock<()>>,
     shard_gates: Mutex<BTreeMap<DaemonDfsMutationLaneKey, Arc<tokio::sync::Semaphore>>>,
+    maintenance_interest_count: AtomicUsize,
+    foreground_generation: AtomicU64,
+    foreground_notify: tokio::sync::Notify,
 }
 
 impl DaemonDfsMutationScheduler {
@@ -686,7 +692,32 @@ impl DaemonDfsMutationScheduler {
         Self {
             global: Arc::new(tokio::sync::RwLock::new(())),
             shard_gates: Mutex::new(BTreeMap::new()),
+            maintenance_interest_count: AtomicUsize::new(0),
+            foreground_generation: AtomicU64::new(0),
+            foreground_notify: tokio::sync::Notify::new(),
         }
+    }
+
+    fn begin_maintenance_interest(self: &Arc<Self>) -> DaemonDfsMaintenanceForegroundPreemption {
+        // Capture the baseline before publishing maintenance interest. Any
+        // foreground waiter that can observe the interest therefore advances
+        // a generation this guard will observe, including while cluster/local
+        // admission is still in progress.
+        let foreground_generation = self.foreground_generation.load(Ordering::Acquire);
+        self.maintenance_interest_count
+            .fetch_add(1, Ordering::AcqRel);
+        DaemonDfsMaintenanceForegroundPreemption {
+            scheduler: Arc::clone(self),
+            foreground_generation,
+        }
+    }
+
+    fn request_foreground_admission(&self) {
+        if self.maintenance_interest_count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        self.foreground_generation.fetch_add(1, Ordering::AcqRel);
+        self.foreground_notify.notify_waiters();
     }
 
     fn shard_gate(
@@ -757,6 +788,7 @@ impl DaemonDfsMutationScheduler {
     }
 }
 
+#[derive(Debug)]
 enum DaemonDfsMutationAdmission {
     ReadOnly {
         _scheduler: Arc<DaemonDfsMutationScheduler>,
@@ -801,9 +833,6 @@ static DAEMON_DFS_METADATA_PUBLISH_SCHEDULERS: OnceLock<
 > = OnceLock::new();
 static DAEMON_DFS_METADATA_PUBLISH_DISCOVERY_SCHEDULERS: OnceLock<
     Mutex<BTreeMap<PathBuf, Weak<sinomo_dfs::DfsMetadataPublishScheduler>>>,
-> = OnceLock::new();
-static DAEMON_DFS_MESSAGE_EXECUTION_GATES: OnceLock<
-    Mutex<BTreeMap<PathBuf, Weak<DaemonDfsMessageExecutionGate>>>,
 > = OnceLock::new();
 static DAEMON_DEFAULT_DFS_RECONCILIATION_WAKES: OnceLock<
     Mutex<BTreeMap<PathBuf, Weak<DaemonDefaultDfsReconciliationWake>>>,
@@ -1025,7 +1054,7 @@ fn daemon_dfs_metadata_history_gc_schedule(
 #[derive(Debug)]
 struct DaemonDfsMaintenanceAdmission {
     _lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
-    _message_execution_guard: tokio::sync::OwnedSemaphorePermit,
+    _mutation_admission: DaemonDfsMutationAdmission,
 }
 
 async fn acquire_daemon_dfs_maintenance_admission(
@@ -1037,17 +1066,12 @@ async fn acquire_daemon_dfs_maintenance_admission(
     let lifecycle_guard = daemon_default_dfs_lifecycle_gate(&data_dir.root())?
         .lock_owned()
         .await;
-    let message_execution_gate = daemon_dfs_message_execution_gate(data_dir)?;
-    let message_execution_guard = Arc::clone(&message_execution_gate.semaphore)
-        .acquire_owned()
-        .await
-        .map_err(|_| DaemonError::Network {
-            address: "DFS message execution".to_string(),
-            detail: "DFS message execution gate closed".to_string(),
-        })?;
+    let mutation_admission = daemon_dfs_mutation_scheduler(data_dir)?
+        .admit(&DfsMessageExecutionScope::GlobalExclusive)
+        .await?;
     Ok(DaemonDfsMaintenanceAdmission {
         _lifecycle_guard: lifecycle_guard,
-        _message_execution_guard: message_execution_guard,
+        _mutation_admission: mutation_admission,
     })
 }
 
@@ -1521,7 +1545,118 @@ impl DaemonDfsDataPlaneHost {
     }
 }
 
+async fn handle_daemon_dfs_status_async(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_dfs::DfsOperatorStatus, DaemonError> {
+    let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    if !cluster_paths.state.exists() {
+        let status_data_dir = data_dir.clone();
+        return tokio::task::spawn_blocking(move || {
+            sinomo_dfs::inspect_cluster_aware_dfs_status(
+                &status_data_dir,
+                &ClusterPaths::new(&status_data_dir),
+            )
+            .map_err(DaemonError::from)
+        })
+        .await
+        .map_err(|source| DaemonError::Network {
+            address: "DFS status".to_string(),
+            detail: format!("DFS status task failed: {source}"),
+        })?;
+    }
+
+    // Status borrows the mutation lane's backend, so it uses the same global
+    // scheduler owner as maintenance and foreground mutation work. Holding the
+    // admission inside the blocking task preserves cancellation safety.
+    let scheduler = daemon_dfs_mutation_scheduler(&data_dir)?;
+    let admission =
+        admit_daemon_dfs_foreground_message(&scheduler, &DfsMessageExecutionScope::GlobalExclusive)
+            .await?;
+    let data_owner_lock = daemon_dfs_data_owner_lock(paths)?;
+    let status_runtime = runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        let _admission = admission;
+        let _data_owner_lock = data_owner_lock;
+        let Some(peer_snapshot) = read_daemon_dfs_message_peer_snapshot(&cluster_paths)? else {
+            return Err(DaemonError::ClusterOrphan);
+        };
+        let (lane, _) = daemon_dfs_message_lane(
+            &data_dir,
+            &cluster_paths,
+            &peer_snapshot,
+            &status_runtime,
+            DaemonDfsMessageLaneKind::Mutation,
+        )?;
+        let mut lane = lane.lock().map_err(|_| DaemonError::Network {
+            address: "DFS status".to_string(),
+            detail: "DFS mutation service lane is poisoned".to_string(),
+        })?;
+        lane.refresh_peer_targets(peer_snapshot.peer_node_ids);
+        let metadata = lane
+            .service
+            .metadata_backend()
+            .ok_or_else(|| DaemonError::Parse {
+                detail: "DFS mutation service lane has no metadata backend".to_string(),
+            })?;
+        // A prior standalone inspection may have retained a duplicate decoded
+        // generation. The daemon-owned lane is now the reusable source.
+        sinomo_dfs::evict_cluster_aware_dfs_metadata_inspection_cache(&data_dir);
+        sinomo_dfs::inspect_dfs_status_from_metadata(&data_dir, &cluster_paths, metadata)
+            .map_err(DaemonError::from)
+    })
+    .await
+    .map_err(|source| DaemonError::Network {
+        address: "DFS status".to_string(),
+        detail: format!("DFS status task failed: {source}"),
+    })?
+}
+
 impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
+    fn status<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, sinomo_dfs::DfsOperatorStatus> {
+        let paths = self.paths.clone();
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            handle_daemon_dfs_status_async(&paths, &runtime)
+                .await
+                .map_err(daemon_dfs_data_plane_error)
+        })
+    }
+
+    fn shared_content_store(
+        &self,
+        data_dir: &SinomoDataDir,
+    ) -> Result<Option<Arc<sinomo_dfs::LocalContentStore>>, DfsDataPlaneHostError> {
+        let configured_data_root =
+            daemon_data_dir(&self.paths).map_err(daemon_dfs_data_plane_error)?;
+        if data_dir.root() != configured_data_root {
+            return Err(DfsDataPlaneHostError::new(format!(
+                "DFS service data root {} does not match daemon data root {}",
+                data_dir.root().display(),
+                configured_data_root.display()
+            )));
+        }
+        let cluster_paths = ClusterPaths::new(data_dir);
+        let Some(peer_snapshot) = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
+            .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let (lane, _) = daemon_dfs_message_lane(
+            data_dir,
+            &cluster_paths,
+            &peer_snapshot,
+            &self.runtime,
+            DaemonDfsMessageLaneKind::ContentRead,
+        )
+        .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))?;
+        let lane = lane
+            .lock()
+            .map_err(|_| DfsDataPlaneHostError::new("DFS content service lane is poisoned"))?;
+        Ok(Some(Arc::new(lane.service.content().clone())))
+    }
+
     fn run_smoke<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, sinomo_dfs::DfsSmokeReport> {
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
@@ -3217,37 +3352,47 @@ fn take_daemon_dfs_message_mutation_service_for_maintenance(
                     &metadata_authority_generation,
                 )
         });
-        if stale {
-            drop(cache.remove(&cache_key));
+        let retained_content_store = if stale {
+            cache.remove(&cache_key).map(|entry| entry.content_store)
+        } else {
+            None
+        };
+        if !cache.contains_key(&cache_key) {
+            let content_store = match retained_content_store {
+                Some(content_store) => content_store,
+                None => sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?,
+            };
+            cache.insert(
+                cache_key.clone(),
+                DaemonDfsMessageServiceCacheEntry {
+                    signature: signature.clone(),
+                    metadata_authority_generation: Arc::clone(&metadata_authority_generation),
+                    peer_node_ids: peer_node_ids.clone(),
+                    content_store,
+                    primary_service: None,
+                    lightweight_read_service: None,
+                    content_read_service: None,
+                },
+            );
         }
         let entry = cache
-            .entry(cache_key)
-            .or_insert_with(|| DaemonDfsMessageServiceCacheEntry {
-                signature: signature.clone(),
-                metadata_authority_generation: Arc::clone(&metadata_authority_generation),
-                peer_node_ids: peer_node_ids.clone(),
-                primary_service: None,
-                lightweight_read_service: None,
-                content_read_service: None,
-            });
+            .get_mut(&cache_key)
+            .expect("daemon DFS message cache entry inserted");
         entry.peer_node_ids.clone_from(&peer_node_ids);
-        entry.primary_service.take()
+        (entry.primary_service.take(), entry.content_store.clone())
     };
 
+    let (cached, content_store) = cached;
     let handle = match cached {
         Some(handle) => handle,
-        None => {
-            let content_store =
-                sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
-            open_daemon_dfs_message_service_lane_with_content(
-                data_dir,
-                cluster_paths,
-                &signature.local_node_id,
-                peer_node_ids.clone(),
-                runtime,
-                content_store,
-            )?
-        }
+        None => open_daemon_dfs_message_service_lane_with_content(
+            data_dir,
+            cluster_paths,
+            &signature.local_node_id,
+            peer_node_ids.clone(),
+            runtime,
+            content_store,
+        )?,
     };
     let handle = Arc::try_unwrap(handle).map_err(|_| sinomo_dfs::DfsError::Network {
         message:
@@ -3390,6 +3535,17 @@ fn daemon_dfs_mutation_scheduler(
     let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
     schedulers.insert(key, Arc::downgrade(&scheduler));
     Ok(scheduler)
+}
+
+async fn admit_daemon_dfs_foreground_message(
+    scheduler: &Arc<DaemonDfsMutationScheduler>,
+    execution_scope: &DfsMessageExecutionScope,
+) -> Result<DaemonDfsMutationAdmission, DaemonError> {
+    if matches!(execution_scope, DfsMessageExecutionScope::ReadOnly) {
+        return scheduler.admit(execution_scope).await;
+    }
+    scheduler.request_foreground_admission();
+    scheduler.admit(execution_scope).await
 }
 
 fn daemon_dfs_metadata_publish_lane_scheduler(
@@ -3566,67 +3722,20 @@ fn wait_at_daemon_dfs_message_committed_edge_test_hook(request_id: &str) {
         .and_then(|release_rx| release_rx.recv_timeout(Duration::from_secs(5)).ok());
 }
 
-/// Serializes metadata mutation/maintenance generations for one data root.
-///
-/// The lightweight read lane has its own service mutex and reads immutable
-/// metadata objects, so it deliberately bypasses this gate. Mutation-capable
-/// work keeps the permit inside `spawn_blocking` so cancellation cannot let a
-/// newer generation overlap work that is still running.
-#[derive(Debug)]
-struct DaemonDfsMessageExecutionGate {
-    semaphore: Arc<tokio::sync::Semaphore>,
-    maintenance_interest_count: AtomicUsize,
-    foreground_generation: AtomicU64,
-    foreground_notify: tokio::sync::Notify,
-}
-
-impl DaemonDfsMessageExecutionGate {
-    fn new() -> Self {
-        Self {
-            semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
-            maintenance_interest_count: AtomicUsize::new(0),
-            foreground_generation: AtomicU64::new(0),
-            foreground_notify: tokio::sync::Notify::new(),
-        }
-    }
-
-    fn begin_maintenance_interest(self: &Arc<Self>) -> DaemonDfsMaintenanceForegroundPreemption {
-        // Capture the baseline before publishing maintenance interest. Any
-        // foreground waiter that can observe the interest therefore advances
-        // a generation this guard will observe, including while cluster/local
-        // admission is still in progress.
-        let foreground_generation = self.foreground_generation.load(Ordering::Acquire);
-        self.maintenance_interest_count
-            .fetch_add(1, Ordering::AcqRel);
-        DaemonDfsMaintenanceForegroundPreemption {
-            gate: Arc::clone(self),
-            foreground_generation,
-        }
-    }
-
-    fn request_foreground_admission(&self) {
-        if self.maintenance_interest_count.load(Ordering::Acquire) == 0 {
-            return;
-        }
-        self.foreground_generation.fetch_add(1, Ordering::AcqRel);
-        self.foreground_notify.notify_waiters();
-    }
-}
-
 #[derive(Debug)]
 struct DaemonDfsMaintenanceForegroundPreemption {
-    gate: Arc<DaemonDfsMessageExecutionGate>,
+    scheduler: Arc<DaemonDfsMutationScheduler>,
     foreground_generation: u64,
 }
 
 impl DaemonDfsMaintenanceForegroundPreemption {
     fn is_requested(&self) -> bool {
-        self.gate.foreground_generation.load(Ordering::Acquire) != self.foreground_generation
+        self.scheduler.foreground_generation.load(Ordering::Acquire) != self.foreground_generation
     }
 
     async fn requested(&self) {
         loop {
-            let notified = self.gate.foreground_notify.notified();
+            let notified = self.scheduler.foreground_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             if self.is_requested() {
@@ -3640,64 +3749,11 @@ impl DaemonDfsMaintenanceForegroundPreemption {
 impl Drop for DaemonDfsMaintenanceForegroundPreemption {
     fn drop(&mut self) {
         let previous = self
-            .gate
+            .scheduler
             .maintenance_interest_count
             .fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "DFS maintenance interest underflow");
     }
-}
-
-fn daemon_dfs_message_execution_gate(
-    data_dir: &SinomoDataDir,
-) -> Result<Arc<DaemonDfsMessageExecutionGate>, DaemonError> {
-    let key = data_dir.root();
-    let mut gates = DAEMON_DFS_MESSAGE_EXECUTION_GATES
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .map_err(|_| DaemonError::Network {
-            address: "DFS message execution".to_string(),
-            detail: "DFS message execution gate map is poisoned".to_string(),
-        })?;
-    if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
-        return Ok(gate);
-    }
-    let gate = Arc::new(DaemonDfsMessageExecutionGate::new());
-    gates.insert(key, Arc::downgrade(&gate));
-    Ok(gate)
-}
-
-async fn acquire_daemon_dfs_foreground_message_execution(
-    gate: &Arc<DaemonDfsMessageExecutionGate>,
-) -> Result<tokio::sync::OwnedSemaphorePermit, DaemonError> {
-    match Arc::clone(&gate.semaphore).try_acquire_owned() {
-        Ok(permit) => return Ok(permit),
-        Err(tokio::sync::TryAcquireError::NoPermits) => gate.request_foreground_admission(),
-        Err(tokio::sync::TryAcquireError::Closed) => {
-            return Err(DaemonError::Network {
-                address: "DFS message execution".to_string(),
-                detail: "DFS message execution gate closed".to_string(),
-            });
-        }
-    }
-    Arc::clone(&gate.semaphore)
-        .acquire_owned()
-        .await
-        .map_err(|_| DaemonError::Network {
-            address: "DFS message execution".to_string(),
-            detail: "DFS message execution gate closed".to_string(),
-        })
-}
-
-async fn acquire_daemon_dfs_message_execution(
-    gate: &Arc<DaemonDfsMessageExecutionGate>,
-    use_lightweight_read_lane: bool,
-) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, DaemonError> {
-    if use_lightweight_read_lane {
-        return Ok(None);
-    }
-    acquire_daemon_dfs_foreground_message_execution(gate)
-        .await
-        .map(Some)
 }
 
 fn daemon_default_dfs_lifecycle_gate(
@@ -3983,12 +4039,17 @@ fn read_daemon_dfs_message_peer_snapshot(
     if !cluster_paths.state.exists() {
         return Ok(None);
     }
-    let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
+    // The cluster state is immutable for the duration of this request. Reuse
+    // the cluster-owned resident snapshot instead of reopening and decoding
+    // state.sobj for every routed DFS message. In-process writers invalidate
+    // this cache immediately, while external replacements are fenced by the
+    // existing short file-generation validation lease.
+    let state = sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(cluster_paths)
         .map_err(daemon_dfs_network_error)?;
     let peer_node_ids = sinomo_dfs::cluster_dfs_peer_node_ids(&state);
     Ok(Some(DaemonDfsMessagePeerSnapshot {
-        cluster_id: state.cluster_id,
-        local_node_id: state.local_node_id,
+        cluster_id: state.cluster_id.clone(),
+        local_node_id: state.local_node_id.clone(),
         kv_snapshot_available: cluster_paths.kv_paths().snapshot.exists(),
         peer_node_ids,
     }))
@@ -4159,6 +4220,32 @@ fn open_daemon_dfs_message_service_lane_with_content(
     runtime: &tokio::runtime::Handle,
     content: sinomo_dfs::LocalContentStore,
 ) -> Result<Arc<DaemonDfsMessageServiceLaneHandle>, sinomo_dfs::DfsError> {
+    open_daemon_dfs_message_metadata_lane_with_content(
+        data_dir,
+        cluster_paths,
+        local_node_id,
+        peer_node_ids,
+        runtime,
+        content,
+        DaemonDfsMetadataLaneBootstrap::MutationGuards,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum DaemonDfsMetadataLaneBootstrap {
+    MutationGuards,
+    ReadOnly,
+}
+
+fn open_daemon_dfs_message_metadata_lane_with_content(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    local_node_id: &sinomo_core::node::NodeId,
+    peer_node_ids: Vec<NodeId>,
+    runtime: &tokio::runtime::Handle,
+    content: sinomo_dfs::LocalContentStore,
+    bootstrap: DaemonDfsMetadataLaneBootstrap,
+) -> Result<Arc<DaemonDfsMessageServiceLaneHandle>, sinomo_dfs::DfsError> {
     let metadata_backend =
         sinomo_dfs::open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
     #[cfg(test)]
@@ -4173,28 +4260,50 @@ fn open_daemon_dfs_message_service_lane_with_content(
             sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
             detached_send_runtime.state.clone(),
         );
-    let service = NetworkedDfsService::new(transport, content);
-    // Message lanes hydrate only the filesystem catalog and durable mutation
-    // guards at construction. A full metadata hydrate here is especially costly
-    // because the cache creates the primary lane and the read-lane pool together
-    // while holding its lock. Read requests that need the complete metadata view
-    // hydrate their selected lane below; routed mutations use targeted backend
-    // reads instead.
-    let service = with_daemon_dfs_control_plane_on_runtime(service, cluster_paths, Some(runtime))
-        .with_boxed_metadata_backend_lazy(metadata_backend)?;
+    let service = with_daemon_dfs_control_plane_on_runtime(
+        NetworkedDfsService::new(transport, content),
+        cluster_paths,
+        Some(runtime),
+    );
+    let service = match bootstrap {
+        DaemonDfsMetadataLaneBootstrap::MutationGuards => {
+            // Mutation lanes retain the filesystem catalog and durable namespace
+            // guards without hydrating the complete metadata projection.
+            service.with_boxed_metadata_backend_lazy(metadata_backend)?
+        }
+        DaemonDfsMetadataLaneBootstrap::ReadOnly => {
+            // Read-only admission resolves authority from the control plane and
+            // reads the backend directly, so global bootstrap scans add no
+            // correctness evidence.
+            service.with_boxed_metadata_backend_for_read_only_requests(metadata_backend)
+        }
+    };
     Ok(Arc::new(DaemonDfsMessageServiceLaneHandle {
         lane: Mutex::new(DaemonDfsMessageServiceLane {
             service,
             peer_node_ids,
-            last_metadata_refresh: Instant::now(),
-            // Routed mutations and namespace operations check the exact shard
-            // marker and rebind only when that shard is actually frozen. An
-            // unconditional all-shard rebind here makes every cold request pay
-            // for control-plane proof reads that are irrelevant in steady state.
-            metadata_hydrated: false,
         }),
         detached_send_runtime,
     }))
+}
+
+fn open_daemon_dfs_message_read_service_lane_with_content(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    local_node_id: &sinomo_core::node::NodeId,
+    peer_node_ids: Vec<NodeId>,
+    runtime: &tokio::runtime::Handle,
+    content: sinomo_dfs::LocalContentStore,
+) -> Result<Arc<DaemonDfsMessageServiceLaneHandle>, sinomo_dfs::DfsError> {
+    open_daemon_dfs_message_metadata_lane_with_content(
+        data_dir,
+        cluster_paths,
+        local_node_id,
+        peer_node_ids,
+        runtime,
+        content,
+        DaemonDfsMetadataLaneBootstrap::ReadOnly,
+    )
 }
 
 fn open_daemon_dfs_message_content_read_lane_with_content(
@@ -4219,8 +4328,6 @@ fn open_daemon_dfs_message_content_read_lane_with_content(
         lane: Mutex::new(DaemonDfsMessageServiceLane {
             service: NetworkedDfsService::new(transport, content),
             peer_node_ids,
-            last_metadata_refresh: Instant::now(),
-            metadata_hydrated: false,
         }),
         detached_send_runtime,
     }))
@@ -4340,14 +4447,6 @@ fn prepare_daemon_dfs_commit_promotion_recovery(
     })
 }
 
-fn daemon_dfs_message_uses_lightweight_read_lane(
-    command: &DfsMessageCommand,
-    execution_scope: &DfsMessageExecutionScope,
-) -> bool {
-    matches!(execution_scope, DfsMessageExecutionScope::ReadOnly)
-        && !sinomo_dfs::dfs_message_requires_full_metadata_hydrate(command)
-}
-
 fn daemon_dfs_message_uses_content_read_lane(command: &DfsMessageCommand) -> bool {
     match &command.routed_message.message {
         sinomo_dfs::DfsNetworkMessage::ReadRequest(request) => {
@@ -4356,6 +4455,153 @@ fn daemon_dfs_message_uses_content_read_lane(command: &DfsMessageCommand) -> boo
         sinomo_dfs::DfsNetworkMessage::BulkReadRequest(_) => true,
         _ => false,
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonDfsMessageLaneKind {
+    Mutation,
+    LightweightRead,
+    ContentRead,
+}
+
+fn daemon_dfs_message_lane(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    peer_snapshot: &DaemonDfsMessagePeerSnapshot,
+    runtime: &tokio::runtime::Handle,
+    kind: DaemonDfsMessageLaneKind,
+) -> Result<(Arc<DaemonDfsMessageServiceLaneHandle>, Duration), sinomo_dfs::DfsError> {
+    let cache_key = data_dir.root();
+    let peer_node_ids = &peer_snapshot.peer_node_ids;
+    let cache_lock_wait_started = Instant::now();
+    let mut cache = daemon_dfs_message_service_cache()
+        .lock()
+        .map_err(|_| daemon_dfs_cache_lock_error())?;
+    let cache_lock_wait = cache_lock_wait_started.elapsed();
+    let metadata_authority_generation = match cache.get(&cache_key) {
+        Some(entry)
+            if entry.signature.cluster_id == peer_snapshot.cluster_id
+                && entry.signature.local_node_id == peer_snapshot.local_node_id =>
+        {
+            Arc::clone(&entry.metadata_authority_generation)
+        }
+        _ => daemon_dfs_metadata_authority_generation_for_identity(
+            cluster_paths,
+            &peer_snapshot.cluster_id,
+            &peer_snapshot.local_node_id,
+            Some(runtime),
+        )?,
+    };
+    let signature = DaemonDfsMessageServiceSignature {
+        cluster_id: peer_snapshot.cluster_id.clone(),
+        local_node_id: peer_snapshot.local_node_id.clone(),
+        kv_snapshot_available: peer_snapshot.kv_snapshot_available,
+        metadata_authority_generation: metadata_authority_generation.generation(),
+    };
+    if cache
+        .get(&cache_key)
+        .is_none_or(|entry| entry.signature != signature)
+    {
+        // Release the superseded backend-bearing lanes before opening their
+        // replacement, while retaining the one process-local content store.
+        let content_store = match cache.remove(&cache_key) {
+            Some(entry) => entry.content_store,
+            None => sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?,
+        };
+        tracing::info!(
+            data_root = %cache_key.display(),
+            metadata_authority_generation = signature.metadata_authority_generation,
+            peer_count = peer_node_ids.len(),
+            "opened bounded daemon DFS message service cache generation"
+        );
+        cache.insert(
+            cache_key.clone(),
+            DaemonDfsMessageServiceCacheEntry {
+                signature,
+                metadata_authority_generation,
+                peer_node_ids: peer_node_ids.clone(),
+                content_store,
+                primary_service: None,
+                lightweight_read_service: None,
+                content_read_service: None,
+            },
+        );
+    }
+
+    let entry = cache
+        .get_mut(&cache_key)
+        .expect("daemon DFS message cache entry inserted");
+    entry.peer_node_ids.clone_from(peer_node_ids);
+    let slot = match kind {
+        DaemonDfsMessageLaneKind::Mutation => &mut entry.primary_service,
+        DaemonDfsMessageLaneKind::LightweightRead => &mut entry.lightweight_read_service,
+        DaemonDfsMessageLaneKind::ContentRead => &mut entry.content_read_service,
+    };
+    if slot.is_none() {
+        let lane = match kind {
+            DaemonDfsMessageLaneKind::Mutation => {
+                open_daemon_dfs_message_service_lane_with_content(
+                    data_dir,
+                    cluster_paths,
+                    &entry.signature.local_node_id,
+                    entry.peer_node_ids.clone(),
+                    runtime,
+                    entry.content_store.clone(),
+                )?
+            }
+            DaemonDfsMessageLaneKind::LightweightRead => {
+                open_daemon_dfs_message_read_service_lane_with_content(
+                    data_dir,
+                    cluster_paths,
+                    &entry.signature.local_node_id,
+                    entry.peer_node_ids.clone(),
+                    runtime,
+                    entry.content_store.clone(),
+                )?
+            }
+            DaemonDfsMessageLaneKind::ContentRead => {
+                open_daemon_dfs_message_content_read_lane_with_content(
+                    data_dir,
+                    cluster_paths,
+                    &entry.signature.local_node_id,
+                    entry.peer_node_ids.clone(),
+                    runtime,
+                    entry.content_store.clone(),
+                )?
+            }
+        };
+        tracing::info!(
+            data_root = %cache_key.display(),
+            lane = ?kind,
+            "opened bounded daemon DFS service lane"
+        );
+        *slot = Some(lane);
+    }
+    Ok((
+        Arc::clone(slot.as_ref().expect("daemon DFS service lane inserted")),
+        cache_lock_wait,
+    ))
+}
+
+fn daemon_dfs_message_content_store(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_dfs::LocalContentStore, sinomo_dfs::DfsError> {
+    let Some(peer_snapshot) = read_daemon_dfs_message_peer_snapshot(cluster_paths)? else {
+        return Err(sinomo_dfs::DfsError::Network {
+            message: "DFS content ingest requires initialized cluster state".to_string(),
+        });
+    };
+    let (lane, _) = daemon_dfs_message_lane(
+        data_dir,
+        cluster_paths,
+        &peer_snapshot,
+        runtime,
+        DaemonDfsMessageLaneKind::ContentRead,
+    )?;
+    let lane = lane.lock().map_err(|_| daemon_dfs_cache_lock_error())?;
+    Ok(lane.service.content().clone())
 }
 
 fn process_daemon_dfs_message_command_on_runtime(
@@ -4368,19 +4614,10 @@ fn process_daemon_dfs_message_command_on_runtime(
     traceparent: Option<String>,
 ) -> Result<Option<DaemonDfsMessageCommandProcessResult>, sinomo_dfs::DfsError> {
     let trace_started = Instant::now();
-    let ensure_started = Instant::now();
-    data_dir
-        .ensure_root_layout()
-        .map_err(|source| sinomo_dfs::DfsError::Metadata {
-            message: source.to_string(),
-        })?;
-    let ensure_ms = ensure_started.elapsed().as_millis();
+    // Daemon startup owns data-directory initialization. Repeating its six
+    // create_dir_all calls here turns every routed DFS message into layout I/O.
     let cache_key = data_dir.root();
     let is_read_only = matches!(execution_scope, DfsMessageExecutionScope::ReadOnly);
-    let requires_full_metadata_hydrate =
-        sinomo_dfs::dfs_message_requires_full_metadata_hydrate(&command);
-    let use_lightweight_read_lane =
-        daemon_dfs_message_uses_lightweight_read_lane(&command, execution_scope);
     let use_content_read_lane = daemon_dfs_message_uses_content_read_lane(&command);
     let request_id = command.request_id.clone();
     let source_node_id = command.routed_message.source_node_id.clone();
@@ -4389,17 +4626,15 @@ fn process_daemon_dfs_message_command_on_runtime(
     let message_id = command.routed_message.message_id;
     let message_kind = daemon_dfs_message_kind(&command.routed_message.message);
     daemon_dfs_perf_trace(format_args!(
-        "dfs-message-dispatch-start request={} kind={} source={} target={} frame_id={} message_id={} read_lane={} content_lane={} full_hydrate_required={} ensure_ms={}",
+        "dfs-message-dispatch-start request={} kind={} source={} target={} frame_id={} message_id={} read_lane={} content_lane={}",
         request_id,
         message_kind,
         source_node_id,
         target_node_id,
         frame_id,
         message_id,
-        use_lightweight_read_lane,
-        use_content_read_lane,
-        requires_full_metadata_hydrate,
-        ensure_ms
+        is_read_only,
+        use_content_read_lane
     ));
     let peer_snapshot_started = Instant::now();
     let Some(peer_snapshot) = read_daemon_dfs_message_peer_snapshot(cluster_paths)? else {
@@ -4416,138 +4651,15 @@ fn process_daemon_dfs_message_command_on_runtime(
     }
     let peer_node_ids = peer_snapshot.peer_node_ids.clone();
     let cache_select_started = Instant::now();
-    let cache_lock_wait_started = Instant::now();
-    let (service_lane_handle, cache_lock_wait) = {
-        let mut cache = daemon_dfs_message_service_cache()
-            .lock()
-            .map_err(|_| daemon_dfs_cache_lock_error())?;
-        let cache_lock_wait = cache_lock_wait_started.elapsed();
-        let metadata_authority_generation = match cache.get(&cache_key) {
-            Some(entry)
-                if entry.signature.cluster_id == peer_snapshot.cluster_id
-                    && entry.signature.local_node_id == peer_snapshot.local_node_id =>
-            {
-                Arc::clone(&entry.metadata_authority_generation)
-            }
-            _ => daemon_dfs_metadata_authority_generation_for_identity(
-                cluster_paths,
-                &peer_snapshot.cluster_id,
-                &peer_snapshot.local_node_id,
-                Some(runtime),
-            )?,
-        };
-        let signature = DaemonDfsMessageServiceSignature {
-            cluster_id: peer_snapshot.cluster_id.clone(),
-            local_node_id: peer_snapshot.local_node_id.clone(),
-            kv_snapshot_available: peer_snapshot.kv_snapshot_available,
-            metadata_authority_generation: metadata_authority_generation.generation(),
-        };
-        let should_rebuild = cache
-            .get(&cache_key)
-            .is_none_or(|entry| entry.signature != signature);
-        if should_rebuild {
-            // The cached lane may contain a fully hydrated all-shard view.
-            // Release the superseded generation before opening its replacement
-            // so an authority or topology change cannot transiently retain two
-            // metadata-heavy service generations.
-            drop(cache.remove(&cache_key));
-            tracing::info!(
-                data_root = %cache_key.display(),
-                metadata_authority_generation = signature.metadata_authority_generation,
-                peer_count = peer_node_ids.len(),
-                "opened bounded daemon DFS message service cache generation"
-            );
-            cache.insert(
-                cache_key.clone(),
-                DaemonDfsMessageServiceCacheEntry {
-                    signature: signature.clone(),
-                    metadata_authority_generation,
-                    peer_node_ids: peer_node_ids.clone(),
-                    primary_service: None,
-                    lightweight_read_service: None,
-                    content_read_service: None,
-                },
-            );
-        }
-
-        let entry = cache
-            .get_mut(&cache_key)
-            .expect("daemon DFS message cache entry inserted");
-        entry.peer_node_ids.clone_from(&peer_node_ids);
-        let service = if use_content_read_lane {
-            if entry.content_read_service.is_none() {
-                let content_store =
-                    sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
-                entry.content_read_service =
-                    Some(open_daemon_dfs_message_content_read_lane_with_content(
-                        data_dir,
-                        cluster_paths,
-                        &entry.signature.local_node_id,
-                        entry.peer_node_ids.clone(),
-                        runtime,
-                        content_store,
-                    )?);
-                tracing::info!(
-                    data_root = %cache_key.display(),
-                    "opened bounded daemon DFS exact-content read lane"
-                );
-            }
-            Arc::clone(
-                entry
-                    .content_read_service
-                    .as_ref()
-                    .expect("exact-content read lane inserted"),
-            )
-        } else if use_lightweight_read_lane {
-            if entry.lightweight_read_service.is_none() {
-                let content_store =
-                    sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
-                entry.lightweight_read_service =
-                    Some(open_daemon_dfs_message_service_lane_with_content(
-                        data_dir,
-                        cluster_paths,
-                        &entry.signature.local_node_id,
-                        entry.peer_node_ids.clone(),
-                        runtime,
-                        content_store,
-                    )?);
-                tracing::info!(
-                    data_root = %cache_key.display(),
-                    "opened bounded daemon DFS lightweight read lane"
-                );
-            }
-            Arc::clone(
-                entry
-                    .lightweight_read_service
-                    .as_ref()
-                    .expect("lightweight read lane inserted"),
-            )
-        } else {
-            if entry.primary_service.is_none() {
-                let content_store =
-                    sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
-                entry.primary_service = Some(open_daemon_dfs_message_service_lane_with_content(
-                    data_dir,
-                    cluster_paths,
-                    &entry.signature.local_node_id,
-                    entry.peer_node_ids.clone(),
-                    runtime,
-                    content_store,
-                )?);
-                tracing::info!(
-                    data_root = %cache_key.display(),
-                    "opened bounded daemon DFS mutation service lane"
-                );
-            }
-            Arc::clone(
-                entry
-                    .primary_service
-                    .as_ref()
-                    .expect("mutation service lane inserted"),
-            )
-        };
-        (service, cache_lock_wait)
+    let lane_kind = if use_content_read_lane {
+        DaemonDfsMessageLaneKind::ContentRead
+    } else if is_read_only {
+        DaemonDfsMessageLaneKind::LightweightRead
+    } else {
+        DaemonDfsMessageLaneKind::Mutation
     };
+    let (service_lane_handle, cache_lock_wait) =
+        daemon_dfs_message_lane(data_dir, cluster_paths, &peer_snapshot, runtime, lane_kind)?;
     let cache_select = cache_select_started.elapsed();
 
     let lane_lock_wait_started = Instant::now();
@@ -4556,28 +4668,9 @@ fn process_daemon_dfs_message_command_on_runtime(
         .map_err(|_| daemon_dfs_cache_lock_error())?;
     let lane_lock_wait = lane_lock_wait_started.elapsed();
     service_lane.refresh_peer_targets(peer_node_ids);
-    let hydrate_started = Instant::now();
-    let mut hydrated_metadata = false;
-    if requires_full_metadata_hydrate
-        && (!service_lane.metadata_hydrated
-            || service_lane.last_metadata_refresh.elapsed()
-                >= DAEMON_DFS_MESSAGE_CACHE_REFRESH_INTERVAL)
-    {
-        tracing::info!(
-            data_root = %cache_key.display(),
-            request = %request_id,
-            kind = message_kind,
-            "hydrating bounded daemon DFS message service metadata"
-        );
-        service_lane.service.hydrate_from_metadata_backend()?;
-        service_lane.last_metadata_refresh = Instant::now();
-        service_lane.metadata_hydrated = true;
-        hydrated_metadata = true;
-    }
-    let hydrate = hydrate_started.elapsed();
     let process_started = Instant::now();
     daemon_dfs_perf_trace(format_args!(
-        "dfs-message-dispatch-before-process request={} kind={} peer_snapshot_ms={} cache_select_ms={} cache_select_us={} cache_lock_wait_ms={} cache_lock_wait_us={} lane_lock_wait_ms={} lane_lock_wait_us={} full_hydrate={} hydrate_ms={} hydrate_us={} pre_process_total_ms={}",
+        "dfs-message-dispatch-before-process request={} kind={} peer_snapshot_ms={} cache_select_ms={} cache_select_us={} cache_lock_wait_ms={} cache_lock_wait_us={} lane_lock_wait_ms={} lane_lock_wait_us={} pre_process_total_ms={}",
         request_id,
         message_kind,
         peer_snapshot_ms,
@@ -4587,9 +4680,6 @@ fn process_daemon_dfs_message_command_on_runtime(
         cache_lock_wait.as_micros(),
         lane_lock_wait.as_millis(),
         lane_lock_wait.as_micros(),
-        hydrated_metadata,
-        hydrate.as_millis(),
-        hydrate.as_micros(),
         trace_started.elapsed().as_millis()
     ));
     let mut process_report = service_lane
@@ -4630,20 +4720,16 @@ fn process_daemon_dfs_message_command_on_runtime(
         .map(|result| (result.response.outbound_messages.len(), result.events.len()))
         .unwrap_or_default();
     daemon_dfs_perf_trace(format_args!(
-        "dfs-message-dispatch request={} read_lane={} peer_snapshot_ms={} ensure_ms={} cache_select_ms={} cache_select_us={} cache_lock_wait_ms={} cache_lock_wait_us={} lane_lock_wait_ms={} lane_lock_wait_us={} full_hydrate={} hydrate_ms={} hydrate_us={} process_ms={} process_us={} repair_queue_records={} repair_queue_appended={} repair_queue_ms={} repair_queue_us={} process_ok={} outbound_messages={} events={} total_ms={}",
+        "dfs-message-dispatch request={} read_lane={} peer_snapshot_ms={} cache_select_ms={} cache_select_us={} cache_lock_wait_ms={} cache_lock_wait_us={} lane_lock_wait_ms={} lane_lock_wait_us={} process_ms={} process_us={} repair_queue_records={} repair_queue_appended={} repair_queue_ms={} repair_queue_us={} process_ok={} outbound_messages={} events={} total_ms={}",
         request_id,
-        use_lightweight_read_lane,
+        is_read_only,
         peer_snapshot_ms,
-        ensure_ms,
         cache_select.as_millis(),
         cache_select.as_micros(),
         cache_lock_wait.as_millis(),
         cache_lock_wait.as_micros(),
         lane_lock_wait.as_millis(),
         lane_lock_wait.as_micros(),
-        hydrated_metadata,
-        hydrate.as_millis(),
-        hydrate.as_micros(),
         process.as_millis(),
         process.as_micros(),
         repair_queue_record_count,
@@ -4781,7 +4867,7 @@ fn emit_daemon_dfs_committed_edges(
 }
 
 async fn ingest_daemon_dfs_message_attachment(
-    data_dir: &SinomoDataDir,
+    content: Option<sinomo_dfs::LocalContentStore>,
     mut command: DfsMessageCommand,
     attachment: Option<DfsInboundAttachment>,
     runtime: &tokio::runtime::Handle,
@@ -4795,7 +4881,9 @@ async fn ingest_daemon_dfs_message_attachment(
     let Some(attachment) = attachment else {
         return Ok((command, None));
     };
-    let task_data_dir = data_dir.clone();
+    let content = content.ok_or_else(|| DaemonError::Parse {
+        detail: "streamed DFS attachment is missing its shared content store".to_string(),
+    })?;
     let task_runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let (expected_hash, stage_blob) = match &command.routed_message.message {
@@ -4822,7 +4910,6 @@ async fn ingest_daemon_dfs_message_attachment(
             });
         }
 
-        let content = LocalContentStore::new(task_data_dir.dfs_dir().join("content"))?;
         let mut ingest = content.begin_quarantined_blob_ingest(
             attachment.descriptor.total_size_bytes,
             expected_hash.as_deref(),
@@ -4872,9 +4959,18 @@ async fn handle_daemon_dfs_message_async(
     let trace_started = Instant::now();
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
-    let (command, preingested_blob) =
-        ingest_daemon_dfs_message_attachment(&data_dir, command, attachment, runtime).await?;
     let cluster_paths = ClusterPaths::new(&data_dir);
+    let content = if attachment.is_some() {
+        Some(daemon_dfs_message_content_store(
+            &data_dir,
+            &cluster_paths,
+            runtime,
+        )?)
+    } else {
+        None
+    };
+    let (command, preingested_blob) =
+        ingest_daemon_dfs_message_attachment(content, command, attachment, runtime).await?;
     let request_id = command.request_id.clone();
     let source_node_id = command.routed_message.source_node_id.clone();
     let target_node_id = command.routed_message.target_node_id.clone();
@@ -4882,8 +4978,6 @@ async fn handle_daemon_dfs_message_async(
     let message_id = command.routed_message.message_id;
     let message_kind = daemon_dfs_message_kind(&command.routed_message.message);
     let execution_scope = dfs_message_execution_scope(&command);
-    let use_lightweight_read_lane =
-        daemon_dfs_message_uses_lightweight_read_lane(&command, &execution_scope);
     let execution_scope_label = match &execution_scope {
         DfsMessageExecutionScope::ReadOnly => "read-only".to_string(),
         DfsMessageExecutionScope::ExactShard {
@@ -4907,15 +5001,10 @@ async fn handle_daemon_dfs_message_async(
     let process_data_owner_lock = daemon_dfs_data_owner_lock(paths)?;
     let scheduler = daemon_dfs_mutation_scheduler(&data_dir)?;
     let admission_started = Instant::now();
-    // Wait for the metadata-memory bound before acquiring logical mutation
-    // authority. Queued mutation-capable work therefore cannot hold a
-    // shard/global gate while it waits for the sole backend-bearing service
-    // generation. Lightweight immutable reads use a separately locked service
-    // lane and must not queue behind maintenance or mutations.
-    let execution_gate = daemon_dfs_message_execution_gate(&data_dir)?;
-    let execution_slot =
-        acquire_daemon_dfs_message_execution(&execution_gate, use_lightweight_read_lane).await?;
-    let admission = scheduler.admit(&execution_scope).await?;
+    // The mutation scheduler is the sole foreground/maintenance admission
+    // owner. Immutable reads use their separately locked service lane and do
+    // not queue behind metadata mutation or maintenance admission.
+    let admission = admit_daemon_dfs_foreground_message(&scheduler, &execution_scope).await?;
     let admission_wait = admission_started.elapsed();
     let process_execution_scope = execution_scope.clone();
     let spawn_started = Instant::now();
@@ -4943,7 +5032,6 @@ async fn handle_daemon_dfs_message_async(
         // Own admission here so a disconnected/cancelled RPC cannot release
         // the shard (or global) guard before the actual DFS mutation stops.
         drop(admission);
-        drop(execution_slot);
         (result, blocking_queue, blocking_started.elapsed())
     })
     .await
@@ -6345,15 +6433,10 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
     // behind an active backend-bearing maintenance pass instead of treating
     // overlap as success and losing a committed input generation.
     let lifecycle_guard = lifecycle_gate.lock_owned().await;
-    let message_execution_gate = daemon_dfs_message_execution_gate(&SinomoDataDir::new(data_dir))?;
-    let message_execution_guard = Arc::clone(&message_execution_gate.semaphore)
-        .acquire_owned()
-        .await
-        .map_err(|_| DaemonError::Network {
-            address: "DFS message execution".to_string(),
-            detail: "DFS message execution gate closed".to_string(),
-        })?;
-    // Own the permit inside the blocking task that polls the complete lifecycle
+    let mutation_admission = daemon_dfs_mutation_scheduler(&SinomoDataDir::new(data_dir))?
+        .admit(&DfsMessageExecutionScope::GlobalExclusive)
+        .await?;
+    // Own admission inside the blocking task that polls the complete lifecycle
     // future. Dropping the JoinHandle cannot cancel a running blocking task, so
     // neither guard can be released while backend-bearing DFS work still runs.
     let task_paths = paths.clone();
@@ -6364,7 +6447,7 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
         .spawn_blocking(move || {
             let _data_owner_lock = task_data_owner_lock;
             let _lifecycle_guard = lifecycle_guard;
-            let _message_execution_guard = message_execution_guard;
+            let _mutation_admission = mutation_admission;
             task_runtime.block_on(ensure_default_distributed_dfs_lifecycle_inner(
                 &task_paths,
                 &task_options,
@@ -6478,8 +6561,8 @@ where
     };
     // A preempted or failed future owns and destroys the broad tick's
     // `NetworkedDfsService` here. A successful future may return a reset,
-    // backend-bearing lane to the cache before this sole message-execution
-    // permit is released, so foreground admission still cannot overlap a live
+    // backend-bearing lane to the cache before global scheduler admission is
+    // released, so foreground admission still cannot overlap a live
     // maintenance generation.
     drop(maintenance);
     outcome
@@ -6560,11 +6643,11 @@ async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
     // foreground request that queues anywhere behind this pass can then ask it
     // to yield once its current synchronous poll reaches an await boundary.
     let foreground_preemption =
-        daemon_dfs_message_execution_gate(&data_dir)?.begin_maintenance_interest();
+        daemon_dfs_mutation_scheduler(&data_dir)?.begin_maintenance_interest();
     let admission = acquire_daemon_dfs_maintenance_admission(&data_dir).await?;
     let DaemonDfsMaintenanceAdmission {
         _lifecycle_guard: lifecycle_guard,
-        _message_execution_guard: message_execution_guard,
+        _mutation_admission: mutation_admission,
     } = admission;
     let mut deferred_work = None;
     let committed_work_tracker = DfsCommittedWorkTracker::new();
@@ -6584,7 +6667,7 @@ async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
         .await;
     // The cancellable broad generation has been collapsed or destroyed at
     // this point. Return its freed pages while maintenance still owns message
-    // admission: trimming after releasing the permit can contend on glibc
+    // admission: trimming after releasing admission can contend on glibc
     // arena locks with the foreground request this pass just admitted.
     let allocator_trim_started = Instant::now();
     let allocator_trimmed = release_daemon_dfs_idle_allocator_pages();
@@ -6595,13 +6678,13 @@ async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
         "dfs maintenance allocator trim"
     );
     // The preemption helper has already completed or dropped the entire
-    // maintenance future before this permit is released. On success it may
+    // maintenance future before global admission is released. On success it may
     // have restored a reset backend-bearing request lane; on preemption/error
     // the owned lane was destroyed. Local mutation therefore remains
     // single-generation even when a repair or metadata RPC is cancelled to
     // admit foreground work. Those sends are replay-safe; return Deferred
     // below so durable work is retried promptly.
-    drop(message_execution_guard);
+    drop(mutation_admission);
     drop(lifecycle_guard);
     drop(foreground_preemption);
     if let Some((detached_runtime, worker)) = deferred_work {
@@ -6677,7 +6760,7 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     // Transfer the mutation lane only after refreshing KV and re-reading the
     // admitted cluster identity. The owned lane remains inside this
     // cancellable future, so preemption destroys it before the execution
-    // permit can be released.
+    // global admission can be released.
     let retained_lane = take_daemon_dfs_message_mutation_service_for_maintenance(
         &data_dir,
         &cluster_paths,
@@ -6694,7 +6777,6 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     } = retained_lane;
     let DaemonDfsMessageServiceLane {
         service: mut maintenance_service,
-        metadata_hydrated: service_was_fully_hydrated,
         ..
     } = lane;
     let authority_generation_before_maintenance = metadata_authority_generation.generation();
@@ -6781,12 +6863,10 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     let reusable_service = if matches!(&maintenance_result, Ok(Some(_))) {
         match maintenance_service.operational_metrics() {
             Ok(metrics) if metrics.authoritative_write_frozen_shard_count == 0 => {
-                let reset_to_lazy = service_was_fully_hydrated;
-                let reset_to_lazy = reset_to_lazy
-                    || matches!(
-                        maintenance_kind,
-                        DaemonDfsMaintenanceKind::ExplicitDisasterRecovery { .. }
-                    );
+                let reset_to_lazy = matches!(
+                    maintenance_kind,
+                    DaemonDfsMaintenanceKind::ExplicitDisasterRecovery { .. }
+                );
                 if reset_to_lazy {
                     match maintenance_service.into_lazy_metadata_backend_service() {
                         Ok(service) => Some(service),
@@ -6864,8 +6944,6 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
             lane: DaemonDfsMessageServiceLane {
                 service,
                 peer_node_ids,
-                last_metadata_refresh: Instant::now(),
-                metadata_hydrated: false,
             },
             detached_send_runtime,
         };
@@ -7791,78 +7869,77 @@ mod tests {
     }
 
     #[test]
-    fn daemon_dfs_message_execution_is_single_flight_per_data_dir() {
-        let first_root = temp_root("message-execution-first");
-        let second_root = temp_root("message-execution-second");
+    fn daemon_dfs_mutation_scheduler_is_reused_per_data_dir() {
+        let first_root = temp_root("mutation-scheduler-first");
+        let second_root = temp_root("mutation-scheduler-second");
         let first_data = SinomoDataDir::new(first_root.path());
         let second_data = SinomoDataDir::new(second_root.path());
-        let first_gate = daemon_dfs_message_execution_gate(&first_data).expect("first gate");
-        let same_gate = daemon_dfs_message_execution_gate(&first_data).expect("same gate");
-        let other_gate = daemon_dfs_message_execution_gate(&second_data).expect("other gate");
+        let first = daemon_dfs_mutation_scheduler(&first_data).expect("first scheduler");
+        let same = daemon_dfs_mutation_scheduler(&first_data).expect("same scheduler");
+        let other = daemon_dfs_mutation_scheduler(&second_data).expect("other scheduler");
 
-        assert!(Arc::ptr_eq(&first_gate, &same_gate));
-        assert!(!Arc::ptr_eq(&first_gate, &other_gate));
-        let first = Arc::clone(&first_gate.semaphore)
-            .try_acquire_owned()
-            .expect("first message execution");
-        assert!(
-            Arc::clone(&same_gate.semaphore)
-                .try_acquire_owned()
-                .is_err(),
-            "same-root message execution must be single flight"
-        );
-        let other = Arc::clone(&other_gate.semaphore)
-            .try_acquire_owned()
-            .expect("other-root message execution");
-        drop(other);
-        drop(first);
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other));
     }
 
     #[test]
-    fn lightweight_dfs_reads_bypass_the_mutation_execution_gate() {
+    fn lightweight_dfs_reads_bypass_global_admission() {
         let root = temp_root("lightweight-read-bypasses-mutation-gate");
-        let gate = daemon_dfs_message_execution_gate(&SinomoDataDir::new(root.path()))
-            .expect("message gate");
+        let scheduler = daemon_dfs_mutation_scheduler(&SinomoDataDir::new(root.path()))
+            .expect("mutation scheduler");
         let runtime = daemon_test_runtime("lightweight-read-bypasses-mutation-gate");
         runtime.block_on(async {
-            let mutation_permit = Arc::clone(&gate.semaphore)
-                .acquire_owned()
+            let global = scheduler
+                .admit(&DfsMessageExecutionScope::GlobalExclusive)
                 .await
-                .expect("mutation permit");
+                .expect("global admission");
+            let read_scope = DfsMessageExecutionScope::ReadOnly;
 
-            let read_slot = tokio::time::timeout(
+            let read_admission = tokio::time::timeout(
                 Duration::from_millis(100),
-                acquire_daemon_dfs_message_execution(&gate, true),
+                admit_daemon_dfs_foreground_message(&scheduler, &read_scope),
             )
             .await
             .expect("lightweight read must not wait for mutation execution")
             .expect("lightweight read admission");
-            assert!(read_slot.is_none());
+            assert!(matches!(
+                read_admission,
+                DaemonDfsMutationAdmission::ReadOnly { .. }
+            ));
 
             assert!(
                 tokio::time::timeout(
                     Duration::from_millis(100),
-                    acquire_daemon_dfs_message_execution(&gate, false),
+                    admit_daemon_dfs_foreground_message(
+                        &scheduler,
+                        &DfsMessageExecutionScope::GlobalExclusive,
+                    ),
                 )
                 .await
                 .is_err(),
-                "mutation-capable work must retain single-flight execution"
+                "another global operation must wait for global admission"
             );
 
-            drop(mutation_permit);
-            let mutation_slot = tokio::time::timeout(
+            drop(global);
+            let hydrating_read = tokio::time::timeout(
                 Duration::from_secs(1),
-                acquire_daemon_dfs_message_execution(&gate, false),
+                admit_daemon_dfs_foreground_message(
+                    &scheduler,
+                    &DfsMessageExecutionScope::GlobalExclusive,
+                ),
             )
             .await
-            .expect("mutation admission after permit release")
-            .expect("mutation execution slot");
-            assert!(mutation_slot.is_some());
+            .expect("global admission after release")
+            .expect("global admission");
+            assert!(matches!(
+                hydrating_read,
+                DaemonDfsMutationAdmission::Global { .. }
+            ));
         });
     }
 
     #[test]
-    fn foreground_dfs_preempts_pending_maintenance_before_permit_release() {
+    fn foreground_dfs_preempts_pending_maintenance_before_admission_release() {
         #[derive(Debug)]
         struct MaintenanceGenerationDrop(Arc<AtomicBool>);
 
@@ -7872,20 +7949,18 @@ mod tests {
             }
         }
 
-        let root = temp_root("foreground-preempts-pending-maintenance");
-        let gate = daemon_dfs_message_execution_gate(&SinomoDataDir::new(root.path()))
-            .expect("message gate");
+        let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
         let runtime = daemon_test_runtime("foreground-preempts-pending-maintenance");
         runtime.block_on(async {
-            let maintenance_interest = gate.begin_maintenance_interest();
-            let maintenance_permit = Arc::clone(&gate.semaphore)
-                .acquire_owned()
+            let maintenance_interest = scheduler.begin_maintenance_interest();
+            let maintenance_admission = scheduler
+                .admit(&DfsMessageExecutionScope::GlobalExclusive)
                 .await
-                .expect("maintenance permit");
+                .expect("maintenance admission");
             let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
             let generation_dropped = Arc::new(AtomicBool::new(false));
-            let maintenance_gate = Arc::clone(&gate);
-            let pending_maintenance_gate = Arc::clone(&gate);
+            let maintenance_scheduler = Arc::clone(&scheduler);
+            let pending_maintenance_scheduler = Arc::clone(&scheduler);
             let maintenance_generation_dropped = Arc::clone(&generation_dropped);
             let observed_generation_dropped = Arc::clone(&generation_dropped);
             let maintenance_task = tokio::spawn(async move {
@@ -7894,9 +7969,7 @@ mod tests {
                     async move {
                         let _generation = MaintenanceGenerationDrop(maintenance_generation_dropped);
                         assert!(
-                            Arc::clone(&pending_maintenance_gate.semaphore)
-                                .try_acquire_owned()
-                                .is_err(),
+                            pending_maintenance_scheduler.global.try_read().is_err(),
                             "maintenance local work must retain exclusive mutation admission"
                         );
                         pending_tx
@@ -7915,25 +7988,24 @@ mod tests {
                     "the maintenance service generation must be destroyed before admission returns"
                 );
                 assert!(
-                    Arc::clone(&maintenance_gate.semaphore)
-                        .try_acquire_owned()
-                        .is_err(),
-                    "preemption must not release the permit before dropping maintenance state"
+                    maintenance_scheduler.global.try_read().is_err(),
+                    "preemption must not release admission before dropping maintenance state"
                 );
-                drop(maintenance_permit);
+                drop(maintenance_admission);
             });
 
             pending_rx.await.expect("maintenance reached outbound wait");
-            let foreground_permit = tokio::time::timeout(
+            let foreground_scope = daemon_dfs_test_execution_scope("scheduler-fs", "root");
+            let foreground_admission = tokio::time::timeout(
                 Duration::from_secs(1),
-                acquire_daemon_dfs_foreground_message_execution(&gate),
+                admit_daemon_dfs_foreground_message(&scheduler, &foreground_scope),
             )
             .await
             .expect("foreground admission must preempt pending maintenance")
-            .expect("foreground permit");
+            .expect("foreground admission");
             maintenance_task.await.expect("maintenance preemption task");
             assert!(generation_dropped.load(Ordering::Acquire));
-            drop(foreground_permit);
+            drop(foreground_admission);
         });
     }
 
@@ -7941,23 +8013,23 @@ mod tests {
     fn simultaneous_two_node_maintenance_rpc_waits_make_foreground_progress() {
         let first_root = temp_root("simultaneous-maintenance-first-node");
         let second_root = temp_root("simultaneous-maintenance-second-node");
-        let first_gate = daemon_dfs_message_execution_gate(&SinomoDataDir::new(first_root.path()))
-            .expect("first message gate");
-        let second_gate =
-            daemon_dfs_message_execution_gate(&SinomoDataDir::new(second_root.path()))
-                .expect("second message gate");
+        let first_scheduler = daemon_dfs_mutation_scheduler(&SinomoDataDir::new(first_root.path()))
+            .expect("first scheduler");
+        let second_scheduler =
+            daemon_dfs_mutation_scheduler(&SinomoDataDir::new(second_root.path()))
+                .expect("second scheduler");
         let runtime = daemon_test_runtime("simultaneous-two-node-maintenance-rpc-waits");
         runtime.block_on(async {
-            let first_interest = first_gate.begin_maintenance_interest();
-            let second_interest = second_gate.begin_maintenance_interest();
-            let first_permit = Arc::clone(&first_gate.semaphore)
-                .acquire_owned()
+            let first_interest = first_scheduler.begin_maintenance_interest();
+            let second_interest = second_scheduler.begin_maintenance_interest();
+            let first_admission = first_scheduler
+                .admit(&DfsMessageExecutionScope::GlobalExclusive)
                 .await
-                .expect("first maintenance permit");
-            let second_permit = Arc::clone(&second_gate.semaphore)
-                .acquire_owned()
+                .expect("first maintenance admission");
+            let second_admission = second_scheduler
+                .admit(&DfsMessageExecutionScope::GlobalExclusive)
                 .await
-                .expect("second maintenance permit");
+                .expect("second maintenance admission");
             let (first_waiting_tx, first_waiting_rx) = tokio::sync::oneshot::channel();
             let (second_waiting_tx, second_waiting_rx) = tokio::sync::oneshot::channel();
 
@@ -7970,7 +8042,7 @@ mod tests {
                     },
                 )
                 .await;
-                drop(first_permit);
+                drop(first_admission);
                 outcome
             });
             let second_maintenance = tokio::spawn(async move {
@@ -7982,7 +8054,7 @@ mod tests {
                     },
                 )
                 .await;
-                drop(second_permit);
+                drop(second_admission);
                 outcome
             });
 
@@ -7992,17 +8064,19 @@ mod tests {
             // maintenance futures before either network timeout is needed.
             first_waiting_rx.await.expect("first outbound wait");
             second_waiting_rx.await.expect("second outbound wait");
+            let first_scope = daemon_dfs_test_execution_scope("scheduler-fs", "root");
+            let second_scope = daemon_dfs_test_execution_scope("scheduler-fs", "root");
             let (first_foreground, second_foreground) =
                 tokio::time::timeout(Duration::from_secs(1), async {
                     tokio::join!(
-                        acquire_daemon_dfs_foreground_message_execution(&first_gate),
-                        acquire_daemon_dfs_foreground_message_execution(&second_gate),
+                        admit_daemon_dfs_foreground_message(&first_scheduler, &first_scope),
+                        admit_daemon_dfs_foreground_message(&second_scheduler, &second_scope,),
                     )
                 })
                 .await
                 .expect("reciprocal inbound RPCs must make progress without timeout");
-            let first_foreground = first_foreground.expect("first foreground permit");
-            let second_foreground = second_foreground.expect("second foreground permit");
+            let first_foreground = first_foreground.expect("first foreground admission");
+            let second_foreground = second_foreground.expect("second foreground admission");
             assert!(matches!(
                 first_maintenance.await.expect("first maintenance task"),
                 DaemonDfsMaintenancePreemptionOutcome::ForegroundWaiting
@@ -8812,10 +8886,12 @@ mod tests {
             body: sinomo_core::network::ObjectRpcIncomingBody::bytes(bytes.clone()),
         };
         let runtime = daemon_test_runtime("daemon-dfs-streamed-primary-content-ingest");
+        let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
+            .expect("shared content store");
 
         let (command, preingested_blob) = runtime
             .block_on(ingest_daemon_dfs_message_attachment(
-                &data_dir,
+                Some(content.clone()),
                 command,
                 Some(attachment),
                 runtime.handle(),
@@ -8830,8 +8906,6 @@ mod tests {
         assert!(write.bytes.is_empty());
         assert_eq!(write.content_size_bytes, Some(bytes.len() as u64));
         let content_hash = write.content_hash.expect("primary finalized hash");
-        let content =
-            LocalContentStore::new(data_dir.dfs_dir().join("content")).expect("content store");
         assert!(
             content
                 .read_manifest(object_id.as_str(), version.as_str())
@@ -8856,7 +8930,7 @@ mod tests {
         let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
         let cluster_paths = ClusterPaths::new(&data_dir);
         let foreground_preemption =
-            daemon_dfs_message_execution_gate(&data_dir)?.begin_maintenance_interest();
+            daemon_dfs_mutation_scheduler(&data_dir)?.begin_maintenance_interest();
         let mut deferred_work = None;
         let result = runtime.block_on(run_daemon_dfs_maintenance_tick_with_admission(
             data_dir,
@@ -8894,25 +8968,28 @@ mod tests {
     }
 
     #[test]
-    fn daemon_dfs_cancelled_execution_waiter_does_not_leak_the_memory_slot() {
-        let root = temp_root("daemon-dfs-cancelled-execution-waiter");
-        let gate = daemon_dfs_message_execution_gate(&SinomoDataDir::new(root.path()))
-            .expect("execution gate");
+    fn daemon_dfs_cancelled_execution_waiter_does_not_leak_shard_admission() {
+        let scheduler = Arc::new(DaemonDfsMutationScheduler::new());
+        let scope = daemon_dfs_test_execution_scope("scheduler-fs", "root");
         let runtime = daemon_test_runtime("daemon-dfs-cancelled-execution-waiter");
         runtime.block_on(async {
-            let first = Arc::clone(&gate.semaphore)
-                .acquire_owned()
+            let first = scheduler
+                .admit(&scope)
                 .await
-                .expect("first execution");
-            let queued_gate = Arc::clone(&gate.semaphore);
+                .expect("first shard admission");
+            let queued_scheduler = Arc::clone(&scheduler);
+            let queued_scope = scope.clone();
             let mut queued = tokio::spawn(async move {
-                queued_gate.acquire_owned().await.expect("queued execution")
+                queued_scheduler
+                    .admit(&queued_scope)
+                    .await
+                    .expect("queued shard admission")
             });
             assert!(
                 tokio::time::timeout(Duration::from_millis(50), &mut queued)
                     .await
                     .is_err(),
-                "second backend-bearing execution must remain queued"
+                "same-shard execution must remain queued"
             );
             queued.abort();
             assert!(
@@ -8921,52 +8998,12 @@ mod tests {
             );
 
             drop(first);
-            let next = tokio::time::timeout(Duration::from_secs(1), gate.semaphore.acquire())
+            let next = tokio::time::timeout(Duration::from_secs(1), scheduler.admit(&scope))
                 .await
                 .expect("execution should advance after cancellation")
-                .expect("execution gate remains open");
+                .expect("shard admission remains open");
             drop(next);
         });
-    }
-
-    #[test]
-    fn daemon_dfs_cancelled_blocking_task_retains_the_memory_slot_until_exit() {
-        let root = temp_root("daemon-dfs-cancelled-blocking-execution");
-        let gate = daemon_dfs_message_execution_gate(&SinomoDataDir::new(root.path()))
-            .expect("execution gate");
-        let runtime = daemon_test_runtime("daemon-dfs-cancelled-blocking-execution");
-        let permit = runtime.block_on(async {
-            Arc::clone(&gate.semaphore)
-                .acquire_owned()
-                .await
-                .expect("execution permit")
-        });
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let blocking = runtime.spawn_blocking(move || {
-            let permit = permit;
-            started_tx.send(()).expect("report blocking start");
-            release_rx.recv().expect("release blocking task");
-            drop(permit);
-            done_tx.send(()).expect("report blocking completion");
-        });
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("blocking task started");
-        blocking.abort();
-        assert!(
-            Arc::clone(&gate.semaphore).try_acquire_owned().is_err(),
-            "aborting a running JoinHandle must not admit another backend generation"
-        );
-        release_tx.send(()).expect("release blocking task");
-        done_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("blocking task completed");
-        let next = Arc::clone(&gate.semaphore)
-            .try_acquire_owned()
-            .expect("slot released by actual blocking completion");
-        drop(next);
     }
 
     #[test]
@@ -14256,10 +14293,6 @@ mod tests {
         };
         let lane = primary_service.lock().expect("primary service lock");
         assert!(
-            !lane.metadata_hydrated,
-            "distributed writes must not force a full metadata hydrate on a cold daemon message lane"
-        );
-        assert!(
             lane.service
                 .metadata()
                 .object(&unrelated_object_id)
@@ -14284,6 +14317,17 @@ mod tests {
             daemon_dfs_test_message_service_lane_open_count(&data_dir),
             1,
             "a cold exact-shard mutation must reuse the one backend-bearing cache lane"
+        );
+        for _ in 0..2 {
+            let status = runtime
+                .block_on(handle_daemon_dfs_status_async(&paths, runtime.handle()))
+                .expect("status from resident mutation lane");
+            assert!(status.object_count > 0);
+        }
+        assert_eq!(
+            daemon_dfs_test_message_service_lane_open_count(&data_dir),
+            1,
+            "repeated daemon status must borrow the resident metadata backend"
         );
         handle_daemon_dfs_message_on_runtime(
             &paths,
@@ -14339,10 +14383,6 @@ mod tests {
                 .expect("restored mutation service")
                 .lock()
                 .expect("restored mutation service lock");
-            assert!(
-                !lane.metadata_hydrated,
-                "maintenance must collapse the full projection before restoring the lane"
-            );
             assert!(
                 lane.service
                     .metadata()
@@ -14595,14 +14635,6 @@ mod tests {
                     .expect("lookup opens lightweight read lane"),
             )
         };
-        let first_refresh = {
-            let lane = read_service.lock().expect("read service lock");
-            assert!(
-                !lane.metadata_hydrated,
-                "lookup messages should use targeted metadata reads instead of forcing a full cold-lane hydrate"
-            );
-            lane.last_metadata_refresh
-        };
         let response = handle_daemon_dfs_message_on_runtime(
             &paths,
             test_dfs_message_command(
@@ -14613,14 +14645,6 @@ mod tests {
         )
         .expect("second DFS message");
         assert_eq!(response.request_id, "dfs_message_warm_cache_2");
-        let second_refresh = read_service
-            .lock()
-            .expect("read service lock")
-            .last_metadata_refresh;
-        assert_eq!(
-            second_refresh, first_refresh,
-            "recently hydrated fresh-metadata commands should reuse the warm lane"
-        );
         write_test_cluster_state_with_remote_endpoint(
             &data_root,
             &local,
@@ -14637,14 +14661,6 @@ mod tests {
         )
         .expect("third DFS message");
         assert_eq!(response.request_id, "dfs_message_warm_cache_3");
-        let third_refresh = read_service
-            .lock()
-            .expect("read service lock")
-            .last_metadata_refresh;
-        assert_eq!(
-            third_refresh, first_refresh,
-            "endpoint refreshes should not force another full metadata hydrate"
-        );
         let second_read_service = {
             let cache = daemon_dfs_message_service_cache()
                 .lock()

@@ -930,26 +930,73 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let affected_object_ids = batch
                 .entries
                 .iter()
-                // A prepare is deliberately hidden. Its expected and proposed
-                // objects are dependency identities, not visible service-state
-                // mutations, so reloading each one here turns a 4K-file prepare
-                // into 4K durable table probes without changing the cache.
-                .filter(|entry| {
-                    !matches!(
-                        &entry.mutation,
-                        DfsMetadataMutation::PutNamespacePrepare { .. }
-                    )
-                })
+                .filter(|entry| entry.mutation.changes_visible_object_placement())
                 .flat_map(|entry| entry.mutation.affected_object_ids())
                 .collect::<BTreeSet<_>>();
-            for object_id in affected_object_ids {
-                // The raw payload order is shard-local, while the sharded
-                // backend has just reconciled global object placement. End the
-                // replay with that authoritative view so a late source-shard
-                // payload cannot leave the service cache on the pre-move path.
-                self.apply_backend_object_to_service_state(&object_id)?;
+            if !affected_object_ids.is_empty() {
+                self.metadata_backend
+                    .as_mut()
+                    .expect("metadata backend checked above")
+                    .begin_consistent_read_snapshot()?;
+                let apply_result: Result<(), DfsError> = (|| {
+                    for object_id in affected_object_ids {
+                        // The raw payload order is shard-local, while the sharded
+                        // backend has just reconciled global object placement. End
+                        // the replay with one pinned authoritative view so a late
+                        // source-shard payload cannot leave the service cache on the
+                        // pre-move path and a bulk commit does not refresh the table
+                        // generation once per object.
+                        self.apply_backend_object_to_service_state(&object_id)?;
+                    }
+                    Ok(())
+                })();
+                self.metadata_backend
+                    .as_mut()
+                    .expect("metadata backend remains installed")
+                    .end_consistent_read_snapshot();
+                apply_result?;
             }
         }
+        let cursor = self
+            .local_metadata_journal_cursors
+            .entry(batch.shard_id.clone())
+            .or_insert(0);
+        *cursor = (*cursor).max(batch.next_after_sequence);
+        Ok(())
+    }
+
+    /// Observe a journal batch that was durably applied as replica state.
+    ///
+    /// Replica tables are the authoritative local copy. Mirroring every
+    /// visible object, version, receipt, intent, and conflict into the service
+    /// shell duplicates the complete namespace on every replica and repeats
+    /// object lookups after the backend already applied the same batch. The
+    /// lazy mutation lane only needs the in-memory guards that fence active
+    /// cross-shard namespace work plus its replay cursor. If this replica is
+    /// later promoted, membership rebind performs one authoritative hydration
+    /// before admitting mutations.
+    pub(crate) fn observe_replicated_metadata_journal_batch(
+        &mut self,
+        batch: &DfsMetadataJournalBatch,
+    ) -> Result<(), DfsError> {
+        for entry in &batch.entries {
+            let DfsMetadataMutation::PutNamespaceJob { job_id, job, .. } = &entry.mutation else {
+                continue;
+            };
+            let job = match job {
+                Some(job) => Some(job.clone()),
+                None => self
+                    .metadata_backend
+                    .as_ref()
+                    .map(|backend| backend.get_namespace_job(job_id))
+                    .transpose()?
+                    .flatten(),
+            };
+            if let Some(job) = job.as_ref() {
+                self.apply_cross_shard_namespace_job_guard(job);
+            }
+        }
+
         let cursor = self
             .local_metadata_journal_cursors
             .entry(batch.shard_id.clone())

@@ -272,6 +272,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(self)
     }
 
+    /// Attach a metadata backend for a service lane which admits read-only
+    /// requests exclusively.
+    ///
+    /// Unlike [`Self::with_boxed_metadata_backend_lazy`], this does not scan the
+    /// filesystem catalog, running namespace jobs, or metadata-shard journal
+    /// heads. Those bootstrap projections are mutation-lane state: targeted
+    /// reads resolve their filesystem and shard authority from the control
+    /// plane and read the durable backend directly. The caller must keep this
+    /// service on a read-only admission lane for its entire lifetime.
+    pub fn with_boxed_metadata_backend_for_read_only_requests(
+        mut self,
+        backend: Box<dyn DfsMetadataBackend>,
+    ) -> Self {
+        self.metadata_backend = Some(backend);
+        self
+    }
+
     /// Rebuild the lightweight service shell while retaining this exact
     /// backend generation, transport, content store, and control-plane client.
     ///

@@ -5944,15 +5944,24 @@ pub fn process_dfs_metadata_journal_batch(
         context.shard.primary_node_id.clone(),
         context.shard.epoch,
     );
-    match backend.apply_journal_batch_with_replica_permit(&permit, &command.batch) {
-        Ok(applied_entries) => {
+    let apply_result = if command.authority_probe.is_some() {
+        backend.apply_journal_batch_with_replica_permit_report(&permit, &command.batch)
+    } else {
+        backend
+            .apply_journal_batch_with_replica_permit(&permit, &command.batch)
+            .map(crate::DfsMetadataReplicaApplyReport::without_authority_proofs)
+    };
+    match apply_result {
+        Ok(apply_report) => {
+            let applied_entries = apply_report.applied_entries();
             let verified_authority_probe_id = if let Some(probe) = command.authority_probe.as_ref()
             {
                 let confirmation_id =
-                    match crate::service_replica::verify_persisted_metadata_authority_probe(
+                    match crate::service_replica::verify_persisted_metadata_authority_probe_after_apply(
                         backend,
                         &context.shard,
                         probe,
+                        &apply_report,
                     ) {
                         Ok(confirmation_id) => confirmation_id,
                         Err(error) => {
@@ -6728,7 +6737,7 @@ pub(crate) fn materialize_default_sifs_metadata_on_bound_primary_shards(
 
         backend.ensure_file_system_on_all_shards(file_system)?;
         materialize_default_sifs_metadata_objects(&mut backend, objects, created_at)?;
-        (backend.into_shard_backends(), BTreeMap::new())
+        (backend.into_shard_backends()?, BTreeMap::new())
     };
 
     let (report, continuation) = migrate_default_sifs_metadata_on_active_primary_shards(
@@ -10468,7 +10477,8 @@ mod cursor_update_tests {
             shards.clone(),
         )
         .expect("bound local primary backends")
-        .into_shard_backends();
+        .into_shard_backends()
+        .expect("extract bound local primary backends");
         crate::metadata_backend::reset_metadata_journal_write_count();
         crate::metadata_shard_index::reset_object_shard_index_write_count();
 
@@ -10564,7 +10574,8 @@ mod cursor_update_tests {
         let bound_primary_backends =
             LocalShardedMetadataBackend::new(metadata_root.clone(), shards.to_vec())
                 .expect("bound local primary backends")
-                .into_shard_backends();
+                .into_shard_backends()
+                .expect("extract bound local primary backends");
         reset_default_sifs_migration_max_buffered_records();
         crate::metadata_backend::reset_metadata_current_tables_snapshot_calls();
         crate::metadata_backend::reset_metadata_journal_write_count();

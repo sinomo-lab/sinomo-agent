@@ -1182,6 +1182,31 @@ fn require_prepare_outer_file_system(
 }
 
 impl DfsMetadataMutation {
+    /// Whether applying this mutation can change the object row that determines
+    /// visible path-to-shard placement.
+    ///
+    /// Object-local receipts, versions, intents, pins, conflicts, and locks all
+    /// carry an object identity for recovery or GC, but do not publish a new
+    /// object row. Keeping that distinction here lets both replica index repair
+    /// and the service mirror avoid an all-shard object reload for those rows.
+    pub(crate) fn changes_visible_object_placement(&self) -> bool {
+        matches!(
+            self,
+            Self::PutObject { .. }
+                | Self::FinalizeCrossShardSourceEviction { .. }
+                | Self::CommitVisibleVersion { .. }
+                | Self::ApplyNamespaceTransaction {
+                    transaction: Some(_),
+                    ..
+                }
+                | Self::PutNamespacePrepare {
+                    status: DfsNamespacePrepareStatus::Committed,
+                    ..
+                }
+                | Self::CommitNamespacePrepare { .. }
+        )
+    }
+
     fn visit_affected_object_ids(&self, mut visit: impl FnMut(&DfsObjectId)) {
         match self {
             Self::PutFileSystem { .. }

@@ -20,8 +20,9 @@ use crate::content_root_catalog::{
 };
 use crate::control_plane::{DfsMetadataNamespacePrepareCodec, DfsMetadataShardConfig};
 use crate::metadata_api::{
-    DfsMetadataBackend, DfsMetadataReplicaIngestPermit, DfsMetadataShardWriteFreeze,
-    DfsNamespaceRequestAdmissionSnapshot, DfsNormalizedNamespacePrepare,
+    DfsMetadataBackend, DfsMetadataReplicaApplyReport, DfsMetadataReplicaIngestPermit,
+    DfsMetadataShardWriteFreeze, DfsNamespaceRequestAdmissionSnapshot,
+    DfsNormalizedNamespacePrepare, DfsValidatedNamespaceAuthorityProof,
     namespace_prepare_expectations_from_lookups,
 };
 use crate::metadata_cursor;
@@ -194,6 +195,21 @@ struct PlannedWrittenJournalTableOps {
     table_ops: Vec<DfsMetadataTableOp>,
     post_append_ops: Vec<DfsMetadataTableOp>,
     rollback: DfsMetadataTableRollback,
+}
+
+#[derive(Default)]
+struct MetadataReplayApplyEvidence {
+    collect_namespace_authority_proof: bool,
+    namespace_authority_proof: Option<DfsValidatedNamespaceAuthorityProof>,
+}
+
+impl MetadataReplayApplyEvidence {
+    fn collecting_namespace_authority_proof() -> Self {
+        Self {
+            collect_namespace_authority_proof: true,
+            namespace_authority_proof: None,
+        }
+    }
 }
 
 fn metadata_backend_perf_trace(args: std::fmt::Arguments<'_>) {
@@ -2669,6 +2685,23 @@ impl LocalSobjMetadataBackend {
         self.namespace_prepare_codec = codec;
     }
 
+    /// Borrow a prepare from this backend's exact materialized generation.
+    /// Sharded write paths use this to avoid cloning the complete transaction
+    /// through the public snapshot-oriented lookup before and after a commit.
+    pub(crate) fn namespace_prepare_ref(
+        &self,
+        operation_id: &str,
+    ) -> Option<&DfsNamespacePrepareRecord> {
+        self.tables.namespace_prepares.get(operation_id)
+    }
+
+    pub(crate) fn has_current_namespace_prepare(&self, operation_id: &str) -> Result<bool> {
+        Ok(self
+            .current_tables_snapshot()?
+            .namespace_prepares
+            .contains_key(operation_id))
+    }
+
     #[cfg(test)]
     pub(crate) fn test_receipt_scan_counts(&self) -> (usize, usize) {
         (
@@ -2747,7 +2780,8 @@ impl LocalSobjMetadataBackend {
         self.require_replication_source_shard(&batch.shard_id)?;
         validate_replicated_journal_batch_entry_order(batch)?;
         let _lock = self.begin_metadata_write()?;
-        self.apply_journal_batch_unlocked(batch, None)
+        self.apply_journal_batch_unlocked(batch, None, MetadataReplayApplyEvidence::default())
+            .map(|report| report.applied_entries())
     }
 
     /// Apply a validated replica batch across only the exact activated author
@@ -2758,6 +2792,24 @@ impl LocalSobjMetadataBackend {
         permit: &DfsMetadataReplicaIngestPermit,
         batch: &DfsMetadataJournalBatch,
     ) -> Result<usize> {
+        self.apply_journal_batch_with_replica_permit_internal(permit, batch, false)
+            .map(|report| report.applied_entries())
+    }
+
+    pub(crate) fn apply_journal_batch_with_replica_permit_report(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+    ) -> Result<DfsMetadataReplicaApplyReport> {
+        self.apply_journal_batch_with_replica_permit_internal(permit, batch, true)
+    }
+
+    fn apply_journal_batch_with_replica_permit_internal(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+        collect_namespace_authority_proof: bool,
+    ) -> Result<DfsMetadataReplicaApplyReport> {
         self.require_replication_source_shard(&batch.shard_id)?;
         validate_replicated_journal_batch_entry_order(batch)?;
         let mut validated_namespace_prepares = BTreeMap::new();
@@ -2769,16 +2821,22 @@ impl LocalSobjMetadataBackend {
             }
         }
         let _lock = self.begin_metadata_replica_ingest(permit, &batch.shard_id)?;
-        self.apply_journal_batch_unlocked(batch, Some(validated_namespace_prepares))
+        let evidence = if collect_namespace_authority_proof {
+            MetadataReplayApplyEvidence::collecting_namespace_authority_proof()
+        } else {
+            MetadataReplayApplyEvidence::default()
+        };
+        self.apply_journal_batch_unlocked(batch, Some(validated_namespace_prepares), evidence)
     }
 
     fn apply_journal_batch_unlocked<'a>(
         &mut self,
         batch: &'a DfsMetadataJournalBatch,
         prevalidated_namespace_prepares: Option<BTreeMap<u64, DfsNamespacePreparePayloadRef<'a>>>,
-    ) -> Result<usize> {
+        mut evidence: MetadataReplayApplyEvidence,
+    ) -> Result<DfsMetadataReplicaApplyReport> {
         if batch.entries.is_empty() {
-            return Ok(0);
+            return Ok(DfsMetadataReplicaApplyReport::default());
         }
         let payloads_prevalidated = prevalidated_namespace_prepares.is_some();
         let mut validated_namespace_prepares = prevalidated_namespace_prepares.unwrap_or_default();
@@ -2856,7 +2914,7 @@ impl LocalSobjMetadataBackend {
         let all_entries = batch.entries.iter().collect::<Vec<_>>();
         self.persist_replayed_journal_entries_unlocked(&all_entries, persisted_through_sequence)?;
         if replay_entries.is_empty() {
-            return Ok(0);
+            return Ok(DfsMetadataReplicaApplyReport::default());
         }
 
         let mut table_ops = Vec::new();
@@ -2870,6 +2928,7 @@ impl LocalSobjMetadataBackend {
             &mut post_append_ops,
             &mut rollback,
             &mut journal_reference_replay_cost_bytes,
+            &mut evidence,
         ) {
             Ok(result) => result,
             Err(error) => {
@@ -2900,7 +2959,12 @@ impl LocalSobjMetadataBackend {
         // exact prefix proof are authoritative, so checkpointing them in
         // batches avoids two atomic file rewrites on every replicated commit.
         metadata_cursor::checkpoint_replay_cursor_if_due(&self.root, &source_cursor)?;
-        Ok(applied)
+        Ok(
+            DfsMetadataReplicaApplyReport::with_namespace_authority_proof(
+                applied,
+                evidence.namespace_authority_proof,
+            ),
+        )
     }
 
     /// Last local or replayed journal sequence visible to this shard.
@@ -3252,6 +3316,7 @@ impl LocalSobjMetadataBackend {
         let mut post_append_ops = Vec::new();
         let mut rollback = DfsMetadataTableRollback::default();
         let mut journal_reference_replay_cost_bytes = 0;
+        let mut evidence = MetadataReplayApplyEvidence::default();
         let changed = match self.materialize_replayed_journal_entry_into_batch(
             entry,
             validated_namespace_prepare,
@@ -3260,6 +3325,7 @@ impl LocalSobjMetadataBackend {
             &mut rollback,
             &mut journal_reference_replay_cost_bytes,
             true,
+            &mut evidence,
         ) {
             Ok(changed) => changed,
             Err(error) => {
@@ -3288,6 +3354,7 @@ impl LocalSobjMetadataBackend {
         post_append_ops: &mut Vec<DfsMetadataTableOp>,
         rollback: &mut DfsMetadataTableRollback,
         journal_reference_replay_cost_bytes: &mut u64,
+        evidence: &mut MetadataReplayApplyEvidence,
     ) -> Result<(usize, u64)> {
         let entries = entries.into_iter().collect::<Vec<_>>();
         let mut changed_count = 0usize;
@@ -3303,6 +3370,7 @@ impl LocalSobjMetadataBackend {
                 rollback,
                 journal_reference_replay_cost_bytes,
                 index.saturating_add(1) == entry_count,
+                evidence,
             )? {
                 changed_count = changed_count.saturating_add(1);
             }
@@ -3318,6 +3386,7 @@ impl LocalSobjMetadataBackend {
         let mut post_append_ops = Vec::new();
         let mut rollback = DfsMetadataTableRollback::default();
         let mut journal_reference_replay_cost_bytes = 0;
+        let mut evidence = MetadataReplayApplyEvidence::default();
         let (applied, last_materialized_sequence) = match self
             .plan_replayed_journal_entries_into_batch(
                 entries,
@@ -3326,6 +3395,7 @@ impl LocalSobjMetadataBackend {
                 &mut post_append_ops,
                 &mut rollback,
                 &mut journal_reference_replay_cost_bytes,
+                &mut evidence,
             ) {
             Ok(result) => result,
             Err(error) => {
@@ -3408,6 +3478,7 @@ impl LocalSobjMetadataBackend {
         rollback: &mut DfsMetadataTableRollback,
         journal_reference_replay_cost_bytes: &mut u64,
         defer_trailing_resolved_op: bool,
+        evidence: &mut MetadataReplayApplyEvidence,
     ) -> Result<bool> {
         match &entry.mutation {
             DfsMetadataMutation::PutFileSystem {
@@ -4132,6 +4203,35 @@ impl LocalSobjMetadataBackend {
                 if ops.is_empty() {
                     return Ok(false);
                 }
+                // The table plan owns the one canonical allocation produced by
+                // PackedV2 unpacking. Hash that exact allocation before it is
+                // moved into the table, then carry only the compact identity to
+                // the immediate authority ACK. Re-reading the table would clone
+                // and normalize the complete prepare a second time.
+                let namespace_authority_proof = (evidence.collect_namespace_authority_proof
+                    && defer_trailing_resolved_op)
+                    .then(|| {
+                        ops.iter().find_map(|op| match op {
+                            DfsMetadataTableOp::PutNamespacePrepare { prepare } => Some(prepare),
+                            _ => None,
+                        })
+                    })
+                    .flatten()
+                    .map(|prepare| {
+                        crate::service_replica::metadata_namespace_prepare_payload_digest_normalized(
+                            prepare,
+                        )
+                        .map_err(|error| MetadataBackendError::Serde(error.to_string()))
+                        .map(|canonical_digest| {
+                            DfsValidatedNamespaceAuthorityProof::from_canonical_prepare(
+                                prepare,
+                                entry.sequence,
+                                canonical_digest,
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .flatten();
                 let defer_resolved_prepare = defer_trailing_resolved_op
                     && matches!(status, DfsNamespacePrepareStatus::Prepared)
                     && matches!(
@@ -4175,6 +4275,9 @@ impl LocalSobjMetadataBackend {
                 }
                 *journal_reference_replay_cost_bytes =
                     journal_reference_replay_cost_bytes.saturating_add(prepare_replay_cost_bytes);
+                if let Some(proof) = namespace_authority_proof {
+                    evidence.namespace_authority_proof = Some(proof);
+                }
                 Ok(true)
             }
             DfsMetadataMutation::CommitNamespacePrepare {
@@ -9634,10 +9737,6 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         self.membership_handoff_write_freeze()
     }
 
-    fn has_any_metadata_shard_write_freeze(&self) -> Result<bool> {
-        Ok(self.membership_handoff_write_freeze()?.is_some())
-    }
-
     fn metadata_shard_authoritative_writes_frozen(
         &self,
         shard_id: &DfsMetadataShardId,
@@ -9786,6 +9885,16 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         batch: &DfsMetadataJournalBatch,
     ) -> Result<usize> {
         LocalSobjMetadataBackend::apply_journal_batch_with_replica_permit(self, permit, batch)
+    }
+
+    fn apply_journal_batch_with_replica_permit_report(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+    ) -> Result<DfsMetadataReplicaApplyReport> {
+        LocalSobjMetadataBackend::apply_journal_batch_with_replica_permit_report(
+            self, permit, batch,
+        )
     }
 
     fn replace_with_replicated_snapshot(
@@ -10556,7 +10665,8 @@ mod tests {
         ContentStoreGcOptions, ContentStoreVersionGcOptions,
         DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES, DfsAdvisoryLockMode, DfsAdvisoryLockOutcome,
         DfsAdvisoryLockRequestId, DfsAdvisoryLockSessionId, DfsContentRootCatalogShardIdentity,
-        DfsMetadataShardAssignment, DfsNamespaceOperation, DfsNamespaceResult, DfsObjectKind,
+        DfsMetadataAuthorityOperation, DfsMetadataAuthorityProbe, DfsMetadataShardAssignment,
+        DfsNamespaceOperation, DfsNamespaceResult, DfsObjectKind,
         dfs_content_root_catalog_topology_digest,
     };
     use sinomo_core::DfsObjectPolicy;
@@ -12599,21 +12709,89 @@ mod tests {
         let source_prefix = DfsMetadataBackend::metadata_prefix_proof(&source, &shard_id)
             .expect("source prefix proof")
             .expect("source shard prefix proof");
+        let operation = crate::service_replica::metadata_authority_operation_for_namespace_prepare(
+            &prepare,
+            prepare_entry.sequence,
+        )
+        .expect("namespace authority operation");
+        let probe = DfsMetadataAuthorityProbe {
+            probe_id: "probe-packed-prepare".to_string(),
+            expected_shard: config.clone(),
+            operation,
+            prepared_prefix: Some(source_prefix.clone()),
+        };
+        let permit = DfsMetadataReplicaIngestPermit::new_validated(
+            config.file_system_id.clone(),
+            shard_id.clone(),
+            config.primary_node_id.clone(),
+            config.epoch,
+        );
+        let replay_batch = DfsMetadataJournalBatch {
+            shard_id: shard_id.clone(),
+            next_after_sequence: prepare_entry.sequence,
+            entries: entries.clone(),
+        };
 
         let mut replica =
             LocalShardedMetadataBackend::new(&replica_root, vec![config.clone()]).expect("replica");
         crate::metadata_records::reset_namespace_prepare_payload_validation_passes();
-        replica
-            .apply_journal_batch(&DfsMetadataJournalBatch {
-                shard_id: shard_id.clone(),
-                next_after_sequence: prepare_entry.sequence,
-                entries: entries.clone(),
-            })
+        crate::service_replica::reset_namespace_prepare_canonical_digest_passes();
+        let apply_report = replica
+            .apply_journal_batch_with_replica_permit_report(&permit, &replay_batch)
             .expect("incremental packed replay");
+        assert_eq!(apply_report.applied_entries(), replay_batch.entries.len());
         assert_eq!(
             crate::metadata_records::namespace_prepare_payload_validation_passes(),
             1,
             "replica persistence, materialization, and journal-reference planning must share one packed-v2 validation proof"
+        );
+        assert_eq!(
+            crate::service_replica::namespace_prepare_canonical_digest_passes(),
+            1,
+            "a newly materialized packed prepare needs one independent canonical digest"
+        );
+        let confirmation_id =
+            crate::service_replica::verify_persisted_metadata_authority_probe_after_apply(
+                &replica,
+                &config,
+                &probe,
+                &apply_report,
+            )
+            .expect("fresh replica authority proof");
+        assert_eq!(
+            Some(confirmation_id),
+            crate::service_replica::metadata_authority_probe_confirmation_id(&probe)
+        );
+        assert_eq!(
+            crate::service_replica::namespace_prepare_canonical_digest_passes(),
+            1,
+            "the immediate authority ACK must reuse the apply digest instead of rehashing the table record"
+        );
+        let mut mismatched_probe = probe.clone();
+        let DfsMetadataAuthorityOperation::NamespaceMutation { payload_digest, .. } =
+            &mut mismatched_probe.operation
+        else {
+            unreachable!("fixture creates a namespace operation")
+        };
+        *payload_digest = "blake3:mismatched-packed-prepare".to_string();
+        crate::service_replica::reset_namespace_prepare_canonical_digest_passes();
+        let mismatch_error =
+            crate::service_replica::verify_persisted_metadata_authority_probe_after_apply(
+                &replica,
+                &config,
+                &mismatched_probe,
+                &apply_report,
+            )
+            .expect_err("mismatched compact proof must use and fail durable verification");
+        assert!(
+            mismatch_error
+                .to_string()
+                .contains("mismatched operation digest")
+        );
+        assert_eq!(
+            crate::service_replica::namespace_prepare_canonical_digest_passes(),
+            1,
+            "compact evidence must never bypass durable verification for a different operation"
         );
         assert_eq!(
             DfsMetadataBackend::metadata_prefix_proof(&replica, &shard_id)
@@ -12627,6 +12805,25 @@ mod tests {
                 .get_namespace_prepare(&prepare.operation_id)
                 .expect("replica prepare"),
             Some(prepare.clone())
+        );
+
+        crate::metadata_records::reset_namespace_prepare_payload_validation_passes();
+        crate::service_replica::reset_namespace_prepare_canonical_digest_passes();
+        let duplicate_report = replica
+            .apply_journal_batch_with_replica_permit_report(&permit, &replay_batch)
+            .expect("duplicate packed replay");
+        assert_eq!(duplicate_report.applied_entries(), 0);
+        crate::service_replica::verify_persisted_metadata_authority_probe_after_apply(
+            &replica,
+            &config,
+            &probe,
+            &duplicate_report,
+        )
+        .expect("duplicate replay durable fallback");
+        assert_eq!(
+            crate::service_replica::namespace_prepare_canonical_digest_passes(),
+            1,
+            "a duplicate apply has no fresh proof and must independently verify durable state"
         );
 
         let snapshot = source
@@ -12645,8 +12842,9 @@ mod tests {
 
         drop(replica);
         crate::metadata_records::reset_namespace_prepare_payload_validation_passes();
-        let replica =
-            LocalShardedMetadataBackend::new(&replica_root, vec![config]).expect("reopen replica");
+        crate::service_replica::reset_namespace_prepare_canonical_digest_passes();
+        let replica = LocalShardedMetadataBackend::new(&replica_root, vec![config.clone()])
+            .expect("reopen replica");
         assert!(
             crate::metadata_records::namespace_prepare_payload_validation_passes() <= 1,
             "reopen must never validate a journal-referenced packed-v2 prepare more than once"
@@ -12657,6 +12855,18 @@ mod tests {
                 .expect("reopened replica prepare"),
             Some(prepare.clone()),
             "journal-referenced table replay must resolve packed prepare bodies"
+        );
+        crate::service_replica::verify_persisted_metadata_authority_probe_after_apply(
+            &replica,
+            &config,
+            &probe,
+            &DfsMetadataReplicaApplyReport::default(),
+        )
+        .expect("reopened replica durable authority proof");
+        assert_eq!(
+            crate::service_replica::namespace_prepare_canonical_digest_passes(),
+            1,
+            "recovery must retain the independent durable-table verification path"
         );
 
         let mut ambiguous = prepare_entry.clone();

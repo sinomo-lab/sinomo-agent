@@ -844,14 +844,24 @@ pub fn inspect_cluster_aware_dfs_status(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
 ) -> Result<DfsOperatorStatus, DfsError> {
-    let (mut status, primary_summary) =
-        with_cached_cluster_aware_dfs_metadata_inspection(data_dir, cluster_paths, |metadata| {
-            let (summary, primary_summary) = metadata.metadata_status_summaries()?;
-            Ok((
-                DfsOperatorInspector::new(metadata).status_from_summary(summary)?,
-                primary_summary,
-            ))
-        })?;
+    with_cached_cluster_aware_dfs_metadata_inspection(data_dir, cluster_paths, |metadata| {
+        inspect_dfs_status_from_metadata(data_dir, cluster_paths, metadata)
+    })
+}
+
+/// Project operator status from an already-owned metadata generation.
+///
+/// Long-lived daemon services use this seam to avoid opening and retaining a
+/// second decoded inspection backend over the same shard tables. Standalone
+/// callers continue through [`inspect_cluster_aware_dfs_status`], which owns
+/// the cold inspection fallback.
+pub fn inspect_dfs_status_from_metadata(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    metadata: &dyn DfsMetadataBackend,
+) -> Result<DfsOperatorStatus, DfsError> {
+    let (summary, primary_summary) = metadata.metadata_status_summaries()?;
+    let mut status = DfsOperatorInspector::new(metadata).status_from_summary(summary)?;
     attach_primary_owned_operational_status(&mut status, &primary_summary);
     attach_cluster_aware_dfs_maintenance_observations(&mut status, data_dir)?;
     if let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths) {

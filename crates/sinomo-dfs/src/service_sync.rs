@@ -287,23 +287,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<usize, DfsError> {
-        let Some(backend) = self.metadata_backend.as_deref() else {
-            return Ok(0);
-        };
-        if !backend.has_any_metadata_shard_write_freeze()? {
+        if self.metadata_backend.is_none() {
             return Ok(0);
         }
 
         // Retired-replica markers are intentionally durable so independently
         // opened stale handles remain fenced. They cannot be rebound by this
-        // node, and using the coarse "any marker" check below as a refresh
-        // trigger made every later SIFS open perform an authoritative full-KV
-        // read forever. Use the daemon-projected control-plane view only to
-        // reject impossible local work. A stale negative is fail-closed: the
-        // marker remains fenced until the projection catches up and a later
-        // lane retries. A possible local-primary rebind still refreshes its
-        // control-plane client before checking the exact proof and changing
-        // the durable marker.
+        // node. Checking the backend-wide marker predicate here also opens
+        // every deferred replica slot before it can discover a marker on a
+        // later local-primary shard. Use the daemon-projected control-plane
+        // view to identify only possible local work, then probe those exact
+        // shard slots. A stale negative is fail-closed: the marker remains
+        // fenced until the projection catches up and a later lane retries. A
+        // possible local-primary rebind still refreshes its control-plane
+        // client before checking the exact proof and changing the marker.
         let projected_shards = {
             let Some(control_plane) = self.control_plane.as_mut() else {
                 return Ok(0);
@@ -330,6 +327,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
 
         self.refresh_control_plane_latest()?;
+        let local_node_id = self.node_id.clone();
         let observed = {
             let Some(control_plane) = self.control_plane.as_mut() else {
                 return Ok(0);
@@ -338,6 +336,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             store
                 .list_metadata_shards(file_system_id)?
                 .into_iter()
+                .filter(|active| active.primary_node_id == local_node_id)
                 .map(|active| {
                     let pending = store.get_metadata_shard_membership_handoff(
                         &active.file_system_id,
@@ -356,10 +355,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(0);
         };
         let mut rebound = 0usize;
-        let mut hydration_required = false;
         for (active, pending, proof) in observed {
-            let shard_id = DfsMetadataShardId::new(active.shard_id.clone());
-            let prefix_before = backend.metadata_prefix_proof(&shard_id)?;
             if rebind_completed_metadata_shard_membership_handoff(
                 backend,
                 &self.node_id,
@@ -368,20 +364,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 proof.as_ref(),
             )? {
                 rebound = rebound.saturating_add(1);
-                // A freshly opened marker-bearing backend may already have
-                // supplied the exact durable state used by the service's
-                // initial hydration. Rebinding still grants this backend
-                // instance authority, but repeating the full object/receipt/
-                // intent scan is necessary only when refresh or deferred
-                // recovery advanced the exact durable prefix.
-                hydration_required |= backend.metadata_prefix_proof(&shard_id)? != prefix_before;
             }
         }
-        if hydration_required {
-            // `clear_*` runs the append-producing recovery deliberately
-            // deferred by backend open while a marker is present. Reflect any
-            // recovered objects, transactions, and coordinator state before
-            // mounted bootstrap performs its first namespace mutation.
+        if rebound > 0 {
+            // Replica ingestion deliberately retains the durable tables rather
+            // than a second complete service-state mirror. Rebinding grants
+            // this long-lived service authority, so rebuild its operational
+            // projection unconditionally before it can admit the first
+            // mutation. This also reflects append-producing recovery run by
+            // `clear_*` while activating the marker.
             self.hydrate_from_metadata_backend()?;
         }
         Ok(rebound)
@@ -4452,8 +4443,8 @@ mod tests {
             .expect("contiguous post-activation prefix rebinds");
         assert_eq!(
             crate::service_hydration::full_metadata_hydration_calls(),
-            0,
-            "binding an already-current durable prefix must not repeat full hydration"
+            1,
+            "promotion must hydrate even an already-current durable prefix because replica ingestion does not retain a visible service-state mirror"
         );
         assert_eq!(
             fresh_after_append
@@ -4698,6 +4689,138 @@ mod tests {
                 .metadata_shard_authoritative_writes_frozen(&shard_id)
                 .expect("retired replica marker"),
             "the retired replica must remain fail-closed"
+        );
+    }
+
+    #[test]
+    fn local_primary_rebind_probes_only_the_candidate_then_hydrates_on_promotion() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-local-rebind-lazy-slots");
+        let metadata_root = root.path().join("metadata");
+        let local = node("node_local_rebind_lazy_users");
+        let root_primary = node("node_local_rebind_lazy_root");
+        let services_primary = node("node_local_rebind_lazy_services");
+        let file_system_id = sifs_file_system_id();
+        let root_shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: root_primary.clone(),
+            replica_node_ids: vec![local.clone()],
+            epoch: 2,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let services_shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "services".to_string(),
+            primary_node_id: services_primary.clone(),
+            replica_node_ids: vec![local.clone()],
+            epoch: 2,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/services".to_string(),
+            },
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let retiring_users = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "users".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: vec![root_primary],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/users".to_string(),
+            },
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let active_users = DfsMetadataShardConfig {
+            replica_node_ids: vec![services_primary],
+            epoch: retiring_users.epoch + 1,
+            ..retiring_users.clone()
+        };
+        let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+        control_plane.with_client(|kv| {
+            let mut store = DfsControlPlaneStore::new(kv);
+            store
+                .put_metadata_shard(&root_shard)
+                .expect("root shard config");
+            store
+                .put_metadata_shard(&services_shard)
+                .expect("services shard config");
+            store
+                .put_metadata_shard(&retiring_users)
+                .expect("retiring users shard config");
+        });
+
+        let users_shard_id = DfsMetadataShardId::new("users");
+        let mut users_backend =
+            LocalSobjMetadataBackend::new(users_shard_id.clone(), metadata_root.join("users"))
+                .expect("users metadata backend");
+        users_backend
+            .put_file_system(&DfsFileSystem::sifs(local.clone()))
+            .expect("users filesystem");
+        let promoted_object = directory_object("/users/promoted-visible", local.clone());
+        users_backend
+            .put_object(&promoted_object)
+            .expect("promoted users object");
+        complete_local_membership_handoff(
+            &control_plane,
+            &mut users_backend,
+            &retiring_users,
+            &active_users,
+        );
+        drop(users_backend);
+
+        let remote_shard_paths = [metadata_root.join("root"), metadata_root.join("services")];
+        let sharded = LocalShardedMetadataBackend::new_with_replica_repair(
+            &metadata_root,
+            vec![root_shard, services_shard, active_users.clone()],
+            &local,
+        )
+        .expect("node-aware sharded backend");
+        assert!(
+            remote_shard_paths.iter().all(|path| !path.exists()),
+            "deferred remote replica slots must start unopened"
+        );
+
+        let mut service = NetworkedDfsService::new(
+            MetadataAckTransport::new(local, []),
+            LocalContentStore::new(root.path().join("content")).expect("content store"),
+        )
+        .with_control_plane(control_plane);
+        service.metadata_backend = Some(Box::new(sharded));
+
+        crate::service_hydration::reset_full_metadata_hydration_calls();
+        assert_eq!(
+            service
+                .rebind_completed_local_metadata_shard_membership_handoffs(&file_system_id)
+                .expect("rebind local users shard"),
+            1
+        );
+        assert_eq!(
+            crate::service_hydration::full_metadata_hydration_calls(),
+            1,
+            "successful promotion must rebuild service state that replica ingestion intentionally does not mirror"
+        );
+        assert_eq!(
+            service.metadata().object(&promoted_object.object_id),
+            Some(&promoted_object),
+            "the first mutation after promotion must observe the complete authoritative state"
+        );
+        let backend = service.metadata_backend().expect("metadata backend");
+        assert!(
+            !backend
+                .metadata_shard_authoritative_writes_frozen(&users_shard_id)
+                .expect("users authority state"),
+            "exact completed users generation must be bound to this service"
+        );
+        assert_eq!(
+            backend
+                .metadata_shard_write_freeze(&users_shard_id)
+                .expect("users handoff marker")
+                .and_then(|marker| marker.activated_epoch),
+            Some(active_users.epoch)
         );
     }
 

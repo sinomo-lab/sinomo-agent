@@ -53,11 +53,17 @@ fn dfs_service_perf_trace(args: std::fmt::Arguments<'_>) {
 /// DFS control-plane service. Host-agnostic: it derives everything from the request's
 /// [`ServiceContext::data_dir`], so it runs with or without a daemon/cluster.
 #[derive(Default)]
-pub struct DfsService;
+pub struct DfsService {
+    host: Option<Arc<dyn DfsDataPlaneHost>>,
+}
 
 impl DfsService {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn with_data_plane_host(host: Arc<dyn DfsDataPlaneHost>) -> Self {
+        Self { host: Some(host) }
     }
 }
 
@@ -70,6 +76,19 @@ pub fn register_data_plane_services(
     host: Arc<dyn DfsDataPlaneHost>,
 ) -> ServiceRegistryBuilder {
     builder.register(DfsDataPlaneService::new(host))
+}
+
+/// Register the complete DFS protocol around one process-owned host.
+///
+/// Sharing the host lets control-plane status reuse the daemon's resident
+/// metadata generation instead of opening a parallel inspection backend.
+pub fn register_services_with_data_plane_host(
+    builder: ServiceRegistryBuilder,
+    host: Arc<dyn DfsDataPlaneHost>,
+) -> ServiceRegistryBuilder {
+    builder
+        .register(DfsService::with_data_plane_host(Arc::clone(&host)))
+        .register(DfsDataPlaneService::new(host))
 }
 
 fn dfs_service_route(route: &'static str) -> ServiceRoute {
@@ -167,6 +186,16 @@ impl std::fmt::Display for DfsDataPlaneHostError {
 impl std::error::Error for DfsDataPlaneHostError {}
 
 pub trait DfsDataPlaneHost: Send + Sync {
+    fn status<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, DfsOperatorStatus>;
+
+    /// Return the process-owned content store when the embedding host already
+    /// retains one for this data root. `None` keeps the host-agnostic service's
+    /// bounded local fallback.
+    fn shared_content_store(
+        &self,
+        data_dir: &SinomoDataDir,
+    ) -> Result<Option<Arc<LocalContentStore>>, DfsDataPlaneHostError>;
+
     fn run_smoke<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, DfsSmokeReport>;
 
     fn handle_message<'a>(
@@ -233,8 +262,17 @@ impl DfsDataPlaneService {
         if let Some(store) = stores.get(&content_root) {
             return Ok(Arc::clone(store));
         }
-        data_dir.ensure_root_layout().map_err(service_error)?;
-        let store = Arc::new(LocalContentStore::new(&content_root).map_err(service_error)?);
+        let store = match self
+            .host
+            .shared_content_store(data_dir)
+            .map_err(service_error)?
+        {
+            Some(store) => store,
+            None => {
+                data_dir.ensure_root_layout().map_err(service_error)?;
+                Arc::new(LocalContentStore::new(&content_root).map_err(service_error)?)
+            }
+        };
         stores.insert(content_root, Arc::clone(&store));
         Ok(store)
     }
@@ -262,6 +300,7 @@ impl Service for DfsService {
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+        let host = self.host.clone();
         Box::pin(async move {
             let mut operation_metrics = crate::performance_metrics::DfsOperationMetricGuard::start(
                 request.route.as_str(),
@@ -272,12 +311,16 @@ impl Service for DfsService {
                     let started_at = Instant::now();
                     let _: () = ctx.decode_request_body(&request).await?;
                     let status_started_at = Instant::now();
-                    let data_dir = Arc::clone(&ctx.data_dir);
-                    let status = tokio::task::spawn_blocking(move || dfs_status(&data_dir))
-                        .await
-                        .map_err(|source| {
-                            ServiceError::Service(format!("DFS status task failed: {source}"))
-                        })??;
+                    let status = if let Some(host) = host {
+                        host.status().await.map_err(service_error)?
+                    } else {
+                        let data_dir = Arc::clone(&ctx.data_dir);
+                        tokio::task::spawn_blocking(move || dfs_status(&data_dir))
+                            .await
+                            .map_err(|source| {
+                                ServiceError::Service(format!("DFS status task failed: {source}"))
+                            })??
+                    };
                     let status_ms = status_started_at.elapsed().as_millis();
                     ctx.respond_value(DFS_STATUS_ROUTE, status)?;
                     dfs_service_perf_trace(format_args!(
@@ -669,12 +712,46 @@ mod tests {
 
     #[derive(Default)]
     struct StubDfsDataPlaneHost {
+        status_calls: Mutex<usize>,
         smoke_calls: Mutex<usize>,
         message_request_ids: Mutex<Vec<String>>,
         message_traceparents: Mutex<Vec<Option<String>>>,
+        shared_content_store: Mutex<Option<Arc<LocalContentStore>>>,
     }
 
     impl DfsDataPlaneHost for StubDfsDataPlaneHost {
+        fn status<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, DfsOperatorStatus> {
+            Box::pin(async move {
+                *self.status_calls.lock().expect("status calls") += 1;
+                Ok(DfsOperatorStatus {
+                    file_system_count: 0,
+                    object_count: 0,
+                    version_count: 0,
+                    receipt_count: 0,
+                    intent_count: 0,
+                    pending_write_count: 0,
+                    open_conflict_count: 0,
+                    pending_repair_count: 0,
+                    repair_attempt_count: 0,
+                    pending_namespace_job_count: 0,
+                    failed_namespace_job_count: 0,
+                    metadata_shards: Vec::new(),
+                    repair_attempts: Vec::new(),
+                })
+            })
+        }
+
+        fn shared_content_store(
+            &self,
+            _data_dir: &SinomoDataDir,
+        ) -> Result<Option<Arc<LocalContentStore>>, DfsDataPlaneHostError> {
+            Ok(self
+                .shared_content_store
+                .lock()
+                .expect("shared content store")
+                .clone())
+        }
+
         fn run_smoke<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, DfsSmokeReport> {
             Box::pin(async move {
                 *self.smoke_calls.lock().expect("smoke calls") += 1;
@@ -855,8 +932,8 @@ mod tests {
 
     #[test]
     fn dfs_service_route_metadata_matches_module_surfaces() {
-        let registry = register_data_plane_services(
-            register_services(ServiceRegistry::builder()),
+        let registry = register_services_with_data_plane_host(
+            ServiceRegistry::builder(),
             Arc::new(StubDfsDataPlaneHost::default()),
         )
         .build();
@@ -979,6 +1056,36 @@ mod tests {
         assert!(Arc::ptr_eq(&first_cached, &second_cached));
     }
 
+    #[test]
+    fn hosted_data_plane_caches_the_host_content_store_reference() {
+        let (_root, data_dir) = temp_data_dir();
+        data_dir.ensure_root_layout().expect("root layout");
+        let shared = Arc::new(
+            LocalContentStore::new(data_dir.dfs_dir().join("content")).expect("content store"),
+        );
+        let host = Arc::new(StubDfsDataPlaneHost::default());
+        *host
+            .shared_content_store
+            .lock()
+            .expect("shared content store") = Some(Arc::clone(&shared));
+        let service = DfsDataPlaneService::new(host.clone());
+
+        let selected = service
+            .content_store_for(&data_dir)
+            .expect("hosted content store");
+        assert!(Arc::ptr_eq(&selected, &shared));
+        assert_eq!(service.cached_content_store_count(), 1);
+
+        *host
+            .shared_content_store
+            .lock()
+            .expect("shared content store") = None;
+        let cached = service
+            .content_store_for(&data_dir)
+            .expect("cached hosted content store");
+        assert!(Arc::ptr_eq(&cached, &shared));
+    }
+
     #[tokio::test]
     async fn dfs_status_serves_in_local_mode_without_a_cluster() {
         let registry = register_services(ServiceRegistry::builder()).build();
@@ -988,6 +1095,21 @@ mod tests {
         };
         assert_eq!(disposition, ServiceDisposition::Continue);
         let _status: DfsOperatorStatus = response.decode_body().expect("decode status");
+    }
+
+    #[tokio::test]
+    async fn hosted_dfs_status_reuses_the_process_data_plane_host() {
+        let host = Arc::new(StubDfsDataPlaneHost::default());
+        let registry =
+            register_services_with_data_plane_host(ServiceRegistry::builder(), host.clone())
+                .build();
+        let (_root, data_dir) = temp_data_dir();
+        let (disposition, response) =
+            dispatch_local(&registry, data_dir, DFS_STATUS_ROUTE, &()).await;
+        assert_eq!(disposition, ServiceDisposition::Continue);
+        let status: DfsOperatorStatus = response.decode_body().expect("decode hosted status");
+        assert_eq!(status.object_count, 0);
+        assert_eq!(*host.status_calls.lock().expect("status calls"), 1);
     }
 
     #[tokio::test]

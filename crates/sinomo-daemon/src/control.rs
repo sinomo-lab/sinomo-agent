@@ -1240,6 +1240,9 @@ fn daemon_sandbox_lifecycle_safety_sweep_due_or_initialize(
 
 type DaemonSandboxLifecycleLease =
     sinomo_dfs::DfsRenewableExclusiveLease<sinomo_dfs::DfsNodeTransport>;
+type DaemonSandboxDfsService = sinomo_dfs::NetworkedDfsService<sinomo_dfs::DfsNodeTransport>;
+type DaemonSandboxInstanceStore =
+    sinomo_sandbox::SifsSandboxInstanceStore<sinomo_dfs::DfsNodeTransport>;
 
 struct DaemonSandboxExecutionLease {
     lease: Option<DaemonSandboxLifecycleLease>,
@@ -1299,13 +1302,10 @@ impl Drop for DaemonSandboxExecutionLease {
 }
 
 fn acquire_daemon_sandbox_lifecycle_lease(
-    paths: &DaemonPaths,
+    mut dfs: DaemonSandboxDfsService,
     sandbox_id: &sinomo_sandbox::SandboxId,
-    runtime: Option<&tokio::runtime::Handle>,
+    replica_candidates: &[sinomo_core::node::NodeId],
 ) -> Result<DaemonSandboxLifecycleLease, DaemonError> {
-    let mut dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
-    let local_node_id = dfs.node_id().clone();
-    let replica_candidates = daemon_sandbox_replica_candidates(paths, &local_node_id);
     let lock_root = sinomo_sandbox::sandbox_lock_root();
     dfs.posix_mkdir_all(&lock_root)?;
     let anchor_path = sinomo_sandbox::sandbox_lock_anchor_path(sandbox_id);
@@ -1316,7 +1316,7 @@ fn acquire_daemon_sandbox_lifecycle_lease(
             match dfs.posix_write_file(
                 &anchor_path,
                 DAEMON_SANDBOX_LOCK_ANCHOR_CONTENT,
-                sinomo_dfs::DfsWriteOptions::replicated_eventual(replica_candidates),
+                sinomo_dfs::DfsWriteOptions::replicated_eventual(replica_candidates.to_vec()),
             ) {
                 Ok(stat) => stat,
                 Err(write_error) => match dfs.posix_stat_distributed(&anchor_path) {
@@ -1375,44 +1375,78 @@ fn ensure_daemon_sandbox_lifecycle_lease(
     })
 }
 
-fn acquire_daemon_sandbox_mutation_lease(
+fn open_daemon_sandbox_store_with_mutation_lease(
     paths: &DaemonPaths,
     sandbox_id: &sinomo_sandbox::SandboxId,
     runtime: Option<&tokio::runtime::Handle>,
-) -> Result<DaemonSandboxExecutionLease, DaemonError> {
-    acquire_daemon_sandbox_mutation_lease_with_recovery(paths, sandbox_id, runtime, true)
+) -> Result<
+    (
+        DaemonSandboxExecutionLease,
+        DaemonSandboxInstanceStore,
+        Vec<sinomo_core::node::NodeId>,
+    ),
+    DaemonError,
+> {
+    open_daemon_sandbox_store_with_lease(paths, sandbox_id, runtime, true)
 }
 
-fn acquire_daemon_sandbox_transaction_lease(
+fn open_daemon_sandbox_store_with_transaction_lease(
     paths: &DaemonPaths,
     sandbox_id: &sinomo_sandbox::SandboxId,
     runtime: Option<&tokio::runtime::Handle>,
-) -> Result<DaemonSandboxExecutionLease, DaemonError> {
-    let lease =
-        acquire_daemon_sandbox_mutation_lease_with_recovery(paths, sandbox_id, runtime, false)?;
+) -> Result<
+    (
+        DaemonSandboxExecutionLease,
+        DaemonSandboxInstanceStore,
+        Vec<sinomo_core::node::NodeId>,
+    ),
+    DaemonError,
+> {
+    let operation = open_daemon_sandbox_store_with_lease(paths, sandbox_id, runtime, false)?;
     // Publish the marker through the durable-file path before any authoritative
     // SIFS fence can be written. A crash in any later phase then makes the cheap
     // 30-second precheck wake recovery without hydrating DFS while idle.
     mark_daemon_sandbox_authoritative_recovery_pending(paths, sandbox_id)?;
-    Ok(lease)
+    Ok(operation)
 }
 
-fn acquire_daemon_sandbox_mutation_lease_with_recovery(
+fn open_daemon_sandbox_store_with_lease(
     paths: &DaemonPaths,
     sandbox_id: &sinomo_sandbox::SandboxId,
     runtime: Option<&tokio::runtime::Handle>,
     recover_authoritative: bool,
-) -> Result<DaemonSandboxExecutionLease, DaemonError> {
-    let raw_lease = acquire_daemon_sandbox_lifecycle_lease(paths, sandbox_id, runtime)?;
+) -> Result<
+    (
+        DaemonSandboxExecutionLease,
+        DaemonSandboxInstanceStore,
+        Vec<sinomo_core::node::NodeId>,
+    ),
+    DaemonError,
+> {
+    // The renewable lease requires an independently owned metadata service for
+    // its background renewal thread. Both services can still share one
+    // clone-backed content store and one replica view for the whole operation.
+    let content = open_daemon_sandbox_content_store(paths)?;
+    let (lease_dfs, replica_candidates) =
+        open_daemon_sandbox_dfs_service_with_replica_candidates_and_content_on_runtime(
+            paths,
+            runtime,
+            content.clone(),
+        )?;
+    let raw_lease =
+        acquire_daemon_sandbox_lifecycle_lease(lease_dfs, sandbox_id, &replica_candidates)?;
     ensure_daemon_sandbox_lifecycle_lease(&raw_lease, sandbox_id, "before pending settlement")?;
     let lease = DaemonSandboxExecutionLease::start(
         raw_lease,
         sinomo_sandbox::SandboxCancellationToken::new(),
     )?;
+    let dfs = open_daemon_sandbox_dfs_service_with_content_on_runtime(paths, runtime, content)?;
+    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
+        .with_replica_candidates(replica_candidates.clone());
     recover_daemon_sandbox_lifecycle_transaction_under_lease(
         paths,
         sandbox_id,
-        runtime,
+        &mut store,
         &lease,
         recover_authoritative,
     )?;
@@ -1421,7 +1455,7 @@ fn acquire_daemon_sandbox_mutation_lease_with_recovery(
             "sandbox {sandbox_id} lifecycle lease lost after pending settlement: {source}"
         ),
     })?;
-    Ok(lease)
+    Ok((lease, store, replica_candidates))
 }
 
 fn ensure_daemon_sandbox_mutation_lease(
@@ -1458,7 +1492,7 @@ fn daemon_sandbox_store_mutation_checkpoint(
 fn recover_daemon_sandbox_lifecycle_transaction_under_lease(
     paths: &DaemonPaths,
     sandbox_id: &sinomo_sandbox::SandboxId,
-    runtime: Option<&tokio::runtime::Handle>,
+    store: &mut DaemonSandboxInstanceStore,
     lifecycle_lease: &DaemonSandboxExecutionLease,
     recover_authoritative: bool,
 ) -> Result<(), DaemonError> {
@@ -1466,7 +1500,7 @@ fn recover_daemon_sandbox_lifecycle_transaction_under_lease(
         recover_daemon_authoritative_sandbox_transaction(
             paths,
             sandbox_id,
-            runtime,
+            store,
             lifecycle_lease,
         )?;
     }
@@ -1477,7 +1511,7 @@ fn recover_daemon_sandbox_lifecycle_transaction_under_lease(
 fn recover_daemon_authoritative_sandbox_transaction(
     paths: &DaemonPaths,
     sandbox_id: &sinomo_sandbox::SandboxId,
-    runtime: Option<&tokio::runtime::Handle>,
+    store: &mut DaemonSandboxInstanceStore,
     lifecycle_lease: &DaemonSandboxExecutionLease,
 ) -> Result<(), DaemonError> {
     ensure_daemon_sandbox_mutation_lease(
@@ -1485,11 +1519,7 @@ fn recover_daemon_authoritative_sandbox_transaction(
         sandbox_id,
         "before authoritative transaction recovery",
     )?;
-    let dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
-    let node_id = dfs.node_id().clone();
-    let replica_candidates = daemon_sandbox_replica_candidates(paths, &node_id);
-    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
-        .with_replica_candidates(replica_candidates);
+    let node_id = store.dfs.node_id().clone();
     let manifest = match store.load_allow_pending_reconciliation(sandbox_id) {
         Ok(manifest) => manifest,
         Err(sinomo_sandbox::SandboxStoreError::NotFound { .. })
@@ -1655,7 +1685,7 @@ fn recover_daemon_authoritative_sandbox_transaction(
 fn recover_daemon_sandbox_lifecycle_transaction_under_lease(
     _paths: &DaemonPaths,
     _sandbox_id: &sinomo_sandbox::SandboxId,
-    _runtime: Option<&tokio::runtime::Handle>,
+    _store: &mut DaemonSandboxInstanceStore,
     _lifecycle_lease: &DaemonSandboxExecutionLease,
     _recover_authoritative: bool,
 ) -> Result<(), DaemonError> {
@@ -4293,14 +4323,10 @@ pub(crate) fn handle_daemon_sandbox_http_fetch_to_file_on_runtime(
     request: sinomo_sandbox::SandboxHttpFetchToFileRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxHttpFetchFileResult, DaemonError> {
-    let lifecycle_lease =
-        acquire_daemon_sandbox_mutation_lease(paths, &request.sandbox_id, runtime)?;
+    let (lifecycle_lease, mut store, replica_candidates) =
+        open_daemon_sandbox_store_with_mutation_lease(paths, &request.sandbox_id, runtime)?;
     let config = load_daemon_sandbox_policy_config(paths)?;
-    let dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
-    let execution_node_id = dfs.node_id().clone();
-    let replica_candidates = daemon_sandbox_replica_candidates(paths, &execution_node_id);
-    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
-        .with_replica_candidates(replica_candidates.clone());
+    let execution_node_id = store.dfs.node_id().clone();
     let manifest = store.load(&request.sandbox_id)?;
     if let Err(denial) = config
         .policy
@@ -4459,13 +4485,12 @@ pub(crate) fn handle_daemon_sandbox_create_on_runtime(
 ) -> Result<sinomo_sandbox::SandboxCreateInstanceResponse, DaemonError> {
     let config = load_daemon_sandbox_policy_config(paths)?;
     let create_limits = daemon_sandbox_create_limits(&request, &config.policy.max_limits);
-    let mut dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
-    let execution_node_id = dfs.node_id().clone();
-    let replica_candidates = daemon_sandbox_replica_candidates(paths, &execution_node_id);
     let sandbox_id = request
         .sandbox_id
         .unwrap_or_else(sinomo_sandbox::SandboxId::generate);
-    let lifecycle_lease = acquire_daemon_sandbox_transaction_lease(paths, &sandbox_id, runtime)?;
+    let (lifecycle_lease, mut store, _replica_candidates) =
+        open_daemon_sandbox_store_with_transaction_lease(paths, &sandbox_id, runtime)?;
+    let execution_node_id = store.dfs.node_id().clone();
     ensure_daemon_sandbox_mutation_lease(&lifecycle_lease, &sandbox_id, "before create")?;
     let mut manifest = sinomo_sandbox::SandboxInstanceManifest::new(
         sandbox_id,
@@ -4509,14 +4534,11 @@ pub(crate) fn handle_daemon_sandbox_create_on_runtime(
     validate_daemon_sandbox_resolved_mount_policy(
         paths,
         &config.policy,
-        &mut dfs,
+        &mut store.dfs,
         &manifest,
         &execution_node_id,
         "sandbox-create-resolved-source",
     )?;
-
-    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
-        .with_replica_candidates(replica_candidates);
     let created = store
         .create_manifest(&manifest)
         .map_err(|source| DaemonError::Parse {
@@ -4588,8 +4610,7 @@ pub(crate) fn handle_daemon_sandbox_status_on_runtime(
     request: sinomo_sandbox::SandboxStatusRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxStatusResponse, DaemonError> {
-    let dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
-    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs);
+    let mut store = open_daemon_sandbox_instance_store_on_runtime(paths, runtime)?;
     let manifest = store.load(&request.sandbox_id)?;
     Ok(sinomo_sandbox::SandboxStatusResponse { manifest })
 }
@@ -4613,13 +4634,10 @@ pub(crate) fn handle_daemon_sandbox_update_on_runtime(
         env_set,
         env_unset,
     } = request;
-    let lifecycle_lease = acquire_daemon_sandbox_mutation_lease(paths, &sandbox_id, runtime)?;
+    let (lifecycle_lease, mut store, replica_candidates) =
+        open_daemon_sandbox_store_with_mutation_lease(paths, &sandbox_id, runtime)?;
     let config = load_daemon_sandbox_policy_config(paths)?;
-    let dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
-    let node_id = dfs.node_id().clone();
-    let replica_candidates = daemon_sandbox_replica_candidates(paths, &node_id);
-    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
-        .with_replica_candidates(replica_candidates.clone());
+    let node_id = store.dfs.node_id().clone();
     let mut manifest = store.load(&sandbox_id)?;
     let cwd_changed = cwd.is_some();
     let mut env_set_keys = env_set.keys().cloned().collect::<Vec<_>>();
@@ -4727,14 +4745,10 @@ pub(crate) fn handle_daemon_sandbox_checkpoint_on_runtime(
     request: sinomo_sandbox::SandboxCheckpointRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxCheckpointResponse, DaemonError> {
-    let lifecycle_lease =
-        acquire_daemon_sandbox_mutation_lease(paths, &request.sandbox_id, runtime)?;
+    let (lifecycle_lease, mut store, _replica_candidates) =
+        open_daemon_sandbox_store_with_mutation_lease(paths, &request.sandbox_id, runtime)?;
     let config = load_daemon_sandbox_policy_config(paths)?;
-    let dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
-    let node_id = dfs.node_id().clone();
-    let replica_candidates = daemon_sandbox_replica_candidates(paths, &node_id);
-    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
-        .with_replica_candidates(replica_candidates);
+    let node_id = store.dfs.node_id().clone();
     let manifest = store.load(&request.sandbox_id)?;
     validate_daemon_sandbox_manifest_policy(
         paths,
@@ -4786,14 +4800,10 @@ pub(crate) fn handle_daemon_sandbox_resume_on_runtime(
     request: sinomo_sandbox::SandboxResumeRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxResumeResponse, DaemonError> {
-    let lifecycle_lease =
-        acquire_daemon_sandbox_transaction_lease(paths, &request.sandbox_id, runtime)?;
+    let (lifecycle_lease, mut store, _replica_candidates) =
+        open_daemon_sandbox_store_with_transaction_lease(paths, &request.sandbox_id, runtime)?;
     let config = load_daemon_sandbox_policy_config(paths)?;
-    let dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
-    let node_id = dfs.node_id().clone();
-    let replica_candidates = daemon_sandbox_replica_candidates(paths, &node_id);
-    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
-        .with_replica_candidates(replica_candidates);
+    let node_id = store.dfs.node_id().clone();
     let current = store.load_allow_pending_reconciliation(&request.sandbox_id)?;
     if let Some(pending) = current.pending_reconciliation.as_ref()
         && !matches!(
@@ -4881,14 +4891,10 @@ pub(crate) fn handle_daemon_sandbox_reboot_on_runtime(
     request: sinomo_sandbox::SandboxRebootRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxRebootResponse, DaemonError> {
-    let lifecycle_lease =
-        acquire_daemon_sandbox_transaction_lease(paths, &request.sandbox_id, runtime)?;
+    let (lifecycle_lease, mut store, _replica_candidates) =
+        open_daemon_sandbox_store_with_transaction_lease(paths, &request.sandbox_id, runtime)?;
     let config = load_daemon_sandbox_policy_config(paths)?;
-    let dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
-    let node_id = dfs.node_id().clone();
-    let replica_candidates = daemon_sandbox_replica_candidates(paths, &node_id);
-    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
-        .with_replica_candidates(replica_candidates);
+    let node_id = store.dfs.node_id().clone();
     let manifest = store.load_allow_pending_reconciliation(&request.sandbox_id)?;
     if let Some(pending) = manifest.pending_reconciliation.as_ref()
         && !matches!(
@@ -4972,13 +4978,9 @@ pub(crate) fn handle_daemon_sandbox_destroy_on_runtime(
     request: sinomo_sandbox::SandboxDestroyRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxDestroyResponse, DaemonError> {
-    let lifecycle_lease =
-        acquire_daemon_sandbox_transaction_lease(paths, &request.sandbox_id, runtime)?;
-    let dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
-    let node_id = dfs.node_id().clone();
-    let replica_candidates = daemon_sandbox_replica_candidates(paths, &node_id);
-    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
-        .with_replica_candidates(replica_candidates);
+    let (lifecycle_lease, mut store, _replica_candidates) =
+        open_daemon_sandbox_store_with_transaction_lease(paths, &request.sandbox_id, runtime)?;
+    let node_id = store.dfs.node_id().clone();
     ensure_daemon_sandbox_mutation_lease(&lifecycle_lease, &request.sandbox_id, "before destroy")?;
     let pending_manifest = store.prepare_destroy(&request.sandbox_id, OffsetDateTime::now_utc())?;
     let transaction_id = pending_manifest
@@ -5036,8 +5038,7 @@ pub(crate) fn handle_daemon_sandbox_list_on_runtime(
     request: sinomo_sandbox::SandboxListRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxListResponse, DaemonError> {
-    let dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
-    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs);
+    let mut store = open_daemon_sandbox_instance_store_on_runtime(paths, runtime)?;
     let manifest = store.load(&request.sandbox_id)?;
     let fs = sinomo_sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest);
     let entries = fs.list(&request.path)?;
@@ -5056,8 +5057,7 @@ pub(crate) fn handle_daemon_sandbox_read_on_runtime(
     request: sinomo_sandbox::SandboxReadRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxReadResponse, DaemonError> {
-    let dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
-    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs);
+    let mut store = open_daemon_sandbox_instance_store_on_runtime(paths, runtime)?;
     let manifest = store.load(&request.sandbox_id)?;
     let fs = sinomo_sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest);
     let bytes = fs.read(&request.path, request.range)?;
@@ -5076,14 +5076,10 @@ pub(crate) fn handle_daemon_sandbox_write_on_runtime(
     request: sinomo_sandbox::SandboxWriteRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxWriteResponse, DaemonError> {
-    let lifecycle_lease =
-        acquire_daemon_sandbox_mutation_lease(paths, &request.sandbox_id, runtime)?;
+    let (lifecycle_lease, mut store, replica_candidates) =
+        open_daemon_sandbox_store_with_mutation_lease(paths, &request.sandbox_id, runtime)?;
     let config = load_daemon_sandbox_policy_config(paths)?;
-    let dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
-    let node_id = dfs.node_id().clone();
-    let replica_candidates = daemon_sandbox_replica_candidates(paths, &node_id);
-    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
-        .with_replica_candidates(replica_candidates.clone());
+    let node_id = store.dfs.node_id().clone();
     let manifest = store.load(&request.sandbox_id)?;
     validate_daemon_sandbox_manifest_policy(
         paths,
@@ -5229,9 +5225,9 @@ pub(crate) fn handle_daemon_sandbox_import_busybox_on_runtime(
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxImportBusyBoxToolchainResponse, DaemonError> {
     let config = load_daemon_sandbox_policy_config(paths)?;
-    let dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
+    let (dfs, replica_candidates) =
+        open_daemon_sandbox_dfs_service_with_replica_candidates_on_runtime(paths, runtime)?;
     let node_id = dfs.node_id().clone();
-    let replica_candidates = daemon_sandbox_replica_candidates(paths, &node_id);
     let mut store = sinomo_sandbox::SifsSandboxToolchainStore::new(dfs)
         .with_replica_candidates(replica_candidates);
     let spec = sinomo_sandbox::SandboxBusyBoxToolchainSpec::new(
@@ -5281,9 +5277,9 @@ pub(crate) fn handle_daemon_sandbox_toolchain_add_command_on_runtime(
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxAddToolchainCommandResponse, DaemonError> {
     let config = load_daemon_sandbox_policy_config(paths)?;
-    let dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
+    let (dfs, replica_candidates) =
+        open_daemon_sandbox_dfs_service_with_replica_candidates_on_runtime(paths, runtime)?;
     let node_id = dfs.node_id().clone();
-    let replica_candidates = daemon_sandbox_replica_candidates(paths, &node_id);
     let mut store = sinomo_sandbox::SifsSandboxToolchainStore::new(dfs)
         .with_replica_candidates(replica_candidates);
     let mut manifest = match store.load_manifest(&request.toolchain_id) {
@@ -5458,9 +5454,9 @@ pub(crate) fn handle_daemon_sandbox_toolchain_import_package_on_runtime(
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxImportToolchainPackageResponse, DaemonError> {
     let config = load_daemon_sandbox_policy_config(paths)?;
-    let dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
+    let (dfs, replica_candidates) =
+        open_daemon_sandbox_dfs_service_with_replica_candidates_on_runtime(paths, runtime)?;
     let node_id = dfs.node_id().clone();
-    let replica_candidates = daemon_sandbox_replica_candidates(paths, &node_id);
     let mut store = sinomo_sandbox::SifsSandboxToolchainStore::new(dfs)
         .with_replica_candidates(replica_candidates);
     let mut manifest = match store.load_manifest(&request.toolchain_id) {
@@ -5619,9 +5615,9 @@ pub(crate) fn handle_daemon_sandbox_toolchain_add_artifact_on_runtime(
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxAddToolchainArtifactResponse, DaemonError> {
     let config = load_daemon_sandbox_policy_config(paths)?;
-    let dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)?;
+    let (dfs, replica_candidates) =
+        open_daemon_sandbox_dfs_service_with_replica_candidates_on_runtime(paths, runtime)?;
     let node_id = dfs.node_id().clone();
-    let replica_candidates = daemon_sandbox_replica_candidates(paths, &node_id);
     let mut store = sinomo_sandbox::SifsSandboxToolchainStore::new(dfs)
         .with_replica_candidates(replica_candidates);
     let mut manifest = match store.load_manifest(&request.toolchain_id) {
@@ -5804,8 +5800,18 @@ fn run_daemon_sandbox_lifecycle_maintenance_scan(
     runtime: &tokio::runtime::Handle,
     marked_sandbox_ids: BTreeSet<sinomo_sandbox::SandboxId>,
 ) -> Result<usize, DaemonError> {
-    let dfs = open_daemon_sandbox_dfs_service_on_runtime(paths, Some(runtime))?;
-    let mut authoritative_store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs);
+    // Metadata generations remain independent across listing, lease mutation,
+    // and recovery, while the immutable-content caches and initialized local
+    // layout are safe to share for the complete bounded scan.
+    let content = open_daemon_sandbox_content_store(paths)?;
+    let (dfs, replica_candidates) =
+        open_daemon_sandbox_dfs_service_with_replica_candidates_and_content_on_runtime(
+            paths,
+            Some(runtime),
+            content.clone(),
+        )?;
+    let mut authoritative_store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
+        .with_replica_candidates(replica_candidates.clone());
     let pending_manifests = authoritative_store.list_pending_authoritative_manifests()?;
     drop(authoritative_store);
 
@@ -5825,14 +5831,32 @@ fn run_daemon_sandbox_lifecycle_maintenance_scan(
     let mut recovered = 0_usize;
     for sandbox_id in candidate_sandbox_ids {
         let result = (|| -> Result<(), DaemonError> {
-            let raw_lease =
-                acquire_daemon_sandbox_lifecycle_lease(paths, &sandbox_id, Some(runtime))?;
+            // Acquire the lease first, then open the recovery generation. A
+            // store retained from the listing scan would have a stale journal
+            // view after the lease mutation and could not safely append.
+            let lease_dfs = open_daemon_sandbox_dfs_service_with_content_on_runtime(
+                paths,
+                Some(runtime),
+                content.clone(),
+            )?;
+            let raw_lease = acquire_daemon_sandbox_lifecycle_lease(
+                lease_dfs,
+                &sandbox_id,
+                &replica_candidates,
+            )?;
             let cancellation = sinomo_sandbox::SandboxCancellationToken::new();
             let lifecycle_lease = DaemonSandboxExecutionLease::start(raw_lease, cancellation)?;
+            let recovery_dfs = open_daemon_sandbox_dfs_service_with_content_on_runtime(
+                paths,
+                Some(runtime),
+                content.clone(),
+            )?;
+            let mut recovery_store = sinomo_sandbox::SifsSandboxInstanceStore::new(recovery_dfs)
+                .with_replica_candidates(replica_candidates.clone());
             recover_daemon_authoritative_sandbox_transaction(
                 paths,
                 &sandbox_id,
-                Some(runtime),
+                &mut recovery_store,
                 &lifecycle_lease,
             )
         })();
@@ -6264,21 +6288,63 @@ pub fn open_daemon_sandbox_dfs_service(
     open_daemon_sandbox_dfs_service_on_runtime(paths, None)
 }
 
+fn open_daemon_sandbox_dfs_service_with_replica_candidates_on_runtime(
+    paths: &DaemonPaths,
+    runtime: Option<&tokio::runtime::Handle>,
+) -> Result<(DaemonSandboxDfsService, Vec<sinomo_core::node::NodeId>), DaemonError> {
+    let content = open_daemon_sandbox_content_store(paths)?;
+    open_daemon_sandbox_dfs_service_with_replica_candidates_and_content_on_runtime(
+        paths, runtime, content,
+    )
+}
+
+fn open_daemon_sandbox_dfs_service_with_replica_candidates_and_content_on_runtime(
+    paths: &DaemonPaths,
+    runtime: Option<&tokio::runtime::Handle>,
+    content: sinomo_dfs::LocalContentStore,
+) -> Result<(DaemonSandboxDfsService, Vec<sinomo_core::node::NodeId>), DaemonError> {
+    let dfs = open_daemon_sandbox_dfs_service_with_content_on_runtime(paths, runtime, content)?;
+    let replica_candidates = daemon_sandbox_replica_candidates(paths, dfs.node_id());
+    Ok((dfs, replica_candidates))
+}
+
+fn open_daemon_sandbox_instance_store_on_runtime(
+    paths: &DaemonPaths,
+    runtime: Option<&tokio::runtime::Handle>,
+) -> Result<DaemonSandboxInstanceStore, DaemonError> {
+    open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)
+        .map(sinomo_sandbox::SifsSandboxInstanceStore::new)
+}
+
 pub(crate) fn open_daemon_sandbox_dfs_service_on_runtime(
     paths: &DaemonPaths,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_dfs::NetworkedDfsService<sinomo_dfs::DfsNodeTransport>, DaemonError> {
+    let content = open_daemon_sandbox_content_store(paths)?;
+    open_daemon_sandbox_dfs_service_with_content_on_runtime(paths, runtime, content)
+}
+
+fn open_daemon_sandbox_content_store(
+    paths: &DaemonPaths,
+) -> Result<sinomo_dfs::LocalContentStore, DaemonError> {
     let data_dir = daemon_data_dir_path(paths)?;
     let data_dir = sinomo_core::local::SinomoDataDir::new(&data_dir);
-    data_dir.ensure_root_layout()?;
+    let content_root = data_dir.dfs_dir().join("content");
+    sinomo_dfs::LocalContentStore::new(&content_root).map_err(|source| DaemonError::Io {
+        path: content_root.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn open_daemon_sandbox_dfs_service_with_content_on_runtime(
+    paths: &DaemonPaths,
+    runtime: Option<&tokio::runtime::Handle>,
+    content: sinomo_dfs::LocalContentStore,
+) -> Result<sinomo_dfs::NetworkedDfsService<sinomo_dfs::DfsNodeTransport>, DaemonError> {
+    let data_dir = daemon_data_dir_path(paths)?;
+    let data_dir = sinomo_core::local::SinomoDataDir::new(&data_dir);
     let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
-    let content = sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content")).map_err(
-        |source| DaemonError::Io {
-            path: data_dir.dfs_dir().join("content").display().to_string(),
-            detail: source.to_string(),
-        },
-    )?;
     let peer_node_ids = sinomo_dfs::cluster_dfs_peer_node_ids(&state);
     let transport = if let Some(runtime) = runtime {
         daemon_dfs_node_transport_on_runtime(
@@ -6294,8 +6360,11 @@ pub(crate) fn open_daemon_sandbox_dfs_service_on_runtime(
     let dfs =
         crate::dfs::with_daemon_owned_dfs_control_plane_on_runtime(dfs, &cluster_paths, runtime);
     let metadata = crate::dfs::open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
+    // Sandbox POSIX calls resolve targeted durable records. Retain only the
+    // filesystem and mutation-guard bootstrap instead of cloning every object,
+    // version, intent, and receipt into each short-lived service.
     let mut dfs = dfs
-        .with_boxed_metadata_backend(metadata)
+        .with_boxed_metadata_backend_lazy(metadata)
         .map_err(|source| DaemonError::Parse {
             detail: source.to_string(),
         })?;

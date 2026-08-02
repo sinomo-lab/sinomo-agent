@@ -232,7 +232,8 @@ pub use local_state::{
     evict_cluster_aware_dfs_metadata_inspection_cache, inspect_cluster_aware_dfs,
     inspect_cluster_aware_dfs_status, inspect_dfs_conflicts, inspect_dfs_file_system,
     inspect_dfs_object, inspect_dfs_path, inspect_dfs_repairs, inspect_dfs_status,
-    list_local_dfs_pins, local_dfs_metadata_shard_path, open_cluster_aware_dfs_metadata_backend,
+    inspect_dfs_status_from_metadata, list_local_dfs_pins, local_dfs_metadata_shard_path,
+    open_cluster_aware_dfs_metadata_backend,
     open_cluster_aware_dfs_metadata_backend_for_inspection,
     open_cluster_sharded_dfs_metadata_backend, open_local_metadata_shard_backend,
     open_local_sharded_metadata_backend, open_local_sharded_metadata_backend_for_replica_repair,
@@ -294,8 +295,9 @@ pub(crate) use message_transport::{
     DfsMetadataJournalBatchDirectGroup, materialize_dfs_routed_call_sync,
 };
 pub use metadata_api::{
-    DfsMetadataBackend, DfsMetadataReplicaIngestPermit, DfsMetadataShardWriteFreeze,
-    DfsNamespaceRequestAdmissionSnapshot, DfsNormalizedNamespacePrepare,
+    DfsMetadataBackend, DfsMetadataReplicaApplyReport, DfsMetadataReplicaIngestPermit,
+    DfsMetadataShardWriteFreeze, DfsNamespaceRequestAdmissionSnapshot,
+    DfsNormalizedNamespacePrepare,
 };
 pub use metadata_backend::LocalSobjMetadataBackend;
 pub use metadata_error::MetadataBackendError;
@@ -561,7 +563,7 @@ pub type DfsVersion = sinomo_core::Id;
 pub use service::{
     DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture, DfsDataPlaneResponse,
     DfsDataPlaneService, DfsInboundAttachment, DfsService, register_data_plane_services,
-    register_services,
+    register_services, register_services_with_data_plane_host,
 };
 pub(crate) use service_state::{
     ActiveReplicaStage, DFS_CONFLICT_SCAN_PAGE_SIZE, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES,
