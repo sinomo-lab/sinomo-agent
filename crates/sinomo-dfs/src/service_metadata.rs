@@ -118,6 +118,8 @@ std::thread_local! {
     static NAMESPACE_PREPARE_AFTER_EXPECTATIONS_TEST_HOOK:
         std::cell::RefCell<Option<NamespacePrepareAfterExpectationsTestHook>> =
             const { std::cell::RefCell::new(None) };
+    static NAMESPACE_PREPARE_EXPECTATION_CAPTURE_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -153,6 +155,22 @@ fn run_namespace_prepare_after_expectations_test_hook(backend: &mut dyn crate::D
             hook(backend);
         }
     });
+}
+
+#[cfg(test)]
+pub(crate) fn reset_namespace_prepare_expectation_capture_calls() {
+    NAMESPACE_PREPARE_EXPECTATION_CAPTURE_CALLS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn namespace_prepare_expectation_capture_calls() -> usize {
+    NAMESPACE_PREPARE_EXPECTATION_CAPTURE_CALLS.get()
+}
+
+struct NamespacePrepareExpectationBundle {
+    shard_id: DfsMetadataShardId,
+    expected_object_versions: BTreeMap<DfsObjectId, Option<DfsVersion>>,
+    expected_path_occupants: BTreeMap<String, Option<DfsObjectId>>,
 }
 
 fn namespace_transaction_shard_paths(
@@ -201,6 +219,10 @@ pub(crate) fn namespace_prepare_expectations(
     ),
     DfsError,
 > {
+    #[cfg(test)]
+    NAMESPACE_PREPARE_EXPECTATION_CAPTURE_CALLS.with(|calls| {
+        calls.set(calls.get().saturating_add(1));
+    });
     backend
         .namespace_prepare_expectations(shard_id, transaction)
         .map_err(DfsError::from)
@@ -721,7 +743,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         transaction: DfsNamespaceTransaction,
     ) -> Result<(), DfsError> {
-        self.apply_namespace_transaction_with_selected_shard(transaction, None, Vec::new())
+        self.apply_namespace_transaction_with_selected_shard(transaction, None, Vec::new(), None)
             .map_err(NamespaceTransactionApplyError::into_dfs_error)
     }
 
@@ -731,7 +753,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         transaction: &DfsNamespaceTransaction,
         writes: &[DfsLocalEventualBatchWriteProof],
         selected_shard: Option<&DfsMetadataShardConfig>,
-    ) -> Result<(), posix_model::DfsPosixError> {
+    ) -> Result<Option<NamespacePrepareExpectationBundle>, posix_model::DfsPosixError> {
         let reject =
             |message: String| posix_model::DfsPosixError::Dfs(DfsError::Distributed { message });
         if transaction.objects.is_empty() || writes.is_empty() {
@@ -792,7 +814,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let objects = transaction
             .objects
             .iter()
-            .map(|object| (object.object_id.clone(), object))
+            .map(|object| (&object.object_id, object))
             .collect::<BTreeMap<_, _>>();
         if objects.len() != transaction.objects.len() {
             return Err(reject(
@@ -812,12 +834,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let versions = transaction
             .versions
             .iter()
-            .map(|version| {
-                (
-                    (version.object_id.clone(), version.version.clone()),
-                    version,
-                )
-            })
+            .map(|version| (&version.object_id, version))
             .collect::<BTreeMap<_, _>>();
         if versions.len() != transaction.versions.len()
             || transaction.versions.len() != transaction.objects.len()
@@ -826,32 +843,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "local-eventual batch requires exactly one visible version per object".to_string(),
             ));
         }
-        let (batch_expected_object_versions, batch_expected_path_occupants) =
-            match (self.metadata_backend.as_ref(), shard_id.as_ref()) {
-                (Some(backend), Some(shard_id)) => {
-                    let (expected_object_versions, expected_path_occupants, _) =
-                        namespace_prepare_expectations(backend.as_ref(), shard_id, transaction)?;
-                    (
-                        expected_object_versions
-                            .into_iter()
-                            .map(|expectation| {
-                                (expectation.object_id, expectation.expected_version)
-                            })
-                            .collect::<BTreeMap<_, _>>(),
-                        expected_path_occupants
-                            .into_iter()
-                            .map(|expectation| (expectation.path, expectation.expected_object_id))
-                            .collect::<BTreeMap<_, _>>(),
-                    )
-                }
-                _ => (BTreeMap::new(), BTreeMap::new()),
-            };
+        let prepare_expectations = match (self.metadata_backend.as_ref(), shard_id.as_ref()) {
+            (Some(backend), Some(shard_id)) => {
+                let (expected_object_versions, expected_path_occupants, _) =
+                    namespace_prepare_expectations(backend.as_ref(), shard_id, transaction)?;
+                Some(NamespacePrepareExpectationBundle {
+                    shard_id: shard_id.clone(),
+                    expected_object_versions: expected_object_versions
+                        .into_iter()
+                        .map(|expectation| (expectation.object_id, expectation.expected_version))
+                        .collect(),
+                    expected_path_occupants: expected_path_occupants
+                        .into_iter()
+                        .map(|expectation| (expectation.path, expectation.expected_object_id))
+                        .collect(),
+                })
+            }
+            _ => None,
+        };
+        let batch_expected_object_versions = prepare_expectations
+            .as_ref()
+            .map(|expectations| &expectations.expected_object_versions);
+        let batch_expected_path_occupants = prepare_expectations
+            .as_ref()
+            .map(|expectations| &expectations.expected_path_occupants);
 
         let mut writes_by_object = BTreeMap::new();
         for write in writes {
             let receipt = &write.receipt;
             let object_id = &receipt.receipt.object_id;
-            if writes_by_object.insert(object_id.clone(), write).is_some() {
+            if writes_by_object.insert(object_id, write).is_some() {
                 return Err(reject(format!(
                     "local-eventual batch repeats the write proof for object {object_id}"
                 )));
@@ -883,16 +904,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     "local-eventual batch durable receipt does not match object {object_id}"
                 )));
             }
-            let version = versions
-                .get(&(object_id.clone(), object.version.clone()))
-                .ok_or_else(|| {
-                    reject(format!(
-                        "local-eventual batch is missing visible version {} for object {object_id}",
-                        object.version
-                    ))
-                })?;
+            let version = versions.get(object_id).ok_or_else(|| {
+                reject(format!(
+                    "local-eventual batch is missing visible version {} for object {object_id}",
+                    object.version
+                ))
+            })?;
             if !version.visible
                 || version.file_system_id != transaction.file_system_id
+                || version.version != object.version
                 || version.content_hash != object.content_hash
                 || version.size_bytes != object.content_size_bytes
                 || version.locations != object.current_locations
@@ -905,7 +925,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
             let current = match (
                 write.expected_base_version.as_ref(),
-                batch_expected_object_versions.get(object_id),
+                batch_expected_object_versions.and_then(|expectations| expectations.get(object_id)),
             ) {
                 // The exact shard snapshot already proves that a create's
                 // deterministic object id is absent. Avoid reopening the same
@@ -914,7 +934,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 _ => current_object(object_id)?,
             };
             let create_path_is_occupied = if write.expected_base_version.is_none() {
-                match batch_expected_path_occupants.get(&object.path) {
+                match batch_expected_path_occupants
+                    .and_then(|expectations| expectations.get(&object.path))
+                {
                     Some(None) => false,
                     Some(Some(occupant_id)) => {
                         if current
@@ -1006,55 +1028,50 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     reason: "parent directory disappeared before the batch committed".to_string(),
                 });
             };
-            let parent_writes = writes_by_object
-                .values()
-                .filter(|write| {
-                    write.expected_base_version.is_none()
-                        && objects
-                            .get(&write.receipt.receipt.object_id)
-                            .and_then(|file| crate::posix_path::parent_posix_path(&file.path))
-                            .as_deref()
-                            == Some(object.path.as_str())
-                })
-                .collect::<Vec<_>>();
-            if parent_writes.is_empty() {
+            let mut parent_write_count = 0_usize;
+            let mut expected_parent_version = None;
+            for write in writes_by_object.values().filter(|write| {
+                write.expected_base_version.is_none()
+                    && objects
+                        .get(&write.receipt.receipt.object_id)
+                        .and_then(|file| crate::posix_path::parent_posix_path(&file.path))
+                        .as_deref()
+                        == Some(object.path.as_str())
+            }) {
+                parent_write_count += 1;
+                let (Some(parent_object_id), Some(parent_version)) = (
+                    write.expected_parent_object_id.as_ref(),
+                    write.expected_parent_version.as_ref(),
+                ) else {
+                    return Err(reject(format!(
+                        "local-eventual batch write proof for parent {} has no exact parent generation",
+                        object.path
+                    )));
+                };
+                if parent_object_id != &object.object_id {
+                    return Err(reject(format!(
+                        "local-eventual batch write proof for parent {} has no exact parent generation",
+                        object.path
+                    )));
+                }
+                match expected_parent_version {
+                    None => expected_parent_version = Some(parent_version),
+                    Some(expected) if expected == parent_version => {}
+                    Some(_) => {
+                        return Err(reject(format!(
+                            "local-eventual batch write proofs disagree on the parent generation for {}",
+                            object.path
+                        )));
+                    }
+                }
+            }
+            if parent_write_count == 0 {
                 return Err(reject(format!(
                     "local-eventual batch directory touch {} is not the parent of a proven file",
                     object.path
                 )));
             }
-            let expected_parent_versions = parent_writes
-                .iter()
-                .map(|write| {
-                    match (
-                        write.expected_parent_object_id.as_ref(),
-                        write.expected_parent_version.as_ref(),
-                    ) {
-                        (Some(parent_object_id), Some(parent_version))
-                            if parent_object_id == &object.object_id =>
-                        {
-                            Ok(parent_version.clone())
-                        }
-                        _ => Err(reject(format!(
-                            "local-eventual batch write proof for parent {} has no exact parent generation",
-                            object.path
-                        ))),
-                    }
-                })
-                .collect::<Result<BTreeSet<_>, _>>()?;
-            let mut expected_parent_versions = expected_parent_versions.iter();
-            let Some(expected_parent_version) = expected_parent_versions.next() else {
-                return Err(reject(format!(
-                    "local-eventual batch write proofs omit the parent generation for {}",
-                    object.path
-                )));
-            };
-            if expected_parent_versions.next().is_some() {
-                return Err(reject(format!(
-                    "local-eventual batch write proofs disagree on the parent generation for {}",
-                    object.path
-                )));
-            }
+            let expected_parent_version = expected_parent_version.expect("count proves a value");
             if &current.version != expected_parent_version {
                 return Err(DfsError::StaleDirectoryVersion {
                     path: object.path.clone(),
@@ -1079,9 +1096,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )));
             }
             let version = versions
-                .get(&(object.object_id.clone(), object.version.clone()))
+                .get(&object.object_id)
                 .ok_or_else(|| reject(format!("missing directory version for {}", object.path)))?;
             if !version.visible
+                || version.version != object.version
                 || version.content_hash.is_some()
                 || version.size_bytes.is_some()
                 || version.locations != object.current_locations
@@ -1092,7 +1110,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )));
             }
         }
-        Ok(())
+        Ok(prepare_expectations)
     }
 
     fn local_eventual_batch_commit_is_durable_replay(
@@ -1208,13 +1226,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         requester_node_id: &NodeId,
         transaction: DfsNamespaceTransaction,
-        writes: &[DfsLocalEventualBatchWriteProof],
+        writes: Vec<DfsLocalEventualBatchWriteProof>,
         selected_shard: Option<DfsMetadataShardConfig>,
     ) -> Result<bool, posix_model::DfsPosixError> {
         if self
             .local_eventual_batch_commit_is_durable_replay(
                 &transaction,
-                writes,
+                &writes,
                 selected_shard.as_ref(),
             )
             .map_err(posix_model::DfsPosixError::from)?
@@ -1223,15 +1241,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map_err(posix_model::DfsPosixError::from)?;
             return Ok(false);
         }
-        self.validate_local_eventual_batch_commit(
+        let prepare_expectations = self.validate_local_eventual_batch_commit(
             requester_node_id,
             &transaction,
-            writes,
+            &writes,
             selected_shard.as_ref(),
         )?;
-        let receipts = writes.iter().map(|write| write.receipt.clone()).collect();
-        self.apply_namespace_transaction_with_selected_shard(transaction, selected_shard, receipts)
-            .map_err(NamespaceTransactionApplyError::into_posix_error)?;
+        let receipts = writes.into_iter().map(|write| write.receipt).collect();
+        self.apply_namespace_transaction_with_selected_shard(
+            transaction,
+            selected_shard,
+            receipts,
+            prepare_expectations,
+        )
+        .map_err(NamespaceTransactionApplyError::into_posix_error)?;
         Ok(true)
     }
 
@@ -1244,9 +1267,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// configuration across independent filesystem operations.
     fn apply_namespace_transaction_with_selected_shard(
         &mut self,
-        transaction: DfsNamespaceTransaction,
+        mut transaction: DfsNamespaceTransaction,
         selected_shard: Option<DfsMetadataShardConfig>,
         content_receipts: Vec<DfsReplicaReceiptRecord>,
+        prepare_expectations: Option<NamespacePrepareExpectationBundle>,
     ) -> Result<(), NamespaceTransactionApplyError> {
         self.clear_metadata_lookup_cache();
         let trace_started = Instant::now();
@@ -1435,15 +1459,54 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             let prepare_shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
             let expectations_started = Instant::now();
-            let (expected_object_versions, expected_path_occupants, _) =
-                namespace_prepare_expectations(
-                    self.metadata_backend
-                        .as_ref()
-                        .expect("clustered metadata backend checked above")
-                        .as_ref(),
-                    &prepare_shard_id,
-                    &transaction,
-                )?;
+            let (expected_object_versions, expected_path_occupants) = if let Some(expectations) =
+                prepare_expectations
+            {
+                if expectations.shard_id != prepare_shard_id {
+                    return Err(DfsError::Metadata {
+                            message: format!(
+                                "namespace transaction {} captured expectations for shard {}, not selected shard {}",
+                                transaction.transaction_id,
+                                expectations.shard_id.0,
+                                prepare_shard_id.0,
+                            ),
+                        }
+                        .into());
+                }
+                (
+                    expectations
+                        .expected_object_versions
+                        .into_iter()
+                        .map(
+                            |(object_id, expected_version)| DfsNamespaceObjectVersionExpectation {
+                                object_id,
+                                expected_version,
+                            },
+                        )
+                        .collect(),
+                    expectations
+                        .expected_path_occupants
+                        .into_iter()
+                        .map(
+                            |(path, expected_object_id)| DfsNamespacePathOccupantExpectation {
+                                path,
+                                expected_object_id,
+                            },
+                        )
+                        .collect(),
+                )
+            } else {
+                let (expected_object_versions, expected_path_occupants, _) =
+                    namespace_prepare_expectations(
+                        self.metadata_backend
+                            .as_ref()
+                            .expect("clustered metadata backend checked above")
+                            .as_ref(),
+                        &prepare_shard_id,
+                        &transaction,
+                    )?;
+                (expected_object_versions, expected_path_occupants)
+            };
             trace_expectations_ms = expectations_started.elapsed().as_millis();
             #[cfg(test)]
             run_namespace_prepare_after_expectations_test_hook(
@@ -1510,21 +1573,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 expected_object_versions,
                 expected_path_occupants,
                 content_receipts,
-                transaction: transaction.clone(),
+                transaction,
                 completed_request,
                 completed_request_completion,
                 status: DfsNamespacePrepareStatus::Prepared,
             };
-            prepare.operation_digest =
-                crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)?;
-            let prepare_entry = self
+            let mut normalized_prepare =
+                crate::metadata_api::DfsNormalizedNamespacePrepare::new(&mut prepare);
+            let operation_digest =
+                crate::service_replica::metadata_namespace_prepare_payload_digest_normalized(
+                    normalized_prepare.as_record(),
+                )?;
+            normalized_prepare.set_operation_digest(operation_digest);
+            let prepare_result = self
                 .metadata_backend
                 .as_mut()
                 .expect("clustered metadata backend checked above")
-                .prepare_namespace_transaction(&prepare)
-                .map_err(|error| {
-                    NamespaceTransactionApplyError::from_prepare_error(&prepare.transaction, error)
-                })?;
+                .prepare_normalized_namespace_transaction_in_place(normalized_prepare);
+            let prepare_entry = prepare_result.map_err(|error| {
+                NamespaceTransactionApplyError::from_prepare_error(&prepare.transaction, error)
+            })?;
             if prepare.completed_request.is_some() || prepare.completed_request_completion.is_some()
             {
                 self.active_durable_namespace_prepare_recorded = true;
@@ -1544,8 +1612,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 entries: vec![prepare_entry],
                 next_after_sequence: prepare_sequence,
             };
-            let operation =
-                crate::service_replica::metadata_authority_operation_for_namespace_prepare(
+            // This exact prepare's canonical digest was computed immediately
+            // above and the backend has now durably accepted the same record.
+            // Reuse it instead of serializing the complete bulk transaction a
+            // second time before replica fan-out.
+            let operation = crate::service_replica::
+                metadata_authority_operation_for_prevalidated_namespace_prepare(
                     &prepare,
                     prepare_sequence,
                 )?;
@@ -1563,6 +1635,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     prepare.owner_epoch,
                 )?;
             drop(publication_guard);
+            // The prepare owned the transaction while the authoritative
+            // journal, replica proof, and compact commit were published. Move
+            // that same body back for the in-memory materialization below;
+            // cloning it here used to duplicate every object and version in a
+            // large bulk write on the foreground path.
+            transaction = prepare.transaction;
         } else if let Some(backend) = self.metadata_backend.as_mut() {
             let ensure_started = Instant::now();
             let file_system = if let Some(file_system) = configured_file_system {
@@ -1589,18 +1667,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             backend.apply_namespace_transaction(&transaction)?;
         }
         trace_backend_apply_ms = backend_apply_started.elapsed().as_millis();
-        for object in transaction
+        let (tombstones, live_objects): (Vec<_>, Vec<_>) = transaction
             .objects
-            .iter()
-            .filter(|object| object.kind == DfsObjectKind::Tombstone)
-            .chain(
-                transaction
-                    .objects
-                    .iter()
-                    .filter(|object| object.kind != DfsObjectKind::Tombstone),
-            )
-            .cloned()
-        {
+            .into_iter()
+            .partition(|object| object.kind == DfsObjectKind::Tombstone);
+        for object in tombstones.into_iter().chain(live_objects) {
             let coordinator_started = Instant::now();
             self.transient_metadata_object_ids.remove(&object.object_id);
             self.transient_metadata_predecessor_object_ids

@@ -41,7 +41,7 @@
 #   SINOMO_DFS_PERF_MODE                    debug-gate (default), release-ceiling, or sustained-churn
 #   SINOMO_DFS_PERF_BINARY_PROFILE          debug (default) or release; release-ceiling requires release
 #   SINOMO_DFS_PERF_EXPECT_NAMESPACE_PREPARE_CODEC
-#                                             required live shard codec (packed-v1)
+#                                             required live shard codec (packed-v2)
 #   SINOMO_DFS_PERF_FILES                   files per shard lane per phase (mode default)
 #   SINOMO_DFS_PERF_BYTES                   bytes per file (1)
 #   SINOMO_DFS_PERF_SUSTAINED_ROUNDS        extra back-to-back three-lane rounds (mode default)
@@ -85,7 +85,7 @@ COMPOSE_OVERRIDE_FILE="${SINOMO_DFS_PERF_COMPOSE_OVERRIDE:-}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-${SINOMO_DFS_PERF_PROJECT:-sinomo-dfs-test}}"
 PERF_MODE="${SINOMO_DFS_PERF_MODE:-debug-gate}"
 BINARY_PROFILE="${SINOMO_DFS_PERF_BINARY_PROFILE:-debug}"
-EXPECTED_NAMESPACE_PREPARE_CODEC="${SINOMO_DFS_PERF_EXPECT_NAMESPACE_PREPARE_CODEC:-packed-v1}"
+EXPECTED_NAMESPACE_PREPARE_CODEC="${SINOMO_DFS_PERF_EXPECT_NAMESPACE_PREPARE_CODEC:-packed-v2}"
 case "$PERF_MODE" in
   debug-gate)
     MODE_DEFAULT_FILES=1024
@@ -468,9 +468,9 @@ case "$BINARY_PROFILE" in
   *) die "SINOMO_DFS_PERF_BINARY_PROFILE must be debug or release, got '$BINARY_PROFILE'" ;;
 esac
 case "$EXPECTED_NAMESPACE_PREPARE_CODEC" in
-  legacy | packed-v1) ;;
+  legacy | packed-v1 | packed-v2) ;;
   *)
-    die "SINOMO_DFS_PERF_EXPECT_NAMESPACE_PREPARE_CODEC must be legacy or packed-v1, got '$EXPECTED_NAMESPACE_PREPARE_CODEC'"
+    die "SINOMO_DFS_PERF_EXPECT_NAMESPACE_PREPARE_CODEC must be legacy, packed-v1, or packed-v2, got '$EXPECTED_NAMESPACE_PREPARE_CODEC'"
     ;;
 esac
 if [[ "$PERF_MODE" == release-ceiling && "$BINARY_PROFILE" != release ]]; then

@@ -42,7 +42,8 @@ use crate::metadata_table_store::{
     install_encoded_metadata_table_snapshot, rotate_metadata_table_log_for_checkpoint,
 };
 use crate::metadata_tables::{
-    DfsMetadataTableRollback, DfsMetadataTables, MetadataTableSnapshotFingerprint,
+    DfsMetadataTableRollback, DfsMetadataTables, DfsNamespacePrepareFootprint,
+    MetadataTableSnapshotFingerprint,
 };
 
 static METADATA_TABLE_CHECKPOINT_WORKERS: OnceLock<MetadataTableCheckpointWorkerRegistry> =
@@ -587,7 +588,17 @@ pub(crate) fn append_and_apply_table_ops(
     ops: Vec<DfsMetadataTableOp>,
     max_log_bytes: u64,
 ) -> Result<()> {
-    append_table_batch(root, state, sequence, ops, None, None, max_log_bytes, None)
+    append_table_batch(
+        root,
+        state,
+        sequence,
+        ops,
+        None,
+        None,
+        max_log_bytes,
+        None,
+        None,
+    )
 }
 
 /// Append compact rebuildable operations while applying their already
@@ -614,6 +625,32 @@ pub(crate) fn append_and_apply_table_ops_with_persisted_ops(
         journal_reference_replay_cost_bytes,
         max_log_bytes,
         None,
+        None,
+    )
+}
+
+/// Persist compact prepare references while reusing the footprint produced by
+/// foreground shape validation for the live table-index apply.
+pub(crate) fn append_and_apply_table_ops_with_namespace_prepare_footprint(
+    root: &Path,
+    state: TableMaterializationState<'_>,
+    sequence: u64,
+    persisted_ops: Vec<DfsMetadataTableOp>,
+    apply_ops: Vec<DfsMetadataTableOp>,
+    journal_reference_replay_cost_bytes: Option<u64>,
+    max_log_bytes: u64,
+    footprint: DfsNamespacePrepareFootprint,
+) -> Result<()> {
+    append_table_batch(
+        root,
+        state,
+        sequence,
+        persisted_ops,
+        Some(apply_ops),
+        journal_reference_replay_cost_bytes,
+        max_log_bytes,
+        None,
+        Some(footprint),
     )
 }
 
@@ -634,6 +671,7 @@ pub(crate) fn append_preapplied_table_ops(
         None,
         max_log_bytes,
         Some(rollback),
+        None,
     )
 }
 
@@ -663,6 +701,7 @@ pub(crate) fn append_preapplied_table_ops_with_journal_reference_replay_cost(
         Some(journal_reference_replay_cost_bytes),
         max_log_bytes,
         Some(rollback),
+        None,
     )
 }
 
@@ -694,6 +733,7 @@ pub(crate) fn append_preapplied_table_ops_then_apply_trailing_resolved_op(
         (journal_reference_replay_cost_bytes != 0).then_some(journal_reference_replay_cost_bytes),
         max_log_bytes,
         Some(rollback),
+        None,
     )
 }
 
@@ -2018,6 +2058,7 @@ fn append_table_batch(
     measured_journal_reference_replay_cost_bytes: Option<u64>,
     max_log_bytes: u64,
     mut rollback: Option<DfsMetadataTableRollback>,
+    mut validated_namespace_prepare_footprint: Option<DfsNamespacePrepareFootprint>,
 ) -> Result<()> {
     let preapplied_with_trailing_resolved_op = rollback.is_some()
         && apply_ops.as_ref().is_some_and(|apply_ops| {
@@ -2046,6 +2087,24 @@ fn append_table_batch(
         return Err(error);
     }
     let validation_ops = apply_ops.as_deref().unwrap_or(&persisted_ops);
+    if let Some(footprint) = validated_namespace_prepare_footprint.as_ref() {
+        let mut matching_prepares = validation_ops.iter().filter_map(|op| match op {
+            DfsMetadataTableOp::PutNamespacePrepare { prepare }
+                if footprint.matches_prepare_identity(prepare) =>
+            {
+                Some(prepare)
+            }
+            _ => None,
+        });
+        if matching_prepares.next().is_none() || matching_prepares.next().is_some() {
+            if let Some(rollback) = rollback.take() {
+                rollback.rollback(state.tables);
+            }
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata table batch {sequence} validated prepare footprint does not name exactly one apply operation"
+            )));
+        }
+    }
     let ordered_ops = if rollback.is_some() {
         persisted_ops.as_slice()
     } else {
@@ -2156,8 +2215,17 @@ fn append_table_batch(
         // after this boundary.
         drop(rollback.take());
         for op in apply_ops.unwrap_or(batch.ops) {
-            state.tables.apply_checked(op)?;
+            if matches!(&op, DfsMetadataTableOp::PutNamespacePrepare { .. })
+                && let Some(footprint) = validated_namespace_prepare_footprint.take()
+            {
+                state
+                    .tables
+                    .apply_checked_with_namespace_prepare_footprint(op, footprint)?;
+            } else {
+                state.tables.apply_checked(op)?;
+            }
         }
+        debug_assert!(validated_namespace_prepare_footprint.is_none());
     }
     *state.materialized_through_sequence = (*state.materialized_through_sequence).max(sequence);
     schedule_metadata_table_checkpoint_if_needed(
@@ -3567,6 +3635,7 @@ mod tests {
             None,
             u64::MAX,
             Some(rollback),
+            None,
         )
         .expect_err("preapplied rollback and separate apply operations must be rejected");
 
@@ -3678,6 +3747,7 @@ mod tests {
             Some(1),
             u64::MAX,
             Some(rollback),
+            None,
         )
         .expect_err("measured replay cost without a journal reference must be rejected");
 

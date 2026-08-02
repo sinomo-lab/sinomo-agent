@@ -1,16 +1,19 @@
 //! Compact, versioned storage codec for authoritative namespace prepares.
 //!
 //! The journal may store this body only when the shard's quorum-committed
-//! configuration selects packed-v1. Replicas decode both representations,
-//! while snapshots and in-memory tables keep using
+//! configuration selects a packed representation. Replicas decode every
+//! retained representation, while snapshots and in-memory tables keep using
 //! [`DfsNamespacePrepareRecord`].
+
+use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::events::EventId;
 use sinomo_core::node::NodeId;
 use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt};
 use thiserror::Error;
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset};
 
 use crate::{
     DfsAdvisoryLockStateRecord, DfsFileSystemId, DfsMetadataShardId,
@@ -22,6 +25,7 @@ use crate::{
 };
 
 pub(crate) const DFS_PACKED_NAMESPACE_PREPARE_V1: u8 = 1;
+pub(crate) const DFS_PACKED_NAMESPACE_PREPARE_V2: u8 = 2;
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub(crate) enum DfsNamespacePrepareCodecError {
@@ -35,6 +39,56 @@ pub(crate) enum DfsNamespacePrepareCodecError {
         expected: String,
         actual: String,
     },
+    #[error(
+        "packed namespace prepare dictionary {dictionary} exceeds the u32 index space ({len} entries)"
+    )]
+    DictionaryTooLarge {
+        dictionary: &'static str,
+        len: usize,
+    },
+    #[error("packed namespace prepare dictionary {dictionary} repeats entry {index}")]
+    DuplicateDictionaryValue {
+        dictionary: &'static str,
+        index: usize,
+    },
+    #[error(
+        "packed namespace prepare {table} column {column} has {actual} rows, expected {expected}"
+    )]
+    ColumnLength {
+        table: &'static str,
+        column: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    #[error(
+        "packed namespace prepare {field}[{row}] references {dictionary}[{index}], but the dictionary has {len} entries"
+    )]
+    InvalidDictionaryIndex {
+        field: &'static str,
+        row: usize,
+        dictionary: &'static str,
+        index: u32,
+        len: usize,
+    },
+    #[error("packed namespace prepare {field}[{row}] has unsupported enum tag {tag}")]
+    InvalidEnumTag {
+        field: &'static str,
+        row: usize,
+        tag: u8,
+    },
+    #[error(
+        "packed namespace prepare {field}[{row}] has invalid time {unix_nanos}ns offset {offset_seconds}s"
+    )]
+    InvalidTime {
+        field: &'static str,
+        row: usize,
+        unix_nanos: i128,
+        offset_seconds: i32,
+    },
+    #[error(
+        "packed namespace prepare sparse column {field} is not strictly row-ordered at entry {entry}"
+    )]
+    NonCanonicalSparseRows { field: &'static str, entry: usize },
 }
 
 /// Packed body stored beside the existing outer mutation identity.
@@ -170,6 +224,7 @@ impl DfsPackedNamespacePrepareV1 {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn unpack(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -177,7 +232,18 @@ impl DfsPackedNamespacePrepareV1 {
         status: DfsNamespacePrepareStatus,
     ) -> Result<DfsNamespacePrepareRecord, DfsNamespacePrepareCodecError> {
         self.validate_file_system_scope(file_system_id)?;
-        Ok(DfsNamespacePrepareRecord {
+        Ok(self.unpack_validated(file_system_id, operation_id, status))
+    }
+
+    /// Materialize a payload whose format, indices, and filesystem scope were
+    /// already validated by its enclosing payload view.
+    pub(crate) fn unpack_validated(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        operation_id: &str,
+        status: DfsNamespacePrepareStatus,
+    ) -> DfsNamespacePrepareRecord {
+        let mut prepare = DfsNamespacePrepareRecord {
             operation_id: operation_id.to_string(),
             file_system_id: file_system_id.clone(),
             shard_id: self.shard_id.clone(),
@@ -202,7 +268,9 @@ impl DfsPackedNamespacePrepareV1 {
             completed_request: self.completed_request.clone(),
             completed_request_completion: self.completed_request_completion.clone(),
             status,
-        })
+        };
+        normalize_unpacked_canonical_in_place(&mut prepare);
+        prepare
     }
 
     pub(crate) fn visit_affected_object_ids(&self, mut visit: impl FnMut(&DfsObjectId)) {
@@ -538,6 +606,1656 @@ impl PackedReplicaReceiptV1 {
     }
 }
 
+/// Indexed, column-oriented namespace prepare body.
+///
+/// V2 interns every identity that is repeated across the prepare's object,
+/// version, expectation, and receipt families. Dense scalar fields remain in
+/// typed columns, while tombstone provenance is sparse. The representation is
+/// deliberately still SOBJ/Serde: the quorum capability fence selects the
+/// positional enum-tag contract, and malformed dictionary references fail
+/// before any canonical record is materialized.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsPackedNamespacePrepareV2 {
+    #[serde(rename = "f")]
+    format_version: u8,
+    #[serde(rename = "s")]
+    shard_id: DfsMetadataShardId,
+    #[serde(rename = "e")]
+    owner_epoch: u64,
+    #[serde(rename = "g")]
+    operation_digest: String,
+    #[serde(rename = "d")]
+    dictionaries: PackedDictionariesV2,
+    #[serde(rename = "x")]
+    expected_object_versions: PackedObjectVersionExpectationsV2,
+    #[serde(rename = "p")]
+    expected_path_occupants: PackedPathOccupantExpectationsV2,
+    #[serde(rename = "r")]
+    content_receipts: PackedReplicaReceiptsV2,
+    #[serde(rename = "i")]
+    transaction_id: String,
+    #[serde(rename = "o")]
+    objects: PackedObjectsV2,
+    #[serde(rename = "v")]
+    versions: PackedObjectVersionsV2,
+    #[serde(rename = "l", default, skip_serializing_if = "Vec::is_empty")]
+    advisory_lock_states: Vec<DfsAdvisoryLockStateRecord>,
+    #[serde(rename = "t")]
+    transaction_created_at: PackedTimeV2,
+    #[serde(rename = "q", default, skip_serializing_if = "Option::is_none")]
+    completed_request: Option<DfsNamespaceRequestRecord>,
+    #[serde(rename = "c", default, skip_serializing_if = "Option::is_none")]
+    completed_request_completion: Option<DfsNamespaceRequestCompletion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PackedDictionariesV2 {
+    #[serde(rename = "o", default, skip_serializing_if = "Vec::is_empty")]
+    object_ids: Vec<DfsObjectId>,
+    #[serde(rename = "p", default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<String>,
+    #[serde(rename = "v", default, skip_serializing_if = "Vec::is_empty")]
+    versions: Vec<DfsVersion>,
+    #[serde(rename = "h", default, skip_serializing_if = "Vec::is_empty")]
+    hashes: Vec<String>,
+    #[serde(rename = "n", default, skip_serializing_if = "Vec::is_empty")]
+    nodes: Vec<NodeId>,
+    #[serde(rename = "e", default, skip_serializing_if = "Vec::is_empty")]
+    events: Vec<EventId>,
+    #[serde(rename = "l")]
+    location_sets: PackedLocationSetsV2,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PackedLocationSetsV2 {
+    /// One leading zero plus the exclusive end offset of every set.
+    #[serde(rename = "o")]
+    offsets: Vec<u32>,
+    #[serde(rename = "n", default, skip_serializing_if = "Vec::is_empty")]
+    nodes: Vec<u32>,
+}
+
+impl PackedLocationSetsV2 {
+    fn empty() -> Self {
+        Self {
+            offsets: vec![0],
+            nodes: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    fn get(&self, index: usize) -> Option<&[u32]> {
+        let start = usize::try_from(*self.offsets.get(index)?).ok()?;
+        let end = usize::try_from(*self.offsets.get(index + 1)?).ok()?;
+        self.nodes.get(start..end)
+    }
+
+    fn validate(&self, node_dictionary_len: usize) -> Result<(), DfsNamespacePrepareCodecError> {
+        if self.offsets.first() != Some(&0)
+            || self.offsets.last().copied().map(|value| value as usize) != Some(self.nodes.len())
+            || self.offsets.windows(2).any(|pair| pair[0] > pair[1])
+        {
+            return Err(DfsNamespacePrepareCodecError::NonCanonicalSparseRows {
+                field: "location_sets.offsets",
+                entry: self.offsets.len(),
+            });
+        }
+        let mut unique = HashSet::with_capacity(self.len());
+        for set_index in 0..self.len() {
+            let set = self
+                .get(set_index)
+                .expect("validated location-set offset bounds");
+            if !unique.insert(set) {
+                return Err(DfsNamespacePrepareCodecError::DuplicateDictionaryValue {
+                    dictionary: "location_sets",
+                    index: set_index,
+                });
+            }
+            for (node_row, node) in set.iter().enumerate() {
+                validate_index(
+                    *node,
+                    node_dictionary_len,
+                    "location_sets.nodes",
+                    node_row,
+                    "nodes",
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PackedObjectVersionExpectationsV2 {
+    #[serde(rename = "o", default, skip_serializing_if = "Vec::is_empty")]
+    object_ids: Vec<u32>,
+    #[serde(
+        rename = "v",
+        default,
+        skip_serializing_if = "PackedOptionalColumnV2::is_empty"
+    )]
+    expected_versions: PackedOptionalColumnV2<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PackedPathOccupantExpectationsV2 {
+    #[serde(rename = "p", default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<u32>,
+    #[serde(
+        rename = "o",
+        default,
+        skip_serializing_if = "PackedOptionalColumnV2::is_empty"
+    )]
+    expected_object_ids: PackedOptionalColumnV2<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PackedObjectsV2 {
+    #[serde(rename = "o", default, skip_serializing_if = "Vec::is_empty")]
+    object_ids: Vec<u32>,
+    #[serde(rename = "p", default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<u32>,
+    #[serde(rename = "k", default, skip_serializing_if = "Vec::is_empty")]
+    kinds: Vec<u8>,
+    #[serde(rename = "n", default, skip_serializing_if = "Vec::is_empty")]
+    owner_nodes: Vec<u32>,
+    #[serde(rename = "l", default, skip_serializing_if = "Vec::is_empty")]
+    location_sets: Vec<u32>,
+    #[serde(rename = "h")]
+    content_hashes: PackedOptionalColumnV2<u32>,
+    #[serde(rename = "z")]
+    content_sizes: PackedOptionalColumnV2<u64>,
+    #[serde(rename = "a")]
+    link_targets: PackedOptionalColumnV2<u32>,
+    #[serde(rename = "m", default, skip_serializing_if = "Vec::is_empty")]
+    modes: Vec<u32>,
+    #[serde(rename = "u", default, skip_serializing_if = "Vec::is_empty")]
+    uids: Vec<u32>,
+    #[serde(rename = "g", default, skip_serializing_if = "Vec::is_empty")]
+    gids: Vec<u32>,
+    #[serde(rename = "aa", default, skip_serializing_if = "Vec::is_empty")]
+    accessed_at_unix_nanos: Vec<u64>,
+    #[serde(rename = "mm", default, skip_serializing_if = "Vec::is_empty")]
+    modified_at_unix_nanos: Vec<u64>,
+    #[serde(rename = "cc", default, skip_serializing_if = "Vec::is_empty")]
+    created_at_unix_nanos: Vec<u64>,
+    #[serde(rename = "xx", default, skip_serializing_if = "Vec::is_empty")]
+    changed_at_unix_nanos: Vec<u64>,
+    #[serde(rename = "v", default, skip_serializing_if = "Vec::is_empty")]
+    versions: Vec<u32>,
+    #[serde(rename = "y", default, skip_serializing_if = "Vec::is_empty")]
+    policies: Vec<u8>,
+    #[serde(rename = "c")]
+    created_by_events: PackedOptionalColumnV2<u32>,
+    #[serde(rename = "e")]
+    last_modified_by_events: PackedOptionalColumnV2<u32>,
+    #[serde(rename = "t", default, skip_serializing_if = "Vec::is_empty")]
+    tombstone_provenance: Vec<PackedSparseTombstoneProvenanceV2>,
+}
+
+/// Dense values plus a compact missing-value bitmap. SOBJ arrays are typed,
+/// so a `Vec<Option<T>>` cannot mix null and primitive elements.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PackedOptionalColumnV2<T> {
+    #[serde(rename = "v", default, skip_serializing_if = "Vec::is_empty")]
+    values: Vec<T>,
+    /// Empty means every row is present. Otherwise one bit per missing row.
+    #[serde(rename = "m", default, skip_serializing_if = "Vec::is_empty")]
+    missing: Vec<u64>,
+}
+
+impl<T> Default for PackedOptionalColumnV2<T> {
+    fn default() -> Self {
+        Self {
+            values: Vec::new(),
+            missing: Vec::new(),
+        }
+    }
+}
+
+impl<T> PackedOptionalColumnV2<T>
+where
+    T: Copy + Default,
+{
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            values: Vec::with_capacity(capacity),
+            missing: Vec::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn push(&mut self, value: Option<T>) {
+        let row = self.values.len();
+        self.values.push(value.unwrap_or_default());
+        if value.is_none() {
+            self.missing.resize(bitmap_word_len(row + 1), 0);
+            self.missing[row / 64] |= 1_u64 << (row % 64);
+        } else if !self.missing.is_empty() {
+            self.missing.resize(bitmap_word_len(row + 1), 0);
+        }
+    }
+
+    fn get(&self, row: usize) -> Option<T> {
+        let value = *self.values.get(row)?;
+        let missing = self
+            .missing
+            .get(row / 64)
+            .is_some_and(|word| word & (1_u64 << (row % 64)) != 0);
+        (!missing).then_some(value)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Option<T>> + '_ {
+        (0..self.len()).map(|row| self.get(row))
+    }
+
+    fn validate_shape(
+        &self,
+        table: &'static str,
+        column: &'static str,
+        expected: usize,
+    ) -> Result<(), DfsNamespacePrepareCodecError> {
+        validate_column_length(table, column, expected, self.values.len())?;
+        if self.missing.is_empty() {
+            return Ok(());
+        }
+        validate_column_length(
+            table,
+            "optional_bitmap_words",
+            bitmap_word_len(expected),
+            self.missing.len(),
+        )?;
+        if let Some(last) = self.missing.last()
+            && expected % 64 != 0
+            && *last >> (expected % 64) != 0
+        {
+            return Err(DfsNamespacePrepareCodecError::NonCanonicalSparseRows {
+                field: column,
+                entry: expected,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn bitmap_word_len(rows: usize) -> usize {
+    rows.saturating_add(63) / 64
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PackedSparseTombstoneProvenanceV2 {
+    #[serde(rename = "r")]
+    row: u32,
+    #[serde(rename = "p")]
+    provenance: DfsTombstoneProvenance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PackedObjectVersionsV2 {
+    #[serde(rename = "o", default, skip_serializing_if = "Vec::is_empty")]
+    object_ids: Vec<u32>,
+    #[serde(rename = "v", default, skip_serializing_if = "Vec::is_empty")]
+    versions: Vec<u32>,
+    #[serde(rename = "h")]
+    content_hashes: PackedOptionalColumnV2<u32>,
+    #[serde(rename = "z")]
+    sizes: PackedOptionalColumnV2<u64>,
+    #[serde(rename = "l", default, skip_serializing_if = "Vec::is_empty")]
+    location_sets: Vec<u32>,
+    #[serde(rename = "e")]
+    created_by_events: PackedOptionalColumnV2<u32>,
+    #[serde(rename = "t", default, skip_serializing_if = "Vec::is_empty")]
+    created_at: Vec<PackedTimeV2>,
+    #[serde(rename = "b", default, skip_serializing_if = "Vec::is_empty")]
+    visible: Vec<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PackedReplicaReceiptsV2 {
+    #[serde(rename = "o", default, skip_serializing_if = "Vec::is_empty")]
+    object_ids: Vec<u32>,
+    #[serde(rename = "v", default, skip_serializing_if = "Vec::is_empty")]
+    versions: Vec<u32>,
+    #[serde(rename = "n", default, skip_serializing_if = "Vec::is_empty")]
+    owner_nodes: Vec<u32>,
+    #[serde(rename = "e", default, skip_serializing_if = "Vec::is_empty")]
+    events: Vec<u32>,
+    #[serde(rename = "r", default, skip_serializing_if = "Vec::is_empty")]
+    replica_nodes: Vec<u32>,
+    #[serde(rename = "h")]
+    content_hashes: PackedOptionalColumnV2<u32>,
+    #[serde(rename = "t", default, skip_serializing_if = "Vec::is_empty")]
+    received_at: Vec<PackedTimeV2>,
+}
+
+/// Exact instant and display offset without RFC3339 string amplification.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PackedTimeV2 {
+    #[serde(rename = "s")]
+    unix_seconds: i64,
+    #[serde(rename = "n")]
+    nanosecond: u32,
+    #[serde(rename = "o", default, skip_serializing_if = "is_zero_i32")]
+    offset_seconds: i32,
+}
+
+impl From<OffsetDateTime> for PackedTimeV2 {
+    fn from(value: OffsetDateTime) -> Self {
+        Self {
+            unix_seconds: value.unix_timestamp(),
+            nanosecond: value.nanosecond(),
+            offset_seconds: value.offset().whole_seconds(),
+        }
+    }
+}
+
+struct BorrowedInterner<'a, T> {
+    dictionary: &'static str,
+    indices: HashMap<&'a T, u32>,
+    values: Vec<T>,
+}
+
+impl<'a, T> BorrowedInterner<'a, T>
+where
+    T: Clone + Eq + Hash,
+{
+    fn new(dictionary: &'static str) -> Self {
+        Self {
+            dictionary,
+            indices: HashMap::new(),
+            values: Vec::new(),
+        }
+    }
+
+    fn intern(&mut self, value: &'a T) -> Result<u32, DfsNamespacePrepareCodecError> {
+        if let Some(index) = self.indices.get(value).copied() {
+            return Ok(index);
+        }
+        let index = u32::try_from(self.values.len()).map_err(|_| {
+            DfsNamespacePrepareCodecError::DictionaryTooLarge {
+                dictionary: self.dictionary,
+                len: self.values.len(),
+            }
+        })?;
+        self.indices.insert(value, index);
+        self.values.push(value.clone());
+        Ok(index)
+    }
+}
+
+struct BorrowedDictionariesV2<'a> {
+    object_ids: BorrowedInterner<'a, DfsObjectId>,
+    paths: BorrowedInterner<'a, String>,
+    versions: BorrowedInterner<'a, DfsVersion>,
+    hashes: BorrowedInterner<'a, String>,
+    nodes: BorrowedInterner<'a, NodeId>,
+    events: BorrowedInterner<'a, EventId>,
+    location_indices: HashMap<&'a [NodeId], u32>,
+    location_sets: PackedLocationSetsV2,
+}
+
+impl<'a> BorrowedDictionariesV2<'a> {
+    fn new() -> Self {
+        Self {
+            object_ids: BorrowedInterner::new("object_ids"),
+            paths: BorrowedInterner::new("paths"),
+            versions: BorrowedInterner::new("versions"),
+            hashes: BorrowedInterner::new("hashes"),
+            nodes: BorrowedInterner::new("nodes"),
+            events: BorrowedInterner::new("events"),
+            location_indices: HashMap::new(),
+            location_sets: PackedLocationSetsV2::empty(),
+        }
+    }
+
+    fn intern_locations(
+        &mut self,
+        locations: &'a [NodeId],
+    ) -> Result<u32, DfsNamespacePrepareCodecError> {
+        if let Some(index) = self.location_indices.get(locations).copied() {
+            return Ok(index);
+        }
+        let index = u32::try_from(self.location_sets.len()).map_err(|_| {
+            DfsNamespacePrepareCodecError::DictionaryTooLarge {
+                dictionary: "location_sets",
+                len: self.location_sets.len(),
+            }
+        })?;
+        let end = self
+            .location_sets
+            .nodes
+            .len()
+            .checked_add(locations.len())
+            .ok_or(DfsNamespacePrepareCodecError::DictionaryTooLarge {
+                dictionary: "location_nodes",
+                len: usize::MAX,
+            })?;
+        let end =
+            u32::try_from(end).map_err(|_| DfsNamespacePrepareCodecError::DictionaryTooLarge {
+                dictionary: "location_nodes",
+                len: end,
+            })?;
+        for node in locations {
+            self.location_sets.nodes.push(self.nodes.intern(node)?);
+        }
+        self.location_sets.offsets.push(end);
+        self.location_indices.insert(locations, index);
+        Ok(index)
+    }
+
+    fn finish(self) -> PackedDictionariesV2 {
+        PackedDictionariesV2 {
+            object_ids: self.object_ids.values,
+            paths: self.paths.values,
+            versions: self.versions.values,
+            hashes: self.hashes.values,
+            nodes: self.nodes.values,
+            events: self.events.values,
+            location_sets: self.location_sets,
+        }
+    }
+}
+
+impl DfsPackedNamespacePrepareV2 {
+    pub(crate) fn format_is_supported(&self) -> bool {
+        self.format_version == DFS_PACKED_NAMESPACE_PREPARE_V2
+    }
+
+    fn require_supported_format(&self) -> Result<(), DfsNamespacePrepareCodecError> {
+        if self.format_is_supported() {
+            return Ok(());
+        }
+        Err(DfsNamespacePrepareCodecError::UnsupportedVersion(
+            self.format_version,
+        ))
+    }
+
+    pub(crate) fn shard_id(&self) -> &DfsMetadataShardId {
+        &self.shard_id
+    }
+
+    pub(crate) fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+
+    pub(crate) fn operation_digest(&self) -> &str {
+        &self.operation_digest
+    }
+
+    pub(crate) fn matches_prepare_identity(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        owner_epoch: u64,
+        operation_digest: &str,
+    ) -> bool {
+        self.shard_id() == shard_id
+            && self.owner_epoch() == owner_epoch
+            && self.operation_digest() == operation_digest
+    }
+
+    pub(crate) fn pack(
+        prepare: &DfsNamespacePrepareRecord,
+    ) -> Result<Self, DfsNamespacePrepareCodecError> {
+        let file_system_id = &prepare.file_system_id;
+        require_file_system(
+            "transaction",
+            file_system_id,
+            &prepare.transaction.file_system_id,
+        )?;
+
+        let mut dictionaries = BorrowedDictionariesV2::new();
+        let mut objects = PackedObjectsV2 {
+            object_ids: Vec::with_capacity(prepare.transaction.objects.len()),
+            paths: Vec::with_capacity(prepare.transaction.objects.len()),
+            kinds: Vec::with_capacity(prepare.transaction.objects.len()),
+            owner_nodes: Vec::with_capacity(prepare.transaction.objects.len()),
+            location_sets: Vec::with_capacity(prepare.transaction.objects.len()),
+            content_hashes: PackedOptionalColumnV2::with_capacity(
+                prepare.transaction.objects.len(),
+            ),
+            content_sizes: PackedOptionalColumnV2::with_capacity(prepare.transaction.objects.len()),
+            link_targets: PackedOptionalColumnV2::with_capacity(prepare.transaction.objects.len()),
+            modes: Vec::with_capacity(prepare.transaction.objects.len()),
+            uids: Vec::with_capacity(prepare.transaction.objects.len()),
+            gids: Vec::with_capacity(prepare.transaction.objects.len()),
+            accessed_at_unix_nanos: Vec::with_capacity(prepare.transaction.objects.len()),
+            modified_at_unix_nanos: Vec::with_capacity(prepare.transaction.objects.len()),
+            created_at_unix_nanos: Vec::with_capacity(prepare.transaction.objects.len()),
+            changed_at_unix_nanos: Vec::with_capacity(prepare.transaction.objects.len()),
+            versions: Vec::with_capacity(prepare.transaction.objects.len()),
+            policies: Vec::with_capacity(prepare.transaction.objects.len()),
+            created_by_events: PackedOptionalColumnV2::with_capacity(
+                prepare.transaction.objects.len(),
+            ),
+            last_modified_by_events: PackedOptionalColumnV2::with_capacity(
+                prepare.transaction.objects.len(),
+            ),
+            tombstone_provenance: Vec::new(),
+        };
+        for (row, object) in prepare.transaction.objects.iter().enumerate() {
+            require_indexed_file_system(
+                "transaction.objects",
+                row,
+                file_system_id,
+                &object.file_system_id,
+            )?;
+            objects
+                .object_ids
+                .push(dictionaries.object_ids.intern(&object.object_id)?);
+            objects.paths.push(dictionaries.paths.intern(&object.path)?);
+            objects.kinds.push(pack_object_kind(&object.kind));
+            objects
+                .owner_nodes
+                .push(dictionaries.nodes.intern(&object.owner_node_id)?);
+            objects
+                .location_sets
+                .push(dictionaries.intern_locations(&object.current_locations)?);
+            objects.content_hashes.push(intern_optional(
+                &mut dictionaries.hashes,
+                object.content_hash.as_ref(),
+            )?);
+            objects.content_sizes.push(object.content_size_bytes);
+            objects.link_targets.push(intern_optional(
+                &mut dictionaries.object_ids,
+                object.link_target_object_id.as_ref(),
+            )?);
+            objects.modes.push(object.mode);
+            objects.uids.push(object.uid);
+            objects.gids.push(object.gid);
+            objects
+                .accessed_at_unix_nanos
+                .push(object.accessed_at_unix_nanos);
+            objects
+                .modified_at_unix_nanos
+                .push(object.modified_at_unix_nanos);
+            objects
+                .created_at_unix_nanos
+                .push(object.created_at_unix_nanos);
+            objects
+                .changed_at_unix_nanos
+                .push(object.changed_at_unix_nanos);
+            objects
+                .versions
+                .push(dictionaries.versions.intern(&object.version)?);
+            objects.policies.push(pack_object_policy(&object.policy));
+            objects.created_by_events.push(intern_optional(
+                &mut dictionaries.events,
+                object.created_by_event_id.as_ref(),
+            )?);
+            objects.last_modified_by_events.push(intern_optional(
+                &mut dictionaries.events,
+                object.last_modified_by_event_id.as_ref(),
+            )?);
+            if let Some(provenance) = &object.tombstone_provenance {
+                let row = u32::try_from(row).map_err(|_| {
+                    DfsNamespacePrepareCodecError::DictionaryTooLarge {
+                        dictionary: "object_rows",
+                        len: prepare.transaction.objects.len(),
+                    }
+                })?;
+                objects
+                    .tombstone_provenance
+                    .push(PackedSparseTombstoneProvenanceV2 {
+                        row,
+                        provenance: provenance.clone(),
+                    });
+            }
+        }
+
+        let mut versions = PackedObjectVersionsV2 {
+            object_ids: Vec::with_capacity(prepare.transaction.versions.len()),
+            versions: Vec::with_capacity(prepare.transaction.versions.len()),
+            content_hashes: PackedOptionalColumnV2::with_capacity(
+                prepare.transaction.versions.len(),
+            ),
+            sizes: PackedOptionalColumnV2::with_capacity(prepare.transaction.versions.len()),
+            location_sets: Vec::with_capacity(prepare.transaction.versions.len()),
+            created_by_events: PackedOptionalColumnV2::with_capacity(
+                prepare.transaction.versions.len(),
+            ),
+            created_at: Vec::with_capacity(prepare.transaction.versions.len()),
+            visible: Vec::with_capacity(prepare.transaction.versions.len()),
+        };
+        for (row, version) in prepare.transaction.versions.iter().enumerate() {
+            require_indexed_file_system(
+                "transaction.versions",
+                row,
+                file_system_id,
+                &version.file_system_id,
+            )?;
+            versions
+                .object_ids
+                .push(dictionaries.object_ids.intern(&version.object_id)?);
+            versions
+                .versions
+                .push(dictionaries.versions.intern(&version.version)?);
+            versions.content_hashes.push(intern_optional(
+                &mut dictionaries.hashes,
+                version.content_hash.as_ref(),
+            )?);
+            versions.sizes.push(version.size_bytes);
+            versions
+                .location_sets
+                .push(dictionaries.intern_locations(&version.locations)?);
+            versions.created_by_events.push(intern_optional(
+                &mut dictionaries.events,
+                version.created_by_event_id.as_ref(),
+            )?);
+            versions.created_at.push(version.created_at.into());
+            versions.visible.push(version.visible);
+        }
+
+        let mut expected_object_versions = PackedObjectVersionExpectationsV2 {
+            object_ids: Vec::with_capacity(prepare.expected_object_versions.len()),
+            expected_versions: PackedOptionalColumnV2::with_capacity(
+                prepare.expected_object_versions.len(),
+            ),
+        };
+        for expected in &prepare.expected_object_versions {
+            expected_object_versions
+                .object_ids
+                .push(dictionaries.object_ids.intern(&expected.object_id)?);
+            expected_object_versions
+                .expected_versions
+                .push(intern_optional(
+                    &mut dictionaries.versions,
+                    expected.expected_version.as_ref(),
+                )?);
+        }
+
+        let mut expected_path_occupants = PackedPathOccupantExpectationsV2 {
+            paths: Vec::with_capacity(prepare.expected_path_occupants.len()),
+            expected_object_ids: PackedOptionalColumnV2::with_capacity(
+                prepare.expected_path_occupants.len(),
+            ),
+        };
+        for expected in &prepare.expected_path_occupants {
+            expected_path_occupants
+                .paths
+                .push(dictionaries.paths.intern(&expected.path)?);
+            expected_path_occupants
+                .expected_object_ids
+                .push(intern_optional(
+                    &mut dictionaries.object_ids,
+                    expected.expected_object_id.as_ref(),
+                )?);
+        }
+
+        let mut content_receipts = PackedReplicaReceiptsV2 {
+            object_ids: Vec::with_capacity(prepare.content_receipts.len()),
+            versions: Vec::with_capacity(prepare.content_receipts.len()),
+            owner_nodes: Vec::with_capacity(prepare.content_receipts.len()),
+            events: Vec::with_capacity(prepare.content_receipts.len()),
+            replica_nodes: Vec::with_capacity(prepare.content_receipts.len()),
+            content_hashes: PackedOptionalColumnV2::with_capacity(prepare.content_receipts.len()),
+            received_at: Vec::with_capacity(prepare.content_receipts.len()),
+        };
+        for (row, receipt) in prepare.content_receipts.iter().enumerate() {
+            require_indexed_file_system(
+                "content_receipts",
+                row,
+                file_system_id,
+                &receipt.receipt.file_system_id,
+            )?;
+            content_receipts
+                .object_ids
+                .push(dictionaries.object_ids.intern(&receipt.receipt.object_id)?);
+            content_receipts.versions.push(
+                dictionaries
+                    .versions
+                    .intern(&receipt.receipt.committed_version)?,
+            );
+            content_receipts
+                .owner_nodes
+                .push(dictionaries.nodes.intern(&receipt.receipt.owner_node_id)?);
+            content_receipts
+                .events
+                .push(dictionaries.events.intern(&receipt.receipt.event_id)?);
+            content_receipts
+                .replica_nodes
+                .push(dictionaries.nodes.intern(&receipt.replica_node_id)?);
+            content_receipts.content_hashes.push(intern_optional(
+                &mut dictionaries.hashes,
+                receipt.content_hash.as_ref(),
+            )?);
+            content_receipts
+                .received_at
+                .push(receipt.received_at.into());
+        }
+
+        let advisory_lock_states = prepare
+            .transaction
+            .advisory_lock_states
+            .iter()
+            .enumerate()
+            .map(|(row, state)| {
+                require_indexed_file_system(
+                    "transaction.advisory_lock_states",
+                    row,
+                    file_system_id,
+                    &state.file_system_id,
+                )?;
+                Ok(state.clone())
+            })
+            .collect::<Result<Vec<_>, DfsNamespacePrepareCodecError>>()?;
+        if let Some(request) = &prepare.completed_request {
+            require_file_system("completed_request", file_system_id, &request.file_system_id)?;
+        }
+        if let Some(completion) = &prepare.completed_request_completion {
+            require_file_system(
+                "completed_request_completion",
+                file_system_id,
+                &completion.file_system_id,
+            )?;
+        }
+
+        Ok(Self {
+            format_version: DFS_PACKED_NAMESPACE_PREPARE_V2,
+            shard_id: prepare.shard_id.clone(),
+            owner_epoch: prepare.owner_epoch,
+            operation_digest: prepare.operation_digest.clone(),
+            dictionaries: dictionaries.finish(),
+            expected_object_versions,
+            expected_path_occupants,
+            content_receipts,
+            transaction_id: prepare.transaction.transaction_id.clone(),
+            objects,
+            versions,
+            advisory_lock_states,
+            transaction_created_at: prepare.transaction.created_at.into(),
+            completed_request: prepare.completed_request.clone(),
+            completed_request_completion: prepare.completed_request_completion.clone(),
+        })
+    }
+
+    pub(crate) fn validate_file_system_scope(
+        &self,
+        expected: &DfsFileSystemId,
+    ) -> Result<(), DfsNamespacePrepareCodecError> {
+        self.validate_structure()?;
+        for (index, state) in self.advisory_lock_states.iter().enumerate() {
+            require_indexed_file_system(
+                "advisory_lock_states",
+                index,
+                expected,
+                &state.file_system_id,
+            )?;
+        }
+        if let Some(request) = &self.completed_request {
+            require_file_system("completed_request", expected, &request.file_system_id)?;
+        }
+        if let Some(completion) = &self.completed_request_completion {
+            require_file_system(
+                "completed_request_completion",
+                expected,
+                &completion.file_system_id,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unpack(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        operation_id: &str,
+        status: DfsNamespacePrepareStatus,
+    ) -> Result<DfsNamespacePrepareRecord, DfsNamespacePrepareCodecError> {
+        self.validate_file_system_scope(file_system_id)?;
+        Ok(self.unpack_validated(file_system_id, operation_id, status))
+    }
+
+    /// Materialize a payload whose format, indices, and filesystem scope were
+    /// already validated by its enclosing payload view.
+    pub(crate) fn unpack_validated(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        operation_id: &str,
+        status: DfsNamespacePrepareStatus,
+    ) -> DfsNamespacePrepareRecord {
+        let expected_object_versions = self
+            .expected_object_versions
+            .object_ids
+            .iter()
+            .zip(self.expected_object_versions.expected_versions.iter())
+            .map(
+                |(object_id, expected_version)| DfsNamespaceObjectVersionExpectation {
+                    object_id: dictionary_value(
+                        &self.dictionaries.object_ids,
+                        *object_id,
+                        "expected_object_versions.object_ids",
+                        0,
+                        "object_ids",
+                    )
+                    .clone(),
+                    expected_version: expected_version.map(|index| {
+                        dictionary_value(
+                            &self.dictionaries.versions,
+                            index,
+                            "expected_object_versions.expected_versions",
+                            0,
+                            "versions",
+                        )
+                        .clone()
+                    }),
+                },
+            )
+            .collect();
+        let expected_path_occupants = self
+            .expected_path_occupants
+            .paths
+            .iter()
+            .zip(self.expected_path_occupants.expected_object_ids.iter())
+            .map(
+                |(path, expected_object_id)| DfsNamespacePathOccupantExpectation {
+                    path: dictionary_value(
+                        &self.dictionaries.paths,
+                        *path,
+                        "expected_path_occupants.paths",
+                        0,
+                        "paths",
+                    )
+                    .clone(),
+                    expected_object_id: expected_object_id.map(|index| {
+                        dictionary_value(
+                            &self.dictionaries.object_ids,
+                            index,
+                            "expected_path_occupants.expected_object_ids",
+                            0,
+                            "object_ids",
+                        )
+                        .clone()
+                    }),
+                },
+            )
+            .collect();
+
+        let content_receipts = (0..self.content_receipts.object_ids.len())
+            .map(|row| DfsReplicaReceiptRecord {
+                receipt: DfsWriteReceipt {
+                    file_system_id: file_system_id.clone(),
+                    object_id: self.object_id_at(
+                        self.content_receipts.object_ids[row],
+                        "content_receipts.object_ids",
+                        row,
+                    ),
+                    committed_version: self.version_at(
+                        self.content_receipts.versions[row],
+                        "content_receipts.versions",
+                        row,
+                    ),
+                    owner_node_id: self.node_at(
+                        self.content_receipts.owner_nodes[row],
+                        "content_receipts.owner_nodes",
+                        row,
+                    ),
+                    event_id: self.event_at(
+                        self.content_receipts.events[row],
+                        "content_receipts.events",
+                        row,
+                    ),
+                },
+                replica_node_id: self.node_at(
+                    self.content_receipts.replica_nodes[row],
+                    "content_receipts.replica_nodes",
+                    row,
+                ),
+                content_hash: self
+                    .content_receipts
+                    .content_hashes
+                    .get(row)
+                    .map(|index| self.hash_at(index, "content_receipts.content_hashes", row)),
+                received_at: unpack_time(
+                    self.content_receipts.received_at[row],
+                    "content_receipts.received_at",
+                    row,
+                )
+                .expect("validated packed-v2 receipt time"),
+            })
+            .collect();
+
+        let mut tombstones = self.objects.tombstone_provenance.iter().peekable();
+        let objects = (0..self.objects.object_ids.len())
+            .map(|row| {
+                let tombstone_provenance = tombstones
+                    .next_if(|entry| entry.row as usize == row)
+                    .map(|entry| entry.provenance.clone());
+                DfsObjectMetadata {
+                    object_id: self.object_id_at(
+                        self.objects.object_ids[row],
+                        "objects.object_ids",
+                        row,
+                    ),
+                    file_system_id: file_system_id.clone(),
+                    path: self.path_at(self.objects.paths[row], "objects.paths", row),
+                    kind: unpack_object_kind(self.objects.kinds[row], "objects.kinds", row)
+                        .expect("validated packed-v2 object kind"),
+                    tombstone_provenance,
+                    owner_node_id: self.node_at(
+                        self.objects.owner_nodes[row],
+                        "objects.owner_nodes",
+                        row,
+                    ),
+                    current_locations: self.location_set_at(
+                        self.objects.location_sets[row],
+                        "objects.location_sets",
+                        row,
+                    ),
+                    content_hash: self
+                        .objects
+                        .content_hashes
+                        .get(row)
+                        .map(|index| self.hash_at(index, "objects.content_hashes", row)),
+                    content_size_bytes: self.objects.content_sizes.get(row),
+                    link_target_object_id: self
+                        .objects
+                        .link_targets
+                        .get(row)
+                        .map(|index| self.object_id_at(index, "objects.link_targets", row)),
+                    mode: self.objects.modes[row],
+                    uid: self.objects.uids[row],
+                    gid: self.objects.gids[row],
+                    accessed_at_unix_nanos: self.objects.accessed_at_unix_nanos[row],
+                    modified_at_unix_nanos: self.objects.modified_at_unix_nanos[row],
+                    created_at_unix_nanos: self.objects.created_at_unix_nanos[row],
+                    changed_at_unix_nanos: self.objects.changed_at_unix_nanos[row],
+                    version: self.version_at(self.objects.versions[row], "objects.versions", row),
+                    policy: unpack_object_policy(
+                        self.objects.policies[row],
+                        "objects.policies",
+                        row,
+                    )
+                    .expect("validated packed-v2 object policy"),
+                    created_by_event_id: self
+                        .objects
+                        .created_by_events
+                        .get(row)
+                        .map(|index| self.event_at(index, "objects.created_by_events", row)),
+                    last_modified_by_event_id: self
+                        .objects
+                        .last_modified_by_events
+                        .get(row)
+                        .map(|index| self.event_at(index, "objects.last_modified_by_events", row)),
+                }
+            })
+            .collect();
+
+        let versions = (0..self.versions.object_ids.len())
+            .map(|row| DfsObjectVersionRecord {
+                file_system_id: file_system_id.clone(),
+                object_id: self.object_id_at(
+                    self.versions.object_ids[row],
+                    "versions.object_ids",
+                    row,
+                ),
+                version: self.version_at(self.versions.versions[row], "versions.versions", row),
+                content_hash: self
+                    .versions
+                    .content_hashes
+                    .get(row)
+                    .map(|index| self.hash_at(index, "versions.content_hashes", row)),
+                size_bytes: self.versions.sizes.get(row),
+                locations: self.location_set_at(
+                    self.versions.location_sets[row],
+                    "versions.location_sets",
+                    row,
+                ),
+                created_by_event_id: self
+                    .versions
+                    .created_by_events
+                    .get(row)
+                    .map(|index| self.event_at(index, "versions.created_by_events", row)),
+                created_at: unpack_time(self.versions.created_at[row], "versions.created_at", row)
+                    .expect("validated packed-v2 version time"),
+                visible: self.versions.visible[row],
+            })
+            .collect();
+
+        let mut prepare = DfsNamespacePrepareRecord {
+            operation_id: operation_id.to_string(),
+            file_system_id: file_system_id.clone(),
+            shard_id: self.shard_id.clone(),
+            owner_epoch: self.owner_epoch,
+            operation_digest: self.operation_digest.clone(),
+            expected_object_versions,
+            expected_path_occupants,
+            content_receipts,
+            transaction: DfsNamespaceTransaction {
+                transaction_id: self.transaction_id.clone(),
+                file_system_id: file_system_id.clone(),
+                objects,
+                versions,
+                advisory_lock_states: self.advisory_lock_states.clone(),
+                created_at: unpack_time(self.transaction_created_at, "transaction_created_at", 0)
+                    .expect("validated packed-v2 transaction time"),
+            },
+            completed_request: self.completed_request.clone(),
+            completed_request_completion: self.completed_request_completion.clone(),
+            status,
+        };
+        normalize_unpacked_canonical_in_place(&mut prepare);
+        prepare
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visit_affected_object_ids(
+        &self,
+        visit: impl FnMut(&DfsObjectId),
+    ) -> Result<(), DfsNamespacePrepareCodecError> {
+        self.validate_structure()?;
+        self.visit_affected_object_ids_validated(visit);
+        Ok(())
+    }
+
+    /// Visit object identities after the enclosing payload view has validated
+    /// every dictionary index and column shape.
+    pub(crate) fn visit_affected_object_ids_validated(&self, mut visit: impl FnMut(&DfsObjectId)) {
+        for (row, index) in self.expected_object_versions.object_ids.iter().enumerate() {
+            visit(dictionary_value(
+                &self.dictionaries.object_ids,
+                *index,
+                "expected_object_versions.object_ids",
+                row,
+                "object_ids",
+            ));
+        }
+        for (row, index) in self.objects.object_ids.iter().enumerate() {
+            visit(dictionary_value(
+                &self.dictionaries.object_ids,
+                *index,
+                "objects.object_ids",
+                row,
+                "object_ids",
+            ));
+        }
+    }
+
+    pub(crate) fn record_count(&self) -> usize {
+        self.objects
+            .object_ids
+            .len()
+            .saturating_add(self.versions.object_ids.len())
+            .saturating_add(self.advisory_lock_states.len())
+            .saturating_add(self.expected_object_versions.object_ids.len())
+            .saturating_add(self.expected_path_occupants.paths.len())
+            .saturating_add(self.content_receipts.object_ids.len())
+    }
+
+    fn object_id_at(&self, index: u32, field: &'static str, row: usize) -> DfsObjectId {
+        dictionary_value(
+            &self.dictionaries.object_ids,
+            index,
+            field,
+            row,
+            "object_ids",
+        )
+        .clone()
+    }
+
+    fn path_at(&self, index: u32, field: &'static str, row: usize) -> String {
+        dictionary_value(&self.dictionaries.paths, index, field, row, "paths").clone()
+    }
+
+    fn version_at(&self, index: u32, field: &'static str, row: usize) -> DfsVersion {
+        dictionary_value(&self.dictionaries.versions, index, field, row, "versions").clone()
+    }
+
+    fn hash_at(&self, index: u32, field: &'static str, row: usize) -> String {
+        dictionary_value(&self.dictionaries.hashes, index, field, row, "hashes").clone()
+    }
+
+    fn node_at(&self, index: u32, field: &'static str, row: usize) -> NodeId {
+        dictionary_value(&self.dictionaries.nodes, index, field, row, "nodes").clone()
+    }
+
+    fn event_at(&self, index: u32, field: &'static str, row: usize) -> EventId {
+        dictionary_value(&self.dictionaries.events, index, field, row, "events").clone()
+    }
+
+    fn location_set_at(&self, index: u32, field: &'static str, row: usize) -> Vec<NodeId> {
+        let _ = (field, row);
+        self.dictionaries
+            .location_sets
+            .get(index as usize)
+            .expect("packed-v2 location-set reference was validated")
+            .iter()
+            .map(|node| self.node_at(*node, "location_sets.nodes", index as usize))
+            .collect()
+    }
+
+    fn validate_structure(&self) -> Result<(), DfsNamespacePrepareCodecError> {
+        self.require_supported_format()?;
+        validate_unique_dictionary("object_ids", &self.dictionaries.object_ids)?;
+        validate_unique_dictionary("paths", &self.dictionaries.paths)?;
+        validate_unique_dictionary("versions", &self.dictionaries.versions)?;
+        validate_unique_dictionary("hashes", &self.dictionaries.hashes)?;
+        validate_unique_dictionary("nodes", &self.dictionaries.nodes)?;
+        validate_unique_dictionary("events", &self.dictionaries.events)?;
+        self.dictionaries
+            .location_sets
+            .validate(self.dictionaries.nodes.len())?;
+
+        let expectation_rows = self.expected_object_versions.object_ids.len();
+        self.expected_object_versions
+            .expected_versions
+            .validate_shape(
+                "expected_object_versions",
+                "expected_versions",
+                expectation_rows,
+            )?;
+        for row in 0..expectation_rows {
+            validate_index(
+                self.expected_object_versions.object_ids[row],
+                self.dictionaries.object_ids.len(),
+                "expected_object_versions.object_ids",
+                row,
+                "object_ids",
+            )?;
+            validate_optional_index(
+                self.expected_object_versions.expected_versions.get(row),
+                self.dictionaries.versions.len(),
+                "expected_object_versions.expected_versions",
+                row,
+                "versions",
+            )?;
+        }
+
+        let path_rows = self.expected_path_occupants.paths.len();
+        self.expected_path_occupants
+            .expected_object_ids
+            .validate_shape("expected_path_occupants", "expected_object_ids", path_rows)?;
+        for row in 0..path_rows {
+            validate_index(
+                self.expected_path_occupants.paths[row],
+                self.dictionaries.paths.len(),
+                "expected_path_occupants.paths",
+                row,
+                "paths",
+            )?;
+            validate_optional_index(
+                self.expected_path_occupants.expected_object_ids.get(row),
+                self.dictionaries.object_ids.len(),
+                "expected_path_occupants.expected_object_ids",
+                row,
+                "object_ids",
+            )?;
+        }
+
+        self.validate_object_columns()?;
+        self.validate_version_columns()?;
+        self.validate_receipt_columns()?;
+        unpack_time(self.transaction_created_at, "transaction_created_at", 0)?;
+        Ok(())
+    }
+
+    fn validate_object_columns(&self) -> Result<(), DfsNamespacePrepareCodecError> {
+        let rows = self.objects.object_ids.len();
+        self.objects
+            .content_hashes
+            .validate_shape("objects", "content_hashes", rows)?;
+        self.objects
+            .content_sizes
+            .validate_shape("objects", "content_sizes", rows)?;
+        self.objects
+            .link_targets
+            .validate_shape("objects", "link_targets", rows)?;
+        self.objects
+            .created_by_events
+            .validate_shape("objects", "created_by_events", rows)?;
+        self.objects.last_modified_by_events.validate_shape(
+            "objects",
+            "last_modified_by_events",
+            rows,
+        )?;
+        for (column, actual) in [
+            ("paths", self.objects.paths.len()),
+            ("kinds", self.objects.kinds.len()),
+            ("owner_nodes", self.objects.owner_nodes.len()),
+            ("location_sets", self.objects.location_sets.len()),
+            ("content_hashes", self.objects.content_hashes.len()),
+            ("content_sizes", self.objects.content_sizes.len()),
+            ("link_targets", self.objects.link_targets.len()),
+            ("modes", self.objects.modes.len()),
+            ("uids", self.objects.uids.len()),
+            ("gids", self.objects.gids.len()),
+            (
+                "accessed_at_unix_nanos",
+                self.objects.accessed_at_unix_nanos.len(),
+            ),
+            (
+                "modified_at_unix_nanos",
+                self.objects.modified_at_unix_nanos.len(),
+            ),
+            (
+                "created_at_unix_nanos",
+                self.objects.created_at_unix_nanos.len(),
+            ),
+            (
+                "changed_at_unix_nanos",
+                self.objects.changed_at_unix_nanos.len(),
+            ),
+            ("versions", self.objects.versions.len()),
+            ("policies", self.objects.policies.len()),
+            ("created_by_events", self.objects.created_by_events.len()),
+            (
+                "last_modified_by_events",
+                self.objects.last_modified_by_events.len(),
+            ),
+        ] {
+            validate_column_length("objects", column, rows, actual)?;
+        }
+        let mut previous_sparse_row = None;
+        for (entry, provenance) in self.objects.tombstone_provenance.iter().enumerate() {
+            if previous_sparse_row.is_some_and(|previous| previous >= provenance.row) {
+                return Err(DfsNamespacePrepareCodecError::NonCanonicalSparseRows {
+                    field: "objects.tombstone_provenance",
+                    entry,
+                });
+            }
+            validate_index(
+                provenance.row,
+                rows,
+                "objects.tombstone_provenance",
+                entry,
+                "object_rows",
+            )?;
+            previous_sparse_row = Some(provenance.row);
+        }
+        for row in 0..rows {
+            validate_index(
+                self.objects.object_ids[row],
+                self.dictionaries.object_ids.len(),
+                "objects.object_ids",
+                row,
+                "object_ids",
+            )?;
+            validate_index(
+                self.objects.paths[row],
+                self.dictionaries.paths.len(),
+                "objects.paths",
+                row,
+                "paths",
+            )?;
+            unpack_object_kind(self.objects.kinds[row], "objects.kinds", row)?;
+            validate_index(
+                self.objects.owner_nodes[row],
+                self.dictionaries.nodes.len(),
+                "objects.owner_nodes",
+                row,
+                "nodes",
+            )?;
+            validate_index(
+                self.objects.location_sets[row],
+                self.dictionaries.location_sets.len(),
+                "objects.location_sets",
+                row,
+                "location_sets",
+            )?;
+            validate_optional_index(
+                self.objects.content_hashes.get(row),
+                self.dictionaries.hashes.len(),
+                "objects.content_hashes",
+                row,
+                "hashes",
+            )?;
+            validate_optional_index(
+                self.objects.link_targets.get(row),
+                self.dictionaries.object_ids.len(),
+                "objects.link_targets",
+                row,
+                "object_ids",
+            )?;
+            validate_index(
+                self.objects.versions[row],
+                self.dictionaries.versions.len(),
+                "objects.versions",
+                row,
+                "versions",
+            )?;
+            unpack_object_policy(self.objects.policies[row], "objects.policies", row)?;
+            validate_optional_index(
+                self.objects.created_by_events.get(row),
+                self.dictionaries.events.len(),
+                "objects.created_by_events",
+                row,
+                "events",
+            )?;
+            validate_optional_index(
+                self.objects.last_modified_by_events.get(row),
+                self.dictionaries.events.len(),
+                "objects.last_modified_by_events",
+                row,
+                "events",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_version_columns(&self) -> Result<(), DfsNamespacePrepareCodecError> {
+        let rows = self.versions.object_ids.len();
+        self.versions
+            .content_hashes
+            .validate_shape("versions", "content_hashes", rows)?;
+        self.versions
+            .sizes
+            .validate_shape("versions", "sizes", rows)?;
+        self.versions
+            .created_by_events
+            .validate_shape("versions", "created_by_events", rows)?;
+        for (column, actual) in [
+            ("versions", self.versions.versions.len()),
+            ("content_hashes", self.versions.content_hashes.len()),
+            ("sizes", self.versions.sizes.len()),
+            ("location_sets", self.versions.location_sets.len()),
+            ("created_by_events", self.versions.created_by_events.len()),
+            ("created_at", self.versions.created_at.len()),
+            ("visible", self.versions.visible.len()),
+        ] {
+            validate_column_length("versions", column, rows, actual)?;
+        }
+        for row in 0..rows {
+            validate_index(
+                self.versions.object_ids[row],
+                self.dictionaries.object_ids.len(),
+                "versions.object_ids",
+                row,
+                "object_ids",
+            )?;
+            validate_index(
+                self.versions.versions[row],
+                self.dictionaries.versions.len(),
+                "versions.versions",
+                row,
+                "versions",
+            )?;
+            validate_optional_index(
+                self.versions.content_hashes.get(row),
+                self.dictionaries.hashes.len(),
+                "versions.content_hashes",
+                row,
+                "hashes",
+            )?;
+            validate_index(
+                self.versions.location_sets[row],
+                self.dictionaries.location_sets.len(),
+                "versions.location_sets",
+                row,
+                "location_sets",
+            )?;
+            validate_optional_index(
+                self.versions.created_by_events.get(row),
+                self.dictionaries.events.len(),
+                "versions.created_by_events",
+                row,
+                "events",
+            )?;
+            unpack_time(self.versions.created_at[row], "versions.created_at", row)?;
+        }
+        Ok(())
+    }
+
+    fn validate_receipt_columns(&self) -> Result<(), DfsNamespacePrepareCodecError> {
+        let rows = self.content_receipts.object_ids.len();
+        self.content_receipts.content_hashes.validate_shape(
+            "content_receipts",
+            "content_hashes",
+            rows,
+        )?;
+        for (column, actual) in [
+            ("versions", self.content_receipts.versions.len()),
+            ("owner_nodes", self.content_receipts.owner_nodes.len()),
+            ("events", self.content_receipts.events.len()),
+            ("replica_nodes", self.content_receipts.replica_nodes.len()),
+            ("content_hashes", self.content_receipts.content_hashes.len()),
+            ("received_at", self.content_receipts.received_at.len()),
+        ] {
+            validate_column_length("content_receipts", column, rows, actual)?;
+        }
+        for row in 0..rows {
+            validate_index(
+                self.content_receipts.object_ids[row],
+                self.dictionaries.object_ids.len(),
+                "content_receipts.object_ids",
+                row,
+                "object_ids",
+            )?;
+            validate_index(
+                self.content_receipts.versions[row],
+                self.dictionaries.versions.len(),
+                "content_receipts.versions",
+                row,
+                "versions",
+            )?;
+            validate_index(
+                self.content_receipts.owner_nodes[row],
+                self.dictionaries.nodes.len(),
+                "content_receipts.owner_nodes",
+                row,
+                "nodes",
+            )?;
+            validate_index(
+                self.content_receipts.events[row],
+                self.dictionaries.events.len(),
+                "content_receipts.events",
+                row,
+                "events",
+            )?;
+            validate_index(
+                self.content_receipts.replica_nodes[row],
+                self.dictionaries.nodes.len(),
+                "content_receipts.replica_nodes",
+                row,
+                "nodes",
+            )?;
+            validate_optional_index(
+                self.content_receipts.content_hashes.get(row),
+                self.dictionaries.hashes.len(),
+                "content_receipts.content_hashes",
+                row,
+                "hashes",
+            )?;
+            unpack_time(
+                self.content_receipts.received_at[row],
+                "content_receipts.received_at",
+                row,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn intern_optional<'a, T>(
+    interner: &mut BorrowedInterner<'a, T>,
+    value: Option<&'a T>,
+) -> Result<Option<u32>, DfsNamespacePrepareCodecError>
+where
+    T: Clone + Eq + Hash,
+{
+    value.map(|value| interner.intern(value)).transpose()
+}
+
+fn validate_unique_dictionary<T>(
+    dictionary: &'static str,
+    values: &[T],
+) -> Result<(), DfsNamespacePrepareCodecError>
+where
+    T: Eq + Hash,
+{
+    let mut unique = HashSet::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        if !unique.insert(value) {
+            return Err(DfsNamespacePrepareCodecError::DuplicateDictionaryValue {
+                dictionary,
+                index,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_column_length(
+    table: &'static str,
+    column: &'static str,
+    expected: usize,
+    actual: usize,
+) -> Result<(), DfsNamespacePrepareCodecError> {
+    if expected == actual {
+        return Ok(());
+    }
+    Err(DfsNamespacePrepareCodecError::ColumnLength {
+        table,
+        column,
+        expected,
+        actual,
+    })
+}
+
+fn validate_index(
+    index: u32,
+    len: usize,
+    field: &'static str,
+    row: usize,
+    dictionary: &'static str,
+) -> Result<(), DfsNamespacePrepareCodecError> {
+    if (index as usize) < len {
+        return Ok(());
+    }
+    Err(DfsNamespacePrepareCodecError::InvalidDictionaryIndex {
+        field,
+        row,
+        dictionary,
+        index,
+        len,
+    })
+}
+
+fn validate_optional_index(
+    index: Option<u32>,
+    len: usize,
+    field: &'static str,
+    row: usize,
+    dictionary: &'static str,
+) -> Result<(), DfsNamespacePrepareCodecError> {
+    index.map_or(Ok(()), |index| {
+        validate_index(index, len, field, row, dictionary)
+    })
+}
+
+fn dictionary_value<'a, T>(
+    values: &'a [T],
+    index: u32,
+    _field: &'static str,
+    _row: usize,
+    _dictionary: &'static str,
+) -> &'a T {
+    values
+        .get(index as usize)
+        .expect("packed-v2 dictionary reference was validated")
+}
+
+fn pack_object_kind(kind: &DfsObjectKind) -> u8 {
+    match kind {
+        DfsObjectKind::File => 0,
+        DfsObjectKind::Directory => 1,
+        DfsObjectKind::Symlink => 2,
+        DfsObjectKind::Hardlink => 3,
+        DfsObjectKind::Artifact => 4,
+        DfsObjectKind::Mount => 5,
+        DfsObjectKind::Tombstone => 6,
+    }
+}
+
+fn unpack_object_kind(
+    tag: u8,
+    field: &'static str,
+    row: usize,
+) -> Result<DfsObjectKind, DfsNamespacePrepareCodecError> {
+    match tag {
+        0 => Ok(DfsObjectKind::File),
+        1 => Ok(DfsObjectKind::Directory),
+        2 => Ok(DfsObjectKind::Symlink),
+        3 => Ok(DfsObjectKind::Hardlink),
+        4 => Ok(DfsObjectKind::Artifact),
+        5 => Ok(DfsObjectKind::Mount),
+        6 => Ok(DfsObjectKind::Tombstone),
+        tag => Err(DfsNamespacePrepareCodecError::InvalidEnumTag { field, row, tag }),
+    }
+}
+
+fn pack_object_policy(policy: &DfsObjectPolicy) -> u8 {
+    match policy {
+        DfsObjectPolicy::LocalOwned => 0,
+        DfsObjectPolicy::ReplicatedConfirmed => 1,
+        DfsObjectPolicy::ReplicatedEventual => 2,
+        DfsObjectPolicy::AppendOnly => 3,
+        DfsObjectPolicy::EphemeralLocal => 4,
+    }
+}
+
+fn unpack_object_policy(
+    tag: u8,
+    field: &'static str,
+    row: usize,
+) -> Result<DfsObjectPolicy, DfsNamespacePrepareCodecError> {
+    match tag {
+        0 => Ok(DfsObjectPolicy::LocalOwned),
+        1 => Ok(DfsObjectPolicy::ReplicatedConfirmed),
+        2 => Ok(DfsObjectPolicy::ReplicatedEventual),
+        3 => Ok(DfsObjectPolicy::AppendOnly),
+        4 => Ok(DfsObjectPolicy::EphemeralLocal),
+        tag => Err(DfsNamespacePrepareCodecError::InvalidEnumTag { field, row, tag }),
+    }
+}
+
+fn unpack_time(
+    packed: PackedTimeV2,
+    field: &'static str,
+    row: usize,
+) -> Result<OffsetDateTime, DfsNamespacePrepareCodecError> {
+    let invalid = || DfsNamespacePrepareCodecError::InvalidTime {
+        field,
+        row,
+        unix_nanos: i128::from(packed.unix_seconds)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(i128::from(packed.nanosecond)),
+        offset_seconds: packed.offset_seconds,
+    };
+    let value = OffsetDateTime::from_unix_timestamp(packed.unix_seconds)
+        .map_err(|_| invalid())?
+        .replace_nanosecond(packed.nanosecond)
+        .map_err(|_| invalid())?;
+    let offset = UtcOffset::from_whole_seconds(packed.offset_seconds).map_err(|_| invalid())?;
+    Ok(value.to_offset(offset))
+}
+
+/// Packed authors receive an already-normalized prepare from the backend.
+/// Reuse the authoritative normalizer while expanding untrusted journal bytes
+/// so replay preserves every canonical ordering choice made by the primary.
+fn normalize_unpacked_canonical_in_place(prepare: &mut DfsNamespacePrepareRecord) {
+    crate::metadata_records::normalize_namespace_prepare_in_place(prepare);
+}
+
 pub(crate) fn validate_namespace_prepare_file_system_scope(
     prepare: &DfsNamespacePrepareRecord,
     expected: &DfsFileSystemId,
@@ -625,6 +2343,10 @@ fn is_zero_u32(value: &u32) -> bool {
 }
 
 fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_zero_i32(value: &i32) -> bool {
     *value == 0
 }
 
@@ -773,7 +2495,7 @@ mod tests {
 
     #[test]
     fn packed_prepare_v1_round_trips_exact_canonical_record_through_sobj() {
-        let prepare = fixture_prepare(2);
+        let prepare = crate::metadata_records::normalized_namespace_prepare(&fixture_prepare(2));
         let packed = DfsPackedNamespacePrepareV1::pack(&prepare).expect("pack prepare");
         let bytes = sinomo_object_serde::to_bytes(&packed, 1, LengthMode::U32)
             .expect("encode packed prepare");
@@ -787,6 +2509,253 @@ mod tests {
             )
             .expect("unpack prepare");
         assert_eq!(unpacked, prepare);
+    }
+
+    #[test]
+    fn packed_prepare_v2_round_trips_normalized_canonical_record_through_sobj() {
+        let prepare = crate::metadata_records::normalized_namespace_prepare(&fixture_prepare(8));
+        let packed = DfsPackedNamespacePrepareV2::pack(&prepare).expect("pack prepare");
+        let bytes = sinomo_object_serde::to_bytes(&packed, 1, LengthMode::U32)
+            .expect("encode packed prepare");
+        let decoded: DfsPackedNamespacePrepareV2 =
+            sinomo_object_serde::from_bytes(&bytes).expect("decode packed prepare");
+        let unpacked = decoded
+            .unpack(
+                &prepare.file_system_id,
+                &prepare.operation_id,
+                prepare.status.clone(),
+            )
+            .expect("unpack prepare");
+        assert_eq!(unpacked, prepare);
+    }
+
+    #[test]
+    fn packed_prepare_v1_and_v2_replay_preserve_authoritative_location_order_and_digest() {
+        let mut prepare = fixture_prepare(1);
+        let mut locations: [NodeId; 2] =
+            [id("node-packed-location-a"), id("node-packed-location-b")];
+        locations.sort();
+        let authoritative_order = vec![locations[1].clone(), locations[0].clone()];
+        prepare.transaction.objects[0].current_locations = vec![
+            authoritative_order[0].clone(),
+            authoritative_order[1].clone(),
+            authoritative_order[0].clone(),
+        ];
+        prepare.transaction.versions[0].locations = vec![
+            authoritative_order[0].clone(),
+            authoritative_order[1].clone(),
+            authoritative_order[0].clone(),
+        ];
+        crate::metadata_records::normalize_namespace_prepare_in_place(&mut prepare);
+
+        assert_eq!(
+            prepare.transaction.objects[0].current_locations,
+            authoritative_order
+        );
+        assert_eq!(
+            prepare.transaction.versions[0].locations,
+            authoritative_order
+        );
+        let primary_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest_normalized(&prepare)
+                .expect("primary prepare digest");
+
+        let replayed_v1 = DfsPackedNamespacePrepareV1::pack(&prepare)
+            .expect("pack v1 prepare")
+            .unpack(
+                &prepare.file_system_id,
+                &prepare.operation_id,
+                prepare.status.clone(),
+            )
+            .expect("unpack v1 prepare");
+        assert_eq!(replayed_v1, prepare);
+        assert_eq!(
+            crate::service_replica::metadata_namespace_prepare_payload_digest_normalized(
+                &replayed_v1,
+            )
+            .expect("v1 replay prepare digest"),
+            primary_digest
+        );
+
+        let replayed_v2 = DfsPackedNamespacePrepareV2::pack(&prepare)
+            .expect("pack v2 prepare")
+            .unpack(
+                &prepare.file_system_id,
+                &prepare.operation_id,
+                prepare.status.clone(),
+            )
+            .expect("unpack v2 prepare");
+        assert_eq!(replayed_v2, prepare);
+        assert_eq!(
+            crate::service_replica::metadata_namespace_prepare_payload_digest_normalized(
+                &replayed_v2,
+            )
+            .expect("v2 replay prepare digest"),
+            primary_digest
+        );
+    }
+
+    #[test]
+    fn packed_prepare_v2_normalizes_untrusted_noncanonical_rows_once_while_unpacking() {
+        let mut prepare = fixture_prepare(3);
+        let first_location = id("node-packed-location-a");
+        let second_location = id("node-packed-location-b");
+        prepare.transaction.objects[0].current_locations = vec![
+            second_location.clone(),
+            first_location.clone(),
+            second_location.clone(),
+        ];
+        prepare.transaction.versions[0].locations =
+            vec![second_location.clone(), first_location, second_location];
+        prepare.expected_path_occupants[0].path = "//services//packed-codec///0".to_string();
+        prepare.expected_object_versions.reverse();
+        prepare.expected_path_occupants.reverse();
+        prepare.content_receipts.reverse();
+
+        let expected = crate::metadata_records::normalized_namespace_prepare(&prepare);
+        let packed =
+            DfsPackedNamespacePrepareV2::pack(&prepare).expect("pack noncanonical prepare");
+        let bytes = sinomo_object_serde::to_bytes(&packed, 1, LengthMode::U32)
+            .expect("encode noncanonical packed prepare");
+        let decoded: DfsPackedNamespacePrepareV2 =
+            sinomo_object_serde::from_bytes(&bytes).expect("decode noncanonical packed prepare");
+        assert_eq!(
+            decoded
+                .unpack(
+                    &prepare.file_system_id,
+                    &prepare.operation_id,
+                    prepare.status.clone(),
+                )
+                .expect("normalize decoded prepare"),
+            expected
+        );
+    }
+
+    #[test]
+    fn packed_prepare_v2_is_deterministic_and_visits_borrowed_object_ids() {
+        let prepare = crate::metadata_records::normalized_namespace_prepare(&fixture_prepare(16));
+        let first = DfsPackedNamespacePrepareV2::pack(&prepare).expect("first pack");
+        let second = DfsPackedNamespacePrepareV2::pack(&prepare).expect("second pack");
+        assert_eq!(first, second);
+        assert_eq!(
+            sinomo_object_serde::to_bytes(&first, 1, LengthMode::U32).expect("first encode"),
+            sinomo_object_serde::to_bytes(&second, 1, LengthMode::U32).expect("second encode")
+        );
+
+        let mut visited = Vec::new();
+        first
+            .visit_affected_object_ids(|object_id| visited.push(object_id.clone()))
+            .expect("visit packed object IDs");
+        let expected = prepare
+            .expected_object_versions
+            .iter()
+            .map(|expected| expected.object_id.clone())
+            .chain(
+                prepare
+                    .transaction
+                    .objects
+                    .iter()
+                    .map(|object| object.object_id.clone()),
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(visited, expected);
+    }
+
+    #[test]
+    fn packed_prepare_v2_preserves_arbitrary_cross_family_relationships() {
+        let mut prepare = fixture_prepare(3);
+        let external_object = id("obj_packed_external_occupant");
+        prepare
+            .expected_object_versions
+            .push(DfsNamespaceObjectVersionExpectation {
+                object_id: external_object.clone(),
+                expected_version: Some(id("version_packed_external_base")),
+            });
+        prepare
+            .expected_path_occupants
+            .push(DfsNamespacePathOccupantExpectation {
+                path: "/services/packed-codec/external".to_string(),
+                expected_object_id: Some(external_object),
+            });
+        let first_object = prepare.transaction.objects[0].object_id.clone();
+        prepare.transaction.versions.push(DfsObjectVersionRecord {
+            file_system_id: prepare.file_system_id.clone(),
+            object_id: first_object,
+            version: id("version_packed_historical_extra"),
+            content_hash: None,
+            size_bytes: None,
+            locations: Vec::new(),
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::nanoseconds(17),
+            visible: false,
+        });
+        let prepare = crate::metadata_records::normalized_namespace_prepare(&prepare);
+        let packed = DfsPackedNamespacePrepareV2::pack(&prepare).expect("pack prepare");
+        assert_eq!(
+            packed
+                .unpack(
+                    &prepare.file_system_id,
+                    &prepare.operation_id,
+                    prepare.status.clone(),
+                )
+                .expect("unpack prepare"),
+            prepare
+        );
+    }
+
+    #[test]
+    fn packed_prepare_v2_rejects_malformed_columns_indices_and_dictionaries() {
+        let prepare = crate::metadata_records::normalized_namespace_prepare(&fixture_prepare(2));
+
+        let mut bad_column =
+            DfsPackedNamespacePrepareV2::pack(&prepare).expect("pack bad-column fixture");
+        bad_column.objects.paths.pop();
+        assert!(matches!(
+            bad_column.validate_file_system_scope(&prepare.file_system_id),
+            Err(DfsNamespacePrepareCodecError::ColumnLength {
+                table: "objects",
+                column: "paths",
+                ..
+            })
+        ));
+
+        let mut bad_index =
+            DfsPackedNamespacePrepareV2::pack(&prepare).expect("pack bad-index fixture");
+        bad_index.objects.object_ids[0] = u32::MAX;
+        assert!(matches!(
+            bad_index.validate_file_system_scope(&prepare.file_system_id),
+            Err(DfsNamespacePrepareCodecError::InvalidDictionaryIndex {
+                field: "objects.object_ids",
+                row: 0,
+                ..
+            })
+        ));
+
+        let mut duplicate =
+            DfsPackedNamespacePrepareV2::pack(&prepare).expect("pack duplicate fixture");
+        duplicate
+            .dictionaries
+            .paths
+            .push(duplicate.dictionaries.paths[0].clone());
+        assert!(matches!(
+            duplicate.validate_file_system_scope(&prepare.file_system_id),
+            Err(DfsNamespacePrepareCodecError::DuplicateDictionaryValue {
+                dictionary: "paths",
+                ..
+            })
+        ));
+
+        let mut bad_tag =
+            DfsPackedNamespacePrepareV2::pack(&prepare).expect("pack bad-tag fixture");
+        bad_tag.objects.kinds[0] = u8::MAX;
+        assert!(matches!(
+            bad_tag.validate_file_system_scope(&prepare.file_system_id),
+            Err(DfsNamespacePrepareCodecError::InvalidEnumTag {
+                field: "objects.kinds",
+                row: 0,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -905,10 +2874,19 @@ mod tests {
         packed_prepare_v1: &'a DfsPackedNamespacePrepareV1,
     }
 
+    #[derive(Serialize)]
+    struct PackedPrepareV2Envelope<'a> {
+        file_system_id: &'a DfsFileSystemId,
+        operation_id: &'a str,
+        status: &'a DfsNamespacePrepareStatus,
+        packed_prepare_v2: &'a DfsPackedNamespacePrepareV2,
+    }
+
     #[test]
-    fn packed_prepare_v1_materially_reduces_actual_sobj_for_4096_records() {
-        let prepare = fixture_prepare(4096);
+    fn packed_prepare_v2_materially_reduces_v1_and_legacy_sobj_for_4096_records() {
+        let prepare = crate::metadata_records::normalized_namespace_prepare(&fixture_prepare(4096));
         let packed = DfsPackedNamespacePrepareV1::pack(&prepare).expect("pack prepare");
+        let packed_v2 = DfsPackedNamespacePrepareV2::pack(&prepare).expect("pack v2 prepare");
         let legacy = LegacyPrepareEnvelope {
             file_system_id: &prepare.file_system_id,
             operation_id: &prepare.operation_id,
@@ -921,21 +2899,38 @@ mod tests {
             status: &prepare.status,
             packed_prepare_v1: &packed,
         };
+        let packed_v2_envelope = PackedPrepareV2Envelope {
+            file_system_id: &prepare.file_system_id,
+            operation_id: &prepare.operation_id,
+            status: &prepare.status,
+            packed_prepare_v2: &packed_v2,
+        };
         let legacy_bytes = sinomo_object_serde::to_bytes(&legacy, 1, LengthMode::U32)
             .expect("encode legacy prepare");
         let packed_bytes = sinomo_object_serde::to_bytes(&packed_envelope, 1, LengthMode::U32)
             .expect("encode packed prepare");
+        let packed_v2_bytes =
+            sinomo_object_serde::to_bytes(&packed_v2_envelope, 1, LengthMode::U32)
+                .expect("encode packed v2 prepare");
         eprintln!(
-            "namespace prepare SOBJ bytes: legacy={} packed={} reduction={:.1}%",
+            "namespace prepare SOBJ bytes: legacy={} packed_v1={} packed_v2={} v1_reduction={:.1}% v2_from_v1={:.1}%",
             legacy_bytes.len(),
             packed_bytes.len(),
-            100.0 * (legacy_bytes.len() - packed_bytes.len()) as f64 / legacy_bytes.len() as f64
+            packed_v2_bytes.len(),
+            100.0 * (legacy_bytes.len() - packed_bytes.len()) as f64 / legacy_bytes.len() as f64,
+            100.0 * (packed_bytes.len() - packed_v2_bytes.len()) as f64 / packed_bytes.len() as f64,
         );
         assert!(
             packed_bytes.len().saturating_mul(4) <= legacy_bytes.len().saturating_mul(3),
             "packed v1 must save at least 25%: legacy={} packed={}",
             legacy_bytes.len(),
             packed_bytes.len()
+        );
+        assert!(
+            packed_v2_bytes.len().saturating_mul(4) <= packed_bytes.len().saturating_mul(3),
+            "packed v2 must save at least 25% beyond v1: v1={} v2={}",
+            packed_bytes.len(),
+            packed_v2_bytes.len()
         );
     }
 }

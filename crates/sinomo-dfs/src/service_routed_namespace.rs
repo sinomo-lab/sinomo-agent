@@ -1165,19 +1165,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if !namespace_operation_returns_synced_response_objects(operation) {
             return Ok(Vec::new());
         }
-        let pinned_backend = if let Some(backend) = self.metadata_backend.as_mut() {
-            backend.begin_consistent_read_snapshot()?;
-            true
-        } else {
-            false
+        let point_lookup_path = match operation {
+            DfsNamespaceOperation::LookupPath { path } => Some(path.as_str()),
+            _ => None,
         };
+        let pinned_backend = self.metadata_backend.is_some();
+        if let Some(backend) = self.metadata_backend.as_mut() {
+            if let Some(path) = point_lookup_path {
+                backend.begin_consistent_read_snapshot_for_path(file_system_id, path)?;
+            } else {
+                backend.begin_consistent_read_snapshot()?;
+            }
+        }
         let result =
             self.synced_namespace_objects_for_operation_from_pinned_view(file_system_id, operation);
         if pinned_backend {
-            self.metadata_backend
+            let backend = self
+                .metadata_backend
                 .as_mut()
-                .expect("pinned metadata backend remains installed")
-                .end_consistent_read_snapshot();
+                .expect("pinned metadata backend remains installed");
+            if let Some(path) = point_lookup_path {
+                backend.end_consistent_read_snapshot_for_path(file_system_id, path);
+            } else {
+                backend.end_consistent_read_snapshot();
+            }
         }
         result
     }
@@ -1272,7 +1283,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn handle_namespace_request_internal(
         &mut self,
         requester_node_id: NodeId,
-        command: DfsNamespaceCommand,
+        mut command: DfsNamespaceCommand,
         recovering: bool,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let request_id = command.request_id.clone();
@@ -1484,7 +1495,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     // inherit an outer local planning snapshot.
                                     self.active_namespace_operation_context.take()
                                 };
-                                let outcome = match (&foreign_shard, &command.operation) {
+                                let outcome = match (&foreign_shard, &mut command.operation) {
                                     (
                                         None,
                                         DfsNamespaceOperation::CommitLocalEventualBatch {
@@ -1507,9 +1518,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                                 },
                                             ))
                                         } else {
+                                            let placeholder = DfsNamespaceTransaction {
+                                                transaction_id: transaction.transaction_id.clone(),
+                                                file_system_id: transaction.file_system_id.clone(),
+                                                objects: Vec::new(),
+                                                versions: Vec::new(),
+                                                advisory_lock_states: Vec::new(),
+                                                created_at: transaction.created_at,
+                                            };
+                                            let transaction =
+                                                std::mem::replace(transaction, placeholder);
+                                            let writes = std::mem::take(writes);
                                             self.apply_local_eventual_batch_commit(
                                                 &requester_node_id,
-                                                transaction.clone(),
+                                                transaction,
                                                 writes,
                                                 shards.first().cloned(),
                                             )
@@ -1521,9 +1543,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                             )
                                         }
                                     }
-                                    (None, _) => self.execute_posix_coordination_operation_local(
-                                        &command.operation,
-                                    ),
+                                    (None, operation) => {
+                                        self.execute_posix_coordination_operation_local(operation)
+                                    }
                                     (Some(_), DfsNamespaceOperation::Rename { from, to }) => self
                                         .namespace_coordinator_dispatch_rename_with_pending_replay(
                                             &command.file_system_id,

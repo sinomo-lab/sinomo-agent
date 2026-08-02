@@ -33,6 +33,8 @@ thread_local! {
         const { std::cell::Cell::new(0) };
     static POSIX_BULK_PREP_TABLE_SNAPSHOT_CALLS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static POSIX_BULK_PARENT_TOUCH_CONSTRUCTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -49,6 +51,16 @@ pub(crate) fn posix_bulk_prep_durable_table_probes() -> usize {
 #[cfg(test)]
 pub(crate) fn posix_bulk_prep_table_snapshot_calls() -> usize {
     POSIX_BULK_PREP_TABLE_SNAPSHOT_CALLS.get()
+}
+
+#[cfg(test)]
+pub(crate) fn posix_bulk_parent_touch_constructions() -> usize {
+    POSIX_BULK_PARENT_TOUCH_CONSTRUCTIONS.get()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_posix_bulk_parent_touch_constructions() {
+    POSIX_BULK_PARENT_TOUCH_CONSTRUCTIONS.set(0);
 }
 
 use crate::dfs_now_unix_nanos as now_unix_nanos;
@@ -80,6 +92,7 @@ use sinomo_core::node::NodeId;
 use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 fn touch_directory_for_batched_child(directory: &mut DfsObjectMetadata, advance_version: bool) {
@@ -133,7 +146,7 @@ struct PosixBulkLocalWrite<'a> {
     expected_base_version: Option<DfsVersion>,
     bytes: &'a [u8],
     metadata_shard: Option<DfsMetadataShardConfig>,
-    parent_touch: Option<PosixBulkParentTouch>,
+    parent_touch: Option<Rc<PosixBulkParentTouch>>,
     link_count_hint: Option<u64>,
 }
 
@@ -158,6 +171,26 @@ struct PosixBulkParentTouch {
     path: String,
     object: DfsObjectMetadata,
     metadata_shard: Option<DfsMetadataShardConfig>,
+}
+
+impl PosixBulkParentTouch {
+    fn shared(
+        path: String,
+        object: DfsObjectMetadata,
+        metadata_shard: Option<DfsMetadataShardConfig>,
+    ) -> Rc<Self> {
+        #[cfg(test)]
+        POSIX_BULK_PARENT_TOUCH_CONSTRUCTIONS.set(
+            POSIX_BULK_PARENT_TOUCH_CONSTRUCTIONS
+                .get()
+                .saturating_add(1),
+        );
+        Rc::new(Self {
+            path,
+            object,
+            metadata_shard,
+        })
+    }
 }
 
 fn posix_error_is_retryable_write_serialization(error: &DfsPosixError) -> bool {
@@ -1867,14 +1900,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // resolution may need a remote freshness pull, which can ingest newer
         // metadata locally; no backend mutation may happen inside the bounded
         // consistent-read scope below.
-        let mut resolved_parents = BTreeMap::<String, (String, DfsObjectMetadata)>::new();
+        let mut resolved_parents = BTreeMap::<String, String>::new();
         for (parent, _, _) in &normalized_files {
             if resolved_parents.contains_key(parent) {
                 continue;
             }
-            let resolved = match authoritative_prefetched_objects.as_ref() {
+            let resolved_parent = match authoritative_prefetched_objects.as_ref() {
                 Some(prefetch) => {
-                    let Some(parent_object) = prefetch.objects_by_path.get(parent).cloned() else {
+                    let Some(parent_object) = prefetch.objects_by_path.get(parent) else {
                         return Err(DfsPosixError::MissingParent {
                             path: parent.clone(),
                         });
@@ -1889,11 +1922,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             path: parent.clone(),
                         });
                     }
-                    (parent.clone(), parent_object)
+                    parent.clone()
                 }
-                None => self.resolve_posix_bulk_parent(parent, require_authoritative_parents)?,
+                None => {
+                    let (resolved_parent, _) =
+                        self.resolve_posix_bulk_parent(parent, require_authoritative_parents)?;
+                    resolved_parent
+                }
             };
-            resolved_parents.insert(parent.clone(), resolved);
+            resolved_parents.insert(parent.clone(), resolved_parent);
         }
         let pinned_metadata_snapshot = if let Some(backend) = self.metadata_backend.as_mut() {
             backend
@@ -1914,8 +1951,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // cannot prove that parent is still live in the generation used
             // for child discovery. Revalidate every unique resolved parent
             // once, then use that exact pinned object for parent touches.
-            let mut pinned_parents = BTreeMap::<String, (String, DfsObjectMetadata)>::new();
-            for (parent, (resolved_parent, _)) in &resolved_parents {
+            let mut pinned_parents = BTreeMap::<String, Rc<PosixBulkParentTouch>>::new();
+            for (parent, resolved_parent) in &resolved_parents {
                 let parent_object = match authoritative_prefetched_objects.as_ref() {
                     Some(prefetch) => prefetch.objects_by_path.get(resolved_parent).cloned(),
                     None => self.lookup_metadata_path_for_local_overwrite(
@@ -1940,15 +1977,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         path: resolved_parent.clone(),
                     });
                 }
-                pinned_parents.insert(parent.clone(), (resolved_parent.clone(), parent_object));
+                let metadata_shard = match metadata_shard_snapshot.as_deref() {
+                    Some(shards) => self.select_sifs_metadata_shard_for_path_from_snapshot(
+                        resolved_parent,
+                        shards,
+                    )?,
+                    None => None,
+                };
+                pinned_parents.insert(
+                    parent.clone(),
+                    PosixBulkParentTouch::shared(
+                        resolved_parent.clone(),
+                        parent_object,
+                        metadata_shard,
+                    ),
+                );
             }
 
             let mut prepared = Vec::with_capacity(files.len());
             let mut seen_objects = BTreeSet::new();
             for (parent, child_name, bytes) in &normalized_files {
-                let (resolved_parent, parent_object) = pinned_parents
+                let parent_touch = pinned_parents
                     .get(parent)
                     .expect("bulk parent was revalidated in pinned metadata generation");
+                let resolved_parent = &parent_touch.path;
                 let path = join_posix_path(resolved_parent, child_name);
                 let mut metadata_path = path.clone();
                 let mut link_count_hint = None;
@@ -2044,22 +2096,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     )?,
                     None => None,
                 };
-                let parent_touch = if touch_parent_on_create {
-                    Some(PosixBulkParentTouch {
-                        path: resolved_parent.clone(),
-                        object: parent_object.clone(),
-                        metadata_shard: match metadata_shard_snapshot.as_deref() {
-                            Some(shards) => self
-                                .select_sifs_metadata_shard_for_path_from_snapshot(
-                                    resolved_parent,
-                                    shards,
-                                )?,
-                            None => None,
-                        },
-                    })
-                } else {
-                    None
-                };
+                let parent_touch = touch_parent_on_create.then(|| Rc::clone(parent_touch));
                 let target_version = next_version(&object.version);
                 prepared.push(PosixBulkLocalWrite {
                     path,
@@ -2128,7 +2165,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut prepared = Vec::with_capacity(files.len());
         let mut seen_objects = BTreeSet::new();
         let mut seen_paths = BTreeSet::new();
-        let mut resolved_parents = BTreeMap::<String, (String, DfsObjectMetadata)>::new();
+        let mut resolved_parents = BTreeMap::<String, Rc<PosixBulkParentTouch>>::new();
         let metadata_shard_snapshot = self.refresh_sifs_metadata_shards()?;
         for &(path, bytes) in files {
             let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
@@ -2138,19 +2175,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let Some(parent) = parent_posix_path(&path) else {
                 return Err(DfsPosixError::IsDirectory { path });
             };
-            let (resolved_parent, parent_object) = match resolved_parents.get(&parent) {
-                Some(resolved) => resolved.clone(),
+            let parent_touch = match resolved_parents.get(&parent) {
+                Some(resolved) => Rc::clone(resolved),
                 None => {
-                    let resolved =
+                    let (resolved_parent, parent_object) =
                         self.resolve_posix_bulk_parent(&parent, require_authoritative_parents)?;
-                    resolved_parents.insert(parent.clone(), resolved.clone());
+                    let metadata_shard = match metadata_shard_snapshot.as_deref() {
+                        Some(shards) => self.select_sifs_metadata_shard_for_path_from_snapshot(
+                            &resolved_parent,
+                            shards,
+                        )?,
+                        None => None,
+                    };
+                    let resolved = PosixBulkParentTouch::shared(
+                        resolved_parent,
+                        parent_object,
+                        metadata_shard,
+                    );
+                    resolved_parents.insert(parent.clone(), Rc::clone(&resolved));
                     resolved
                 }
             };
+            let resolved_parent = &parent_touch.path;
             let Some((_, child_name)) = path.rsplit_once('/') else {
                 return Err(DfsPosixError::InvalidPath { path });
             };
-            let path = join_posix_path(&resolved_parent, child_name);
+            let path = join_posix_path(resolved_parent, child_name);
             // Duplicate paths can be rejected locally. Existing-path
             // exclusivity is checked from one coherent shard snapshot by the
             // authoritative CommitLocalEventualBatch handler and fenced again
@@ -2169,17 +2219,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 None => None,
             };
-            let parent_touch = Some(PosixBulkParentTouch {
-                path: resolved_parent.clone(),
-                object: parent_object.clone(),
-                metadata_shard: match metadata_shard_snapshot.as_deref() {
-                    Some(shards) => self.select_sifs_metadata_shard_for_path_from_snapshot(
-                        &resolved_parent,
-                        shards,
-                    )?,
-                    None => None,
-                },
-            });
             let target_version = next_version(&object.version);
             prepared.push(PosixBulkLocalWrite {
                 path,
@@ -2188,7 +2227,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 expected_base_version: None,
                 bytes,
                 metadata_shard,
-                parent_touch,
+                parent_touch: Some(parent_touch),
                 link_count_hint: Some(1),
             });
         }
@@ -2219,19 +2258,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let content_elapsed = content_started.elapsed();
         let prepare_setup_started = Instant::now();
         let write_time = now_unix_nanos();
-        let mut committed_objects = Vec::with_capacity(prepared.len());
-        for (write, manifest) in prepared.iter().zip(manifests.iter()) {
-            let mut object = write.object.clone();
-            object.version = write.target_version.clone();
-            object.content_hash = Some(manifest.content_hash.clone());
-            object.content_size_bytes = Some(manifest.size_bytes);
-            object.current_locations = vec![self.node_id.clone()];
-            object.modified_at_unix_nanos = write_time;
-            object.changed_at_unix_nanos = write_time;
-            object.last_modified_by_event_id = Some(EventId::generate());
-            committed_objects.push(object);
-        }
         type MetadataAuthorityKey = Option<(NodeId, String, u64)>;
+        struct PosixBulkAuthorityGroup {
+            selected_shard: Option<DfsMetadataShardConfig>,
+            objects: Vec<DfsObjectMetadata>,
+            writes: Vec<DfsLocalEventualBatchWriteProof>,
+        }
+
         let authority_key = |shard: Option<&DfsMetadataShardConfig>| {
             shard.map(|shard| {
                 (
@@ -2241,30 +2274,93 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )
             })
         };
-        let mut metadata_shards =
-            BTreeMap::<MetadataAuthorityKey, Option<DfsMetadataShardConfig>>::new();
-        let mut objects_by_metadata_authority =
-            BTreeMap::<MetadataAuthorityKey, Vec<DfsObjectMetadata>>::new();
-        for (write, object) in prepared.iter().zip(committed_objects.iter().cloned()) {
-            let key = authority_key(write.metadata_shard.as_ref());
-            metadata_shards
-                .entry(key.clone())
-                .or_insert_with(|| write.metadata_shard.clone());
-            objects_by_metadata_authority
-                .entry(key)
-                .or_default()
-                .push(object);
-        }
-        let mut touched_parent_objects =
-            BTreeMap::<(MetadataAuthorityKey, DfsObjectId), DfsObjectMetadata>::new();
-        for write in &prepared {
-            let Some(parent_touch) = write.parent_touch.as_ref() else {
-                continue;
+        let mut groups = BTreeMap::<MetadataAuthorityKey, PosixBulkAuthorityGroup>::new();
+        let mut unique_parent_touches = BTreeMap::<DfsObjectId, Rc<PosixBulkParentTouch>>::new();
+        let mut stats = Vec::with_capacity(prepared.len());
+        let mut stat_elapsed = Duration::ZERO;
+        for (write, manifest) in prepared.into_iter().zip(manifests) {
+            let PosixBulkLocalWrite {
+                path,
+                mut object,
+                target_version,
+                expected_base_version,
+                bytes: _,
+                metadata_shard,
+                parent_touch,
+                link_count_hint,
+            } = write;
+            object.version = target_version;
+            object.content_hash = Some(manifest.content_hash);
+            object.content_size_bytes = Some(manifest.size_bytes);
+            object.current_locations = vec![self.node_id.clone()];
+            object.modified_at_unix_nanos = write_time;
+            object.changed_at_unix_nanos = write_time;
+            object.last_modified_by_event_id = Some(EventId::generate());
+
+            let stat_started = Instant::now();
+            stats.push(self.stat_object_for_path_with_link_count_hint(
+                &object,
+                &path,
+                link_count_hint,
+            ));
+            stat_elapsed = stat_elapsed.saturating_add(stat_started.elapsed());
+
+            let metadata_authority = authority_key(metadata_shard.as_ref());
+            let authority_node_id = metadata_shard
+                .as_ref()
+                .map(|shard| shard.primary_node_id.clone())
+                .unwrap_or_else(|| self.node_id.clone());
+            if let Some(parent) = parent_touch.as_ref()
+                && !unique_parent_touches.contains_key(&parent.object.object_id)
+            {
+                unique_parent_touches.insert(parent.object.object_id.clone(), Rc::clone(parent));
+            }
+            let expected_parent_object_id = parent_touch
+                .as_ref()
+                .map(|parent| parent.object.object_id.clone());
+            let expected_parent_version = parent_touch
+                .as_ref()
+                .map(|parent| parent.object.version.clone());
+            let proof = DfsLocalEventualBatchWriteProof {
+                expected_base_version,
+                expected_parent_object_id,
+                expected_parent_version,
+                receipt: DfsReplicaReceiptRecord {
+                    receipt: DfsWriteReceipt {
+                        file_system_id: object.file_system_id.clone(),
+                        object_id: object.object_id.clone(),
+                        committed_version: object.version.clone(),
+                        owner_node_id: authority_node_id,
+                        event_id: object
+                            .last_modified_by_event_id
+                            .clone()
+                            .expect("bulk committed objects carry a write event"),
+                    },
+                    replica_node_id: self.node_id.clone(),
+                    content_hash: object.content_hash.clone(),
+                    received_at: time::OffsetDateTime::now_utc(),
+                },
             };
-            let metadata_authority = authority_key(parent_touch.metadata_shard.as_ref());
-            metadata_shards
-                .entry(metadata_authority.clone())
-                .or_insert_with(|| parent_touch.metadata_shard.clone());
+            let group =
+                groups
+                    .entry(metadata_authority)
+                    .or_insert_with(|| PosixBulkAuthorityGroup {
+                        selected_shard: metadata_shard,
+                        objects: Vec::new(),
+                        writes: Vec::new(),
+                    });
+            group.objects.push(object);
+            group.writes.push(proof);
+        }
+        for (_, parent_touch) in unique_parent_touches {
+            let parent_authority = authority_key(parent_touch.metadata_shard.as_ref());
+            groups
+                .entry(parent_authority.clone())
+                .or_insert_with(|| PosixBulkAuthorityGroup {
+                    selected_shard: parent_touch.metadata_shard.clone(),
+                    objects: Vec::new(),
+                    writes: Vec::new(),
+                });
             let parent = &parent_touch.object;
             if parent.kind == DfsObjectKind::Tombstone {
                 return Err(DfsPosixError::MissingParent {
@@ -2276,43 +2372,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     path: parent_touch.path.clone(),
                 });
             }
-            let key = (metadata_authority, parent.object_id.clone());
-            touched_parent_objects.entry(key).or_insert_with(|| {
-                // This is the version observed while resolving the parent. The
-                // write proof carries that exact predecessor to the metadata
-                // authority; a mismatch rejects the whole shard group and
-                // triggers an authoritative parent refresh plus bounded retry.
-                let mut parent = parent.clone();
-                parent.version = next_version(&parent.version);
-                parent.modified_at_unix_nanos = write_time;
-                parent.changed_at_unix_nanos = write_time;
-                parent.last_modified_by_event_id = Some(EventId::generate());
-                parent
-            });
+            // This is the version observed while resolving the parent. The
+            // write proof carries that exact predecessor to the metadata
+            // authority; a mismatch rejects the whole shard group and
+            // triggers an authoritative parent refresh plus bounded retry.
+            let mut parent = parent.clone();
+            parent.version = next_version(&parent.version);
+            parent.modified_at_unix_nanos = write_time;
+            parent.changed_at_unix_nanos = write_time;
+            parent.last_modified_by_event_id = Some(EventId::generate());
+            groups
+                .get_mut(&parent_authority)
+                .expect("parent authority group was installed with its write proof")
+                .objects
+                .push(parent);
         }
-        for ((metadata_authority, _), object) in touched_parent_objects {
-            objects_by_metadata_authority
-                .entry(metadata_authority)
-                .or_default()
-                .push(object);
-        }
-        let all_metadata_paths = objects_by_metadata_authority
-            .values()
-            .flatten()
-            .map(|object| object.path.clone())
-            .collect::<BTreeSet<_>>();
-        let prepare_setup_elapsed = prepare_setup_started.elapsed();
-        let authority_group_count = objects_by_metadata_authority.len();
+        let prepare_setup_elapsed = prepare_setup_started.elapsed().saturating_sub(stat_elapsed);
+        let authority_group_count = groups.len();
         let mut group_prepare_elapsed = Duration::ZERO;
         let mut authority_commit_elapsed = Duration::ZERO;
         let mut committed_metadata_paths = BTreeSet::new();
-        for (metadata_authority, objects) in objects_by_metadata_authority {
+        let mut remaining_groups = groups.into_iter();
+        while let Some((_metadata_authority, group)) = remaining_groups.next() {
             let group_prepare_started = Instant::now();
+            let PosixBulkAuthorityGroup {
+                selected_shard,
+                objects,
+                writes,
+            } = group;
+            let trace_object_count = objects.len();
             let group_metadata_paths = objects
                 .iter()
                 .map(|object| object.path.clone())
                 .collect::<BTreeSet<_>>();
-            let selected_shard = metadata_shards.remove(&metadata_authority).unwrap_or(None);
             let versions = objects
                 .iter()
                 .map(|object| crate::object_version_record(object, object.content_size_bytes))
@@ -2325,7 +2417,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &versions,
                 ),
                 file_system_id: sifs_file_system_id(),
-                objects: objects.clone(),
+                objects,
                 versions,
                 advisory_lock_states: Vec::new(),
                 created_at: time::OffsetDateTime::now_utc(),
@@ -2334,39 +2426,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .as_ref()
                 .map(|shard| shard.primary_node_id.clone())
                 .unwrap_or_else(|| self.node_id.clone());
-            let writes = prepared
-                .iter()
-                .zip(committed_objects.iter())
-                .filter(|(write, _)| {
-                    authority_key(write.metadata_shard.as_ref()) == metadata_authority
-                })
-                .map(|(write, object)| DfsLocalEventualBatchWriteProof {
-                    expected_base_version: write.expected_base_version.clone(),
-                    expected_parent_object_id: write
-                        .parent_touch
-                        .as_ref()
-                        .map(|parent| parent.object.object_id.clone()),
-                    expected_parent_version: write
-                        .parent_touch
-                        .as_ref()
-                        .map(|parent| parent.object.version.clone()),
-                    receipt: DfsReplicaReceiptRecord {
-                        receipt: DfsWriteReceipt {
-                            file_system_id: object.file_system_id.clone(),
-                            object_id: object.object_id.clone(),
-                            committed_version: object.version.clone(),
-                            owner_node_id: authority_node_id.clone(),
-                            event_id: object
-                                .last_modified_by_event_id
-                                .clone()
-                                .expect("bulk committed objects carry a write event"),
-                        },
-                        replica_node_id: self.node_id.clone(),
-                        content_hash: object.content_hash.clone(),
-                        received_at: time::OffsetDateTime::now_utc(),
-                    },
-                })
-                .collect::<Vec<_>>();
             let trace_write_count = writes.len();
             let group_prepare_duration = group_prepare_started.elapsed();
             group_prepare_elapsed = group_prepare_elapsed.saturating_add(group_prepare_duration);
@@ -2389,7 +2448,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.apply_local_eventual_batch_commit(
                     &requester_node_id,
                     transaction,
-                    &writes,
+                    writes,
                     selected_shard,
                 )
                 .map(drop)
@@ -2402,7 +2461,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.node_id,
                 trace_shard_id,
                 trace_remote,
-                objects.len(),
+                trace_object_count,
                 trace_write_count,
                 group_prepare_duration.as_micros(),
                 authority_commit_duration.as_millis(),
@@ -2422,33 +2481,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 {
                     return Err(source);
                 }
-                let unattempted_metadata_paths = all_metadata_paths
-                    .difference(&committed_metadata_paths)
-                    .filter(|path| !group_metadata_paths.contains(*path))
-                    .cloned()
+                let unattempted_metadata_paths = remaining_groups
+                    .flat_map(|(_, group)| group.objects.into_iter().map(|object| object.path))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
                     .collect();
                 return Err(DfsPosixError::PartialBulkCommit {
-                    committed_metadata_paths: committed_metadata_paths.iter().cloned().collect(),
-                    indeterminate_metadata_paths: group_metadata_paths.iter().cloned().collect(),
+                    committed_metadata_paths: committed_metadata_paths.into_iter().collect(),
+                    indeterminate_metadata_paths: group_metadata_paths.into_iter().collect(),
                     unattempted_metadata_paths,
                     source: Box::new(source),
                 });
             }
             committed_metadata_paths.extend(group_metadata_paths);
         }
-        let stat_started = Instant::now();
-        let stats = committed_objects
-            .iter()
-            .zip(prepared.iter())
-            .map(|(object, write)| {
-                self.stat_object_for_path_with_link_count_hint(
-                    object,
-                    &write.path,
-                    write.link_count_hint,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let stat_elapsed = stat_started.elapsed();
+        let stats = stats.into_iter().collect::<Result<Vec<_>>>()?;
         crate::dfs_perf_trace(format_args!(
             "posix-bulk-local-write node={} objects={} content_bytes={} authority_groups={} content_ms={} prepare_setup_ms={} group_prepare_ms={} authority_commit_ms={} stat_ms={} total_ms={}",
             self.node_id,

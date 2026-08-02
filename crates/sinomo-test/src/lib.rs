@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
 
@@ -243,13 +244,42 @@ pub struct SinomoTestReport {
 }
 
 #[derive(Clone, Debug)]
+enum SinomoTestClusterSnapshotEvidence {
+    Unverified {
+        snapshot: Arc<sinomo_core::kv::KvSnapshot>,
+        source: PathBuf,
+    },
+    Authoritative(SinomoTestAuthoritativeClusterSnapshot),
+}
+
+#[derive(Clone, Debug)]
+pub struct SinomoTestAuthoritativeClusterSnapshot {
+    snapshot: Arc<sinomo_core::kv::KvSnapshot>,
+    authority: sinomo_core::kv::KvAuthorityProof,
+    source: PathBuf,
+}
+
+impl SinomoTestAuthoritativeClusterSnapshot {
+    pub fn snapshot(&self) -> Arc<sinomo_core::kv::KvSnapshot> {
+        Arc::clone(&self.snapshot)
+    }
+
+    pub fn authority(&self) -> sinomo_core::kv::KvAuthorityProof {
+        self.authority
+    }
+
+    pub fn source(&self) -> &Path {
+        &self.source
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct SinomoTestContext {
     data_dir: PathBuf,
     parameters: BTreeMap<String, String>,
     live: bool,
     require_cluster: bool,
-    cluster_snapshot: Option<sinomo_core::kv::KvSnapshot>,
-    cluster_config_source: Option<PathBuf>,
+    cluster_snapshot: Option<SinomoTestClusterSnapshotEvidence>,
     runtime_capabilities: BTreeSet<String>,
     diagnostics: serde_json::Map<String, serde_json::Value>,
 }
@@ -262,7 +292,6 @@ impl SinomoTestContext {
             live: false,
             require_cluster: false,
             cluster_snapshot: None,
-            cluster_config_source: None,
             runtime_capabilities: BTreeSet::new(),
             diagnostics: Default::default(),
         }
@@ -298,9 +327,31 @@ impl SinomoTestContext {
         snapshot: sinomo_core::kv::KvSnapshot,
         source: impl Into<PathBuf>,
     ) -> Self {
-        self.cluster_snapshot = Some(snapshot);
-        self.cluster_config_source = Some(source.into());
+        self.cluster_snapshot = Some(SinomoTestClusterSnapshotEvidence::Unverified {
+            snapshot: Arc::new(snapshot),
+            source: source.into(),
+        });
         self
+    }
+
+    /// Installs a cluster snapshot together with the fresh authority proof
+    /// obtained for this invocation. Consumers that require current routing
+    /// can reuse this exact immutable generation instead of paying for another
+    /// serialized Raft barrier during the same test case.
+    pub fn try_with_authoritative_cluster_snapshot(
+        mut self,
+        read: sinomo_core::kv::KvAuthoritativeRead<sinomo_core::kv::KvSnapshot>,
+        source: impl Into<PathBuf>,
+    ) -> Result<Self, sinomo_core::kv::KvError> {
+        sinomo_core::kv::validate_cluster_kv_authoritative_snapshot_read(&read)?;
+        self.cluster_snapshot = Some(SinomoTestClusterSnapshotEvidence::Authoritative(
+            SinomoTestAuthoritativeClusterSnapshot {
+                snapshot: Arc::new(read.value),
+                authority: read.authority,
+                source: source.into(),
+            },
+        ));
+        Ok(self)
     }
 
     pub fn with_runtime_capability(mut self, capability: impl Into<String>) -> Self {
@@ -342,11 +393,24 @@ impl SinomoTestContext {
     }
 
     pub fn cluster_snapshot(&self) -> Option<&sinomo_core::kv::KvSnapshot> {
-        self.cluster_snapshot.as_ref()
+        match self.cluster_snapshot.as_ref()? {
+            SinomoTestClusterSnapshotEvidence::Unverified { snapshot, .. } => Some(snapshot),
+            SinomoTestClusterSnapshotEvidence::Authoritative(snapshot) => Some(&snapshot.snapshot),
+        }
+    }
+
+    pub fn authoritative_cluster_snapshot(&self) -> Option<SinomoTestAuthoritativeClusterSnapshot> {
+        match self.cluster_snapshot.as_ref()? {
+            SinomoTestClusterSnapshotEvidence::Unverified { .. } => None,
+            SinomoTestClusterSnapshotEvidence::Authoritative(snapshot) => Some(snapshot.clone()),
+        }
     }
 
     pub fn cluster_config_source(&self) -> Option<&Path> {
-        self.cluster_config_source.as_deref()
+        match self.cluster_snapshot.as_ref()? {
+            SinomoTestClusterSnapshotEvidence::Unverified { source, .. } => Some(source),
+            SinomoTestClusterSnapshotEvidence::Authoritative(snapshot) => Some(&snapshot.source),
+        }
     }
 
     pub fn runtime_capabilities(&self) -> &BTreeSet<String> {
@@ -499,6 +563,103 @@ mod tests {
 
         assert_eq!(report.status, SinomoTestStatus::Passed);
         assert_eq!(report.diagnostics["seen"], true);
+    }
+
+    #[test]
+    fn authoritative_cluster_snapshot_reuses_one_immutable_generation() {
+        use sinomo_core::kv::{KvAuthorityBasis, KvAuthorityProof, KvRevision, KvSnapshot};
+
+        let snapshot = KvSnapshot {
+            revision: KvRevision(7),
+            compacted_revision: KvRevision::ZERO,
+            entries: Vec::new(),
+            leases: Vec::new(),
+            events: Vec::new(),
+            committed_requests: Vec::new(),
+            expired_requests: Vec::new(),
+        };
+        let authority = KvAuthorityProof {
+            term: 3,
+            commit_index: 11,
+            revision: snapshot.revision,
+            basis: KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks: 2,
+                required_quorum: 2,
+            },
+        };
+        let context = SinomoTestContext::new("/tmp/sinomo-test")
+            .try_with_authoritative_cluster_snapshot(
+                sinomo_core::kv::KvAuthoritativeRead {
+                    value: snapshot,
+                    authority,
+                },
+                "cluster/kv-snapshot.sobj",
+            )
+            .expect("valid authoritative snapshot");
+
+        let first = context
+            .authoritative_cluster_snapshot()
+            .expect("authoritative snapshot");
+        let second = context
+            .authoritative_cluster_snapshot()
+            .expect("same authoritative snapshot");
+        assert!(Arc::ptr_eq(&first.snapshot(), &second.snapshot()));
+        assert_eq!(first.authority(), authority);
+        assert_eq!(first.source(), Path::new("cluster/kv-snapshot.sobj"));
+        assert_eq!(
+            context.cluster_snapshot().expect("snapshot").revision,
+            KvRevision(7)
+        );
+    }
+
+    #[test]
+    fn authoritative_cluster_snapshot_rejects_mismatched_or_incomplete_proof() {
+        use sinomo_core::kv::{
+            KvAuthoritativeRead, KvAuthorityBasis, KvAuthorityProof, KvRevision, KvSnapshot,
+        };
+        let snapshot = || KvSnapshot {
+            revision: KvRevision(7),
+            compacted_revision: KvRevision::ZERO,
+            entries: Vec::new(),
+            leases: Vec::new(),
+            events: Vec::new(),
+            committed_requests: Vec::new(),
+            expired_requests: Vec::new(),
+        };
+        let proof = |revision, voter_acks| KvAuthorityProof {
+            term: 3,
+            commit_index: 11,
+            revision,
+            basis: KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks,
+                required_quorum: 2,
+            },
+        };
+
+        assert!(
+            SinomoTestContext::new("/tmp/sinomo-test")
+                .try_with_authoritative_cluster_snapshot(
+                    KvAuthoritativeRead {
+                        value: snapshot(),
+                        authority: proof(KvRevision(6), 2),
+                    },
+                    "cluster/kv-snapshot.sobj",
+                )
+                .is_err(),
+            "proof and snapshot revisions must be inseparable"
+        );
+        assert!(
+            SinomoTestContext::new("/tmp/sinomo-test")
+                .try_with_authoritative_cluster_snapshot(
+                    KvAuthoritativeRead {
+                        value: snapshot(),
+                        authority: proof(KvRevision(7), 1),
+                    },
+                    "cluster/kv-snapshot.sobj",
+                )
+                .is_err(),
+            "an incomplete quorum must not create reusable authority evidence"
+        );
     }
 
     #[test]

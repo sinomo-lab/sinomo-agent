@@ -1133,14 +1133,36 @@ pub(crate) fn load_model_config_for_node(
     ))
 }
 
+pub(crate) enum ModelConfigClusterSnapshot {
+    Authoritative(KvAuthoritativeRead<KvSnapshot>),
+    #[cfg(test)]
+    Unverified(KvSnapshot),
+}
+
+impl ModelConfigClusterSnapshot {
+    fn into_snapshot(self) -> KvSnapshot {
+        match self {
+            Self::Authoritative(read) => read.value,
+            #[cfg(test)]
+            Self::Unverified(snapshot) => snapshot,
+        }
+    }
+}
+
 pub(crate) fn model_config_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {
+    model_config_cluster_snapshot_read(paths).map(ModelConfigClusterSnapshot::into_snapshot)
+}
+
+pub(crate) fn model_config_cluster_snapshot_read(
+    paths: &ClusterPaths,
+) -> Result<ModelConfigClusterSnapshot, CliError> {
     let _ = paths;
     if let Some(status) = default_main_daemon_status()? {
         match daemon_fetch_cluster_kv_authoritative_snapshot(
             &status.address,
             MODEL_CONFIG_CLUSTER_SNAPSHOT_TIMEOUT,
         ) {
-            Ok(snapshot) => return Ok(snapshot.value),
+            Ok(snapshot) => return Ok(ModelConfigClusterSnapshot::Authoritative(snapshot)),
             Err(error) => {
                 #[cfg(not(test))]
                 return Err(error.into());
@@ -1152,6 +1174,7 @@ pub(crate) fn model_config_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSn
     #[cfg(test)]
     {
         return sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
+            .map(ModelConfigClusterSnapshot::Unverified)
             .map_err(sinomo_runtime::network::NetworkError::directory)
             .map_err(Into::into);
     }

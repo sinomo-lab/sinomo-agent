@@ -192,9 +192,13 @@ pub(crate) fn namespace_transaction_id_for_batch(
     // hand-maintained fingerprint omitted those fields, causing a later
     // policy transition to reuse an existing transaction ID with a different
     // payload.
-    let input = serde_json::to_vec(&(file_system_id, objects, versions))
+    // `serde_json::to_vec` first allocated a second payload-sized buffer just
+    // to hash it. Bulk prepares can be several MiB, so stream the exact same
+    // serializer output directly into BLAKE3 instead.
+    let mut hasher = blake3::Hasher::new();
+    serde_json::to_writer(&mut hasher, &(file_system_id, objects, versions))
         .expect("DFS namespace transaction payload is serializable");
-    format!("namespace_{kind}_{}", blake3::hash(&input).to_hex())
+    format!("namespace_{kind}_{}", hasher.finalize().to_hex())
 }
 
 #[cfg(test)]
@@ -300,6 +304,31 @@ mod tests {
         assert_ne!(
             eventual, confirmed,
             "a policy-only mutation is a different durable transaction payload"
+        );
+    }
+
+    #[test]
+    fn namespace_batch_transaction_id_matches_legacy_buffered_hash() {
+        let node = NodeId::from_legacy_named("node_namespace_batch_hash").expect("node");
+        let objects = distributed_sifs_bootstrap_objects(node);
+        let file_system_id = objects[0].file_system_id.clone();
+        let versions = Vec::new();
+        let legacy_payload = serde_json::to_vec(&(&file_system_id, &objects, &versions))
+            .expect("legacy namespace transaction payload is serializable");
+        let legacy = format!(
+            "namespace_visible-batch_{}",
+            blake3::hash(&legacy_payload).to_hex()
+        );
+
+        assert_eq!(
+            namespace_transaction_id_for_batch(
+                "visible-batch",
+                &file_system_id,
+                &objects,
+                &versions,
+            ),
+            legacy,
+            "streaming JSON into the transaction hash must preserve durable idempotency IDs"
         );
     }
 }

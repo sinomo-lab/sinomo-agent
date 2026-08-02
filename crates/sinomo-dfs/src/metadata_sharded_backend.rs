@@ -19,13 +19,12 @@ use crate::content_root_catalog::{
     DfsContentRootCatalogPageRequest, DfsContentRootCatalogShardIdentity,
 };
 use crate::control_plane::{
-    DfsMetadataNamespacePrepareCodec, DfsMetadataShardAssignment, DfsMetadataShardConfig,
-    DfsMetadataShardRoutingIndex,
+    DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardRoutingIndex,
 };
 use crate::intent::write_intent_status_is_active;
 use crate::metadata_api::{
     DfsMetadataBackend, DfsMetadataReplicaIngestPermit, DfsMetadataShardWriteFreeze,
-    DfsNamespaceRequestAdmissionSnapshot,
+    DfsNamespaceRequestAdmissionSnapshot, DfsNormalizedNamespacePrepare,
 };
 use crate::metadata_backend::LocalSobjMetadataBackend;
 use crate::metadata_error::{MetadataBackendError, Result};
@@ -161,6 +160,7 @@ mod visible_placement_tests {
                         status,
                         prepare: Some(prepare),
                         packed_prepare_v1: None,
+                        packed_prepare_v2: None,
                     },
                 }],
                 next_after_sequence: 1,
@@ -210,12 +210,399 @@ mod visible_placement_tests {
     }
 }
 
+#[cfg(test)]
+mod namespace_prepare_codec_handoff_tests {
+    use super::*;
+    use crate::control_plane::{
+        DfsMetadataNamespacePrepareCodec, DfsMetadataShardMembershipHandoffProof,
+    };
+    use sinomo_core::DfsObjectPolicy;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use time::OffsetDateTime;
+
+    static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new() -> Self {
+            let unique = NEXT_TEST_ROOT.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "sinomo-dfs-v1-v2-handoff-{}-{unique}",
+                std::process::id()
+            )))
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn node(value: &str) -> NodeId {
+        NodeId::from_legacy_named(value).expect("valid node id")
+    }
+
+    fn shard_config(codec: DfsMetadataNamespacePrepareCodec, epoch: u64) -> DfsMetadataShardConfig {
+        DfsMetadataShardConfig {
+            file_system_id: crate::sifs_file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: node("codec-primary"),
+            replica_node_ids: vec![node("codec-replica")],
+            epoch,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: codec,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        }
+    }
+
+    fn file_system() -> DfsFileSystem {
+        DfsFileSystem {
+            file_system_id: crate::sifs_file_system_id(),
+            display_name: "codec handoff".to_string(),
+            owner_node_id: node("codec-primary"),
+            subtree_policies: Vec::new(),
+        }
+    }
+
+    fn object(version: &str) -> DfsObjectMetadata {
+        DfsObjectMetadata {
+            object_id: DfsObjectId::from_legacy_named("codec-handoff-object")
+                .expect("valid object id"),
+            file_system_id: crate::sifs_file_system_id(),
+            path: "services/codec-handoff/object".to_string(),
+            kind: DfsObjectKind::File,
+            tombstone_provenance: None,
+            owner_node_id: node("codec-primary"),
+            current_locations: vec![node("codec-primary")],
+            content_hash: Some(format!("blake3:{version}")),
+            content_size_bytes: Some(1),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: DfsVersion::from_legacy_named(version).expect("valid version"),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        }
+    }
+
+    fn prepare(
+        operation_id: &str,
+        owner_epoch: u64,
+        current: &DfsObjectMetadata,
+        committed: DfsObjectMetadata,
+    ) -> DfsNamespacePrepareRecord {
+        let mut prepare = DfsNamespacePrepareRecord {
+            operation_id: operation_id.to_string(),
+            file_system_id: current.file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new("root"),
+            owner_epoch,
+            operation_digest: String::new(),
+            expected_object_versions: vec![DfsNamespaceObjectVersionExpectation {
+                object_id: current.object_id.clone(),
+                expected_version: Some(current.version.clone()),
+            }],
+            expected_path_occupants: vec![DfsNamespacePathOccupantExpectation {
+                path: current.path.clone(),
+                expected_object_id: Some(current.object_id.clone()),
+            }],
+            content_receipts: Vec::new(),
+            transaction: DfsNamespaceTransaction {
+                transaction_id: format!("transaction:{operation_id}"),
+                file_system_id: current.file_system_id.clone(),
+                objects: vec![committed],
+                versions: Vec::new(),
+                advisory_lock_states: Vec::new(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            },
+            completed_request: None,
+            completed_request_completion: None,
+            status: DfsNamespacePrepareStatus::Prepared,
+        };
+        prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+                .expect("namespace prepare digest");
+        prepare
+    }
+
+    fn seed_lagging_replica(
+        root: &std::path::Path,
+        config: &DfsMetadataShardConfig,
+        shard_id: &DfsMetadataShardId,
+        entries: &[DfsMetadataJournalEntry],
+        head: u64,
+    ) {
+        let mut replica =
+            LocalShardedMetadataBackend::new(root, vec![config.clone()]).expect("lagging replica");
+        replica
+            .apply_journal_batch(&DfsMetadataJournalBatch {
+                shard_id: shard_id.clone(),
+                entries: entries.to_vec(),
+                next_after_sequence: head,
+            })
+            .expect("seed pre-upgrade replica prefix");
+    }
+
+    fn assert_prepare_status(
+        backend: &LocalShardedMetadataBackend,
+        operation_id: &str,
+        expected: DfsNamespacePrepareStatus,
+    ) {
+        assert_eq!(
+            backend
+                .get_namespace_prepare(operation_id)
+                .expect("namespace prepare lookup")
+                .map(|prepare| prepare.status),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn packed_v1_to_v2_handoff_reopen_preserves_history_and_replica_recovery() {
+        let test_root = TestRoot::new();
+        let source_root = test_root.0.join("source");
+        let catch_up_root = test_root.0.join("catch-up-replica");
+        let snapshot_root = test_root.0.join("snapshot-replica");
+        let shard_id = DfsMetadataShardId::new("root");
+        let local_node_id = node("codec-primary");
+        let retiring = shard_config(DfsMetadataNamespacePrepareCodec::PackedV1, 7);
+        let mut active = shard_config(DfsMetadataNamespacePrepareCodec::PackedV2, 8);
+        active.replica_node_ids = vec![node("codec-successor-replica")];
+
+        let mut source = LocalShardedMetadataBackend::new(&source_root, vec![retiring.clone()])
+            .expect("v1 source");
+        source.put_file_system(&file_system()).expect("filesystem");
+        let initial = object("codec-handoff-v1");
+        source.put_object(&initial).expect("initial object");
+        let pre_upgrade_entries = source.journal_since(0).expect("pre-upgrade prefix");
+        let pre_upgrade_head = pre_upgrade_entries
+            .last()
+            .expect("pre-upgrade journal head")
+            .sequence;
+        seed_lagging_replica(
+            &catch_up_root,
+            &retiring,
+            &shard_id,
+            &pre_upgrade_entries,
+            pre_upgrade_head,
+        );
+        seed_lagging_replica(
+            &snapshot_root,
+            &retiring,
+            &shard_id,
+            &pre_upgrade_entries,
+            pre_upgrade_head,
+        );
+
+        let v1_committed = object("codec-handoff-v1-committed");
+        let v1_prepare = prepare(
+            "prepare-before-v2-activation",
+            retiring.epoch,
+            &initial,
+            v1_committed.clone(),
+        );
+        let v1_entry = source
+            .prepare_namespace_transaction(&v1_prepare)
+            .expect("packed-v1 prepare");
+        assert!(matches!(
+            v1_entry.mutation,
+            DfsMetadataMutation::PutNamespacePrepare {
+                prepare: None,
+                packed_prepare_v1: Some(_),
+                packed_prepare_v2: None,
+                ..
+            }
+        ));
+        source
+            .commit_prepared_namespace_transaction(
+                &v1_prepare.operation_id,
+                &v1_prepare.operation_digest,
+                v1_prepare.owner_epoch,
+            )
+            .expect("commit v1 prepare");
+
+        let handoff_id = "packed-v1-to-v2-activation";
+        let freeze = source
+            .freeze_metadata_shard_for_membership_handoff(&shard_id, handoff_id, retiring.epoch)
+            .expect("freeze v1 generation")
+            .expect("configured source shard");
+        let proof = DfsMetadataShardMembershipHandoffProof {
+            handoff_id: handoff_id.to_string(),
+            retiring_shard: retiring,
+            desired_shard: active.clone(),
+            journal_sequence: freeze.journal_sequence,
+            state_fingerprint: freeze.state_fingerprint,
+            acknowledged_node_ids: [local_node_id.clone()].into_iter().collect(),
+        };
+        assert!(
+            crate::service_sync::rebind_completed_metadata_shard_membership_handoff(
+                &mut source,
+                &local_node_id,
+                &active,
+                None,
+                Some(&proof),
+            )
+            .expect("activate v2 generation")
+        );
+        assert_prepare_status(
+            &source,
+            &v1_prepare.operation_id,
+            DfsNamespacePrepareStatus::Committed,
+        );
+
+        drop(source);
+        let mut source = LocalShardedMetadataBackend::new(&source_root, vec![active.clone()])
+            .expect("reopen active v2 source");
+        assert!(
+            source
+                .clear_metadata_shard_membership_handoff_freeze(&shard_id, handoff_id, &active,)
+                .expect("bind reopened source to the activated v2 generation")
+        );
+        assert_prepare_status(
+            &source,
+            &v1_prepare.operation_id,
+            DfsNamespacePrepareStatus::Committed,
+        );
+
+        let v2_committed = object("codec-handoff-v2-prepared");
+        let v2_prepare = prepare(
+            "prepare-after-v2-activation",
+            active.epoch,
+            &v1_committed,
+            v2_committed,
+        );
+        let v2_entry = source
+            .prepare_namespace_transaction(&v2_prepare)
+            .expect("packed-v2 prepare after reopen");
+        assert!(matches!(
+            v2_entry.mutation,
+            DfsMetadataMutation::PutNamespacePrepare {
+                prepare: None,
+                packed_prepare_v1: None,
+                packed_prepare_v2: Some(_),
+                ..
+            }
+        ));
+
+        let retained_entries = source.journal_since(0).expect("mixed-codec journal");
+        assert!(retained_entries.iter().any(|entry| matches!(
+            &entry.mutation,
+            DfsMetadataMutation::PutNamespacePrepare {
+                prepare: None,
+                packed_prepare_v1: Some(_),
+                packed_prepare_v2: None,
+                ..
+            }
+        )));
+        assert!(retained_entries.iter().any(|entry| matches!(
+            &entry.mutation,
+            DfsMetadataMutation::PutNamespacePrepare {
+                prepare: None,
+                packed_prepare_v1: None,
+                packed_prepare_v2: Some(_),
+                ..
+            }
+        )));
+
+        let source_head = source
+            .shard_backend(&shard_id)
+            .expect("source shard")
+            .journal_last_sequence();
+        let source_prefix = DfsMetadataBackend::metadata_prefix_proof(&source, &shard_id)
+            .expect("source prefix proof")
+            .expect("source shard prefix proof");
+
+        let catch_up_batch = source
+            .journal_batch_for_shard_since_limited(&shard_id, pre_upgrade_head, 32, usize::MAX)
+            .expect("mixed-codec catch-up batch")
+            .expect("mixed-codec catch-up entries");
+        assert_eq!(catch_up_batch.next_after_sequence, source_head);
+        let mut catch_up = LocalShardedMetadataBackend::new(&catch_up_root, vec![active.clone()])
+            .expect("reopen lagging replica on v2 config");
+        catch_up
+            .apply_journal_batch(&catch_up_batch)
+            .expect("incrementally replay v1 and v2 entries");
+        assert_eq!(
+            DfsMetadataBackend::metadata_prefix_proof(&catch_up, &shard_id)
+                .expect("catch-up prefix proof")
+                .expect("catch-up shard prefix proof"),
+            source_prefix
+        );
+        assert_prepare_status(
+            &catch_up,
+            &v1_prepare.operation_id,
+            DfsNamespacePrepareStatus::Committed,
+        );
+        assert_prepare_status(
+            &catch_up,
+            &v2_prepare.operation_id,
+            DfsNamespacePrepareStatus::Prepared,
+        );
+
+        let snapshot = source
+            .export_shard_table_snapshot(&shard_id)
+            .expect("export active snapshot")
+            .expect("active shard snapshot");
+        let mut snapshot_replica =
+            LocalShardedMetadataBackend::new(&snapshot_root, vec![active.clone()])
+                .expect("reopen snapshot replica on v2 config");
+        snapshot_replica
+            .replace_with_replicated_snapshot(shard_id.clone(), source_head, snapshot)
+            .expect("install mixed-history authoritative snapshot");
+        assert_eq!(
+            DfsMetadataBackend::metadata_prefix_proof(&snapshot_replica, &shard_id)
+                .expect("snapshot prefix proof")
+                .expect("snapshot shard prefix proof"),
+            source_prefix
+        );
+        assert_prepare_status(
+            &snapshot_replica,
+            &v1_prepare.operation_id,
+            DfsNamespacePrepareStatus::Committed,
+        );
+        assert_prepare_status(
+            &snapshot_replica,
+            &v2_prepare.operation_id,
+            DfsNamespacePrepareStatus::Prepared,
+        );
+
+        drop(catch_up);
+        drop(snapshot_replica);
+        let catch_up = LocalShardedMetadataBackend::new(&catch_up_root, vec![active.clone()])
+            .expect("reopen incrementally recovered replica");
+        let snapshot_replica = LocalShardedMetadataBackend::new(&snapshot_root, vec![active])
+            .expect("reopen snapshot-recovered replica");
+        for replica in [&catch_up, &snapshot_replica] {
+            assert_prepare_status(
+                replica,
+                &v1_prepare.operation_id,
+                DfsNamespacePrepareStatus::Committed,
+            );
+            assert_prepare_status(
+                replica,
+                &v2_prepare.operation_id,
+                DfsNamespacePrepareStatus::Prepared,
+            );
+        }
+    }
+}
+
 const ROUTING_TOPOLOGY_HISTORY_LIMIT: usize = 4;
 
 #[cfg(test)]
 thread_local! {
     static SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static SHARDED_CONSISTENT_READ_SNAPSHOT_SHARDS: std::cell::RefCell<Vec<DfsMetadataShardId>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -226,6 +613,16 @@ pub(crate) fn reset_sharded_metadata_object_id_lookup_count() {
 #[cfg(test)]
 pub(crate) fn sharded_metadata_object_id_lookup_count() -> usize {
     SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT.get()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_sharded_consistent_read_snapshot_shards() {
+    SHARDED_CONSISTENT_READ_SNAPSHOT_SHARDS.with(|shards| shards.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub(crate) fn sharded_consistent_read_snapshot_shards() -> Vec<DfsMetadataShardId> {
+    SHARDED_CONSISTENT_READ_SNAPSHOT_SHARDS.with(|shards| shards.borrow().clone())
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -673,6 +1070,60 @@ impl LocalShardedMetadataBackend {
             }
         }
         Ok(shard_ids)
+    }
+
+    fn consistent_read_shard_ids_for_path(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Vec<DfsMetadataShardId>> {
+        let selected = self.select_shard_id_for_path(file_system_id, path)?;
+        let mut shard_ids = vec![selected.clone()];
+        shard_ids.extend(self.fallback_shard_ids_for_path(file_system_id, path, &selected)?);
+        if let Some(missing) = shard_ids
+            .iter()
+            .find(|shard_id| !self.shards.contains_key(*shard_id))
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "path {path} routed to unavailable local metadata shard {missing:?}"
+            )));
+        }
+        Ok(shard_ids)
+    }
+
+    fn begin_consistent_read_snapshot_for_shards(
+        &mut self,
+        shard_ids: &[DfsMetadataShardId],
+    ) -> Result<()> {
+        #[cfg(test)]
+        SHARDED_CONSISTENT_READ_SNAPSHOT_SHARDS
+            .with(|observed| observed.borrow_mut().extend_from_slice(shard_ids));
+        for (index, shard_id) in shard_ids.iter().enumerate() {
+            let begin = self
+                .shards
+                .get_mut(shard_id)
+                .expect("routed consistent-read shard remains installed")
+                .begin_consistent_read_snapshot();
+            if let Err(error) = begin {
+                for pinned_shard_id in &shard_ids[..index] {
+                    self.shards
+                        .get_mut(pinned_shard_id)
+                        .expect("pinned consistent-read shard remains installed")
+                        .end_consistent_read_snapshot();
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn end_consistent_read_snapshot_for_shards(&mut self, shard_ids: &[DfsMetadataShardId]) {
+        for shard_id in shard_ids {
+            self.shards
+                .get_mut(shard_id)
+                .expect("routed consistent-read shard remains installed")
+                .end_consistent_read_snapshot();
+        }
     }
 
     fn clear_routing_fallbacks_for_file_system(
@@ -1513,29 +1964,33 @@ impl LocalShardedMetadataBackend {
 impl DfsMetadataBackend for LocalShardedMetadataBackend {
     fn begin_consistent_read_snapshot(&mut self) -> Result<()> {
         let shard_ids = self.shards.keys().cloned().collect::<Vec<_>>();
-        for (index, shard_id) in shard_ids.iter().enumerate() {
-            let begin = self
-                .shards
-                .get_mut(shard_id)
-                .expect("collected shard id remains installed")
-                .begin_consistent_read_snapshot();
-            if let Err(error) = begin {
-                for pinned_shard_id in &shard_ids[..index] {
-                    self.shards
-                        .get_mut(pinned_shard_id)
-                        .expect("pinned shard remains installed")
-                        .end_consistent_read_snapshot();
-                }
-                return Err(error);
-            }
-        }
-        Ok(())
+        self.begin_consistent_read_snapshot_for_shards(&shard_ids)
     }
 
     fn end_consistent_read_snapshot(&mut self) {
-        for backend in self.shards.values_mut() {
-            backend.end_consistent_read_snapshot();
-        }
+        let shard_ids = self.shards.keys().cloned().collect::<Vec<_>>();
+        self.end_consistent_read_snapshot_for_shards(&shard_ids);
+    }
+
+    fn begin_consistent_read_snapshot_for_path(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<()> {
+        let shard_ids = self.consistent_read_shard_ids_for_path(file_system_id, path)?;
+        self.begin_consistent_read_snapshot_for_shards(&shard_ids)
+    }
+
+    fn end_consistent_read_snapshot_for_path(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) {
+        let Ok(shard_ids) = self.consistent_read_shard_ids_for_path(file_system_id, path) else {
+            debug_assert!(false, "path-scoped metadata read lost its routed shard");
+            return;
+        };
+        self.end_consistent_read_snapshot_for_shards(&shard_ids);
     }
 
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry> {
@@ -3368,53 +3823,62 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         &mut self,
         prepare: &DfsNamespacePrepareRecord,
     ) -> Result<DfsMetadataJournalEntry> {
-        let prepare = normalized_namespace_prepare(prepare);
-        if !self.shards.contains_key(&prepare.shard_id) {
-            return Err(MetadataBackendError::Serde(format!(
-                "namespace prepare {} targets unknown local shard {}",
-                prepare.operation_id, prepare.shard_id.0
-            )));
-        }
-        let (configured_epoch, configured_codec) = self
-            .shard_configs
-            .get(&prepare.shard_id.0)
-            .map(|shard| (shard.epoch, shard.namespace_prepare_codec))
-            .ok_or_else(|| {
-                MetadataBackendError::Serde(format!(
-                    "namespace prepare {} targets unconfigured local shard {}",
-                    prepare.operation_id, prepare.shard_id.0
-                ))
-            })?;
-        if configured_codec == DfsMetadataNamespacePrepareCodec::PackedV1
-            && prepare.owner_epoch != configured_epoch
-        {
-            return Err(MetadataBackendError::Serde(format!(
-                "namespace prepare {} owner epoch {} does not match configured shard {} epoch {}",
-                prepare.operation_id, prepare.owner_epoch, prepare.shard_id.0, configured_epoch
-            )));
-        }
-        for path in prepare
-            .transaction
-            .objects
-            .iter()
-            .map(|object| object.path.as_str())
-            .chain(
-                prepare
-                    .expected_path_occupants
-                    .iter()
-                    .map(|expected| expected.path.as_str()),
-            )
-        {
-            let selected = self.select_shard_id_for_path(&prepare.file_system_id, path)?;
-            if selected != prepare.shard_id {
+        let mut prepare = prepare.clone();
+        self.prepare_namespace_transaction_in_place(&mut prepare)
+    }
+
+    fn prepare_normalized_namespace_transaction_in_place(
+        &mut self,
+        prepare: DfsNormalizedNamespacePrepare<'_>,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let shard_id = {
+            let record = prepare.as_record();
+            if !self.shards.contains_key(&record.shard_id) {
                 return Err(MetadataBackendError::Serde(format!(
-                    "namespace prepare {} path {} routes to shard {}, not prepared shard {}",
-                    prepare.operation_id, path, selected.0, prepare.shard_id.0
+                    "namespace prepare {} targets unknown local shard {}",
+                    record.operation_id, record.shard_id.0
                 )));
             }
-        }
-        self.shard_backend_mut(&prepare.shard_id)?
-            .prepare_namespace_transaction(&prepare)
+            let (configured_epoch, configured_codec) = self
+                .shard_configs
+                .get(&record.shard_id.0)
+                .map(|shard| (shard.epoch, shard.namespace_prepare_codec))
+                .ok_or_else(|| {
+                    MetadataBackendError::Serde(format!(
+                        "namespace prepare {} targets unconfigured local shard {}",
+                        record.operation_id, record.shard_id.0
+                    ))
+                })?;
+            if configured_codec.is_packed() && record.owner_epoch != configured_epoch {
+                return Err(MetadataBackendError::Serde(format!(
+                    "namespace prepare {} owner epoch {} does not match configured shard {} epoch {}",
+                    record.operation_id, record.owner_epoch, record.shard_id.0, configured_epoch
+                )));
+            }
+            for path in record
+                .transaction
+                .objects
+                .iter()
+                .map(|object| object.path.as_str())
+                .chain(
+                    record
+                        .expected_path_occupants
+                        .iter()
+                        .map(|expected| expected.path.as_str()),
+                )
+            {
+                let selected = self.select_shard_id_for_path(&record.file_system_id, path)?;
+                if selected != record.shard_id {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "namespace prepare {} path {} routes to shard {}, not prepared shard {}",
+                        record.operation_id, path, selected.0, record.shard_id.0
+                    )));
+                }
+            }
+            record.shard_id.clone()
+        };
+        self.shard_backend_mut(&shard_id)?
+            .prepare_normalized_namespace_transaction_in_place(prepare)
     }
 
     fn rebind_prepared_namespace_transaction(

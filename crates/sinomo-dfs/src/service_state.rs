@@ -363,6 +363,11 @@ impl DfsCommittedWorkTracker {
 pub struct DfsMessageProcessReport {
     pub outcome: Result<DfsMessageProcessResult, DfsError>,
     pub committed_work: DfsMessageCommittedWork,
+    /// Exact zero-attempt repair queue entries created by this message.
+    ///
+    /// This is deliberately a delta rather than a snapshot of every pending
+    /// repair owned by the service lane.
+    pub committed_repair_records: Vec<DfsRepairAttemptRecord>,
 }
 
 /// Result of a networked DFS write after the service has applied routing,

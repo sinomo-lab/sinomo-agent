@@ -385,6 +385,7 @@ fn test_run(options: TestRunOptions) -> Result<(), CliError> {
         options.live,
         options.require_cluster,
         &options.params,
+        options.tag.is_none(),
     )?;
     if let Some(tag) = options.tag.as_deref() {
         let report = test_run_tag(&registry, &mut context, tag)?;
@@ -496,6 +497,7 @@ fn test_context(
     live: bool,
     require_cluster: bool,
     params: &[(String, String)],
+    preserve_cluster_authority: bool,
 ) -> Result<SinomoTestContext, CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     let mut context = SinomoTestContext::new(data_dir.root())
@@ -523,8 +525,19 @@ fn test_context(
     context = context.with_runtime_capabilities(native_dylib_capabilities);
     if model_config_uses_cluster(&data_dir) {
         let paths = ClusterPaths::new(&data_dir);
-        let snapshot = model_config_cluster_snapshot(&paths)?;
-        context = context.with_cluster_snapshot(snapshot, paths.kv_paths().snapshot);
+        let snapshot = model_config_cluster_snapshot_read(&paths)?;
+        context = match snapshot {
+            ModelConfigClusterSnapshot::Authoritative(read) if preserve_cluster_authority => {
+                context.try_with_authoritative_cluster_snapshot(read, paths.kv_paths().snapshot)?
+            }
+            ModelConfigClusterSnapshot::Authoritative(read) => {
+                context.with_cluster_snapshot(read.value, paths.kv_paths().snapshot)
+            }
+            #[cfg(test)]
+            ModelConfigClusterSnapshot::Unverified(snapshot) => {
+                context.with_cluster_snapshot(snapshot, paths.kv_paths().snapshot)
+            }
+        };
     } else if require_cluster {
         return Err(CliError::Parse {
             detail: "test requires cluster runtime, but this CLI invocation is in local mode"

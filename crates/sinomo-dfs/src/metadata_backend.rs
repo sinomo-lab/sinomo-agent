@@ -21,7 +21,8 @@ use crate::content_root_catalog::{
 use crate::control_plane::{DfsMetadataNamespacePrepareCodec, DfsMetadataShardConfig};
 use crate::metadata_api::{
     DfsMetadataBackend, DfsMetadataReplicaIngestPermit, DfsMetadataShardWriteFreeze,
-    DfsNamespaceRequestAdmissionSnapshot, namespace_prepare_expectations_from_lookups,
+    DfsNamespaceRequestAdmissionSnapshot, DfsNormalizedNamespacePrepare,
+    namespace_prepare_expectations_from_lookups,
 };
 use crate::metadata_cursor;
 use crate::metadata_error::{MetadataBackendError, Result};
@@ -79,10 +80,11 @@ use crate::metadata_read_snapshot;
 use crate::metadata_receipt::{receipt_for_replica_from_backend, replay_receipt_matches_existing};
 use crate::metadata_records::*;
 use crate::metadata_replay::{
-    borrowed_namespace_prepare_payload, decoded_namespace_prepare_payload,
-    hydrate_journal_entry_payloads, journal_entry_has_replay_payloads,
-    require_journal_entry_replay_payloads, require_replica_journal_entry_file_system,
-    required_replay_payload,
+    borrowed_namespace_prepare_payload, decoded_normalized_namespace_prepare_payload,
+    decoded_normalized_namespace_prepare_payload_from_validated_ref,
+    decoded_normalized_namespace_prepare_payload_with_ref, hydrate_journal_entry_payloads,
+    journal_entry_has_replay_payloads, require_journal_entry_replay_payloads,
+    require_replica_journal_entry_file_system, required_replay_payload,
 };
 use crate::metadata_summary::{
     metadata_summary_for_file_system_from_tables, metadata_summary_from_tables,
@@ -101,12 +103,13 @@ use crate::metadata_table_store::{
     metadata_tables_from_table_snapshot, metadata_tables_snapshot, persist_metadata_table_snapshot,
     read_metadata_table_snapshot_for_replica_repair, read_metadata_table_state_lenient,
 };
+#[cfg(test)]
+use crate::metadata_tables::namespace_prepare_footprint;
 use crate::metadata_tables::{
     DfsMetadataTableRollback, DfsMetadataTables, DfsMetadataTablesSnapshot,
-    MetadataTableReadSnapshotCache, MetadataTableSnapshotFingerprint,
-    namespace_job_receipt_eviction_delta, namespace_prepare_footprint,
-    namespace_prepare_receipt_eviction_delta, namespace_request_receipt_eviction_delta,
-    namespace_transaction_receipt_eviction_delta,
+    DfsNamespacePrepareFootprint, MetadataTableReadSnapshotCache, MetadataTableSnapshotFingerprint,
+    namespace_job_receipt_eviction_delta, namespace_prepare_receipt_eviction_delta,
+    namespace_request_receipt_eviction_delta, namespace_transaction_receipt_eviction_delta,
 };
 use crate::metadata_tombstone::{metadata_now_unix_nanos, plan_tombstone_compaction};
 use crate::metadata_visible_commit::{
@@ -124,6 +127,7 @@ use sinomo_core::events::EventId;
 use sinomo_core::node::NodeId;
 #[cfg(test)]
 use sinomo_core::object::serde_ext as sinomo_object_serde;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 #[cfg(test)]
@@ -972,11 +976,15 @@ fn prepared_write_intent_rebind_payload_matches(
         && left.created_at == right.created_at
 }
 
+struct ValidatedNamespacePreparePlan {
+    footprint: DfsNamespacePrepareFootprint,
+}
+
 fn validate_namespace_prepare_shape(
     tables: &DfsMetadataTables,
     shard_id: &DfsMetadataShardId,
     prepare: &DfsNamespacePrepareRecord,
-) -> Result<()> {
+) -> Result<ValidatedNamespacePreparePlan> {
     if prepare.operation_id.trim().is_empty() || prepare.operation_digest.trim().is_empty() {
         return Err(MetadataBackendError::Serde(
             "namespace prepare requires a non-empty operation id and digest".to_string(),
@@ -1049,29 +1057,27 @@ fn validate_namespace_prepare_shape(
             )));
         }
     }
-    let transaction_object_ids = prepare
+    if let Some(object_id) = prepare
         .transaction
         .objects
         .iter()
-        .map(|object| object.object_id.clone())
+        .map(|object| &object.object_id)
         .chain(
             prepare
                 .transaction
                 .versions
                 .iter()
-                .map(|version| version.object_id.clone()),
+                .map(|version| &version.object_id),
         )
         .chain(
             prepare
                 .transaction
                 .advisory_lock_states
                 .iter()
-                .map(|state| state.object_id.clone()),
+                .map(|state| &state.object_id),
         )
-        .collect::<BTreeSet<_>>();
-    if let Some(object_id) = transaction_object_ids
-        .iter()
-        .find(|object_id| !expected_object_ids.contains(*object_id))
+        .filter(|object_id| !expected_object_ids.contains(*object_id))
+        .min()
     {
         return Err(MetadataBackendError::Serde(format!(
             "namespace prepare {} is missing the version expectation for object {}",
@@ -1082,19 +1088,21 @@ fn validate_namespace_prepare_shape(
     let mut expected_paths = BTreeSet::new();
     for expected in &prepare.expected_path_occupants {
         let path = normalize_path(&expected.path);
-        if !expected_paths.insert(path.clone()) {
+        if expected_paths.contains(&path) {
             return Err(MetadataBackendError::Serde(format!(
                 "namespace prepare {} repeats path expectation {}",
                 prepare.operation_id, path
             )));
         }
+        expected_paths.insert(path);
     }
     if let Some(path) = prepare
         .transaction
         .objects
         .iter()
-        .map(|object| normalize_path(&object.path))
-        .find(|path| !expected_paths.contains(path))
+        .map(|object| object.path.trim_matches('/'))
+        .filter(|path| !expected_paths.contains(*path))
+        .min()
     {
         return Err(MetadataBackendError::Serde(format!(
             "namespace prepare {} is missing the occupant expectation for path {}",
@@ -1105,25 +1113,20 @@ fn validate_namespace_prepare_shape(
         .transaction
         .objects
         .iter()
-        .map(|object| (object.object_id.clone(), object))
-        .collect::<BTreeMap<_, _>>();
+        .map(|object| (&object.object_id, object))
+        .collect::<BTreeMap<&DfsObjectId, _>>();
     let transaction_versions = prepare
         .transaction
         .versions
         .iter()
-        .map(|version| {
-            (
-                (version.object_id.clone(), version.version.clone()),
-                version,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+        .map(|version| ((&version.object_id, &version.version), version))
+        .collect::<BTreeMap<(&DfsObjectId, &DfsVersion), _>>();
     let mut receipt_keys = BTreeSet::new();
     for receipt in &prepare.content_receipts {
         let key = (
-            receipt.receipt.object_id.clone(),
-            receipt.receipt.committed_version.clone(),
-            receipt.replica_node_id.clone(),
+            &receipt.receipt.object_id,
+            &receipt.receipt.committed_version,
+            &receipt.replica_node_id,
         );
         if !receipt_keys.insert(key) {
             return Err(MetadataBackendError::Serde(format!(
@@ -1134,15 +1137,15 @@ fn validate_namespace_prepare_shape(
                 receipt.replica_node_id
             )));
         }
-        let Some(object) = transaction_objects.get(&receipt.receipt.object_id) else {
+        let Some(object) = transaction_objects.get(&&receipt.receipt.object_id) else {
             return Err(MetadataBackendError::Serde(format!(
                 "namespace prepare {} has a content receipt for object {} outside its transaction",
                 prepare.operation_id, receipt.receipt.object_id
             )));
         };
         let version_key = (
-            receipt.receipt.object_id.clone(),
-            receipt.receipt.committed_version.clone(),
+            &receipt.receipt.object_id,
+            &receipt.receipt.committed_version,
         );
         let Some(version) = transaction_versions.get(&version_key) else {
             return Err(MetadataBackendError::Serde(format!(
@@ -1333,7 +1336,13 @@ fn validate_namespace_prepare_shape(
             }
         }
     }
-    Ok(())
+    Ok(ValidatedNamespacePreparePlan {
+        footprint: DfsNamespacePrepareFootprint::from_validated_parts(
+            prepare,
+            expected_object_ids,
+            expected_paths,
+        ),
+    })
 }
 
 fn namespace_prepare_request_completion_is_materialized(
@@ -1450,9 +1459,9 @@ fn validate_namespace_prepare_expectations(
 fn validate_namespace_prepare_does_not_overlap(
     tables: &DfsMetadataTables,
     prepare: &DfsNamespacePrepareRecord,
+    footprint: &DfsNamespacePrepareFootprint,
 ) -> Result<()> {
-    let (object_ids, paths) = namespace_prepare_footprint(prepare);
-    for object_id in &object_ids {
+    for object_id in footprint.object_ids() {
         if let Some(existing_operation_id) = tables.namespace_prepare_object_owner_other_than(
             &prepare.file_system_id,
             object_id,
@@ -1464,7 +1473,7 @@ fn validate_namespace_prepare_does_not_overlap(
             )));
         }
     }
-    for path in &paths {
+    for path in footprint.normalized_paths() {
         if let Some(existing_operation_id) = tables
             .namespace_prepare_normalized_path_owner_other_than(
                 &prepare.file_system_id,
@@ -1488,14 +1497,20 @@ fn validate_namespace_prepare_does_not_overlap_reference(
 ) -> Result<()> {
     NAMESPACE_PREPARE_HISTORY_SCAN_CALLS
         .set(NAMESPACE_PREPARE_HISTORY_SCAN_CALLS.get().saturating_add(1));
-    let (object_ids, paths) = namespace_prepare_footprint(prepare);
+    let footprint = namespace_prepare_footprint(prepare);
     for existing in tables.namespace_prepares.values().filter(|existing| {
         existing.status == DfsNamespacePrepareStatus::Prepared
             && existing.operation_id != prepare.operation_id
             && existing.file_system_id == prepare.file_system_id
     }) {
-        let (existing_object_ids, existing_paths) = namespace_prepare_footprint(existing);
-        if !object_ids.is_disjoint(&existing_object_ids) || !paths.is_disjoint(&existing_paths) {
+        let existing_footprint = namespace_prepare_footprint(existing);
+        if !footprint
+            .object_ids()
+            .is_disjoint(existing_footprint.object_ids())
+            || !footprint
+                .normalized_paths()
+                .is_disjoint(existing_footprint.normalized_paths())
+        {
             return Err(MetadataBackendError::Serde(format!(
                 "namespace prepare {} overlaps active prepare {}",
                 prepare.operation_id, existing.operation_id
@@ -1510,12 +1525,35 @@ fn namespace_prepare_table_ops_for_record(
     shard_id: &DfsMetadataShardId,
     prepare: &DfsNamespacePrepareRecord,
 ) -> Result<Vec<DfsMetadataTableOp>> {
-    validate_namespace_prepare_shape(tables, shard_id, prepare)?;
+    namespace_prepare_table_plan_for_payload(tables, shard_id, Cow::Borrowed(prepare))
+        .map(|plan| plan.ops)
+}
+
+fn namespace_prepare_table_ops_for_owned_record(
+    tables: &DfsMetadataTables,
+    shard_id: &DfsMetadataShardId,
+    prepare: DfsNamespacePrepareRecord,
+) -> Result<Vec<DfsMetadataTableOp>> {
+    namespace_prepare_table_plan_for_payload(tables, shard_id, Cow::Owned(prepare))
+        .map(|plan| plan.ops)
+}
+
+struct NamespacePrepareTablePlan {
+    ops: Vec<DfsMetadataTableOp>,
+    prepared_footprint: Option<DfsNamespacePrepareFootprint>,
+}
+
+fn namespace_prepare_table_plan_for_payload(
+    tables: &DfsMetadataTables,
+    shard_id: &DfsMetadataShardId,
+    prepare: Cow<'_, DfsNamespacePrepareRecord>,
+) -> Result<NamespacePrepareTablePlan> {
+    let validated = validate_namespace_prepare_shape(tables, shard_id, prepare.as_ref())?;
     let existing = tables.namespace_prepares.get(&prepare.operation_id);
-    match prepare.status {
+    match &prepare.status {
         DfsNamespacePrepareStatus::Prepared => {
             if let Some(existing) = existing {
-                if !namespace_prepare_payload_matches(existing, prepare) {
+                if !namespace_prepare_payload_matches(existing, prepare.as_ref()) {
                     return Err(MetadataBackendError::Serde(format!(
                         "namespace prepare {} reuses an operation id with a different payload",
                         prepare.operation_id
@@ -1528,8 +1566,12 @@ fn namespace_prepare_table_ops_for_record(
                     )));
                 }
             }
-            validate_namespace_prepare_expectations(tables, prepare)?;
-            validate_namespace_prepare_does_not_overlap(tables, prepare)?;
+            validate_namespace_prepare_expectations(tables, prepare.as_ref())?;
+            validate_namespace_prepare_does_not_overlap(
+                tables,
+                prepare.as_ref(),
+                &validated.footprint,
+            )?;
             validate_namespace_transaction_preconditions(tables, &prepare.transaction)?;
             let mut ops = Vec::with_capacity(2);
             if let Some(completion) = prepare.completed_request.as_ref() {
@@ -1544,9 +1586,12 @@ fn namespace_prepare_table_ops_for_record(
                 }
             }
             ops.push(DfsMetadataTableOp::PutNamespacePrepare {
-                prepare: prepare.clone(),
+                prepare: prepare.into_owned(),
             });
-            Ok(ops)
+            Ok(NamespacePrepareTablePlan {
+                ops,
+                prepared_footprint: Some(validated.footprint),
+            })
         }
         DfsNamespacePrepareStatus::Committed => {
             let existing = existing.ok_or_else(|| {
@@ -1555,7 +1600,7 @@ fn namespace_prepare_table_ops_for_record(
                     prepare.operation_id
                 ))
             })?;
-            if !namespace_prepare_payload_matches(existing, prepare) {
+            if !namespace_prepare_payload_matches(existing, prepare.as_ref()) {
                 return Err(MetadataBackendError::Serde(format!(
                     "namespace prepare {} commit payload does not match the durable prepare",
                     prepare.operation_id
@@ -1568,31 +1613,39 @@ fn namespace_prepare_table_ops_for_record(
                 )));
             }
             if existing.status == DfsNamespacePrepareStatus::Committed
-                && existing == prepare
+                && existing == prepare.as_ref()
                 && namespace_transaction_recovery_is_complete(tables, &prepare.transaction)
-                && namespace_prepare_content_receipts_are_complete(tables, prepare)
-                && namespace_prepare_request_completion_is_materialized(tables, prepare)
+                && namespace_prepare_content_receipts_are_complete(tables, prepare.as_ref())
+                && namespace_prepare_request_completion_is_materialized(tables, prepare.as_ref())
             {
-                return Ok(Vec::new());
+                return Ok(NamespacePrepareTablePlan {
+                    ops: Vec::new(),
+                    prepared_footprint: None,
+                });
             }
             if existing.status != DfsNamespacePrepareStatus::Committed {
-                validate_namespace_prepare_expectations(tables, prepare)?;
-                validate_namespace_prepare_does_not_overlap(tables, prepare)?;
+                validate_namespace_prepare_expectations(tables, prepare.as_ref())?;
+                validate_namespace_prepare_does_not_overlap(
+                    tables,
+                    prepare.as_ref(),
+                    &validated.footprint,
+                )?;
                 validate_namespace_transaction_preconditions(tables, &prepare.transaction)?;
-                return Ok(vec![DfsMetadataTableOp::CommitNamespacePrepare {
-                    operation_id: prepare.operation_id.clone(),
-                    operation_digest: prepare.operation_digest.clone(),
-                    owner_epoch: prepare.owner_epoch,
-                }]);
+                return Ok(NamespacePrepareTablePlan {
+                    ops: vec![DfsMetadataTableOp::CommitNamespacePrepare {
+                        operation_id: prepare.operation_id.clone(),
+                        operation_digest: prepare.operation_digest.clone(),
+                        owner_epoch: prepare.owner_epoch,
+                    }],
+                    prepared_footprint: None,
+                });
             }
-            let mut ops = missing_namespace_prepare_content_receipt_ops(tables, prepare);
+            let mut ops = missing_namespace_prepare_content_receipt_ops(tables, prepare.as_ref());
             ops.extend(plan_namespace_transaction_recovery_table_ops(
                 tables,
                 &prepare.transaction,
             ));
-            ops.push(DfsMetadataTableOp::PutNamespacePrepare {
-                prepare: prepare.clone(),
-            });
+            let prepare_insert_index = ops.len();
             if let Some(request) = &prepare.completed_request {
                 let key = (
                     request.requester_node_id.clone(),
@@ -1626,7 +1679,16 @@ fn namespace_prepare_table_ops_for_record(
                     });
                 }
             }
-            Ok(ops)
+            ops.insert(
+                prepare_insert_index,
+                DfsMetadataTableOp::PutNamespacePrepare {
+                    prepare: prepare.into_owned(),
+                },
+            );
+            Ok(NamespacePrepareTablePlan {
+                ops,
+                prepared_footprint: None,
+            })
         }
         DfsNamespacePrepareStatus::Aborted => {
             let existing = existing.ok_or_else(|| {
@@ -1635,7 +1697,7 @@ fn namespace_prepare_table_ops_for_record(
                     prepare.operation_id
                 ))
             })?;
-            if !namespace_prepare_payload_matches(existing, prepare) {
+            if !namespace_prepare_payload_matches(existing, prepare.as_ref()) {
                 return Err(MetadataBackendError::Serde(format!(
                     "namespace prepare {} abort payload does not match the durable prepare",
                     prepare.operation_id
@@ -1647,19 +1709,26 @@ fn namespace_prepare_table_ops_for_record(
                     prepare.operation_id
                 )));
             }
-            if existing == prepare {
-                return Ok(Vec::new());
+            if existing == prepare.as_ref() {
+                return Ok(NamespacePrepareTablePlan {
+                    ops: Vec::new(),
+                    prepared_footprint: None,
+                });
             }
-            Ok(vec![DfsMetadataTableOp::PutNamespacePrepare {
-                prepare: prepare.clone(),
-            }])
+            Ok(NamespacePrepareTablePlan {
+                ops: vec![DfsMetadataTableOp::PutNamespacePrepare {
+                    prepare: prepare.into_owned(),
+                }],
+                prepared_footprint: None,
+            })
         }
     }
 }
 
-fn namespace_prepare_journal_reference(
+fn namespace_prepare_journal_reference_from_validated(
     entry: &DfsMetadataJournalEntry,
     prepare: &DfsNamespacePrepareRecord,
+    journal_prepare: &DfsNamespacePreparePayloadRef<'_>,
 ) -> Result<DfsMetadataTableOp> {
     let DfsMetadataMutation::PutNamespacePrepare {
         file_system_id,
@@ -1673,20 +1742,6 @@ fn namespace_prepare_journal_reference(
             entry.sequence, prepare.operation_id
         )));
     };
-    let journal_prepare = borrowed_namespace_prepare_payload(entry)?.ok_or_else(|| {
-        MetadataBackendError::Serde(format!(
-            "journal entry {} cannot back namespace prepare {} table materialization without a payload",
-            entry.sequence, prepare.operation_id
-        ))
-    })?;
-    journal_prepare
-        .validate_file_system_scope(&prepare.file_system_id)
-        .map_err(|source| {
-            MetadataBackendError::Serde(format!(
-                "journal entry {} cannot back namespace prepare {} table materialization: {source}",
-                entry.sequence, prepare.operation_id
-            ))
-        })?;
     if entry.sequence == 0
         || entry.shard_id != prepare.shard_id
         || file_system_id != &prepare.file_system_id
@@ -1710,16 +1765,56 @@ fn namespace_prepare_journal_reference(
     })
 }
 
+fn validate_replicated_journal_batch_entry_order(batch: &DfsMetadataJournalBatch) -> Result<()> {
+    let mut previous_sequence = None;
+    for (index, entry) in batch.entries.iter().enumerate() {
+        if entry.shard_id != batch.shard_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata journal batch for shard {} contains entry from shard {}",
+                batch.shard_id.0, entry.shard_id.0
+            )));
+        }
+        if let Some(previous_sequence) = previous_sequence
+            && entry.sequence <= previous_sequence
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata journal batch for shard {} is not strictly sequence-ordered at entry {index}: {} follows {}",
+                batch.shard_id.0, entry.sequence, previous_sequence
+            )));
+        }
+        previous_sequence = Some(entry.sequence);
+    }
+    Ok(())
+}
+
 fn namespace_prepare_persisted_table_ops(
     entry: &DfsMetadataJournalEntry,
     apply_ops: &[DfsMetadataTableOp],
 ) -> Result<Vec<DfsMetadataTableOp>> {
+    // This helper is called only for an entry just authored from the same
+    // canonical prepare that produced `apply_ops`. Packing constructed a
+    // structurally valid representation, so preserve that proof instead of
+    // rescanning the complete body before replacing the table record with its
+    // compact journal reference.
+    let journal_prepare = entry
+        .mutation
+        .namespace_prepare_payload_ref_prevalidated()
+        .ok_or_else(|| {
+            MetadataBackendError::Serde(format!(
+                "journal entry {} cannot back namespace prepare table materialization without one payload",
+                entry.sequence
+            ))
+        })?;
     let mut prepare_references = 0usize;
     let mut persisted_ops = Vec::with_capacity(apply_ops.len());
     for op in apply_ops {
         match op {
             DfsMetadataTableOp::PutNamespacePrepare { prepare } => {
-                persisted_ops.push(namespace_prepare_journal_reference(entry, prepare)?);
+                persisted_ops.push(namespace_prepare_journal_reference_from_validated(
+                    entry,
+                    prepare,
+                    &journal_prepare,
+                )?);
                 prepare_references = prepare_references.saturating_add(1);
             }
             op => persisted_ops.push(op.clone()),
@@ -2650,8 +2745,9 @@ impl LocalSobjMetadataBackend {
     /// into table batches, and then acknowledged by advancing replay cursors.
     pub fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
         self.require_replication_source_shard(&batch.shard_id)?;
+        validate_replicated_journal_batch_entry_order(batch)?;
         let _lock = self.begin_metadata_write()?;
-        self.apply_journal_batch_unlocked(batch)
+        self.apply_journal_batch_unlocked(batch, None)
     }
 
     /// Apply a validated replica batch across only the exact activated author
@@ -2662,17 +2758,30 @@ impl LocalSobjMetadataBackend {
         permit: &DfsMetadataReplicaIngestPermit,
         batch: &DfsMetadataJournalBatch,
     ) -> Result<usize> {
+        self.require_replication_source_shard(&batch.shard_id)?;
+        validate_replicated_journal_batch_entry_order(batch)?;
+        let mut validated_namespace_prepares = BTreeMap::new();
         for entry in &batch.entries {
-            require_replica_journal_entry_file_system(entry, permit.file_system_id())?;
+            if let Some(prepare) =
+                require_replica_journal_entry_file_system(entry, permit.file_system_id())?
+            {
+                validated_namespace_prepares.insert(entry.sequence, prepare);
+            }
         }
         let _lock = self.begin_metadata_replica_ingest(permit, &batch.shard_id)?;
-        self.apply_journal_batch_unlocked(batch)
+        self.apply_journal_batch_unlocked(batch, Some(validated_namespace_prepares))
     }
 
-    fn apply_journal_batch_unlocked(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
+    fn apply_journal_batch_unlocked<'a>(
+        &mut self,
+        batch: &'a DfsMetadataJournalBatch,
+        prevalidated_namespace_prepares: Option<BTreeMap<u64, DfsNamespacePreparePayloadRef<'a>>>,
+    ) -> Result<usize> {
         if batch.entries.is_empty() {
             return Ok(0);
         }
+        let payloads_prevalidated = prevalidated_namespace_prepares.is_some();
+        let mut validated_namespace_prepares = prevalidated_namespace_prepares.unwrap_or_default();
         for entry in &batch.entries {
             if entry.shard_id != batch.shard_id {
                 return Err(MetadataBackendError::Serde(format!(
@@ -2680,7 +2789,11 @@ impl LocalSobjMetadataBackend {
                     batch.shard_id.0, entry.shard_id.0
                 )));
             }
-            require_journal_entry_replay_payloads(entry)?;
+            if !payloads_prevalidated
+                && let Some(prepare) = require_journal_entry_replay_payloads(entry)?
+            {
+                validated_namespace_prepares.insert(entry.sequence, prepare);
+            }
         }
 
         let mut candidate_prefix_proof = self.prefix_proof.clone().ok_or_else(|| {
@@ -2752,6 +2865,7 @@ impl LocalSobjMetadataBackend {
         let mut journal_reference_replay_cost_bytes = 0;
         let (applied, table_sequence) = match self.plan_replayed_journal_entries_into_batch(
             replay_entries.iter().copied(),
+            &validated_namespace_prepares,
             &mut table_ops,
             &mut post_append_ops,
             &mut rollback,
@@ -3063,7 +3177,7 @@ impl LocalSobjMetadataBackend {
         entry: &DfsMetadataJournalEntry,
     ) -> Result<Option<DfsMetadataJournalEntry>> {
         let _lock = self.begin_metadata_write()?;
-        require_journal_entry_replay_payloads(entry)?;
+        let validated_namespace_prepare = require_journal_entry_replay_payloads(entry)?;
         let candidate_prefix_proof = self.prefix_proof_after_entry(
             self.prefix_proof.as_ref().ok_or_else(|| {
                 MetadataBackendError::Serde(format!(
@@ -3075,7 +3189,9 @@ impl LocalSobjMetadataBackend {
         )?;
         self.persist_replayed_journal_entry_unlocked(entry)?;
         let previous_prefix_proof = self.prefix_proof.replace(candidate_prefix_proof);
-        let changed = match self.materialize_replayed_journal_entry_unlocked(entry) {
+        let changed = match self
+            .materialize_replayed_journal_entry_unlocked(entry, validated_namespace_prepare)
+        {
             Ok(changed) => changed,
             Err(error) => {
                 self.prefix_proof = previous_prefix_proof;
@@ -3130,6 +3246,7 @@ impl LocalSobjMetadataBackend {
     fn materialize_replayed_journal_entry_unlocked(
         &mut self,
         entry: &DfsMetadataJournalEntry,
+        validated_namespace_prepare: Option<DfsNamespacePreparePayloadRef<'_>>,
     ) -> Result<bool> {
         let mut table_ops = Vec::new();
         let mut post_append_ops = Vec::new();
@@ -3137,6 +3254,7 @@ impl LocalSobjMetadataBackend {
         let mut journal_reference_replay_cost_bytes = 0;
         let changed = match self.materialize_replayed_journal_entry_into_batch(
             entry,
+            validated_namespace_prepare,
             &mut table_ops,
             &mut post_append_ops,
             &mut rollback,
@@ -3165,6 +3283,7 @@ impl LocalSobjMetadataBackend {
     fn plan_replayed_journal_entries_into_batch<'a>(
         &mut self,
         entries: impl IntoIterator<Item = &'a DfsMetadataJournalEntry>,
+        validated_namespace_prepares: &BTreeMap<u64, DfsNamespacePreparePayloadRef<'a>>,
         table_ops: &mut Vec<DfsMetadataTableOp>,
         post_append_ops: &mut Vec<DfsMetadataTableOp>,
         rollback: &mut DfsMetadataTableRollback,
@@ -3178,6 +3297,7 @@ impl LocalSobjMetadataBackend {
             last_materialized_sequence = entry.sequence;
             if self.materialize_replayed_journal_entry_into_batch(
                 entry,
+                validated_namespace_prepares.get(&entry.sequence).copied(),
                 table_ops,
                 post_append_ops,
                 rollback,
@@ -3201,6 +3321,7 @@ impl LocalSobjMetadataBackend {
         let (applied, last_materialized_sequence) = match self
             .plan_replayed_journal_entries_into_batch(
                 entries,
+                &BTreeMap::new(),
                 &mut table_ops,
                 &mut post_append_ops,
                 &mut rollback,
@@ -3281,6 +3402,7 @@ impl LocalSobjMetadataBackend {
     fn materialize_replayed_journal_entry_into_batch(
         &mut self,
         entry: &DfsMetadataJournalEntry,
+        validated_namespace_prepare: Option<DfsNamespacePreparePayloadRef<'_>>,
         table_ops: &mut Vec<DfsMetadataTableOp>,
         post_append_ops: &mut Vec<DfsMetadataTableOp>,
         rollback: &mut DfsMetadataTableRollback,
@@ -3959,12 +4081,24 @@ impl LocalSobjMetadataBackend {
                 status,
                 ..
             } => {
-                let prepare = decoded_namespace_prepare_payload(entry)?.ok_or_else(|| {
-                    MetadataBackendError::Serde(format!(
-                        "metadata journal entry {}:{} cannot replay put-namespace-prepare without its record payload",
-                        entry.shard_id.0, entry.sequence
-                    ))
-                })?;
+                let (journal_prepare, prepare) = if let Some(journal_prepare) =
+                    validated_namespace_prepare
+                {
+                    let prepare = decoded_normalized_namespace_prepare_payload_from_validated_ref(
+                        entry,
+                        journal_prepare,
+                    )?;
+                    (journal_prepare, prepare)
+                } else {
+                    decoded_normalized_namespace_prepare_payload_with_ref(entry)?.ok_or_else(
+                        || {
+                            MetadataBackendError::Serde(format!(
+                                "metadata journal entry {}:{} cannot replay put-namespace-prepare without its record payload",
+                                entry.shard_id.0, entry.sequence
+                            ))
+                        },
+                    )?
+                };
                 if prepare.file_system_id != *file_system_id
                     || prepare.operation_id != *operation_id
                     || prepare.status != *status
@@ -3973,7 +4107,6 @@ impl LocalSobjMetadataBackend {
                         "journal namespace prepare scope {file_system_id}/{operation_id}/{status:?} does not match its payload"
                     )));
                 }
-                let prepare = normalized_namespace_prepare(&prepare);
                 if let Some(receipt) = self.tables.namespace_prepare_receipts.get(operation_id) {
                     if receipt.status == prepare.status
                         && receipt.matches_prepare_identity(&prepare)
@@ -3984,12 +4117,21 @@ impl LocalSobjMetadataBackend {
                         "journal namespace prepare {operation_id} conflicts with its compacted receipt"
                     )));
                 }
-                let ops =
-                    namespace_prepare_table_ops_for_record(&self.tables, &self.shard_id, &prepare)?;
+                let prepare_reference = namespace_prepare_journal_reference_from_validated(
+                    entry,
+                    &prepare,
+                    &journal_prepare,
+                )?;
+                let prepare_replay_cost_bytes =
+                    metadata_table_apply::namespace_prepare_replay_cost_bytes(&prepare);
+                let ops = namespace_prepare_table_ops_for_owned_record(
+                    &self.tables,
+                    &self.shard_id,
+                    prepare.into_owned(),
+                )?;
                 if ops.is_empty() {
                     return Ok(false);
                 }
-                let prepare_reference = namespace_prepare_journal_reference(entry, &prepare)?;
                 let defer_resolved_prepare = defer_trailing_resolved_op
                     && matches!(status, DfsNamespacePrepareStatus::Prepared)
                     && matches!(
@@ -4031,10 +4173,8 @@ impl LocalSobjMetadataBackend {
                         "journal namespace prepare {operation_id} did not materialize a journal-referenced prepare"
                     )));
                 }
-                *journal_reference_replay_cost_bytes = journal_reference_replay_cost_bytes
-                    .saturating_add(metadata_table_apply::namespace_prepare_replay_cost_bytes(
-                        &prepare,
-                    ));
+                *journal_reference_replay_cost_bytes =
+                    journal_reference_replay_cost_bytes.saturating_add(prepare_replay_cost_bytes);
                 Ok(true)
             }
             DfsMetadataMutation::CommitNamespacePrepare {
@@ -4529,6 +4669,17 @@ impl LocalSobjMetadataBackend {
         prepare: &DfsNamespacePrepareRecord,
         apply_ops: Vec<DfsMetadataTableOp>,
     ) -> Result<DfsMetadataJournalEntry> {
+        self.write_namespace_prepare_and_materialize_with_footprint_unlocked(
+            prepare, apply_ops, None,
+        )
+    }
+
+    fn write_namespace_prepare_and_materialize_with_footprint_unlocked(
+        &mut self,
+        prepare: &DfsNamespacePrepareRecord,
+        apply_ops: Vec<DfsMetadataTableOp>,
+        prepared_footprint: Option<DfsNamespacePrepareFootprint>,
+    ) -> Result<DfsMetadataJournalEntry> {
         let trace_started = Instant::now();
         let mutation = match self.namespace_prepare_codec {
             DfsMetadataNamespacePrepareCodec::Legacy => {
@@ -4536,6 +4687,14 @@ impl LocalSobjMetadataBackend {
             }
             DfsMetadataNamespacePrepareCodec::PackedV1 => {
                 DfsMetadataMutation::put_namespace_prepare_packed_v1(prepare).map_err(|source| {
+                    MetadataBackendError::Serde(format!(
+                        "pack namespace prepare {} for journal: {source}",
+                        prepare.operation_id
+                    ))
+                })?
+            }
+            DfsMetadataNamespacePrepareCodec::PackedV2 => {
+                DfsMetadataMutation::put_namespace_prepare_packed_v2(prepare).map_err(|source| {
                     MetadataBackendError::Serde(format!(
                         "pack namespace prepare {} for journal: {source}",
                         prepare.operation_id
@@ -4553,12 +4712,21 @@ impl LocalSobjMetadataBackend {
         let persisted_ops = namespace_prepare_persisted_table_ops(&entry, &apply_ops)?;
         let persisted_ms = persisted_started.elapsed().as_millis();
         let table_started = Instant::now();
-        self.append_and_apply_table_ops_with_persisted_ops(
-            entry.sequence,
-            persisted_ops,
-            apply_ops,
-            journal_record_bytes,
-        )?;
+        match prepared_footprint {
+            Some(footprint) => self.append_and_apply_table_ops_with_namespace_prepare_footprint(
+                entry.sequence,
+                persisted_ops,
+                apply_ops,
+                journal_record_bytes,
+                footprint,
+            )?,
+            None => self.append_and_apply_table_ops_with_persisted_ops(
+                entry.sequence,
+                persisted_ops,
+                apply_ops,
+                journal_record_bytes,
+            )?,
+        }
         let table_ms = table_started.elapsed().as_millis();
         let checkpoint_started = Instant::now();
         self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
@@ -4681,8 +4849,17 @@ impl LocalSobjMetadataBackend {
             let mut advanced = false;
             for entry in entries {
                 self.advance_metadata_prefix_proof_unlocked(std::slice::from_ref(&entry))?;
-                if journal_entry_has_replay_payloads(&entry) {
-                    self.materialize_replayed_journal_entry_unlocked(&entry)?;
+                if matches!(
+                    &entry.mutation,
+                    DfsMetadataMutation::PutNamespacePrepare { .. }
+                ) {
+                    if let Some(prepare) = borrowed_namespace_prepare_payload(&entry)? {
+                        self.materialize_replayed_journal_entry_unlocked(&entry, Some(prepare))?;
+                    } else {
+                        self.materialize_local_journal_entry(&entry)?;
+                    }
+                } else if journal_entry_has_replay_payloads(&entry) {
+                    self.materialize_replayed_journal_entry_unlocked(&entry, None)?;
                 } else {
                     self.materialize_local_journal_entry(&entry)?;
                 }
@@ -5041,11 +5218,14 @@ impl LocalSobjMetadataBackend {
                 }]
             }
             DfsMetadataMutation::PutNamespacePrepare { .. } => {
-                let Some(prepare) = decoded_namespace_prepare_payload(entry)? else {
+                let Some(prepare) = decoded_normalized_namespace_prepare_payload(entry)? else {
                     return Ok(());
                 };
-                let prepare = normalized_namespace_prepare(&prepare);
-                namespace_prepare_table_ops_for_record(&self.tables, &self.shard_id, &prepare)?
+                namespace_prepare_table_ops_for_owned_record(
+                    &self.tables,
+                    &self.shard_id,
+                    prepare.into_owned(),
+                )?
             }
             DfsMetadataMutation::CommitNamespacePrepare {
                 file_system_id,
@@ -5527,6 +5707,27 @@ impl LocalSobjMetadataBackend {
             apply_ops,
             Some(journal_reference_replay_cost_bytes),
             DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES,
+        )
+    }
+
+    fn append_and_apply_table_ops_with_namespace_prepare_footprint(
+        &mut self,
+        sequence: u64,
+        persisted_ops: Vec<DfsMetadataTableOp>,
+        apply_ops: Vec<DfsMetadataTableOp>,
+        journal_reference_replay_cost_bytes: u64,
+        footprint: DfsNamespacePrepareFootprint,
+    ) -> Result<()> {
+        let root = self.root.clone();
+        metadata_table_apply::append_and_apply_table_ops_with_namespace_prepare_footprint(
+            &root,
+            self.table_materialization_state(),
+            sequence,
+            persisted_ops,
+            apply_ops,
+            Some(journal_reference_replay_cost_bytes),
+            DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES,
+            footprint,
         )
     }
 
@@ -8282,6 +8483,15 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         &mut self,
         prepare: &DfsNamespacePrepareRecord,
     ) -> Result<DfsMetadataJournalEntry> {
+        let mut prepare = prepare.clone();
+        self.prepare_namespace_transaction_in_place(&mut prepare)
+    }
+
+    fn prepare_normalized_namespace_transaction_in_place(
+        &mut self,
+        prepare: DfsNormalizedNamespacePrepare<'_>,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let prepare = prepare.as_record();
         let trace_started = Instant::now();
         let lock_started = Instant::now();
         let _lock = self.begin_metadata_write()?;
@@ -8292,9 +8502,6 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 prepare.operation_id
             )));
         }
-        let normalize_started = Instant::now();
-        let prepare = normalized_namespace_prepare(prepare);
-        let normalize_ms = normalize_started.elapsed().as_millis();
         if let Some(receipt) = self
             .tables
             .namespace_prepare_receipts
@@ -8302,10 +8509,12 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             .cloned()
         {
             let canonical_digest =
-                crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
-                    .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+                crate::service_replica::metadata_namespace_prepare_payload_digest_normalized(
+                    prepare,
+                )
+                .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
             if prepare.operation_digest != canonical_digest
-                || !receipt.matches_prepare_identity(&prepare)
+                || !receipt.matches_prepare_identity(prepare)
             {
                 return Err(MetadataBackendError::Serde(format!(
                     "namespace prepare {} reuses a compacted operation id with a different payload",
@@ -8318,12 +8527,13 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                     prepare.operation_id
                 )));
             }
-            return self.write_journal_entry_and_apply_table_ops_unlocked(
+            let entry = self.write_journal_entry_and_apply_table_ops_unlocked(
                 DfsMetadataMutation::put_namespace_prepare_receipt(&receipt),
                 vec![DfsMetadataTableOp::PutNamespacePrepareReceipt { receipt }],
-            );
+            )?;
+            return Ok(entry);
         }
-        if self.tables.namespace_prepare_history_expired(&prepare) {
+        if self.tables.namespace_prepare_history_expired(prepare) {
             return Err(MetadataBackendError::Serde(format!(
                 "namespace prepare {} idempotency history expired or is unknown",
                 prepare.operation_id
@@ -8335,7 +8545,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             .get(&prepare.operation_id)
             .cloned()
             && existing.status == DfsNamespacePrepareStatus::Committed
-            && namespace_prepare_payload_matches(&existing, &prepare)
+            && namespace_prepare_payload_matches(&existing, prepare)
             && namespace_transaction_recovery_is_complete(&self.tables, &existing.transaction)
             && namespace_prepare_content_receipts_are_complete(&self.tables, &existing)
             && namespace_prepare_request_completion_is_materialized(&self.tables, &existing)
@@ -8344,34 +8554,49 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             // visible transaction already committed. Replicate the durable
             // committed marker again instead of attempting the forbidden
             // Committed -> Prepared transition.
-            return self.write_namespace_prepare_and_materialize_unlocked(
+            let entry = self.write_namespace_prepare_and_materialize_unlocked(
                 &existing,
                 vec![DfsMetadataTableOp::PutNamespacePrepare {
                     prepare: existing.clone(),
                 }],
-            );
+            )?;
+            return Ok(entry);
         }
         let plan_started = Instant::now();
-        let mut table_ops =
-            namespace_prepare_table_ops_for_record(&self.tables, &self.shard_id, &prepare)?;
-        if table_ops.is_empty() {
-            table_ops.push(DfsMetadataTableOp::PutNamespacePrepare {
-                prepare: prepare.clone(),
-            });
+        let mut table_plan = namespace_prepare_table_plan_for_payload(
+            &self.tables,
+            &self.shard_id,
+            Cow::Borrowed(prepare),
+        )?;
+        if table_plan.ops.is_empty() {
+            table_plan
+                .ops
+                .push(DfsMetadataTableOp::PutNamespacePrepare {
+                    prepare: (*prepare).clone(),
+                });
         }
+        let prepared_footprint = table_plan.prepared_footprint.take().ok_or_else(|| {
+            MetadataBackendError::Serde(format!(
+                "namespace prepare {} validated without an active footprint",
+                prepare.operation_id
+            ))
+        })?;
         let plan_ms = plan_started.elapsed().as_millis();
         let write_started = Instant::now();
-        let entry = self.write_namespace_prepare_and_materialize_unlocked(&prepare, table_ops)?;
+        let entry = self.write_namespace_prepare_and_materialize_with_footprint_unlocked(
+            prepare,
+            table_plan.ops,
+            Some(prepared_footprint),
+        )?;
         let write_ms = write_started.elapsed().as_millis();
         metadata_backend_perf_trace(format_args!(
-            "metadata-prepare-namespace-transaction shard={} operation={} objects={} versions={} receipts={} lock_ms={} normalize_ms={} plan_ms={} write_ms={} total_ms={}",
+            "metadata-prepare-namespace-transaction shard={} operation={} objects={} versions={} receipts={} lock_ms={} plan_ms={} write_ms={} total_ms={}",
             self.shard_id.0,
             prepare.operation_id,
             prepare.transaction.objects.len(),
             prepare.transaction.versions.len(),
             prepare.content_receipts.len(),
             lock_ms,
-            normalize_ms,
             plan_ms,
             write_ms,
             trace_started.elapsed().as_millis()
@@ -8442,9 +8667,9 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 rebound.owner_epoch, current.owner_epoch
             )));
         }
-        validate_namespace_prepare_shape(&self.tables, &self.shard_id, &rebound)?;
+        let validated = validate_namespace_prepare_shape(&self.tables, &self.shard_id, &rebound)?;
         validate_namespace_prepare_expectations(&self.tables, &rebound)?;
-        validate_namespace_prepare_does_not_overlap(&self.tables, &rebound)?;
+        validate_namespace_prepare_does_not_overlap(&self.tables, &rebound, &validated.footprint)?;
         validate_namespace_transaction_preconditions(&self.tables, &rebound.transaction)?;
         self.write_namespace_prepare_and_materialize_unlocked(
             &rebound,
@@ -8527,13 +8752,18 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             // operation again. The journal remains the source of truth across
             // a table append failure or crash.
             let shape_started = Instant::now();
-            validate_namespace_prepare_shape(&self.tables, &self.shard_id, &prepare)?;
+            let validated =
+                validate_namespace_prepare_shape(&self.tables, &self.shard_id, &prepare)?;
             let shape_ms = shape_started.elapsed().as_millis();
             let expectations_started = Instant::now();
             validate_namespace_prepare_expectations(&self.tables, &prepare)?;
             let expectations_ms = expectations_started.elapsed().as_millis();
             let overlap_started = Instant::now();
-            validate_namespace_prepare_does_not_overlap(&self.tables, &prepare)?;
+            validate_namespace_prepare_does_not_overlap(
+                &self.tables,
+                &prepare,
+                &validated.footprint,
+            )?;
             let overlap_ms = overlap_started.elapsed().as_millis();
             let preconditions_started = Instant::now();
             validate_namespace_transaction_preconditions(&self.tables, &prepare.transaction)?;
@@ -12007,7 +12237,7 @@ mod tests {
 
         let mut source =
             LocalSobjMetadataBackend::new(shard_id.clone(), &source_root).expect("source");
-        source.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV1);
+        source.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV2);
         source.put_file_system(&file_system()).expect("filesystem");
         let initial_entries = source.journal_since(0).expect("initial source journal");
         let initial_sequence = initial_entries
@@ -12060,9 +12290,21 @@ mod tests {
         prepare.operation_digest =
             crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
                 .expect("large prepare digest");
+        crate::metadata_tables::reset_namespace_prepare_footprint_constructions();
+        crate::metadata_tables::reset_namespace_prepare_materialization_counters();
         source
             .prepare_namespace_transaction(&prepare)
             .expect("source large prepare");
+        assert_eq!(
+            crate::metadata_tables::namespace_prepare_footprint_constructions(),
+            1,
+            "foreground admission, overlap validation, and table indexing must reuse one large-prepare footprint"
+        );
+        assert_eq!(
+            crate::metadata_tables::namespace_prepare_materialization_counters(),
+            (0, 1),
+            "foreground prepare must run one post-append table-index materialization"
+        );
         let prepare_entries = source
             .journal_since(initial_sequence)
             .expect("large prepare source journal");
@@ -12071,7 +12313,7 @@ mod tests {
             prepare_entries[0].mutation,
             DfsMetadataMutation::PutNamespacePrepare {
                 prepare: None,
-                packed_prepare_v1: Some(_),
+                packed_prepare_v2: Some(_),
                 status: DfsNamespacePrepareStatus::Prepared,
                 ..
             }
@@ -12288,21 +12530,27 @@ mod tests {
             namespace_prepare("operation-packed-prepare", &shard_id.0, &current, committed);
         let mut config = shard_config(&shard_id.0, DfsMetadataShardAssignment::Root);
         config.epoch = prepare.owner_epoch;
-        config.namespace_prepare_codec = DfsMetadataNamespacePrepareCodec::PackedV1;
+        config.namespace_prepare_codec = DfsMetadataNamespacePrepareCodec::PackedV2;
 
         let mut source =
             LocalShardedMetadataBackend::new(&source_root, vec![config.clone()]).expect("source");
         source.put_file_system(&file_system()).expect("filesystem");
         source.put_object(&current).expect("current object");
+        crate::metadata_records::reset_namespace_prepare_payload_validation_passes();
         source
             .prepare_namespace_transaction(&prepare)
             .expect("packed namespace prepare");
+        assert_eq!(
+            crate::metadata_records::namespace_prepare_payload_validation_passes(),
+            0,
+            "trusted packed-v2 construction and its journal-reference table op must not rescan the freshly built body"
+        );
 
         let entries = source.journal_since(0).expect("source journal");
         let prepare_entry = entries.last().expect("prepare journal entry");
         let DfsMetadataMutation::PutNamespacePrepare {
             prepare: canonical,
-            packed_prepare_v1,
+            packed_prepare_v2,
             ..
         } = &prepare_entry.mutation
         else {
@@ -12313,9 +12561,33 @@ mod tests {
             "packed activation must not retain a second canonical body"
         );
         assert!(
-            packed_prepare_v1.is_some(),
-            "packed activation must emit the packed v1 body"
+            packed_prepare_v2.is_some(),
+            "packed activation must emit the packed v2 body"
         );
+        let catch_up_batch = source
+            .shard_backend(&shard_id)
+            .expect("source shard backend")
+            .journal_batch_since_limited(
+                prepare_entry.sequence.saturating_sub(1),
+                1,
+                8 * 1024 * 1024,
+            )
+            .expect("hydrate packed-v2 catch-up batch")
+            .expect("packed-v2 catch-up batch");
+        assert!(matches!(
+            catch_up_batch.entries.as_slice(),
+            [DfsMetadataJournalEntry {
+                mutation: DfsMetadataMutation::PutNamespacePrepare {
+                    prepare: None,
+                    packed_prepare_v1: None,
+                    packed_prepare_v2: Some(_),
+                    ..
+                },
+                ..
+            }]
+        ));
+        require_journal_entry_replay_payloads(&catch_up_batch.entries[0])
+            .expect("hydration must preserve the sole packed-v2 representation");
         assert_eq!(
             prepare_entry
                 .mutation
@@ -12330,6 +12602,7 @@ mod tests {
 
         let mut replica =
             LocalShardedMetadataBackend::new(&replica_root, vec![config.clone()]).expect("replica");
+        crate::metadata_records::reset_namespace_prepare_payload_validation_passes();
         replica
             .apply_journal_batch(&DfsMetadataJournalBatch {
                 shard_id: shard_id.clone(),
@@ -12337,6 +12610,11 @@ mod tests {
                 entries: entries.clone(),
             })
             .expect("incremental packed replay");
+        assert_eq!(
+            crate::metadata_records::namespace_prepare_payload_validation_passes(),
+            1,
+            "replica persistence, materialization, and journal-reference planning must share one packed-v2 validation proof"
+        );
         assert_eq!(
             DfsMetadataBackend::metadata_prefix_proof(&replica, &shard_id)
                 .expect("replica prefix proof")
@@ -12366,8 +12644,13 @@ mod tests {
         );
 
         drop(replica);
+        crate::metadata_records::reset_namespace_prepare_payload_validation_passes();
         let replica =
             LocalShardedMetadataBackend::new(&replica_root, vec![config]).expect("reopen replica");
+        assert!(
+            crate::metadata_records::namespace_prepare_payload_validation_passes() <= 1,
+            "reopen must never validate a journal-referenced packed-v2 prepare more than once"
+        );
         assert_eq!(
             replica
                 .get_namespace_prepare(&prepare.operation_id)
@@ -12379,13 +12662,13 @@ mod tests {
         let mut ambiguous = prepare_entry.clone();
         let DfsMetadataMutation::PutNamespacePrepare {
             prepare: canonical,
-            packed_prepare_v1,
+            packed_prepare_v2,
             ..
         } = &mut ambiguous.mutation
         else {
             panic!("prepare entry changed mutation kind");
         };
-        assert!(packed_prepare_v1.is_some());
+        assert!(packed_prepare_v2.is_some());
         *canonical = Some(prepare);
         let error = require_journal_entry_replay_payloads(&ambiguous)
             .expect_err("dual prepare representations must fail replay");
@@ -13003,8 +13286,13 @@ mod tests {
         reuse_after_reopen.transaction.transaction_id =
             "transaction:reuse-after-reopen".to_string();
         reset_namespace_prepare_history_scan_calls();
-        validate_namespace_prepare_does_not_overlap(&reopened.tables, &reuse_after_reopen)
-            .expect("terminal history must not block its released footprint after reopen");
+        let footprint = namespace_prepare_footprint(&reuse_after_reopen);
+        validate_namespace_prepare_does_not_overlap(
+            &reopened.tables,
+            &reuse_after_reopen,
+            &footprint,
+        )
+        .expect("terminal history must not block its released footprint after reopen");
         assert_eq!(namespace_prepare_history_scan_calls(), 0);
 
         cleanup(&root);
@@ -13381,7 +13669,9 @@ mod tests {
             expected_accept: bool,
         ) {
             reset_namespace_prepare_history_scan_calls();
-            let indexed = validate_namespace_prepare_does_not_overlap(tables, candidate).is_ok();
+            let footprint = namespace_prepare_footprint(candidate);
+            let indexed =
+                validate_namespace_prepare_does_not_overlap(tables, candidate, &footprint).is_ok();
             assert_eq!(
                 namespace_prepare_history_scan_calls(),
                 0,
@@ -13529,13 +13819,19 @@ mod tests {
         let mut committed = current.clone();
         committed.version = version("version_sharded_prepare_2");
         committed.changed_at_unix_nanos = 2;
-        let prepare =
+        let mut prepare =
             namespace_prepare("operation-sharded", "services", &current, committed.clone());
         backend.put_file_system(&file_system()).expect("filesystem");
         backend.put_object(&current).expect("current object");
+        crate::metadata_api::reset_namespace_prepare_normalization_passes();
         backend
-            .prepare_namespace_transaction(&prepare)
+            .prepare_namespace_transaction_in_place(&mut prepare)
             .expect("sharded prepare");
+        assert_eq!(
+            crate::metadata_api::namespace_prepare_normalization_passes(),
+            1,
+            "the in-place router and local store must consume the caller's one canonicalization"
+        );
         assert_eq!(
             backend
                 .get_object(&current.object_id)
@@ -22234,6 +22530,71 @@ mod tests {
 
         cleanup(&leader_root);
         cleanup(&follower_root);
+    }
+
+    #[test]
+    fn replica_batch_rejects_duplicate_sequences_before_validation_or_persistence() {
+        let root = temp_root("replica_batch_rejects_duplicate_sequences");
+        let shard_id = DfsMetadataShardId::new("shard-duplicate-sequence");
+        let mut source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source")).expect("source");
+        let mut replica =
+            LocalSobjMetadataBackend::new(shard_id.clone(), root.join("replica")).expect("replica");
+        source.put_file_system(&file_system()).expect("filesystem");
+        let entry = source
+            .journal_since(0)
+            .expect("source journal")
+            .into_iter()
+            .next()
+            .expect("filesystem entry");
+        let duplicate_sequence = entry.sequence;
+        let duplicate_batch = DfsMetadataJournalBatch {
+            shard_id: shard_id.clone(),
+            entries: vec![entry.clone(), entry],
+            next_after_sequence: duplicate_sequence,
+        };
+        let initial_prefix = replica.metadata_prefix_proof().expect("initial prefix");
+
+        let error = replica
+            .apply_journal_batch(&duplicate_batch)
+            .expect_err("duplicate sequence must fail ordinary replica apply");
+        assert!(
+            error.to_string().contains("not strictly sequence-ordered"),
+            "unexpected duplicate-sequence error: {error}"
+        );
+        assert!(
+            replica
+                .journal_since(0)
+                .expect("replica journal")
+                .is_empty()
+        );
+        assert_eq!(
+            replica.metadata_prefix_proof().expect("unchanged prefix"),
+            initial_prefix
+        );
+
+        let permit = DfsMetadataReplicaIngestPermit::new_validated(
+            file_system_id(),
+            shard_id,
+            node("node_duplicate_sequence_source"),
+            1,
+        );
+        let error = replica
+            .apply_journal_batch_with_replica_permit(&permit, &duplicate_batch)
+            .expect_err("duplicate sequence must fail before permit payload proofs are indexed");
+        assert!(error.to_string().contains("not strictly sequence-ordered"));
+        assert!(
+            replica
+                .journal_since(0)
+                .expect("replica journal")
+                .is_empty()
+        );
+        assert_eq!(
+            replica.metadata_prefix_proof().expect("unchanged prefix"),
+            initial_prefix
+        );
+
+        cleanup(&root);
     }
 
     #[test]

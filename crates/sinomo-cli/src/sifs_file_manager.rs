@@ -35,6 +35,7 @@ use sinomo_runtime::kv::{KvError, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResp
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
+use sinomo_runtime::test::SinomoTestAuthoritativeClusterSnapshot;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::io::Read;
@@ -2057,7 +2058,10 @@ impl FileManagerBackend for SifsFileManagerBackend {
 }
 
 impl SifsOneShotBulkWriteRequester {
-    pub(crate) fn open(data_dir: &SinomoDataDir) -> Result<Self, String> {
+    pub(crate) fn open(
+        data_dir: &SinomoDataDir,
+        authoritative_snapshot: Option<SinomoTestAuthoritativeClusterSnapshot>,
+    ) -> Result<Self, String> {
         data_dir
             .ensure_root_layout()
             .map_err(|error| format!("cannot prepare Sinomo data directory: {error}"))?;
@@ -2069,10 +2073,21 @@ impl SifsOneShotBulkWriteRequester {
             );
         }
 
-        // A successful scoped daemon refresh is the freshness proof for the
-        // catalog consumed below. Unlike the general backend, this requester
-        // must never fall back to direct routing or an old local snapshot.
-        refresh_sifs_cluster_kv_snapshot(data_dir, &cluster_paths)?;
+        if let Some(snapshot) = authoritative_snapshot.as_ref() {
+            let expected_source = cluster_paths.kv_paths().snapshot;
+            if snapshot.source() != expected_source {
+                return Err(format!(
+                    "one-shot SIFS bulk write authority source {} does not match local cluster snapshot {}",
+                    snapshot.source().display(),
+                    expected_source.display()
+                ));
+            }
+        } else {
+            // Suite/tag and fixture contexts do not carry an immediately fresh
+            // proof. Preserve the fail-closed path by paying for a new daemon
+            // authority barrier rather than trusting their older snapshot.
+            refresh_sifs_cluster_kv_snapshot(data_dir, &cluster_paths)?;
+        }
         let state = cluster::read_cluster_state_without_kv(&cluster_paths)
             .map_err(|error| format!("cannot read local cluster state: {error}"))?;
         let peer_node_ids = cluster_dfs_peer_node_ids(&state);
@@ -2094,12 +2109,21 @@ impl SifsOneShotBulkWriteRequester {
             &cluster_paths,
             local_node_id.clone(),
         );
-        // The scoped refresh above already installed the latest snapshot. Load
-        // that exact materialization without paying a second daemon barrier.
-        control_plane
-            .inner
-            .replace_cached_snapshot(false)
-            .map_err(|error| format!("cannot load one-shot DFS shard catalog: {error}"))?;
+        if let Some(authoritative_snapshot) = authoritative_snapshot {
+            // The exact single-case test context fetched and canonically
+            // validated this generation under a current-term quorum barrier.
+            // Install its Arc directly instead of serializing a duplicate Raft
+            // barrier and rereading the materialized snapshot from disk.
+            control_plane
+                .inner
+                .install_cached_snapshot(authoritative_snapshot.snapshot())
+                .map_err(|error| format!("cannot install one-shot DFS shard catalog: {error}"))?;
+        } else {
+            control_plane
+                .inner
+                .replace_cached_snapshot(false)
+                .map_err(|error| format!("cannot load one-shot DFS shard catalog: {error}"))?;
+        }
         control_plane
             .validate_cached_catalog()
             .map_err(|error| format!("cannot validate one-shot DFS shard catalog: {error}"))?;
@@ -2653,6 +2677,16 @@ impl SifsControlPlaneKvClient {
             .map_err(|_| self.kv_error("SIFS snapshot cache lock is poisoned"))?;
         cache.loaded = true;
         cache.snapshot = snapshot;
+        Ok(())
+    }
+
+    fn install_cached_snapshot(&self, snapshot: Arc<KvSnapshot>) -> Result<(), KvError> {
+        let mut cache = self
+            .snapshot
+            .lock()
+            .map_err(|_| self.kv_error("SIFS snapshot cache lock is poisoned"))?;
+        cache.loaded = true;
+        cache.snapshot = Some(snapshot);
         Ok(())
     }
 
@@ -4146,13 +4180,14 @@ mod tests {
 
         let control_plane =
             SifsOneShotBulkWriteControlPlaneKvClient::new(&data_dir, &cluster_paths, local_node_id);
+        let authoritative_snapshot =
+            cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(&cluster_paths)
+                .expect("read authoritative fixture snapshot")
+                .expect("authoritative fixture snapshot");
         control_plane
             .inner
-            .replace_cached_snapshot(false)
-            .expect("install fresh catalog");
-        control_plane
-            .validate_cached_catalog()
-            .expect("validate fresh catalog");
+            .install_cached_snapshot(authoritative_snapshot)
+            .expect("install returned authoritative catalog");
 
         let snapshot_path = cluster_paths.kv_paths().snapshot;
         fs::remove_file(&snapshot_path).expect("remove materialized snapshot");
@@ -4166,6 +4201,44 @@ mod tests {
         assert!(
             !snapshot_path.exists(),
             "cached validation must not trigger another daemon/KV materialization"
+        );
+    }
+
+    #[test]
+    fn one_shot_bulk_write_rejects_authority_from_another_data_dir() {
+        let root = temp_sifs_data_dir("one-shot-foreign-authority");
+        let data_dir = SinomoDataDir::new(&root);
+        seed_observation_cluster(&data_dir);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let snapshot =
+            cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(&cluster_paths)
+                .expect("read fixture snapshot")
+                .expect("fixture snapshot");
+        let authority = sinomo_runtime::kv::KvAuthorityProof {
+            term: 4,
+            commit_index: 12,
+            revision: snapshot.revision,
+            basis: sinomo_runtime::kv::KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks: 2,
+                required_quorum: 2,
+            },
+        };
+        let token = sinomo_runtime::test::SinomoTestContext::new(&root)
+            .try_with_authoritative_cluster_snapshot(
+                sinomo_runtime::kv::KvAuthoritativeRead {
+                    value: (*snapshot).clone(),
+                    authority,
+                },
+                root.join("another-cluster/kv-snapshot.sobj"),
+            )
+            .expect("valid but foreign authoritative snapshot")
+            .authoritative_cluster_snapshot()
+            .expect("authoritative token");
+        let error = SifsOneShotBulkWriteRequester::open(&data_dir, Some(token))
+            .expect_err("foreign authority source must fail before transport open");
+        assert!(
+            error.contains("does not match local cluster snapshot"),
+            "unexpected foreign authority error: {error}"
         );
     }
 

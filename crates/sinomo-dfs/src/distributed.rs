@@ -485,6 +485,12 @@ pub struct DistributedEventualCoordinator {
     receipt_count: usize,
     committed_versions: BTreeMap<ObjectKey, DfsVersion>,
     repair_jobs: Vec<DistributedRepairJob>,
+    /// Repair jobs created while serving the current inbound message.
+    ///
+    /// The durable daemon queue consumes this delta at the committed edge.
+    /// Keeping an explicit capture avoids walking and serializing the complete
+    /// accumulated repair backlog after every foreground write.
+    message_repair_jobs: Option<Vec<DistributedRepairJob>>,
 }
 
 impl DistributedEventualCoordinator {
@@ -497,6 +503,14 @@ impl DistributedEventualCoordinator {
 
     pub(crate) fn observe_restored_intent_counter_floor(&mut self, floor: u64) {
         self.next_intent_id = self.next_intent_id.max(floor.saturating_add(1));
+    }
+
+    pub(crate) fn begin_message_repair_job_capture(&mut self) {
+        self.message_repair_jobs = Some(Vec::new());
+    }
+
+    pub(crate) fn take_message_repair_jobs(&mut self) -> Vec<DistributedRepairJob> {
+        self.message_repair_jobs.take().unwrap_or_default()
     }
 
     pub fn set_committed_version(
@@ -1036,13 +1050,17 @@ impl DistributedEventualCoordinator {
             .iter()
             .filter(|node_id| !durable_nodes.contains(*node_id))
         {
-            self.repair_jobs.push(DistributedRepairJob {
+            let job = DistributedRepairJob {
                 intent_id: intent.intent_id.clone(),
                 file_system_id: intent.file_system_id.clone(),
                 object_id: intent.object_id.clone(),
                 version: intent.target_version.clone(),
                 missing_replica_node_id: missing_replica_node_id.clone(),
-            });
+            };
+            if let Some(message_repair_jobs) = self.message_repair_jobs.as_mut() {
+                message_repair_jobs.push(job.clone());
+            }
+            self.repair_jobs.push(job);
         }
 
         Ok(())

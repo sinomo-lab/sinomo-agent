@@ -36,6 +36,59 @@ use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
 };
 
+#[cfg(test)]
+std::thread_local! {
+    static NAMESPACE_PREPARE_NORMALIZATION_PASSES: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn record_namespace_prepare_normalization_pass() {
+    NAMESPACE_PREPARE_NORMALIZATION_PASSES.with(|passes| {
+        passes.set(passes.get().saturating_add(1));
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn reset_namespace_prepare_normalization_passes() {
+    NAMESPACE_PREPARE_NORMALIZATION_PASSES.with(|passes| passes.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn namespace_prepare_normalization_passes() -> usize {
+    NAMESPACE_PREPARE_NORMALIZATION_PASSES.with(std::cell::Cell::get)
+}
+
+/// Proof that a mutable namespace prepare is in canonical normalized order.
+///
+/// The wrapped record remains owned by the caller, but safe external code
+/// cannot forge this proof because construction and mutable access are kept at
+/// the DFS normalization boundary. Backend implementations may inspect the
+/// canonical record and either use the default borrowed fallback or consume
+/// the proof in an optimized implementation.
+pub struct DfsNormalizedNamespacePrepare<'a> {
+    prepare: &'a mut DfsNamespacePrepareRecord,
+}
+
+impl<'a> DfsNormalizedNamespacePrepare<'a> {
+    pub(crate) fn new(prepare: &'a mut DfsNamespacePrepareRecord) -> Self {
+        #[cfg(test)]
+        record_namespace_prepare_normalization_pass();
+        crate::metadata_records::normalize_namespace_prepare_in_place(prepare);
+        Self { prepare }
+    }
+
+    /// Borrow the canonical record without weakening its normalization proof.
+    pub fn as_record(&self) -> &DfsNamespacePrepareRecord {
+        self.prepare
+    }
+
+    pub(crate) fn set_operation_digest(&mut self, operation_digest: String) {
+        self.prepare.operation_digest = operation_digest;
+    }
+}
+
 /// Durable shard-local freeze installed while a same-primary membership
 /// handoff carries the retiring authority's exact state.
 ///
@@ -251,6 +304,31 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
 
     /// End one bounded coherent-read scope opened above.
     fn end_consistent_read_snapshot(&mut self) {}
+
+    /// Pin the metadata generation needed to serve one exact namespace path.
+    ///
+    /// The default is deliberately conservative for unsharded and third-party
+    /// backends. A sharded router can override this to refresh only the active
+    /// path shard and any retained routing fallbacks instead of reopening every
+    /// unrelated shard for a point lookup.
+    fn begin_consistent_read_snapshot_for_path(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<()> {
+        let _ = (file_system_id, path);
+        self.begin_consistent_read_snapshot()
+    }
+
+    /// End a path-scoped coherent-read scope opened above.
+    fn end_consistent_read_snapshot_for_path(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) {
+        let _ = (file_system_id, path);
+        self.end_consistent_read_snapshot();
+    }
 
     /// Create or replace a filesystem record and journal the mutation.
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry>;
@@ -1505,6 +1583,35 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &mut self,
         prepare: &DfsNamespacePrepareRecord,
     ) -> Result<DfsMetadataJournalEntry>;
+
+    /// In-place counterpart used by large foreground prepares.
+    ///
+    /// The caller keeps ownership for later in-memory publication and for
+    /// precise conflict-to-path error mapping. The default normalizes this
+    /// allocation once and delegates to the canonical entry point below.
+    fn prepare_namespace_transaction_in_place(
+        &mut self,
+        prepare: &mut DfsNamespacePrepareRecord,
+    ) -> Result<DfsMetadataJournalEntry> {
+        self.prepare_normalized_namespace_transaction_in_place(DfsNormalizedNamespacePrepare::new(
+            prepare,
+        ))
+    }
+
+    /// Persist a namespace prepare that is already in canonical normalized
+    /// order, without repeating the large-vector normalization passes.
+    ///
+    /// The unforgeable wrapper proves that the DFS boundary normalized the
+    /// record and retained its exclusive mutable borrow. Backends that validate
+    /// routing or persist packed records should override this method so the
+    /// same allocation flows through every layer. The default preserves
+    /// compatibility with borrowed-only backends.
+    fn prepare_normalized_namespace_transaction_in_place(
+        &mut self,
+        prepare: DfsNormalizedNamespacePrepare<'_>,
+    ) -> Result<DfsMetadataJournalEntry> {
+        self.prepare_namespace_transaction(prepare.as_record())
+    }
 
     /// Move an exact durable namespace prepare to a newer shard-owner epoch.
     ///

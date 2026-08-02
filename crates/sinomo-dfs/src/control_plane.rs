@@ -22,8 +22,9 @@ use sinomo_core::kv::{
     InProcessKvStore, KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse,
 };
 use sinomo_core::node::{
-    ClusterCapabilityPolicyRecord, DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY, NodeId,
-    cluster_capability_policy_key, cluster_member_key,
+    ClusterCapabilityPolicyRecord, DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
+    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY, NodeId, cluster_capability_policy_key,
+    cluster_member_key,
 };
 use sinomo_core::{ClusterMemberRecord, ClusterMemberState, DfsObjectPolicy};
 use std::collections::{BTreeMap, BTreeSet};
@@ -787,6 +788,40 @@ pub enum DfsMetadataNamespacePrepareCodec {
     /// Activation is one-way until a future rollback protocol proves a
     /// legacy-readable snapshot and replay floor beyond all packed records.
     PackedV1,
+    /// Indexed packed-v2 authoritative journal payload. This capability is
+    /// cumulative with every earlier codec and is selected only after every
+    /// assigned metadata member advertises the matching decoder capability.
+    PackedV2,
+}
+
+impl DfsMetadataNamespacePrepareCodec {
+    pub(crate) const fn rank(self) -> u8 {
+        match self {
+            Self::Legacy => 0,
+            Self::PackedV1 => 1,
+            Self::PackedV2 => 2,
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::PackedV1 => "packed-v1",
+            Self::PackedV2 => "packed-v2",
+        }
+    }
+
+    pub(crate) const fn required_capability(self) -> Option<&'static str> {
+        match self {
+            Self::Legacy => None,
+            Self::PackedV1 => Some(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY),
+            Self::PackedV2 => Some(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY),
+        }
+    }
+
+    pub(crate) const fn is_packed(self) -> bool {
+        !matches!(self, Self::Legacy)
+    }
 }
 
 fn metadata_namespace_prepare_codec_is_legacy(codec: &DfsMetadataNamespacePrepareCodec) -> bool {
@@ -4003,13 +4038,13 @@ fn validate_metadata_namespace_prepare_codec_transition(
     expected: &DfsMetadataShardConfig,
     desired: &DfsMetadataShardConfig,
 ) -> Result<(), KvError> {
-    if expected.namespace_prepare_codec == DfsMetadataNamespacePrepareCodec::PackedV1
-        && desired.namespace_prepare_codec == DfsMetadataNamespacePrepareCodec::Legacy
-    {
+    if desired.namespace_prepare_codec.rank() < expected.namespace_prepare_codec.rank() {
         return Err(KvError::Serialization {
             detail: format!(
-                "metadata shard {} cannot downgrade packed-v1 namespace prepares without a legacy-readable snapshot and replay-floor proof",
-                expected.shard_id
+                "metadata shard {} cannot downgrade namespace prepare codec {} to {} without a compatible snapshot, including a legacy-readable snapshot when required, and replay-floor proof",
+                expected.shard_id,
+                expected.namespace_prepare_codec.label(),
+                desired.namespace_prepare_codec.label(),
             ),
         });
     }
@@ -4022,13 +4057,13 @@ fn validate_raw_metadata_namespace_prepare_codec_write(
 ) -> Result<(), KvError> {
     validate_metadata_namespace_prepare_codec_transition(current, desired)?;
     if current.namespace_prepare_codec != desired.namespace_prepare_codec
-        || (current.namespace_prepare_codec == DfsMetadataNamespacePrepareCodec::PackedV1
-            && current != desired)
+        || (current.namespace_prepare_codec.is_packed() && current != desired)
     {
         return Err(KvError::Serialization {
             detail: format!(
-                "metadata shard {} cannot activate or reconfigure packed-v1 namespace prepares through a raw put; use the capability-validated metadata membership handoff",
-                current.shard_id
+                "metadata shard {} cannot activate or reconfigure {} namespace prepares through a raw put; use the capability-validated metadata membership handoff",
+                current.shard_id,
+                desired.namespace_prepare_codec.label(),
             ),
         });
     }
@@ -4039,9 +4074,9 @@ fn metadata_namespace_prepare_codec_admission_compares(
     kv: &(impl DfsControlPlaneKvClient + ?Sized),
     desired: &DfsMetadataShardConfig,
 ) -> Result<Vec<KvCompare>, KvError> {
-    if desired.namespace_prepare_codec != DfsMetadataNamespacePrepareCodec::PackedV1 {
+    let Some(required_capability) = desired.namespace_prepare_codec.required_capability() else {
         return Ok(Vec::new());
-    }
+    };
     let mut cluster_id = None;
     let mut compares = Vec::new();
     for node_id in metadata_shard_configured_node_ids(desired) {
@@ -4050,8 +4085,10 @@ fn metadata_namespace_prepare_codec_admission_compares(
             kv.get(&member_key)?
                 .ok_or_else(|| KvError::Serialization {
                     detail: format!(
-                        "metadata shard {} cannot activate packed-v1 namespace prepares: assigned node {} has no authoritative cluster member capability record",
-                        desired.shard_id, node_id
+                        "metadata shard {} cannot activate {} namespace prepares: assigned node {} has no authoritative cluster member capability record",
+                        desired.shard_id,
+                        desired.namespace_prepare_codec.label(),
+                        node_id,
                     ),
                 })?;
         let policy_key = cluster_capability_policy_key(&node_id);
@@ -4064,6 +4101,7 @@ fn metadata_namespace_prepare_codec_admission_compares(
             policy_key,
             policy_entry,
             &mut cluster_id,
+            required_capability,
         )?);
     }
     Ok(compares)
@@ -4073,9 +4111,9 @@ async fn metadata_namespace_prepare_codec_admission_compares_async(
     kv: &mut (impl AsyncDfsControlPlaneKvClient + ?Sized),
     desired: &DfsMetadataShardConfig,
 ) -> Result<Vec<KvCompare>, KvError> {
-    if desired.namespace_prepare_codec != DfsMetadataNamespacePrepareCodec::PackedV1 {
+    let Some(required_capability) = desired.namespace_prepare_codec.required_capability() else {
         return Ok(Vec::new());
-    }
+    };
     let mut cluster_id = None;
     let mut compares = Vec::new();
     for node_id in metadata_shard_configured_node_ids(desired) {
@@ -4085,8 +4123,10 @@ async fn metadata_namespace_prepare_codec_admission_compares_async(
             .await?
             .ok_or_else(|| KvError::Serialization {
                 detail: format!(
-                    "metadata shard {} cannot activate packed-v1 namespace prepares: assigned node {} has no authoritative cluster member capability record",
-                    desired.shard_id, node_id
+                    "metadata shard {} cannot activate {} namespace prepares: assigned node {} has no authoritative cluster member capability record",
+                    desired.shard_id,
+                    desired.namespace_prepare_codec.label(),
+                    node_id,
                 ),
             })?;
         let policy_key = cluster_capability_policy_key(&node_id);
@@ -4099,6 +4139,7 @@ async fn metadata_namespace_prepare_codec_admission_compares_async(
             policy_key,
             policy_entry,
             &mut cluster_id,
+            required_capability,
         )?);
     }
     Ok(compares)
@@ -4112,13 +4153,16 @@ fn metadata_namespace_prepare_codec_member_compares(
     policy_key: String,
     policy_entry: Option<KvEntry>,
     cluster_id: &mut Option<sinomo_core::Id>,
+    required_capability: &str,
 ) -> Result<Vec<KvCompare>, KvError> {
     let member = member_entry.decode::<ClusterMemberRecord>()?;
     if member.node_id != *node_id || !member.state.is_authorized() {
         return Err(KvError::Serialization {
             detail: format!(
-                "metadata shard {} cannot activate packed-v1 namespace prepares: assigned node {} is not an authorized cluster member",
-                desired.shard_id, node_id
+                "metadata shard {} cannot activate {} namespace prepares: assigned node {} is not an authorized cluster member",
+                desired.shard_id,
+                desired.namespace_prepare_codec.label(),
+                node_id,
             ),
         });
     }
@@ -4132,8 +4176,10 @@ fn metadata_namespace_prepare_codec_member_compares(
     {
         return Err(KvError::Serialization {
             detail: format!(
-                "metadata shard {} cannot activate packed-v1 namespace prepares: assigned node {} has an inconsistent authoritative capability policy",
-                desired.shard_id, node_id
+                "metadata shard {} cannot activate {} namespace prepares: assigned node {} has an inconsistent authoritative capability policy",
+                desired.shard_id,
+                desired.namespace_prepare_codec.label(),
+                node_id,
             ),
         });
     }
@@ -4141,13 +4187,17 @@ fn metadata_namespace_prepare_codec_member_compares(
         .as_ref()
         .map(|policy| policy.capabilities.as_slice())
         .unwrap_or(member.capabilities.as_slice());
-    if !effective_capabilities.iter().any(|capability| {
-        capability.as_str() == DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY
-    }) {
+    if !effective_capabilities
+        .iter()
+        .any(|capability| capability.as_str() == required_capability)
+    {
         return Err(KvError::Serialization {
             detail: format!(
-                "metadata shard {} cannot activate packed-v1 namespace prepares: assigned node {} effective capability policy does not advertise {}",
-                desired.shard_id, node_id, DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY
+                "metadata shard {} cannot activate {} namespace prepares: assigned node {} effective capability policy does not advertise {}",
+                desired.shard_id,
+                desired.namespace_prepare_codec.label(),
+                node_id,
+                required_capability,
             ),
         });
     }
@@ -4157,8 +4207,9 @@ fn metadata_namespace_prepare_codec_member_compares(
     {
         return Err(KvError::Serialization {
             detail: format!(
-                "metadata shard {} cannot activate packed-v1 namespace prepares across inconsistent cluster member records",
-                desired.shard_id
+                "metadata shard {} cannot activate {} namespace prepares across inconsistent cluster member records",
+                desired.shard_id,
+                desired.namespace_prepare_codec.label(),
             ),
         });
     }
@@ -5326,6 +5377,28 @@ mod tests {
             member.capabilities.push(capability.clone());
             kv.put_serde(cluster_member_key(node_id), &member, None)
                 .expect("put packed prepare capability member");
+        }
+    }
+
+    fn add_packed_v2_namespace_prepare_capability<'a>(
+        kv: &mut InProcessKvStore,
+        node_ids: impl IntoIterator<Item = &'a NodeId>,
+    ) {
+        let capability =
+            sinomo_core::CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY)
+                .expect("static capability");
+        for node_id in node_ids {
+            let key = cluster_member_key(node_id);
+            let mut member = kv
+                .get(&key)
+                .expect("cluster member capability record")
+                .decode::<ClusterMemberRecord>()
+                .expect("decode cluster member capability record");
+            if !member.capabilities.contains(&capability) {
+                member.capabilities.push(capability.clone());
+            }
+            kv.put_serde(key, &member, None)
+                .expect("add packed-v2 prepare capability");
         }
     }
 
@@ -7344,6 +7417,108 @@ mod tests {
                 .expect("read retained legacy shard"),
             Some(legacy)
         );
+    }
+
+    #[test]
+    fn metadata_namespace_prepare_codec_transitions_are_monotonic_through_v2() {
+        let legacy = DfsMetadataShardConfig {
+            file_system_id: file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: node("node_codec_transition_owner"),
+            replica_node_ids: vec![node("node_codec_transition_replica")],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let packed_v1 = DfsMetadataShardConfig {
+            epoch: 2,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
+            ..legacy.clone()
+        };
+        let packed_v2 = DfsMetadataShardConfig {
+            epoch: 3,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV2,
+            ..legacy.clone()
+        };
+
+        validate_metadata_namespace_prepare_codec_transition(&legacy, &packed_v1)
+            .expect("legacy to packed-v1 upgrade");
+        validate_metadata_namespace_prepare_codec_transition(&packed_v1, &packed_v2)
+            .expect("packed-v1 to packed-v2 upgrade");
+        validate_metadata_namespace_prepare_codec_transition(&legacy, &packed_v2)
+            .expect("a fully capable new generation may activate packed-v2 directly");
+        for desired in [&packed_v1, &legacy] {
+            assert!(matches!(
+                validate_metadata_namespace_prepare_codec_transition(&packed_v2, desired),
+                Err(KvError::Serialization { detail })
+                    if detail.contains("cannot downgrade")
+                        && detail.contains("packed-v2")
+                        && detail.contains(desired.namespace_prepare_codec.label())
+            ));
+        }
+    }
+
+    #[test]
+    fn initial_packed_v2_metadata_shard_requires_its_exact_capability() {
+        let packed_v2 = DfsMetadataShardConfig {
+            file_system_id: file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: node("node_initial_packed_v2_owner"),
+            replica_node_ids: vec![node("node_initial_packed_v2_replica")],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV2,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let configured_node_ids = std::iter::once(&packed_v2.primary_node_id)
+            .chain(packed_v2.replica_node_ids.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut kv = InProcessKvStore::new();
+        put_packed_namespace_prepare_capable_members(&mut kv, configured_node_ids.iter());
+
+        assert!(matches!(
+            DfsControlPlaneStore::new(&mut kv).put_metadata_shard(&packed_v2),
+            Err(KvError::Serialization { detail })
+                if detail.contains("packed-v2")
+                    && detail.contains(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY)
+        ));
+
+        add_packed_v2_namespace_prepare_capability(&mut kv, configured_node_ids.iter());
+        let denied_node_id = &packed_v2.replica_node_ids[0];
+        let denied_member = kv
+            .get(&cluster_member_key(denied_node_id))
+            .expect("packed-v2 member")
+            .decode::<ClusterMemberRecord>()
+            .expect("decode packed-v2 member");
+        let mut denied_policy = ClusterCapabilityPolicyRecord::from(&denied_member);
+        denied_policy.capabilities.retain(|capability| {
+            capability.as_str() != DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY
+        });
+        kv.put_serde(
+            cluster_capability_policy_key(denied_node_id),
+            &denied_policy,
+            None,
+        )
+        .expect("put packed-v2 denying policy");
+        assert!(matches!(
+            DfsControlPlaneStore::new(&mut kv).put_metadata_shard(&packed_v2),
+            Err(KvError::Serialization { detail })
+                if detail.contains("effective capability policy")
+                    && detail.contains(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY)
+        ));
+
+        let allowed_policy = ClusterCapabilityPolicyRecord::from(&denied_member);
+        kv.put_serde(
+            cluster_capability_policy_key(denied_node_id),
+            &allowed_policy,
+            None,
+        )
+        .expect("put packed-v2 allowing policy");
+        DfsControlPlaneStore::new(&mut kv)
+            .put_metadata_shard(&packed_v2)
+            .expect("capability-proved packed-v2 create");
     }
 
     #[test]

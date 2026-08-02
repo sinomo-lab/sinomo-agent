@@ -76,6 +76,42 @@ impl DfsRepairMaintenanceBudget {
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// Drain only the repair jobs created while serving the current message.
+    ///
+    /// A committed repair job retains its pending write until it is repaired
+    /// or loses authority, so the pending record is the exact source for the
+    /// content identity persisted in the daemon's local durable queue. Jobs
+    /// without a pending write are intentionally omitted, matching
+    /// `durable_repair_queue_records`: they are not executable by this lane.
+    pub(crate) fn take_message_committed_repair_queue_records(
+        &mut self,
+    ) -> Vec<DfsRepairAttemptRecord> {
+        let now = dfs_now_unix_nanos();
+        let mut records = BTreeMap::new();
+        for job in self.coordinator.take_message_repair_jobs() {
+            let Some(pending) = self.pending_writes.get(&job.intent_id) else {
+                continue;
+            };
+            records.insert(
+                (job.intent_id.clone(), job.missing_replica_node_id.clone()),
+                DfsRepairAttemptRecord {
+                    intent_id: job.intent_id,
+                    object_id: pending.object_id.clone(),
+                    version: pending.version.clone(),
+                    content_hash: pending.content_hash.clone(),
+                    missing_replica_node_id: job.missing_replica_node_id,
+                    attempts: 0,
+                    in_flight: false,
+                    last_attempt_unix_nanos: 0,
+                    next_retry_unix_nanos: now,
+                    transfer_request_id: None,
+                    last_error: None,
+                },
+            );
+        }
+        records.into_values().collect()
+    }
+
     /// Number of new stage sends that may be reserved for this intent now.
     /// Background writes reserve only the exact W deficit; foreground writes
     /// may reserve every missing desired replica. A timed-out inflight request
