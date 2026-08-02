@@ -295,7 +295,7 @@ pub(crate) use message_transport::{
 };
 pub use metadata_api::{
     DfsMetadataBackend, DfsMetadataReplicaIngestPermit, DfsMetadataShardWriteFreeze,
-    DfsNamespaceRequestAdmissionSnapshot,
+    DfsNamespaceRequestAdmissionSnapshot, DfsNormalizedNamespacePrepare,
 };
 pub use metadata_backend::LocalSobjMetadataBackend;
 pub use metadata_error::MetadataBackendError;
@@ -306,7 +306,7 @@ pub use metadata_history_gc::{
 pub use metadata_limits::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
 };
-pub use metadata_prepare_codec::DfsPackedNamespacePrepareV1;
+pub use metadata_prepare_codec::{DfsPackedNamespacePrepareV1, DfsPackedNamespacePrepareV2};
 pub use metadata_records::{
     DfsConflictPage, DfsConflictPageCursor, DfsConflictRecord, DfsConflictScanCursor,
     DfsConflictScanPage, DfsConflictStatus, DfsCrossShardPinTransferRecord,

@@ -31423,6 +31423,7 @@ fn sifs_posix_create_bulk_local_eventual_avoids_per_file_requester_lookups() {
         .collect::<Vec<_>>();
 
     crate::posix::reset_posix_metadata_raw_lookup_count();
+    crate::posix::reset_posix_bulk_parent_touch_constructions();
     let stats = dfs
         .posix_create_files_local_eventual_with_known_parents(
             owned_files
@@ -31433,6 +31434,11 @@ fn sifs_posix_create_bulk_local_eventual_avoids_per_file_requester_lookups() {
     let raw_lookup_count = crate::posix::posix_metadata_raw_lookup_count();
 
     assert_eq!(stats.len(), owned_files.len());
+    assert_eq!(
+        crate::posix::posix_bulk_parent_touch_constructions(),
+        1,
+        "one shared parent must produce one parent-touch record for the complete bulk create"
+    );
     let parent_component_count = work.trim_matches('/').split('/').count();
     let single_parent_walk_bound = parent_component_count + 1;
     assert!(

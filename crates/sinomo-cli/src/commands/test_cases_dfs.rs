@@ -1245,9 +1245,10 @@ fn optional_namespace_prepare_codec_parameter(
         Some(raw) => match raw.trim() {
             "legacy" => Ok(Some(DfsMetadataNamespacePrepareCodec::Legacy)),
             "packed-v1" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV1)),
+            "packed-v2" => Ok(Some(DfsMetadataNamespacePrepareCodec::PackedV2)),
             other => Err(SinomoTestError::InvalidParameter {
                 name: key.to_string(),
-                detail: format!("expected `legacy` or `packed-v1`, got `{other}`"),
+                detail: format!("expected `legacy`, `packed-v1`, or `packed-v2`, got `{other}`"),
             }),
         },
         None => Ok(None),
@@ -1258,6 +1259,7 @@ fn namespace_prepare_codec_label(codec: DfsMetadataNamespacePrepareCodec) -> &'s
     match codec {
         DfsMetadataNamespacePrepareCodec::Legacy => "legacy",
         DfsMetadataNamespacePrepareCodec::PackedV1 => "packed-v1",
+        DfsMetadataNamespacePrepareCodec::PackedV2 => "packed-v2",
     }
 }
 
@@ -5491,7 +5493,9 @@ mod tests {
         for (raw, expected) in [
             ("legacy", DfsMetadataNamespacePrepareCodec::Legacy),
             ("packed-v1", DfsMetadataNamespacePrepareCodec::PackedV1),
+            ("packed-v2", DfsMetadataNamespacePrepareCodec::PackedV2),
         ] {
+            assert_eq!(namespace_prepare_codec_label(expected), raw);
             let ctx = SinomoTestContext::new("unused")
                 .with_parameter("expected-namespace-prepare-codec", raw);
             assert_eq!(
@@ -5505,7 +5509,7 @@ mod tests {
         }
 
         let invalid = SinomoTestContext::new("unused")
-            .with_parameter("expected-namespace-prepare-codec", "packed-v2");
+            .with_parameter("expected-namespace-prepare-codec", "packed-v3");
         assert!(matches!(
             optional_namespace_prepare_codec_parameter(
                 &invalid,
@@ -5515,6 +5519,7 @@ mod tests {
                 if name == "expected-namespace-prepare-codec"
                     && detail.contains("legacy")
                     && detail.contains("packed-v1")
+                    && detail.contains("packed-v2")
         ));
     }
 

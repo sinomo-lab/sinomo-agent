@@ -31,10 +31,10 @@ use crate::metadata_records::{
     DfsMetadataTableSnapshot, DfsMetadataTableSnapshotTables, DfsNamespaceTransaction,
     DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord, DfsVisibleCommitSnapshotRecord,
     DfsVisibleVersionCommitRecord, DfsWriteIntentRecord,
-    dfs_metadata_table_snapshot_state_fingerprint, normalized_namespace_prepare,
-    normalized_object_metadata, normalized_version_record,
+    dfs_metadata_table_snapshot_state_fingerprint, normalized_object_metadata,
+    normalized_version_record,
 };
-use crate::metadata_replay::decoded_namespace_prepare_payload;
+use crate::metadata_replay::decoded_normalized_namespace_prepare_payload;
 use crate::metadata_tables::{
     DfsMetadataTableState, DfsMetadataTables, MetadataTableReplay,
     MetadataTableSnapshotFingerprint, max_optional_sequence,
@@ -984,12 +984,11 @@ fn resolve_metadata_table_op_from_journal(
             "metadata table namespace prepare {operation_id} reference {journal_sequence} does not name a payload-complete put-namespace-prepare entry"
         )));
     };
-    let prepare = decoded_namespace_prepare_payload(&entry)?.ok_or_else(|| {
+    let prepare = decoded_normalized_namespace_prepare_payload(&entry)?.ok_or_else(|| {
         MetadataBackendError::Serde(format!(
             "metadata table namespace prepare {operation_id} reference {journal_sequence} does not name a payload-complete put-namespace-prepare entry"
         ))
     })?;
-    let prepare = normalized_namespace_prepare(&prepare);
     if journal_file_system_id != &file_system_id
         || journal_operation_id != &operation_id
         || journal_status != &status
@@ -1004,7 +1003,9 @@ fn resolve_metadata_table_op_from_journal(
             "metadata table namespace prepare {operation_id} reference {journal_sequence} scope/digest/epoch/status fence mismatch"
         )));
     }
-    Ok(DfsMetadataTableOp::PutNamespacePrepare { prepare })
+    Ok(DfsMetadataTableOp::PutNamespacePrepare {
+        prepare: prepare.into_owned(),
+    })
 }
 
 pub(crate) fn append_metadata_table_batch(

@@ -808,7 +808,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let objects = transaction
             .objects
             .iter()
-            .map(|object| (object.object_id.clone(), object))
+            .map(|object| (&object.object_id, object))
             .collect::<BTreeMap<_, _>>();
         if objects.len() != transaction.objects.len() {
             return Err(reject(
@@ -828,12 +828,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let versions = transaction
             .versions
             .iter()
-            .map(|version| {
-                (
-                    (version.object_id.clone(), version.version.clone()),
-                    version,
-                )
-            })
+            .map(|version| (&version.object_id, version))
             .collect::<BTreeMap<_, _>>();
         if versions.len() != transaction.versions.len()
             || transaction.versions.len() != transaction.objects.len()
@@ -871,7 +866,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         for write in writes {
             let receipt = &write.receipt;
             let object_id = &receipt.receipt.object_id;
-            if writes_by_object.insert(object_id.clone(), write).is_some() {
+            if writes_by_object.insert(object_id, write).is_some() {
                 return Err(reject(format!(
                     "local-eventual batch repeats the write proof for object {object_id}"
                 )));
@@ -903,16 +898,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     "local-eventual batch durable receipt does not match object {object_id}"
                 )));
             }
-            let version = versions
-                .get(&(object_id.clone(), object.version.clone()))
-                .ok_or_else(|| {
-                    reject(format!(
-                        "local-eventual batch is missing visible version {} for object {object_id}",
-                        object.version
-                    ))
-                })?;
+            let version = versions.get(object_id).ok_or_else(|| {
+                reject(format!(
+                    "local-eventual batch is missing visible version {} for object {object_id}",
+                    object.version
+                ))
+            })?;
             if !version.visible
                 || version.file_system_id != transaction.file_system_id
+                || version.version != object.version
                 || version.content_hash != object.content_hash
                 || version.size_bytes != object.content_size_bytes
                 || version.locations != object.current_locations
@@ -1028,55 +1022,50 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     reason: "parent directory disappeared before the batch committed".to_string(),
                 });
             };
-            let parent_writes = writes_by_object
-                .values()
-                .filter(|write| {
-                    write.expected_base_version.is_none()
-                        && objects
-                            .get(&write.receipt.receipt.object_id)
-                            .and_then(|file| crate::posix_path::parent_posix_path(&file.path))
-                            .as_deref()
-                            == Some(object.path.as_str())
-                })
-                .collect::<Vec<_>>();
-            if parent_writes.is_empty() {
+            let mut parent_write_count = 0_usize;
+            let mut expected_parent_version = None;
+            for write in writes_by_object.values().filter(|write| {
+                write.expected_base_version.is_none()
+                    && objects
+                        .get(&write.receipt.receipt.object_id)
+                        .and_then(|file| crate::posix_path::parent_posix_path(&file.path))
+                        .as_deref()
+                        == Some(object.path.as_str())
+            }) {
+                parent_write_count += 1;
+                let (Some(parent_object_id), Some(parent_version)) = (
+                    write.expected_parent_object_id.as_ref(),
+                    write.expected_parent_version.as_ref(),
+                ) else {
+                    return Err(reject(format!(
+                        "local-eventual batch write proof for parent {} has no exact parent generation",
+                        object.path
+                    )));
+                };
+                if parent_object_id != &object.object_id {
+                    return Err(reject(format!(
+                        "local-eventual batch write proof for parent {} has no exact parent generation",
+                        object.path
+                    )));
+                }
+                match expected_parent_version {
+                    None => expected_parent_version = Some(parent_version),
+                    Some(expected) if expected == parent_version => {}
+                    Some(_) => {
+                        return Err(reject(format!(
+                            "local-eventual batch write proofs disagree on the parent generation for {}",
+                            object.path
+                        )));
+                    }
+                }
+            }
+            if parent_write_count == 0 {
                 return Err(reject(format!(
                     "local-eventual batch directory touch {} is not the parent of a proven file",
                     object.path
                 )));
             }
-            let expected_parent_versions = parent_writes
-                .iter()
-                .map(|write| {
-                    match (
-                        write.expected_parent_object_id.as_ref(),
-                        write.expected_parent_version.as_ref(),
-                    ) {
-                        (Some(parent_object_id), Some(parent_version))
-                            if parent_object_id == &object.object_id =>
-                        {
-                            Ok(parent_version.clone())
-                        }
-                        _ => Err(reject(format!(
-                            "local-eventual batch write proof for parent {} has no exact parent generation",
-                            object.path
-                        ))),
-                    }
-                })
-                .collect::<Result<BTreeSet<_>, _>>()?;
-            let mut expected_parent_versions = expected_parent_versions.iter();
-            let Some(expected_parent_version) = expected_parent_versions.next() else {
-                return Err(reject(format!(
-                    "local-eventual batch write proofs omit the parent generation for {}",
-                    object.path
-                )));
-            };
-            if expected_parent_versions.next().is_some() {
-                return Err(reject(format!(
-                    "local-eventual batch write proofs disagree on the parent generation for {}",
-                    object.path
-                )));
-            }
+            let expected_parent_version = expected_parent_version.expect("count proves a value");
             if &current.version != expected_parent_version {
                 return Err(DfsError::StaleDirectoryVersion {
                     path: object.path.clone(),
@@ -1101,9 +1090,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )));
             }
             let version = versions
-                .get(&(object.object_id.clone(), object.version.clone()))
+                .get(&object.object_id)
                 .ok_or_else(|| reject(format!("missing directory version for {}", object.path)))?;
             if !version.visible
+                || version.version != object.version
                 || version.content_hash.is_some()
                 || version.size_bytes.is_some()
                 || version.locations != object.current_locations
@@ -1230,13 +1220,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         requester_node_id: &NodeId,
         transaction: DfsNamespaceTransaction,
-        writes: &[DfsLocalEventualBatchWriteProof],
+        writes: Vec<DfsLocalEventualBatchWriteProof>,
         selected_shard: Option<DfsMetadataShardConfig>,
     ) -> Result<bool, posix_model::DfsPosixError> {
         if self
             .local_eventual_batch_commit_is_durable_replay(
                 &transaction,
-                writes,
+                &writes,
                 selected_shard.as_ref(),
             )
             .map_err(posix_model::DfsPosixError::from)?
@@ -1248,10 +1238,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let prepare_expectations = self.validate_local_eventual_batch_commit(
             requester_node_id,
             &transaction,
-            writes,
+            &writes,
             selected_shard.as_ref(),
         )?;
-        let receipts = writes.iter().map(|write| write.receipt.clone()).collect();
+        let receipts = writes.into_iter().map(|write| write.receipt).collect();
         self.apply_namespace_transaction_with_selected_shard(
             transaction,
             selected_shard,
@@ -1582,16 +1572,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 completed_request_completion,
                 status: DfsNamespacePrepareStatus::Prepared,
             };
-            prepare.operation_digest =
-                crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)?;
-            let prepare_entry = self
+            let mut normalized_prepare =
+                crate::metadata_api::DfsNormalizedNamespacePrepare::new(&mut prepare);
+            let operation_digest =
+                crate::service_replica::metadata_namespace_prepare_payload_digest_normalized(
+                    normalized_prepare.as_record(),
+                )?;
+            normalized_prepare.set_operation_digest(operation_digest);
+            let prepare_result = self
                 .metadata_backend
                 .as_mut()
                 .expect("clustered metadata backend checked above")
-                .prepare_namespace_transaction(&prepare)
-                .map_err(|error| {
-                    NamespaceTransactionApplyError::from_prepare_error(&prepare.transaction, error)
-                })?;
+                .prepare_normalized_namespace_transaction_in_place(normalized_prepare);
+            let prepare_entry = prepare_result.map_err(|error| {
+                NamespaceTransactionApplyError::from_prepare_error(&prepare.transaction, error)
+            })?;
             if prepare.completed_request.is_some() || prepare.completed_request_completion.is_some()
             {
                 self.active_durable_namespace_prepare_recorded = true;

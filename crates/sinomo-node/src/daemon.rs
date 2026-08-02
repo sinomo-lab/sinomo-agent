@@ -17,6 +17,12 @@ pub const DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY: &str = "dfs.placement.reco
 /// assigned metadata member advertises this capability.
 pub const DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY: &str =
     "dfs.metadata.namespace-prepare.packed.v1";
+/// Advertised by main daemons that can replay packed-v2 namespace prepare
+/// journal bodies as well as every earlier namespace-prepare format. Selection
+/// remains capability-fenced per metadata shard so an older assigned member
+/// can never receive a format it cannot decode.
+pub const DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY: &str =
+    "dfs.metadata.namespace-prepare.packed.v2";
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 
@@ -33,6 +39,8 @@ pub fn main_daemon_capabilities(role: &ClusterMemberRole) -> Vec<CapabilityName>
         CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("static capability"),
         CapabilityName::new(DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY).expect("static capability"),
         CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY)
+            .expect("static capability"),
+        CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY)
             .expect("static capability"),
     ];
     if matches!(role, ClusterMemberRole::Voter) {

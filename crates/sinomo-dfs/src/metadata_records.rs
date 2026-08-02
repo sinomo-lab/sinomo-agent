@@ -17,7 +17,7 @@ use crate::advisory_lock::DfsAdvisoryLockStateRecord;
 use crate::metadata_api::DfsMetadataBackend;
 use crate::metadata_keys::{normalize_node_locations, object_inode_id};
 use crate::metadata_prepare_codec::{
-    DfsNamespacePrepareCodecError, DfsPackedNamespacePrepareV1,
+    DfsNamespacePrepareCodecError, DfsPackedNamespacePrepareV1, DfsPackedNamespacePrepareV2,
     validate_namespace_prepare_file_system_scope,
 };
 use crate::{
@@ -25,6 +25,30 @@ use crate::{
     DfsNamespaceResult, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsPosixCoordinationResult,
     DfsReplicationPolicy, DfsVersion, normalize_current_locations,
 };
+
+#[cfg(test)]
+std::thread_local! {
+    static NAMESPACE_PREPARE_PAYLOAD_VALIDATION_PASSES: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_namespace_prepare_payload_validation_passes() {
+    NAMESPACE_PREPARE_PAYLOAD_VALIDATION_PASSES.with(|passes| passes.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn namespace_prepare_payload_validation_passes() -> usize {
+    NAMESPACE_PREPARE_PAYLOAD_VALIDATION_PASSES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn record_namespace_prepare_payload_validation_pass() {
+    NAMESPACE_PREPARE_PAYLOAD_VALIDATION_PASSES.with(|passes| {
+        passes.set(passes.get().saturating_add(1));
+    });
+}
 
 /// Stable identifier for a DFS metadata shard.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
@@ -845,6 +869,10 @@ pub enum DfsMetadataMutation {
         /// missing canonical body, and fail replay closed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         packed_prepare_v1: Option<DfsPackedNamespacePrepareV1>,
+        /// Indexed, column-oriented body selected only after every assigned
+        /// metadata member advertises packed-v2 decoder support.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        packed_prepare_v2: Option<Box<DfsPackedNamespacePrepareV2>>,
     },
     /// Fenced commit of the complete Prepared body already durable earlier in
     /// this shard's journal. Replayers must resolve the referenced prepare and
@@ -916,9 +944,11 @@ pub enum DfsMetadataMutation {
 /// Borrowed view of the one authoritative namespace-prepare representation in
 /// a journal mutation.
 ///
-/// The outer fields remain part of the view because packed-v1 intentionally
-/// omits them. Validation and identity checks can therefore stay allocation
-/// free until a caller explicitly requests canonical table materialization.
+/// Construction validates the selected representation exactly once. The
+/// outer fields remain part of the view because packed payloads intentionally
+/// omit them; later scope and identity checks can therefore stay allocation
+/// free without rescanning the complete packed body.
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum DfsNamespacePreparePayloadRef<'a> {
     Canonical {
         file_system_id: &'a DfsFileSystemId,
@@ -932,9 +962,16 @@ pub(crate) enum DfsNamespacePreparePayloadRef<'a> {
         status: &'a DfsNamespacePrepareStatus,
         prepare: &'a DfsPackedNamespacePrepareV1,
     },
+    PackedV2 {
+        file_system_id: &'a DfsFileSystemId,
+        operation_id: &'a str,
+        status: &'a DfsNamespacePrepareStatus,
+        prepare: &'a DfsPackedNamespacePrepareV2,
+    },
 }
 
 impl<'a> DfsNamespacePreparePayloadRef<'a> {
+    #[cfg(test)]
     pub(crate) fn into_canonical(
         self,
     ) -> Result<Cow<'a, DfsNamespacePrepareRecord>, DfsNamespacePrepareCodecError> {
@@ -945,11 +982,56 @@ impl<'a> DfsNamespacePreparePayloadRef<'a> {
                 operation_id,
                 status,
                 prepare,
-            } => Ok(Cow::Owned(prepare.unpack(
+            } => Ok(Cow::Owned(prepare.unpack_validated(
                 file_system_id,
                 operation_id,
                 status.clone(),
-            )?)),
+            ))),
+            Self::PackedV2 {
+                file_system_id,
+                operation_id,
+                status,
+                prepare,
+            } => Ok(Cow::Owned(prepare.unpack_validated(
+                file_system_id,
+                operation_id,
+                status.clone(),
+            ))),
+        }
+    }
+
+    /// Materialize one canonical, normalized table record.
+    ///
+    /// Packed payloads already require an owned canonical allocation at the
+    /// table boundary. Their validated unpack path materializes and normalizes
+    /// that allocation once, without rescanning it here.
+    pub(crate) fn into_normalized_canonical(
+        self,
+    ) -> Result<Cow<'a, DfsNamespacePrepareRecord>, DfsNamespacePrepareCodecError> {
+        match self {
+            Self::Canonical { prepare, .. } => {
+                Ok(Cow::Owned(normalized_namespace_prepare(prepare)))
+            }
+            Self::PackedV1 {
+                file_system_id,
+                operation_id,
+                status,
+                prepare,
+            } => Ok(Cow::Owned(prepare.unpack_validated(
+                file_system_id,
+                operation_id,
+                status.clone(),
+            ))),
+            Self::PackedV2 {
+                file_system_id,
+                operation_id,
+                status,
+                prepare,
+            } => Ok(Cow::Owned(prepare.unpack_validated(
+                file_system_id,
+                operation_id,
+                status.clone(),
+            ))),
         }
     }
 
@@ -957,24 +1039,12 @@ impl<'a> DfsNamespacePreparePayloadRef<'a> {
         &self,
         expected: &DfsFileSystemId,
     ) -> Result<(), DfsNamespacePrepareCodecError> {
-        match self {
-            Self::Canonical {
-                file_system_id,
-                prepare,
-                ..
-            } => {
-                require_prepare_outer_file_system(file_system_id, expected)?;
-                validate_namespace_prepare_file_system_scope(prepare, expected)
-            }
-            Self::PackedV1 {
-                file_system_id,
-                prepare,
-                ..
-            } => {
-                require_prepare_outer_file_system(file_system_id, expected)?;
-                prepare.validate_file_system_scope(expected)
-            }
-        }
+        let file_system_id = match self {
+            Self::Canonical { file_system_id, .. }
+            | Self::PackedV1 { file_system_id, .. }
+            | Self::PackedV2 { file_system_id, .. } => file_system_id,
+        };
+        require_prepare_outer_file_system(file_system_id, expected)
     }
 
     pub(crate) fn matches_prepare_identity(&self, expected: &DfsNamespacePrepareRecord) -> bool {
@@ -996,6 +1066,21 @@ impl<'a> DfsNamespacePreparePayloadRef<'a> {
                     && prepare.operation_digest == expected.operation_digest
             }
             Self::PackedV1 {
+                file_system_id,
+                operation_id,
+                status,
+                prepare,
+            } => {
+                *file_system_id == &expected.file_system_id
+                    && *operation_id == expected.operation_id
+                    && *status == &expected.status
+                    && prepare.matches_prepare_identity(
+                        &expected.shard_id,
+                        expected.owner_epoch,
+                        &expected.operation_digest,
+                    )
+            }
+            Self::PackedV2 {
                 file_system_id,
                 operation_id,
                 status,
@@ -1051,6 +1136,17 @@ impl<'a> DfsNamespacePreparePayloadRef<'a> {
                     && *outer_status == status
                     && prepare.matches_prepare_identity(shard_id, owner_epoch, operation_digest)
             }
+            Self::PackedV2 {
+                file_system_id: outer_file_system_id,
+                operation_id: outer_operation_id,
+                status: outer_status,
+                prepare,
+            } => {
+                *outer_file_system_id == file_system_id
+                    && *outer_operation_id == operation_id
+                    && *outer_status == status
+                    && prepare.matches_prepare_identity(shard_id, owner_epoch, operation_digest)
+            }
         }
     }
 
@@ -1066,6 +1162,7 @@ impl<'a> DfsNamespacePreparePayloadRef<'a> {
                 .saturating_add(prepare.expected_path_occupants.len())
                 .saturating_add(prepare.content_receipts.len()),
             Self::PackedV1 { prepare, .. } => prepare.record_count(),
+            Self::PackedV2 { prepare, .. } => prepare.record_count(),
         }
     }
 }
@@ -1146,6 +1243,9 @@ impl DfsMetadataMutation {
                 }
                 Ok(Some(DfsNamespacePreparePayloadRef::PackedV1 { prepare, .. })) => {
                     prepare.visit_affected_object_ids(visit);
+                }
+                Ok(Some(DfsNamespacePreparePayloadRef::PackedV2 { prepare, .. })) => {
+                    prepare.visit_affected_object_ids_validated(visit);
                 }
                 // Missing, dual, unsupported, or malformed payloads are rejected
                 // by replay. Do not let a pre-validation routing/index visitor
@@ -1428,6 +1528,7 @@ impl DfsMetadataMutation {
             status: prepare.status.clone(),
             prepare: Some(prepare.clone()),
             packed_prepare_v1: None,
+            packed_prepare_v2: None,
         }
     }
 
@@ -1440,6 +1541,20 @@ impl DfsMetadataMutation {
             status: prepare.status.clone(),
             prepare: None,
             packed_prepare_v1: Some(DfsPackedNamespacePrepareV1::pack(prepare)?),
+            packed_prepare_v2: None,
+        })
+    }
+
+    pub(crate) fn put_namespace_prepare_packed_v2(
+        prepare: &DfsNamespacePrepareRecord,
+    ) -> Result<Self, DfsNamespacePrepareCodecError> {
+        Ok(Self::PutNamespacePrepare {
+            file_system_id: prepare.file_system_id.clone(),
+            operation_id: prepare.operation_id.clone(),
+            status: prepare.status.clone(),
+            prepare: None,
+            packed_prepare_v1: None,
+            packed_prepare_v2: Some(Box::new(DfsPackedNamespacePrepareV2::pack(prepare)?)),
         })
     }
 
@@ -1452,28 +1567,98 @@ impl DfsMetadataMutation {
             status,
             prepare,
             packed_prepare_v1,
+            packed_prepare_v2,
         } = self
         else {
             return Ok(None);
         };
-        match (prepare.as_ref(), packed_prepare_v1.as_ref()) {
-            (Some(_), Some(_)) => Err(DfsNamespacePrepareCodecError::AmbiguousPayload),
-            (Some(prepare), None) => Ok(Some(DfsNamespacePreparePayloadRef::Canonical {
+        let representation_count = usize::from(prepare.is_some())
+            .saturating_add(usize::from(packed_prepare_v1.is_some()))
+            .saturating_add(usize::from(packed_prepare_v2.is_some()));
+        if representation_count > 1 {
+            return Err(DfsNamespacePrepareCodecError::AmbiguousPayload);
+        }
+        if let Some(prepare) = prepare.as_ref() {
+            #[cfg(test)]
+            record_namespace_prepare_payload_validation_pass();
+            validate_namespace_prepare_file_system_scope(prepare, file_system_id)?;
+            return Ok(Some(DfsNamespacePreparePayloadRef::Canonical {
                 file_system_id,
                 operation_id,
                 status,
                 prepare,
-            })),
-            (None, Some(prepare)) => {
-                prepare.validate_file_system_scope(file_system_id)?;
-                Ok(Some(DfsNamespacePreparePayloadRef::PackedV1 {
-                    file_system_id,
-                    operation_id,
-                    status,
-                    prepare,
-                }))
-            }
-            (None, None) => Ok(None),
+            }));
+        }
+        if let Some(prepare) = packed_prepare_v1.as_ref() {
+            #[cfg(test)]
+            record_namespace_prepare_payload_validation_pass();
+            prepare.validate_file_system_scope(file_system_id)?;
+            return Ok(Some(DfsNamespacePreparePayloadRef::PackedV1 {
+                file_system_id,
+                operation_id,
+                status,
+                prepare,
+            }));
+        }
+        if let Some(prepare) = packed_prepare_v2.as_ref() {
+            #[cfg(test)]
+            record_namespace_prepare_payload_validation_pass();
+            prepare.validate_file_system_scope(file_system_id)?;
+            return Ok(Some(DfsNamespacePreparePayloadRef::PackedV2 {
+                file_system_id,
+                operation_id,
+                status,
+                prepare,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Reborrow a namespace-prepare representation whose full codec and
+    /// filesystem validation was already completed against this immutable
+    /// mutation.
+    ///
+    /// This is used only to carry a validation proof across a write-lock or
+    /// table-planning boundary. Callers must not use it for unvalidated wire
+    /// input.
+    pub(crate) fn namespace_prepare_payload_ref_prevalidated(
+        &self,
+    ) -> Option<DfsNamespacePreparePayloadRef<'_>> {
+        let Self::PutNamespacePrepare {
+            file_system_id,
+            operation_id,
+            status,
+            prepare,
+            packed_prepare_v1,
+            packed_prepare_v2,
+        } = self
+        else {
+            return None;
+        };
+        match (
+            prepare.as_ref(),
+            packed_prepare_v1.as_ref(),
+            packed_prepare_v2.as_ref(),
+        ) {
+            (Some(prepare), None, None) => Some(DfsNamespacePreparePayloadRef::Canonical {
+                file_system_id,
+                operation_id,
+                status,
+                prepare,
+            }),
+            (None, Some(prepare), None) => Some(DfsNamespacePreparePayloadRef::PackedV1 {
+                file_system_id,
+                operation_id,
+                status,
+                prepare,
+            }),
+            (None, None, Some(prepare)) => Some(DfsNamespacePreparePayloadRef::PackedV2 {
+                file_system_id,
+                operation_id,
+                status,
+                prepare,
+            }),
+            _ => None,
         }
     }
 
@@ -3075,7 +3260,7 @@ pub(crate) fn normalized_namespace_transaction(
     transaction
 }
 
-fn normalize_namespace_transaction_in_place(transaction: &mut DfsNamespaceTransaction) {
+pub(crate) fn normalize_namespace_transaction_in_place(transaction: &mut DfsNamespaceTransaction) {
     for object in &mut transaction.objects {
         normalize_object_metadata_in_place(object);
     }
@@ -3091,6 +3276,18 @@ pub(crate) fn normalized_namespace_prepare(
     prepare: &DfsNamespacePrepareRecord,
 ) -> DfsNamespacePrepareRecord {
     let mut prepare = prepare.clone();
+    normalize_namespace_prepare_in_place(&mut prepare);
+    prepare
+}
+
+/// Canonicalize an owned namespace prepare without cloning its transaction.
+///
+/// Large local-eventual batches already transfer ownership of their prepare to
+/// the metadata authority. Keeping the in-place form separate lets that hot
+/// path compute the canonical digest, journal payload, and materialized table
+/// state from one object graph instead of cloning thousands of objects and
+/// versions solely to normalize them.
+pub(crate) fn normalize_namespace_prepare_in_place(prepare: &mut DfsNamespacePrepareRecord) {
     normalize_namespace_transaction_in_place(&mut prepare.transaction);
     for expected in &mut prepare.expected_path_occupants {
         expected.path = crate::metadata_keys::normalize_path(&expected.path);
@@ -3109,7 +3306,6 @@ pub(crate) fn normalized_namespace_prepare(
                 &right.replica_node_id,
             ))
     });
-    prepare
 }
 
 pub(crate) fn put_visible_version_record_if_changed(
@@ -3136,6 +3332,23 @@ pub(crate) fn remote_read_rejection_prunes_location(reason: &str) -> bool {
 mod tests {
     use super::*;
     use sinomo_core::DfsObjectPolicy;
+
+    #[test]
+    fn metadata_mutation_stack_footprint_stays_bounded() {
+        // Journal mutations cross several by-value Result boundaries. Keeping
+        // large packed bodies behind pointers prevents the debug write path
+        // from exhausting the default worker-thread stack.
+        assert!(
+            std::mem::size_of::<DfsMetadataMutation>() <= 12 * 1024,
+            "DfsMetadataMutation grew to {} bytes",
+            std::mem::size_of::<DfsMetadataMutation>()
+        );
+        assert!(
+            std::mem::size_of::<DfsMetadataJournalEntry>() <= 12 * 1024,
+            "DfsMetadataJournalEntry grew to {} bytes",
+            std::mem::size_of::<DfsMetadataJournalEntry>()
+        );
+    }
 
     fn node(value: &str) -> NodeId {
         NodeId::from_legacy_named(value).expect("valid node id")
@@ -3508,6 +3721,7 @@ mod tests {
                 status,
                 prepare,
                 packed_prepare_v1: Some(packed),
+                packed_prepare_v2: None,
             },
             _ => panic!("namespace prepare constructor returned another mutation"),
         };

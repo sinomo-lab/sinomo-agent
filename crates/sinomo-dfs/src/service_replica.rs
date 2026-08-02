@@ -1468,6 +1468,18 @@ pub(crate) fn metadata_namespace_prepare_payload_digest(
     prepare: &DfsNamespacePrepareRecord,
 ) -> Result<String, DfsError> {
     let prepare = crate::metadata_records::normalized_namespace_prepare(prepare);
+    metadata_namespace_prepare_payload_digest_normalized(&prepare)
+}
+
+/// Hash a namespace prepare that has already been canonicalized in place.
+///
+/// Callers that own a large prepare can normalize it once and keep transferring
+/// that same allocation through journal and table materialization. The public
+/// compatibility helper above retains the defensive clone for borrowed and
+/// recovery callers whose normalization state is not known.
+pub(crate) fn metadata_namespace_prepare_payload_digest_normalized(
+    prepare: &DfsNamespacePrepareRecord,
+) -> Result<String, DfsError> {
     metadata_authority_payload_digest(&(
         &prepare.operation_id,
         &prepare.file_system_id,

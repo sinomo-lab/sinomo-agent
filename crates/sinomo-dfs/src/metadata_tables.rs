@@ -44,6 +44,7 @@ thread_local! {
     static NAMESPACE_COMMIT_DIRECT_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
     static NAMESPACE_PREPARE_ROLLBACK_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
     static NAMESPACE_PREPARE_POST_APPEND_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
+    static NAMESPACE_PREPARE_FOOTPRINT_CONSTRUCTIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -72,6 +73,16 @@ pub(crate) fn namespace_prepare_materialization_counters() -> (usize, usize) {
         NAMESPACE_PREPARE_ROLLBACK_MATERIALIZATIONS.get(),
         NAMESPACE_PREPARE_POST_APPEND_MATERIALIZATIONS.get(),
     )
+}
+
+#[cfg(test)]
+pub(crate) fn reset_namespace_prepare_footprint_constructions() {
+    NAMESPACE_PREPARE_FOOTPRINT_CONSTRUCTIONS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn namespace_prepare_footprint_constructions() -> usize {
+    NAMESPACE_PREPARE_FOOTPRINT_CONSTRUCTIONS.get()
 }
 
 fn completed_namespace_request_outcome_matches(
@@ -197,9 +208,85 @@ pub(crate) fn max_optional_sequence(left: Option<u64>, right: Option<u64>) -> Op
     }
 }
 
+/// Owned active-prepare footprint built while the prepare body is validated.
+///
+/// Foreground prepare admission passes this exact value through overlap
+/// validation and post-journal table indexing. Replay and snapshot rebuilds
+/// can still construct it from the self-contained prepare record at the safe
+/// generic apply boundary.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct DfsNamespacePrepareFootprint {
+    file_system_id: DfsFileSystemId,
+    operation_id: String,
+    operation_digest: String,
+    owner_epoch: u64,
+    transaction_id: String,
+    expected_object_count: usize,
+    expected_path_count: usize,
+    transaction_object_count: usize,
+    transaction_version_count: usize,
+    content_receipt_count: usize,
+    object_ids: BTreeSet<DfsObjectId>,
+    normalized_paths: BTreeSet<String>,
+}
+
+impl DfsNamespacePrepareFootprint {
+    pub(crate) fn from_validated_parts(
+        prepare: &DfsNamespacePrepareRecord,
+        object_ids: BTreeSet<DfsObjectId>,
+        normalized_paths: BTreeSet<String>,
+    ) -> Self {
+        #[cfg(test)]
+        NAMESPACE_PREPARE_FOOTPRINT_CONSTRUCTIONS.set(
+            NAMESPACE_PREPARE_FOOTPRINT_CONSTRUCTIONS
+                .get()
+                .saturating_add(1),
+        );
+        Self {
+            file_system_id: prepare.file_system_id.clone(),
+            operation_id: prepare.operation_id.clone(),
+            operation_digest: prepare.operation_digest.clone(),
+            owner_epoch: prepare.owner_epoch,
+            transaction_id: prepare.transaction.transaction_id.clone(),
+            expected_object_count: prepare.expected_object_versions.len(),
+            expected_path_count: prepare.expected_path_occupants.len(),
+            transaction_object_count: prepare.transaction.objects.len(),
+            transaction_version_count: prepare.transaction.versions.len(),
+            content_receipt_count: prepare.content_receipts.len(),
+            object_ids,
+            normalized_paths,
+        }
+    }
+
+    pub(crate) fn object_ids(&self) -> &BTreeSet<DfsObjectId> {
+        &self.object_ids
+    }
+
+    pub(crate) fn normalized_paths(&self) -> &BTreeSet<String> {
+        &self.normalized_paths
+    }
+
+    pub(crate) fn matches_prepare_identity(&self, prepare: &DfsNamespacePrepareRecord) -> bool {
+        self.file_system_id == prepare.file_system_id
+            && self.operation_id == prepare.operation_id
+            && self.operation_digest == prepare.operation_digest
+            && self.owner_epoch == prepare.owner_epoch
+            && self.transaction_id == prepare.transaction.transaction_id
+            && self.expected_object_count == prepare.expected_object_versions.len()
+            && self.expected_path_count == prepare.expected_path_occupants.len()
+            && self.transaction_object_count == prepare.transaction.objects.len()
+            && self.transaction_version_count == prepare.transaction.versions.len()
+            && self.content_receipt_count == prepare.content_receipts.len()
+    }
+
+    fn into_parts(self) -> (BTreeSet<DfsObjectId>, BTreeSet<String>) {
+        (self.object_ids, self.normalized_paths)
+    }
+}
+
 pub(crate) fn namespace_prepare_footprint(
     prepare: &DfsNamespacePrepareRecord,
-) -> (BTreeSet<DfsObjectId>, BTreeSet<String>) {
+) -> DfsNamespacePrepareFootprint {
     let mut object_ids = prepare
         .expected_object_versions
         .iter()
@@ -224,7 +311,7 @@ pub(crate) fn namespace_prepare_footprint(
             .iter()
             .map(|object| normalize_path(&object.path)),
     );
-    (object_ids, paths)
+    DfsNamespacePrepareFootprint::from_validated_parts(prepare, object_ids, paths)
 }
 
 fn namespace_transaction_order_key(
@@ -349,6 +436,40 @@ impl DfsMetadataTables {
                 Ok(())
             }
         }
+    }
+
+    /// Apply a prepare operation with the footprint produced by the same
+    /// successful shape-validation pass. The generic checked boundary above
+    /// remains self-contained for replay and untrusted callers; only the
+    /// foreground journal/materialization path uses this allocation-reuse
+    /// entry point.
+    pub(crate) fn apply_checked_with_namespace_prepare_footprint(
+        &mut self,
+        op: DfsMetadataTableOp,
+        footprint: DfsNamespacePrepareFootprint,
+    ) -> Result<()> {
+        let DfsMetadataTableOp::PutNamespacePrepare { prepare } = op else {
+            return Err(MetadataBackendError::Serde(
+                "validated namespace prepare footprint requires a prepare table operation"
+                    .to_string(),
+            ));
+        };
+        if !footprint.matches_prepare_identity(&prepare) {
+            return Err(MetadataBackendError::Serde(format!(
+                "validated namespace prepare footprint does not match prepare {}",
+                prepare.operation_id
+            )));
+        }
+        #[cfg(test)]
+        NAMESPACE_PREPARE_POST_APPEND_MATERIALIZATIONS.set(
+            NAMESPACE_PREPARE_POST_APPEND_MATERIALIZATIONS
+                .get()
+                .saturating_add(1),
+        );
+        self.namespace_prepare_receipts
+            .remove(&prepare.operation_id);
+        self.put_namespace_prepare_indexed_with_footprint(prepare, footprint);
+        Ok(())
     }
 
     /// Validate any dependency referenced by a compact semantic operation
@@ -713,7 +834,7 @@ impl DfsMetadataTables {
             .values()
             .filter(|prepare| prepare.status == DfsNamespacePrepareStatus::Prepared)
         {
-            let (object_ids, paths) = namespace_prepare_footprint(prepare);
+            let (object_ids, paths) = namespace_prepare_footprint(prepare).into_parts();
             for object_id in object_ids {
                 object_owners
                     .entry(prepare.file_system_id.clone())
@@ -817,11 +938,15 @@ impl DfsMetadataTables {
             Self::namespace_prepare_request_index_from_history(&self.namespace_prepares);
     }
 
-    fn index_namespace_prepare_footprint(&mut self, prepare: &DfsNamespacePrepareRecord) {
+    fn index_namespace_prepare_footprint(
+        &mut self,
+        prepare: &DfsNamespacePrepareRecord,
+        footprint: DfsNamespacePrepareFootprint,
+    ) {
         if prepare.status != DfsNamespacePrepareStatus::Prepared {
             return;
         }
-        let (object_ids, paths) = namespace_prepare_footprint(prepare);
+        let (object_ids, paths) = footprint.into_parts();
         for object_id in object_ids {
             self.namespace_prepare_object_owners
                 .entry(prepare.file_system_id.clone())
@@ -844,7 +969,7 @@ impl DfsMetadataTables {
         if prepare.status != DfsNamespacePrepareStatus::Prepared {
             return;
         }
-        let (object_ids, paths) = namespace_prepare_footprint(prepare);
+        let (object_ids, paths) = namespace_prepare_footprint(prepare).into_parts();
         for object_id in object_ids {
             let remove_file_system = self
                 .namespace_prepare_object_owners
@@ -885,15 +1010,24 @@ impl DfsMetadataTables {
         }
     }
 
-    fn put_namespace_prepare_indexed(&mut self, prepare: DfsNamespacePrepareRecord) {
+    fn put_namespace_prepare_indexed_with_footprint(
+        &mut self,
+        prepare: DfsNamespacePrepareRecord,
+        footprint: DfsNamespacePrepareFootprint,
+    ) {
         let operation_id = prepare.operation_id.clone();
         if let Some(previous) = self.namespace_prepares.remove(&operation_id) {
             self.unindex_namespace_prepare_footprint(&previous);
             self.unindex_namespace_prepare_request(&previous);
         }
-        self.index_namespace_prepare_footprint(&prepare);
+        self.index_namespace_prepare_footprint(&prepare, footprint);
         self.index_namespace_prepare_request(&prepare);
         self.namespace_prepares.insert(operation_id, prepare);
+    }
+
+    fn put_namespace_prepare_indexed(&mut self, prepare: DfsNamespacePrepareRecord) {
+        let footprint = namespace_prepare_footprint(&prepare);
+        self.put_namespace_prepare_indexed_with_footprint(prepare, footprint);
     }
 
     fn namespace_request_order_key(

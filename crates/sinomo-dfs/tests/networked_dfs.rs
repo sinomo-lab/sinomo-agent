@@ -2,7 +2,7 @@ use sinomo_core::events::EventId;
 use sinomo_core::kv::InProcessKvStore;
 use sinomo_core::network::InProcessNetwork;
 use sinomo_core::node::{
-    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY, NodeId, cluster_member_key,
+    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY, NodeId, cluster_member_key,
 };
 use sinomo_core::{
     ClusterMemberRecord, ClusterMemberState, DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest,
@@ -2600,7 +2600,7 @@ fn networked_dfs_applies_metadata_journal_batches_from_peer() {
 }
 
 #[test]
-fn networked_dfs_replicates_packed_namespace_prepare_and_reopens_exact_prefix() {
+fn networked_dfs_replicates_packed_v2_namespace_prepare_and_reopens_exact_prefix() {
     let owner = NodeId::from_legacy_named("node_packed_prepare_owner").expect("node");
     let replica = NodeId::from_legacy_named("node_packed_prepare_replica").expect("node");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
@@ -2623,14 +2623,14 @@ fn networked_dfs_replicates_packed_namespace_prepare_and_reopens_exact_prefix() 
         replica_node_ids: vec![replica.clone()],
         epoch: 7,
         assignment: DfsMetadataShardAssignment::Root,
-        namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV1,
+        namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::PackedV2,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     control_plane.with_client(|kv| {
         let cluster_id = sinomo_core::Id::from_legacy_named("networked-packed-prepare-cluster")
             .expect("cluster id");
         let capability =
-            sinomo_core::CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY)
+            sinomo_core::CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY)
                 .expect("static capability");
         for node_id in [&owner, &replica] {
             let mut member = ClusterMemberRecord::local_non_voting(
@@ -2738,11 +2738,11 @@ fn networked_dfs_replicates_packed_namespace_prepare_and_reopens_exact_prefix() 
             &prepare_entry.mutation,
             DfsMetadataMutation::PutNamespacePrepare {
                 prepare: None,
-                packed_prepare_v1: Some(_),
+                packed_prepare_v2: Some(_),
                 ..
             }
         ),
-        "the primary must author PackedV1 instead of retaining a canonical journal body"
+        "the primary must author PackedV2 instead of retaining a canonical journal body"
     );
     let replica_backend =
         LocalShardedMetadataBackend::new(&replica_metadata_root, vec![shard.clone()])

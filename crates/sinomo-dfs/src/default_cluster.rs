@@ -9,7 +9,10 @@ use sinomo_core::network::{
     ClusterConnectivityGraph, ClusterPaths, cluster_healthy_route_next_hop,
     pooled_routed_relationship_is_active,
 };
-use sinomo_core::node::{DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY, NodeId};
+use sinomo_core::node::{
+    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY,
+    DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY, NodeId,
+};
 use sinomo_core::{ClusterBootstrapState, ClusterMemberRecord, ClusterMemberRole, DfsObjectPolicy};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -2021,34 +2024,39 @@ fn select_metadata_namespace_prepare_codec(
     let assigned_node_ids = std::iter::once(&shard.primary_node_id)
         .chain(shard.replica_node_ids.iter())
         .collect::<BTreeSet<_>>();
-    let all_assigned_support_packed_v1 = !assigned_node_ids.is_empty()
-        && assigned_node_ids.iter().all(|node_id| {
-            state.members.iter().any(|member| {
-                member.node_id == **node_id
-                    && member.state.is_authorized()
-                    && member.capabilities.iter().any(|capability| {
-                        capability.as_str() == DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY
-                    })
+    let all_assigned_support = |required_capability: &str| {
+        !assigned_node_ids.is_empty()
+            && assigned_node_ids.iter().all(|node_id| {
+                state.members.iter().any(|member| {
+                    member.node_id == **node_id
+                        && member.state.is_authorized()
+                        && member
+                            .capabilities
+                            .iter()
+                            .any(|capability| capability.as_str() == required_capability)
+                })
             })
-        });
-    if current.is_some_and(|current| {
-        current.namespace_prepare_codec == DfsMetadataNamespacePrepareCodec::PackedV1
-    }) && !all_assigned_support_packed_v1
-    {
-        // Capability loss cannot prove that an older binary can reopen retained
-        // packed journal history. Keep the exact active generation instead of
-        // manufacturing an unsafe Legacy transition. Membership reconciliation
-        // can resume after every desired member is capable (or the incapable
-        // member has been removed); a future rollback protocol must provide a
-        // canonical legacy-readable snapshot and replay floor first.
-        shard.namespace_prepare_codec = DfsMetadataNamespacePrepareCodec::PackedV1;
-        return false;
-    }
-    shard.namespace_prepare_codec = if all_assigned_support_packed_v1 {
+    };
+    let selected = if all_assigned_support(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY) {
+        DfsMetadataNamespacePrepareCodec::PackedV2
+    } else if all_assigned_support(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY) {
         DfsMetadataNamespacePrepareCodec::PackedV1
     } else {
         DfsMetadataNamespacePrepareCodec::Legacy
     };
+    if let Some(current) = current
+        && selected.rank() < current.namespace_prepare_codec.rank()
+    {
+        // Capability loss cannot prove that an older binary can reopen retained
+        // packed journal history. Keep the exact active codec instead of
+        // manufacturing an unsafe downgrade. Membership reconciliation can
+        // resume after every desired member is capable (or the incapable
+        // member has been removed); a future rollback protocol must provide a
+        // compatible snapshot and replay floor first.
+        shard.namespace_prepare_codec = current.namespace_prepare_codec;
+        return false;
+    }
+    shard.namespace_prepare_codec = selected;
     true
 }
 
@@ -2492,6 +2500,71 @@ mod tests {
         assert_eq!(
             retained, packed,
             "capability loss must fail closed instead of advertising an old-binary-safe downgrade"
+        );
+    }
+
+    #[test]
+    fn metadata_prepare_codec_prefers_v2_and_retains_it_after_capability_loss() {
+        let mut state = test_cluster_state_with_members(
+            "cluster_dfs_prepare_codec_v2",
+            "node_dfs_prepare_codec_v2_local",
+            &[
+                "node_dfs_prepare_codec_v2_remote_a",
+                "node_dfs_prepare_codec_v2_remote_b",
+            ],
+        );
+        let file_system = default_cluster_sifs(&state);
+        let mut host = TestDefaultClusterBootstrapHost {
+            current_shard: None,
+            unavailable_node_ids: BTreeSet::new(),
+            primary_transfer_ready: false,
+            primary_transfer_targets: Vec::new(),
+        };
+        let packed_v1 =
+            sinomo_core::CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY)
+                .expect("static capability");
+        let packed_v2 =
+            sinomo_core::CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY)
+                .expect("static capability");
+        for member in &mut state.members {
+            member.capabilities.push(packed_v1.clone());
+            member.capabilities.push(packed_v2.clone());
+        }
+
+        let selected = default_cluster_metadata_shard_with_host(
+            &mut host,
+            &state,
+            &file_system,
+            "root",
+            DfsMetadataShardAssignment::Root,
+            0,
+        )
+        .expect("v2-capable shard");
+        assert_eq!(
+            selected.namespace_prepare_codec,
+            DfsMetadataNamespacePrepareCodec::PackedV2,
+            "the newest codec supported by every assigned member wins"
+        );
+
+        state
+            .members
+            .last_mut()
+            .expect("assigned member")
+            .capabilities
+            .retain(|candidate| candidate != &packed_v2);
+        host.current_shard = Some(selected.clone());
+        let retained = default_cluster_metadata_shard_with_host(
+            &mut host,
+            &state,
+            &file_system,
+            "root",
+            DfsMetadataShardAssignment::Root,
+            0,
+        )
+        .expect("v2 capability loss retains the current generation");
+        assert_eq!(
+            retained, selected,
+            "falling back to packed-v1 still cannot reopen an active packed-v2 history"
         );
     }
 
