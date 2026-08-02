@@ -9,6 +9,13 @@ pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = durable_file::DEFAULT_OBJECT_
 pub(crate) const RAFT_NODE_LOCK_WAIT: Duration = Duration::from_secs(5);
 pub(crate) const RAFT_NODE_LOCK_RETRY_INITIAL: Duration = Duration::from_millis(2);
 pub(crate) const RAFT_NODE_LOCK_RETRY_MAX: Duration = Duration::from_millis(40);
+/// Local read cold-starts must remain fast when a real writer owns the flock,
+/// but a zero-wait probe is too brittle: a concurrently spawned child briefly
+/// inherits open file descriptions between `fork` and `exec`, and short-lived
+/// command phases can be releasing the lock at the same instant. One bounded
+/// backoff window absorbs those transient owners while keeping the three-read
+/// snapshot/point/prefix fallback path well below its 250ms latency budget.
+pub(crate) const RAFT_LOCAL_READ_LOCK_WAIT: Duration = Duration::from_millis(40);
 pub(crate) static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KV_READ_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 
@@ -98,6 +105,7 @@ pub(crate) struct MaterializedSnapshotCacheEntry {
 }
 
 pub(crate) struct RaftViewCacheEntry {
+    pub(crate) node_id: NodeId,
     pub(crate) identity: RaftViewIdentity,
     pub(crate) snapshot: Arc<KvSnapshot>,
     pub(crate) last_used: u64,
@@ -148,6 +156,11 @@ pub(crate) struct FileIdentity {
 /// changing means a cached decoded store is no longer authoritative.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct RaftViewIdentity {
+    /// The root and lock identities fence replacement of an otherwise-empty
+    /// Raft directory. Without them, a cached all-`None` durable view could be
+    /// reused while its retained flock still referred to an unlinked lock file.
+    pub(crate) root: Option<FileIdentity>,
+    pub(crate) lock: Option<FileIdentity>,
     pub(crate) hard_state: Option<FileIdentity>,
     pub(crate) wal: Option<FileIdentity>,
     pub(crate) snapshot: Option<FileIdentity>,
@@ -263,6 +276,8 @@ pub(crate) fn optional_file_identity_for_read(
 
 pub(crate) fn raft_view_identity(paths: &KvWalPaths) -> Option<RaftViewIdentity> {
     Some(RaftViewIdentity {
+        root: optional_file_identity(&paths.root)?,
+        lock: optional_file_identity(&paths.lock)?,
         hard_state: optional_file_identity(&paths.hard_state)?,
         wal: optional_file_identity(&paths.wal)?,
         snapshot: optional_file_identity(&paths.snapshot)?,
@@ -272,16 +287,22 @@ pub(crate) fn raft_view_identity(paths: &KvWalPaths) -> Option<RaftViewIdentity>
 pub(crate) fn raft_view_identity_for_read(
     paths: &KvWalPaths,
 ) -> Result<(bool, Option<RaftViewIdentity>), KvError> {
+    let root = optional_file_identity_for_read(&paths.root)?;
+    let lock = optional_file_identity_for_read(&paths.lock)?;
     let hard_state = optional_file_identity_for_read(&paths.hard_state)?;
     let wal = optional_file_identity_for_read(&paths.wal)?;
     let snapshot = optional_file_identity_for_read(&paths.snapshot)?;
     let has_durable_state = hard_state != Some(None) || wal != Some(None) || snapshot != Some(None);
-    let identity = match (hard_state, wal, snapshot) {
-        (Some(hard_state), Some(wal), Some(snapshot)) => Some(RaftViewIdentity {
-            hard_state,
-            wal,
-            snapshot,
-        }),
+    let identity = match (root, lock, hard_state, wal, snapshot) {
+        (Some(root), Some(lock), Some(hard_state), Some(wal), Some(snapshot)) => {
+            Some(RaftViewIdentity {
+                root,
+                lock,
+                hard_state,
+                wal,
+                snapshot,
+            })
+        }
         _ => None,
     };
     Ok((has_durable_state, identity))
@@ -447,11 +468,12 @@ pub(crate) fn persisted_hard_state_actual_reads_for_test(path: &Path) -> u64 {
 
 pub(crate) fn cache_lookup_raft_view(
     paths: &KvWalPaths,
+    node_id: &NodeId,
     identity: RaftViewIdentity,
 ) -> Option<Arc<KvSnapshot>> {
     let mut guard = raft_view_cache().lock().ok()?;
     let entry = guard.get_mut(&paths.root)?;
-    if entry.identity != identity {
+    if entry.node_id != *node_id || entry.identity != identity {
         return None;
     }
     entry.last_used = kv_read_cache_tick();
@@ -465,6 +487,7 @@ pub(crate) fn cache_lookup_raft_view(
 
 pub(crate) fn cache_store_raft_view(
     paths: &KvWalPaths,
+    node_id: NodeId,
     identity: RaftViewIdentity,
     snapshot: Arc<KvSnapshot>,
 ) {
@@ -473,11 +496,22 @@ pub(crate) fn cache_store_raft_view(
         guard.insert(
             paths.root.clone(),
             RaftViewCacheEntry {
+                node_id,
                 identity,
                 snapshot,
                 last_used: kv_read_cache_tick(),
             },
         );
+    }
+}
+
+/// Drops the immutable cold-read image once this process owns the resident
+/// writer for the same durable Raft root. Keeping both would retain two full
+/// keyspace representations even though all local reads prefer the resident
+/// indexed store from this point onward.
+pub(crate) fn evict_cached_raft_view(paths: &KvWalPaths) {
+    if let Ok(mut guard) = raft_view_cache().lock() {
+        guard.remove(&paths.root);
     }
 }
 

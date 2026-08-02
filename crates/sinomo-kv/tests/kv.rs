@@ -12,6 +12,7 @@ mod power_loss;
 
 #[cfg(test)]
 mod tests {
+    use super::raft::validate_cluster_kv_txn_compact_commit_response;
     use super::*;
 
     static OBJECT_FILE_WRITE_MARK_CACHE_TEST_MUTEX: std::sync::Mutex<()> =
@@ -396,6 +397,16 @@ mod tests {
             cluster_kv_raft_peer_progress_next_index_hint(&paths, &peer, 7, 12),
             Some(9)
         );
+        let loaded = read_cluster_kv_raft_peer_progress(&paths).expect("load progress once");
+        assert_eq!(
+            cluster_kv_raft_peer_progress_next_index_hint_from_records(&loaded, &peer, 7, 12),
+            Some(9)
+        );
+        assert_eq!(
+            cluster_kv_raft_peer_progress_next_index_hint_from_records(&loaded, &peer, 8, 12),
+            None,
+            "an already-loaded ledger still rejects stale-term hints"
+        );
 
         std::fs::write(&paths.raft_peer_progress, b"not a sinomo object")
             .expect("corrupt soft progress ledger");
@@ -489,10 +500,47 @@ mod tests {
             cluster_kv_txn_response_rpc_payload(&txn_response).expect("txn response payload");
         assert_eq!(txn_response_payload.route, CLUSTER_KV_TXN_ROUTE);
         assert_eq!(txn_response_payload.category, CLUSTER_KV_RPC_CATEGORY);
+
+        #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+        struct LegacyClusterKvTxnRpcResponse {
+            request_id: KvRequestId,
+            command_digest: KvCommandDigest,
+            txn_response: Option<KvTxnResponse>,
+            authority: KvAuthorityProof,
+            replayed_committed_request: bool,
+        }
+        let legacy_body = encode_cluster_kv_rpc_body(&LegacyClusterKvTxnRpcResponse {
+            request_id: txn_response.request_id.clone(),
+            command_digest: txn_response.command_digest,
+            txn_response: txn_response.txn_response.clone(),
+            authority: txn_response.authority.clone(),
+            replayed_committed_request: txn_response.replayed_committed_request,
+        })
+        .expect("encode pre-submitted-digest response");
+        assert_eq!(
+            decode_cluster_kv_txn_rpc_body(&legacy_body)
+                .expect("decode mixed-version transaction response")
+                .submitted_command_digest,
+            None,
+            "new nodes must decode old authorities during a rolling upgrade"
+        );
+        assert_eq!(
+            decode_cluster_kv_rpc_body::<LegacyClusterKvTxnRpcResponse>(&txn_response_payload.body)
+                .expect("old peer decodes response with submitted digest"),
+            LegacyClusterKvTxnRpcResponse {
+                request_id: txn_response.request_id.clone(),
+                command_digest: txn_response.command_digest,
+                txn_response: txn_response.txn_response.clone(),
+                authority: txn_response.authority.clone(),
+                replayed_committed_request: txn_response.replayed_committed_request,
+            },
+            "old nodes must ignore the added response field during a rolling upgrade"
+        );
         assert_eq!(
             decode_cluster_kv_txn_rpc_body(&txn_response_payload.body).expect("txn response body"),
             ClusterKvTxnRpcResponse {
                 request_id: txn_response.request_id,
+                submitted_command_digest: Some(txn_response.command_digest),
                 command_digest: txn_response.command_digest,
                 txn_response: txn_response.txn_response,
                 authority: txn_response.authority,
@@ -1964,6 +2012,14 @@ mod tests {
         );
         assert!(cluster_kv_key_can_defer_materialized_snapshot(
             "/cluster/endpoints/node-a/endpoint-a"
+        ));
+        assert_eq!(
+            cluster_kv_keyspace_class("/cluster/services/dfs/node-a"),
+            ClusterKvKeyspaceClass::Critical,
+            "service reconciliation still has cross-process snapshot readers"
+        );
+        assert!(!cluster_kv_key_can_defer_materialized_snapshot(
+            "/cluster/services/dfs/node-a"
         ));
         assert_eq!(
             cluster_kv_keyspace_class("/dfs/filesystems/fs-a/metadata-authority-barriers/services"),
@@ -8297,6 +8353,10 @@ mod tests {
     struct RacingCommitTestHost {
         kv_paths: ClusterKvPaths,
         node_id: NodeId,
+        remote_targets: Vec<NodeId>,
+        session_released_before_fanout: bool,
+        status_lock_acquired: bool,
+        fanout_lock_acquired: bool,
     }
 
     impl ClusterKvRaftCommandStorage for RacingCommitTestHost {
@@ -8373,6 +8433,10 @@ mod tests {
                 .commit_index_with_events(&self.node_id, index)
                 .map_err(Into::into)
         }
+
+        fn release_cluster_raft_command_session_after_commit(&mut self) {
+            self.session_released_before_fanout = true;
+        }
     }
 
     impl ClusterKvRaftQuorumCommitHost for RacingCommitTestHost {
@@ -8389,7 +8453,7 @@ mod tests {
             &mut self,
             _state: &ClusterBootstrapState,
         ) -> Result<Vec<Self::Target>, Self::Error> {
-            Ok(Vec::new())
+            Ok(self.remote_targets.clone())
         }
 
         fn target_node_id<'a>(&self, target: &'a Self::Target) -> &'a NodeId {
@@ -8403,15 +8467,44 @@ mod tests {
             _timeout: Duration,
         ) -> Result<ClusterRaftAppendResponse, Self::Error> {
             Ok(ClusterRaftAppendResponse {
-                accepted: false,
-                detail: "no remote voters in this test".to_string(),
+                accepted: true,
+                detail: "test remote voter accepted".to_string(),
                 state: state.clone(),
                 append: RaftAppendEntriesResponse {
                     term: 1,
-                    success: false,
-                    match_index: 0,
+                    success: true,
+                    match_index: 1,
                 },
             })
+        }
+
+        fn record_target_replication_status(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            _target: &Self::Target,
+            _status: ClusterKvRaftTargetReplicationStatus,
+            _latency_ms: Option<u64>,
+        ) -> Result<(), Self::Error> {
+            let guard = lock_cluster_kv_commit_sequence(&self.kv_paths, Duration::from_millis(50))?;
+            self.status_lock_acquired = true;
+            drop(guard);
+            Ok(())
+        }
+
+        fn fan_out_committed_cluster_raft_command(
+            &mut self,
+            _state: ClusterBootstrapState,
+            _events: Vec<KvEvent>,
+            _targets: Vec<Self::Target>,
+        ) -> Result<(), Self::Error> {
+            assert!(
+                self.session_released_before_fanout,
+                "durable command session must be released before fanout"
+            );
+            let guard = lock_cluster_kv_commit_sequence(&self.kv_paths, Duration::from_millis(50))?;
+            self.fanout_lock_acquired = true;
+            drop(guard);
+            Ok(())
         }
 
         fn cluster_authority_error(&mut self, failure: KvAuthorityFailure) -> Self::Error {
@@ -8486,7 +8579,14 @@ mod tests {
                 let node_id = local.clone();
                 let state = state.clone();
                 std::thread::spawn(move || {
-                    let mut host = RacingCommitTestHost { kv_paths, node_id };
+                    let mut host = RacingCommitTestHost {
+                        kv_paths,
+                        node_id,
+                        remote_targets: Vec::new(),
+                        session_released_before_fanout: false,
+                        status_lock_acquired: false,
+                        fanout_lock_acquired: false,
+                    };
                     let mut state = state;
                     for index in 0..COMMITS_PER_THREAD {
                         commit_cluster_kv_raft_command_with_quorum(
@@ -8530,6 +8630,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn quorum_commit_releases_sequence_lock_before_fanout() {
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-commit-fanout-unlocked");
+        let kv_paths = ClusterKvPaths::new(&root);
+        let local = NodeId::from_legacy_named("node_commit_fanout_unlocked").expect("local");
+        let remote = NodeId::from_legacy_named("node_commit_fanout_unused").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        state.members.truncate(1);
+        let mut host = RacingCommitTestHost {
+            kv_paths,
+            node_id: local,
+            remote_targets: Vec::new(),
+            session_released_before_fanout: false,
+            status_lock_acquired: false,
+            fanout_lock_acquired: false,
+        };
+
+        commit_cluster_kv_raft_command_with_quorum(
+            &mut state,
+            KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                key: "/kv/fanout/unlocked".to_string(),
+                value: b"committed".to_vec(),
+                lease_id: None,
+            })),
+            ClusterKvRaftQuorumCommitOptions {
+                timeout: Duration::from_secs(1),
+            },
+            &mut host,
+        )
+        .expect("commit and unlocked fanout");
+
+        assert!(
+            host.fanout_lock_acquired,
+            "fanout must be able to acquire the sequence lock after durable apply"
+        );
+        assert!(host.session_released_before_fanout);
+    }
+
+    #[test]
+    fn quorum_commit_releases_sequence_lock_before_replication_status_callbacks() {
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-commit-status-unlocked");
+        let kv_paths = ClusterKvPaths::new(&root);
+        let local = NodeId::from_legacy_named("node_commit_status_unlocked").expect("local");
+        let remote = NodeId::from_legacy_named("node_commit_status_remote").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        let mut host = RacingCommitTestHost {
+            kv_paths,
+            node_id: local,
+            remote_targets: vec![remote],
+            session_released_before_fanout: false,
+            status_lock_acquired: false,
+            fanout_lock_acquired: false,
+        };
+
+        commit_cluster_kv_raft_command_with_quorum(
+            &mut state,
+            KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                key: "/kv/status/unlocked".to_string(),
+                value: b"committed".to_vec(),
+                lease_id: None,
+            })),
+            ClusterKvRaftQuorumCommitOptions {
+                timeout: Duration::from_secs(1),
+            },
+            &mut host,
+        )
+        .expect("commit with unlocked status callback");
+
+        assert!(
+            host.status_lock_acquired,
+            "soft connectivity/status callbacks must run after the durable commit releases the proposal lock"
+        );
     }
 
     #[test]
@@ -8712,6 +8886,74 @@ mod tests {
         .expect("accept exact proof for leader-fenced command");
 
         assert_eq!(result, forwarded);
+    }
+
+    #[test]
+    fn compact_forwarded_txn_proof_binds_submitted_digest_for_fresh_and_replay() {
+        let local = NodeId::from_legacy_named("node_compact_digest_learner").expect("local node");
+        let remote = NodeId::from_legacy_named("node_compact_digest_voter").expect("remote node");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        state.members[0].role = ClusterMemberRole::Learner;
+        state.members[0].state = ClusterMemberState::Learner;
+        let request = KvTxnRequest::generated(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Put {
+                key: "/kv/compact-digest/bound".to_string(),
+                value: b"value".to_vec(),
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        });
+        let submitted_command_digest = request
+            .clone()
+            .into_command_request()
+            .digest()
+            .expect("submitted digest");
+        let txn_response = Some(KvTxnResponse {
+            succeeded: true,
+            revision: KvRevision(1),
+            responses: Vec::new(),
+        });
+
+        for (basis, replayed_committed_request) in [
+            (
+                KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks: 1,
+                    required_quorum: 1,
+                },
+                false,
+            ),
+            (KvAuthorityBasis::ExactCommittedRequest, true),
+        ] {
+            let valid = ClusterKvTxnCompactCommitResult {
+                request_id: request.request_id.clone(),
+                submitted_command_digest: Some(submitted_command_digest),
+                // The authenticated leader may add authorization-fence
+                // compares, so the durable digest is deliberately distinct.
+                command_digest: KvCommandDigest([42; 32]),
+                txn_response: txn_response.clone(),
+                authority: KvAuthorityProof {
+                    term: 1,
+                    commit_index: 7,
+                    revision: KvRevision(1),
+                    basis: basis.clone(),
+                },
+                replayed_committed_request,
+            };
+            validate_cluster_kv_txn_compact_commit_response(&state, &request, &valid)
+                .expect("accept response bound to the submitted transaction");
+
+            let mut mismatched = valid;
+            mismatched.submitted_command_digest = Some(KvCommandDigest([99; 32]));
+            let error =
+                validate_cluster_kv_txn_compact_commit_response(&state, &request, &mismatched)
+                    .expect_err("reject response for another submitted transaction");
+            assert!(matches!(
+                error,
+                KvError::AuthorityUnavailable { detail }
+                    if detail.contains("digest does not match")
+            ));
+        }
     }
 
     #[test]
@@ -10279,6 +10521,614 @@ mod tests {
     }
 
     #[test]
+    fn durable_raft_node_reuses_resident_indexed_state_across_opens() {
+        let root = temp_raft_root("sinomo-kv-resident-raft-reuse");
+        let node_id = NodeId::from_legacy_named("node_resident_raft_reuse").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let wal_paths = paths.raft_wal_paths(&node_id);
+        reset_resident_raft_open_counts_for_test(&wal_paths.root);
+
+        {
+            let mut storage = paths.local_raft_command_storage(node_id.clone(), |_| false);
+            let entry = storage
+                .append_uncommitted(KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                    key: "/resident/value".to_string(),
+                    value: b"retained".to_vec(),
+                    lease_id: None,
+                })))
+                .expect("append");
+            storage
+                .commit_index_with_events(entry.index)
+                .expect("commit");
+        }
+        assert_eq!(resident_raft_open_counts_for_test(&wal_paths.root), (1, 0));
+
+        for expected_warm_opens in 1..=3 {
+            let mut storage = paths.local_raft_command_storage(node_id.clone(), |_| false);
+            assert_eq!(
+                storage
+                    .read_index_entry("/resident/value")
+                    .expect("resident point read")
+                    .expect("resident value")
+                    .value,
+                b"retained"
+            );
+            drop(storage);
+            assert_eq!(
+                resident_raft_open_counts_for_test(&wal_paths.root),
+                (1, expected_warm_opens)
+            );
+        }
+    }
+
+    #[test]
+    fn resident_raft_node_invalidates_after_durable_state_replacement() {
+        let root = temp_raft_root("sinomo-kv-resident-raft-invalidation");
+        let node_id = NodeId::from_legacy_named("node_resident_raft_invalidation").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let wal_paths = paths.raft_wal_paths(&node_id);
+        reset_resident_raft_open_counts_for_test(&wal_paths.root);
+
+        let mut storage = paths.local_raft_command_storage(node_id.clone(), |_| false);
+        storage.read_index_state().expect("cold resident open");
+        drop(storage);
+        let mut replacement = wal_paths
+            .read_persisted_hard_state()
+            .expect("read persisted hard state");
+        replacement.current_term = 9;
+        replacement.voted_for = None;
+        replacement.leader_id = None;
+        wal_paths
+            .write_persisted_hard_state(&replacement)
+            .expect("replace hard state outside resident owner");
+
+        let mut reopened = paths.local_raft_command_storage(node_id, |_| false);
+        assert_eq!(
+            reopened
+                .read_index_state()
+                .expect("reopened state")
+                .current_term,
+            9
+        );
+        assert_eq!(resident_raft_open_counts_for_test(&wal_paths.root), (2, 0));
+    }
+
+    #[test]
+    fn resident_persistence_error_evicts_state_before_reopen() {
+        let root = temp_raft_root("sinomo-kv-resident-persistence-error");
+        let node_id = NodeId::from_legacy_named("node_resident_persistence_error").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let wal_paths = paths.raft_wal_paths(&node_id);
+        reset_resident_raft_open_counts_for_test(&wal_paths.root);
+
+        let mut storage = paths.local_raft_command_storage(node_id.clone(), |_| false);
+        storage.read_index_state().expect("cold resident open");
+        std::fs::create_dir_all(&wal_paths.wal).expect("replace absent WAL with directory");
+        assert!(
+            storage
+                .append_uncommitted(KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                    key: "/resident/must-not-cache".to_string(),
+                    value: b"value".to_vec(),
+                    lease_id: None,
+                })))
+                .is_err()
+        );
+        drop(storage);
+        std::fs::remove_dir(&wal_paths.wal).expect("remove WAL failure fixture");
+
+        let mut reopened = paths.local_raft_command_storage(node_id, |_| false);
+        let state = reopened
+            .read_index_state()
+            .expect("cold reopen after failure");
+        assert_eq!(state.applied_index, 0);
+        assert!(
+            reopened
+                .read_index_entry("/resident/must-not-cache")
+                .expect("read after failure")
+                .is_none()
+        );
+        assert_eq!(resident_raft_open_counts_for_test(&wal_paths.root), (2, 0));
+    }
+
+    #[test]
+    fn resident_node_is_not_checked_in_during_panic_unwind() {
+        let root = temp_raft_root("sinomo-kv-resident-panic-eviction");
+        let node_id = NodeId::from_legacy_named("node_resident_panic_eviction").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let wal_paths = paths.raft_wal_paths(&node_id);
+        reset_resident_raft_open_counts_for_test(&wal_paths.root);
+
+        let unwind_paths = paths.clone();
+        let unwind_node_id = node_id.clone();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut storage = unwind_paths.local_raft_command_storage(unwind_node_id, |_| false);
+            storage.read_index_state().expect("cold resident open");
+            panic!("resident node unwind fixture");
+        }));
+        assert!(unwind.is_err());
+
+        let mut reopened = paths.local_raft_command_storage(node_id, |_| false);
+        reopened
+            .read_index_state()
+            .expect("cold reopen after unwind");
+        assert_eq!(resident_raft_open_counts_for_test(&wal_paths.root), (2, 0));
+    }
+
+    #[test]
+    fn local_command_storage_exposes_coherent_indexed_read_state() {
+        let root = temp_raft_root("sinomo-kv-resident-read-index");
+        let node_id = NodeId::from_legacy_named("node_resident_read_index").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let mut storage = paths.local_raft_command_storage(node_id.clone(), |_| false);
+        let entry = storage
+            .append_uncommitted(KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                key: "/read-index/value".to_string(),
+                value: b"indexed".to_vec(),
+                lease_id: None,
+            })))
+            .expect("append");
+        storage
+            .commit_index_with_events(entry.index)
+            .expect("commit");
+
+        let state = storage.read_index_state().expect("read-index state");
+        assert_eq!(state.current_term, 1);
+        assert_eq!(state.leader_id.as_ref(), Some(&node_id));
+        assert_eq!(state.commit_index, entry.index);
+        assert_eq!(state.commit_term, Some(1));
+        assert_eq!(state.applied_index, entry.index);
+        assert_eq!(state.revision, KvRevision(1));
+        assert!(state.has_current_term_commit);
+        assert_eq!(
+            storage
+                .read_index_entry("/read-index/value")
+                .expect("point read")
+                .expect("point value")
+                .value,
+            b"indexed"
+        );
+        assert_eq!(
+            storage
+                .read_index_prefix("/read-index/")
+                .expect("prefix read")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn resident_local_point_read_does_not_wait_for_checked_out_writer() {
+        let root = temp_raft_root("sinomo-kv-resident-read-concurrency");
+        let node_id = NodeId::from_legacy_named("node_resident_read_concurrency").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        {
+            let mut storage = paths.local_raft_command_storage(node_id.clone(), |_| false);
+            let entry = storage
+                .append_uncommitted(KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                    key: "/resident/concurrent".to_string(),
+                    value: b"committed".to_vec(),
+                    lease_id: None,
+                })))
+                .expect("append seed");
+            storage
+                .commit_index_with_events(entry.index)
+                .expect("commit seed");
+        }
+
+        let mut writer = paths.local_raft_command_storage(node_id.clone(), |_| false);
+        writer
+            .append_uncommitted(KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                key: "/resident/uncommitted".to_string(),
+                value: b"not-visible".to_vec(),
+                lease_id: None,
+            })))
+            .expect("hold resident writer checkout");
+
+        let read_paths = paths.clone();
+        let read_node_id = node_id.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            result_tx
+                .send(read_cluster_kv_local_entry(
+                    &read_paths,
+                    &read_node_id,
+                    "/resident/concurrent",
+                ))
+                .expect("send local read");
+        });
+        let read = result_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("resident local read must not wait for writer")
+            .expect("local read");
+        assert_eq!(read.value.expect("committed value").value, b"committed");
+        reader.join().expect("join local reader");
+        drop(writer);
+    }
+
+    #[test]
+    fn read_only_point_reads_seed_indexed_view_after_one_cold_replay() {
+        let root = temp_raft_root("sinomo-kv-read-only-index-seed");
+        let node_id = NodeId::from_legacy_named("node_read_only_index_seed").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let wal_paths = paths.raft_wal_paths(&node_id);
+        {
+            let mut node = DurableRaftKvNode::open(node_id.clone(), wal_paths.clone())
+                .expect("seed durable raft node");
+            let entry = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/read-only/value".to_string(),
+                        value: b"indexed".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append seed value");
+            node.commit_to(entry.index).expect("commit seed value");
+        }
+        assert!(!registered_resident_raft_node_exists(&wal_paths));
+        reset_nonresident_raft_open_count_for_test(&wal_paths.root);
+        reset_resident_raft_open_counts_for_test(&wal_paths.root);
+
+        for _ in 0..2 {
+            let read = read_cluster_kv_local_entry(&paths, &node_id, "/read-only/value")
+                .expect("public local point read");
+            assert_eq!(read.value.expect("seed value").value, b"indexed");
+        }
+        assert!(registered_resident_raft_node_exists(&wal_paths));
+        assert_eq!(
+            nonresident_raft_open_count_for_test(&wal_paths.root),
+            1,
+            "the first read should cold-replay and seed the read view; the second must be indexed"
+        );
+        assert_eq!(
+            resident_raft_open_counts_for_test(&wal_paths.root),
+            (0, 0),
+            "read-only calls must not construct a second resident full-store copy"
+        );
+        assert!(
+            !cached_resident_raft_node_exists_for_test(&wal_paths),
+            "read-only calls may register coordination state but must not retain a writer or flock"
+        );
+    }
+
+    #[test]
+    fn resident_writer_evicts_redundant_immutable_full_view() {
+        let root = temp_raft_root("sinomo-kv-read-before-resident-write");
+        let node_id = NodeId::from_legacy_named("node_read_before_resident_write").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let wal_paths = paths.raft_wal_paths(&node_id);
+        {
+            let mut node = DurableRaftKvNode::open(node_id.clone(), wal_paths.clone())
+                .expect("seed durable node");
+            let entry = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/read-before-write/value".to_string(),
+                        value: b"value".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append seed");
+            node.commit_to(entry.index).expect("commit seed");
+        }
+
+        read_cluster_kv_local_entry(&paths, &node_id, "/read-before-write/value")
+            .expect("seed immutable read view");
+        assert!(
+            raft_view_cache()
+                .lock()
+                .expect("raft view cache")
+                .contains_key(&wal_paths.root)
+        );
+
+        let mut storage = paths.local_raft_command_storage(node_id, |_| false);
+        storage.read_index_state().expect("open resident writer");
+        assert!(
+            !raft_view_cache()
+                .lock()
+                .expect("raft view cache")
+                .contains_key(&wal_paths.root),
+            "the resident indexed store must replace, not duplicate, the immutable full view"
+        );
+    }
+
+    #[test]
+    fn standalone_snapshot_reads_release_flock_for_nonresident_writer() {
+        let root = temp_raft_root("sinomo-kv-read-only-snapshot-flock");
+        let node_id = NodeId::from_legacy_named("node_read_only_snapshot_flock").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let wal_paths = paths.raft_wal_paths(&node_id);
+        {
+            let mut node = DurableRaftKvNode::open(node_id.clone(), wal_paths.clone())
+                .expect("seed durable raft node");
+            let entry = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/read-only/snapshot".to_string(),
+                        value: b"visible".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append seed value");
+            node.commit_to(entry.index).expect("commit seed value");
+        }
+
+        for _ in 0..2 {
+            let read = read_cluster_kv_local_snapshot(&paths, &node_id)
+                .expect("standalone local snapshot");
+            assert_eq!(
+                read.value
+                    .get("/read-only/snapshot")
+                    .expect("snapshot value")
+                    .value,
+                b"visible"
+            );
+        }
+        assert!(!cached_resident_raft_node_exists_for_test(&wal_paths));
+
+        let started = Instant::now();
+        let writer = DurableRaftKvNode::open(node_id, wal_paths)
+            .expect("nonresident writer must acquire the released flock");
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "read-only snapshot calls must not leave a permanent resident flock owner"
+        );
+        drop(writer);
+    }
+
+    #[test]
+    fn concurrent_first_reads_share_one_cold_replay() {
+        let root = temp_raft_root("sinomo-kv-concurrent-cold-read");
+        let node_id = NodeId::from_legacy_named("node_concurrent_cold_read").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let wal_paths = paths.raft_wal_paths(&node_id);
+        {
+            let mut node = DurableRaftKvNode::open(node_id.clone(), wal_paths.clone())
+                .expect("seed durable raft node");
+            let entry = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/concurrent/first-read".to_string(),
+                        value: b"shared".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append seed value");
+            node.commit_to(entry.index).expect("commit seed value");
+        }
+        reset_nonresident_raft_open_count_for_test(&wal_paths.root);
+
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let mut readers = Vec::new();
+        for _ in 0..2 {
+            let start = start.clone();
+            let paths = paths.clone();
+            let node_id = node_id.clone();
+            readers.push(std::thread::spawn(move || {
+                start.wait();
+                read_cluster_kv_local_entry(&paths, &node_id, "/concurrent/first-read")
+            }));
+        }
+        start.wait();
+        for reader in readers {
+            let read = reader
+                .join()
+                .expect("join concurrent reader")
+                .expect("concurrent first read");
+            assert_eq!(read.value.expect("seed value").value, b"shared");
+        }
+        assert_eq!(
+            nonresident_raft_open_count_for_test(&wal_paths.root),
+            1,
+            "concurrent first reads must serialize the cold replay and recheck its immutable cache"
+        );
+        assert!(!cached_resident_raft_node_exists_for_test(&wal_paths));
+    }
+
+    #[test]
+    fn resident_cache_rejects_same_root_for_a_different_node() {
+        let root = temp_raft_root("sinomo-kv-resident-node-id-fence");
+        let first_node = NodeId::from_legacy_named("node_resident_id_first").expect("first node");
+        let second_node =
+            NodeId::from_legacy_named("node_resident_id_second").expect("second node");
+        let wal_paths = KvWalPaths::new(&root);
+        reset_resident_raft_open_counts_for_test(&wal_paths.root);
+
+        drop(
+            DurableRaftKvNode::open_resident_inner(
+                first_node,
+                wal_paths.clone(),
+                false,
+                Duration::ZERO,
+            )
+            .expect("seed first resident owner"),
+        );
+        drop(
+            DurableRaftKvNode::open_resident_inner(
+                second_node,
+                wal_paths.clone(),
+                false,
+                Duration::ZERO,
+            )
+            .expect("open same root for second node"),
+        );
+        assert_eq!(
+            resident_raft_open_counts_for_test(&wal_paths.root),
+            (2, 0),
+            "node identity mismatch must force a cold reopen"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resident_cache_rejects_replaced_empty_durable_root() {
+        let root = temp_raft_root("sinomo-kv-resident-root-replacement");
+        let node_id = NodeId::from_legacy_named("node_resident_root_replacement").expect("node");
+        let wal_paths = KvWalPaths::new(&root);
+        reset_resident_raft_open_counts_for_test(&wal_paths.root);
+
+        drop(
+            DurableRaftKvNode::open_resident_inner(
+                node_id.clone(),
+                wal_paths.clone(),
+                false,
+                Duration::ZERO,
+            )
+            .expect("seed empty resident root"),
+        );
+        let retired_root = root.with_extension("retired");
+        std::fs::rename(&root, &retired_root).expect("replace durable root while old lock is open");
+        {
+            let mut replacement = DurableRaftKvNode::open(node_id.clone(), wal_paths.clone())
+                .expect("open replacement durable root");
+            replacement
+                .become_leader(7)
+                .expect("persist replacement term");
+        }
+
+        let reopened = DurableRaftKvNode::open_resident_inner(
+            node_id,
+            wal_paths.clone(),
+            false,
+            Duration::ZERO,
+        )
+        .expect("resident open after root replacement");
+        assert_eq!(reopened.hard_state().current_term, 7);
+        assert_eq!(
+            resident_raft_open_counts_for_test(&wal_paths.root),
+            (2, 0),
+            "root and lock replacement must invalidate an otherwise-empty cached resident"
+        );
+    }
+
+    #[test]
+    fn local_snapshot_reads_registered_resident_node_without_flock_contention() {
+        let root = temp_raft_root("sinomo-kv-resident-local-snapshot");
+        let node_id = NodeId::from_legacy_named("node_resident_local_snapshot").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        {
+            let mut storage = paths.local_raft_command_storage(node_id.clone(), |_| false);
+            let entry = storage
+                .append_uncommitted(KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                    key: "/resident/snapshot".to_string(),
+                    value: b"visible".to_vec(),
+                    lease_id: None,
+                })))
+                .expect("append");
+            storage
+                .commit_index_with_events(entry.index)
+                .expect("commit");
+        }
+
+        let read = read_cluster_kv_local_snapshot(&paths, &node_id)
+            .expect("local snapshot from registered resident node");
+        assert_eq!(
+            read.value
+                .get("/resident/snapshot")
+                .expect("resident snapshot value")
+                .value,
+            b"visible"
+        );
+        assert_eq!(read.applied_index, 1);
+    }
+
+    #[test]
+    fn local_reads_fall_back_immediately_when_nonresident_raft_flock_is_held() {
+        let root = temp_raft_root("sinomo-kv-local-read-nonresident-busy");
+        let node_id = NodeId::from_legacy_named("node_local_read_nonresident_busy").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let mut materialized = InProcessKvStore::new();
+        materialized
+            .put("/cached/a", b"a".to_vec(), None)
+            .expect("seed cached a");
+        materialized
+            .put("/cached/b", b"b".to_vec(), None)
+            .expect("seed cached b");
+        let cached_snapshot = materialized.try_snapshot().expect("cached snapshot");
+        write_cluster_kv_snapshot(&paths, &cached_snapshot).expect("write cached snapshot");
+
+        let _held = DurableRaftKvNode::open(node_id.clone(), paths.raft_wal_paths(&node_id))
+            .expect("hold operation-scoped raft flock");
+        assert!(
+            !registered_resident_raft_node_exists(&paths.raft_wal_paths(&node_id)),
+            "fixture must exercise a lock owner outside the resident registry"
+        );
+
+        let started = Instant::now();
+        let snapshot = read_cluster_kv_local_snapshot(&paths, &node_id)
+            .expect("snapshot should fall back to materialized view");
+        let entry = read_cluster_kv_local_entry(&paths, &node_id, "/cached/a")
+            .expect("point read should fall back to materialized view");
+        let prefix = read_cluster_kv_local_prefix(&paths, &node_id, "/cached/")
+            .expect("prefix read should fall back to materialized view");
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "local read fallback must not wait for the normal Raft flock timeout"
+        );
+        assert_eq!(snapshot.revision, cached_snapshot.revision);
+        assert_eq!(snapshot.applied_index, 0);
+        assert_eq!(snapshot.observed_term, 0);
+        assert!(snapshot.known_leader.is_none());
+        assert_eq!(entry.value.expect("cached point value").value, b"a");
+        assert_eq!(entry.applied_index, 0);
+        assert_eq!(
+            prefix
+                .value
+                .into_iter()
+                .map(|entry| entry.key)
+                .collect::<Vec<_>>(),
+            vec!["/cached/a", "/cached/b"]
+        );
+        assert_eq!(prefix.applied_index, 0);
+    }
+
+    #[test]
+    fn incremental_event_lookup_binary_searches_large_retained_history() {
+        let mut store = InProcessKvStore::new();
+        for index in 0..MAX_RETAINED_EVENTS {
+            store
+                .put(format!("/history/{index:04}"), vec![b'x'], None)
+                .expect("append retained event");
+        }
+        let previous_revision = KvRevision(store.revision().0.saturating_sub(1));
+        reset_events_after_revision_partition_probes_for_test();
+        let events = store
+            .events_after_revision(previous_revision)
+            .expect("read event suffix");
+        let probes = events_after_revision_partition_probes_for_test();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].revision, store.revision());
+        assert!(
+            probes <= 16,
+            "partition lookup should be logarithmic for {MAX_RETAINED_EVENTS} events, observed {probes} probes"
+        );
+    }
+
+    #[test]
+    fn resident_checkout_zero_wait_reports_busy() {
+        let root = temp_raft_root("sinomo-kv-resident-zero-wait");
+        let node_id = NodeId::from_legacy_named("node_resident_zero_wait").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let mut storage = paths.local_raft_command_storage(node_id.clone(), |_| false);
+        storage.read_index_state().expect("hold resident checkout");
+
+        assert!(matches!(
+            DurableRaftKvNode::open_resident_inner(
+                node_id.clone(),
+                paths.raft_wal_paths(&node_id),
+                false,
+                Duration::ZERO,
+            ),
+            Err(KvError::Busy { .. })
+        ));
+    }
+
+    #[test]
     fn durable_raft_save_snapshot_skips_identical_wal_tail_rewrite() {
         let root = temp_raft_root("sinomo-kv-snapshot-no-wal-rewrite");
         let node_id = NodeId::from_legacy_named("node_snapshot_no_wal_rewrite").expect("node");
@@ -10889,6 +11739,8 @@ mod tests {
                 max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
             },
         );
+        let wal_paths = paths.raft_wal_paths(&node_id);
+        reset_resident_raft_open_counts_for_test(&wal_paths.root);
         let concurrent_operation_store = store.clone();
         let mut storage = ClusterKvRaftLocalCommandStorage::new(store, node_id.clone(), |_| false);
 
@@ -10967,12 +11819,16 @@ mod tests {
 
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (opened_tx, opened_rx) = std::sync::mpsc::channel();
-        let wal_paths = paths.raft_wal_paths(&node_id);
         let reopen_node_id = node_id.clone();
         let reopen = std::thread::spawn(move || {
             started_tx.send(()).expect("notify reopen started");
-            let reopened = DurableRaftKvNode::open(reopen_node_id, wal_paths)
-                .expect("reopen after resident command session");
+            let reopened = DurableRaftKvNode::open_resident_inner(
+                reopen_node_id,
+                wal_paths,
+                false,
+                RAFT_NODE_LOCK_WAIT,
+            )
+            .expect("resident reopen after command session");
             opened_tx
                 .send(reopened.last_log_index())
                 .expect("report reopened log index");
@@ -10999,6 +11855,188 @@ mod tests {
             .join()
             .expect("join concurrent operation thread");
         reopen.join().expect("join reopen thread");
+        assert_eq!(
+            resident_raft_open_counts_for_test(&paths.raft_wal_paths(&node_id).root),
+            (1, 2),
+            "both post-session operations must reuse the decoded resident node without replay"
+        );
+    }
+
+    #[test]
+    fn compact_commit_and_raft_metadata_updates_do_not_build_complete_snapshot() {
+        let root = temp_raft_root("sinomo-kv-compact-production-no-full-snapshot");
+        let node_id =
+            NodeId::from_legacy_named("node_compact_production_no_snapshot").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let store = ClusterKvRaftStore::new(
+            paths,
+            ClusterKvRaftCompactionPolicy {
+                max_snapshot_bytes: u64::MAX,
+                max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+            },
+        );
+        let mut storage = ClusterKvRaftLocalCommandStorage::new(
+            store.clone(),
+            node_id.clone(),
+            cluster_kv_key_can_defer_materialized_snapshot,
+        );
+        let entry = storage
+            .append_uncommitted(KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                key: "/cluster/health/nodes/compact-test".to_string(),
+                value: b"healthy".to_vec(),
+                lease_id: None,
+            })))
+            .expect("append deferrable command");
+
+        reset_complete_snapshot_materializations_for_test();
+        let committed = storage
+            .commit_index_compact(entry.index)
+            .expect("commit compact command");
+        assert!(committed.checkpoint_snapshot.is_none());
+        assert_eq!(
+            complete_snapshot_materializations_for_test(),
+            0,
+            "an ordinary compact commit must remain proportional to its delta"
+        );
+
+        storage
+            .append_uncommitted(KvCommandRequest::generated(KvCommand::Barrier))
+            .expect("append uncommitted barrier");
+        reset_complete_snapshot_materializations_for_test();
+        storage
+            .discard_uncommitted_tail_and_clear_leader_compact()
+            .expect("discard compact tail");
+        storage.observe_term(7).expect("observe compact term");
+        assert_eq!(
+            complete_snapshot_materializations_for_test(),
+            0,
+            "failure cleanup and hard-state changes must not project the keyspace"
+        );
+        drop(storage);
+
+        reset_complete_snapshot_materializations_for_test();
+        store
+            .set_leader_compact(&node_id, 8)
+            .expect("set compact leader");
+        store
+            .clear_leader_compact(&node_id)
+            .expect("clear compact leader");
+        assert_eq!(
+            complete_snapshot_materializations_for_test(),
+            0,
+            "leader metadata updates must remain hard-state-only"
+        );
+    }
+
+    #[test]
+    fn exact_replay_repairs_failed_critical_materialized_projection() {
+        let root = temp_raft_root("sinomo-kv-replay-repairs-critical-projection");
+        let node_id =
+            NodeId::from_legacy_named("node_replay_repairs_critical_projection").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let store = ClusterKvRaftStore::new(
+            paths.clone(),
+            ClusterKvRaftCompactionPolicy {
+                max_snapshot_bytes: u64::MAX,
+                max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+            },
+        );
+        let mut storage = ClusterKvRaftLocalCommandStorage::new(
+            store,
+            node_id,
+            cluster_kv_key_can_defer_materialized_snapshot,
+        );
+        let request = KvCommandRequest::new(
+            KvRequestId::generate(),
+            KvCommand::Op(KvOp::Put {
+                key: "/config/replay-projection".to_string(),
+                value: b"durable".to_vec(),
+                lease_id: None,
+            }),
+        );
+        let entry = storage
+            .append_uncommitted(request.clone())
+            .expect("append critical command");
+
+        std::fs::create_dir_all(&paths.snapshot)
+            .expect("block materialized snapshot publication with a directory");
+        storage
+            .commit_index_compact(entry.index)
+            .expect_err("projection failure must surface after durable apply");
+        assert_eq!(
+            storage
+                .read_index_entry("/config/replay-projection")
+                .expect("read durable resident value")
+                .expect("durable value")
+                .value,
+            b"durable"
+        );
+
+        std::fs::remove_dir(&paths.snapshot).expect("unblock materialized projection");
+        let replay = storage
+            .replay_record_if_committed(&request)
+            .expect("repair exact replay")
+            .expect("committed record");
+        assert_eq!(replay.request_id, request.request_id);
+        assert_eq!(storage.take_last_snapshot_publish_wrote(), Some(true));
+        assert_eq!(
+            read_cluster_kv_cached_snapshot(&paths)
+                .expect("read repaired projection")
+                .get("/config/replay-projection")
+                .expect("repaired projected value")
+                .value,
+            b"durable"
+        );
+    }
+
+    #[test]
+    fn leader_request_outcome_lookup_reads_resident_retention_indexes_without_snapshot() {
+        let root = temp_raft_root("sinomo-kv-request-outcome-resident-read");
+        let node_id =
+            NodeId::from_legacy_named("node_request_outcome_resident_read").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let store = ClusterKvRaftStore::new(
+            paths,
+            ClusterKvRaftCompactionPolicy {
+                max_snapshot_bytes: u64::MAX,
+                max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+            },
+        );
+        store
+            .set_leader_compact(&node_id, 1)
+            .expect("establish local leader");
+        let mut storage = ClusterKvRaftLocalCommandStorage::new(
+            store,
+            node_id,
+            cluster_kv_key_can_defer_materialized_snapshot,
+        );
+        let request = KvCommandRequest::generated(KvCommand::Barrier);
+        let request_id = request.request_id.clone();
+        let entry = storage
+            .append_uncommitted(request)
+            .expect("append retained request");
+        storage
+            .commit_index_compact(entry.index)
+            .expect("commit retained request");
+
+        reset_complete_snapshot_materializations_for_test();
+        assert!(matches!(
+            storage
+                .read_index_request_outcome(&request_id)
+                .expect("read committed request outcome"),
+            Some(KvRequestOutcome::Committed(record)) if record.request_id == request_id
+        ));
+        assert_eq!(
+            storage
+                .read_index_request_outcome(&KvRequestId::generate())
+                .expect("read missing request outcome"),
+            None
+        );
+        assert_eq!(
+            complete_snapshot_materializations_for_test(),
+            0,
+            "leader request-outcome reads must not project the complete KV store"
+        );
     }
 
     #[test]
@@ -13065,6 +14103,7 @@ mod tests {
 
         let snapshot = Arc::new(InProcessKvStore::new().snapshot().expect("snapshot"));
         let hard_state = RaftHardState::default();
+        let cache_node_id = NodeId::from_legacy_named("node_kv_read_cache_lru").expect("node id");
         let mtime = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000));
         for index in 0..FILE_CACHE_CAPACITY.saturating_sub(1) {
             cache_store_snapshot(
@@ -13087,7 +14126,10 @@ mod tests {
                 KvWalPaths::new(format!("/sinomo-kv-lru-test/100-quiet-raft-{index:04}"));
             cache_store_raft_view(
                 &quiet_paths,
+                cache_node_id.clone(),
                 RaftViewIdentity {
+                    root: None,
+                    lock: None,
                     hard_state: None,
                     wal: None,
                     snapshot: None,
@@ -13112,11 +14154,18 @@ mod tests {
         );
         let hot_raft_paths = KvWalPaths::new("/sinomo-kv-lru-test/000-hot-raft");
         let hot_raft_identity = RaftViewIdentity {
+            root: None,
+            lock: None,
             hard_state: None,
             wal: None,
             snapshot: None,
         };
-        cache_store_raft_view(&hot_raft_paths, hot_raft_identity, snapshot.clone());
+        cache_store_raft_view(
+            &hot_raft_paths,
+            cache_node_id.clone(),
+            hot_raft_identity,
+            snapshot.clone(),
+        );
 
         assert!(
             cache_lookup_snapshot(&hot_snapshot_path, hot_snapshot_identity).is_some(),
@@ -13127,7 +14176,7 @@ mod tests {
             "looking up the hot hard-state cache entry should refresh its recency"
         );
         assert!(
-            cache_lookup_raft_view(&hot_raft_paths, hot_raft_identity).is_some(),
+            cache_lookup_raft_view(&hot_raft_paths, &cache_node_id, hot_raft_identity).is_some(),
             "looking up the hot raft view should refresh its recency"
         );
 
@@ -13147,6 +14196,7 @@ mod tests {
         );
         cache_store_raft_view(
             &KvWalPaths::new("/sinomo-kv-lru-test/999-extra-raft"),
+            cache_node_id.clone(),
             hot_raft_identity,
             snapshot,
         );
@@ -13160,7 +14210,7 @@ mod tests {
             "recent hard-state cache entry should survive capacity churn"
         );
         assert!(
-            cache_lookup_raft_view(&hot_raft_paths, hot_raft_identity).is_some(),
+            cache_lookup_raft_view(&hot_raft_paths, &cache_node_id, hot_raft_identity).is_some(),
             "recent raft-view cache entry should survive capacity churn"
         );
         materialized_snapshot_cache()

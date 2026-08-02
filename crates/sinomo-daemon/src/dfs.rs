@@ -102,6 +102,21 @@ const DAEMON_DEFAULT_DFS_MEMBER_PREFIX: &str = "/cluster/members/";
 const DAEMON_DEFAULT_DFS_ENDPOINT_PREFIX: &str = "/cluster/endpoints/";
 const DAEMON_DEFAULT_DFS_CONNECTIVITY_PREFIX: &str = "/cluster/network/connectivity/";
 
+fn daemon_kv_events_cover_revision_range(
+    previous_revision: KvRevision,
+    current_revision: KvRevision,
+    events: &[sinomo_core::kv::KvEvent],
+) -> bool {
+    current_revision <= previous_revision
+        || (events.first().map(|event| event.revision) == Some(previous_revision.next())
+            && events.last().map(|event| event.revision) == Some(current_revision)
+            && events.windows(2).all(|events| {
+                let previous = events[0].revision;
+                let current = events[1].revision;
+                current == previous || current == previous.next()
+            }))
+}
+
 fn daemon_dfs_local_zone() -> Option<String> {
     std::env::var(SINOMO_DFS_ZONE_ENV)
         .ok()
@@ -210,7 +225,8 @@ struct DaemonDfsMetadataAuthorityGeneration {
     #[cfg(test)]
     projection_rebuild_count: AtomicU64,
     publish_wake: Mutex<Option<DaemonDfsMetadataAuthorityPublishWake>>,
-    subscription: OnceLock<sinomo_core::cluster::ClusterKvCommittedSnapshotSubscription>,
+    snapshot_subscription: OnceLock<sinomo_core::cluster::ClusterKvCommittedSnapshotSubscription>,
+    delta_subscription: OnceLock<sinomo_core::cluster::ClusterKvCommittedDeltaSubscription>,
     snapshot_watcher: OnceLock<notify::RecommendedWatcher>,
 }
 
@@ -242,7 +258,8 @@ impl DaemonDfsMetadataAuthorityGeneration {
             #[cfg(test)]
             projection_rebuild_count: AtomicU64::new(0),
             publish_wake: Mutex::new(None),
-            subscription: OnceLock::new(),
+            snapshot_subscription: OnceLock::new(),
+            delta_subscription: OnceLock::new(),
             snapshot_watcher: OnceLock::new(),
         }
     }
@@ -292,9 +309,11 @@ impl DaemonDfsMetadataAuthorityGeneration {
                     let first_new = snapshot
                         .events
                         .partition_point(|event| event.revision <= revision);
-                    snapshot.events[first_new..]
-                        .iter()
-                        .any(|event| daemon_dfs_metadata_authority_key_is_exact(&event.key))
+                    let new_events = &snapshot.events[first_new..];
+                    !daemon_kv_events_cover_revision_range(revision, snapshot.revision, new_events)
+                        || new_events
+                            .iter()
+                            .any(|event| daemon_dfs_metadata_authority_key_is_exact(&event.key))
                 }
             };
             if !rebuild {
@@ -325,6 +344,102 @@ impl DaemonDfsMetadataAuthorityGeneration {
             observed.entries = entries;
             authority_changed
         };
+        self.publish_authority_change(authority_changed);
+    }
+
+    /// Applies a complete process-local authority delta without projecting the
+    /// whole resident KV image. The delta stream is an optimization rather
+    /// than a replay log, so startup, compaction, or any revision gap asks the
+    /// subscriber to rebuild from the resident materialized snapshot.
+    fn observe_delta(&self, delta: &sinomo_core::kv::ClusterKvCommittedDelta) -> bool {
+        let authority_changed = {
+            let Ok(mut observed) = self.projection.lock() else {
+                return false;
+            };
+            let Some(previous_revision) = observed.revision else {
+                return false;
+            };
+            if delta.revision <= previous_revision {
+                return true;
+            }
+            if previous_revision < delta.compacted_revision || delta.events.is_empty() {
+                return false;
+            }
+            if !daemon_kv_events_cover_revision_range(
+                previous_revision,
+                delta.revision,
+                &delta.events,
+            ) {
+                return false;
+            }
+
+            let relevant_event_keys = delta
+                .events
+                .iter()
+                .filter(|event| daemon_dfs_metadata_authority_key_is_exact(&event.key))
+                .map(|event| event.key.as_str())
+                .collect::<BTreeSet<_>>();
+            let mut final_keys = BTreeSet::new();
+            let mut relevant_final_keys = BTreeSet::new();
+            for state in &delta.final_key_states {
+                if !final_keys.insert(state.key.as_str())
+                    || state
+                        .entry
+                        .as_ref()
+                        .is_some_and(|entry| entry.key != state.key)
+                {
+                    return false;
+                }
+                if daemon_dfs_metadata_authority_key_is_exact(&state.key) {
+                    relevant_final_keys.insert(state.key.as_str());
+                }
+            }
+            if relevant_event_keys != relevant_final_keys {
+                return false;
+            }
+
+            let mut authority_changed = false;
+            for state in &delta.final_key_states {
+                if !daemon_dfs_metadata_authority_key_is_exact(&state.key) {
+                    continue;
+                }
+                let position = observed
+                    .entries
+                    .binary_search_by(|(key, _)| key.as_str().cmp(state.key.as_str()));
+                match (position, state.entry.as_ref()) {
+                    (Ok(index), Some(entry)) if observed.entries[index].1 == entry.value => {}
+                    (Ok(index), Some(entry)) => {
+                        observed.entries[index].1 = entry.value.clone();
+                        authority_changed = true;
+                    }
+                    (Err(index), Some(entry)) => {
+                        observed
+                            .entries
+                            .insert(index, (state.key.clone(), entry.value.clone()));
+                        authority_changed = true;
+                    }
+                    (Ok(index), None) => {
+                        observed.entries.remove(index);
+                        authority_changed = true;
+                    }
+                    (Err(_), None) => {}
+                }
+            }
+            if authority_changed {
+                let _ = self.generation.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |generation| Some(generation.saturating_add(1)),
+                );
+            }
+            observed.revision = Some(delta.revision);
+            authority_changed
+        };
+        self.publish_authority_change(authority_changed);
+        true
+    }
+
+    fn publish_authority_change(&self, authority_changed: bool) {
         let wake = authority_changed
             .then(|| {
                 self.publish_wake
@@ -377,6 +492,9 @@ fn daemon_dfs_metadata_authority_snapshot_watcher(
                     let Some(generation) = generation.upgrade() else {
                         return;
                     };
+                    sinomo_core::cluster::invalidate_cluster_kv_observed_read_models(
+                        &cluster_paths,
+                    );
                     match sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(
                         &cluster_paths,
                     ) {
@@ -3771,19 +3889,51 @@ fn daemon_dfs_metadata_authority_generation_for_identity(
 
     let generation = Arc::new(DaemonDfsMetadataAuthorityGeneration::new());
     generation.attach_publish_wake(cluster_paths, runtime);
-    let weak_generation = Arc::downgrade(&generation);
-    let subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_snapshots(
+    let snapshot_generation = Arc::downgrade(&generation);
+    let snapshot_subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_snapshots(
         cluster_paths,
         move |snapshot| {
-            if let Some(generation) = weak_generation.upgrade() {
+            if let Some(generation) = snapshot_generation.upgrade() {
                 generation.observe(snapshot);
             }
         },
     );
     generation
-        .subscription
-        .set(subscription)
-        .expect("new metadata-authority generation subscription");
+        .snapshot_subscription
+        .set(snapshot_subscription)
+        .expect("new metadata-authority generation snapshot subscription");
+    let delta_generation = Arc::downgrade(&generation);
+    let delta_cluster_paths = cluster_paths.clone();
+    let delta_subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_deltas(
+        cluster_paths,
+        move |delta| {
+            let Some(generation) = delta_generation.upgrade() else {
+                return;
+            };
+            if generation.observe_delta(delta) {
+                return;
+            }
+            match sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(
+                &delta_cluster_paths,
+            ) {
+                Ok(Some(snapshot)) => generation.observe(snapshot.as_ref()),
+                Ok(None) => tracing::warn!(
+                    target: "sinomo.dfs.metadata_authority",
+                    revision = delta.revision.0,
+                    "DFS metadata-authority committed-delta gap has no resident KV snapshot to rebuild from"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "sinomo.dfs.metadata_authority",
+                    revision = delta.revision.0,
+                    "DFS metadata-authority committed-delta gap rebuild failed: {error}"
+                ),
+            }
+        },
+    );
+    generation
+        .delta_subscription
+        .set(delta_subscription)
+        .expect("new metadata-authority generation delta subscription");
     if let Some(runtime) = runtime {
         let watcher = daemon_dfs_metadata_authority_snapshot_watcher(
             cluster_paths,
@@ -5024,7 +5174,8 @@ enum DaemonDefaultDfsReconciliationStep {
 pub(crate) struct DaemonDefaultDfsReconciliationReactor {
     _projection_tx: tokio::sync::watch::Sender<DaemonDefaultDfsReconciliationProjection>,
     projection_rx: tokio::sync::watch::Receiver<DaemonDefaultDfsReconciliationProjection>,
-    _subscription: sinomo_core::cluster::ClusterKvCommittedSnapshotSubscription,
+    _snapshot_subscription: sinomo_core::cluster::ClusterKvCommittedSnapshotSubscription,
+    _delta_subscription: sinomo_core::cluster::ClusterKvCommittedDeltaSubscription,
     _metadata_authority_generation: Option<Arc<DaemonDfsMetadataAuthorityGeneration>>,
     _local_wake: Arc<DaemonDefaultDfsReconciliationWake>,
     local_wake_rx: tokio::sync::watch::Receiver<u64>,
@@ -5098,14 +5249,64 @@ impl DaemonDefaultDfsReconciliationReactor {
                 Arc::clone(&parked_subscription),
             ),
         ));
-        let subscription_observer = Arc::clone(&projection_observer);
-        let subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_snapshots(
+        let snapshot_subscription_observer = Arc::clone(&projection_observer);
+        let snapshot_subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_snapshots(
             cluster_paths,
             move |snapshot| {
-                let mut observer = subscription_observer
+                let mut observer = snapshot_subscription_observer
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 observer.observe(&observer_tx, &observer_local_node_id, snapshot);
+            },
+        );
+        let delta_subscription_observer = Arc::clone(&projection_observer);
+        let delta_projection_tx = projection_tx.clone();
+        let delta_local_node_id = local_node_id.clone();
+        let delta_cluster_paths = cluster_paths.clone();
+        let delta_subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_deltas(
+            cluster_paths,
+            move |delta| {
+                let applied = delta_subscription_observer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .observe_delta(&delta_projection_tx, delta);
+                if applied {
+                    return;
+                }
+
+                // A compact process-local delta is intentionally not a
+                // replay journal. Startup, compaction, or a missed revision
+                // therefore falls back to the resident materialized view,
+                // whose monotonic observer check also closes the
+                // subscribe/read race.
+                match sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(
+                    &delta_cluster_paths,
+                ) {
+                    Ok(Some(snapshot)) => {
+                        delta_subscription_observer
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .observe(
+                                &delta_projection_tx,
+                                &delta_local_node_id,
+                                snapshot.as_ref(),
+                            );
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            target: "sinomo.dfs.reconciliation",
+                            revision = delta.revision.0,
+                            "default DFS committed-delta gap has no resident KV snapshot to rebuild from"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "sinomo.dfs.reconciliation",
+                            revision = delta.revision.0,
+                            "default DFS committed-delta gap rebuild failed: {error}"
+                        );
+                    }
+                }
             },
         );
         // Subscribe before sampling the resident snapshot. If a newer commit
@@ -5139,7 +5340,8 @@ impl DaemonDefaultDfsReconciliationReactor {
         Ok(Self {
             _projection_tx: projection_tx,
             projection_rx,
-            _subscription: subscription,
+            _snapshot_subscription: snapshot_subscription,
+            _delta_subscription: delta_subscription,
             _metadata_authority_generation: metadata_authority_generation,
             _local_wake: local_wake,
             local_wake_rx,
@@ -5696,8 +5898,14 @@ impl DaemonDefaultDfsCommittedProjectionObserver {
         let first_new = snapshot
             .events
             .partition_point(|event| event.revision <= previous_revision);
+        let new_events = &snapshot.events[first_new..];
+        if !daemon_kv_events_cover_revision_range(previous_revision, snapshot.revision, new_events)
+        {
+            self.rebuild(projection_tx, local_node_id, snapshot);
+            return;
+        }
         let parked_handoff = self.parked_handoff();
-        let relevant_change = snapshot.events[first_new..].iter().any(|event| {
+        let relevant_change = new_events.iter().any(|event| {
             parked_handoff.as_ref().map_or_else(
                 || daemon_default_dfs_reconciliation_key_is_relevant(&event.key),
                 |parked| {
@@ -5726,6 +5934,137 @@ impl DaemonDefaultDfsCommittedProjectionObserver {
                 false
             });
         }
+    }
+
+    /// Applies a complete process-local commit without rebuilding the full KV
+    /// snapshot. Returns `false` when startup, compaction, or a revision gap
+    /// requires the caller to rebuild from the resident authoritative view.
+    fn observe_delta(
+        &mut self,
+        projection_tx: &tokio::sync::watch::Sender<DaemonDefaultDfsReconciliationProjection>,
+        delta: &sinomo_core::kv::ClusterKvCommittedDelta,
+    ) -> bool {
+        let Some(previous_revision) = self.revision else {
+            return false;
+        };
+        if delta.revision <= previous_revision {
+            return true;
+        }
+        if previous_revision < delta.compacted_revision || delta.events.is_empty() {
+            return false;
+        }
+        if !daemon_kv_events_cover_revision_range(previous_revision, delta.revision, &delta.events)
+        {
+            return false;
+        }
+        let relevant_event_keys = delta
+            .events
+            .iter()
+            .filter(|event| daemon_default_dfs_reconciliation_key_is_relevant(&event.key))
+            .map(|event| event.key.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut final_keys = BTreeSet::new();
+        let mut relevant_final_keys = BTreeSet::new();
+        for state in &delta.final_key_states {
+            if !final_keys.insert(state.key.as_str())
+                || state
+                    .entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.key != state.key)
+            {
+                return false;
+            }
+            if daemon_default_dfs_reconciliation_key_is_relevant(&state.key) {
+                relevant_final_keys.insert(state.key.as_str());
+            }
+        }
+        if relevant_event_keys != relevant_final_keys {
+            return false;
+        }
+
+        let parked_handoff = self.parked_handoff();
+        let permit_key =
+            sinomo_dfs::placement_authority_permit_key(&sinomo_dfs::sifs_file_system_id());
+        let has_relevant_state = delta.final_key_states.iter().any(|state| {
+            state.key == permit_key || daemon_default_dfs_reconciliation_key_is_relevant(&state.key)
+        });
+        if !has_relevant_state {
+            projection_tx.send_if_modified(|observed| {
+                if observed
+                    .revision
+                    .is_some_and(|revision| delta.revision <= revision)
+                {
+                    return false;
+                }
+                observed.revision = Some(delta.revision);
+                false
+            });
+            self.revision = Some(delta.revision);
+            return true;
+        }
+        projection_tx.send_if_modified(|observed| {
+            if observed
+                .revision
+                .is_some_and(|revision| delta.revision <= revision)
+            {
+                return false;
+            }
+            let previous_wake_inputs = parked_handoff
+                .as_ref()
+                .map(|parked| parked.wake_inputs(&observed.inputs));
+            let previous_permit = observed.placement_authority_permit.clone();
+            let mut inputs_changed = false;
+            for state in &delta.final_key_states {
+                if state.key == permit_key {
+                    observed.placement_authority_permit =
+                        state
+                            .entry
+                            .as_ref()
+                            .map(|entry| DaemonDefaultDfsPermitGeneration {
+                                modify_revision: entry.modify_revision,
+                                version: entry.version,
+                                value: entry.value.clone(),
+                            });
+                    continue;
+                }
+                if !daemon_default_dfs_reconciliation_key_is_relevant(&state.key) {
+                    continue;
+                }
+                let position = observed
+                    .inputs
+                    .binary_search_by(|(key, _)| key.as_str().cmp(state.key.as_str()));
+                match state.entry.as_ref() {
+                    Some(entry) => {
+                        let value = daemon_default_dfs_reconciliation_input_value(entry);
+                        match position {
+                            Ok(index) if observed.inputs[index].1 == value => {}
+                            Ok(index) => {
+                                observed.inputs[index].1 = value;
+                                inputs_changed = true;
+                            }
+                            Err(index) => {
+                                observed.inputs.insert(index, (state.key.clone(), value));
+                                inputs_changed = true;
+                            }
+                        }
+                    }
+                    None => {
+                        if let Ok(index) = position {
+                            observed.inputs.remove(index);
+                            inputs_changed = true;
+                        }
+                    }
+                }
+            }
+            observed.revision = Some(delta.revision);
+            let relevant_inputs_changed =
+                parked_handoff.as_ref().map_or(inputs_changed, |parked| {
+                    previous_wake_inputs.as_ref() != Some(&parked.wake_inputs(&observed.inputs))
+                });
+            relevant_inputs_changed || previous_permit != observed.placement_authority_permit
+        });
+        self.revision = Some(delta.revision);
+        true
     }
 
     fn apply_parked_projection_deltas(
@@ -14501,6 +14840,115 @@ mod tests {
     }
 
     #[test]
+    fn daemon_dfs_revision_coverage_accepts_multi_key_transaction_revision() {
+        let events = vec![
+            sinomo_core::kv::KvEvent {
+                revision: KvRevision(8),
+                key: "/dfs/filesystems/sifs/config".to_string(),
+                kind: sinomo_core::kv::KvEventKind::Delete,
+            },
+            sinomo_core::kv::KvEvent {
+                revision: KvRevision(8),
+                key: "/dfs/filesystems/sifs/metadata-shards/root".to_string(),
+                kind: sinomo_core::kv::KvEventKind::Delete,
+            },
+        ];
+
+        assert!(daemon_kv_events_cover_revision_range(
+            KvRevision(7),
+            KvRevision(8),
+            &events,
+        ));
+    }
+
+    #[test]
+    fn daemon_dfs_metadata_authority_delta_rejects_revision_gaps() {
+        let file_system_id = sinomo_dfs::sifs_file_system_id();
+        let shard_key = metadata_shard_key(&file_system_id, "root");
+        let generation = DaemonDfsMetadataAuthorityGeneration::new();
+        generation.observe(&default_dfs_reactor_test_snapshot(
+            1,
+            vec![(shard_key.clone(), b"shard-v1".to_vec())],
+        ));
+        let initial_generation = generation.generation();
+        let initial_rebuilds = generation.projection_rebuild_count();
+
+        let complete = sinomo_core::kv::ClusterKvCommittedDelta {
+            revision: KvRevision(2),
+            compacted_revision: KvRevision::ZERO,
+            events: vec![sinomo_core::kv::KvEvent {
+                revision: KvRevision(2),
+                key: shard_key.clone(),
+                kind: sinomo_core::kv::KvEventKind::Put {
+                    value: b"shard-v2".to_vec(),
+                },
+            }],
+            final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
+                key: shard_key.clone(),
+                entry: Some(KvEntry {
+                    key: shard_key.clone(),
+                    value: b"shard-v2".to_vec(),
+                    create_revision: KvRevision(1),
+                    modify_revision: KvRevision(2),
+                    version: KvVersion(2),
+                    lease_id: None,
+                }),
+            }],
+        };
+        assert!(generation.observe_delta(&complete));
+        assert_eq!(generation.generation(), initial_generation + 1);
+        assert_eq!(generation.projection_rebuild_count(), initial_rebuilds);
+        assert_eq!(
+            generation
+                .projection
+                .lock()
+                .expect("projection lock")
+                .revision,
+            Some(KvRevision(2))
+        );
+
+        let gapped = sinomo_core::kv::ClusterKvCommittedDelta {
+            revision: KvRevision(4),
+            compacted_revision: KvRevision::ZERO,
+            events: vec![sinomo_core::kv::KvEvent {
+                revision: KvRevision(4),
+                key: shard_key.clone(),
+                kind: sinomo_core::kv::KvEventKind::Put {
+                    value: b"shard-v4".to_vec(),
+                },
+            }],
+            final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
+                key: shard_key.clone(),
+                entry: Some(KvEntry {
+                    key: shard_key,
+                    value: b"shard-v4".to_vec(),
+                    create_revision: KvRevision(1),
+                    modify_revision: KvRevision(4),
+                    version: KvVersion(3),
+                    lease_id: None,
+                }),
+            }],
+        };
+        assert!(!generation.observe_delta(&gapped));
+        assert_eq!(generation.generation(), initial_generation + 1);
+        assert_eq!(
+            generation
+                .projection
+                .lock()
+                .expect("projection lock")
+                .revision,
+            Some(KvRevision(2)),
+            "a gapped compact delta must not advance the retained cursor before a full rebuild"
+        );
+
+        let compacted = sinomo_core::kv::ClusterKvCommittedDelta {
+            compacted_revision: KvRevision(3),
+            ..gapped
+        };
+        assert!(!generation.observe_delta(&compacted));
+    }
+
+    #[test]
     fn metadata_authority_change_schedules_inherited_local_primary_backlog() {
         let root = temp_root("daemon-dfs-authority-inherited-backlog");
         let data_root = root.join("data");
@@ -14896,6 +15344,93 @@ mod tests {
             observer.rebuild_count, 3,
             "compaction must rebuild from the resident snapshot"
         );
+    }
+
+    #[test]
+    fn default_dfs_projection_applies_complete_delta_and_rebuilds_gaps() {
+        let local = NodeId::from_legacy_named("node_default_dfs_delta").expect("node");
+        let config_key = sinomo_dfs::file_system_config_key(&sinomo_dfs::sifs_file_system_id());
+        let (projection_tx, mut projection_rx) =
+            tokio::sync::watch::channel(DaemonDefaultDfsReconciliationProjection::default());
+        let mut observer = DaemonDefaultDfsCommittedProjectionObserver::default();
+
+        observer.observe(
+            &projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(1, vec![(config_key.clone(), vec![1])]),
+        );
+        assert_eq!(observer.rebuild_count, 1);
+        let _ = projection_rx.borrow_and_update();
+
+        let complete = sinomo_core::kv::ClusterKvCommittedDelta {
+            revision: KvRevision(2),
+            compacted_revision: KvRevision::ZERO,
+            events: vec![sinomo_core::kv::KvEvent {
+                revision: KvRevision(2),
+                key: config_key.clone(),
+                kind: sinomo_core::kv::KvEventKind::Put { value: vec![2] },
+            }],
+            final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
+                key: config_key.clone(),
+                entry: Some(KvEntry {
+                    key: config_key.clone(),
+                    value: vec![2],
+                    create_revision: KvRevision(1),
+                    modify_revision: KvRevision(2),
+                    version: KvVersion(2),
+                    lease_id: None,
+                }),
+            }],
+        };
+        assert!(observer.observe_delta(&projection_tx, &complete));
+        assert_eq!(
+            observer.rebuild_count, 1,
+            "a complete bounded delta must not rebuild the full snapshot projection"
+        );
+        assert!(
+            projection_rx
+                .has_changed()
+                .expect("projection channel open"),
+            "a relevant final-key-state change must wake default DFS reconciliation"
+        );
+        let changed = projection_rx.borrow_and_update().clone();
+        assert_eq!(changed.revision, Some(KvRevision(2)));
+        assert_eq!(changed.inputs, vec![(config_key.clone(), vec![2])]);
+
+        assert!(observer.observe_delta(&projection_tx, &complete));
+        assert!(
+            !projection_rx
+                .has_changed()
+                .expect("projection channel open"),
+            "an equal delta must not retrigger reconciliation"
+        );
+
+        let gapped = sinomo_core::kv::ClusterKvCommittedDelta {
+            revision: KvRevision(4),
+            compacted_revision: KvRevision::ZERO,
+            events: vec![sinomo_core::kv::KvEvent {
+                revision: KvRevision(4),
+                key: config_key.clone(),
+                kind: sinomo_core::kv::KvEventKind::Put { value: vec![4] },
+            }],
+            final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
+                key: config_key.clone(),
+                entry: Some(KvEntry {
+                    key: config_key,
+                    value: vec![4],
+                    create_revision: KvRevision(1),
+                    modify_revision: KvRevision(4),
+                    version: KvVersion(3),
+                    lease_id: None,
+                }),
+            }],
+        };
+        assert!(
+            !observer.observe_delta(&projection_tx, &gapped),
+            "a missed revision must request a conservative resident-snapshot rebuild"
+        );
+        assert_eq!(observer.revision, Some(KvRevision(2)));
+        assert_eq!(projection_tx.borrow().revision, Some(KvRevision(2)));
     }
 
     #[test]

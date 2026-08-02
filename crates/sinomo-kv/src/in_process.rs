@@ -1,5 +1,41 @@
 use crate::internal::*;
 
+#[cfg(test)]
+static EVENTS_AFTER_REVISION_PARTITION_PROBES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static COMPLETE_SNAPSHOT_MATERIALIZATIONS: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_events_after_revision_partition_probes_for_test() {
+    EVENTS_AFTER_REVISION_PARTITION_PROBES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn events_after_revision_partition_probes_for_test() -> u64 {
+    EVENTS_AFTER_REVISION_PARTITION_PROBES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_complete_snapshot_materializations_for_test() {
+    COMPLETE_SNAPSHOT_MATERIALIZATIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn complete_snapshot_materializations_for_test() -> u64 {
+    COMPLETE_SNAPSHOT_MATERIALIZATIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn record_complete_snapshot_materialization_for_test() {
+    COMPLETE_SNAPSHOT_MATERIALIZATIONS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SimulatedKeyState {
     pub(crate) present: bool,
@@ -1013,6 +1049,43 @@ impl InProcessKvStore {
         self.try_snapshot()
     }
 
+    pub(crate) fn events_after_revision(
+        &self,
+        revision: KvRevision,
+    ) -> Result<Vec<KvEvent>, KvError> {
+        // Retained events are revision ordered. Locate the first new event in
+        // logarithmic time instead of filtering the full retained history on
+        // every resident-node checkin.
+        let first_new = self.events.partition_point(|event| {
+            #[cfg(test)]
+            EVENTS_AFTER_REVISION_PARTITION_PROBES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            event.revision <= revision
+        });
+        let new_events = &self.events[first_new..];
+        metrics::histogram!("sinomo.kv.commit.incremental_events", "kind" => "retained")
+            .record(self.events.len() as f64);
+        metrics::histogram!("sinomo.kv.commit.incremental_events", "kind" => "selected")
+            .record(new_events.len() as f64);
+        let mut events = Vec::new();
+        try_reserve_kv_items(
+            &mut events,
+            new_events.len(),
+            "collect incremental committed KV events",
+        )?;
+        for event in new_events {
+            events.push(try_clone_kv_event(
+                event,
+                "collect incremental committed KV events",
+            )?);
+        }
+        Ok(events)
+    }
+
+    pub(crate) fn retained_events(&self) -> impl Iterator<Item = &KvEvent> {
+        self.events.iter().map(AsRef::as_ref)
+    }
+
     /// Materializes the complete wire/persistence snapshot.
     ///
     /// This is deliberately an explicit `O(total retained state)` boundary:
@@ -1022,6 +1095,8 @@ impl InProcessKvStore {
     /// this owned representation with a persistent/COW snapshot view before
     /// putting this method on a per-operation path.
     pub fn try_snapshot(&self) -> Result<KvSnapshot, KvError> {
+        #[cfg(test)]
+        record_complete_snapshot_materialization_for_test();
         metrics::histogram!("sinomo.kv.snapshot.materialize.entries")
             .record(self.entries.len() as f64);
         metrics::histogram!("sinomo.kv.snapshot.materialize.events")
@@ -1066,6 +1141,8 @@ impl InProcessKvStore {
     /// and committed-request payload while preserving the existing owned
     /// `KvSnapshot` wire and persistence format.
     pub(crate) fn try_into_snapshot(self) -> Result<KvSnapshot, KvError> {
+        #[cfg(test)]
+        record_complete_snapshot_materialization_for_test();
         let leases = self.try_current_leases_for_snapshot()?;
         let Self {
             revision,
@@ -2655,7 +2732,7 @@ pub(crate) struct ReplicatedKvNode {
 }
 
 impl ReplicatedKvNode {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             store: InProcessKvStore::new(),
             log: Vec::new(),

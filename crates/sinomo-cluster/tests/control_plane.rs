@@ -6346,6 +6346,20 @@ fn committed_raft_config_is_effective_after_stale_local_state_restart() {
     )
     .expect("commit safe overlapping local demotion");
 
+    // Keep an intentionally stale materialized read model while the current
+    // resident Raft node is checked out. Snapshot-based projection would hit
+    // the busy fallback and resurrect the old voter set; the exact local point
+    // read remains available from the resident indexed read view.
+    sinomo_kv::write_cluster_kv_snapshot(&paths.kv_paths(), &seeded)
+        .expect("restore stale materialized config");
+    let mut held_resident = paths.kv_paths().local_raft_command_storage(
+        local.clone(),
+        sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
+    );
+    held_resident
+        .read_index_state()
+        .expect("hold current resident Raft node");
+
     // Simulate restart with the pre-change local projection still on disk.
     write_cluster_state(&paths, &stale_local_state).expect("restore stale local state");
     let effective = read_cluster_consensus_state(&paths).expect("effective consensus state");
@@ -6356,6 +6370,7 @@ fn committed_raft_config_is_effective_after_stale_local_state_restart() {
         sinomo_kv::cluster_kv_raft_quorum_size_for_state(&effective),
         2
     );
+    drop(held_resident);
 }
 
 #[test]

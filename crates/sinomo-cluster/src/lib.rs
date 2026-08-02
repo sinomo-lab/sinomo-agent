@@ -140,8 +140,9 @@ pub use join_registration::{
     send_cluster_join_registration_over_membership_rpc,
 };
 pub use kv_local_store::{
-    ClusterKvPathsExt, kv_err, read_cluster_kv_latest_observed_entry,
-    read_cluster_kv_latest_observed_prefix_entries, read_cluster_kv_latest_observed_snapshot,
+    ClusterKvPathsExt, invalidate_cluster_kv_observed_read_models, kv_err,
+    read_cluster_kv_latest_observed_entry, read_cluster_kv_latest_observed_prefix_entries,
+    read_cluster_kv_latest_observed_snapshot,
     read_cluster_kv_latest_observed_snapshot_arc_if_present, read_cluster_kv_local_snapshot,
 };
 pub use kv_read_model::KvClusterDirectory;
@@ -156,16 +157,23 @@ pub use kv_snapshot::{
     refresh_current_cluster_kv_store_with_outcome,
 };
 pub use kv_snapshot_observer::{
-    ClusterKvCommittedSnapshotSubscription, subscribe_cluster_kv_committed_snapshots,
+    ClusterKvCommittedDeltaSubscription, ClusterKvCommittedSnapshotSubscription,
+    subscribe_cluster_kv_committed_deltas, subscribe_cluster_kv_committed_snapshots,
 };
 pub use kv_txn_quorum::{
     ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumHost,
+    commit_cluster_kv_txn_compact_with_quorum_response_async_with_host,
     commit_cluster_kv_txn_with_quorum_response_async_with_host,
     commit_cluster_kv_txn_with_quorum_response_with_host,
     handle_cluster_kv_authoritative_snapshot_request_async_with_host,
     handle_cluster_kv_txn_request_async_with_host,
+    handle_cluster_kv_txn_request_compact_async_with_host,
+    handle_forwarded_cluster_kv_txn_rpc_request_compact_async_with_host,
+    read_cluster_kv_authoritative_entry_async_with_host,
+    read_cluster_kv_authoritative_range_prefix_async_with_host,
     read_cluster_kv_authoritative_snapshot_async_with_host,
     read_cluster_kv_authoritative_snapshot_with_host,
+    read_cluster_kv_request_outcome_async_with_host,
 };
 pub use local_membership::{
     ClusterLocalDaemonMembershipObservation, ClusterLocalDaemonMembershipRefresh,

@@ -29,6 +29,119 @@ pub fn read_cluster_kv_store_for_node(
     read_cluster_kv_current_snapshot_for_node(paths, node_id).and_then(InProcessKvStore::restore)
 }
 
+enum ClusterKvLocalImmutableSnapshot {
+    Snapshot(KvLocalRead<Arc<KvSnapshot>>),
+    RetryResident,
+}
+
+fn cluster_kv_local_read_metadata_for_revision(
+    wal_paths: &KvWalPaths,
+    node_id: &NodeId,
+    revision: KvRevision,
+) -> (u64, u64, Option<NodeId>) {
+    match resident_raft_local_read_metadata(wal_paths, node_id) {
+        Some((resident_revision, observed_term, applied_index, known_leader))
+            if resident_revision == revision =>
+        {
+            (observed_term, applied_index, known_leader)
+        }
+        _ => (0, 0, None),
+    }
+}
+
+/// Reads or seeds the immutable local Raft-view cache without ever checking a
+/// node into the resident writer slot. The cold loader consumes the restored
+/// store into its snapshot, so seeding does not construct a second full
+/// BTreeMap/event copy alongside the decoded node.
+fn read_cluster_kv_local_immutable_snapshot(
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+    wal_paths: &KvWalPaths,
+) -> Result<ClusterKvLocalImmutableSnapshot, KvError> {
+    for _ in 0..3 {
+        let (_, identity) = raft_view_identity_for_read(wal_paths)?;
+        if let Some(identity) = identity
+            && let Some(snapshot) = cache_lookup_raft_view(wal_paths, node_id, identity)
+        {
+            let (observed_term, applied_index, known_leader) =
+                cluster_kv_local_read_metadata_for_revision(wal_paths, node_id, snapshot.revision);
+            return Ok(ClusterKvLocalImmutableSnapshot::Snapshot(KvLocalRead {
+                revision: snapshot.revision,
+                observed_term,
+                applied_index,
+                known_leader,
+                value: snapshot,
+            }));
+        }
+
+        let loader = match begin_resident_raft_cold_read(wal_paths)? {
+            ResidentRaftColdReadStart::Load(loader) => loader,
+            ResidentRaftColdReadStart::RetryImmutableCache => continue,
+            ResidentRaftColdReadStart::RetryResident => {
+                return Ok(ClusterKvLocalImmutableSnapshot::RetryResident);
+            }
+        };
+        let cache = paths.local_cache();
+        let node = DurableRaftKvNode::try_open_with_materialized_cache(
+            node_id.clone(),
+            wal_paths.clone(),
+            &cache.materialized,
+        )?;
+        let identity = raft_view_identity(wal_paths).ok_or_else(|| KvError::Io {
+            path: wal_paths.root.display().to_string(),
+            detail: "durable Raft identity unavailable after local read replay".to_string(),
+        })?;
+        let revision = node.store().revision();
+        let observed_term = node.hard_state().current_term;
+        let applied_index = node.applied_index();
+        let known_leader = node.hard_state().leader_id.clone();
+        let snapshot = Arc::new(node.try_into_snapshot()?.canonicalized());
+        cache_store_raft_view(wal_paths, node_id.clone(), identity, snapshot.clone());
+        loader.complete(
+            node_id.clone(),
+            identity,
+            revision,
+            observed_term,
+            applied_index,
+            known_leader.clone(),
+        );
+        return Ok(ClusterKvLocalImmutableSnapshot::Snapshot(KvLocalRead {
+            value: snapshot,
+            revision,
+            observed_term,
+            applied_index,
+            known_leader,
+        }));
+    }
+    Err(KvError::Busy {
+        path: wal_paths.root.display().to_string(),
+    })
+}
+
+fn cluster_kv_local_materialized_fallback(
+    paths: &ClusterKvPaths,
+    wal_paths: &KvWalPaths,
+    node_id: &NodeId,
+    busy_error: KvError,
+) -> Result<(Arc<KvSnapshot>, u64, u64, Option<NodeId>), KvError> {
+    let Some(snapshot) = paths.local_cache().cached_snapshot_arc_if_present()? else {
+        return Err(busy_error);
+    };
+    // A materialized snapshot is an observational read model, not an anchored
+    // Raft snapshot. Only attach resident consensus metadata when it describes
+    // this exact revision; otherwise report the conservative unknown values.
+    let (observed_term, applied_index, known_leader) =
+        match resident_raft_local_read_metadata(wal_paths, node_id) {
+            Some((revision, observed_term, applied_index, known_leader))
+                if revision == snapshot.revision =>
+            {
+                (observed_term, applied_index, known_leader)
+            }
+            _ => (0, 0, None),
+        };
+    Ok((snapshot, observed_term, applied_index, known_leader))
+}
+
 /// Reads the best locally available KV view without contacting a quorum.
 ///
 /// The returned metadata is observational only: neither the known leader nor
@@ -39,22 +152,48 @@ pub fn read_cluster_kv_local_snapshot(
 ) -> Result<KvLocalRead<KvSnapshot>, KvError> {
     let started = Instant::now();
     let result = (|| {
-        let node = paths.raft_store().open_node(node_id)?;
-        // Read value and metadata from the same opened Raft view. Reopening via
-        // the materialized-cache helper here can observe a different applied
-        // index (or fall back while this node lock is held).
-        let revision = node.store().revision();
-        let observed_term = node.hard_state().current_term;
-        let applied_index = node.applied_index();
-        let known_leader = node.hard_state().leader_id.clone();
-        let snapshot = node.try_into_snapshot()?;
-        Ok(KvLocalRead {
-            revision,
-            observed_term,
-            applied_index,
-            known_leader,
-            value: snapshot,
-        })
+        let wal_paths = paths.raft_wal_paths(node_id);
+        if let Some(read) = read_resident_raft_local_snapshot(&wal_paths, node_id) {
+            return read;
+        }
+        match read_cluster_kv_local_immutable_snapshot(paths, node_id, &wal_paths) {
+            Ok(ClusterKvLocalImmutableSnapshot::Snapshot(read)) => Ok(KvLocalRead {
+                revision: read.revision,
+                observed_term: read.observed_term,
+                applied_index: read.applied_index,
+                known_leader: read.known_leader,
+                value: (*read.value).clone(),
+            }),
+            Ok(ClusterKvLocalImmutableSnapshot::RetryResident) => {
+                if let Some(read) = read_resident_raft_local_snapshot(&wal_paths, node_id) {
+                    return read;
+                }
+                let error = KvError::Busy {
+                    path: wal_paths.root.display().to_string(),
+                };
+                let (snapshot, observed_term, applied_index, known_leader) =
+                    cluster_kv_local_materialized_fallback(paths, &wal_paths, node_id, error)?;
+                Ok(KvLocalRead {
+                    revision: snapshot.revision,
+                    observed_term,
+                    applied_index,
+                    known_leader,
+                    value: (*snapshot).clone(),
+                })
+            }
+            Err(error @ KvError::Busy { .. }) => {
+                let (snapshot, observed_term, applied_index, known_leader) =
+                    cluster_kv_local_materialized_fallback(paths, &wal_paths, node_id, error)?;
+                Ok(KvLocalRead {
+                    revision: snapshot.revision,
+                    observed_term,
+                    applied_index,
+                    known_leader,
+                    value: (*snapshot).clone(),
+                })
+            }
+            Err(error) => Err(error),
+        }
     })();
     record_kv_read(
         "local",
@@ -71,24 +210,54 @@ pub fn read_cluster_kv_local_entry(
     key: &str,
 ) -> Result<KvLocalRead<Option<KvEntry>>, KvError> {
     let started = Instant::now();
-    let result = (|| {
-        let node = paths.raft_store().open_node(node_id)?;
-        let value = node
-            .store()
-            .get(key)
-            .map(|entry| try_clone_kv_entry(entry, "read local KV entry"))
-            .transpose()?;
-        Ok(KvLocalRead {
-            value,
-            revision: node.store().revision(),
-            observed_term: node.hard_state().current_term,
-            applied_index: node.applied_index(),
-            known_leader: node.hard_state().leader_id.clone(),
-        })
-    })();
+    let wal_paths = paths.raft_wal_paths(node_id);
+    let (source, result) = match read_resident_raft_local_entry(&wal_paths, node_id, key) {
+        Some(result) => ("resident_raft_entry", result),
+        None => (
+            "immutable_or_materialized_entry",
+            (|| match read_cluster_kv_local_immutable_snapshot(paths, node_id, &wal_paths) {
+                Ok(ClusterKvLocalImmutableSnapshot::Snapshot(read)) => Ok(KvLocalRead {
+                    value: read.value.get(key).cloned(),
+                    revision: read.revision,
+                    observed_term: read.observed_term,
+                    applied_index: read.applied_index,
+                    known_leader: read.known_leader,
+                }),
+                Ok(ClusterKvLocalImmutableSnapshot::RetryResident) => {
+                    if let Some(read) = read_resident_raft_local_entry(&wal_paths, node_id, key) {
+                        return read;
+                    }
+                    let error = KvError::Busy {
+                        path: wal_paths.root.display().to_string(),
+                    };
+                    let (snapshot, observed_term, applied_index, known_leader) =
+                        cluster_kv_local_materialized_fallback(paths, &wal_paths, node_id, error)?;
+                    Ok(KvLocalRead {
+                        value: snapshot.get(key).cloned(),
+                        revision: snapshot.revision,
+                        observed_term,
+                        applied_index,
+                        known_leader,
+                    })
+                }
+                Err(error @ KvError::Busy { .. }) => {
+                    let (snapshot, observed_term, applied_index, known_leader) =
+                        cluster_kv_local_materialized_fallback(paths, &wal_paths, node_id, error)?;
+                    Ok(KvLocalRead {
+                        value: snapshot.get(key).cloned(),
+                        revision: snapshot.revision,
+                        observed_term,
+                        applied_index,
+                        known_leader,
+                    })
+                }
+                Err(error) => Err(error),
+            })(),
+        ),
+    };
     record_kv_read(
         "local",
-        "durable_raft_entry",
+        source,
         if result.is_ok() { "ok" } else { "error" },
         started,
     );
@@ -101,20 +270,120 @@ pub fn read_cluster_kv_local_prefix(
     prefix: &str,
 ) -> Result<KvLocalRead<Vec<KvEntry>>, KvError> {
     let started = Instant::now();
-    let result = (|| {
-        let node = paths.raft_store().open_node(node_id)?;
-        let value = node.store().range_prefix(prefix)?;
-        Ok(KvLocalRead {
-            value,
-            revision: node.store().revision(),
-            observed_term: node.hard_state().current_term,
-            applied_index: node.applied_index(),
-            known_leader: node.hard_state().leader_id.clone(),
-        })
-    })();
+    let wal_paths = paths.raft_wal_paths(node_id);
+    let (source, result) = match read_resident_raft_local_prefix(&wal_paths, node_id, prefix) {
+        Some(result) => ("resident_raft_prefix", result),
+        None => (
+            "immutable_or_materialized_prefix",
+            (|| match read_cluster_kv_local_immutable_snapshot(paths, node_id, &wal_paths) {
+                Ok(ClusterKvLocalImmutableSnapshot::Snapshot(read)) => Ok(KvLocalRead {
+                    value: read.value.try_range_prefix(prefix)?,
+                    revision: read.revision,
+                    observed_term: read.observed_term,
+                    applied_index: read.applied_index,
+                    known_leader: read.known_leader,
+                }),
+                Ok(ClusterKvLocalImmutableSnapshot::RetryResident) => {
+                    if let Some(read) = read_resident_raft_local_prefix(&wal_paths, node_id, prefix)
+                    {
+                        return read;
+                    }
+                    let error = KvError::Busy {
+                        path: wal_paths.root.display().to_string(),
+                    };
+                    let (snapshot, observed_term, applied_index, known_leader) =
+                        cluster_kv_local_materialized_fallback(paths, &wal_paths, node_id, error)?;
+                    Ok(KvLocalRead {
+                        value: snapshot.try_range_prefix(prefix)?,
+                        revision: snapshot.revision,
+                        observed_term,
+                        applied_index,
+                        known_leader,
+                    })
+                }
+                Err(error @ KvError::Busy { .. }) => {
+                    let (snapshot, observed_term, applied_index, known_leader) =
+                        cluster_kv_local_materialized_fallback(paths, &wal_paths, node_id, error)?;
+                    Ok(KvLocalRead {
+                        value: snapshot.try_range_prefix(prefix)?,
+                        revision: snapshot.revision,
+                        observed_term,
+                        applied_index,
+                        known_leader,
+                    })
+                }
+                Err(error) => Err(error),
+            })(),
+        ),
+    };
     record_kv_read(
         "local",
-        "durable_raft_prefix",
+        source,
+        if result.is_ok() { "ok" } else { "error" },
+        started,
+    );
+    result
+}
+
+pub fn read_cluster_kv_local_event_history(
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+) -> Result<KvLocalRead<ClusterKvEventReadView>, KvError> {
+    let started = Instant::now();
+    let wal_paths = paths.raft_wal_paths(node_id);
+    let result = match read_resident_raft_local_event_history(&wal_paths, node_id) {
+        Some(result) => result,
+        None => match read_cluster_kv_local_immutable_snapshot(paths, node_id, &wal_paths) {
+            Ok(ClusterKvLocalImmutableSnapshot::Snapshot(read)) => Ok(KvLocalRead {
+                value: ClusterKvEventReadView {
+                    compacted_revision: read.value.compacted_revision,
+                    events: read.value.events.clone(),
+                },
+                revision: read.revision,
+                observed_term: read.observed_term,
+                applied_index: read.applied_index,
+                known_leader: read.known_leader,
+            }),
+            Ok(ClusterKvLocalImmutableSnapshot::RetryResident) => {
+                if let Some(read) = read_resident_raft_local_event_history(&wal_paths, node_id) {
+                    return read;
+                }
+                let error = KvError::Busy {
+                    path: wal_paths.root.display().to_string(),
+                };
+                let (snapshot, observed_term, applied_index, known_leader) =
+                    cluster_kv_local_materialized_fallback(paths, &wal_paths, node_id, error)?;
+                Ok(KvLocalRead {
+                    value: ClusterKvEventReadView {
+                        compacted_revision: snapshot.compacted_revision,
+                        events: snapshot.events.clone(),
+                    },
+                    revision: snapshot.revision,
+                    observed_term,
+                    applied_index,
+                    known_leader,
+                })
+            }
+            Err(error @ KvError::Busy { .. }) => {
+                let (snapshot, observed_term, applied_index, known_leader) =
+                    cluster_kv_local_materialized_fallback(paths, &wal_paths, node_id, error)?;
+                Ok(KvLocalRead {
+                    value: ClusterKvEventReadView {
+                        compacted_revision: snapshot.compacted_revision,
+                        events: snapshot.events.clone(),
+                    },
+                    revision: snapshot.revision,
+                    observed_term,
+                    applied_index,
+                    known_leader,
+                })
+            }
+            Err(error) => Err(error),
+        },
+    };
+    record_kv_read(
+        "local",
+        "raft_event_history",
         if result.is_ok() { "ok" } else { "error" },
         started,
     );
@@ -697,34 +966,45 @@ impl KvMaterializedCache {
             }
         };
         if has_durable_state {
+            if let Some(read) = read_resident_raft_local_snapshot(&paths, &node_id) {
+                let snapshot = read?.value.canonicalized();
+                if refresh_materialized {
+                    self.write_raft_snapshot_if_changed(&snapshot)?;
+                }
+                record_kv_read("local", "resident_raft", "ok", started);
+                return Ok(Arc::new(snapshot));
+            }
             if let Some(identity) = identity
-                && let Some(snapshot) = cache_lookup_raft_view(&paths, identity)
+                && let Some(snapshot) = cache_lookup_raft_view(&paths, &node_id, identity)
             {
                 record_kv_read("local", "raft_view_cache", "ok", started);
                 return Ok(snapshot);
             }
-            let node =
-                match DurableRaftKvNode::try_open_with_materialized_cache(node_id, paths, self) {
-                    Ok(node) => node,
-                    Err(error @ KvError::Busy { .. }) => {
-                        let fallback = match self.read_snapshot_arc_if_present() {
-                            Ok(Some(snapshot)) => Ok(snapshot),
-                            Ok(None) => Err(error),
-                            Err(error) => Err(error),
-                        };
-                        record_kv_read(
-                            "local",
-                            "materialized_busy_fallback",
-                            if fallback.is_ok() { "ok" } else { "error" },
-                            started,
-                        );
-                        return fallback;
-                    }
-                    Err(error) => {
-                        record_kv_read("local", "durable_raft_open", "error", started);
-                        return Err(error);
-                    }
-                };
+            let node = match DurableRaftKvNode::try_open_with_materialized_cache(
+                node_id.clone(),
+                paths,
+                self,
+            ) {
+                Ok(node) => node,
+                Err(error @ KvError::Busy { .. }) => {
+                    let fallback = match self.read_snapshot_arc_if_present() {
+                        Ok(Some(snapshot)) => Ok(snapshot),
+                        Ok(None) => Err(error),
+                        Err(error) => Err(error),
+                    };
+                    record_kv_read(
+                        "local",
+                        "materialized_busy_fallback",
+                        if fallback.is_ok() { "ok" } else { "error" },
+                        started,
+                    );
+                    return fallback;
+                }
+                Err(error) => {
+                    record_kv_read("local", "durable_raft_open", "error", started);
+                    return Err(error);
+                }
+            };
             let raft_paths = node.paths.clone();
             let snapshot = match node.try_into_snapshot() {
                 Ok(snapshot) => snapshot.canonicalized(),
@@ -741,7 +1021,7 @@ impl KvMaterializedCache {
             }
             let snapshot = Arc::new(snapshot);
             if let Some(identity) = raft_view_identity(&raft_paths) {
-                cache_store_raft_view(&raft_paths, identity, snapshot.clone());
+                cache_store_raft_view(&raft_paths, node_id.clone(), identity, snapshot.clone());
             }
             record_kv_read("local", "durable_raft_open", "ok", started);
             return Ok(snapshot);
@@ -884,9 +1164,9 @@ impl KvMaterializedCache {
         // local Raft publication: the WAL and anchored Raft snapshots retain exact
         // revision/request identity. Imported snapshots use the strict comparator
         // above because their committed-log generation arbitrates equal revisions.
-        if existing.is_some_and(|existing| {
-            kv_snapshot_materialized_read_state_eq(existing, snapshot)
-        }) {
+        if existing
+            .is_some_and(|existing| kv_snapshot_materialized_read_state_eq(existing, snapshot))
+        {
             return Ok(false);
         }
         let desired = self.materialized(snapshot);
@@ -1034,9 +1314,13 @@ impl KvLocalCache {
     }
 
     pub fn current_get(&self, node_id: NodeId, key: &str) -> Result<Option<KvEntry>, KvError> {
+        let wal_paths = self.raft_wal_paths(&node_id);
+        if let Some(read) = read_resident_raft_local_entry(&wal_paths, &node_id, key) {
+            return read.map(|read| read.value);
+        }
         let snapshot = self
             .materialized
-            .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))?;
+            .read_snapshot_with_raft_view(node_id, wal_paths)?;
         Ok(snapshot.get(key).cloned())
     }
 
@@ -1045,10 +1329,9 @@ impl KvLocalCache {
         node_id: NodeId,
         key: &str,
     ) -> Result<Option<T>, KvError> {
-        let snapshot = self
-            .materialized
-            .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))?;
-        snapshot.get(key).map(|entry| entry.decode()).transpose()
+        self.current_get(node_id, key)?
+            .map(|entry| entry.decode())
+            .transpose()
     }
 
     pub fn current_range_prefix(
@@ -1056,9 +1339,13 @@ impl KvLocalCache {
         node_id: NodeId,
         prefix: &str,
     ) -> Result<Vec<KvEntry>, KvError> {
+        let wal_paths = self.raft_wal_paths(&node_id);
+        if let Some(read) = read_resident_raft_local_prefix(&wal_paths, &node_id, prefix) {
+            return read.map(|read| read.value);
+        }
         let snapshot = self
             .materialized
-            .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))?;
+            .read_snapshot_with_raft_view(node_id, wal_paths)?;
         snapshot.try_range_prefix(prefix)
     }
 
@@ -1068,9 +1355,19 @@ impl KvLocalCache {
         prefix: &str,
         max_entries: usize,
     ) -> Result<Vec<KvEntry>, KvError> {
+        let wal_paths = self.raft_wal_paths(&node_id);
+        if let Some(read) = read_resident_raft_local_prefix_limited_by_payload_bytes(
+            &wal_paths,
+            &node_id,
+            prefix,
+            max_entries,
+            usize::MAX,
+        ) {
+            return read.map(|read| read.value);
+        }
         let snapshot = self
             .materialized
-            .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))?;
+            .read_snapshot_with_raft_view(node_id, wal_paths)?;
         snapshot.range_prefix_limited(prefix, max_entries)
     }
 
@@ -1081,9 +1378,19 @@ impl KvLocalCache {
         max_entries: usize,
         max_payload_bytes: usize,
     ) -> Result<Vec<KvEntry>, KvError> {
+        let wal_paths = self.raft_wal_paths(&node_id);
+        if let Some(read) = read_resident_raft_local_prefix_limited_by_payload_bytes(
+            &wal_paths,
+            &node_id,
+            prefix,
+            max_entries,
+            max_payload_bytes,
+        ) {
+            return read.map(|read| read.value);
+        }
         let snapshot = self
             .materialized
-            .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))?;
+            .read_snapshot_with_raft_view(node_id, wal_paths)?;
         snapshot.range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)
     }
 
@@ -1092,11 +1399,9 @@ impl KvLocalCache {
         node_id: NodeId,
         prefix: &str,
     ) -> Result<Vec<T>, KvError> {
-        let snapshot = self
-            .materialized
-            .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))?;
+        let entries = self.current_range_prefix(node_id, prefix)?;
         let mut values = Vec::new();
-        for entry in snapshot.prefix_entries(prefix) {
+        for entry in entries {
             try_reserve_kv_items(&mut values, 1, "decode snapshot prefix range")?;
             values.push(entry.decode()?);
         }
@@ -1110,10 +1415,18 @@ impl KvLocalCache {
         max_entries: usize,
         max_payload_bytes: usize,
     ) -> Result<Vec<T>, KvError> {
-        let snapshot = self
-            .materialized
-            .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))?;
-        snapshot.range_prefix_serde_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)
+        let entries = self.current_range_prefix_limited_by_payload_bytes(
+            node_id,
+            prefix,
+            max_entries,
+            max_payload_bytes,
+        )?;
+        let mut values = Vec::new();
+        for entry in entries {
+            try_reserve_kv_items(&mut values, 1, "decode snapshot prefix range")?;
+            values.push(entry.decode()?);
+        }
+        Ok(values)
     }
 
     pub fn current_snapshot(&self, node_id: NodeId) -> Result<KvSnapshot, KvError> {
@@ -1222,12 +1535,17 @@ impl KvLocalCache {
         snapshot: KvSnapshot,
     ) -> Result<bool, KvError> {
         let wal_paths = self.raft_wal_paths(&node_id);
-        let node = DurableRaftKvNode::open_with_materialized_cache(
-            node_id.clone(),
-            wal_paths,
-            &self.materialized,
-        )?;
-        let local_snapshot = node.store().try_snapshot()?;
+        let local_snapshot = match read_resident_raft_local_snapshot(&wal_paths, &node_id) {
+            Some(read) => read?.value,
+            None => {
+                let node = DurableRaftKvNode::open_with_materialized_cache(
+                    node_id.clone(),
+                    wal_paths,
+                    &self.materialized,
+                )?;
+                node.store().try_snapshot()?
+            }
+        };
         if kv_snapshot_materialized_generation(&snapshot)
             <= kv_snapshot_materialized_generation(&local_snapshot)
         {

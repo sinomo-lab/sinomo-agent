@@ -381,6 +381,18 @@ impl ClusterKvPaths {
             .map(|(outcome, wrote)| (outcome.response, wrote))
     }
 
+    pub fn apply_raft_append_compact_with_publish_report(
+        &self,
+        node_id: &NodeId,
+        snapshot: Option<RaftSnapshot>,
+        append: RaftAppendEntriesRequest,
+    ) -> Result<(RaftAppendEntriesCompactApplyOutcome, bool), KvError> {
+        self.raft_store()
+            .apply_append_entries_with_optional_snapshot_compact_and_publish(
+                node_id, snapshot, append,
+            )
+    }
+
     pub fn apply_raft_vote_response(
         &self,
         state: &ClusterBootstrapState,
@@ -452,12 +464,24 @@ impl ClusterKvPaths {
             .locked_set_leader_and_write_snapshot_if_changed(node_id, term)
     }
 
+    pub fn locked_set_raft_leader_compact(
+        &self,
+        node_id: &NodeId,
+        term: u64,
+    ) -> Result<(), KvError> {
+        self.raft_store().locked_set_leader_compact(node_id, term)
+    }
+
     pub fn clear_raft_leader_and_write_snapshot_if_changed(
         &self,
         node_id: &NodeId,
     ) -> Result<KvSnapshot, KvError> {
         self.raft_store()
             .clear_leader_and_write_snapshot_if_changed(node_id)
+    }
+
+    pub fn locked_clear_raft_leader_compact(&self, node_id: &NodeId) -> Result<(), KvError> {
+        self.raft_store().locked_clear_leader_compact(node_id)
     }
 
     pub fn locked_discard_raft_uncommitted_tail(&self, node_id: &NodeId) -> Result<bool, KvError> {
@@ -472,6 +496,14 @@ impl ClusterKvPaths {
     ) -> Result<bool, KvError> {
         self.raft_store()
             .locked_observe_term_and_write_snapshot_if_changed(node_id, term)
+    }
+
+    pub fn locked_observe_raft_term_compact(
+        &self,
+        node_id: &NodeId,
+        term: u64,
+    ) -> Result<bool, KvError> {
+        self.raft_store().locked_observe_term_compact(node_id, term)
     }
 
     pub fn locked_local_raft_vote_metadata(

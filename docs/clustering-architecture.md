@@ -166,6 +166,17 @@ compare-and-swap behavior, watches resume from revisions, and snapshots bound
 recovery cost. The KV state machine owns these semantics; the cluster layer only
 drives replication and exposes authorized service operations.
 
+The main daemon keeps its decoded Raft node and indexed KV state resident while
+it owns the node-local writer lock. Snapshot/WAL restore is therefore a startup
+or recovery cost, not a point-read or per-command cost. A read-only process may
+seed an identity-validated immutable view from one cold restore, but it never
+retains the writer lock. Commits return their bounded event/final-key delta;
+full Raft snapshots are created only at the log/event compaction threshold or
+when a compatibility/export caller explicitly requests one. The shared
+main/shadow projection remains synchronous for Critical and unclassified
+keyspaces; Operational and Telemetry projections converge from committed
+deltas and periodic checkpoints.
+
 Public reads use one of two explicit consistency contracts:
 
 - A **local** read returns the best materialized or applied view available on
@@ -175,6 +186,19 @@ Public reads use one of two explicit consistency contracts:
   returns a view at or after that barrier together with its revision, term, and
   committed log index. It fails rather than degrading to a local read when the
   barrier cannot be established.
+
+For a leader with an entry committed in its current term, point and bounded
+prefix reads use a ReadIndex-style empty AppendEntries quorum confirmation and
+then project from the resident index. This does not append a log entry. The
+first read after election commits one compact barrier, then performs its final
+indexed read under the same term, leader, and exact configuration fence. A
+non-leader forwards the bounded range operation itself; it does not fetch a
+whole authoritative snapshot to answer a point or prefix request. APIs whose
+declared result is a complete snapshot still materialize that snapshot.
+Concurrent reads may share one confirmation only when their root, leader,
+term, commit position, exact configuration entry, and voter set are identical.
+Each caller retains its own deadline and independently revalidates that fence
+against the resident applied state before returning data.
 
 Leader preference is a routing optimization, not a third consistency level. A
 reachable leader without current quorum evidence does not prove freshness.
@@ -197,10 +221,11 @@ it still requires a quorum barrier unless an exact committed-request record can
 replay its response. After an uncertain timeout, callers query the request ID
 instead of guessing whether a blind retry is safe. The request-outcome route
 establishes a fresh current-term quorum barrier first and returns its authority
-proof with the outcome. Committed history comes from that authoritative
-snapshot; node-local rejected, unknown, or expired attempt state is considered
-only after the snapshot rules out a commit. Without authority, the query fails
-closed.
+proof with the outcome. The authority reads only its resident committed-request
+and expiry indexes; followers forward that bounded lookup rather than fetching
+the complete KV snapshot. Node-local rejected, unknown, or expired attempt
+state is considered only after the authoritative lookup rules out a commit.
+Without authority, the query fails closed.
 
 The config service exposes this identity at its outer write boundary:
 `ConfigSetRequest.request_id` is preserved into the cluster KV transaction, and

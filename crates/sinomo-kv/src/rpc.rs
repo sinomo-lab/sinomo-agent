@@ -63,13 +63,7 @@ pub fn decode_cluster_kv_txn_rpc_request_body(body: &[u8]) -> Result<KvTxnReques
 pub fn cluster_kv_txn_response_rpc_payload(
     response: &ClusterKvTxnCommitResult,
 ) -> Result<ClusterKvRpcPayload, KvError> {
-    let response = ClusterKvTxnRpcResponse {
-        request_id: response.request_id.clone(),
-        command_digest: response.command_digest,
-        txn_response: response.txn_response.clone(),
-        authority: response.authority.clone(),
-        replayed_committed_request: response.replayed_committed_request,
-    };
+    let response = ClusterKvTxnRpcResponse::from(response);
     Ok(ClusterKvRpcPayload {
         route: CLUSTER_KV_TXN_ROUTE,
         category: CLUSTER_KV_RPC_CATEGORY,
@@ -87,12 +81,44 @@ pub fn cluster_kv_txn_response_rpc_payload(
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterKvTxnRpcResponse {
     pub request_id: KvRequestId,
+    /// Digest of the caller's transaction before the receiving voter adds
+    /// authenticated membership/capability fence compares. `None` is accepted
+    /// only for responses from a pre-field peer during a mixed-version
+    /// rollout; current peers always emit `Some` and validators bind it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_command_digest: Option<KvCommandDigest>,
     /// Digest of the command that actually entered the replicated log. This
     /// can include authority-fence compares added by the authenticated leader.
     pub command_digest: KvCommandDigest,
     pub txn_response: Option<KvTxnResponse>,
     pub authority: KvAuthorityProof,
     pub replayed_committed_request: bool,
+}
+
+impl From<&ClusterKvTxnCommitResult> for ClusterKvTxnRpcResponse {
+    fn from(response: &ClusterKvTxnCommitResult) -> Self {
+        Self {
+            request_id: response.request_id.clone(),
+            submitted_command_digest: Some(response.command_digest),
+            command_digest: response.command_digest,
+            txn_response: response.txn_response.clone(),
+            authority: response.authority.clone(),
+            replayed_committed_request: response.replayed_committed_request,
+        }
+    }
+}
+
+impl From<ClusterKvTxnCommitResult> for ClusterKvTxnRpcResponse {
+    fn from(response: ClusterKvTxnCommitResult) -> Self {
+        Self {
+            request_id: response.request_id,
+            submitted_command_digest: Some(response.command_digest),
+            command_digest: response.command_digest,
+            txn_response: response.txn_response,
+            authority: response.authority,
+            replayed_committed_request: response.replayed_committed_request,
+        }
+    }
 }
 
 pub fn decode_cluster_kv_txn_rpc_body(body: &[u8]) -> Result<ClusterKvTxnRpcResponse, KvError> {

@@ -5,7 +5,9 @@ use crate::control_plane_options::ClusterRaftAppendReplicationOptions;
 use crate::kv_local_store::ClusterKvPathsExt;
 use crate::kv_local_store::LocalClusterRaftCommandStorage;
 use crate::kv_local_store::kv_err;
-use crate::local_state_store::project_committed_cluster_raft_config;
+use crate::local_state_store::{
+    project_cluster_raft_config_record, project_committed_cluster_raft_config,
+};
 use crate::member_store::merge_cluster_state_from_peer;
 use crate::prelude::*;
 #[allow(unused_imports)]
@@ -20,17 +22,233 @@ use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 use sinomo_network::{ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 type SharedLocalClusterRaftCommandStorage = Arc<Mutex<LocalClusterRaftCommandStorage>>;
 
-pub type ClusterRaftQuorumBatch = Vec<(NodeId, ClusterRaftAppendRequest, Duration)>;
+/// Per-target delivery metadata around an immutable append payload. Voters at
+/// the same progress index share the payload allocation while transports keep
+/// independent targets, deadlines, and outcomes.
+pub type ClusterRaftQuorumBatch = Vec<(NodeId, Arc<ClusterRaftAppendRequest>, Duration)>;
 pub type ClusterRaftQuorumBatchOutcomes = Vec<(
     NodeId,
-    ClusterRaftAppendRequest,
+    Arc<ClusterRaftAppendRequest>,
     Result<ClusterRaftAppendResponse, NetworkError>,
 )>;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ClusterRaftAppendRequestBuildKey {
+    Snapshot,
+    Tail(u64),
+}
+
+#[cfg(test)]
+mod post_commit_observation_tests {
+    use super::*;
+    use sinomo_kv::{ClusterKvRaftConfigRecord, KvCommand, KvOp, encode_kv_value};
+    use std::sync::{Condvar, mpsc};
+    use time::OffsetDateTime;
+
+    struct NoopRaftTransport;
+
+    impl ClusterRaftQuorumAsyncHost for NoopRaftTransport {
+        fn send_raft_append_to_node_async<'a>(
+            &'a mut self,
+            _paths: &'a ClusterPaths,
+            _state: &'a ClusterBootstrapState,
+            _target_node_id: &'a NodeId,
+            _request: &'a ClusterRaftAppendRequest,
+            _timeout: Duration,
+        ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse> {
+            Box::pin(async {
+                Err(NetworkError::Io {
+                    operation: "unexpected post-commit test Raft send".to_string(),
+                    detail: "single-voter test must not use network transport".to_string(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_delta_observer_runs_after_sequence_and_storage_locks_release() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-post-commit-observer-locks");
+        let data_dir = sinomo_local::SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let local = NodeId::from_legacy_named("node_post_commit_observer").expect("local node");
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_post_commit_observer").expect("cluster id");
+        let now = OffsetDateTime::now_utc();
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "post commit observer",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        state.term = 7;
+        let daemon_capability =
+            sinomo_base::CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY)
+                .expect("daemon capability");
+        state.members[0].capabilities = vec![daemon_capability.clone()];
+        state.members[0].allowed_capabilities = vec![daemon_capability];
+        let config = ClusterKvRaftConfigRecord {
+            cluster_id,
+            term: 7,
+            kv_revision: 1,
+            voters: vec![local.clone()],
+            learners: Vec::new(),
+            non_voting: Vec::new(),
+            updated_at: now,
+        };
+        let kv_paths = paths.kv_paths();
+        let mut node = kv_paths.raft_store().open_node(&local).expect("open node");
+        node.become_leader(7).expect("become initial leader");
+        node.append_local_command(
+            7,
+            KvCommand::Op(KvOp::Put {
+                key: sinomo_kv::cluster_kv_raft_config_key(),
+                value: encode_kv_value(&config).expect("encode config"),
+                lease_id: None,
+            }),
+        )
+        .expect("append config");
+        let value_entry = node
+            .append_local_command(
+                7,
+                KvCommand::Op(KvOp::Put {
+                    key: "/post-commit/fixture".to_string(),
+                    value: b"ready".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append fixture value");
+        node.commit_to(value_entry.index).expect("commit fixture");
+        state.kv_revision = node.store().revision().0;
+        drop(node);
+        crate::raft_election::locked_set_cluster_raft_leader(&paths, &local, 7)
+            .expect("publish resident local leadership");
+
+        let storage = Arc::new(Mutex::new(LocalClusterRaftCommandStorage::new(
+            &paths,
+            local.clone(),
+        )));
+        let observer_storage = Arc::clone(&storage);
+        let observer_kv_paths = paths.kv_paths();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let observer_release = Arc::clone(&release);
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let _subscription =
+            crate::kv_snapshot_observer::subscribe_cluster_kv_committed_deltas(&paths, move |_| {
+                let storage_guard = observer_storage
+                    .try_lock()
+                    .expect("post-commit observer must not run under the storage mutex");
+                drop(storage_guard);
+                let sequence_guard = sinomo_kv::lock_cluster_kv_commit_sequence(
+                    &observer_kv_paths,
+                    Duration::from_millis(100),
+                )
+                .expect("post-commit observer must not run under the proposal sequence lock");
+                drop(sequence_guard);
+                entered_tx.send(()).expect("report observer entry");
+                let (released, wake) = &*observer_release;
+                let mut released = released.lock().expect("observer release lock");
+                while !*released {
+                    released = wake.wait(released).expect("observer release wait");
+                }
+            });
+
+        let request = KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+            key: "/cluster/members/post-commit-observer".to_string(),
+            value: b"member".to_vec(),
+            lease_id: None,
+        }));
+        let trace = ClusterKvQuorumCommitTrace::new(
+            request.request_id.clone(),
+            local,
+            state.term,
+            state.kv_revision,
+        );
+        let runtime = tokio::runtime::Handle::current();
+        let mut transport = NoopRaftTransport;
+        let mut host = NetworkClusterKvRaftQuorumCommitAsyncHost {
+            runtime: &runtime,
+            paths: &paths,
+            storage,
+            append_options: ClusterControlPlaneTimeouts::default_daemon_transport()
+                .raft_append_replication_options(Duration::from_secs(1)),
+            trace,
+            initial_term: state.term,
+            initial_revision: state.kv_revision,
+            host: &mut transport,
+        };
+        let commit = sinomo_kv::commit_cluster_kv_raft_command_compact_with_quorum_async(
+            &mut state,
+            request,
+            ClusterKvRaftQuorumCommitOptions {
+                timeout: Duration::from_secs(1),
+            },
+            &mut host,
+        );
+        let release_observer = async move {
+            tokio::task::spawn_blocking(move || {
+                let entered = entered_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+                let (released, wake) = &*release;
+                *released.lock().expect("observer release lock") = true;
+                wake.notify_all();
+                entered
+            })
+            .await
+            .expect("release observer task")
+        };
+        let (result, observer_entered) = tokio::join!(commit, release_observer);
+        result.expect("commit completes after observer release");
+        assert!(observer_entered, "blocking observer must be invoked");
+    }
+}
+
+fn build_deduplicated_append_request_wave<T, E>(
+    requests: &[(ClusterRaftAppendRequestBuildKey, u64)],
+    mut build: impl FnMut(u64) -> Result<T, E>,
+) -> Result<Vec<Arc<T>>, E> {
+    let mut requests_by_key: BTreeMap<ClusterRaftAppendRequestBuildKey, Arc<T>> = BTreeMap::new();
+    let mut built_requests = Vec::new();
+    for (key, next_index) in requests.iter().copied() {
+        match requests_by_key.entry(key) {
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                built_requests.push(Arc::clone(entry.get()));
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let request = Arc::new(build(next_index)?);
+                entry.insert(Arc::clone(&request));
+                built_requests.push(request);
+            }
+        }
+    }
+    Ok(built_requests)
+}
+
+fn remaining_raft_quorum_budget(deadline: Instant, phase: &str) -> Result<Duration, NetworkError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!("cluster Raft quorum replication timed out during {phase}"),
+        });
+    }
+    Ok(remaining)
+}
+
+fn raft_quorum_phase_timeout(phase: &str) -> NetworkError {
+    NetworkError::ClusterReadOnly {
+        detail: format!("cluster Raft quorum replication timed out during {phase}"),
+    }
+}
 
 fn cluster_kv_replication_status_label(
     status: sinomo_kv::ClusterKvRaftTargetReplicationStatus,
@@ -744,6 +962,16 @@ impl<S, R, F, O> sinomo_kv::ClusterKvRaftCommandStorage
         )
     }
 
+    fn replay_cluster_raft_request_record_if_committed(
+        &mut self,
+        request: &KvCommandRequest,
+    ) -> Result<Option<sinomo_kv::KvCommittedRequestRecord>, NetworkError> {
+        sinomo_kv::ClusterKvRaftCommandStorage::replay_cluster_raft_request_record_if_committed(
+            &mut self.storage,
+            request,
+        )
+    }
+
     fn append_cluster_raft_request_uncommitted(
         &mut self,
         request: KvCommandRequest,
@@ -806,6 +1034,30 @@ impl<S, R, F, O> sinomo_kv::ClusterKvRaftCommandStorage
             &mut self.storage,
             index,
         )
+    }
+
+    fn commit_cluster_raft_index_compact(
+        &mut self,
+        index: u64,
+    ) -> Result<sinomo_kv::ClusterKvRaftCompactCommitResult, NetworkError> {
+        sinomo_kv::ClusterKvRaftCommandStorage::commit_cluster_raft_index_compact(
+            &mut self.storage,
+            index,
+        )
+    }
+
+    fn release_cluster_raft_command_session_after_commit(&mut self) {
+        self.storage.release_session_after_commit();
+    }
+
+    fn publish_cluster_raft_post_commit_observations(
+        &mut self,
+        commit: Option<&sinomo_kv::ClusterKvRaftCompactCommitResult>,
+    ) -> Result<(), NetworkError> {
+        self.storage
+            .take_post_commit_observations(commit)?
+            .publish();
+        Ok(())
     }
 }
 
@@ -1028,6 +1280,13 @@ impl<T> sinomo_kv::ClusterKvRaftCommandStorage for DriverRaftQuorumCommitHost<'_
         )
     }
 
+    fn replay_cluster_raft_request_record_if_committed(
+        &mut self,
+        request: &KvCommandRequest,
+    ) -> Result<Option<sinomo_kv::KvCommittedRequestRecord>, NetworkError> {
+        self.storage.replay_record_if_committed(request)
+    }
+
     fn append_cluster_raft_request_uncommitted(
         &mut self,
         request: KvCommandRequest,
@@ -1131,6 +1390,27 @@ impl<T> sinomo_kv::ClusterKvRaftCommandStorage for DriverRaftQuorumCommitHost<'_
             &mut self.storage,
             index,
         )
+    }
+
+    fn commit_cluster_raft_index_compact(
+        &mut self,
+        index: u64,
+    ) -> Result<sinomo_kv::ClusterKvRaftCompactCommitResult, NetworkError> {
+        self.storage.commit_index_compact(index)
+    }
+
+    fn release_cluster_raft_command_session_after_commit(&mut self) {
+        self.storage.release_session_after_commit();
+    }
+
+    fn publish_cluster_raft_post_commit_observations(
+        &mut self,
+        commit: Option<&sinomo_kv::ClusterKvRaftCompactCommitResult>,
+    ) -> Result<(), NetworkError> {
+        self.storage
+            .take_post_commit_observations(commit)?
+            .publish();
+        Ok(())
     }
 }
 
@@ -1358,6 +1638,14 @@ where
         self.host.replay_cluster_raft_request_if_committed(request)
     }
 
+    fn replay_cluster_raft_request_record_if_committed(
+        &mut self,
+        request: &KvCommandRequest,
+    ) -> Result<Option<sinomo_kv::KvCommittedRequestRecord>, NetworkError> {
+        self.host
+            .replay_cluster_raft_request_record_if_committed(request)
+    }
+
     fn append_cluster_raft_request_uncommitted(
         &mut self,
         request: KvCommandRequest,
@@ -1427,6 +1715,48 @@ where
             ),
         }
         result
+    }
+
+    fn commit_cluster_raft_index_compact(
+        &mut self,
+        index: u64,
+    ) -> Result<sinomo_kv::ClusterKvRaftCompactCommitResult, NetworkError> {
+        let started = Instant::now();
+        let result = self.host.commit_cluster_raft_index_compact(index);
+        match &result {
+            Ok(commit) => self.commit_sequence_trace.trace.record(
+                "apply",
+                started.elapsed(),
+                commit.committed_request.term,
+                index,
+                commit.committed_request.revision.0,
+                "applied",
+                format_args!("committed the local Raft entry and published its compact delta"),
+            ),
+            Err(error) => self.commit_sequence_trace.trace.record(
+                "apply",
+                started.elapsed(),
+                self.commit_sequence_trace.term,
+                index,
+                self.commit_sequence_trace.revision,
+                "error",
+                format_args!("{error}"),
+            ),
+        }
+        result
+    }
+
+    fn release_cluster_raft_command_session_after_commit(&mut self) {
+        self.host
+            .release_cluster_raft_command_session_after_commit();
+    }
+
+    fn publish_cluster_raft_post_commit_observations(
+        &mut self,
+        commit: Option<&sinomo_kv::ClusterKvRaftCompactCommitResult>,
+    ) -> Result<(), NetworkError> {
+        self.host
+            .publish_cluster_raft_post_commit_observations(commit)
     }
 }
 
@@ -1866,6 +2196,36 @@ where
         })
     }
 
+    fn replay_cluster_raft_request_record_if_committed_async<'a>(
+        &'a mut self,
+        request: &'a KvCommandRequest,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<
+        'a,
+        Option<sinomo_kv::KvCommittedRequestRecord>,
+        NetworkError,
+    > {
+        let runtime = self.runtime;
+        let storage = Arc::clone(&self.storage);
+        let request = request.clone();
+        Box::pin(async move {
+            runtime
+                .spawn_blocking(move || {
+                    lock_local_cluster_raft_command_storage(
+                        &storage,
+                        "replay committed cluster Raft request record",
+                    )?
+                    .replay_record_if_committed(&request)
+                })
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "cluster raft replay committed request record".to_string(),
+                    detail: format!(
+                        "cluster raft replay committed request record task failed: {source}"
+                    ),
+                })?
+        })
+    }
+
     fn append_cluster_raft_request_uncommitted_async<'a>(
         &'a mut self,
         request: KvCommandRequest,
@@ -2082,6 +2442,116 @@ where
         })
     }
 
+    fn commit_cluster_raft_index_compact_async<'a>(
+        &'a mut self,
+        index: u64,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<
+        'a,
+        sinomo_kv::ClusterKvRaftCompactCommitResult,
+        NetworkError,
+    > {
+        let runtime = self.runtime;
+        let storage = Arc::clone(&self.storage);
+        let trace = self.trace.clone();
+        let initial_term = self.initial_term;
+        let initial_revision = self.initial_revision;
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = runtime
+                .spawn_blocking(move || {
+                    lock_local_cluster_raft_command_storage(
+                        &storage,
+                        "compact-commit cluster Raft index",
+                    )?
+                    .commit_index_compact(index)
+                })
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "cluster raft compact commit index".to_string(),
+                    detail: format!("cluster raft compact commit index task failed: {source}"),
+                })?;
+            match &result {
+                Ok(commit) => trace.record(
+                    "apply",
+                    started.elapsed(),
+                    commit.committed_request.term,
+                    index,
+                    commit.committed_request.revision.0,
+                    "applied",
+                    format_args!("committed the local Raft entry and published its compact delta"),
+                ),
+                Err(error) => trace.record(
+                    "apply",
+                    started.elapsed(),
+                    initial_term,
+                    index,
+                    initial_revision,
+                    "error",
+                    format_args!("{error}"),
+                ),
+            }
+            result
+        })
+    }
+
+    fn release_cluster_raft_command_session_after_commit_async<'a>(
+        &'a mut self,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, (), NetworkError> {
+        let runtime = self.runtime;
+        let storage = Arc::clone(&self.storage);
+        Box::pin(async move {
+            runtime
+                .spawn_blocking(move || {
+                    lock_local_cluster_raft_command_storage(
+                        &storage,
+                        "release committed cluster Raft command session",
+                    )?
+                    .release_session_after_commit();
+                    Ok::<_, NetworkError>(())
+                })
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "release committed cluster raft command session".to_string(),
+                    detail: format!(
+                        "release committed cluster raft command session task failed: {source}"
+                    ),
+                })?
+        })
+    }
+
+    fn publish_cluster_raft_post_commit_observations_async<'a>(
+        &'a mut self,
+        commit: Option<&'a sinomo_kv::ClusterKvRaftCompactCommitResult>,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, (), NetworkError> {
+        let runtime = self.runtime;
+        let storage = Arc::clone(&self.storage);
+        let commit = commit.cloned();
+        Box::pin(async move {
+            runtime
+                .spawn_blocking(move || {
+                    let observations = {
+                        let mut storage = lock_local_cluster_raft_command_storage(
+                            &storage,
+                            "take committed cluster Raft observations",
+                        )?;
+                        storage.take_post_commit_observations(commit.as_ref())?
+                    };
+                    // Invoke arbitrary synchronous observer callbacks only after
+                    // the storage guard above has been dropped. The generic
+                    // quorum driver has already dropped the proposal lock too.
+                    observations.publish();
+                    Ok::<_, NetworkError>(())
+                })
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "publish committed cluster raft observations".to_string(),
+                    detail: format!(
+                        "publish committed cluster raft observations task failed: {source}"
+                    ),
+                })?
+        })
+    }
+
     fn remote_voter_targets_async<'a>(
         &'a mut self,
         state: &'a ClusterBootstrapState,
@@ -2169,6 +2639,7 @@ where
         let host = &mut *self.host;
         Box::pin(async move {
             let started = Instant::now();
+            let deadline = started + timeout;
             let target_count = targets.len();
             if required_remote_acks == 0 || targets.is_empty() {
                 trace.record(
@@ -2195,32 +2666,56 @@ where
 
             let last_log_index = {
                 let storage = Arc::clone(&storage);
-                runtime
-                    .spawn_blocking(move || {
+                let remaining =
+                    remaining_raft_quorum_budget(deadline, "resident log-index preparation")?;
+                tokio::time::timeout(
+                    remaining,
+                    runtime.spawn_blocking(move || {
                         lock_local_cluster_raft_command_storage(
                             &storage,
                             "read resident cluster Raft log index",
                         )?
                         .last_log_index()
-                    })
-                    .await
-                    .map_err(|source| NetworkError::Io {
-                        operation: "read resident cluster Raft log index".to_string(),
-                        detail: format!("resident Raft log index task failed: {source}"),
-                    })??
-            };
-            let default_next_index = last_log_index.saturating_add(1);
-            let mut pending = Vec::new();
-            for target in targets {
-                let next_index = sinomo_kv::cluster_kv_raft_peer_progress_next_index_hint_async(
-                    paths.kv_paths(),
-                    target.clone(),
-                    state.term,
-                    last_log_index,
+                    }),
                 )
                 .await
-                .filter(|next_index| (1..=default_next_index).contains(next_index))
-                .unwrap_or(default_next_index);
+                .map_err(|_| raft_quorum_phase_timeout("resident log-index preparation"))?
+                .map_err(|source| NetworkError::Io {
+                    operation: "read resident cluster Raft log index".to_string(),
+                    detail: format!("resident Raft log index task failed: {source}"),
+                })??
+            };
+            let default_next_index = last_log_index.saturating_add(1);
+            // Peer progress is one bounded soft-state ledger. Decode it once
+            // for the whole replication wave instead of issuing one blocking
+            // file read per voter in series.
+            let peer_progress = {
+                let kv_paths = paths.kv_paths();
+                let remaining =
+                    remaining_raft_quorum_budget(deadline, "peer-progress preparation")?;
+                tokio::time::timeout(
+                    remaining,
+                    runtime.spawn_blocking(move || {
+                        sinomo_kv::read_cluster_kv_raft_peer_progress(&kv_paths)
+                    }),
+                )
+                .await
+                .map_err(|_| raft_quorum_phase_timeout("peer-progress preparation"))?
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default()
+            };
+            let mut pending = Vec::new();
+            for target in targets {
+                let next_index =
+                    sinomo_kv::cluster_kv_raft_peer_progress_next_index_hint_from_records(
+                        &peer_progress,
+                        &target,
+                        state.term,
+                        last_log_index,
+                    )
+                    .filter(|next_index| (1..=default_next_index).contains(next_index))
+                    .unwrap_or(default_next_index);
                 pending.push(PendingTarget {
                     target,
                     next_index,
@@ -2229,8 +2724,6 @@ where
                     last_response: None,
                 });
             }
-
-            let deadline = std::time::Instant::now() + timeout;
             let mut accepted = 0_usize;
             let mut completed = Vec::new();
             while accepted < required_remote_acks && !pending.is_empty() {
@@ -2241,50 +2734,96 @@ where
                     break;
                 }
 
-                let mut sends = Vec::new();
-                for target in &mut pending {
-                    if target.attempts >= append_options.max_attempts {
-                        continue;
-                    }
-                    let request = {
-                        let storage = Arc::clone(&storage);
-                        let state = state.clone();
-                        let next_index = target.next_index;
-                        runtime
-                            .spawn_blocking(move || {
-                                lock_local_cluster_raft_command_storage(
-                                    &storage,
-                                    "build resident cluster Raft append request",
-                                )?
-                                .build_raft_append_request(&state, next_index)
+                // Build the complete send wave under one resident-storage
+                // acquisition. The requests may have different next indexes,
+                // but they do not need one spawn_blocking round trip and mutex
+                // acquisition per voter.
+                let next_indexes = pending
+                    .iter()
+                    .filter(|target| target.attempts < append_options.max_attempts)
+                    .map(|target| target.next_index)
+                    .collect::<Vec<_>>();
+                let requests = {
+                    let storage = Arc::clone(&storage);
+                    let state = state.clone();
+                    let build_budget =
+                        remaining_raft_quorum_budget(deadline, "append request-wave build")?;
+                    tokio::time::timeout(
+                        build_budget,
+                        runtime.spawn_blocking(move || {
+                            let mut storage = lock_local_cluster_raft_command_storage(
+                                &storage,
+                                "build resident cluster Raft append request wave",
+                            )?;
+                            // Voters commonly share the same progress index.
+                            // Build each distinct tail/snapshot once per wave
+                            // and Arc-share it across the matching transports;
+                            // repeated durable tail construction and deep
+                            // cloning are no longer proportional to voter
+                            // count. Keep distinct indexes serial under this
+                            // one resident operation fence: independently
+                            // opening/building them would contend the same
+                            // exclusive store lock and could lose the coherent
+                            // log view this commit session guarantees.
+                            let mut request_builds = Vec::with_capacity(next_indexes.len());
+                            for next_index in next_indexes {
+                                let key =
+                                    if storage.raft_append_request_uses_snapshot(next_index)? {
+                                        ClusterRaftAppendRequestBuildKey::Snapshot
+                                    } else {
+                                        ClusterRaftAppendRequestBuildKey::Tail(next_index)
+                                    };
+                                request_builds.push((key, next_index));
+                            }
+                            build_deduplicated_append_request_wave(&request_builds, |next_index| {
+                                storage.build_raft_append_request(&state, next_index)
                             })
-                            .await
-                            .map_err(|source| NetworkError::Io {
-                                operation: "build resident cluster Raft append request".to_string(),
-                                detail: format!("resident Raft append build task failed: {source}"),
-                            })??
-                    };
+                        }),
+                    )
+                    .await
+                    .map_err(|_| raft_quorum_phase_timeout("append request-wave build"))?
+                    .map_err(|source| NetworkError::Io {
+                        operation: "build resident cluster Raft append request wave".to_string(),
+                        detail: format!("resident Raft append request-wave task failed: {source}"),
+                    })??
+                };
+                let mut sends = Vec::new();
+                for (target, request) in pending
+                    .iter_mut()
+                    .filter(|target| target.attempts < append_options.max_attempts)
+                    .zip(requests)
+                {
                     target.attempts = target.attempts.saturating_add(1);
                     record_cluster_kv_replication_send(&request);
-                    host.on_raft_append_sent_async().await?;
+                    let callback_budget =
+                        remaining_raft_quorum_budget(deadline, "append send callback")?;
+                    tokio::time::timeout(callback_budget, host.on_raft_append_sent_async())
+                        .await
+                        .map_err(|_| raft_quorum_phase_timeout("append send callback"))??;
+                    let attempt_budget =
+                        remaining_raft_quorum_budget(deadline, "append quorum send")?;
                     sends.push((
                         target.target.clone(),
                         request,
-                        append_options.routed_node_append_attempt_timeout(remaining),
+                        append_options.routed_node_append_attempt_timeout(attempt_budget),
                     ));
                 }
                 if sends.is_empty() {
                     break;
                 }
 
-                let outcomes = host
-                    .send_raft_appends_to_quorum_async(
+                let send_budget = remaining_raft_quorum_budget(deadline, "append quorum send")?;
+                let outcomes = tokio::time::timeout(
+                    send_budget,
+                    host.send_raft_appends_to_quorum_async(
                         paths,
                         state,
                         sends,
                         required_remote_acks.saturating_sub(accepted),
-                    )
-                    .await?;
+                    ),
+                )
+                .await
+                .map_err(|_| raft_quorum_phase_timeout("append quorum send"))??;
                 if outcomes.is_empty() {
                     break;
                 }
@@ -2539,6 +3078,7 @@ where
     }
 }
 
+/// Legacy full-view wrapper around the compact daemon commit path.
 pub async fn commit_cluster_raft_command_with_quorum_async_with_host<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
@@ -2548,6 +3088,50 @@ pub async fn commit_cluster_raft_command_with_quorum_async_with_host<H>(
     append_options: ClusterRaftAppendReplicationOptions,
     host: &mut H,
 ) -> Result<ClusterKvRaftQuorumCommitResult, NetworkError>
+where
+    H: ClusterRaftQuorumAsyncHost,
+{
+    let compact = commit_cluster_raft_command_compact_with_quorum_async_with_host(
+        runtime,
+        paths,
+        state,
+        request,
+        options,
+        append_options,
+        host,
+    )
+    .await?;
+    let kv_paths = paths.kv_paths();
+    let local_node_id = state.local_node_id.clone();
+    let snapshot = runtime
+        .spawn_blocking(move || {
+            sinomo_kv::read_cluster_kv_current_snapshot_for_node(&kv_paths, local_node_id)
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "materialize cluster KV quorum result".to_string(),
+            detail: format!("cluster KV snapshot materialization task failed: {source}"),
+        })?
+        .map_err(kv_err)?;
+    Ok(ClusterKvRaftQuorumCommitResult {
+        snapshot,
+        txn_response: compact.txn_response,
+        authority: compact.authority,
+        replayed_committed_request: compact.replayed_committed_request,
+    })
+}
+
+/// Canonical daemon mutation path. The result is bounded by the command delta;
+/// periodic checkpoint materialization remains local to the committing node.
+pub async fn commit_cluster_raft_command_compact_with_quorum_async_with_host<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    request: KvCommandRequest,
+    options: ClusterKvRaftQuorumCommitOptions,
+    append_options: ClusterRaftAppendReplicationOptions,
+    host: &mut H,
+) -> Result<sinomo_kv::ClusterKvRaftQuorumCompactCommitResult, NetworkError>
 where
     H: ClusterRaftQuorumAsyncHost,
 {
@@ -2588,7 +3172,7 @@ where
         host,
     };
     let commit_started = Instant::now();
-    let result = sinomo_kv::commit_cluster_kv_raft_command_with_quorum_async(
+    let result = sinomo_kv::commit_cluster_kv_raft_command_compact_with_quorum_async(
         &mut consensus_state,
         request,
         options,
@@ -2629,4 +3213,1493 @@ where
     state.term = state.term.max(consensus_state.term);
     state.kv_revision = state.kv_revision.max(consensus_state.kv_revision);
     Ok(result)
+}
+
+/// Confirms a linearizable read against a current-term voter quorum without
+/// appending a no-op entry to the Raft log.
+///
+/// This follows etcd's ReadIndex safety shape: the leader must already have a
+/// committed entry in its current term, the exact applied read view and
+/// heartbeat anchor are captured coherently, and a majority must acknowledge
+/// that anchor in the same term. `None` asks the caller to use the existing
+/// barrier path, which is required for the first read after an election and is
+/// also a safe catch-up fallback when a follower rejects the compact probe.
+fn remaining_read_index_budget(deadline: Instant, phase: &str) -> Result<Duration, NetworkError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!("Raft ReadIndex timed out during {phase}"),
+        });
+    }
+    Ok(remaining)
+}
+
+fn read_index_phase_timeout(phase: &str) -> NetworkError {
+    NetworkError::ClusterReadOnly {
+        detail: format!("Raft ReadIndex timed out during {phase}"),
+    }
+}
+
+type ReadIndexConfigEntryFence = Option<(String, Vec<u8>, u64, u64, u64, Option<u64>)>;
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ReadIndexSingleflightKey {
+    cluster_root: PathBuf,
+    leader_id: NodeId,
+    leader_term: u64,
+    commit_index: u64,
+    commit_term: Option<u64>,
+    config_entry: ReadIndexConfigEntryFence,
+    voters: Vec<NodeId>,
+}
+
+impl ReadIndexSingleflightKey {
+    fn new(
+        paths: &ClusterPaths,
+        leader_id: NodeId,
+        read_state: &sinomo_kv::ClusterKvRaftReadIndexState,
+        config_entry: Option<&sinomo_kv::KvEntry>,
+        voters: &BTreeSet<NodeId>,
+    ) -> Self {
+        Self {
+            cluster_root: paths.root.clone(),
+            leader_id,
+            leader_term: read_state.current_term,
+            commit_index: read_state.commit_index,
+            commit_term: read_state.commit_term,
+            config_entry: config_entry.map(|entry| {
+                (
+                    entry.key.clone(),
+                    entry.value.clone(),
+                    entry.create_revision.0,
+                    entry.modify_revision.0,
+                    entry.version.0,
+                    entry.lease_id.map(|lease_id| lease_id.0),
+                )
+            }),
+            voters: voters.iter().cloned().collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ReadIndexQuorumConfirmation {
+    voter_acks: usize,
+    quorum_size: usize,
+    state_after_probe: ClusterBootstrapState,
+}
+
+#[derive(Clone, Debug)]
+enum ReadIndexQuorumOutcome {
+    Confirmed(ReadIndexQuorumConfirmation),
+    Fallback,
+    RetryFlight,
+    HigherTerm {
+        observed_term: u64,
+        confirmed_term: u64,
+    },
+}
+
+type ReadIndexSingleflightResult = Result<ReadIndexQuorumOutcome, NetworkError>;
+
+struct ReadIndexSingleflight {
+    // This is the same notifier shape used by etcd's linearizable-read loop:
+    // one owner performs the ReadIndex round and publishes one retained result
+    // that releases every reader already waiting on the matching authority
+    // fence. `watch` keeps publication race-free for late-polled waiters.
+    result: tokio::sync::watch::Sender<Option<ReadIndexSingleflightResult>>,
+    #[cfg(test)]
+    waiters: AtomicUsize,
+}
+
+type ReadIndexSingleflightRegistry = BTreeMap<ReadIndexSingleflightKey, Arc<ReadIndexSingleflight>>;
+
+fn read_index_singleflight_registry() -> &'static Mutex<ReadIndexSingleflightRegistry> {
+    static REGISTRY: OnceLock<Mutex<ReadIndexSingleflightRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+struct ReadIndexSingleflightOwner {
+    key: ReadIndexSingleflightKey,
+    flight: Arc<ReadIndexSingleflight>,
+    completed: bool,
+}
+
+impl ReadIndexSingleflightOwner {
+    fn finish(mut self, result: ReadIndexSingleflightResult) -> ReadIndexSingleflightResult {
+        self.completed = true;
+        self.flight.result.send_replace(Some(result.clone()));
+        self.remove_from_registry();
+        result
+    }
+
+    fn publish_retry(mut self) {
+        self.completed = true;
+        // Remove the completed flight before waking waiters so the first one
+        // to reclaim cannot subscribe to the stale retry result again.
+        self.remove_from_registry();
+        self.flight
+            .result
+            .send_replace(Some(Ok(ReadIndexQuorumOutcome::RetryFlight)));
+    }
+
+    fn remove_from_registry(&self) {
+        let Ok(mut registry) = read_index_singleflight_registry().lock() else {
+            return;
+        };
+        if registry
+            .get(&self.key)
+            .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
+        {
+            registry.remove(&self.key);
+        }
+    }
+}
+
+impl Drop for ReadIndexSingleflightOwner {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.remove_from_registry();
+        self.flight
+            .result
+            .send_replace(Some(Ok(ReadIndexQuorumOutcome::RetryFlight)));
+    }
+}
+
+fn read_index_owner_failure_allows_reclaim(error: &NetworkError) -> bool {
+    match error {
+        NetworkError::ClusterReadOnly { detail } => {
+            detail.starts_with("Raft ReadIndex timed out during ")
+        }
+        NetworkError::Timeout { .. }
+        | NetworkError::RetryExhausted { .. }
+        | NetworkError::OutcomeUnknown { .. } => true,
+        _ => false,
+    }
+}
+
+struct ReadIndexSingleflightWaiter {
+    result: tokio::sync::watch::Receiver<Option<ReadIndexSingleflightResult>>,
+    #[cfg(test)]
+    flight: Arc<ReadIndexSingleflight>,
+}
+
+#[cfg(test)]
+impl Drop for ReadIndexSingleflightWaiter {
+    fn drop(&mut self) {
+        self.flight.waiters.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+enum ReadIndexSingleflightClaim {
+    Owner(ReadIndexSingleflightOwner),
+    Waiter(ReadIndexSingleflightWaiter),
+}
+
+fn claim_read_index_singleflight(
+    key: ReadIndexSingleflightKey,
+) -> Result<ReadIndexSingleflightClaim, NetworkError> {
+    let mut registry =
+        read_index_singleflight_registry()
+            .lock()
+            .map_err(|error| NetworkError::Io {
+                operation: "claim cluster Raft ReadIndex singleflight".to_string(),
+                detail: format!("ReadIndex singleflight registry lock poisoned: {error}"),
+            })?;
+    if let Some(flight) = registry.get(&key).cloned() {
+        #[cfg(test)]
+        flight.waiters.fetch_add(1, Ordering::Relaxed);
+        let result = flight.result.subscribe();
+        return Ok(ReadIndexSingleflightClaim::Waiter(
+            ReadIndexSingleflightWaiter {
+                result,
+                #[cfg(test)]
+                flight,
+            },
+        ));
+    }
+
+    let (result, _initial_receiver) = tokio::sync::watch::channel(None);
+    let flight = Arc::new(ReadIndexSingleflight {
+        result,
+        #[cfg(test)]
+        waiters: AtomicUsize::new(0),
+    });
+    registry.insert(key.clone(), Arc::clone(&flight));
+    Ok(ReadIndexSingleflightClaim::Owner(
+        ReadIndexSingleflightOwner {
+            key,
+            flight,
+            completed: false,
+        },
+    ))
+}
+
+async fn wait_for_read_index_singleflight(
+    mut waiter: ReadIndexSingleflightWaiter,
+    deadline: Instant,
+) -> ReadIndexSingleflightResult {
+    loop {
+        if let Some(result) = waiter.result.borrow().clone() {
+            return result;
+        }
+        let budget = remaining_read_index_budget(deadline, "shared quorum confirmation")?;
+        match tokio::time::timeout(budget, waiter.result.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                return Err(NetworkError::ClusterReadOnly {
+                    detail: "Raft ReadIndex quorum confirmation owner ended without a result"
+                        .to_string(),
+                });
+            }
+            Err(_) => return Err(read_index_phase_timeout("shared quorum confirmation")),
+        }
+    }
+}
+
+#[cfg(test)]
+fn read_index_singleflight_waiters_for_root(root: &std::path::Path) -> usize {
+    read_index_singleflight_registry()
+        .lock()
+        .ok()
+        .map(|registry| {
+            registry
+                .iter()
+                .filter(|(key, _)| key.cluster_root == root)
+                .map(|(_, flight)| flight.waiters.load(Ordering::Relaxed))
+                .sum()
+        })
+        .unwrap_or_default()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn confirm_cluster_raft_read_index_quorum<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    deadline: Instant,
+    append_options: ClusterRaftAppendReplicationOptions,
+    read_state: &sinomo_kv::ClusterKvRaftReadIndexState,
+    request: Arc<ClusterRaftAppendRequest>,
+    host: &mut H,
+) -> ReadIndexSingleflightResult
+where
+    H: ClusterRaftQuorumAsyncHost,
+{
+    let quorum_size = sinomo_kv::cluster_kv_raft_quorum_size_for_state(state);
+    let required_remote_acks = quorum_size.saturating_sub(1);
+    let mut voter_acks = 1_usize;
+    if required_remote_acks > 0 {
+        let selection_budget = remaining_read_index_budget(deadline, "voter selection")?;
+        let mut targets = tokio::time::timeout(
+            selection_budget,
+            ClusterEndpointSelector::select_internal_unique_node_ids_async(
+                runtime,
+                paths,
+                state,
+                ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
+            ),
+        )
+        .await
+        .map_err(|_| read_index_phase_timeout("voter selection"))??;
+        targets
+            .retain(|node_id| node_id != &state.local_node_id && state.node_is_raft_voter(node_id));
+        let mut attempts = Vec::new();
+        for target in targets {
+            let callback_budget = remaining_read_index_budget(deadline, "probe dispatch")?;
+            tokio::time::timeout(callback_budget, host.on_raft_append_sent_async())
+                .await
+                .map_err(|_| read_index_phase_timeout("probe dispatch"))??;
+            let remaining = remaining_read_index_budget(deadline, "quorum probe")?;
+            attempts.push((
+                target,
+                Arc::clone(&request),
+                append_options.routed_node_append_attempt_timeout(remaining),
+            ));
+        }
+        let network_budget = remaining_read_index_budget(deadline, "quorum probe")?;
+        let outcomes = tokio::time::timeout(
+            network_budget,
+            host.send_raft_appends_to_quorum_async(paths, state, attempts, required_remote_acks),
+        )
+        .await
+        .map_err(|_| read_index_phase_timeout("quorum probe"))??;
+        let mut higher_term = None;
+        for (target, _request, result) in outcomes {
+            match result {
+                Ok(response)
+                    if response.accepted && response.append.term == read_state.current_term =>
+                {
+                    voter_acks = voter_acks.saturating_add(1);
+                    merge_cluster_state_from_peer(state, response.state);
+                    host.record_node_command_connectivity(
+                        paths,
+                        state,
+                        &target,
+                        ClusterConnectivityState::Healthy,
+                        None,
+                    );
+                }
+                Ok(response) => {
+                    if response.append.term > read_state.current_term {
+                        higher_term = Some(
+                            higher_term
+                                .unwrap_or(read_state.current_term)
+                                .max(response.append.term),
+                        );
+                    }
+                    host.record_node_command_connectivity(
+                        paths,
+                        state,
+                        &target,
+                        ClusterConnectivityState::Healthy,
+                        None,
+                    );
+                }
+                Err(_) => host.record_node_command_connectivity(
+                    paths,
+                    state,
+                    &target,
+                    ClusterConnectivityState::Degraded,
+                    None,
+                ),
+            }
+        }
+        if let Some(higher_term) = higher_term {
+            let paths = paths.clone();
+            let local_node_id = state.local_node_id.clone();
+            // A higher term is safety state, not optional read work. Persist it
+            // even when the caller's read deadline expired just as the peer
+            // response arrived; the storage operation has its own bounded lock
+            // wait and must complete before this node can answer/propose again.
+            runtime
+                .spawn_blocking(move || {
+                    LocalClusterRaftCommandStorage::new(&paths, local_node_id)
+                        .observe_term(higher_term)
+                })
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "observe higher Raft ReadIndex term".to_string(),
+                    detail: format!("ReadIndex term observation task failed: {source}"),
+                })??;
+            state.term = state.term.max(higher_term);
+            return Ok(ReadIndexQuorumOutcome::HigherTerm {
+                observed_term: higher_term,
+                confirmed_term: read_state.current_term,
+            });
+        }
+    }
+
+    if voter_acks < quorum_size {
+        return Ok(ReadIndexQuorumOutcome::Fallback);
+    }
+
+    Ok(ReadIndexQuorumOutcome::Confirmed(
+        ReadIndexQuorumConfirmation {
+            voter_acks,
+            quorum_size,
+            state_after_probe: state.clone(),
+        },
+    ))
+}
+
+pub(crate) async fn read_cluster_raft_with_read_index_async_with_host<H, T, F>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    timeout: Duration,
+    append_options: ClusterRaftAppendReplicationOptions,
+    read_value: F,
+    host: &mut H,
+) -> Result<Option<sinomo_kv::KvAuthoritativeRead<T>>, NetworkError>
+where
+    H: ClusterRaftQuorumAsyncHost,
+    T: Send + 'static,
+    F: FnOnce(&mut LocalClusterRaftCommandStorage) -> Result<T, NetworkError> + Send + 'static,
+{
+    let deadline = Instant::now() + timeout;
+    let state_for_probe = state.clone();
+    let paths_for_probe = paths.clone();
+    let local_node_id = state.local_node_id.clone();
+    let prepare_budget = remaining_read_index_budget(deadline, "resident preparation")?;
+    let prepared = tokio::time::timeout(
+        prepare_budget,
+        runtime.spawn_blocking(move || {
+            let mut storage =
+                LocalClusterRaftCommandStorage::new(&paths_for_probe, local_node_id.clone());
+            let read_state = storage.read_index_state()?;
+            let config_entry = storage.read_index_entry(&sinomo_kv::cluster_kv_raft_config_key())?;
+            let mut probe_state = state_for_probe;
+            if let Some(entry) = config_entry.as_ref() {
+                let config: sinomo_kv::ClusterKvRaftConfigRecord =
+                    entry.decode().map_err(kv_err)?;
+                project_cluster_raft_config_record(&mut probe_state, &config)?;
+            }
+            if read_state.leader_id.as_ref() != Some(&local_node_id)
+                || !sinomo_kv::cluster_kv_raft_local_is_voter(&probe_state)
+            {
+                return Err(NetworkError::ClusterReadOnly {
+                    detail: "local node lost verified Raft leadership before ReadIndex preparation"
+                        .to_string(),
+                });
+            }
+            if read_state.current_term < probe_state.term {
+                return Err(NetworkError::ClusterReadOnly {
+                    detail: format!(
+                        "local Raft term {} trails projected cluster term {} during ReadIndex",
+                        read_state.current_term, probe_state.term
+                    ),
+                });
+            }
+            let projected_voters = sinomo_kv::cluster_kv_raft_voter_ids(&probe_state)
+                .map_err(kv_err)?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            if let Some(entry) = config_entry.as_ref() {
+                let config: sinomo_kv::ClusterKvRaftConfigRecord =
+                    entry.decode().map_err(kv_err)?;
+                let config_voters = config.voters.into_iter().collect::<BTreeSet<_>>();
+                if config_voters != projected_voters {
+                    return Err(NetworkError::ClusterReadOnly {
+                        detail: "committed Raft configuration changed during ReadIndex preparation"
+                            .to_string(),
+                    });
+                }
+            }
+            if !read_state.has_current_term_commit {
+                return Ok(None);
+            }
+            if read_state.applied_index < read_state.commit_index {
+                return Err(NetworkError::ClusterReadOnly {
+                    detail: format!(
+                        "local Raft apply index {} trails ReadIndex commit {}",
+                        read_state.applied_index, read_state.commit_index
+                    ),
+                });
+            }
+
+            probe_state.term = probe_state.term.max(read_state.current_term);
+            probe_state.kv_revision = probe_state.kv_revision.max(read_state.revision.0);
+            let mut request = storage.build_raft_append_request(
+                &probe_state,
+                read_state.commit_index.saturating_add(1),
+            )?;
+            if request.append.prev_log_index != read_state.commit_index
+                || Some(request.append.prev_log_term) != read_state.commit_term
+            {
+                return Err(NetworkError::ClusterReadOnly {
+                    detail: format!(
+                        "ReadIndex anchor at term {} index {} is not retained by the local Raft log",
+                        read_state.current_term, read_state.commit_index
+                    ),
+                });
+            }
+            // ReadIndex only asks whether this leader still owns a current-term
+            // majority. Never attach a snapshot or uncommitted tail to that
+            // probe; lagging voters fall back to the normal catch-up/barrier
+            // path instead.
+            request.snapshot = None;
+            request.append.entries.clear();
+            request.append.leader_commit = read_state.commit_index;
+            Ok(Some((
+                read_state,
+                request,
+                config_entry,
+                projected_voters,
+                probe_state,
+            )))
+        }),
+    )
+    .await
+        .map_err(|_| read_index_phase_timeout("resident preparation"))?
+        .map_err(|source| NetworkError::Io {
+            operation: "prepare cluster Raft ReadIndex".to_string(),
+            detail: format!("cluster Raft ReadIndex preparation task failed: {source}"),
+        })??;
+    let Some((read_state, request, config_fence, confirmed_voters, confirmed_state)) = prepared
+    else {
+        return Ok(None);
+    };
+    // Use the configuration captured under the resident operation fence for
+    // quorum calculation and target selection. The caller's earlier projected
+    // state can race a committed membership transition.
+    *state = confirmed_state.clone();
+    let singleflight_key = ReadIndexSingleflightKey::new(
+        paths,
+        state.local_node_id.clone(),
+        &read_state,
+        config_fence.as_ref(),
+        &confirmed_voters,
+    );
+    let request = Arc::new(request);
+    let quorum_outcome = loop {
+        // A cancelled or shorter-budget owner publishes a retry notification
+        // after removing its flight. The longest-lived waiter then wins this
+        // exact-fence claim and performs the replacement quorum wave with its
+        // own remaining deadline, matching etcd's notifier-loop ownership.
+        remaining_read_index_budget(deadline, "singleflight claim")?;
+        match claim_read_index_singleflight(singleflight_key.clone())? {
+            ReadIndexSingleflightClaim::Owner(owner) => {
+                metrics::counter!(
+                    "sinomo.kv.authoritative_read.read_index_singleflight",
+                    "role" => "owner"
+                )
+                .increment(1);
+                let result = confirm_cluster_raft_read_index_quorum(
+                    runtime,
+                    paths,
+                    state,
+                    deadline,
+                    append_options,
+                    &read_state,
+                    Arc::clone(&request),
+                    host,
+                )
+                .await;
+                match result {
+                    Err(error) if read_index_owner_failure_allows_reclaim(&error) => {
+                        owner.publish_retry();
+                        return Err(error);
+                    }
+                    result => break owner.finish(result)?,
+                }
+            }
+            ReadIndexSingleflightClaim::Waiter(waiter) => {
+                metrics::counter!(
+                    "sinomo.kv.authoritative_read.read_index_singleflight",
+                    "role" => "waiter"
+                )
+                .increment(1);
+                match wait_for_read_index_singleflight(waiter, deadline).await? {
+                    ReadIndexQuorumOutcome::RetryFlight => continue,
+                    outcome => break outcome,
+                }
+            }
+        }
+    };
+    let (voter_acks, quorum_size) = match quorum_outcome {
+        ReadIndexQuorumOutcome::Confirmed(confirmation) => {
+            *state = confirmation.state_after_probe;
+            (confirmation.voter_acks, confirmation.quorum_size)
+        }
+        ReadIndexQuorumOutcome::Fallback => return Ok(None),
+        ReadIndexQuorumOutcome::RetryFlight => unreachable!("retry outcomes are reclaimed above"),
+        ReadIndexQuorumOutcome::HigherTerm {
+            observed_term,
+            confirmed_term,
+        } => {
+            state.term = state.term.max(observed_term);
+            return Err(NetworkError::ClusterReadOnly {
+                detail: format!(
+                    "Raft ReadIndex observed higher term {observed_term} while confirming term {confirmed_term}"
+                ),
+            });
+        }
+    };
+
+    // As in etcd, confirmation establishes a read index; it does not bless a
+    // value captured before the quorum round trip. Reopen the warm resident
+    // node, reject a leader/term change, wait for the confirmed index to be
+    // locally applied, and only then project the requested view.
+    let paths_for_read = paths.clone();
+    let local_node_id = state.local_node_id.clone();
+    let confirmed_term = read_state.current_term;
+    let confirmed_commit_index = read_state.commit_index;
+    let mut state_for_config = confirmed_state;
+    let final_read_budget = remaining_read_index_budget(deadline, "final applied read")?;
+    let (applied_state, value) = tokio::time::timeout(
+        final_read_budget,
+        runtime.spawn_blocking(move || {
+            let mut storage =
+                LocalClusterRaftCommandStorage::new(&paths_for_read, local_node_id.clone());
+            let applied_state = storage.read_index_state()?;
+            if applied_state.current_term != confirmed_term
+                || applied_state.leader_id.as_ref() != Some(&local_node_id)
+            {
+                return Err(NetworkError::ClusterReadOnly {
+                    detail: format!(
+                        "Raft leadership changed while confirming ReadIndex term {confirmed_term}"
+                    ),
+                });
+            }
+            if applied_state.applied_index > applied_state.commit_index {
+                return Err(NetworkError::ClusterReadOnly {
+                    detail: format!(
+                        "local Raft apply index {} exceeds committed index {} during ReadIndex",
+                        applied_state.applied_index, applied_state.commit_index
+                    ),
+                });
+            }
+            if applied_state.applied_index < confirmed_commit_index {
+                return Err(NetworkError::ClusterReadOnly {
+                    detail: format!(
+                        "local Raft apply index {} trails confirmed ReadIndex {}",
+                        applied_state.applied_index, confirmed_commit_index
+                    ),
+                });
+            }
+            let applied_config_entry =
+                storage.read_index_entry(&sinomo_kv::cluster_kv_raft_config_key())?;
+            if applied_config_entry != config_fence {
+                return Err(NetworkError::ClusterReadOnly {
+                    detail: "committed Raft configuration changed while confirming ReadIndex; retry the read"
+                        .to_string(),
+                });
+            }
+            if let Some(entry) = applied_config_entry.as_ref() {
+                let config: sinomo_kv::ClusterKvRaftConfigRecord =
+                    entry.decode().map_err(kv_err)?;
+                project_cluster_raft_config_record(&mut state_for_config, &config)?;
+            }
+            let applied_voters = sinomo_kv::cluster_kv_raft_voter_ids(&state_for_config)
+                .map_err(kv_err)?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            if applied_voters != confirmed_voters
+                || !sinomo_kv::cluster_kv_raft_local_is_voter(&state_for_config)
+            {
+                return Err(NetworkError::ClusterReadOnly {
+                    detail: "local node or voter configuration changed while confirming ReadIndex; retry the read"
+                        .to_string(),
+                });
+            }
+            let value = read_value(&mut storage)?;
+            Ok((applied_state, value))
+        }),
+    )
+        .await
+        .map_err(|_| read_index_phase_timeout("final applied read"))?
+        .map_err(|source| NetworkError::Io {
+            operation: "apply cluster Raft ReadIndex".to_string(),
+            detail: format!("cluster Raft ReadIndex apply task failed: {source}"),
+        })??;
+    state.term = state.term.max(applied_state.current_term);
+    state.kv_revision = state.kv_revision.max(applied_state.revision.0);
+    metrics::counter!("sinomo.kv.authoritative_read", "path" => "read_index").increment(1);
+    Ok(Some(sinomo_kv::KvAuthoritativeRead {
+        value,
+        authority: sinomo_kv::KvAuthorityProof {
+            term: read_state.current_term,
+            // The quorum probe establishes `confirmed_commit_index` as the
+            // linearization lower bound. The final coherent resident view may
+            // include later entries committed by the unchanged leader. Its
+            // applied index is the matching upper bound for the returned
+            // revision/value and for request-outcome validation.
+            commit_index: applied_state.applied_index,
+            revision: applied_state.revision,
+            basis: sinomo_kv::KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks,
+                required_quorum: quorum_size,
+            },
+        },
+    }))
+}
+
+#[cfg(test)]
+mod read_index_tests {
+    use super::*;
+    use sinomo_base::{CapabilityName, ClusterMemberRecord};
+    use sinomo_kv::{
+        ClusterKvRaftConfigRecord, ClusterKvRequestOutcomeRead, KvCommand, KvOp, KvRequestOutcome,
+        encode_kv_value, validate_cluster_kv_request_outcome_read,
+    };
+    use sinomo_node::DAEMON_MAIN_RUN_CAPABILITY;
+    use time::OffsetDateTime;
+
+    const TEST_KEY: &str = "/read-index/value";
+
+    struct ReadIndexFixture {
+        _root: sinomo_testdir::TestDir,
+        paths: ClusterPaths,
+        state: ClusterBootstrapState,
+        local: NodeId,
+        initial_config: ClusterKvRaftConfigRecord,
+        initial_last_index: u64,
+    }
+
+    fn read_index_fixture(leader_term: u64, committed_term: u64) -> ReadIndexFixture {
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-read-index");
+        let data_dir = sinomo_local::SinomoDataDir::new(root.path());
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_read_index").expect("cluster id");
+        let local = NodeId::from_legacy_named("node_read_index_a").expect("local node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "read index",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        state.term = leader_term;
+
+        let node_ids = [
+            local.clone(),
+            NodeId::from_legacy_named("node_read_index_b").expect("node b"),
+            NodeId::from_legacy_named("node_read_index_c").expect("node c"),
+            NodeId::from_legacy_named("node_read_index_d").expect("node d"),
+            NodeId::from_legacy_named("node_read_index_e").expect("node e"),
+        ];
+        let capability =
+            CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("daemon capability");
+        state.members[0].capabilities = vec![capability.clone()];
+        state.members[0].allowed_capabilities = vec![capability.clone()];
+        for (position, node_id) in node_ids.iter().enumerate().skip(1) {
+            let mut member = if position <= 2 {
+                ClusterMemberRecord::local_voter(
+                    cluster_id.clone(),
+                    node_id.clone(),
+                    format!("node-{position}"),
+                    format!("pk-{position}"),
+                    now,
+                )
+            } else {
+                ClusterMemberRecord::local_non_voting(
+                    cluster_id.clone(),
+                    node_id.clone(),
+                    format!("node-{position}"),
+                    format!("pk-{position}"),
+                    now,
+                )
+            };
+            member.capabilities = vec![capability.clone()];
+            member.allowed_capabilities = vec![capability.clone()];
+            member.endpoints = vec![sinomo_network::daemon_lan_endpoint(
+                node_id,
+                format!("10.99.0.{}:21353", position + 1),
+                0,
+            )];
+            state.members.push(member);
+        }
+
+        let initial_config = ClusterKvRaftConfigRecord {
+            cluster_id,
+            term: committed_term,
+            kv_revision: 1,
+            voters: node_ids[..3].to_vec(),
+            learners: Vec::new(),
+            non_voting: node_ids[3..].to_vec(),
+            updated_at: now,
+        };
+        let kv_paths = paths.kv_paths();
+        let mut node = kv_paths.raft_store().open_node(&local).expect("open node");
+        node.become_leader(committed_term)
+            .expect("become initial leader");
+        let config_entry = node
+            .append_local_command(
+                committed_term,
+                KvCommand::Op(KvOp::Put {
+                    key: sinomo_kv::cluster_kv_raft_config_key(),
+                    value: encode_kv_value(&initial_config).expect("encode config"),
+                    lease_id: None,
+                }),
+            )
+            .expect("append config");
+        let value_entry = node
+            .append_local_command(
+                committed_term,
+                KvCommand::Op(KvOp::Put {
+                    key: TEST_KEY.to_string(),
+                    value: b"confirmed".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append value");
+        node.commit_to(value_entry.index).expect("commit fixture");
+        assert!(config_entry.index < value_entry.index);
+        if leader_term != committed_term {
+            node.become_leader(leader_term)
+                .expect("advance leader term");
+        }
+        let initial_last_index = node.last_log_index();
+        drop(node);
+        ReadIndexFixture {
+            _root: root,
+            paths,
+            state,
+            local,
+            initial_config,
+            initial_last_index,
+        }
+    }
+
+    enum ReadIndexAction {
+        None,
+        HigherTerm(u64),
+        ClearLeader,
+        CommitRequest(KvCommandRequest),
+        ChangeConfigTwice {
+            intermediate: ClusterKvRaftConfigRecord,
+            final_config: ClusterKvRaftConfigRecord,
+        },
+    }
+
+    struct ReadIndexHost {
+        paths: ClusterPaths,
+        local: NodeId,
+        action: Option<ReadIndexAction>,
+        sends: usize,
+    }
+
+    impl ReadIndexHost {
+        fn commit_request(&self, request: KvCommandRequest) -> Result<(), NetworkError> {
+            let store = self.paths.kv_paths().raft_store();
+            let entry = store
+                .locked_append_request_uncommitted(&self.local, request)
+                .map_err(kv_err)?;
+            store
+                .locked_commit_index_with_events_and_publish_report(
+                    &self.local,
+                    entry.index,
+                    |_| false,
+                )
+                .map_err(kv_err)?;
+            Ok(())
+        }
+
+        fn apply_action(&mut self) -> Result<Option<u64>, NetworkError> {
+            match self.action.take().unwrap_or(ReadIndexAction::None) {
+                ReadIndexAction::None => Ok(None),
+                ReadIndexAction::HigherTerm(term) => Ok(Some(term)),
+                ReadIndexAction::ClearLeader => {
+                    self.paths
+                        .kv_paths()
+                        .raft_store()
+                        .discard_uncommitted_tail_and_clear_leader(&self.local)
+                        .map_err(kv_err)?;
+                    Ok(None)
+                }
+                ReadIndexAction::CommitRequest(request) => {
+                    self.commit_request(request)?;
+                    Ok(None)
+                }
+                ReadIndexAction::ChangeConfigTwice {
+                    intermediate,
+                    final_config,
+                } => {
+                    for config in [intermediate, final_config] {
+                        self.commit_request(KvCommandRequest::generated(KvCommand::Op(
+                            KvOp::Put {
+                                key: sinomo_kv::cluster_kv_raft_config_key(),
+                                value: encode_kv_value(&config).map_err(kv_err)?,
+                                lease_id: None,
+                            },
+                        )))?;
+                    }
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    impl ClusterRaftQuorumAsyncHost for ReadIndexHost {
+        fn send_raft_append_to_node_async<'a>(
+            &'a mut self,
+            _paths: &'a ClusterPaths,
+            state: &'a ClusterBootstrapState,
+            _target_node_id: &'a NodeId,
+            request: &'a ClusterRaftAppendRequest,
+            _timeout: Duration,
+        ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse> {
+            Box::pin(async move {
+                self.sends = self.sends.saturating_add(1);
+                let response_term = self.apply_action()?.unwrap_or(request.append.term);
+                let accepted = response_term == request.append.term;
+                Ok(ClusterRaftAppendResponse {
+                    accepted,
+                    detail: if accepted {
+                        "accepted ReadIndex heartbeat".to_string()
+                    } else {
+                        "observed higher term".to_string()
+                    },
+                    state: state.clone(),
+                    append: sinomo_kv::RaftAppendEntriesResponse {
+                        term: response_term,
+                        success: accepted,
+                        match_index: request.append.prev_log_index,
+                    },
+                })
+            })
+        }
+    }
+
+    struct CoalescedReadIndexHostState {
+        quorum_waves: AtomicUsize,
+        wave_entered: tokio::sync::Semaphore,
+        wave_release: tokio::sync::Semaphore,
+    }
+
+    struct CoalescedReadIndexHost {
+        shared: Arc<CoalescedReadIndexHostState>,
+    }
+
+    impl ClusterRaftQuorumAsyncHost for CoalescedReadIndexHost {
+        fn send_raft_append_to_node_async<'a>(
+            &'a mut self,
+            _paths: &'a ClusterPaths,
+            _state: &'a ClusterBootstrapState,
+            _target_node_id: &'a NodeId,
+            _request: &'a ClusterRaftAppendRequest,
+            _timeout: Duration,
+        ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse> {
+            Box::pin(async {
+                Err(NetworkError::Io {
+                    operation: "send coalesced ReadIndex probe".to_string(),
+                    detail: "single-target path should not be used by the coalescing test"
+                        .to_string(),
+                })
+            })
+        }
+
+        fn send_raft_appends_to_quorum_async<'a>(
+            &'a mut self,
+            _paths: &'a ClusterPaths,
+            state: &'a ClusterBootstrapState,
+            attempts: ClusterRaftQuorumBatch,
+            required_acks: usize,
+        ) -> ClusterMembershipRpcFuture<'a, ClusterRaftQuorumBatchOutcomes> {
+            Box::pin(async move {
+                self.shared.quorum_waves.fetch_add(1, Ordering::SeqCst);
+                self.shared.wave_entered.add_permits(1);
+                self.shared
+                    .wave_release
+                    .acquire()
+                    .await
+                    .expect("ReadIndex wave release semaphore")
+                    .forget();
+
+                Ok(attempts
+                    .into_iter()
+                    .take(required_acks)
+                    .map(|(target, request, _timeout)| {
+                        let response = ClusterRaftAppendResponse {
+                            accepted: true,
+                            detail: "accepted coalesced ReadIndex heartbeat".to_string(),
+                            state: state.clone(),
+                            append: sinomo_kv::RaftAppendEntriesResponse {
+                                term: request.append.term,
+                                success: true,
+                                match_index: request.append.prev_log_index,
+                            },
+                        };
+                        (target, request, Ok(response))
+                    })
+                    .collect())
+            })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReclaimFirstWave {
+        Cancelled,
+        TimedOut,
+    }
+
+    struct ReclaimReadIndexHostState {
+        quorum_waves: AtomicUsize,
+        first_wave_entered: tokio::sync::Semaphore,
+        fail_first_wave: tokio::sync::Semaphore,
+        first_wave: ReclaimFirstWave,
+    }
+
+    struct ReclaimReadIndexHost {
+        shared: Arc<ReclaimReadIndexHostState>,
+    }
+
+    impl ClusterRaftQuorumAsyncHost for ReclaimReadIndexHost {
+        fn send_raft_append_to_node_async<'a>(
+            &'a mut self,
+            _paths: &'a ClusterPaths,
+            _state: &'a ClusterBootstrapState,
+            _target_node_id: &'a NodeId,
+            _request: &'a ClusterRaftAppendRequest,
+            _timeout: Duration,
+        ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse> {
+            Box::pin(async {
+                Err(NetworkError::Io {
+                    operation: "send reclaimed ReadIndex probe".to_string(),
+                    detail: "single-target path should not be used by the reclaim test".to_string(),
+                })
+            })
+        }
+
+        fn send_raft_appends_to_quorum_async<'a>(
+            &'a mut self,
+            _paths: &'a ClusterPaths,
+            state: &'a ClusterBootstrapState,
+            attempts: ClusterRaftQuorumBatch,
+            required_acks: usize,
+        ) -> ClusterMembershipRpcFuture<'a, ClusterRaftQuorumBatchOutcomes> {
+            Box::pin(async move {
+                let wave = self.shared.quorum_waves.fetch_add(1, Ordering::SeqCst);
+                if wave == 0 {
+                    self.shared.first_wave_entered.add_permits(1);
+                    match self.shared.first_wave {
+                        ReclaimFirstWave::Cancelled => std::future::pending::<()>().await,
+                        ReclaimFirstWave::TimedOut => {
+                            self.shared
+                                .fail_first_wave
+                                .acquire()
+                                .await
+                                .expect("release first ReadIndex timeout wave")
+                                .forget();
+                            return Err(NetworkError::Timeout {
+                                operation: "test ReadIndex quorum wave".to_string(),
+                                phase: sinomo_network::NetworkTimeoutPhase::Overall,
+                                timeout: Duration::from_millis(1),
+                                delivery_state:
+                                    sinomo_network::NetworkDeliveryState::DefinitelyNotSent,
+                            });
+                        }
+                    }
+                }
+
+                Ok(attempts
+                    .into_iter()
+                    .take(required_acks)
+                    .map(|(target, request, _timeout)| {
+                        let response = ClusterRaftAppendResponse {
+                            accepted: true,
+                            detail: "accepted reclaimed ReadIndex heartbeat".to_string(),
+                            state: state.clone(),
+                            append: sinomo_kv::RaftAppendEntriesResponse {
+                                term: request.append.term,
+                                success: true,
+                                match_index: request.append.prev_log_index,
+                            },
+                        };
+                        (target, request, Ok(response))
+                    })
+                    .collect())
+            })
+        }
+    }
+
+    fn run_read_index<T: Send + 'static>(
+        fixture: &mut ReadIndexFixture,
+        host: &mut ReadIndexHost,
+        read_value: impl FnOnce(&mut LocalClusterRaftCommandStorage) -> Result<T, NetworkError>
+        + Send
+        + 'static,
+    ) -> Result<Option<sinomo_kv::KvAuthoritativeRead<T>>, NetworkError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(read_cluster_raft_with_read_index_async_with_host(
+            runtime.handle(),
+            &fixture.paths,
+            &mut fixture.state,
+            Duration::from_secs(2),
+            ClusterControlPlaneTimeouts::default_daemon_transport()
+                .raft_append_replication_options(Duration::from_secs(2)),
+            read_value,
+            host,
+        ))
+    }
+
+    fn no_action_host(fixture: &ReadIndexFixture) -> ReadIndexHost {
+        ReadIndexHost {
+            paths: fixture.paths.clone(),
+            local: fixture.local.clone(),
+            action: Some(ReadIndexAction::None),
+            sends: 0,
+        }
+    }
+
+    #[test]
+    fn append_request_wave_builds_once_per_distinct_progress_index() {
+        let mut shared_builds = 0_usize;
+        let shared = build_deduplicated_append_request_wave(
+            &[
+                (ClusterRaftAppendRequestBuildKey::Tail(9), 9),
+                (ClusterRaftAppendRequestBuildKey::Tail(9), 9),
+                (ClusterRaftAppendRequestBuildKey::Tail(9), 9),
+                (ClusterRaftAppendRequestBuildKey::Tail(9), 9),
+            ],
+            |next_index| -> Result<_, ()> {
+                shared_builds = shared_builds.saturating_add(1);
+                Ok(format!("request-{next_index}"))
+            },
+        )
+        .expect("shared progress wave");
+        assert_eq!(shared_builds, 1);
+        assert_eq!(shared.len(), 4);
+        assert!(Arc::ptr_eq(&shared[0], &shared[1]));
+        assert!(Arc::ptr_eq(&shared[0], &shared[3]));
+
+        let mut mixed_builds = 0_usize;
+        let mixed = build_deduplicated_append_request_wave(
+            &[
+                (ClusterRaftAppendRequestBuildKey::Tail(9), 9),
+                (ClusterRaftAppendRequestBuildKey::Tail(4), 4),
+                (ClusterRaftAppendRequestBuildKey::Tail(9), 9),
+                (ClusterRaftAppendRequestBuildKey::Tail(2), 2),
+                (ClusterRaftAppendRequestBuildKey::Tail(4), 4),
+            ],
+            |next_index| -> Result<_, ()> {
+                mixed_builds = mixed_builds.saturating_add(1);
+                Ok(format!("request-{next_index}"))
+            },
+        )
+        .expect("mixed progress wave");
+        assert_eq!(mixed_builds, 3);
+        assert_eq!(mixed[0], mixed[2]);
+        assert_eq!(mixed[1], mixed[4]);
+        assert!(Arc::ptr_eq(&mixed[0], &mixed[2]));
+        assert!(Arc::ptr_eq(&mixed[1], &mixed[4]));
+        assert!(!Arc::ptr_eq(&mixed[0], &mixed[1]));
+
+        let mut snapshot_builds = 0_usize;
+        let snapshots = build_deduplicated_append_request_wave(
+            &[
+                (ClusterRaftAppendRequestBuildKey::Snapshot, 1),
+                (ClusterRaftAppendRequestBuildKey::Snapshot, 4),
+            ],
+            |next_index| -> Result<_, ()> {
+                snapshot_builds = snapshot_builds.saturating_add(1);
+                Ok(format!("snapshot-request-from-{next_index}"))
+            },
+        )
+        .expect("normalized snapshot wave");
+        assert_eq!(snapshot_builds, 1);
+        assert!(Arc::ptr_eq(&snapshots[0], &snapshots[1]));
+    }
+
+    #[test]
+    fn read_index_confirms_three_voter_read_without_appending_barrier() {
+        let mut fixture = read_index_fixture(7, 7);
+        let mut host = no_action_host(&fixture);
+        let read = run_read_index(&mut fixture, &mut host, |storage| {
+            storage.read_index_entry(TEST_KEY)
+        })
+        .expect("ReadIndex")
+        .expect("steady-state read");
+
+        assert_eq!(read.value.expect("entry").value, b"confirmed".to_vec());
+        assert_eq!(host.sends, 1);
+        assert!(matches!(
+            read.authority.basis,
+            sinomo_kv::KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks: 2,
+                required_quorum: 2
+            }
+        ));
+        let last_index = fixture
+            .paths
+            .kv_paths()
+            .raft_store()
+            .locked_last_log_index(&fixture.local)
+            .expect("last index");
+        assert_eq!(last_index, fixture.initial_last_index);
+    }
+
+    #[test]
+    fn concurrent_read_indexes_share_one_quorum_confirmation_wave() {
+        let fixture = read_index_fixture(7, 7);
+        let shared = Arc::new(CoalescedReadIndexHostState {
+            quorum_waves: AtomicUsize::new(0),
+            wave_entered: tokio::sync::Semaphore::new(0),
+            wave_release: tokio::sync::Semaphore::new(0),
+        });
+        let mut first_state = fixture.state.clone();
+        let mut second_state = fixture.state.clone();
+        let mut first_host = CoalescedReadIndexHost {
+            shared: Arc::clone(&shared),
+        };
+        let mut second_host = CoalescedReadIndexHost {
+            shared: Arc::clone(&shared),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let timeout = Duration::from_secs(2);
+        let append_options = ClusterControlPlaneTimeouts::default_daemon_transport()
+            .raft_append_replication_options(timeout);
+        let root = fixture.paths.root.clone();
+
+        let (first, second, ()) = runtime.block_on(async {
+            let first = read_cluster_raft_with_read_index_async_with_host(
+                runtime.handle(),
+                &fixture.paths,
+                &mut first_state,
+                timeout,
+                append_options,
+                |storage| storage.read_index_entry(TEST_KEY),
+                &mut first_host,
+            );
+            let second = read_cluster_raft_with_read_index_async_with_host(
+                runtime.handle(),
+                &fixture.paths,
+                &mut second_state,
+                timeout,
+                append_options,
+                |storage| storage.read_index_entry(TEST_KEY),
+                &mut second_host,
+            );
+            let release = async {
+                shared
+                    .wave_entered
+                    .acquire()
+                    .await
+                    .expect("ReadIndex quorum wave entered")
+                    .forget();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        if read_index_singleflight_waiters_for_root(&root) == 1 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("second read joined the active ReadIndex singleflight");
+                shared.wave_release.add_permits(1);
+            };
+            tokio::join!(first, second, release)
+        });
+
+        let first = first.expect("first ReadIndex").expect("first read");
+        let second = second.expect("second ReadIndex").expect("second read");
+        assert_eq!(
+            first.value.expect("first entry").value,
+            b"confirmed".to_vec()
+        );
+        assert_eq!(
+            second.value.expect("second entry").value,
+            b"confirmed".to_vec()
+        );
+        assert_eq!(shared.quorum_waves.load(Ordering::SeqCst), 1);
+        assert_eq!(read_index_singleflight_waiters_for_root(&root), 0);
+    }
+
+    fn assert_read_index_waiter_reclaims_failed_owner(first_wave: ReclaimFirstWave) {
+        let fixture = read_index_fixture(7, 7);
+        let shared = Arc::new(ReclaimReadIndexHostState {
+            quorum_waves: AtomicUsize::new(0),
+            first_wave_entered: tokio::sync::Semaphore::new(0),
+            fail_first_wave: tokio::sync::Semaphore::new(0),
+            first_wave,
+        });
+        let root = fixture.paths.root.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let read = runtime.block_on(async {
+            let owner_paths = fixture.paths.clone();
+            let mut owner_state = fixture.state.clone();
+            let owner_shared = Arc::clone(&shared);
+            let owner = tokio::spawn(async move {
+                let timeout = Duration::from_secs(1);
+                let append_options = ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .raft_append_replication_options(timeout);
+                let mut host = ReclaimReadIndexHost {
+                    shared: owner_shared,
+                };
+                read_cluster_raft_with_read_index_async_with_host(
+                    &tokio::runtime::Handle::current(),
+                    &owner_paths,
+                    &mut owner_state,
+                    timeout,
+                    append_options,
+                    |storage| storage.read_index_entry(TEST_KEY),
+                    &mut host,
+                )
+                .await
+            });
+
+            shared
+                .first_wave_entered
+                .acquire()
+                .await
+                .expect("first ReadIndex wave entered")
+                .forget();
+
+            let waiter_paths = fixture.paths.clone();
+            let mut waiter_state = fixture.state.clone();
+            let waiter_shared = Arc::clone(&shared);
+            let waiter = tokio::spawn(async move {
+                let timeout = Duration::from_secs(5);
+                let append_options = ClusterControlPlaneTimeouts::default_daemon_transport()
+                    .raft_append_replication_options(timeout);
+                let mut host = ReclaimReadIndexHost {
+                    shared: waiter_shared,
+                };
+                read_cluster_raft_with_read_index_async_with_host(
+                    &tokio::runtime::Handle::current(),
+                    &waiter_paths,
+                    &mut waiter_state,
+                    timeout,
+                    append_options,
+                    |storage| storage.read_index_entry(TEST_KEY),
+                    &mut host,
+                )
+                .await
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if read_index_singleflight_waiters_for_root(&root) == 1 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("long-budget reader joined the first owner's flight");
+
+            match first_wave {
+                ReclaimFirstWave::Cancelled => {
+                    owner.abort();
+                    let error = owner.await.expect_err("short owner was aborted");
+                    assert!(error.is_cancelled());
+                }
+                ReclaimFirstWave::TimedOut => {
+                    shared.fail_first_wave.add_permits(1);
+                    let error = owner
+                        .await
+                        .expect("short owner task")
+                        .expect_err("first ReadIndex wave timed out");
+                    assert!(matches!(error, NetworkError::Timeout { .. }));
+                }
+            }
+
+            tokio::time::timeout(Duration::from_secs(2), waiter)
+                .await
+                .expect("long-budget reader reclaimed the flight")
+                .expect("long-budget reader task")
+                .expect("reclaimed ReadIndex")
+                .expect("authoritative read")
+        });
+
+        assert_eq!(read.value.expect("entry").value, b"confirmed".to_vec());
+        assert_eq!(shared.quorum_waves.load(Ordering::SeqCst), 2);
+        assert_eq!(read_index_singleflight_waiters_for_root(&root), 0);
+    }
+
+    #[test]
+    fn long_budget_read_index_waiter_reclaims_cancelled_owner() {
+        assert_read_index_waiter_reclaims_failed_owner(ReclaimFirstWave::Cancelled);
+    }
+
+    #[test]
+    fn long_budget_read_index_waiter_reclaims_timed_out_owner() {
+        assert_read_index_waiter_reclaims_failed_owner(ReclaimFirstWave::TimedOut);
+    }
+
+    #[test]
+    fn read_index_falls_back_before_current_term_has_a_commit() {
+        let mut fixture = read_index_fixture(8, 7);
+        let mut host = no_action_host(&fixture);
+        let read = run_read_index(&mut fixture, &mut host, |storage| {
+            storage.read_index_entry(TEST_KEY)
+        })
+        .expect("fallback decision");
+
+        assert!(read.is_none());
+        assert_eq!(host.sends, 0);
+    }
+
+    #[test]
+    fn read_index_observes_higher_term_and_rejects_read() {
+        let mut fixture = read_index_fixture(7, 7);
+        let mut host = no_action_host(&fixture);
+        host.action = Some(ReadIndexAction::HigherTerm(9));
+        let error = run_read_index(&mut fixture, &mut host, |storage| {
+            storage.read_index_entry(TEST_KEY)
+        })
+        .expect_err("higher term must reject ReadIndex");
+
+        assert!(error.to_string().contains("higher term 9"));
+        let node = fixture
+            .paths
+            .kv_paths()
+            .raft_store()
+            .open_node(&fixture.local)
+            .expect("reopen node");
+        assert_eq!(node.hard_state().current_term, 9);
+        assert_eq!(node.hard_state().leader_id, None);
+    }
+
+    #[test]
+    fn read_index_rejects_final_leadership_change() {
+        let mut fixture = read_index_fixture(7, 7);
+        let mut host = no_action_host(&fixture);
+        host.action = Some(ReadIndexAction::ClearLeader);
+        let error = run_read_index(&mut fixture, &mut host, |storage| {
+            storage.read_index_entry(TEST_KEY)
+        })
+        .expect_err("leadership change must reject ReadIndex");
+
+        assert!(error.to_string().contains("leadership changed"));
+    }
+
+    #[test]
+    fn read_index_rejects_two_config_transitions_even_if_voter_set_returns() {
+        let mut fixture = read_index_fixture(7, 7);
+        let mut intermediate = fixture.initial_config.clone();
+        intermediate.kv_revision = 3;
+        intermediate.voters = vec![
+            fixture.state.members[0].node_id.clone(),
+            fixture.state.members[3].node_id.clone(),
+            fixture.state.members[4].node_id.clone(),
+        ];
+        intermediate.non_voting = vec![
+            fixture.state.members[1].node_id.clone(),
+            fixture.state.members[2].node_id.clone(),
+        ];
+        let mut final_config = fixture.initial_config.clone();
+        final_config.kv_revision = 4;
+        let mut host = no_action_host(&fixture);
+        host.action = Some(ReadIndexAction::ChangeConfigTwice {
+            intermediate,
+            final_config,
+        });
+
+        let error = run_read_index(&mut fixture, &mut host, |storage| {
+            storage.read_index_entry(TEST_KEY)
+        })
+        .expect_err("config generation change must reject ReadIndex");
+        assert!(error.to_string().contains("configuration changed"));
+    }
+
+    #[test]
+    fn read_index_proof_covers_concurrent_committed_request_in_final_view() {
+        let mut fixture = read_index_fixture(7, 7);
+        let concurrent_request = KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+            key: "/read-index/concurrent".to_string(),
+            value: b"later".to_vec(),
+            lease_id: None,
+        }));
+        let concurrent_request_id = concurrent_request.request_id.clone();
+        let mut host = no_action_host(&fixture);
+        host.action = Some(ReadIndexAction::CommitRequest(concurrent_request));
+        let read = run_read_index(&mut fixture, &mut host, |storage| {
+            storage.read_index_snapshot()
+        })
+        .expect("ReadIndex")
+        .expect("authoritative snapshot");
+        let record = read
+            .value
+            .committed_requests
+            .iter()
+            .find(|record| record.request_id == concurrent_request_id)
+            .cloned()
+            .expect("concurrent committed request");
+
+        assert!(read.authority.commit_index >= record.log_index);
+        assert!(read.authority.revision >= record.revision);
+        validate_cluster_kv_request_outcome_read(&ClusterKvRequestOutcomeRead {
+            authority: read.authority,
+            outcome: KvRequestOutcome::Committed(record),
+        })
+        .expect("proof covers final coherent request outcome");
+    }
 }

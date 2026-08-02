@@ -209,10 +209,10 @@ fn daemon_locked_set_cluster_raft_leader(
     paths: &ClusterPaths,
     node_id: &NodeId,
     term: u64,
-) -> Result<KvSnapshot, sinomo_core::network::NetworkError> {
+) -> Result<(), sinomo_core::network::NetworkError> {
     paths
         .kv_paths()
-        .locked_set_raft_leader_and_write_snapshot_if_changed(node_id, term)
+        .locked_set_raft_leader_compact(node_id, term)
         .map_err(sinomo_core::network::NetworkError::directory)
 }
 
@@ -1321,6 +1321,35 @@ pub(crate) async fn handle_daemon_cluster_kv_request_async_on_runtime(
     handle_daemon_cluster_kv_request_async_with_forwarding(paths, request, true, runtime).await
 }
 
+pub(crate) async fn handle_daemon_cluster_kv_request_compact_async_on_runtime_with_timeouts(
+    paths: &DaemonPaths,
+    request: sinomo_core::kv::KvTxnRequest,
+    runtime: &tokio::runtime::Handle,
+    timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
+) -> Result<sinomo_core::kv::ClusterKvTxnCompactCommitResult, DaemonError> {
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    let task_runtime = runtime.clone();
+    let mut task = OwnedDaemonTask::new(runtime.spawn(async move {
+        let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+            DaemonClusterRpcMode::from_handle(&task_runtime),
+            timeouts,
+        );
+        sinomo_core::cluster::handle_cluster_kv_txn_request_compact_async_with_host(
+            &task_runtime,
+            &cluster_paths,
+            request,
+            timeouts.kv_txn_quorum_options(true),
+            &mut host,
+        )
+        .await
+        .map_err(DaemonError::from)
+    }));
+    task.join().await.map_err(|source| DaemonError::Network {
+        address: "compact cluster KV quorum commit task".to_string(),
+        detail: source.to_string(),
+    })?
+}
+
 pub(crate) async fn handle_daemon_cluster_kv_authoritative_snapshot_request_async_on_runtime(
     paths: &DaemonPaths,
     body: &[u8],
@@ -1355,6 +1384,78 @@ pub(crate) async fn handle_daemon_cluster_kv_authoritative_snapshot_request_asyn
     })?
 }
 
+pub(crate) async fn handle_daemon_cluster_kv_authoritative_range_prefix_request_async_on_runtime(
+    paths: &DaemonPaths,
+    prefix: String,
+    allow_forwarding: bool,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<sinomo_core::kv::KvEntry>>, DaemonError> {
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    let timeouts = cluster_control_plane_timeouts();
+    let task_runtime = runtime.clone();
+    let mut task = OwnedDaemonTask::new(runtime.spawn(async move {
+        let mut state = sinomo_core::cluster::read_cluster_state_without_kv_async(
+            &task_runtime,
+            &cluster_paths,
+        )
+        .await?;
+        let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+            DaemonClusterRpcMode::from_handle(&task_runtime),
+            timeouts,
+        );
+        sinomo_core::cluster::read_cluster_kv_authoritative_range_prefix_async_with_host(
+            &task_runtime,
+            &cluster_paths,
+            &mut state,
+            prefix,
+            timeouts.kv_txn_quorum_options(allow_forwarding),
+            &mut host,
+        )
+        .await
+        .map_err(DaemonError::from)
+    }));
+    task.join().await.map_err(|source| DaemonError::Network {
+        address: "cluster KV authoritative prefix read task".to_string(),
+        detail: source.to_string(),
+    })?
+}
+
+pub(crate) async fn handle_daemon_cluster_kv_authoritative_entry_request_async_on_runtime(
+    paths: &DaemonPaths,
+    key: String,
+    allow_forwarding: bool,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::kv::KvAuthoritativeRead<Option<sinomo_core::kv::KvEntry>>, DaemonError> {
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    let timeouts = cluster_control_plane_timeouts();
+    let task_runtime = runtime.clone();
+    let mut task = OwnedDaemonTask::new(runtime.spawn(async move {
+        let mut state = sinomo_core::cluster::read_cluster_state_without_kv_async(
+            &task_runtime,
+            &cluster_paths,
+        )
+        .await?;
+        let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+            DaemonClusterRpcMode::from_handle(&task_runtime),
+            timeouts,
+        );
+        sinomo_core::cluster::read_cluster_kv_authoritative_entry_async_with_host(
+            &task_runtime,
+            &cluster_paths,
+            &mut state,
+            key,
+            timeouts.kv_txn_quorum_options(allow_forwarding),
+            &mut host,
+        )
+        .await
+        .map_err(DaemonError::from)
+    }));
+    task.join().await.map_err(|source| DaemonError::Network {
+        address: "cluster KV authoritative point read task".to_string(),
+        detail: source.to_string(),
+    })?
+}
+
 pub(crate) async fn handle_daemon_cluster_kv_request_outcome_request_async_on_runtime(
     paths: &DaemonPaths,
     body: &[u8],
@@ -1362,43 +1463,62 @@ pub(crate) async fn handle_daemon_cluster_kv_request_outcome_request_async_on_ru
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_core::kv::ClusterKvRequestOutcomeRead, DaemonError> {
     let request = sinomo_core::kv::decode_cluster_kv_request_outcome_rpc_request_body(body)?;
-    let barrier = sinomo_core::kv::cluster_kv_authoritative_snapshot_rpc_payload()?;
-    let authoritative = handle_daemon_cluster_kv_authoritative_snapshot_request_async_on_runtime(
-        paths,
-        &barrier.body,
-        allow_forwarding,
-        runtime,
-    )
-    .await?;
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    let kv_paths = cluster_paths.kv_paths();
-    let request_id = request.request_id;
-    let authoritative_snapshot = authoritative.value;
-    let outcome = runtime
-        .spawn_blocking(move || {
-            sinomo_core::kv::resolve_cluster_kv_request_outcome(
-                &kv_paths,
-                &authoritative_snapshot,
-                &request_id,
-            )
-        })
-        .await
-        .map_err(|source| DaemonError::Io {
-            path: cluster_paths.root.display().to_string(),
-            detail: format!("cluster KV request outcome task failed: {source}"),
-        })??;
-    Ok(sinomo_core::kv::ClusterKvRequestOutcomeRead {
-        authority: authoritative.authority,
-        outcome,
-    })
+    let timeouts = cluster_control_plane_timeouts();
+    let mut state =
+        sinomo_core::cluster::read_cluster_state_without_kv_async(runtime, &cluster_paths).await?;
+    let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+        DaemonClusterRpcMode::from_handle(runtime),
+        timeouts,
+    );
+    // The service adapter enables forwarding only for a process-local signer.
+    // The same distinction selects the originating node's attempt ledger:
+    // authenticated forwarded RPCs return retained consensus history only,
+    // then the original node overlays its own durable attempt state.
+    sinomo_core::cluster::read_cluster_kv_request_outcome_async_with_host(
+        runtime,
+        &cluster_paths,
+        &mut state,
+        request.request_id,
+        allow_forwarding,
+        timeouts.kv_txn_quorum_options(allow_forwarding),
+        &mut host,
+    )
+    .await
+    .map_err(DaemonError::from)
 }
 
 pub(crate) async fn handle_forwarded_daemon_cluster_kv_txn_request_async_on_runtime(
     paths: &DaemonPaths,
     request: sinomo_core::kv::KvTxnRequest,
     runtime: &tokio::runtime::Handle,
-) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
-    handle_daemon_cluster_kv_request_async_with_forwarding(paths, request, false, runtime).await
+) -> Result<sinomo_core::kv::ClusterKvTxnRpcResponse, DaemonError> {
+    handle_daemon_cluster_kv_txn_rpc_request_compact_async_on_runtime(
+        paths, request, false, runtime,
+    )
+    .await
+}
+
+pub(crate) async fn handle_daemon_cluster_kv_txn_rpc_request_compact_async_on_runtime(
+    paths: &DaemonPaths,
+    request: sinomo_core::kv::KvTxnRequest,
+    allow_forwarding: bool,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::kv::ClusterKvTxnRpcResponse, DaemonError> {
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+        DaemonClusterRpcMode::from_handle(runtime),
+        cluster_control_plane_timeouts(),
+    );
+    sinomo_core::cluster::handle_forwarded_cluster_kv_txn_rpc_request_compact_async_with_host(
+        runtime,
+        &cluster_paths,
+        request,
+        cluster_kv_txn_quorum_options(allow_forwarding),
+        &mut host,
+    )
+    .await
+    .map_err(Into::into)
 }
 
 async fn handle_daemon_cluster_kv_request_async_with_forwarding(
@@ -9640,6 +9760,45 @@ mod tests {
         let daemon_paths = DaemonPaths::new(&data_dir);
         let cluster_paths = ClusterPaths::new(&data_dir);
         cluster_paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_kv_outcome_no_quorum").expect("cluster");
+        let local = NodeId::from_legacy_named("node_daemon_kv_outcome_local").expect("local");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "request outcome no quorum",
+            local,
+            "local",
+            "pk-local",
+            now,
+        );
+        for (node_id, name) in [
+            (
+                NodeId::from_legacy_named("node_daemon_kv_outcome_second").expect("second"),
+                "second",
+            ),
+            (
+                NodeId::from_legacy_named("node_daemon_kv_outcome_third").expect("third"),
+                "third",
+            ),
+        ] {
+            state.members.push(ClusterMemberRecord::local_voter(
+                cluster_id.clone(),
+                node_id,
+                name,
+                format!("pk-{name}"),
+                now,
+            ));
+        }
+        for member in &mut state.members {
+            let capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+            member.capabilities = capabilities.clone();
+            member.allowed_capabilities = capabilities;
+        }
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+            .expect("seed cluster raft config");
         let request = sinomo_core::kv::KvCommandRequest::generated(KvCommand::Barrier);
         sinomo_core::kv::mark_cluster_kv_request_rejected_before_commit(
             &cluster_paths.kv_paths(),
@@ -9669,7 +9828,10 @@ mod tests {
             )
             .expect_err("local attempt state must not bypass authority");
 
-        assert!(matches!(error, DaemonError::ClusterReadOnly { .. }));
+        assert!(
+            matches!(error, DaemonError::ClusterReadOnly { .. }),
+            "unexpected request-outcome failure: {error:?}"
+        );
     }
 
     #[test]

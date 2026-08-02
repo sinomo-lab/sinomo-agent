@@ -7,7 +7,7 @@ use crate::prelude::*;
 #[allow(unused_imports)]
 use sinomo_kv::KvError;
 use sinomo_kv::{ClusterKvRaftLocalVoteMetadata, ClusterRaftVoteRequest, ClusterRaftVoteResponse};
-use sinomo_kv::{KvSnapshot, RaftRequestVoteRequest, RaftRequestVoteResponse};
+use sinomo_kv::{RaftRequestVoteRequest, RaftRequestVoteResponse};
 use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
@@ -378,7 +378,7 @@ pub(crate) fn locked_observe_cluster_raft_term(
 ) -> Result<bool, NetworkError> {
     paths
         .kv_paths()
-        .locked_observe_raft_term_and_write_snapshot_if_changed(node_id, term)
+        .locked_observe_raft_term_compact(node_id, term)
         .map_err(kv_err)
 }
 
@@ -386,10 +386,10 @@ pub fn locked_set_cluster_raft_leader(
     paths: &ClusterPaths,
     node_id: &NodeId,
     term: u64,
-) -> Result<KvSnapshot, NetworkError> {
+) -> Result<(), NetworkError> {
     paths
         .kv_paths()
-        .locked_set_raft_leader_and_write_snapshot_if_changed(node_id, term)
+        .locked_set_raft_leader_compact(node_id, term)
         .map_err(kv_err)
 }
 

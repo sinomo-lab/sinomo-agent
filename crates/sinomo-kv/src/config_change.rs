@@ -276,9 +276,29 @@ pub fn cluster_kv_raft_peer_progress_next_index_hint(
     current_term: u64,
     last_local_log_index: u64,
 ) -> Option<u64> {
-    let hint = read_cluster_kv_raft_peer_progress(paths)
-        .ok()?
-        .into_iter()
+    let hints = read_cluster_kv_raft_peer_progress(paths).ok()?;
+    cluster_kv_raft_peer_progress_next_index_hint_from_records(
+        &hints,
+        peer_node_id,
+        current_term,
+        last_local_log_index,
+    )
+}
+
+/// Resolves one discardable catch-up hint from an already loaded ledger.
+///
+/// Quorum replication prepares every voter in one wave. Loading and decoding
+/// the same bounded ledger once per voter turns that preparation into needless
+/// serial I/O, so callers that need several hints should read the ledger once
+/// and reuse this pure validator for every target.
+pub fn cluster_kv_raft_peer_progress_next_index_hint_from_records(
+    hints: &[ClusterKvRaftPeerProgress],
+    peer_node_id: &NodeId,
+    current_term: u64,
+    last_local_log_index: u64,
+) -> Option<u64> {
+    let hint = hints
+        .iter()
         .find(|hint| hint.peer_node_id == *peer_node_id)?;
     let expected_next_index = hint.match_index.checked_add(1)?;
     let last_local_next_index = last_local_log_index.saturating_add(1);

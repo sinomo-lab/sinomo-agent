@@ -38,7 +38,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicU8, Ordering},
+    atomic::{AtomicU8, AtomicU64, Ordering},
 };
 #[cfg(test)]
 use std::thread;
@@ -70,6 +70,7 @@ const DAEMON_RUNTIME_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_NETWORK_MODULE_CONTEXT_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_RUNTIME_TASK_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const DAEMON_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const DAEMON_CONNECTIVITY_EXTERNAL_SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(100);
 const DAEMON_SANDBOX_STREAM_CHANNEL_CAPACITY: usize = 64;
 const DAEMON_SANDBOX_SESSION_BODY_BUFFER_BYTES: usize = 256 * 1024;
 const DAEMON_SANDBOX_LOCK_ANCHOR_CONTENT: &[u8] = b"sinomo-sandbox-lifecycle-lock-v1\n";
@@ -483,8 +484,23 @@ impl DaemonConnectivityTopologyProjection {
         let first_new = snapshot
             .events
             .partition_point(|event| event.revision.0 <= revision);
+        let new_events = &snapshot.events[first_new..];
+        if !daemon_connectivity_events_cover_revision_range(
+            revision,
+            snapshot.revision.0,
+            new_events,
+        ) {
+            let next = daemon_connectivity_topology_projection_from_snapshot(
+                snapshot,
+                self.include_connectivity_records,
+            );
+            let changed = daemon_connectivity_projection_change(&self.values, &next);
+            self.values = next;
+            self.revision = Some(snapshot.revision.0);
+            return changed;
+        }
         let mut before = BTreeMap::new();
-        for event in &snapshot.events[first_new..] {
+        for event in new_events {
             if !daemon_connectivity_topology_key(&event.key, self.include_connectivity_records) {
                 continue;
             }
@@ -512,6 +528,100 @@ impl DaemonConnectivityTopologyProjection {
         }
         changed
     }
+
+    /// Applies one complete process-local commit delta.
+    ///
+    /// `None` requests a full resident projection rebuild. This is deliberately
+    /// conservative around startup races, compacted history, or a revision gap:
+    /// a partial topology image is worse than paying one exceptional O(N)
+    /// rebuild. The ordinary in-order path touches only the command's final key
+    /// states.
+    fn observe_delta(
+        &mut self,
+        delta: &sinomo_core::kv::ClusterKvCommittedDelta,
+    ) -> Option<DaemonConnectivityProjectionChange> {
+        let revision = self.revision?;
+        if delta.revision.0 <= revision {
+            return Some(DaemonConnectivityProjectionChange::default());
+        }
+        if revision < delta.compacted_revision.0 || delta.events.is_empty() {
+            return None;
+        }
+        if !daemon_connectivity_events_cover_revision_range(
+            revision,
+            delta.revision.0,
+            &delta.events,
+        ) {
+            return None;
+        }
+
+        let relevant_event_keys = delta
+            .events
+            .iter()
+            .filter(|event| {
+                daemon_connectivity_topology_key(&event.key, self.include_connectivity_records)
+            })
+            .map(|event| event.key.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut final_keys = BTreeSet::new();
+        let mut relevant_final_keys = BTreeSet::new();
+        for state in &delta.final_key_states {
+            if !final_keys.insert(state.key.as_str())
+                || state
+                    .entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.key != state.key)
+            {
+                return None;
+            }
+            if daemon_connectivity_topology_key(&state.key, self.include_connectivity_records) {
+                relevant_final_keys.insert(state.key.as_str());
+            }
+        }
+        if relevant_event_keys != relevant_final_keys {
+            return None;
+        }
+
+        let mut changed = DaemonConnectivityProjectionChange::default();
+        for state in &delta.final_key_states {
+            if !daemon_connectivity_topology_key(&state.key, self.include_connectivity_records) {
+                continue;
+            }
+            let previous = self.values.get(&state.key).cloned();
+            match state.entry.as_ref() {
+                Some(entry) => {
+                    self.values.insert(
+                        state.key.clone(),
+                        daemon_connectivity_topology_value(&state.key, &entry.value),
+                    );
+                }
+                None => {
+                    self.values.remove(&state.key);
+                }
+            }
+            if previous != self.values.get(&state.key).cloned() {
+                changed.record_key(&state.key);
+            }
+        }
+        self.revision = Some(delta.revision.0);
+        Some(changed)
+    }
+}
+
+fn daemon_connectivity_events_cover_revision_range(
+    previous_revision: u64,
+    current_revision: u64,
+    events: &[sinomo_core::kv::KvEvent],
+) -> bool {
+    current_revision <= previous_revision
+        || (events.first().map(|event| event.revision.0)
+            == Some(previous_revision.saturating_add(1))
+            && events.last().map(|event| event.revision.0) == Some(current_revision)
+            && events.windows(2).all(|events| {
+                let previous = events[0].revision.0;
+                let current = events[1].revision.0;
+                current == previous || current == previous.saturating_add(1)
+            }))
 }
 
 fn daemon_connectivity_projection_change(
@@ -589,60 +699,253 @@ fn daemon_connectivity_record_key(key: &str) -> bool {
     key.starts_with("/cluster/network/connectivity/")
 }
 
+struct DaemonConnectivityTopologySubscriptions {
+    _snapshot_subscription: sinomo_core::cluster::ClusterKvCommittedSnapshotSubscription,
+    _delta_subscription: sinomo_core::cluster::ClusterKvCommittedDeltaSubscription,
+    _external_snapshot_watcher: notify::RecommendedWatcher,
+    // The callbacks retain this too. Keeping it here makes the ownership
+    // explicit and lets focused tests inspect the independent observer.
+    _projection: Arc<Mutex<DaemonConnectivityTopologyProjection>>,
+}
+
+#[derive(Clone)]
+struct DaemonConnectivityTopologyObserver {
+    cluster_paths: sinomo_core::network::ClusterPaths,
+    daemon_paths: DaemonPaths,
+    runtime: tokio::runtime::Handle,
+    projection: Arc<Mutex<DaemonConnectivityTopologyProjection>>,
+    wake_default_dfs: bool,
+}
+
+impl DaemonConnectivityTopologyObserver {
+    fn observe_snapshot(&self, snapshot: &sinomo_core::kv::KvSnapshot, source: &'static str) {
+        let changed = self
+            .projection
+            .lock()
+            .map(|mut projection| projection.observe(snapshot))
+            .unwrap_or(DaemonConnectivityProjectionChange {
+                probe_inputs_changed: true,
+                route_generation_changed: true,
+            });
+        self.publish_change(changed, source, snapshot.revision.0);
+    }
+
+    fn observe_delta(&self, delta: &sinomo_core::kv::ClusterKvCommittedDelta) {
+        let observed = self
+            .projection
+            .lock()
+            .map(|mut projection| projection.observe_delta(delta));
+        match observed {
+            Ok(Some(changed)) => {
+                self.publish_change(changed, "committed connectivity delta", delta.revision.0)
+            }
+            Ok(None) => self.rebuild_after_delta_gap(delta),
+            Err(_) => self.publish_change(
+                DaemonConnectivityProjectionChange {
+                    probe_inputs_changed: true,
+                    route_generation_changed: true,
+                },
+                "poisoned committed connectivity delta projection",
+                delta.revision.0,
+            ),
+        }
+    }
+
+    fn rebuild_after_delta_gap(&self, delta: &sinomo_core::kv::ClusterKvCommittedDelta) {
+        tracing::warn!(
+            observed_revision = self
+                .projection
+                .lock()
+                .ok()
+                .and_then(|projection| projection.revision),
+            delta_revision = delta.revision.0,
+            compacted_revision = delta.compacted_revision.0,
+            "connectivity topology delta has no continuous baseline; rebuilding its resident projection"
+        );
+        match sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(
+            &self.cluster_paths,
+        ) {
+            Ok(Some(snapshot)) => {
+                self.observe_snapshot(snapshot.as_ref(), "rebuilt committed connectivity snapshot")
+            }
+            Ok(None) => self.publish_change(
+                DaemonConnectivityProjectionChange {
+                    probe_inputs_changed: true,
+                    route_generation_changed: true,
+                },
+                "missing committed connectivity rebuild snapshot",
+                delta.revision.0,
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    "connectivity topology delta gap could not rebuild its resident projection: {error}"
+                );
+                self.publish_change(
+                    DaemonConnectivityProjectionChange {
+                        probe_inputs_changed: true,
+                        route_generation_changed: true,
+                    },
+                    "failed committed connectivity rebuild snapshot",
+                    delta.revision.0,
+                );
+            }
+        }
+    }
+
+    fn publish_change(
+        &self,
+        changed: DaemonConnectivityProjectionChange,
+        source: &'static str,
+        generation: u64,
+    ) {
+        if changed.probe_inputs_changed {
+            request_daemon_cluster_maintenance(
+                DaemonClusterMaintenanceReason::CommittedConnectivityTopologyChanged,
+            );
+        }
+        if changed.route_generation_changed && self.wake_default_dfs {
+            notify_daemon_dfs_metadata_publish_route_generation(
+                &self.daemon_paths,
+                &self.runtime,
+                source,
+                generation,
+            );
+        }
+    }
+}
+
+fn daemon_connectivity_topology_snapshot_watcher(
+    cluster_paths: &sinomo_core::network::ClusterPaths,
+    observer: DaemonConnectivityTopologyObserver,
+) -> Result<notify::RecommendedWatcher, DaemonError> {
+    let snapshot_path = cluster_paths.kv_paths().snapshot;
+    let callback_snapshot_path = snapshot_path.clone();
+    let callback_cluster_paths = cluster_paths.clone();
+    let callback_runtime = observer.runtime.clone();
+    let event_generation = Arc::new(AtomicU64::new(0));
+    let mut watcher = notify::recommended_watcher(
+        move |result: Result<notify::Event, notify::Error>| match result {
+            Ok(event)
+                if event
+                    .paths
+                    .iter()
+                    .any(|path| path == &callback_snapshot_path) =>
+            {
+                let event_id = event_generation
+                    .fetch_add(1, Ordering::AcqRel)
+                    .saturating_add(1);
+                let event_generation = Arc::clone(&event_generation);
+                let cluster_paths = callback_cluster_paths.clone();
+                let snapshot_path = callback_snapshot_path.clone();
+                let observer = observer.clone();
+                callback_runtime.spawn(async move {
+                    tokio::time::sleep(DAEMON_CONNECTIVITY_EXTERNAL_SNAPSHOT_DEBOUNCE).await;
+                    if event_generation.load(Ordering::Acquire) != event_id {
+                        return;
+                    }
+                    // The writer's process-local observer cannot invalidate a
+                    // shadow daemon's caches. Invalidate before sampling the
+                    // shared critical projection so every later route/state
+                    // read is forced through the new generation.
+                    sinomo_core::cluster::invalidate_cluster_kv_observed_read_models(
+                        &cluster_paths,
+                    );
+                    match sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(
+                        &cluster_paths,
+                    ) {
+                        Ok(Some(snapshot)) => observer.observe_snapshot(
+                            snapshot.as_ref(),
+                            "external committed connectivity snapshot",
+                        ),
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(
+                            path = %snapshot_path.display(),
+                            "committed connectivity snapshot change could not be read: {error}"
+                        ),
+                    }
+                });
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                path = %callback_snapshot_path.display(),
+                "committed connectivity snapshot watcher failed: {error}"
+            ),
+        },
+    )
+    .map_err(|source| DaemonError::Network {
+        address: snapshot_path.display().to_string(),
+        detail: format!("cannot watch committed connectivity snapshot: {source}"),
+    })?;
+    let watch_root = snapshot_path.parent().ok_or_else(|| DaemonError::Network {
+        address: snapshot_path.display().to_string(),
+        detail: "committed connectivity snapshot has no parent directory".to_string(),
+    })?;
+    notify::Watcher::watch(
+        &mut watcher,
+        watch_root,
+        notify::RecursiveMode::NonRecursive,
+    )
+    .map_err(|source| DaemonError::Network {
+        address: watch_root.display().to_string(),
+        detail: format!("cannot watch committed connectivity snapshot directory: {source}"),
+    })?;
+    Ok(watcher)
+}
+
 fn subscribe_daemon_connectivity_topology_sources(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
     wake_default_dfs: bool,
-) -> Result<sinomo_core::cluster::ClusterKvCommittedSnapshotSubscription, DaemonError> {
+) -> Result<DaemonConnectivityTopologySubscriptions, DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
     let projection = Arc::new(Mutex::new(DaemonConnectivityTopologyProjection::new(
         wake_default_dfs,
     )));
-    let callback_projection = Arc::clone(&projection);
-    let callback_paths = paths.clone();
-    let callback_runtime = runtime.clone();
-    let subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_snapshots(
+    let observer = DaemonConnectivityTopologyObserver {
+        cluster_paths: cluster_paths.clone(),
+        daemon_paths: paths.clone(),
+        runtime: runtime.clone(),
+        projection: Arc::clone(&projection),
+        wake_default_dfs,
+    };
+    let snapshot_observer = observer.clone();
+    let snapshot_subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_snapshots(
         &cluster_paths,
         move |snapshot| {
-            let changed = callback_projection
-                .lock()
-                .map(|mut projection| projection.observe(snapshot))
-                .unwrap_or(DaemonConnectivityProjectionChange {
-                    probe_inputs_changed: true,
-                    route_generation_changed: true,
-                });
-            if changed.probe_inputs_changed {
-                request_daemon_cluster_maintenance(
-                    DaemonClusterMaintenanceReason::CommittedConnectivityTopologyChanged,
-                );
-            }
-            if changed.route_generation_changed && wake_default_dfs {
-                notify_daemon_dfs_metadata_publish_route_generation(
-                    &callback_paths,
-                    &callback_runtime,
-                    "committed connectivity directory",
-                    snapshot.revision.0,
-                );
-            }
+            snapshot_observer.observe_snapshot(snapshot, "committed connectivity snapshot")
         },
     );
+    let delta_observer = observer.clone();
+    let delta_subscription =
+        sinomo_core::cluster::subscribe_cluster_kv_committed_deltas(&cluster_paths, move |delta| {
+            delta_observer.observe_delta(delta)
+        });
+    let external_snapshot_watcher =
+        daemon_connectivity_topology_snapshot_watcher(&cluster_paths, observer)?;
     // Close the register/read race without creating a synthetic startup wake:
     // the maintenance owner already performs one startup reconciliation, and
-    // a callback that won the race keeps its newer revision.
-    match sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(
-        &cluster_paths,
-    ) {
-        Ok(Some(snapshot)) => {
-            if let Ok(mut projection) = projection.lock() {
-                projection.seed_if_newer(&snapshot);
+    // callbacks are blocked on this projection lock until the coherent sample
+    // is installed. A callback that won the lock first is included by the
+    // subsequent resident read.
+    if let Ok(mut projection_guard) = projection.lock() {
+        match sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(
+            &cluster_paths,
+        ) {
+            Ok(Some(snapshot)) => {
+                projection_guard.seed_if_newer(&snapshot);
             }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                "connectivity topology observation started without an initial KV projection: {error}"
+            ),
         }
-        Ok(None) => {}
-        Err(error) => tracing::warn!(
-            "connectivity topology observation started without an initial KV projection: {error}"
-        ),
     }
-    Ok(subscription)
+    Ok(DaemonConnectivityTopologySubscriptions {
+        _snapshot_subscription: snapshot_subscription,
+        _delta_subscription: delta_subscription,
+        _external_snapshot_watcher: external_snapshot_watcher,
+        _projection: projection,
+    })
 }
 
 fn notify_daemon_dfs_metadata_publish_route_generation(
@@ -2103,9 +2406,7 @@ async fn run_daemon_background_maintenance_loop(
     service_registry: sinomo_core::service::ServiceRegistrySnapshotStore,
     runtime: tokio::runtime::Handle,
     startup_cluster: Option<DaemonClusterStatus>,
-    connectivity_topology_subscription: Option<
-        sinomo_core::cluster::ClusterKvCommittedSnapshotSubscription,
-    >,
+    connectivity_topology_subscription: Option<DaemonConnectivityTopologySubscriptions>,
     maintain_cluster_runtime: bool,
     maintain_default_dfs: bool,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -7036,6 +7337,245 @@ mod tests {
             },
             "a committed reachability change must wake retained DFS lanes without feedback probing"
         );
+    }
+
+    #[test]
+    fn connectivity_revision_coverage_accepts_multi_key_transaction_revision() {
+        use sinomo_core::kv::{KvEvent, KvEventKind, KvRevision};
+
+        let events = vec![
+            KvEvent {
+                revision: KvRevision(8),
+                key: "/cluster/members/first".to_string(),
+                kind: KvEventKind::Delete,
+            },
+            KvEvent {
+                revision: KvRevision(8),
+                key: "/cluster/endpoints/second".to_string(),
+                kind: KvEventKind::Delete,
+            },
+        ];
+
+        assert!(daemon_connectivity_events_cover_revision_range(
+            7, 8, &events
+        ));
+    }
+
+    #[test]
+    fn committed_route_projection_applies_complete_delta_and_rebuilds_gaps() {
+        use sinomo_core::kv::{
+            ClusterKvCommittedDelta, ClusterKvCommittedKeyState, KvEntry, KvEvent, KvEventKind,
+            KvRevision, KvSnapshot, KvVersion, encode_kv_value,
+        };
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = sinomo_core::node::ClusterId::generate();
+        let remote_node = NodeId::generate();
+        let member_key = sinomo_core::node::cluster_member_key(&remote_node);
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote_node.clone(),
+            "remote",
+            "public-key",
+            now,
+        );
+        let initial_value = encode_kv_value(&member).expect("initial member");
+        let initial_entry = KvEntry {
+            key: member_key.clone(),
+            value: initial_value,
+            create_revision: KvRevision(1),
+            modify_revision: KvRevision(1),
+            version: KvVersion(1),
+            lease_id: None,
+        };
+        let mut projection = DaemonConnectivityTopologyProjection::default();
+        projection.seed_if_newer(&KvSnapshot {
+            revision: KvRevision(1),
+            compacted_revision: KvRevision::ZERO,
+            entries: vec![initial_entry],
+            leases: Vec::new(),
+            events: Vec::new(),
+            committed_requests: Vec::new(),
+            expired_requests: Vec::new(),
+        });
+
+        member.endpoints = vec![sinomo_core::network::daemon_lan_endpoint(
+            &remote_node,
+            "127.0.0.1:42002".to_string(),
+            10,
+        )];
+        let changed_value = encode_kv_value(&member).expect("changed member");
+        let changed_entry = KvEntry {
+            key: member_key.clone(),
+            value: changed_value.clone(),
+            create_revision: KvRevision(1),
+            modify_revision: KvRevision(2),
+            version: KvVersion(2),
+            lease_id: None,
+        };
+        let delta = ClusterKvCommittedDelta {
+            revision: KvRevision(2),
+            compacted_revision: KvRevision::ZERO,
+            events: vec![KvEvent {
+                revision: KvRevision(2),
+                key: member_key.clone(),
+                kind: KvEventKind::Put {
+                    value: changed_value,
+                },
+            }],
+            final_key_states: vec![ClusterKvCommittedKeyState {
+                key: member_key.clone(),
+                entry: Some(changed_entry),
+            }],
+        };
+        assert_eq!(
+            projection.observe_delta(&delta),
+            Some(DaemonConnectivityProjectionChange {
+                probe_inputs_changed: true,
+                route_generation_changed: true,
+            })
+        );
+        assert_eq!(projection.revision, Some(2));
+        assert_eq!(
+            projection.observe_delta(&delta),
+            Some(DaemonConnectivityProjectionChange::default()),
+            "an equal delta must not retrigger or regress the projection"
+        );
+
+        let mut gapped = delta.clone();
+        gapped.revision = KvRevision(4);
+        gapped.events[0].revision = KvRevision(4);
+        gapped.final_key_states[0]
+            .entry
+            .as_mut()
+            .expect("put state")
+            .modify_revision = KvRevision(4);
+        assert_eq!(
+            projection.observe_delta(&gapped),
+            None,
+            "a missing revision must request a conservative full rebuild"
+        );
+        assert_eq!(projection.revision, Some(2));
+
+        let mut compacted = delta;
+        compacted.revision = KvRevision(3);
+        compacted.compacted_revision = KvRevision(3);
+        compacted.events[0].revision = KvRevision(3);
+        assert_eq!(
+            projection.observe_delta(&compacted),
+            None,
+            "a delta beyond the retained baseline must request a full rebuild"
+        );
+        assert_eq!(projection.revision, Some(2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn external_critical_snapshot_advances_separate_connectivity_observer_once() {
+        let root = sinomo_testdir::TestDir::new("daemon-connectivity-external-critical-snapshot");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data layout");
+        let daemon_paths = DaemonPaths::new(&data_dir);
+        daemon_paths.ensure().expect("daemon paths");
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let local_node =
+            NodeId::from_legacy_named("node_connectivity_external_snapshot").expect("local node");
+        let cluster_id = sinomo_core::node::ClusterId::from_legacy_named(
+            "cluster_connectivity_external_snapshot",
+        )
+        .expect("cluster id");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "external connectivity snapshot",
+            local_node.clone(),
+            "local",
+            "local-public-key",
+            OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("initial cluster KV");
+
+        let subscriptions = subscribe_daemon_connectivity_topology_sources(
+            &daemon_paths,
+            &tokio::runtime::Handle::current(),
+            false,
+        )
+        .expect("connectivity topology subscriptions");
+        let initial_revision = subscriptions
+            ._projection
+            .lock()
+            .expect("initial projection")
+            .revision
+            .expect("initial revision");
+
+        let current = sinomo_core::cluster::read_cluster_kv_current_snapshot(&cluster_paths)
+            .expect("current cluster KV");
+        let stale_snapshot = current.clone();
+        let mut external_store =
+            sinomo_core::kv::InProcessKvStore::restore(current).expect("external store");
+        let member_key = sinomo_core::node::cluster_member_key(&local_node);
+        let mut member = state.members[0].clone();
+        member.endpoints = vec![sinomo_core::network::daemon_lan_endpoint(
+            &local_node,
+            "127.0.0.1:43002".to_string(),
+            20,
+        )];
+        external_store
+            .put_serde(member_key.clone(), &member, None)
+            .expect("external critical member update");
+        let external_snapshot = external_store.snapshot().expect("external snapshot");
+        assert!(external_snapshot.revision.0 > initial_revision);
+
+        // Deliberately bypass sinomo-cluster's in-process observers. Only the
+        // shared materialized-snapshot watcher can deliver this generation to
+        // the retained connectivity projection, matching a main/shadow split.
+        let external_write_at = Instant::now();
+        sinomo_core::kv::write_cluster_kv_snapshot(&cluster_paths.kv_paths(), &external_snapshot)
+            .expect("external critical snapshot write");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let observed = subscriptions
+                ._projection
+                .lock()
+                .expect("observed projection")
+                .revision;
+            if observed == Some(external_snapshot.revision.0) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "separate connectivity observer did not see the newer critical snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            external_write_at.elapsed()
+                >= DAEMON_CONNECTIVITY_EXTERNAL_SNAPSHOT_DEBOUNCE
+                    .saturating_sub(Duration::from_millis(20)),
+            "the update must arrive through the debounced cross-process watcher"
+        );
+
+        let mut projection = subscriptions._projection.lock().expect("final projection");
+        assert!(matches!(
+            projection.values.get(&member_key),
+            Some(DaemonConnectivityTopologyValue::Member(member))
+                if member.endpoints.iter().any(|endpoint| endpoint.address == "127.0.0.1:43002")
+        ));
+        let observed_values = projection.values.clone();
+        assert_eq!(
+            projection.observe(&external_snapshot),
+            DaemonConnectivityProjectionChange::default(),
+            "an equal shared snapshot must not retrigger the observer"
+        );
+        assert!(stale_snapshot.revision < external_snapshot.revision);
+        assert_eq!(
+            projection.observe(&stale_snapshot),
+            DaemonConnectivityProjectionChange::default(),
+            "a stale shared snapshot must not regress or retrigger the observer"
+        );
+        assert_eq!(projection.revision, Some(external_snapshot.revision.0));
+        assert_eq!(projection.values, observed_values);
     }
 
     #[tokio::test]

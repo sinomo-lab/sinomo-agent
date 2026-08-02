@@ -1,6 +1,8 @@
 use crate::connectivity_publish::cluster_connectivity_publish_record_matches;
 use crate::keyspace::cluster_connectivity_key;
-use crate::kv_snapshot_observer::notify_cluster_kv_committed_snapshot_observers;
+use crate::kv_snapshot_observer::{
+    notify_cluster_kv_committed_delta_observers, notify_cluster_kv_committed_snapshot_observers,
+};
 use crate::local_state_store::read_cluster_state_without_kv;
 #[allow(unused_imports)]
 use sinomo_kv::KvError;
@@ -14,9 +16,10 @@ use sinomo_base::ClusterBootstrapState;
 #[cfg(any(test, feature = "test-support"))]
 use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvWalPaths};
 use sinomo_kv::{
-    ClusterKvRaftCommitResult, ClusterRaftAppendRequest, DurableRaftKvNode, InProcessKvStore,
-    KvCommand, KvCommandRequest, KvCommittedRequestRecord, KvEntry, KvLocalCache, KvLogEntry, KvOp,
-    KvRevision, KvSnapshot, KvTxnResponse, RaftAppendEntriesRequest, RaftAppendEntriesResponse,
+    ClusterKvCommittedDelta, ClusterKvCommittedKeyState, ClusterKvRaftCommitResult,
+    ClusterRaftAppendRequest, DurableRaftKvNode, InProcessKvStore, KvCommand, KvCommandRequest,
+    KvCommittedRequestRecord, KvEntry, KvEvent, KvLocalCache, KvLogEntry, KvOp, KvRevision,
+    KvSnapshot, KvTxnResponse, RaftAppendEntriesRequest, RaftAppendEntriesResponse,
     RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot,
 };
 use sinomo_node::NodeId;
@@ -320,9 +323,17 @@ pub(crate) fn observe_cluster_kv_snapshot_write(
     wrote: bool,
     snapshot: Option<&KvSnapshot>,
 ) {
-    if wrote {
-        crate::local_state_store::invalidate_cluster_state_cache(paths);
-        sinomo_network::invalidate_cluster_route_graph_cache(paths);
+    observe_cluster_kv_snapshot_write_with_invalidation(paths, wrote, snapshot, true);
+}
+
+fn observe_cluster_kv_snapshot_write_with_invalidation(
+    paths: &ClusterPaths,
+    wrote: bool,
+    snapshot: Option<&KvSnapshot>,
+    invalidate_on_write: bool,
+) {
+    if wrote && invalidate_on_write {
+        invalidate_cluster_kv_observed_read_models(paths);
     }
     if let Some(observer) = io_observer() {
         if wrote {
@@ -337,6 +348,102 @@ pub(crate) fn observe_cluster_kv_snapshot_write(
     if let Some(snapshot) = snapshot {
         notify_cluster_kv_committed_snapshot_observers(paths, snapshot);
     }
+}
+
+fn observe_cluster_kv_committed_delta(
+    paths: &ClusterPaths,
+    revision: KvRevision,
+    compacted_revision: KvRevision,
+    events: Vec<KvEvent>,
+    final_key_states: Vec<ClusterKvCommittedKeyState>,
+    invalidate_read_models: bool,
+) {
+    if invalidate_read_models {
+        invalidate_cluster_kv_observed_read_models_for_events(paths, &events);
+    }
+    notify_cluster_kv_committed_delta_observers(
+        paths,
+        &ClusterKvCommittedDelta {
+            revision,
+            compacted_revision,
+            events,
+            final_key_states,
+        },
+    );
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ClusterKvObservedReadModelInvalidation {
+    cluster_state: bool,
+    route_graph: bool,
+}
+
+#[cfg(test)]
+static CLUSTER_KV_OBSERVED_READ_MODEL_INVALIDATIONS_FOR_TEST: LazyLock<
+    Mutex<HashMap<PathBuf, (u64, u64)>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn cluster_kv_observed_read_model_invalidation_for_events(
+    events: &[KvEvent],
+) -> ClusterKvObservedReadModelInvalidation {
+    let mut invalidation = ClusterKvObservedReadModelInvalidation::default();
+    for event in events {
+        let key = event.key.as_str();
+        if key.starts_with("/cluster/members/")
+            || key.starts_with("/cluster/endpoints/")
+            || key.starts_with("/cluster/policy/capabilities/")
+        {
+            invalidation.cluster_state = true;
+            invalidation.route_graph = true;
+        } else if key.starts_with("/cluster/network/connectivity/") {
+            invalidation.route_graph = true;
+        }
+        if invalidation.cluster_state && invalidation.route_graph {
+            break;
+        }
+    }
+    invalidation
+}
+
+fn invalidate_cluster_kv_observed_read_models_for_events(paths: &ClusterPaths, events: &[KvEvent]) {
+    let invalidation = cluster_kv_observed_read_model_invalidation_for_events(events);
+    invalidate_cluster_kv_observed_read_models_selective(paths, invalidation);
+}
+
+fn invalidate_cluster_kv_observed_read_models_selective(
+    paths: &ClusterPaths,
+    invalidation: ClusterKvObservedReadModelInvalidation,
+) {
+    #[cfg(test)]
+    if let Ok(mut counts) = CLUSTER_KV_OBSERVED_READ_MODEL_INVALIDATIONS_FOR_TEST.lock() {
+        let counts = counts.entry(paths.root.clone()).or_default();
+        counts.0 = counts
+            .0
+            .saturating_add(u64::from(invalidation.cluster_state));
+        counts.1 = counts.1.saturating_add(u64::from(invalidation.route_graph));
+    }
+    if invalidation.cluster_state {
+        crate::local_state_store::invalidate_cluster_state_cache(paths);
+    }
+    if invalidation.route_graph {
+        sinomo_network::invalidate_cluster_route_graph_cache(paths);
+    }
+}
+
+/// Invalidates process-local projections derived from the committed cluster KV.
+///
+/// Local commit observers call this directly. A daemon watching the shared
+/// materialized snapshot also calls it when another process publishes a newer
+/// critical projection, because process-local observer callbacks cannot cross
+/// the main/shadow process boundary.
+pub fn invalidate_cluster_kv_observed_read_models(paths: &ClusterPaths) {
+    invalidate_cluster_kv_observed_read_models_selective(
+        paths,
+        ClusterKvObservedReadModelInvalidation {
+            cluster_state: true,
+            route_graph: true,
+        },
+    );
 }
 
 fn imported_snapshot_requires_route_read_model_materialization(
@@ -762,22 +869,33 @@ pub fn apply_cluster_raft_append(
     snapshot: Option<RaftSnapshot>,
     append: RaftAppendEntriesRequest,
 ) -> Result<RaftAppendEntriesResponse, NetworkError> {
-    let (response, wrote) = paths
+    let (outcome, wrote) = paths
         .kv_paths()
-        .apply_raft_append_with_response_and_publish_report(
-            node_id,
-            snapshot,
-            append,
-            sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
-        )
+        .apply_raft_append_compact_with_publish_report(node_id, snapshot, append)
         .map_err(kv_err)?;
-    let observed = sinomo_kv::read_cluster_kv_current_snapshot_arc_for_node(
-        &paths.kv_paths(),
-        node_id.clone(),
-    )
-    .ok();
-    observe_cluster_kv_snapshot_write(paths, wrote, observed.as_deref());
-    Ok(response)
+    let observed = outcome
+        .restored_snapshot
+        .as_ref()
+        .or(outcome.checkpoint_snapshot.as_ref());
+    let restored_snapshot = outcome.restored_snapshot.is_some();
+    let snapshot_invalidates_read_models = wrote && (!outcome.commit_advanced || restored_snapshot);
+    observe_cluster_kv_snapshot_write_with_invalidation(
+        paths,
+        wrote,
+        observed,
+        !outcome.commit_advanced || restored_snapshot,
+    );
+    if outcome.commit_advanced {
+        observe_cluster_kv_committed_delta(
+            paths,
+            outcome.read_state.revision,
+            outcome.compacted_revision,
+            outcome.committed_events,
+            outcome.final_key_states,
+            !snapshot_invalidates_read_models,
+        );
+    }
+    Ok(outcome.response)
 }
 
 pub(crate) fn locked_apply_cluster_raft_vote(
@@ -789,6 +907,54 @@ pub(crate) fn locked_apply_cluster_raft_vote(
         .kv_paths()
         .locked_apply_raft_vote(node_id, vote)
         .map_err(kv_err)
+}
+
+pub(crate) struct LocalClusterRaftPostCommitObservations {
+    paths: ClusterPaths,
+    snapshot_write: Option<(bool, KvSnapshot)>,
+    delta: Option<ClusterKvCommittedDelta>,
+    watcher_events: Option<Vec<KvEvent>>,
+}
+
+impl LocalClusterRaftPostCommitObservations {
+    pub(crate) fn publish(self) {
+        let Self {
+            paths,
+            snapshot_write,
+            delta,
+            watcher_events,
+        } = self;
+        let has_delta = delta.is_some();
+        if let Some(delta) = delta {
+            observe_cluster_kv_committed_delta(
+                &paths,
+                delta.revision,
+                delta.compacted_revision,
+                delta.events,
+                delta.final_key_states,
+                true,
+            );
+        }
+        if let Some((wrote, snapshot)) = snapshot_write {
+            // A normal compact commit invalidates only the projections touched
+            // by its exact event keys. Snapshot publication is still observed,
+            // but must not invalidate the same caches a second time. Exact
+            // replay repair has no delta, so conservatively invalidate both.
+            observe_cluster_kv_snapshot_write_with_invalidation(
+                &paths,
+                wrote,
+                Some(&snapshot),
+                !has_delta,
+            );
+        }
+        if let Some(events) = watcher_events {
+            if events.is_empty() {
+                sinomo_kv::notify_cluster_kv_watchers(&paths.kv_paths());
+            } else {
+                sinomo_kv::notify_cluster_kv_watchers_for_events(&paths.kv_paths(), &events);
+            }
+        }
+    }
 }
 
 pub struct LocalClusterRaftCommandStorage {
@@ -824,6 +990,44 @@ impl LocalClusterRaftCommandStorage {
         self.inner.last_log_index().map_err(kv_err)
     }
 
+    pub(crate) fn read_index_state(
+        &mut self,
+    ) -> Result<sinomo_kv::ClusterKvRaftReadIndexState, NetworkError> {
+        self.inner.read_index_state().map_err(kv_err)
+    }
+
+    pub(crate) fn read_index_snapshot(&mut self) -> Result<KvSnapshot, NetworkError> {
+        self.inner.read_index_snapshot().map_err(kv_err)
+    }
+
+    pub(crate) fn read_index_entry(&mut self, key: &str) -> Result<Option<KvEntry>, NetworkError> {
+        self.inner.read_index_entry(key).map_err(kv_err)
+    }
+
+    pub(crate) fn read_index_request_outcome(
+        &mut self,
+        request_id: &sinomo_kv::KvRequestId,
+    ) -> Result<Option<sinomo_kv::KvRequestOutcome>, NetworkError> {
+        self.inner
+            .read_index_request_outcome(request_id)
+            .map_err(kv_err)
+    }
+
+    pub(crate) fn read_index_prefix_limited_by_payload_bytes(
+        &mut self,
+        prefix: &str,
+        max_entries: usize,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<KvEntry>, NetworkError> {
+        self.inner
+            .read_index_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)
+            .map_err(kv_err)
+    }
+
+    pub(crate) fn release_session_after_commit(&mut self) {
+        self.inner.release_session_after_commit();
+    }
+
     pub(crate) fn build_raft_append_request(
         &mut self,
         state: &ClusterBootstrapState,
@@ -834,11 +1038,29 @@ impl LocalClusterRaftCommandStorage {
             .map_err(kv_err)
     }
 
+    pub(crate) fn raft_append_request_uses_snapshot(
+        &mut self,
+        next_index: u64,
+    ) -> Result<bool, NetworkError> {
+        self.inner
+            .cluster_raft_append_request_uses_snapshot(next_index)
+            .map_err(kv_err)
+    }
+
     pub(crate) fn replay_if_committed(
         &mut self,
         request: &KvCommandRequest,
     ) -> Result<Option<(KvSnapshot, KvCommittedRequestRecord)>, NetworkError> {
         self.inner.replay_if_committed(request).map_err(kv_err)
+    }
+
+    pub(crate) fn replay_record_if_committed(
+        &mut self,
+        request: &KvCommandRequest,
+    ) -> Result<Option<KvCommittedRequestRecord>, NetworkError> {
+        self.inner
+            .replay_record_if_committed(request)
+            .map_err(kv_err)
     }
 
     pub(crate) fn append_uncommitted(
@@ -884,6 +1106,14 @@ impl LocalClusterRaftCommandStorage {
         Ok(snapshot)
     }
 
+    pub(crate) fn discard_uncommitted_tail_and_clear_leader_compact(
+        &mut self,
+    ) -> Result<(), NetworkError> {
+        self.inner
+            .discard_uncommitted_tail_and_clear_leader_compact()
+            .map_err(kv_err)
+    }
+
     pub(crate) fn observe_term(&mut self, term: u64) -> Result<(), NetworkError> {
         self.inner.observe_term(term).map_err(kv_err)
     }
@@ -895,6 +1125,47 @@ impl LocalClusterRaftCommandStorage {
         let result = self.inner.commit_index_with_events(index).map_err(kv_err)?;
         self.observe_last_snapshot_publish(&result.snapshot);
         Ok(result)
+    }
+
+    pub(crate) fn commit_index_compact(
+        &mut self,
+        index: u64,
+    ) -> Result<sinomo_kv::ClusterKvRaftCompactCommitResult, NetworkError> {
+        self.inner.commit_index_compact(index).map_err(kv_err)
+    }
+
+    pub(crate) fn take_post_commit_observations(
+        &mut self,
+        commit: Option<&sinomo_kv::ClusterKvRaftCompactCommitResult>,
+    ) -> Result<LocalClusterRaftPostCommitObservations, NetworkError> {
+        let snapshot_publish_wrote = self.inner.take_last_snapshot_publish_wrote();
+        let snapshot_write = match (snapshot_publish_wrote, commit) {
+            (Some(wrote), Some(commit)) => commit
+                .checkpoint_snapshot
+                .as_ref()
+                .map(|snapshot| (wrote, snapshot.clone())),
+            (Some(true), None) => Some((
+                true,
+                sinomo_kv::read_cluster_kv_cached_snapshot(&self.paths.kv_paths())
+                    .map_err(kv_err)?,
+            )),
+            _ => None,
+        };
+        let delta = commit.map(|commit| ClusterKvCommittedDelta {
+            revision: commit.committed_request.revision,
+            compacted_revision: commit.compacted_revision,
+            events: commit.events.clone(),
+            final_key_states: commit.final_key_states.clone(),
+        });
+        let watcher_events = commit
+            .map(|commit| commit.events.clone())
+            .or_else(|| snapshot_write.as_ref().map(|_| Vec::new()));
+        Ok(LocalClusterRaftPostCommitObservations {
+            paths: self.paths.clone(),
+            snapshot_write,
+            delta,
+            watcher_events,
+        })
     }
 }
 
@@ -910,6 +1181,13 @@ impl sinomo_kv::ClusterKvRaftCommandStorage for LocalClusterRaftCommandStorage {
         request: &KvCommandRequest,
     ) -> Result<Option<(KvSnapshot, KvCommittedRequestRecord)>, NetworkError> {
         self.replay_if_committed(request)
+    }
+
+    fn replay_cluster_raft_request_record_if_committed(
+        &mut self,
+        request: &KvCommandRequest,
+    ) -> Result<Option<KvCommittedRequestRecord>, NetworkError> {
+        self.replay_record_if_committed(request)
     }
 
     fn append_cluster_raft_request_uncommitted(
@@ -938,7 +1216,7 @@ impl sinomo_kv::ClusterKvRaftCommandStorage for LocalClusterRaftCommandStorage {
     fn discard_cluster_raft_uncommitted_tail_and_clear_leader(
         &mut self,
     ) -> Result<(), NetworkError> {
-        self.discard_uncommitted_tail_and_clear_leader().map(|_| ())
+        self.discard_uncommitted_tail_and_clear_leader_compact()
     }
 
     fn observe_cluster_raft_term(
@@ -954,6 +1232,25 @@ impl sinomo_kv::ClusterKvRaftCommandStorage for LocalClusterRaftCommandStorage {
         index: u64,
     ) -> Result<ClusterKvRaftCommitResult, NetworkError> {
         self.commit_index_with_events(index)
+    }
+
+    fn commit_cluster_raft_index_compact(
+        &mut self,
+        index: u64,
+    ) -> Result<sinomo_kv::ClusterKvRaftCompactCommitResult, NetworkError> {
+        self.commit_index_compact(index)
+    }
+
+    fn release_cluster_raft_command_session_after_commit(&mut self) {
+        self.release_session_after_commit();
+    }
+
+    fn publish_cluster_raft_post_commit_observations(
+        &mut self,
+        commit: Option<&sinomo_kv::ClusterKvRaftCompactCommitResult>,
+    ) -> Result<(), NetworkError> {
+        self.take_post_commit_observations(commit)?.publish();
+        Ok(())
     }
 }
 
@@ -991,6 +1288,125 @@ pub fn kv_err(error: sinomo_kv::KvError) -> sinomo_network::NetworkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_event(key: &str) -> KvEvent {
+        KvEvent {
+            revision: KvRevision(1),
+            key: key.to_string(),
+            kind: sinomo_kv::KvEventKind::Put {
+                value: b"value".to_vec(),
+            },
+        }
+    }
+
+    fn reset_observed_read_model_invalidation_counts(paths: &ClusterPaths) {
+        CLUSTER_KV_OBSERVED_READ_MODEL_INVALIDATIONS_FOR_TEST
+            .lock()
+            .expect("invalidation test counts")
+            .remove(&paths.root);
+    }
+
+    fn observed_read_model_invalidation_counts(paths: &ClusterPaths) -> (u64, u64) {
+        CLUSTER_KV_OBSERVED_READ_MODEL_INVALIDATIONS_FOR_TEST
+            .lock()
+            .expect("invalidation test counts")
+            .get(&paths.root)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn committed_delta_invalidates_only_affected_cluster_read_models() {
+        let none = ClusterKvObservedReadModelInvalidation::default();
+        assert_eq!(
+            cluster_kv_observed_read_model_invalidation_for_events(&[]),
+            none
+        );
+        for key in [
+            "/config/ui/theme",
+            "/dfs/repair/job",
+            "/cluster/services/catalog",
+            "/cluster/network/info/node-a",
+            "/cluster/raft/config",
+            "/cluster/raft/config-changes/change-a",
+        ] {
+            assert_eq!(
+                cluster_kv_observed_read_model_invalidation_for_events(&[test_event(key)]),
+                none,
+                "unrelated key {key} must retain cluster read-model caches"
+            );
+        }
+
+        let state_and_route = ClusterKvObservedReadModelInvalidation {
+            cluster_state: true,
+            route_graph: true,
+        };
+        for key in [
+            "/cluster/members/node-a",
+            "/cluster/endpoints/node-a/endpoint-a",
+            "/cluster/policy/capabilities/node-a",
+        ] {
+            assert_eq!(
+                cluster_kv_observed_read_model_invalidation_for_events(&[test_event(key)]),
+                state_and_route,
+                "routing directory key {key} must invalidate state and route projections"
+            );
+        }
+        assert_eq!(
+            cluster_kv_observed_read_model_invalidation_for_events(&[test_event(
+                "/cluster/network/connectivity/node-a/node-b/endpoint-a",
+            )]),
+            ClusterKvObservedReadModelInvalidation {
+                cluster_state: false,
+                route_graph: true,
+            }
+        );
+    }
+
+    #[test]
+    fn local_snapshot_and_delta_publication_invalidates_each_affected_cache_once() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-kv-observation-invalidation");
+        let data_dir = sinomo_local::SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let snapshot = InProcessKvStore::new()
+            .try_snapshot()
+            .expect("empty snapshot");
+
+        reset_observed_read_model_invalidation_counts(&paths);
+        LocalClusterRaftPostCommitObservations {
+            paths: paths.clone(),
+            snapshot_write: Some((true, snapshot.clone())),
+            delta: Some(ClusterKvCommittedDelta {
+                revision: KvRevision(1),
+                compacted_revision: KvRevision::ZERO,
+                events: vec![test_event("/cluster/members/node-a")],
+                final_key_states: Vec::new(),
+            }),
+            watcher_events: None,
+        }
+        .publish();
+        assert_eq!(observed_read_model_invalidation_counts(&paths), (1, 1));
+
+        reset_observed_read_model_invalidation_counts(&paths);
+        LocalClusterRaftPostCommitObservations {
+            paths: paths.clone(),
+            snapshot_write: Some((true, snapshot)),
+            delta: Some(ClusterKvCommittedDelta {
+                revision: KvRevision(2),
+                compacted_revision: KvRevision::ZERO,
+                events: vec![test_event("/cluster/services/catalog")],
+                final_key_states: Vec::new(),
+            }),
+            watcher_events: None,
+        }
+        .publish();
+        assert_eq!(
+            observed_read_model_invalidation_counts(&paths),
+            (0, 0),
+            "an unrelated compact delta must not invalidate caches merely because its critical snapshot was published"
+        );
+    }
 
     #[test]
     fn imported_snapshot_reconciliation_defers_while_local_raft_node_is_busy() {

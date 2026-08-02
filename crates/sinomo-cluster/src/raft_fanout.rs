@@ -5,7 +5,6 @@ use crate::control_plane_options::{
 };
 use crate::kv_local_store::ClusterKvPathsExt;
 use crate::kv_local_store::kv_err;
-use crate::kv_local_store::read_cluster_kv_snapshot;
 use crate::local_state_store::read_cluster_state;
 use crate::prelude::*;
 use crate::raft_quorum::ClusterKvQuorumAsyncHost;
@@ -272,9 +271,24 @@ async fn run_cluster_raft_committed_fanout_worker_async_with_host<H, F>(
     H: ClusterRaftCommittedFanoutAsyncHost + Send + 'static,
     F: FnMut() -> H,
 {
+    let mut refresh_inputs_before_pass = false;
     loop {
         while CLUSTER_RAFT_FANOUT_PENDING.swap(false, Ordering::AcqRel) {
             metrics::gauge!("sinomo.kv.fanout.pending").set(0.0);
+            // The first pass already owns the exact commit state/events passed
+            // by its caller. Only a coalesced follow-up needs to refresh, and
+            // it reads the resident event index rather than cloning the full
+            // materialized keyspace after every ordinary fanout.
+            if refresh_inputs_before_pass {
+                if let Some((latest_state, latest_events)) =
+                    read_latest_cluster_raft_fanout_inputs_async(&runtime, &paths).await
+                {
+                    state = latest_state;
+                    events = latest_events;
+                } else {
+                    events = Vec::new();
+                }
+            }
             let started = Instant::now();
             let result = fan_out_committed_cluster_raft_command_async_with_factory(
                 &runtime,
@@ -312,14 +326,7 @@ async fn run_cluster_raft_committed_fanout_worker_async_with_host<H, F>(
                     );
                 }
             }
-            if let Some((latest_state, latest_events)) =
-                read_latest_cluster_raft_fanout_inputs_async(&runtime, &paths).await
-            {
-                state = latest_state;
-                events = latest_events;
-            } else {
-                events = Vec::new();
-            }
+            refresh_inputs_before_pass = true;
         }
 
         let claimed = claim_next_cluster_raft_fanout_pass(
@@ -485,9 +492,12 @@ async fn read_latest_cluster_raft_fanout_inputs_async(
     runtime
         .spawn_blocking(move || {
             let latest_state = read_cluster_state(&paths)?;
-            let latest_events = read_cluster_kv_snapshot(&paths)
-                .map(|snapshot| snapshot.events)
-                .unwrap_or_default();
+            let latest_events = sinomo_kv::read_cluster_kv_local_event_history(
+                &paths.kv_paths(),
+                &latest_state.local_node_id,
+            )
+            .map(|read| read.value.events)
+            .unwrap_or_default();
             Ok::<_, NetworkError>((latest_state, latest_events))
         })
         .await

@@ -3,8 +3,9 @@ use crate::kv_local_store::ClusterKvPathsExt;
 use crate::kv_local_store::invalidate_cluster_kv_reader_node_id_cache;
 #[allow(unused_imports)]
 use crate::kv_local_store::kv_err;
-use crate::kv_local_store::read_cluster_kv_current_snapshot_arc;
-use crate::kv_local_store::record_current_cluster_kv_reader_node_id_cache;
+use crate::kv_local_store::{
+    read_cluster_kv_reader_node_id, record_current_cluster_kv_reader_node_id_cache,
+};
 use crate::kv_read_model::read_cluster_members_from_kv;
 use crate::local_membership::{
     locally_learned_remote_route_endpoints, merge_cluster_join_registration,
@@ -315,15 +316,30 @@ pub fn project_committed_cluster_raft_config(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
 ) -> Result<bool, NetworkError> {
-    let snapshot = match read_cluster_kv_current_snapshot_arc(paths) {
-        Ok(snapshot) => snapshot,
+    let node_id = match read_cluster_kv_reader_node_id(paths) {
+        Ok(node_id) => node_id,
         Err(NetworkError::ClusterOrphan) => return Ok(false),
         Err(error) => return Err(error),
     };
-    let Some(entry) = snapshot.get(&sinomo_kv::cluster_kv_raft_config_key()) else {
+    let config_key = sinomo_kv::cluster_kv_raft_config_key();
+    let read = sinomo_kv::read_cluster_kv_local_entry(&paths.kv_paths(), &node_id, &config_key)
+        .map_err(kv_err)?;
+    let Some(entry) = read.value else {
         return Ok(false);
     };
     let config: ClusterKvRaftConfigRecord = entry.decode().map_err(kv_err)?;
+    project_cluster_raft_config_record(state, &config)?;
+    Ok(true)
+}
+
+/// Applies an already captured committed Raft configuration to a topology
+/// view without performing another KV read. Consensus paths use this while a
+/// resident Raft operation fence is held so config validation is coherent with
+/// the exact log/apply state that supplied the record.
+pub(crate) fn project_cluster_raft_config_record(
+    state: &mut ClusterBootstrapState,
+    config: &ClusterKvRaftConfigRecord,
+) -> Result<(), NetworkError> {
     if config.cluster_id != state.cluster_id {
         return Err(NetworkError::InvalidClusterCommand {
             detail: format!(
@@ -389,7 +405,7 @@ pub fn project_committed_cluster_raft_config(
         }
     }
 
-    Ok(true)
+    Ok(())
 }
 
 /// Reads the merged cluster state through a short, syscall-free validation

@@ -1348,7 +1348,7 @@ async fn write_cluster_config_async(
         None => KvTxnRequest::generated(txn),
     };
     let committed = cluster
-        .kv_commit_async(request)
+        .kv_commit_compact_async(request)
         .await
         .map_err(ConfigError::Service)?;
     let response = committed.txn_response.ok_or_else(|| {

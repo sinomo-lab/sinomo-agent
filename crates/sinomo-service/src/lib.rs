@@ -34,7 +34,8 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use sinomo_kv::{
-    ClusterKvTxnCommitResult, KvAuthoritativeRead, KvEntry, KvError, KvLocalRead, KvTxnRequest,
+    ClusterKvTxnCommitResult, ClusterKvTxnCompactCommitResult, KvAuthoritativeRead, KvEntry,
+    KvError, KvLocalRead, KvTxnRequest,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
@@ -128,6 +129,29 @@ pub trait ClusterAccess: Send + Sync {
         &'a self,
         request: KvTxnRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ClusterKvTxnCommitResult, ServiceError>> + Send + 'a>>;
+
+    /// Commits without forcing the host to materialize the complete post-commit
+    /// keyspace. Hosts with a resident KV backend should override this method;
+    /// the compatibility default keeps existing embedders source compatible.
+    fn kv_commit_compact_async<'a>(
+        &'a self,
+        request: KvTxnRequest,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<ClusterKvTxnCompactCommitResult, ServiceError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.kv_commit_async(request)
+                .await
+                .map(|result| ClusterKvTxnCompactCommitResult {
+                    request_id: result.request_id,
+                    submitted_command_digest: Some(result.command_digest),
+                    command_digest: result.command_digest,
+                    txn_response: result.txn_response,
+                    authority: result.authority,
+                    replayed_committed_request: result.replayed_committed_request,
+                })
+        })
+    }
 }
 
 /// Where the response to one service request goes.

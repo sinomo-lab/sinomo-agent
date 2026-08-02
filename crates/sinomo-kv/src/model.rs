@@ -809,6 +809,51 @@ pub struct KvEvent {
     pub kind: KvEventKind,
 }
 
+/// Bounded event-history projection used by local watches and committed-delta
+/// fanout. Unlike [`KvSnapshot`], this view does not clone the complete
+/// keyspace, leases, or request ledger.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ClusterKvEventReadView {
+    pub compacted_revision: KvRevision,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_fallible_vec"
+    )]
+    pub events: Vec<KvEvent>,
+}
+
+/// Final state of one key touched by a committed command. Delete events carry
+/// `None`; puts carry the complete versioned entry so incremental observers do
+/// not need a full snapshot to recover metadata absent from [`KvEvent`].
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ClusterKvCommittedKeyState {
+    pub key: String,
+    pub entry: Option<KvEntry>,
+}
+
+/// Bounded post-commit update used by process-local observers. Its size is
+/// proportional to the keys changed by one command. Cross-process consumers
+/// still rely on the shared full snapshot for critical/unknown keyspaces; this
+/// value is not a durable projection journal.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ClusterKvCommittedDelta {
+    pub revision: KvRevision,
+    pub compacted_revision: KvRevision,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_fallible_vec"
+    )]
+    pub events: Vec<KvEvent>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_fallible_vec"
+    )]
+    pub final_key_states: Vec<ClusterKvCommittedKeyState>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct KvWatch {
     pub watch_id: WatchId,
@@ -952,10 +997,11 @@ pub struct KvAuthoritativeRead<T> {
     pub authority: KvAuthorityProof,
 }
 
-/// Outcome of one request after a fresh current-term quorum barrier.
+/// Outcome of one request after a fresh current-term quorum confirmation.
 ///
-/// Committed history comes from the barrier snapshot. Rejected, unknown, and
-/// expired states may additionally reflect the querying node's durable attempt
+/// Committed history comes from the resident committed-request and expiry
+/// indexes after ReadIndex (or a first-current-term barrier). Rejected and
+/// unknown states may additionally reflect the querying node's durable attempt
 /// ledger, but are returned only after committed history has been ruled out by
 /// the attached authority proof.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

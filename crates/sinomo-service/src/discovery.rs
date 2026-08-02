@@ -10,7 +10,9 @@
 
 use crate::{ClusterAccess, ServiceError, ServiceRegistry};
 use serde::{Deserialize, Serialize};
-use sinomo_kv::{ClusterKvTxnCommitResult, KvEntry, KvOp, KvTxn, KvTxnRequest};
+#[cfg(test)]
+use sinomo_kv::ClusterKvTxnCommitResult;
+use sinomo_kv::{ClusterKvTxnCompactCommitResult, KvEntry, KvOp, KvTxn, KvTxnRequest};
 use sinomo_network::{ClusterDirectory, NetworkError};
 use sinomo_node::NodeId;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -130,7 +132,7 @@ pub async fn publish_local_service_instances(
     node_id: &NodeId,
     registry_version: u64,
     now: OffsetDateTime,
-) -> Result<Option<ClusterKvTxnCommitResult>, ServiceError> {
+) -> Result<Option<ClusterKvTxnCompactCommitResult>, ServiceError> {
     let records = service_instance_records_from_registry(registry, node_id, registry_version, now);
     let mut existing_by_key: std::collections::BTreeMap<String, KvEntry> = cluster
         .kv_range_prefix_local(CLUSTER_SERVICES_KV_PREFIX)?
@@ -161,7 +163,7 @@ pub async fn publish_local_service_instances(
         failure: Vec::new(),
     };
     cluster
-        .kv_commit_async(KvTxnRequest::generated(txn))
+        .kv_commit_compact_async(KvTxnRequest::generated(txn))
         .await
         .map(Some)
 }
