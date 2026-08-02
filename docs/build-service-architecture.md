@@ -71,6 +71,12 @@ that the worker is currently reachable, has free capacity, or still supports a
 toolchain. Scheduling therefore uses fresh, expiring advertisements and route
 health. Cluster membership alone never makes a node an eligible builder.
 
+Normal build routes terminate on the node's main daemon. Because a supervision
+shadow shares the installation's node identity, build target calls carry an
+explicit main-daemon destination affinity. Relays remain process-agnostic, but
+the terminal endpoint and any reused routed carrier must satisfy that affinity;
+a healthy shadow cannot stand in for an unavailable builder.
+
 Advertisements are placement evidence, not resource reservations. Before
 dispatch, the scheduler acquires a short-lived lease for a compatible worker
 slot. If the reservation races with another job, expires, or the worker becomes

@@ -5,8 +5,9 @@
 //! Durable table and journal storage stays in `metadata_backend`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
@@ -723,6 +724,463 @@ struct LocalMetadataShardSlot {
     backend: OnceLock<LocalSobjMetadataBackend>,
 }
 
+/// One resident shard-local backend slot shared by scoped mutation sessions.
+///
+/// The slot owns exactly one [`LocalSobjMetadataBackend`] instance. Converting
+/// a [`LocalShardedMetadataBackend`] moves any already-open instance here; a
+/// deferred replica slot is still opened lazily, once, on its first lock.
+/// Keeping the backend itself behind the shard lock is important: membership
+/// handoff authority is deliberately bound to that exact in-memory instance.
+#[derive(Debug)]
+struct ResidentLocalMetadataShardSlot {
+    config: DfsMetadataShardConfig,
+    root: PathBuf,
+    open_mode: LocalMetadataShardOpenMode,
+    state: Mutex<ResidentLocalMetadataShardState>,
+    available: Condvar,
+}
+
+#[derive(Debug)]
+enum ResidentLocalMetadataShardState {
+    Unopened,
+    Opening,
+    Available(LocalSobjMetadataBackend),
+    CheckedOut,
+}
+
+impl ResidentLocalMetadataShardSlot {
+    fn from_local_slot(slot: LocalMetadataShardSlot) -> Self {
+        let LocalMetadataShardSlot {
+            config,
+            root,
+            open_mode,
+            initialization: _,
+            backend,
+        } = slot;
+        Self {
+            config,
+            root,
+            open_mode,
+            state: Mutex::new(match backend.into_inner() {
+                Some(backend) => ResidentLocalMetadataShardState::Available(backend),
+                None => ResidentLocalMetadataShardState::Unopened,
+            }),
+            available: Condvar::new(),
+        }
+    }
+
+    fn open_backend(&self) -> Result<LocalSobjMetadataBackend> {
+        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode)
+    }
+
+    fn checkout(self: &Arc<Self>) -> Result<LocalSobjMetadataBackend> {
+        loop {
+            let mut state = self.state.lock().map_err(|error| {
+                MetadataBackendError::Serde(format!(
+                    "resident metadata shard {} state lock failed: {error}",
+                    self.config.shard_id
+                ))
+            })?;
+            match &*state {
+                ResidentLocalMetadataShardState::Unopened => {
+                    *state = ResidentLocalMetadataShardState::Opening;
+                    drop(state);
+                    let opened = self.open_backend();
+                    let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                    match opened {
+                        Ok(backend) => {
+                            *state = ResidentLocalMetadataShardState::CheckedOut;
+                            return Ok(backend);
+                        }
+                        Err(error) => {
+                            *state = ResidentLocalMetadataShardState::Unopened;
+                            self.available.notify_all();
+                            return Err(error);
+                        }
+                    }
+                }
+                ResidentLocalMetadataShardState::Available(_) => {
+                    let ResidentLocalMetadataShardState::Available(backend) =
+                        std::mem::replace(&mut *state, ResidentLocalMetadataShardState::CheckedOut)
+                    else {
+                        unreachable!("resident metadata shard availability checked above")
+                    };
+                    return Ok(backend);
+                }
+                ResidentLocalMetadataShardState::Opening
+                | ResidentLocalMetadataShardState::CheckedOut => {
+                    state = self.available.wait(state).map_err(|error| {
+                        MetadataBackendError::Serde(format!(
+                            "resident metadata shard {} availability wait failed: {error}",
+                            self.config.shard_id
+                        ))
+                    })?;
+                    drop(state);
+                }
+            }
+        }
+    }
+
+    fn restore(&self, backend: LocalSobjMetadataBackend) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        debug_assert!(matches!(
+            *state,
+            ResidentLocalMetadataShardState::CheckedOut
+        ));
+        *state = ResidentLocalMetadataShardState::Available(backend);
+        self.available.notify_all();
+    }
+
+    fn is_open(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        matches!(
+            *state,
+            ResidentLocalMetadataShardState::Available(_)
+                | ResidentLocalMetadataShardState::CheckedOut
+        )
+    }
+}
+
+/// A cheap, exact-shard handle into a resident local metadata generation.
+///
+/// Cloning this value does not clone or reopen metadata. Each clone points to
+/// the same shard-local backend and therefore observes the same process-local
+/// membership-handoff authority binding.
+#[derive(Clone, Debug)]
+pub struct ResidentLocalMetadataShardHandle {
+    file_system_id: DfsFileSystemId,
+    shard_id: DfsMetadataShardId,
+    slot: Arc<ResidentLocalMetadataShardSlot>,
+}
+
+impl ResidentLocalMetadataShardHandle {
+    pub fn file_system_id(&self) -> &DfsFileSystemId {
+        &self.file_system_id
+    }
+
+    pub fn shard_id(&self) -> &DfsMetadataShardId {
+        &self.shard_id
+    }
+
+    /// Check out only this shard's resident backend for one bounded operation.
+    /// A competing checkout waits until the returned lease is dropped.
+    pub fn checkout(&self) -> Result<ResidentLocalMetadataShardLease> {
+        let backend = self.slot.checkout()?;
+        Ok(ResidentLocalMetadataShardLease {
+            file_system_id: self.file_system_id.clone(),
+            shard_id: self.shard_id.clone(),
+            slot: Arc::clone(&self.slot),
+            backend: Some(backend),
+        })
+    }
+
+    /// Run one bounded operation against the exact resident backend instance.
+    pub fn with_backend<R>(
+        &self,
+        operation: impl FnOnce(&mut LocalSobjMetadataBackend) -> Result<R>,
+    ) -> Result<R> {
+        let mut lease = self.checkout()?;
+        operation(&mut *lease)
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.slot.is_open()
+    }
+}
+
+/// Owned, exclusive access to one resident shard-local metadata backend.
+///
+/// Dropping the lease returns the same backend instance to its resident slot.
+pub struct ResidentLocalMetadataShardLease {
+    file_system_id: DfsFileSystemId,
+    shard_id: DfsMetadataShardId,
+    slot: Arc<ResidentLocalMetadataShardSlot>,
+    backend: Option<LocalSobjMetadataBackend>,
+}
+
+impl std::fmt::Debug for ResidentLocalMetadataShardLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResidentLocalMetadataShardLease")
+            .field("file_system_id", &self.file_system_id)
+            .field("shard_id", &self.shard_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResidentLocalMetadataShardLease {
+    pub fn file_system_id(&self) -> &DfsFileSystemId {
+        &self.file_system_id
+    }
+
+    pub fn shard_id(&self) -> &DfsMetadataShardId {
+        &self.shard_id
+    }
+}
+
+impl Deref for ResidentLocalMetadataShardLease {
+    type Target = LocalSobjMetadataBackend;
+
+    fn deref(&self) -> &Self::Target {
+        self.backend
+            .as_ref()
+            .expect("resident metadata shard lease retains backend until drop")
+    }
+}
+
+impl DerefMut for ResidentLocalMetadataShardLease {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.backend
+            .as_mut()
+            .expect("resident metadata shard lease retains backend until drop")
+    }
+}
+
+impl Drop for ResidentLocalMetadataShardLease {
+    fn drop(&mut self) {
+        if let Some(backend) = self.backend.take() {
+            self.slot.restore(backend);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ResidentLocalShardedMetadataRouterState {
+    root: PathBuf,
+    local_node_id: Option<NodeId>,
+    shard_configs: BTreeMap<String, DfsMetadataShardConfig>,
+    routing_indexes: BTreeMap<DfsFileSystemId, DfsMetadataShardRoutingIndex>,
+    fallback_routing_indexes: Vec<BTreeMap<DfsFileSystemId, DfsMetadataShardRoutingIndex>>,
+}
+
+#[derive(Debug)]
+struct ResidentLocalShardedMetadataBackendInner {
+    router: Mutex<ResidentLocalShardedMetadataRouterState>,
+    shards: BTreeMap<DfsMetadataShardId, Arc<ResidentLocalMetadataShardSlot>>,
+}
+
+/// One resident sharded metadata generation with independent shard locks.
+///
+/// This is intentionally a pool of the original shard backend instances, not
+/// an `Arc<Mutex<LocalShardedMetadataBackend>>`: unrelated shards can execute
+/// concurrently, while same-shard calls retain the existing serialization and
+/// authority semantics.
+#[derive(Clone, Debug)]
+pub struct ResidentLocalShardedMetadataBackend {
+    inner: Arc<ResidentLocalShardedMetadataBackendInner>,
+}
+
+impl ResidentLocalShardedMetadataBackend {
+    pub fn shard_ids(&self) -> Vec<DfsMetadataShardId> {
+        self.inner.shards.keys().cloned().collect()
+    }
+
+    pub fn shard_config(&self, shard_id: &DfsMetadataShardId) -> Result<DfsMetadataShardConfig> {
+        self.with_router(|router| router.shard_configs.get(&shard_id.0).cloned())?
+            .ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "unknown resident DFS metadata shard: {}",
+                    shard_id.0
+                ))
+            })
+    }
+
+    /// Scope a handle to an exact filesystem and shard identity.
+    ///
+    /// Requiring both identities prevents a wire-derived shard name from
+    /// borrowing an unrelated filesystem's resident backend.
+    pub fn scope_shard(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<ResidentLocalMetadataShardHandle> {
+        let slot = self.inner.shards.get(shard_id).ok_or_else(|| {
+            MetadataBackendError::Serde(format!(
+                "unknown resident DFS metadata shard: {}",
+                shard_id.0
+            ))
+        })?;
+        let configured_file_system_id = self
+            .with_router(|router| {
+                router
+                    .shard_configs
+                    .get(&shard_id.0)
+                    .map(|config| config.file_system_id.clone())
+            })?
+            .ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "resident DFS metadata shard {} has no routing config",
+                    shard_id.0
+                ))
+            })?;
+        if configured_file_system_id != *file_system_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "resident DFS metadata shard {} belongs to filesystem {}, not {}",
+                shard_id.0, configured_file_system_id, file_system_id
+            )));
+        }
+        Ok(ResidentLocalMetadataShardHandle {
+            file_system_id: file_system_id.clone(),
+            shard_id: shard_id.clone(),
+            slot: Arc::clone(slot),
+        })
+    }
+
+    /// Check out every shard in canonical shard-id order and reconstruct the
+    /// original router around those exact instances.
+    pub fn checkout_global(&self) -> Result<ResidentLocalShardedMetadataBackendLease> {
+        let mut leases = Vec::with_capacity(self.inner.shards.len());
+        for (shard_id, slot) in &self.inner.shards {
+            let backend = slot.checkout()?;
+            leases.push((
+                shard_id.clone(),
+                ResidentLocalMetadataShardLease {
+                    file_system_id: slot.config.file_system_id.clone(),
+                    shard_id: shard_id.clone(),
+                    slot: Arc::clone(slot),
+                    backend: Some(backend),
+                },
+            ));
+        }
+        // The first canonical shard also serializes competing global
+        // checkouts. Read router state only after every shard is owned so a
+        // waiter cannot capture and later restore a predecessor generation.
+        let router = self.with_router(|router| ResidentLocalShardedMetadataRouterState {
+            root: router.root.clone(),
+            local_node_id: router.local_node_id.clone(),
+            shard_configs: router.shard_configs.clone(),
+            routing_indexes: router.routing_indexes.clone(),
+            fallback_routing_indexes: router.fallback_routing_indexes.clone(),
+        })?;
+        let mut shards = BTreeMap::new();
+        for (shard_id, mut lease) in leases {
+            let slot = Arc::clone(&lease.slot);
+            let backend = lease
+                .backend
+                .take()
+                .expect("new global resident lease owns checked-out shard");
+            let config = router
+                .shard_configs
+                .get(&shard_id.0)
+                .cloned()
+                .unwrap_or_else(|| slot.config.clone());
+            let local_slot = LocalMetadataShardSlot {
+                config,
+                root: slot.root.clone(),
+                open_mode: slot.open_mode,
+                initialization: Mutex::new(()),
+                backend: OnceLock::new(),
+            };
+            local_slot
+                .backend
+                .set(backend)
+                .expect("global resident checkout installs exact shard backend");
+            shards.insert(shard_id, local_slot);
+        }
+        Ok(ResidentLocalShardedMetadataBackendLease {
+            resident: self.clone(),
+            backend: Some(LocalShardedMetadataBackend {
+                root: router.root,
+                local_node_id: router.local_node_id,
+                shard_configs: router.shard_configs,
+                routing_indexes: router.routing_indexes,
+                fallback_routing_indexes: router.fallback_routing_indexes,
+                shards,
+            }),
+        })
+    }
+
+    fn with_router<R>(
+        &self,
+        operation: impl FnOnce(&ResidentLocalShardedMetadataRouterState) -> R,
+    ) -> Result<R> {
+        let router = self.inner.router.lock().map_err(|error| {
+            MetadataBackendError::Serde(format!(
+                "resident DFS metadata router lock failed: {error}"
+            ))
+        })?;
+        Ok(operation(&router))
+    }
+}
+
+/// Owned, exclusive access to every shard in one resident router generation.
+/// Dropping this lease restores the same shard instances and any router state
+/// changed by handoff or routing-fallback reconciliation.
+pub struct ResidentLocalShardedMetadataBackendLease {
+    resident: ResidentLocalShardedMetadataBackend,
+    backend: Option<LocalShardedMetadataBackend>,
+}
+
+impl std::fmt::Debug for ResidentLocalShardedMetadataBackendLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResidentLocalShardedMetadataBackendLease")
+            .field("shard_count", &self.resident.inner.shards.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Deref for ResidentLocalShardedMetadataBackendLease {
+    type Target = LocalShardedMetadataBackend;
+
+    fn deref(&self) -> &Self::Target {
+        self.backend
+            .as_ref()
+            .expect("resident global metadata lease retains router until drop")
+    }
+}
+
+impl DerefMut for ResidentLocalShardedMetadataBackendLease {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.backend
+            .as_mut()
+            .expect("resident global metadata lease retains router until drop")
+    }
+}
+
+impl Drop for ResidentLocalShardedMetadataBackendLease {
+    fn drop(&mut self) {
+        let Some(backend) = self.backend.take() else {
+            return;
+        };
+        let LocalShardedMetadataBackend {
+            root,
+            local_node_id,
+            shard_configs,
+            routing_indexes,
+            fallback_routing_indexes,
+            shards,
+        } = backend;
+        {
+            let mut router = self
+                .resident
+                .inner
+                .router
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *router = ResidentLocalShardedMetadataRouterState {
+                root,
+                local_node_id,
+                shard_configs,
+                routing_indexes,
+                fallback_routing_indexes,
+            };
+        }
+        for (shard_id, slot) in shards {
+            let backend = slot
+                .backend
+                .into_inner()
+                .expect("global resident lease returns every checked-out shard backend");
+            self.resident
+                .inner
+                .shards
+                .get(&shard_id)
+                .expect("global resident lease returns known shard")
+                .restore(backend);
+        }
+    }
+}
+
 impl LocalMetadataShardSlot {
     fn new(
         config: DfsMetadataShardConfig,
@@ -743,32 +1201,7 @@ impl LocalMetadataShardSlot {
     }
 
     fn open_backend(&self) -> Result<LocalSobjMetadataBackend> {
-        let shard_id = DfsMetadataShardId::new(self.config.shard_id.clone());
-        let mut backend = match self.open_mode {
-            LocalMetadataShardOpenMode::Strict => {
-                LocalSobjMetadataBackend::new(shard_id, self.root.clone())?
-            }
-            LocalMetadataShardOpenMode::ReplicaRepair => {
-                match LocalSobjMetadataBackend::new(shard_id.clone(), self.root.clone()) {
-                    Ok(backend) => backend,
-                    Err(open_error) => LocalSobjMetadataBackend::open_for_replica_repair(
-                        shard_id,
-                        self.root.clone(),
-                    )
-                    .map_err(|repair_error| {
-                        MetadataBackendError::Serde(format!(
-                            "cannot open replica metadata shard {}: {open_error}; repair-only open failed: {repair_error}",
-                            self.config.shard_id
-                        ))
-                    })?,
-                }
-            }
-            LocalMetadataShardOpenMode::Inspection => {
-                LocalSobjMetadataBackend::open_for_inspection(shard_id, self.root.clone())?
-            }
-        };
-        backend.set_namespace_prepare_codec(self.config.namespace_prepare_codec);
-        Ok(backend)
+        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode)
     }
 
     fn backend(&self) -> Result<&LocalSobjMetadataBackend> {
@@ -821,6 +1254,39 @@ impl LocalMetadataShardSlot {
             .into_inner()
             .expect("metadata shard slot initialized above"))
     }
+}
+
+fn open_local_metadata_shard_backend(
+    config: &DfsMetadataShardConfig,
+    root: &Path,
+    open_mode: LocalMetadataShardOpenMode,
+) -> Result<LocalSobjMetadataBackend> {
+    let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
+    let mut backend = match open_mode {
+        LocalMetadataShardOpenMode::Strict => {
+            LocalSobjMetadataBackend::new(shard_id, root.to_path_buf())?
+        }
+        LocalMetadataShardOpenMode::ReplicaRepair => {
+            match LocalSobjMetadataBackend::new(shard_id.clone(), root.to_path_buf()) {
+                Ok(backend) => backend,
+                Err(open_error) => LocalSobjMetadataBackend::open_for_replica_repair(
+                    shard_id,
+                    root.to_path_buf(),
+                )
+                .map_err(|repair_error| {
+                    MetadataBackendError::Serde(format!(
+                        "cannot open replica metadata shard {}: {open_error}; repair-only open failed: {repair_error}",
+                        config.shard_id
+                    ))
+                })?,
+            }
+        }
+        LocalMetadataShardOpenMode::Inspection => {
+            LocalSobjMetadataBackend::open_for_inspection(shard_id, root.to_path_buf())?
+        }
+    };
+    backend.set_namespace_prepare_codec(config.namespace_prepare_codec);
+    Ok(backend)
 }
 
 #[derive(Debug)]
@@ -879,6 +1345,44 @@ impl LocalShardedMetadataBackend {
     ) -> Result<Self> {
         let root = root.into();
         Self::open_with(root, shards, false, Some(local_node_id))
+    }
+
+    /// Move this router's exact shard backend instances into a resident pool.
+    ///
+    /// Already-open shards are moved without decoding or recovery. Deferred
+    /// replica-repair slots remain lazy and are opened once by their first
+    /// scoped handle. The consumed router cannot subsequently create a second
+    /// process-local authority capability for the same pool generation.
+    pub fn into_resident(self) -> ResidentLocalShardedMetadataBackend {
+        let Self {
+            root,
+            local_node_id,
+            shard_configs,
+            routing_indexes,
+            fallback_routing_indexes,
+            shards,
+        } = self;
+        let shards = shards
+            .into_iter()
+            .map(|(shard_id, slot)| {
+                (
+                    shard_id,
+                    Arc::new(ResidentLocalMetadataShardSlot::from_local_slot(slot)),
+                )
+            })
+            .collect();
+        ResidentLocalShardedMetadataBackend {
+            inner: Arc::new(ResidentLocalShardedMetadataBackendInner {
+                router: Mutex::new(ResidentLocalShardedMetadataRouterState {
+                    root,
+                    local_node_id,
+                    shard_configs,
+                    routing_indexes,
+                    fallback_routing_indexes,
+                }),
+                shards,
+            }),
+        }
     }
 
     fn open_with(
@@ -2127,6 +2631,8 @@ impl LocalShardedMetadataBackend {
 mod lazy_replica_slot_tests {
     use super::*;
     use sinomo_core::DfsObjectPolicy;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     fn node(value: &str) -> NodeId {
         NodeId::from_legacy_named(value).expect("valid node id")
@@ -2240,9 +2746,220 @@ mod lazy_replica_slot_tests {
             "lazy slots must not merge instance-local authority capabilities"
         );
     }
+
+    #[test]
+    fn resident_handles_move_open_backends_and_open_deferred_shards_once() {
+        let root = sinomo_testdir::TestDir::new("dfs-resident-shard-open-once");
+        let metadata_root = root.path().join("metadata");
+        let local_node_id = node("resident-open-local");
+        let file_system_id = crate::sifs_file_system_id();
+        let root_shard_id = DfsMetadataShardId::new("root");
+        let replica_shard_id = DfsMetadataShardId::new("services");
+        let router = LocalShardedMetadataBackend::new_with_replica_repair(
+            &metadata_root,
+            configs(&local_node_id),
+            &local_node_id,
+        )
+        .expect("open node-aware sharded backend");
+        crate::metadata_backend::reset_metadata_backend_open_calls();
+
+        let resident = router.into_resident();
+        let root_handle = resident
+            .scope_shard(&file_system_id, &root_shard_id)
+            .expect("scope moved primary");
+        assert!(root_handle.is_open());
+        root_handle
+            .with_backend(|backend| backend.metadata_summary().map(|_| ()))
+            .expect("read moved primary backend");
+        assert_eq!(
+            crate::metadata_backend::metadata_backend_open_calls(),
+            0,
+            "converting and borrowing an eager shard must not reopen it"
+        );
+
+        let replica_handle = resident
+            .scope_shard(&file_system_id, &replica_shard_id)
+            .expect("scope deferred replica");
+        assert!(!replica_handle.is_open());
+        replica_handle
+            .with_backend(|backend| backend.metadata_summary().map(|_| ()))
+            .expect("open deferred replica once");
+        assert_eq!(crate::metadata_backend::metadata_backend_open_calls(), 1);
+        replica_handle
+            .clone()
+            .with_backend(|backend| backend.metadata_summary().map(|_| ()))
+            .expect("reuse deferred replica instance");
+        assert_eq!(
+            crate::metadata_backend::metadata_backend_open_calls(),
+            1,
+            "cloned resident handles must reuse the first lazy open"
+        );
+    }
+
+    #[test]
+    fn resident_handles_share_instance_local_handoff_authority() {
+        let root = sinomo_testdir::TestDir::new("dfs-resident-shard-handoff-authority");
+        let metadata_root = root.path().join("metadata");
+        let local_node_id = node("resident-handoff-local");
+        let file_system_id = crate::sifs_file_system_id();
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut shard = configs(&local_node_id)
+            .into_iter()
+            .find(|config| config.shard_id == shard_id.0)
+            .expect("root config");
+        let resident = LocalShardedMetadataBackend::new(&metadata_root, vec![shard.clone()])
+            .expect("open sharded backend")
+            .into_resident();
+        let first = resident
+            .scope_shard(&file_system_id, &shard_id)
+            .expect("scope first handle");
+        let second = first.clone();
+
+        first
+            .with_backend(|backend| {
+                backend.freeze_metadata_shard_for_membership_handoff(
+                    &shard_id,
+                    "resident-handoff",
+                    shard.epoch,
+                )?;
+                shard.epoch += 1;
+                backend.clear_metadata_shard_membership_handoff_freeze(
+                    &shard_id,
+                    "resident-handoff",
+                    &shard,
+                )?;
+                Ok(())
+            })
+            .expect("bind activated handoff to resident instance");
+        assert!(
+            !second
+                .with_backend(|backend| {
+                    backend.metadata_shard_authoritative_writes_frozen(&shard_id)
+                })
+                .expect("observe authority through cloned handle"),
+            "every handle must observe the authority bound to the moved instance"
+        );
+    }
+
+    #[test]
+    fn resident_global_checkout_returns_same_instances_and_router_updates() {
+        let root = sinomo_testdir::TestDir::new("dfs-resident-global-checkout");
+        let metadata_root = root.path().join("metadata");
+        let local_node_id = node("resident-global-local");
+        let file_system_id = crate::sifs_file_system_id();
+        let shard_id = DfsMetadataShardId::new("root");
+        let shard = configs(&local_node_id)
+            .into_iter()
+            .find(|config| config.shard_id == shard_id.0)
+            .expect("root config");
+        let resident = LocalShardedMetadataBackend::new(&metadata_root, vec![shard.clone()])
+            .expect("open sharded backend")
+            .into_resident();
+        let handle = resident
+            .scope_shard(&file_system_id, &shard_id)
+            .expect("scope resident shard");
+        crate::metadata_backend::reset_metadata_backend_open_calls();
+
+        {
+            let mut global = resident.checkout_global().expect("check out global router");
+            global
+                .freeze_metadata_shard_for_membership_handoff(
+                    &shard_id,
+                    "resident-global-handoff",
+                    shard.epoch,
+                )
+                .expect("freeze resident shard");
+            let mut active = shard.clone();
+            active.epoch += 1;
+            global
+                .clear_metadata_shard_membership_handoff_freeze(
+                    &shard_id,
+                    "resident-global-handoff",
+                    &active,
+                )
+                .expect("activate resident shard");
+        }
+        assert_eq!(
+            crate::metadata_backend::metadata_backend_open_calls(),
+            0,
+            "global checkout must reconstruct the router from resident instances"
+        );
+
+        assert_eq!(
+            resident
+                .shard_config(&shard_id)
+                .expect("returned router config")
+                .epoch,
+            shard.epoch + 1,
+            "global checkout must return router configuration updates"
+        );
+        handle
+            .with_backend(|backend| {
+                assert!(!backend.metadata_shard_authoritative_writes_frozen(&shard_id)?);
+                Ok(())
+            })
+            .expect("returned exact backend authority");
+    }
+
+    #[test]
+    fn resident_backend_serializes_one_shard_without_blocking_another() {
+        let root = sinomo_testdir::TestDir::new("dfs-resident-disjoint-shard-locks");
+        let metadata_root = root.path().join("metadata");
+        let local_node_id = node("resident-lock-local");
+        let file_system_id = crate::sifs_file_system_id();
+        let resident = LocalShardedMetadataBackend::new(&metadata_root, configs(&local_node_id))
+            .expect("open strict sharded backend")
+            .into_resident();
+        let root_handle = resident
+            .scope_shard(&file_system_id, &DfsMetadataShardId::new("root"))
+            .expect("scope root shard");
+        let services_handle = resident
+            .scope_shard(&file_system_id, &DfsMetadataShardId::new("services"))
+            .expect("scope services shard");
+        let root_guard = root_handle.checkout().expect("check out root shard");
+
+        let (services_tx, services_rx) = mpsc::channel();
+        let services_thread = std::thread::spawn(move || {
+            let _guard = services_handle
+                .checkout()
+                .expect("check out disjoint shard");
+            services_tx.send(()).expect("signal disjoint lock");
+        });
+        services_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("disjoint shard must not wait for root shard");
+        services_thread.join().expect("disjoint lock thread");
+
+        let (same_tx, same_rx) = mpsc::channel();
+        let same_handle = root_handle.clone();
+        let same_thread = std::thread::spawn(move || {
+            let _guard = same_handle
+                .checkout()
+                .expect("check out same shard after release");
+            same_tx.send(()).expect("signal same-shard lock");
+        });
+        assert!(
+            same_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "same-shard handle must remain serialized"
+        );
+        drop(root_guard);
+        same_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("same shard must advance after release");
+        same_thread.join().expect("same-shard lock thread");
+    }
 }
 
 impl DfsMetadataBackend for LocalShardedMetadataBackend {
+    fn metadata_shard_id_for_path(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Option<DfsMetadataShardId>> {
+        self.select_shard_id_for_path(file_system_id, path)
+            .map(Some)
+    }
+
     fn begin_consistent_read_snapshot(&mut self) -> Result<()> {
         let shard_ids = self.shards.keys().cloned().collect::<Vec<_>>();
         self.begin_consistent_read_snapshot_for_shards(&shard_ids)

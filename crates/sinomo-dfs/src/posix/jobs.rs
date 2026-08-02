@@ -375,9 +375,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // reservation. Install its transient fast-path guard before the
             // quorum checkpoint: if the checkpoint or the first destination
             // RPC fails, concurrent writes must still observe the parked saga.
-            if job.status == DfsNamespaceJobStatus::Running {
-                self.lock_cross_shard_namespace_path(&job.file_system_id, &job.root_path);
-            }
+            self.apply_cross_shard_namespace_job_guard(job)?;
             let mut checkpoint_object =
                 self.lookup_metadata_path_raw(&job.file_system_id, &job.root_path)?;
             if checkpoint_object.is_none()

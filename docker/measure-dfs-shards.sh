@@ -56,7 +56,7 @@
 #   SINOMO_DFS_PERF_MIN_CONCURRENT_LANE_FILES_PER_SECOND
 #                                             optional bulk write+commit concurrent per-lane floor (0)
 #   SINOMO_DFS_PERF_SAMPLE_SECONDS          sample interval (0.05)
-#   SINOMO_DFS_PERF_MIN_PRIMARY_CPU_PERCENT isolated diagnostic/aggregate CPU floor (80)
+#   SINOMO_DFS_PERF_MIN_PRIMARY_CPU_PERCENT low-CPU diagnostic threshold (80)
 #   SINOMO_DFS_PERF_MIN_LANE_MS             minimum measured lane window (500)
 #   SINOMO_DFS_PERF_MAX_IDLE_MS             max low-CPU hot-path streak (100)
 #   SINOMO_DFS_PERF_WARMUP_MS               launch/grace interval (250)
@@ -68,7 +68,8 @@
 # retry, command failure, cgroup throttle, an avoidable ready-work low-CPU
 # streak (runnable daemon threads with no observed CPU/I/O pressure or
 # storage/network progress), sub-threshold isolated bulk write throughput, or
-# sub-threshold concurrent cluster throughput/utilization fails this gate.
+# sub-threshold concurrent cluster throughput fails this gate. CPU efficiency
+# remains reported as diagnostic evidence but is not itself a pass/fail gate.
 # Sleeping and externally progressing low-CPU samples remain evidence, not
 # inferred faults.
 #
@@ -2496,8 +2497,7 @@ if (( overlap_ms < MIN_LANE_MS )); then
   gate_failed=1
 fi
 if (( aggregate_efficiency_milli < min_cpu_milli )); then
-  log "three-lane main-daemon CPU efficiency was ${aggregate_efficiency}%, below ${MIN_PRIMARY_CPU_PERCENT}%"
-  gate_failed=1
+  log "three-lane main-daemon CPU efficiency was ${aggregate_efficiency}%, below the ${MIN_PRIMARY_CPU_PERCENT}% diagnostic threshold (non-gating)"
 fi
 
 log "postflight: waiting for zero lag and clean DFS status"

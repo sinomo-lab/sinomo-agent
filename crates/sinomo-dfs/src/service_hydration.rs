@@ -35,6 +35,92 @@ fn hydration_never_cancelled() -> bool {
     false
 }
 
+impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// Drop the reconstructable metadata mirror while retaining the service's
+    /// transport, durable backend capability, and operation-independent state.
+    ///
+    /// Both complete hydration and exact-replica snapshot replacement start
+    /// from this boundary. Keeping the reset in one place prevents a new
+    /// durable projection from leaving stale objects, tombstones, intents, or
+    /// pending transfers from the generation it replaced.
+    fn reset_reconstructable_metadata_projection(&mut self) {
+        self.metadata = DfsMetadataStore::new();
+        self.tombstones_by_metadata_path.clear();
+        self.transient_metadata_object_ids.clear();
+        self.transient_metadata_predecessor_object_ids.clear();
+        self.coordinator = DistributedEventualCoordinator::new();
+        self.pending_writes.clear();
+        self.pending_reads.clear();
+        self.clear_metadata_lookup_cache();
+    }
+
+    fn restore_durable_intent_counter_floor(&mut self) -> Result<(), DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(());
+        };
+        let intent_counter_floor = backend.write_intent_counter_floor()?;
+        self.coordinator
+            .observe_restored_intent_counter_floor(intent_counter_floor);
+        Ok(())
+    }
+
+    /// Refresh an exact replica lane after atomically replacing its shard.
+    ///
+    /// Replica tables are the authoritative local copy. Materializing every
+    /// object, version, intent, and receipt into this long-lived request shell
+    /// would retain the namespace twice and is unnecessary until promotion,
+    /// whose handoff path performs a complete authoritative hydration.
+    pub(crate) fn hydrate_lazy_exact_replica_after_snapshot_install(
+        &mut self,
+    ) -> Result<(), DfsError> {
+        let exact_shard_id = self
+            .metadata_backend
+            .as_ref()
+            .and_then(|backend| backend.resident_exact_shard_id())
+            .cloned()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "lazy replica snapshot hydration requires an exact resident shard"
+                    .to_string(),
+            })?;
+        self.reset_reconstructable_metadata_projection();
+        // A replacement snapshot is an authoritative cursor reset. Do not let
+        // the previous generation's in-memory high-water mark win via `max`.
+        self.local_metadata_journal_cursors.remove(&exact_shard_id);
+        self.hydrate_file_systems_from_metadata_backend()
+    }
+
+    /// Discard one completed exact namespace request's rebuildable object
+    /// projection while retaining its shard runtime identity and cursors.
+    ///
+    /// Single-shard namespace operations are terminal and replayable through
+    /// the durable request ledger before the daemon calls this method. Their
+    /// visible objects and coordinator versions are therefore caches of the
+    /// resident shard tables, not cross-request ownership. Keeping only the
+    /// filesystem catalog, journal cursor, and shared job guards prevents both
+    /// accumulated duplicate state and stale reads after later global work.
+    pub fn collapse_exact_namespace_request_projection(&mut self) -> Result<(), DfsError> {
+        if self
+            .metadata_backend
+            .as_ref()
+            .and_then(|backend| backend.resident_exact_shard_id())
+            .is_none()
+        {
+            return Err(DfsError::Metadata {
+                message: "namespace projection collapse requires an exact resident shard"
+                    .to_string(),
+            });
+        }
+        let file_systems = std::mem::take(&mut self.metadata.filesystems);
+        self.reset_reconstructable_metadata_projection();
+        self.metadata.filesystems = file_systems;
+        self.active_namespace_operation_context = None;
+        self.active_durable_namespace_request = None;
+        self.active_durable_namespace_prepare_recorded = false;
+        self.routed_namespace_settle_depth = 0;
+        self.restore_durable_intent_counter_floor()
+    }
+}
+
 fn try_walk_metadata_pages_until_cancelled<C, E>(
     should_cancel: &(dyn Fn() -> bool + Sync),
     mut fetch_page: impl FnMut(Option<&C>) -> std::result::Result<Option<C>, E>,
@@ -97,8 +183,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         should_cancel: &(dyn Fn() -> bool + Sync),
     ) -> Result<bool, DfsError> {
-        self.cross_shard_namespace_locks.clear();
+        let exact_shard_id = self
+            .metadata_backend
+            .as_ref()
+            .and_then(|backend| backend.resident_exact_shard_id())
+            .cloned();
         let Some(backend) = self.metadata_backend.as_ref() else {
+            self.cross_shard_namespace_locks.replace_jobs([]);
             return Ok(true);
         };
         let mut locks = Vec::new();
@@ -114,36 +205,73 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
                     )
                 {
-                    locks.push((job.file_system_id.clone(), job.root_path.clone()));
+                    let shard_id = match exact_shard_id.as_ref() {
+                        Some(shard_id) => Some(shard_id.clone()),
+                        None => backend
+                            .metadata_shard_id_for_path(&job.file_system_id, &job.root_path)?,
+                    };
+                    locks.push((
+                        shard_id,
+                        job.job_id.clone(),
+                        job.file_system_id.clone(),
+                        job.root_path.clone(),
+                    ));
                 }
             }
             Ok::<_, DfsError>(page.next_cursor)
         })? {
             return Ok(false);
         }
-        for (file_system_id, path) in locks {
-            if should_cancel() {
-                return Ok(false);
-            }
-            self.lock_cross_shard_namespace_path(&file_system_id, &path);
+        if should_cancel() {
+            return Ok(false);
+        }
+        if let Some(exact_shard_id) = exact_shard_id {
+            // A snapshot install can remove a previously running job. Replace
+            // this shard's complete job-owned projection so that obsolete
+            // guards disappear without disturbing sibling shards.
+            self.cross_shard_namespace_locks.replace_shard_jobs(
+                &exact_shard_id,
+                locks
+                    .into_iter()
+                    .map(|(_, job_id, file_system_id, path)| (job_id, file_system_id, path)),
+            );
+        } else {
+            self.cross_shard_namespace_locks.replace_jobs(locks);
         }
         Ok(!should_cancel())
     }
 
-    fn apply_cross_shard_namespace_job_guard(&mut self, job: &DfsNamespaceJobRecord) {
+    pub(crate) fn apply_cross_shard_namespace_job_guard(
+        &mut self,
+        job: &DfsNamespaceJobRecord,
+    ) -> Result<(), DfsError> {
         if !matches!(
             job.kind,
             DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
                 | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
                 | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
         ) {
-            return;
+            return Ok(());
         }
         if job.status == DfsNamespaceJobStatus::Running {
-            self.lock_cross_shard_namespace_path(&job.file_system_id, &job.root_path);
+            let shard_id = self
+                .metadata_backend
+                .as_ref()
+                .map(|backend| {
+                    backend.metadata_shard_id_for_path(&job.file_system_id, &job.root_path)
+                })
+                .transpose()?
+                .flatten();
+            self.cross_shard_namespace_locks.upsert_job(
+                shard_id,
+                job.job_id.clone(),
+                job.file_system_id.clone(),
+                job.root_path.clone(),
+            );
         } else {
-            self.unlock_cross_shard_namespace_path(&job.file_system_id, &job.root_path);
+            self.cross_shard_namespace_locks.remove_job(&job.job_id);
         }
+        Ok(())
     }
 
     pub fn hydrate_from_metadata_backend(&mut self) -> Result<(), DfsError> {
@@ -233,20 +361,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(false);
         }
 
-        self.metadata = DfsMetadataStore::new();
-        self.tombstones_by_metadata_path.clear();
-        self.transient_metadata_object_ids.clear();
-        self.transient_metadata_predecessor_object_ids.clear();
-        self.coordinator = DistributedEventualCoordinator::new();
-        let intent_counter_floor = self
-            .metadata_backend
-            .as_ref()
-            .expect("metadata backend checked above")
-            .write_intent_counter_floor()?;
-        self.coordinator
-            .observe_restored_intent_counter_floor(intent_counter_floor);
-        self.pending_writes.clear();
-        self.pending_reads.clear();
+        self.reset_reconstructable_metadata_projection();
+        self.restore_durable_intent_counter_floor()?;
         if !self.rebuild_cross_shard_namespace_locks_until_cancelled(should_cancel)? {
             return Ok(false);
         }
@@ -711,6 +827,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.metadata
                 .add_file_system(DfsFileSystem::sifs(self.node_id.clone()));
         }
+        // Lazy mutation services still allocate intent identifiers. Restore
+        // the durable floor without materializing the intent bodies so a
+        // rebuilt request shell cannot reuse an identifier after restart or
+        // explicit disaster recovery.
+        self.restore_durable_intent_counter_floor()?;
         // Lazy services still process mutations. Restore the durable guards for
         // running cross-shard namespace jobs without paying for a full object,
         // version, intent, and receipt scan.
@@ -993,7 +1114,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .flatten(),
             };
             if let Some(job) = job.as_ref() {
-                self.apply_cross_shard_namespace_job_guard(job);
+                self.apply_cross_shard_namespace_job_guard(job)?;
             }
         }
 
@@ -1124,7 +1245,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
                     return Ok(());
                 };
-                self.apply_cross_shard_namespace_job_guard(job);
+                self.apply_cross_shard_namespace_job_guard(job)?;
             }
             DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => {
                 let Some(transaction) = transaction.as_ref() else {
@@ -1281,7 +1402,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .transpose()?
                     .flatten();
                 if let Some(job) = job.as_ref() {
-                    self.apply_cross_shard_namespace_job_guard(job);
+                    self.apply_cross_shard_namespace_job_guard(job)?;
                 }
             }
             DfsMetadataMutation::ApplyNamespaceTransaction { transaction_id, .. } => {

@@ -451,34 +451,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(foreign_primary)
     }
 
-    /// Marks a path as participating in an in-flight cross-shard move so
-    /// concurrent mutations cannot fork the object between shards. Directory
-    /// moves lock their whole subtree: the check matches descendants and
-    /// ancestors of the locked path, not just the path itself.
-    pub(crate) fn lock_cross_shard_namespace_path(
-        &mut self,
-        file_system_id: &DfsFileSystemId,
-        path: &str,
-    ) {
-        let Some(normalized) = posix_path::normalized_posix_path_key(path) else {
-            return;
-        };
-        self.cross_shard_namespace_locks
-            .insert((file_system_id.clone(), normalized));
-    }
-
-    pub(crate) fn unlock_cross_shard_namespace_path(
-        &mut self,
-        file_system_id: &DfsFileSystemId,
-        path: &str,
-    ) {
-        let Some(normalized) = posix_path::normalized_posix_path_key(path) else {
-            return;
-        };
-        self.cross_shard_namespace_locks
-            .remove(&(file_system_id.clone(), normalized));
-    }
-
     pub(crate) fn ensure_path_not_in_cross_shard_flight(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -490,17 +462,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(normalized) = posix_path::normalized_posix_path_key(path) else {
             return Ok(());
         };
-        let blocked =
-            self.cross_shard_namespace_locks
-                .iter()
-                .any(|(locked_file_system_id, locked_path)| {
-                    locked_file_system_id == file_system_id
-                        && (posix_path::posix_path_is_at_or_under_prefix(&normalized, locked_path)
-                            || posix_path::posix_path_is_at_or_under_prefix(
-                                locked_path,
-                                &normalized,
-                            ))
-                });
+        let blocked = self
+            .cross_shard_namespace_locks
+            .blocks(file_system_id, &normalized);
         if blocked {
             return Err(DfsError::Busy {
                 path: path.to_string(),

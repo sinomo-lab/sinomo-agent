@@ -2369,6 +2369,23 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// Return per-shard metadata journal and replay status.
     fn metadata_shard_statuses(&self) -> Result<Vec<DfsMetadataShardStatus>>;
 
+    /// Resolve the durable shard which owns one namespace path when this
+    /// backend can prove that routing identity.
+    ///
+    /// Unsharded backends inherit the single status identity. Sharded routers
+    /// override this with their canonical path routing table. Returning `None`
+    /// is conservative: callers retain an unscoped guard which exact-shard
+    /// replacement cannot discard without positive ownership evidence.
+    fn metadata_shard_id_for_path(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Option<DfsMetadataShardId>> {
+        let _ = (file_system_id, path);
+        let statuses = self.metadata_shard_statuses()?;
+        Ok((statuses.len() == 1).then(|| statuses[0].shard_id.clone()))
+    }
+
     /// Persist and materialize a replicated journal batch.
     ///
     /// `batch.shard_id` is the logical shard identity and must match the

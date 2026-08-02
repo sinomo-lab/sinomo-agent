@@ -253,9 +253,9 @@ pub use routed_stream_pool::{
     write_local_object_rpc_carrier_prelude,
 };
 pub use routing::{
-    CandidatePath, ConnectOptions, DirectRoutedConnector, MAX_ROUTE_CANDIDATES,
-    MultiHopRoutedConnector, PeerStream, RouteConstraints, RouteHop, RouteTrace,
-    RoutedAvailability, RoutedConnectFuture, RoutedConnector, RoutedRelayReport,
+    CandidatePath, ConnectOptions, DestinationProcessAffinity, DirectRoutedConnector,
+    MAX_ROUTE_CANDIDATES, MultiHopRoutedConnector, PeerStream, RouteConstraints, RouteHop,
+    RouteTrace, RoutedAvailability, RoutedConnectFuture, RoutedConnector, RoutedRelayReport,
     RoutedSessionDisposition, RoutedSessionIdentity, RoutedSessionProtection,
     accept_direct_routed_session, accept_or_relay_routed_session, connect_direct_routed_endpoint,
     plan_routes,

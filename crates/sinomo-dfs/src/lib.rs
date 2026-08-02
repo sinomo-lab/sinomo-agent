@@ -401,7 +401,10 @@ pub(crate) use metadata_replication::{
     prepare_dfs_metadata_journal_publish_with_host,
     prepare_dfs_metadata_journal_publish_with_host_and_execution_exclusions,
 };
-pub use metadata_sharded_backend::LocalShardedMetadataBackend;
+pub use metadata_sharded_backend::{
+    LocalShardedMetadataBackend, ResidentLocalMetadataShardHandle, ResidentLocalMetadataShardLease,
+    ResidentLocalShardedMetadataBackend, ResidentLocalShardedMetadataBackendLease,
+};
 pub use model::{
     DfsFileSystem, DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, DfsOperationalMetrics,
     DfsPlacementScope, DfsPolicyViolation, DfsReadOutcome, DfsServiceEvent, DfsSubtreePolicy,
@@ -583,11 +586,11 @@ pub(crate) use service_state::{
 pub use service_state::{
     DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT, DfsCancellationFlag,
     DfsCommittedWork, DfsCommittedWorkTracker, DfsConfirmedTimeoutAction,
-    DfsConfirmedTimeoutOutcome, DfsConflictReadView, DfsMessageCommittedWork,
-    DfsMessageProcessReport, DfsMessageProcessResult, DfsMetadataReplicationOutcome,
-    DfsOwnerHandoffOutcome, DfsReconnectReconciliation, NetworkedDfsRangeReadOutcome,
-    NetworkedDfsReadFreshness, NetworkedDfsReadOutcome, NetworkedDfsService,
-    NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
+    DfsConfirmedTimeoutOutcome, DfsConflictReadView, DfsCrossShardNamespaceLockRegistry,
+    DfsMessageCommittedWork, DfsMessageProcessReport, DfsMessageProcessResult,
+    DfsMetadataReplicationOutcome, DfsOwnerHandoffOutcome, DfsReconnectReconciliation,
+    NetworkedDfsRangeReadOutcome, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
+    NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
 };
 pub use service_trace::with_dfs_traceparent;
 pub(crate) use service_trace::{

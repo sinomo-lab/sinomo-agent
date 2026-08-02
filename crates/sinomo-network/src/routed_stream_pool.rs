@@ -523,6 +523,7 @@ struct PoolKey {
     require_confidentiality: bool,
     require_relay_forwarding: bool,
     max_hops: usize,
+    destination_process_affinity: crate::DestinationProcessAffinity,
 }
 
 impl PoolKey {
@@ -530,6 +531,7 @@ impl PoolKey {
         scope: String,
         directory_generation: u64,
         constraints: RouteConstraints,
+        destination_process_affinity: crate::DestinationProcessAffinity,
         local_node_id: NodeId,
         peer_node_id: NodeId,
         protection: crate::RoutedSessionProtection,
@@ -544,6 +546,7 @@ impl PoolKey {
             require_confidentiality: constraints.require_confidentiality,
             require_relay_forwarding: constraints.require_relay_forwarding,
             max_hops: constraints.max_hops,
+            destination_process_affinity,
         }
     }
 
@@ -556,6 +559,7 @@ impl PoolKey {
             && self.require_confidentiality == other.require_confidentiality
             && self.require_relay_forwarding == other.require_relay_forwarding
             && self.max_hops == other.max_hops
+            && self.destination_process_affinity == other.destination_process_affinity
     }
 }
 
@@ -657,10 +661,39 @@ pub async fn open_pooled_routed_stream_with_protection<F>(
 where
     F: Future<Output = Result<PeerStream, NetworkError>>,
 {
+    open_pooled_routed_stream_with_protection_and_destination_process_affinity(
+        scope,
+        directory_generation,
+        constraints,
+        crate::DestinationProcessAffinity::Any,
+        local_node_id,
+        peer_node_id,
+        protection,
+        timeout,
+        establish,
+    )
+    .await
+}
+
+pub(crate) async fn open_pooled_routed_stream_with_protection_and_destination_process_affinity<F>(
+    scope: String,
+    directory_generation: u64,
+    constraints: RouteConstraints,
+    destination_process_affinity: crate::DestinationProcessAffinity,
+    local_node_id: NodeId,
+    peer_node_id: NodeId,
+    protection: crate::RoutedSessionProtection,
+    timeout: Duration,
+    establish: F,
+) -> Result<PeerStream, NetworkError>
+where
+    F: Future<Output = Result<PeerStream, NetworkError>>,
+{
     let key = PoolKey::new(
         scope,
         directory_generation,
         constraints,
+        destination_process_affinity,
         local_node_id,
         peer_node_id,
         protection,
@@ -822,10 +855,14 @@ pub async fn accept_pooled_routed_stream_carrier(
     constraints: RouteConstraints,
     carrier: PeerStream,
 ) -> Result<RoutedStreamAcceptor, NetworkError> {
+    // The routed handshake proves the initiating node, but it does not identify
+    // which process endpoint on that node opened the carrier. Publish accepted
+    // carriers only for affinity-neutral reverse calls.
     let key = PoolKey::new(
         scope,
         directory_generation,
         constraints,
+        crate::DestinationProcessAffinity::Any,
         carrier.local_node_id.clone(),
         carrier.peer_node_id.clone(),
         carrier.protection,
@@ -1073,6 +1110,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn main_daemon_open_never_reuses_an_affinity_neutral_carrier() {
+        let (any_client_carrier, any_server_carrier) = carrier_pair();
+        let (main_client_carrier, main_server_carrier) = carrier_pair();
+        let local = any_client_carrier.local_node_id.clone();
+        let peer = any_client_carrier.peer_node_id.clone();
+        let scope = Id::generate().to_string();
+        let any_establishments = Arc::new(AtomicUsize::new(0));
+        let main_establishments = Arc::new(AtomicUsize::new(0));
+        let mut any_acceptor = accept_routed_stream_carrier(any_server_carrier);
+        let mut main_acceptor = accept_routed_stream_carrier(main_server_carrier);
+        let any_server = tokio::spawn(async move {
+            let mut stream = any_acceptor
+                .accept()
+                .await
+                .expect("accept affinity-neutral stream")
+                .expect("affinity-neutral stream");
+            let mut byte = [0_u8; 1];
+            stream
+                .read_exact(&mut byte)
+                .await
+                .expect("read affinity-neutral stream");
+            byte[0]
+        });
+        let main_server = tokio::spawn(async move {
+            let mut stream = main_acceptor
+                .accept()
+                .await
+                .expect("accept main-daemon stream")
+                .expect("main-daemon stream");
+            let mut byte = [0_u8; 1];
+            stream
+                .read_exact(&mut byte)
+                .await
+                .expect("read main-daemon stream");
+            byte[0]
+        });
+
+        let any_count = Arc::clone(&any_establishments);
+        let mut any_stream = open_pooled_routed_stream(
+            scope.clone(),
+            1,
+            RouteConstraints::default(),
+            local.clone(),
+            peer.clone(),
+            Duration::from_secs(1),
+            async move {
+                any_count.fetch_add(1, Ordering::Relaxed);
+                Ok(any_client_carrier)
+            },
+        )
+        .await
+        .expect("open affinity-neutral stream");
+        let any_session_id = any_stream.session_id.clone();
+
+        let main_count = Arc::clone(&main_establishments);
+        let mut main_stream =
+            open_pooled_routed_stream_with_protection_and_destination_process_affinity(
+                scope.clone(),
+                1,
+                RouteConstraints::default(),
+                crate::DestinationProcessAffinity::MainDaemon,
+                local,
+                peer,
+                crate::RoutedSessionProtection::Plaintext,
+                Duration::from_secs(1),
+                async move {
+                    main_count.fetch_add(1, Ordering::Relaxed);
+                    Ok(main_client_carrier)
+                },
+            )
+            .await
+            .expect("open main-daemon stream");
+
+        assert_ne!(
+            any_session_id, main_stream.session_id,
+            "a main-daemon open must establish a carrier with matching affinity"
+        );
+        any_stream
+            .write_all(b"a")
+            .await
+            .expect("write affinity-neutral stream");
+        main_stream
+            .write_all(b"m")
+            .await
+            .expect("write main-daemon stream");
+        assert_eq!(any_server.await.expect("affinity-neutral server"), b'a');
+        assert_eq!(main_server.await.expect("main-daemon server"), b'm');
+        assert_eq!(any_establishments.load(Ordering::Relaxed), 1);
+        assert_eq!(main_establishments.load(Ordering::Relaxed), 1);
+        assert_eq!(retire_pooled_routed_streams(&scope).await, 2);
+    }
+
+    #[tokio::test]
     async fn accepted_owned_carrier_supports_reverse_direction_streams() {
         let (client_carrier, server_carrier) = carrier_pair();
         let client_node = client_carrier.local_node_id.clone();
@@ -1189,6 +1319,31 @@ mod tests {
             pooled_routed_relationship_is_active(&scope, &client_node, &server_node),
             Some(false),
         );
+    }
+
+    #[tokio::test]
+    async fn accepted_carrier_is_affinity_neutral_for_reverse_reuse() {
+        let (client_carrier, server_carrier) = carrier_pair();
+        let scope = Id::generate().to_string();
+        let constraints = RouteConstraints::default();
+
+        let acceptor =
+            accept_pooled_routed_stream_carrier(scope.clone(), 1, constraints, server_carrier)
+                .await
+                .expect("accept pooled carrier");
+        let pool = routed_stream_pool().lock().await;
+        let accepted_key = pool
+            .keys()
+            .find(|key| key.scope == scope)
+            .expect("accepted carrier pool key");
+        assert_eq!(
+            accepted_key.destination_process_affinity,
+            crate::DestinationProcessAffinity::Any
+        );
+        drop(pool);
+        drop(acceptor);
+        drop(client_carrier);
+        assert_eq!(retire_pooled_routed_streams(&scope).await, 1);
     }
 
     #[tokio::test]
@@ -1600,6 +1755,7 @@ fn routed_carrier_pool_never_crosses_protection_modes() {
         "pool-protection".to_string(),
         1,
         RouteConstraints::default(),
+        crate::DestinationProcessAffinity::Any,
         local.clone(),
         peer.clone(),
         crate::RoutedSessionProtection::Plaintext,
@@ -1608,6 +1764,7 @@ fn routed_carrier_pool_never_crosses_protection_modes() {
         "pool-protection".to_string(),
         1,
         RouteConstraints::default(),
+        crate::DestinationProcessAffinity::Any,
         local,
         peer,
         crate::RoutedSessionProtection::Aead,
@@ -1615,4 +1772,31 @@ fn routed_carrier_pool_never_crosses_protection_modes() {
 
     assert_ne!(plaintext, aead);
     assert!(!plaintext.same_relationship(&aead));
+}
+
+#[test]
+fn routed_carrier_pool_never_crosses_destination_process_affinities() {
+    let local = NodeId::from_legacy_named("pool-affinity-local").expect("local node id");
+    let peer = NodeId::from_legacy_named("pool-affinity-peer").expect("peer node id");
+    let any = PoolKey::new(
+        "pool-affinity".to_string(),
+        1,
+        RouteConstraints::default(),
+        crate::DestinationProcessAffinity::Any,
+        local.clone(),
+        peer.clone(),
+        crate::RoutedSessionProtection::Plaintext,
+    );
+    let main = PoolKey::new(
+        "pool-affinity".to_string(),
+        1,
+        RouteConstraints::default(),
+        crate::DestinationProcessAffinity::MainDaemon,
+        local,
+        peer,
+        crate::RoutedSessionProtection::Plaintext,
+    );
+
+    assert_ne!(any, main);
+    assert!(!any.same_relationship(&main));
 }

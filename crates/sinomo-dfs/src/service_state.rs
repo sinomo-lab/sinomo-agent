@@ -1,6 +1,7 @@
 //! Networked DFS service state, outcome, event, and pending-state types.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -19,7 +20,8 @@ use crate::{
     DfsObjectId, DfsObjectMetadata, DfsOutboundAttachment, DfsPendingNamespaceRequestPageCursor,
     DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData, DfsReadResult,
     DfsRepairAttemptRecord, DfsVersion, DistributedEventualCoordinator, DistributedRepairJob,
-    LocalContentStore, ObjectVersionReader,
+    LocalContentStore, ObjectVersionReader, ResidentLocalMetadataShardLease,
+    ResidentLocalShardedMetadataBackendLease,
 };
 
 pub(crate) const DFS_REMOTE_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -156,6 +158,139 @@ pub(crate) const DFS_ROUTED_NAMESPACE_IDLE_WAIT: Duration = Duration::from_milli
 
 pub(crate) const DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES: usize = 64;
 
+/// Process-local guard registry for paths owned by running cross-shard jobs.
+///
+/// Metadata backends remain the durable source of truth. This registry is the
+/// live admission projection shared by every request shell borrowing the same
+/// resident backend generation, so a global rename/hardlink job cannot become
+/// invisible to an already-open exact-shard lane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DfsCrossShardNamespaceJobLock {
+    shard_id: Option<DfsMetadataShardId>,
+    file_system_id: DfsFileSystemId,
+    path: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DfsCrossShardNamespaceLockRegistry {
+    /// Job identity is the ownership boundary. A delayed terminal update for
+    /// one job must not remove a newer job's guard merely because both jobs
+    /// use the same path.
+    locks_by_job: Arc<Mutex<BTreeMap<String, DfsCrossShardNamespaceJobLock>>>,
+}
+
+impl DfsCrossShardNamespaceLockRegistry {
+    pub(crate) fn replace_jobs(
+        &self,
+        locks: impl IntoIterator<Item = (Option<DfsMetadataShardId>, String, DfsFileSystemId, String)>,
+    ) {
+        let mut current = self
+            .locks_by_job
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        current.clear();
+        current.extend(
+            locks
+                .into_iter()
+                .map(|(shard_id, job_id, file_system_id, path)| {
+                    (
+                        job_id,
+                        DfsCrossShardNamespaceJobLock {
+                            shard_id,
+                            file_system_id,
+                            path,
+                        },
+                    )
+                }),
+        );
+    }
+
+    pub(crate) fn replace_shard_jobs(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        locks: impl IntoIterator<Item = (String, DfsFileSystemId, String)>,
+    ) {
+        let mut current = self
+            .locks_by_job
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        current.retain(|_, lock| lock.shard_id.as_ref() != Some(shard_id));
+        current.extend(locks.into_iter().map(|(job_id, file_system_id, path)| {
+            (
+                job_id,
+                DfsCrossShardNamespaceJobLock {
+                    shard_id: Some(shard_id.clone()),
+                    file_system_id,
+                    path,
+                },
+            )
+        }));
+    }
+
+    pub(crate) fn upsert_job(
+        &self,
+        shard_id: Option<DfsMetadataShardId>,
+        job_id: String,
+        file_system_id: DfsFileSystemId,
+        path: String,
+    ) {
+        self.locks_by_job
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                job_id,
+                DfsCrossShardNamespaceJobLock {
+                    shard_id,
+                    file_system_id,
+                    path,
+                },
+            );
+    }
+
+    pub(crate) fn remove_job(&self, job_id: &str) {
+        self.locks_by_job
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(job_id);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.locks_by_job
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        let current = self
+            .locks_by_job
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        current
+            .values()
+            .map(|lock| (&lock.file_system_id, lock.path.as_str()))
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    pub(crate) fn blocks(&self, file_system_id: &DfsFileSystemId, path: &str) -> bool {
+        self.locks_by_job
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .any(|lock| {
+                lock.file_system_id == *file_system_id
+                    && (crate::posix_path::posix_path_is_at_or_under_prefix(path, &lock.path)
+                        || crate::posix_path::posix_path_is_at_or_under_prefix(&lock.path, path))
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.locks_by_job, &other.locks_by_job)
+    }
+}
+
 /// Immutable control-plane inputs reused by the local planning portion of one
 /// routed namespace command.
 ///
@@ -213,6 +348,75 @@ impl DfsCancellationFlag {
     }
 }
 
+/// One metadata capability temporarily attached to a DFS service.
+///
+/// Ordinary callers retain an owned backend. Daemon request lanes instead
+/// attach a lease from the process-resident shard pool for the bounded request
+/// which is about to run. Keeping that distinction behind `Deref` preserves
+/// the existing backend call sites while making it impossible to open a second
+/// authority-bearing backend merely to execute another shard concurrently.
+pub(crate) enum DfsMetadataBackendOwner {
+    Owned(Box<dyn DfsMetadataBackend>),
+    ResidentShard(ResidentLocalMetadataShardLease),
+    ResidentSharded(ResidentLocalShardedMetadataBackendLease),
+}
+
+impl std::fmt::Debug for DfsMetadataBackendOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Owned(backend) => formatter
+                .debug_tuple("OwnedMetadataBackend")
+                .field(backend)
+                .finish(),
+            Self::ResidentShard(lease) => lease.fmt(formatter),
+            Self::ResidentSharded(lease) => lease.fmt(formatter),
+        }
+    }
+}
+
+impl Deref for DfsMetadataBackendOwner {
+    type Target = dyn DfsMetadataBackend;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(backend) => backend.as_ref(),
+            Self::ResidentShard(lease) => &**lease,
+            Self::ResidentSharded(lease) => &**lease,
+        }
+    }
+}
+
+impl DerefMut for DfsMetadataBackendOwner {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Owned(backend) => backend.as_mut(),
+            Self::ResidentShard(lease) => &mut **lease,
+            Self::ResidentSharded(lease) => &mut **lease,
+        }
+    }
+}
+
+impl AsRef<dyn DfsMetadataBackend> for DfsMetadataBackendOwner {
+    fn as_ref(&self) -> &(dyn DfsMetadataBackend + 'static) {
+        &**self
+    }
+}
+
+impl AsMut<dyn DfsMetadataBackend> for DfsMetadataBackendOwner {
+    fn as_mut(&mut self) -> &mut (dyn DfsMetadataBackend + 'static) {
+        &mut **self
+    }
+}
+
+impl DfsMetadataBackendOwner {
+    pub(crate) fn resident_exact_shard_id(&self) -> Option<&DfsMetadataShardId> {
+        match self {
+            Self::ResidentShard(lease) => Some(lease.shard_id()),
+            Self::Owned(_) | Self::ResidentSharded(_) => None,
+        }
+    }
+}
+
 /// Stateful networked DFS data-plane and metadata coordinator.
 #[derive(Debug)]
 pub struct NetworkedDfsService<T> {
@@ -224,7 +428,7 @@ pub struct NetworkedDfsService<T> {
     pub(crate) content: LocalContentStore,
     pub(crate) coordinator: DistributedEventualCoordinator,
     pub(crate) control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
-    pub(crate) metadata_backend: Option<Box<dyn DfsMetadataBackend>>,
+    pub(crate) metadata_backend: Option<DfsMetadataBackendOwner>,
     pub(crate) metadata_lookup_cache:
         Mutex<BTreeMap<(DfsFileSystemId, String), Option<DfsObjectMetadata>>>,
     pub(crate) metadata_lookup_cache_depth: Mutex<usize>,
@@ -261,7 +465,7 @@ pub struct NetworkedDfsService<T> {
     /// contradictory terminal rejection.
     pub(crate) active_durable_namespace_prepare_recorded: bool,
     pub(crate) routed_namespace_settle_depth: usize,
-    pub(crate) cross_shard_namespace_locks: BTreeSet<(DfsFileSystemId, String)>,
+    pub(crate) cross_shard_namespace_locks: DfsCrossShardNamespaceLockRegistry,
     pub(crate) last_events: Vec<NetworkedDfsServiceEvent>,
     pub(crate) message_committed_work: DfsMessageCommittedWork,
     pub(crate) committed_work_tracker: Option<DfsCommittedWorkTracker>,

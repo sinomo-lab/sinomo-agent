@@ -50,6 +50,31 @@ const ROUTED_CANDIDATE_PER_HOP_HANDSHAKE_BUDGET: Duration = Duration::from_milli
 /// probe fails whenever two cluster nodes differ by more than two seconds.
 const ROUTED_SESSION_DEADLINE_CLOCK_SKEW_MILLIS: i64 = 30_000;
 
+/// Selects which daemon process may terminate a routed relationship.
+///
+/// Main and shadow daemons intentionally share one cluster node identity. The
+/// affinity therefore belongs to endpoint selection and local carrier reuse;
+/// it is not part of the routed-session wire descriptor or peer authority.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DestinationProcessAffinity {
+    /// Any process endpoint advertising the destination node identity.
+    #[default]
+    Any,
+    /// Only an endpoint owned by the node's main daemon.
+    MainDaemon,
+}
+
+impl DestinationProcessAffinity {
+    fn accepts_terminal_endpoint(self, endpoint: &ClusterEndpointRecord) -> bool {
+        match self {
+            Self::Any => true,
+            Self::MainDaemon => {
+                crate::endpoint_selector::cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RouteConstraints {
     pub require_full_duplex: bool,
@@ -175,6 +200,24 @@ pub fn plan_routes(
     destination_node_id: &NodeId,
     constraints: RouteConstraints,
 ) -> Vec<CandidatePath> {
+    plan_routes_with_destination_process_affinity(
+        directory,
+        connectivity,
+        source_node_id,
+        destination_node_id,
+        constraints,
+        DestinationProcessAffinity::Any,
+    )
+}
+
+fn plan_routes_with_destination_process_affinity(
+    directory: &DirectorySnapshot,
+    connectivity: &ConnectivitySnapshot,
+    source_node_id: &NodeId,
+    destination_node_id: &NodeId,
+    constraints: RouteConstraints,
+    destination_process_affinity: DestinationProcessAffinity,
+) -> Vec<CandidatePath> {
     if connectivity.directory_generation() != directory.version().0
         || !directory.is_authorized(source_node_id)
         || !directory.is_authorized(destination_node_id)
@@ -183,7 +226,15 @@ pub fn plan_routes(
         return Vec::new();
     }
     if source_node_id == destination_node_id {
-        return vec![CandidatePath::at_source(source_node_id.clone())];
+        return match destination_process_affinity {
+            DestinationProcessAffinity::Any => {
+                vec![CandidatePath::at_source(source_node_id.clone())]
+            }
+            // A node identity does not distinguish its main and shadow
+            // processes. Without a terminal endpoint dial there is no positive
+            // proof that this process is the main daemon.
+            DestinationProcessAffinity::MainDaemon => Vec::new(),
+        };
     }
 
     let mut adjacency = BTreeMap::<NodeId, Vec<RouteHop>>::new();
@@ -235,6 +286,11 @@ pub fn plan_routes(
         };
         for hop in next_hops {
             if path.nodes.contains(&hop.target_node_id) {
+                continue;
+            }
+            if &hop.target_node_id == destination_node_id
+                && !destination_process_affinity.accepts_terminal_endpoint(&hop.endpoint)
+            {
                 continue;
             }
             let next_path = path.extend(hop.clone());
@@ -2725,6 +2781,7 @@ impl MultiHopRoutedConnector {
         &self,
         destination_node_id: NodeId,
         options: ConnectOptions,
+        destination_process_affinity: DestinationProcessAffinity,
     ) -> Result<PeerStream, NetworkError> {
         let directory = &self.directory;
         if !directory.is_authorized(&self.local_node_id) {
@@ -2738,12 +2795,13 @@ impl MultiHopRoutedConnector {
             });
         }
         let connectivity = self.connectivity.snapshot();
-        let paths = plan_routes(
+        let paths = plan_routes_with_destination_process_affinity(
             directory,
             &connectivity,
             &self.local_node_id,
             &destination_node_id,
             options.constraints,
+            destination_process_affinity,
         );
         let deadline = tokio::time::Instant::now() + options.timeout;
         let path_count = paths.len();
@@ -2855,6 +2913,29 @@ impl MultiHopRoutedConnector {
             },
         })
     }
+
+    pub(crate) fn connect_with_destination_process_affinity<'a>(
+        &'a self,
+        destination_node_id: NodeId,
+        options: ConnectOptions,
+        destination_process_affinity: DestinationProcessAffinity,
+    ) -> RoutedConnectFuture<'a> {
+        Box::pin(async move {
+            tokio::time::timeout(
+                options.timeout,
+                self.connect_inner(destination_node_id, options, destination_process_affinity),
+            )
+            .await
+            .map_err(|_| {
+                NetworkError::timeout(
+                    "establish multi-hop routed session",
+                    NetworkTimeoutPhase::Connect,
+                    options.timeout,
+                    NetworkDeliveryState::DefinitelyNotSent,
+                )
+            })?
+        })
+    }
 }
 
 fn routed_candidate_attempt_timeout(
@@ -2892,21 +2973,11 @@ impl RoutedConnector for MultiHopRoutedConnector {
         destination_node_id: NodeId,
         options: ConnectOptions,
     ) -> RoutedConnectFuture<'a> {
-        Box::pin(async move {
-            tokio::time::timeout(
-                options.timeout,
-                self.connect_inner(destination_node_id, options),
-            )
-            .await
-            .map_err(|_| {
-                NetworkError::timeout(
-                    "establish multi-hop routed session",
-                    NetworkTimeoutPhase::Connect,
-                    options.timeout,
-                    NetworkDeliveryState::DefinitelyNotSent,
-                )
-            })?
-        })
+        self.connect_with_destination_process_affinity(
+            destination_node_id,
+            options,
+            DestinationProcessAffinity::Any,
+        )
     }
 
     fn availability(&self, destination_node_id: &NodeId) -> RoutedAvailability {
@@ -3193,6 +3264,31 @@ mod tests {
         }
     }
 
+    fn folded_shadow_edge(
+        source: &NodeId,
+        destination: &NodeId,
+        name: &str,
+        directory_generation: u64,
+        latency_micros: u64,
+        address: &str,
+    ) -> DirectConnectivityObservation {
+        let mut observation = edge(
+            source,
+            destination,
+            name,
+            directory_generation,
+            latency_micros,
+        );
+        observation.endpoint.transport = ClusterTransportKind::LanTcp;
+        observation.endpoint.address = address.to_string();
+        observation.endpoint.endpoint_id = sinomo_node::daemon_lan_endpoint_id(
+            &sinomo_node::shadow_daemon_node_id(destination),
+            address,
+        );
+        observation.endpoint.node_id = destination.clone();
+        observation
+    }
+
     fn fixtures(
         directory_generation: u64,
         edges: Vec<DirectConnectivityObservation>,
@@ -3252,6 +3348,223 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[0].nodes, vec![a.clone(), c.clone()]);
         assert_eq!(paths[1].nodes, vec![a, b, c]);
+    }
+
+    #[test]
+    fn planner_applies_main_daemon_affinity_only_to_the_terminal_endpoint() {
+        let source = node("node_route_affinity_source");
+        let relay = node("node_route_affinity_relay");
+        let destination = node("node_route_affinity_destination");
+        let mut shadow_direct = edge(
+            &source,
+            &destination,
+            "endpoint_route_affinity_shadow_direct",
+            61,
+            1,
+        );
+        shadow_direct.endpoint.transport = ClusterTransportKind::LanTcp;
+        shadow_direct.endpoint.address = "198.51.100.61:21354".to_string();
+        let shadow_direct_id = shadow_direct.endpoint.endpoint_id.clone();
+
+        let mut main_direct = edge(
+            &source,
+            &destination,
+            "endpoint_route_affinity_main_direct",
+            61,
+            30,
+        );
+        main_direct.endpoint.transport = ClusterTransportKind::LanTcp;
+        main_direct.endpoint.address = "198.51.100.61:21353".to_string();
+        let main_direct_id = main_direct.endpoint.endpoint_id.clone();
+
+        // A shadow-looking endpoint is still valid as an intermediate hop. The
+        // affinity describes the process that terminates the relationship.
+        let mut shadow_relay = edge(
+            &source,
+            &relay,
+            "endpoint_route_affinity_shadow_relay",
+            61,
+            5,
+        );
+        shadow_relay.endpoint.transport = ClusterTransportKind::LanTcp;
+        shadow_relay.endpoint.address = "198.51.100.62:21354".to_string();
+        let shadow_relay_id = shadow_relay.endpoint.endpoint_id.clone();
+
+        let mut relay_to_main = edge(
+            &relay,
+            &destination,
+            "endpoint_route_affinity_relay_to_main",
+            61,
+            5,
+        );
+        relay_to_main.endpoint.transport = ClusterTransportKind::LanTcp;
+        relay_to_main.endpoint.address = "198.51.100.61:21353".to_string();
+        let relay_to_main_id = relay_to_main.endpoint.endpoint_id.clone();
+
+        let (directory, connectivity) = fixtures(
+            61,
+            vec![shadow_direct, main_direct, shadow_relay, relay_to_main],
+        );
+        let unrestricted = plan_routes(
+            &directory,
+            &connectivity,
+            &source,
+            &destination,
+            RouteConstraints::default(),
+        );
+        assert!(unrestricted.iter().any(|path| {
+            path.hops
+                .last()
+                .is_some_and(|hop| hop.endpoint.endpoint_id == shadow_direct_id)
+        }));
+
+        let main_only = plan_routes_with_destination_process_affinity(
+            &directory,
+            &connectivity,
+            &source,
+            &destination,
+            RouteConstraints::default(),
+            DestinationProcessAffinity::MainDaemon,
+        );
+
+        assert_eq!(main_only.len(), 2);
+        assert!(main_only.iter().all(|path| {
+            path.hops.last().is_some_and(|hop| {
+                hop.endpoint.endpoint_id == main_direct_id
+                    || hop.endpoint.endpoint_id == relay_to_main_id
+            })
+        }));
+        assert!(main_only.iter().any(|path| {
+            path.hops.first().is_some_and(|hop| {
+                hop.endpoint.endpoint_id == shadow_relay_id
+                    && path
+                        .hops
+                        .last()
+                        .is_some_and(|last| last.endpoint.endpoint_id == relay_to_main_id)
+            })
+        }));
+    }
+
+    #[test]
+    fn planner_rejects_unknown_terminal_process_for_main_affinity() {
+        let source = node("node_route_affinity_unknown_source");
+        let destination = node("node_route_affinity_unknown_destination");
+        let (directory, connectivity) = fixtures(
+            62,
+            vec![edge(
+                &source,
+                &destination,
+                "endpoint_route_affinity_unknown_terminal",
+                62,
+                1,
+            )],
+        );
+
+        assert_eq!(
+            plan_routes(
+                &directory,
+                &connectivity,
+                &source,
+                &destination,
+                RouteConstraints::default(),
+            )
+            .len(),
+            1
+        );
+        assert!(
+            plan_routes_with_destination_process_affinity(
+                &directory,
+                &connectivity,
+                &source,
+                &destination,
+                RouteConstraints::default(),
+                DestinationProcessAffinity::MainDaemon,
+            )
+            .is_empty(),
+            "an unclassified terminal endpoint is not positive main-daemon reachability"
+        );
+    }
+
+    #[test]
+    fn planner_rejects_a_folded_shadow_only_terminal_for_main_daemon_affinity() {
+        let source = node("node_route_affinity_shadow_only_source");
+        let destination = node("node_route_affinity_shadow_only_destination");
+        let address = "198.51.100.81:22154";
+        let folded_shadow = folded_shadow_edge(
+            &source,
+            &destination,
+            "endpoint_route_affinity_folded_shadow",
+            81,
+            1,
+            address,
+        );
+
+        let (directory, connectivity) = fixtures(81, vec![folded_shadow]);
+        assert_eq!(
+            plan_routes(
+                &directory,
+                &connectivity,
+                &source,
+                &destination,
+                RouteConstraints::default(),
+            )
+            .len(),
+            1,
+            "an affinity-neutral caller may use a folded shadow endpoint"
+        );
+        assert!(
+            plan_routes_with_destination_process_affinity(
+                &directory,
+                &connectivity,
+                &source,
+                &destination,
+                RouteConstraints::default(),
+                DestinationProcessAffinity::MainDaemon,
+            )
+            .is_empty(),
+            "a folded shadow endpoint is not positive main-daemon reachability"
+        );
+    }
+
+    #[test]
+    fn planner_cannot_treat_a_self_target_as_main_daemon_process_proof() {
+        let source = node("node_route_affinity_self_target");
+        let other = node("node_route_affinity_self_target_other");
+        let (directory, connectivity) = fixtures(
+            82,
+            vec![edge(
+                &source,
+                &other,
+                "endpoint_route_affinity_self_target_other",
+                82,
+                1,
+            )],
+        );
+
+        assert_eq!(
+            plan_routes(
+                &directory,
+                &connectivity,
+                &source,
+                &source,
+                RouteConstraints::default(),
+            )
+            .len(),
+            1,
+            "the compatibility planner retains its affinity-neutral zero-hop path"
+        );
+        assert!(
+            plan_routes_with_destination_process_affinity(
+                &directory,
+                &connectivity,
+                &source,
+                &source,
+                RouteConstraints::default(),
+                DestinationProcessAffinity::MainDaemon,
+            )
+            .is_empty(),
+            "a shared node id cannot prove that the current process is the main daemon"
+        );
     }
 
     #[test]
@@ -4431,6 +4744,61 @@ mod tests {
         assert_eq!(stream.route_trace.endpoint_ids, vec![second_endpoint_id]);
         stream.shutdown().await.expect("close routed session");
         network.wait_idle().await;
+    }
+
+    #[tokio::test]
+    async fn multi_hop_main_affinity_does_not_dial_a_shadow_only_terminal() {
+        let source = node("node_relay_affinity_shadow_only_source");
+        let destination = node("node_relay_affinity_shadow_only_destination");
+        let folded_shadow = folded_shadow_edge(
+            &source,
+            &destination,
+            "endpoint_relay_affinity_folded_shadow",
+            83,
+            1,
+            "198.51.100.83:22154",
+        );
+        let (directory, connectivity) = fixtures(83, vec![folded_shadow]);
+        let network = TestRelayNetwork::new(directory.clone(), connectivity);
+        let connector = MultiHopRoutedConnector::from_snapshot(
+            source.clone(),
+            directory,
+            network.connectivity.clone(),
+            network.connectivity.clone(),
+            Arc::new(network.provider(source.clone())),
+            Arc::new(TestRoutedIdentity {
+                local_node_id: source,
+            }),
+        )
+        .expect("multi-hop connector");
+
+        match connector
+            .connect_with_destination_process_affinity(
+                destination,
+                ConnectOptions::default(),
+                DestinationProcessAffinity::MainDaemon,
+            )
+            .await
+        {
+            Err(NetworkError::RetryExhausted {
+                attempts,
+                delivery_state,
+                ..
+            }) => {
+                assert_eq!(attempts, 0);
+                assert_eq!(delivery_state, NetworkDeliveryState::DefinitelyNotSent);
+            }
+            Err(error) => panic!("unexpected main-affinity failure: {error}"),
+            Ok(_) => panic!("shadow-only reachability must not satisfy main-daemon affinity"),
+        }
+        assert!(
+            network
+                .dialed_edges
+                .lock()
+                .expect("dialed edges lock")
+                .is_empty(),
+            "a shadow-only terminal must be rejected before dialing"
+        );
     }
 
     #[tokio::test]

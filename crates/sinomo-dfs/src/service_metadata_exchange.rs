@@ -1096,8 +1096,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         ..DfsMessageCommittedWork::default()
                     });
                     // The backend was replaced wholesale; in-memory state
-                    // must follow it.
-                    self.hydrate_from_metadata_backend()?;
+                    // must follow it. Exact resident replica lanes deliberately
+                    // retain only filesystem, cursor, and namespace-job guard
+                    // state. Owned/global services may coordinate foreground
+                    // operations and therefore keep their complete projection.
+                    if self
+                        .metadata_backend
+                        .as_ref()
+                        .and_then(|backend| backend.resident_exact_shard_id())
+                        .is_some()
+                    {
+                        self.hydrate_lazy_exact_replica_after_snapshot_install()?;
+                    } else {
+                        self.hydrate_from_metadata_backend()?;
+                    }
                     DfsMetadataSnapshotInstallResult::Installed { archived_existing }
                 }
                 Err(error) => DfsMetadataSnapshotInstallResult::Rejected {

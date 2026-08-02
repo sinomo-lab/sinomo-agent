@@ -4789,7 +4789,7 @@ mod tests {
             LocalContentStore::new(root.path().join("content")).expect("content store"),
         )
         .with_control_plane(control_plane);
-        service.metadata_backend = Some(Box::new(sharded));
+        service.set_metadata_backend_unhydrated(sharded);
 
         crate::service_hydration::reset_full_metadata_hydration_calls();
         assert_eq!(

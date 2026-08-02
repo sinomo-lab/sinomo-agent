@@ -464,6 +464,7 @@ pub struct ClusterObjectRpcOptions {
     timeouts: DaemonRpcTimeouts,
     overall_timeout: Option<Duration>,
     protection: crate::RoutedSessionProtection,
+    destination_process_affinity: crate::DestinationProcessAffinity,
 }
 
 impl ClusterObjectRpcOptions {
@@ -475,6 +476,7 @@ impl ClusterObjectRpcOptions {
             timeouts,
             overall_timeout: None,
             protection: crate::RoutedSessionProtection::Plaintext,
+            destination_process_affinity: crate::DestinationProcessAffinity::Any,
         }
     }
 
@@ -503,6 +505,18 @@ impl ClusterObjectRpcOptions {
         protection: crate::RoutedSessionProtection,
     ) -> Self {
         self.protection = protection;
+        self
+    }
+
+    /// Restricts node-targeted routing to a compatible destination process.
+    ///
+    /// This affects only [`ClusterObjectRpcClient::call_target`]. Concrete
+    /// endpoint calls are already pinned by endpoint identity.
+    pub fn with_destination_process_affinity(
+        mut self,
+        affinity: crate::DestinationProcessAffinity,
+    ) -> Self {
+        self.destination_process_affinity = affinity;
         self
     }
 
@@ -538,6 +552,7 @@ impl Default for ClusterObjectRpcOptions {
             timeouts: DaemonRpcTimeouts::default(),
             overall_timeout: None,
             protection: crate::RoutedSessionProtection::Plaintext,
+            destination_process_affinity: crate::DestinationProcessAffinity::Any,
         }
     }
 }
@@ -1148,25 +1163,27 @@ where
             }
         };
         let constraints = stream_native_service_route_constraints();
+        let destination_process_affinity = options.destination_process_affinity;
         let open_started_ns = trace
             .map(|_| crate::network_timeline_monotonic_ns())
             .unwrap_or(0);
-        let stream_result = crate::open_pooled_routed_stream_with_protection(
+        let stream_result = crate::routed_stream_pool::open_pooled_routed_stream_with_protection_and_destination_process_affinity(
             state.cluster_id.to_string(),
             directory_generation,
             constraints,
+            destination_process_affinity,
             state.local_node_id.clone(),
             target_node_id.clone(),
             options.protection,
             connect_timeout,
-            crate::RoutedConnector::connect(
-                connector.as_ref(),
+            connector.connect_with_destination_process_affinity(
                 target_node_id.clone(),
                 crate::ConnectOptions {
                     constraints,
                     timeout: connect_timeout,
                     protection: options.protection,
                 },
+                destination_process_affinity,
             ),
         )
         .await;
@@ -1300,6 +1317,21 @@ mod tests {
                 .with_routed_session_protection(crate::RoutedSessionProtection::Aead)
                 .protection,
             crate::RoutedSessionProtection::Aead
+        );
+    }
+
+    #[test]
+    fn cluster_rpc_destination_process_affinity_is_explicit() {
+        let defaults = ClusterObjectRpcOptions::default();
+        assert_eq!(
+            defaults.destination_process_affinity,
+            crate::DestinationProcessAffinity::Any
+        );
+        assert_eq!(
+            defaults
+                .with_destination_process_affinity(crate::DestinationProcessAffinity::MainDaemon,)
+                .destination_process_affinity,
+            crate::DestinationProcessAffinity::MainDaemon
         );
     }
 

@@ -22,6 +22,7 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
 const DEFAULT_DAEMON_SHADOW_PORT: u16 = 21_354;
+const DEFAULT_DAEMON_MAIN_PORT: u16 = 21_353;
 
 fn try_clone_selector_id(
     id: &sinomo_base::Id,
@@ -1139,7 +1140,7 @@ pub(crate) fn try_cluster_main_daemon_command_endpoint_candidates_impl(
     for endpoint in command_targets {
         if endpoint.privacy == ClusterEndpointPrivacy::LocalOnly
             || !main_daemon_node_ids.contains(&endpoint.node_id)
-            || cluster_endpoint_identifies_shadow_daemon_for_node(&endpoint)
+            || !cluster_endpoint_can_carry_main_daemon_rpc(&endpoint)
         {
             continue;
         }
@@ -1181,7 +1182,38 @@ pub(crate) fn cluster_endpoint_identifies_shadow_daemon_for_node(
 }
 
 pub fn cluster_endpoint_can_carry_main_daemon_rpc(endpoint: &ClusterEndpointRecord) -> bool {
-    !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
+    if cluster_endpoint_identifies_shadow_daemon_for_node(endpoint) {
+        return false;
+    }
+    match endpoint.transport {
+        // An in-process endpoint cannot terminate in a distinct shadow
+        // process. This is the only transport whose process role follows
+        // directly from the transport boundary itself.
+        ClusterTransportKind::InProcess => true,
+        ClusterTransportKind::LanTcp => {
+            // Current LAN advertisements bind the endpoint id to the main
+            // node identity and exact address. Keep the default main port as
+            // an explicit compatibility proof for older static records which
+            // predate stable endpoint ids. A custom-port record with neither
+            // proof stays unknown and therefore fails closed.
+            endpoint.endpoint_id == daemon_lan_endpoint_id(&endpoint.node_id, &endpoint.address)
+                || cluster_endpoint_address_port(&endpoint.address)
+                    == Some(DEFAULT_DAEMON_MAIN_PORT)
+        }
+        ClusterTransportKind::Loopback => {
+            endpoint.endpoint_id == daemon_loopback_endpoint_id(&endpoint.node_id)
+                || cluster_endpoint_address_port(&endpoint.address)
+                    == Some(DEFAULT_DAEMON_MAIN_PORT)
+        }
+        // Protocol-specific transports must positively classify the endpoint.
+        // `Unknown` is deliberately not treated as the absence of a shadow
+        // marker: older or custom modules may publish both daemon processes
+        // under the same node identity.
+        _ => crate::network_module::network_module_registry().is_some_and(|registry| {
+            registry.endpoint_role(endpoint)
+                == crate::network_module::NetworkModuleEndpointRole::MainDaemon
+        }),
+    }
 }
 
 fn cluster_endpoint_uses_default_shadow_daemon_port(endpoint: &ClusterEndpointRecord) -> bool {
@@ -1304,7 +1336,7 @@ pub(crate) fn try_cluster_member_publish_targets_impl(
             .endpoints
             .iter()
             .filter(|endpoint| locally_learned_bridge_route_endpoint(endpoint))
-            .filter(|endpoint| !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint))
+            .filter(|endpoint| cluster_endpoint_can_carry_main_daemon_rpc(endpoint))
         {
             push_unique_cluster_endpoint(&mut targets, &mut seen, endpoint)?;
         }
@@ -1316,7 +1348,7 @@ pub(crate) fn try_cluster_member_publish_targets_impl(
         }
         let Some(endpoint) =
             graph.best_healthy_endpoint_matching(&state.local_node_id, &node_id, |endpoint| {
-                !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
+                cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
             })
         else {
             continue;
@@ -1403,7 +1435,7 @@ fn try_cluster_member_daemon_status_targets_with_graph(
         if !is_local_process && matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly) {
             continue;
         }
-        if member_runs_main_daemon && cluster_endpoint_identifies_shadow_daemon_for_node(endpoint) {
+        if member_runs_main_daemon && !cluster_endpoint_can_carry_main_daemon_rpc(endpoint) {
             continue;
         }
         crate::object::try_reserve_vec(
@@ -1423,7 +1455,7 @@ fn try_cluster_member_daemon_status_targets_with_graph(
         if !is_local_process && matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly) {
             continue;
         }
-        if member_runs_main_daemon && cluster_endpoint_identifies_shadow_daemon_for_node(endpoint) {
+        if member_runs_main_daemon && !cluster_endpoint_can_carry_main_daemon_rpc(endpoint) {
             continue;
         }
         if !cluster_endpoint_is_currently_dialable(endpoint) {
@@ -1614,7 +1646,8 @@ fn cluster_rollout_route_process_rank(
 ) -> u8 {
     let unavailable = graph.unavailability_rank(endpoint) != 0;
     let identifies_shadow = cluster_endpoint_identifies_shadow_daemon_for_node(endpoint);
-    if endpoint.node_id == *main_node_id && !identifies_shadow {
+    let identifies_main = cluster_endpoint_can_carry_main_daemon_rpc(endpoint);
+    if endpoint.node_id == *main_node_id && identifies_main {
         if unavailable { 2 } else { 0 }
     } else if endpoint.node_id == *shadow_node_id
         || (endpoint.node_id == *main_node_id && identifies_shadow)
@@ -1932,7 +1965,7 @@ pub(crate) fn try_cluster_sync_targets(
         let mut endpoints = Vec::new();
         for endpoint in member.endpoints.iter().filter(|endpoint| {
             endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
-                && !cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
+                && cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
                 && cluster_endpoint_is_currently_dialable(endpoint)
         }) {
             crate::object::try_reserve_vec(&mut endpoints, 1, "collect cluster sync endpoints")?;
@@ -1996,6 +2029,55 @@ mod tests {
             priority,
             last_observed_latency_ms: None,
         }
+    }
+
+    #[test]
+    fn main_daemon_endpoint_role_requires_positive_process_proof() {
+        let node_id = NodeId::from_legacy_named("node_main_endpoint_role_proof").expect("node id");
+        let legacy_main = selector_test_endpoint(
+            &node_id,
+            "main.example.test:21353",
+            ClusterEndpointPrivacy::Lan,
+            0,
+        );
+        assert!(
+            cluster_endpoint_can_carry_main_daemon_rpc(&legacy_main),
+            "the default main port remains an explicit legacy LAN proof"
+        );
+
+        let mut stable_custom_main = selector_test_endpoint(
+            &node_id,
+            "main.example.test:22440",
+            ClusterEndpointPrivacy::Lan,
+            0,
+        );
+        assert!(
+            !cluster_endpoint_can_carry_main_daemon_rpc(&stable_custom_main),
+            "a custom endpoint with an unrelated id has unknown process role"
+        );
+        stable_custom_main.endpoint_id =
+            daemon_lan_endpoint_id(&node_id, &stable_custom_main.address);
+        assert!(cluster_endpoint_can_carry_main_daemon_rpc(
+            &stable_custom_main
+        ));
+
+        let mut stable_custom_shadow = stable_custom_main.clone();
+        stable_custom_shadow.endpoint_id = daemon_lan_endpoint_id(
+            &shadow_daemon_node_id(&node_id),
+            &stable_custom_shadow.address,
+        );
+        assert!(
+            !cluster_endpoint_can_carry_main_daemon_rpc(&stable_custom_shadow),
+            "a custom-port shadow endpoint must never satisfy main affinity"
+        );
+
+        let mut unknown_module_endpoint = stable_custom_main;
+        unknown_module_endpoint.transport = ClusterTransportKind::LanQuic;
+        unknown_module_endpoint.address = "quic://unknown-process".to_string();
+        assert!(
+            !cluster_endpoint_can_carry_main_daemon_rpc(&unknown_module_endpoint),
+            "an unclassified module endpoint must fail closed"
+        );
     }
 
     #[test]

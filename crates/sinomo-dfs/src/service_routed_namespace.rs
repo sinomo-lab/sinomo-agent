@@ -141,7 +141,7 @@ mod tests {
             network.add_node(node_id),
             LocalContentStore::new(root.join("content")).expect("content"),
         );
-        service.metadata_backend = Some(Box::new(backend));
+        service.set_metadata_backend_unhydrated(backend);
 
         crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
         let objects = service

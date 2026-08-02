@@ -5,12 +5,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use sinomo_core::network::NetworkError;
 use sinomo_core::node::NodeId;
 
+use crate::service_state::DfsMetadataBackendOwner;
 use crate::{
     AsyncDfsMessageTransport, DfsCancellationFlag, DfsCommittedWorkTracker, DfsConflictStatus,
     DfsControlPlaneKvClient, DfsError, DfsFileSystem, DfsMessageCommittedWork, DfsMessageTransport,
     DfsMetadataBackend, DfsMetadataStore, DfsNetworkMessage, DfsOperationalMetrics, DfsRoutedCall,
     DfsRoutedMessage, DfsTransportIdentity, DistributedEventualCoordinator, LocalContentStore,
-    NetworkedDfsService, NetworkedDfsServiceEvent, build_dfs_routed_message,
+    NetworkedDfsService, NetworkedDfsServiceEvent, ResidentLocalMetadataShardLease,
+    ResidentLocalShardedMetadataBackendLease, build_dfs_routed_message,
 };
 
 impl<T> NetworkedDfsService<T> {
@@ -75,7 +77,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             active_durable_namespace_request: None,
             active_durable_namespace_prepare_recorded: false,
             routed_namespace_settle_depth: 0,
-            cross_shard_namespace_locks: BTreeSet::new(),
+            cross_shard_namespace_locks: Default::default(),
             last_events: Vec::new(),
             message_committed_work: DfsMessageCommittedWork::default(),
             committed_work_tracker: None,
@@ -112,6 +114,20 @@ where
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// Share the live cross-shard namespace admission projection with another
+    /// request shell over the same resident metadata generation.
+    pub fn with_cross_shard_namespace_lock_registry(
+        mut self,
+        registry: crate::DfsCrossShardNamespaceLockRegistry,
+    ) -> Self {
+        self.cross_shard_namespace_locks = registry;
+        self
+    }
+
+    pub fn cross_shard_namespace_lock_registry(&self) -> crate::DfsCrossShardNamespaceLockRegistry {
+        self.cross_shard_namespace_locks.clone()
+    }
+
     pub(crate) fn clear_metadata_lookup_cache(&self) {
         if let Ok(mut cache) = self.metadata_lookup_cache.lock() {
             cache.clear();
@@ -213,7 +229,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         mut self,
         backend: impl DfsMetadataBackend + Send + 'static,
     ) -> Result<Self, DfsError> {
-        self.metadata_backend = Some(Box::new(backend));
+        self.metadata_backend = Some(DfsMetadataBackendOwner::Owned(Box::new(backend)));
         self.hydrate_from_metadata_backend()?;
         Ok(self)
     }
@@ -222,16 +238,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         mut self,
         backend: impl DfsMetadataBackend + Send + 'static,
     ) -> Result<Self, DfsError> {
-        self.metadata_backend = Some(Box::new(backend));
+        self.metadata_backend = Some(DfsMetadataBackendOwner::Owned(Box::new(backend)));
         self.hydrate_file_systems_from_metadata_backend()?;
         Ok(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_metadata_backend_unhydrated(
+        &mut self,
+        backend: impl DfsMetadataBackend + Send + 'static,
+    ) {
+        self.metadata_backend = Some(DfsMetadataBackendOwner::Owned(Box::new(backend)));
     }
 
     pub fn with_boxed_metadata_backend(
         mut self,
         backend: Box<dyn DfsMetadataBackend>,
     ) -> Result<Self, DfsError> {
-        self.metadata_backend = Some(backend);
+        self.metadata_backend = Some(DfsMetadataBackendOwner::Owned(backend));
         self.hydrate_from_metadata_backend()?;
         Ok(self)
     }
@@ -244,7 +268,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         mut self,
         backend: Box<dyn DfsMetadataBackend>,
     ) -> Result<Self, DfsError> {
-        self.metadata_backend = Some(backend);
+        self.metadata_backend = Some(DfsMetadataBackendOwner::Owned(backend));
         self.hydrate_from_metadata_backend_for_commit_promotion_recovery()?;
         Ok(self)
     }
@@ -254,7 +278,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         backend: Box<dyn DfsMetadataBackend>,
         should_cancel: &(dyn Fn() -> bool + Sync),
     ) -> Result<Option<Self>, DfsError> {
-        self.metadata_backend = Some(backend);
+        self.metadata_backend = Some(DfsMetadataBackendOwner::Owned(backend));
         if !self.hydrate_from_metadata_backend_for_commit_promotion_recovery_until_cancelled(
             should_cancel,
         )? {
@@ -267,7 +291,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         mut self,
         backend: Box<dyn DfsMetadataBackend>,
     ) -> Result<Self, DfsError> {
-        self.metadata_backend = Some(backend);
+        self.metadata_backend = Some(DfsMetadataBackendOwner::Owned(backend));
         self.hydrate_file_systems_from_metadata_backend()?;
         Ok(self)
     }
@@ -285,8 +309,77 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         mut self,
         backend: Box<dyn DfsMetadataBackend>,
     ) -> Self {
-        self.metadata_backend = Some(backend);
+        self.metadata_backend = Some(DfsMetadataBackendOwner::Owned(backend));
         self
+    }
+
+    /// Attach one checked-out resident shard and hydrate the bounded mutation
+    /// lane without transferring ownership of the process-wide backend pool.
+    pub fn with_resident_metadata_shard_backend_lazy(
+        mut self,
+        backend: ResidentLocalMetadataShardLease,
+    ) -> Result<Self, DfsError> {
+        self.metadata_backend = Some(DfsMetadataBackendOwner::ResidentShard(backend));
+        self.hydrate_file_systems_from_metadata_backend()?;
+        Ok(self)
+    }
+
+    /// Attach the checked-out resident router and hydrate the compatibility
+    /// lane used for operations which cannot prove one exact shard.
+    pub fn with_resident_sharded_metadata_backend_lazy(
+        mut self,
+        backend: ResidentLocalShardedMetadataBackendLease,
+    ) -> Result<Self, DfsError> {
+        self.metadata_backend = Some(DfsMetadataBackendOwner::ResidentSharded(backend));
+        self.hydrate_file_systems_from_metadata_backend()?;
+        Ok(self)
+    }
+
+    /// Attach an exact resident backend immediately before one served request.
+    pub fn attach_resident_metadata_shard_backend(
+        &mut self,
+        backend: ResidentLocalMetadataShardLease,
+    ) -> Result<(), DfsError> {
+        self.attach_resident_metadata_backend(DfsMetadataBackendOwner::ResidentShard(backend))
+    }
+
+    /// Attach the resident all-shard router immediately before one global
+    /// compatibility request or maintenance scope.
+    pub fn attach_resident_sharded_metadata_backend(
+        &mut self,
+        backend: ResidentLocalShardedMetadataBackendLease,
+    ) -> Result<(), DfsError> {
+        self.attach_resident_metadata_backend(DfsMetadataBackendOwner::ResidentSharded(backend))
+    }
+
+    fn attach_resident_metadata_backend(
+        &mut self,
+        backend: DfsMetadataBackendOwner,
+    ) -> Result<(), DfsError> {
+        if self.metadata_backend.is_some() {
+            return Err(DfsError::Metadata {
+                message: "DFS service already has an attached metadata backend".to_string(),
+            });
+        }
+        self.metadata_backend = Some(backend);
+        Ok(())
+    }
+
+    /// Return a request-scoped resident backend to its pool. Owned backends are
+    /// never detached through this API.
+    pub fn release_resident_metadata_backend(&mut self) -> Result<(), DfsError> {
+        if self
+            .metadata_backend
+            .as_ref()
+            .is_some_and(|backend| matches!(backend, DfsMetadataBackendOwner::Owned(_)))
+        {
+            return Err(DfsError::Metadata {
+                message: "cannot release an owned DFS metadata backend as a resident lease"
+                    .to_string(),
+            });
+        }
+        self.metadata_backend.take();
+        Ok(())
     }
 
     /// Rebuild the lightweight service shell while retaining this exact
@@ -302,11 +395,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let metadata_backend = self.metadata_backend.take();
         let control_plane = self.control_plane.take();
         let Self {
-            transport, content, ..
+            transport,
+            content,
+            cross_shard_namespace_locks,
+            metadata_replication_cursors,
+            committed_work_tracker,
+            repair_retry_tick,
+            next_frame_id,
+            next_message_id,
+            next_request_id,
+            cancellation,
+            ..
         } = self;
         let mut service = Self::new(transport, content);
         service.control_plane = control_plane;
         service.metadata_backend = metadata_backend;
+        // Request shells over one resident generation must continue sharing
+        // the same live job-owned admission projection after explicit disaster
+        // recovery collapses its fully hydrated service back to lazy state.
+        service.cross_shard_namespace_locks = cross_shard_namespace_locks;
+        service.metadata_replication_cursors = metadata_replication_cursors;
+        service.committed_work_tracker = committed_work_tracker;
+        // Rebuilding a shell is not a process restart. Preserve monotonic
+        // transport/request identities and lifecycle state so delayed replies
+        // cannot collide with a newly reset counter sequence.
+        service.repair_retry_tick = repair_retry_tick;
+        service.next_frame_id = next_frame_id;
+        service.next_message_id = next_message_id;
+        service.next_request_id = next_request_id;
+        service.cancellation = cancellation;
         service.hydrate_file_systems_from_metadata_backend()?;
         Ok(service)
     }

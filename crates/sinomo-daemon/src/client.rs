@@ -2438,9 +2438,11 @@ where
         send_object_rpc_call_to_target_async_with_options(
             target_node_id,
             call,
-            sinomo_core::network::ClusterObjectRpcOptions::new(object_rpc_transfer_timeouts(
-                sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-            )),
+            main_daemon_build_target_rpc_options(
+                sinomo_core::network::ClusterObjectRpcOptions::new(object_rpc_transfer_timeouts(
+                    sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                )),
+            ),
             &runtime,
             true,
         )
@@ -2449,6 +2451,14 @@ where
         .await
         .map_err(Into::into)
     })
+}
+
+fn main_daemon_build_target_rpc_options(
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+) -> sinomo_core::network::ClusterObjectRpcOptions {
+    options.with_destination_process_affinity(
+        sinomo_core::network::DestinationProcessAffinity::MainDaemon,
+    )
 }
 
 pub fn send_daemon_build_submit(
@@ -2556,7 +2566,9 @@ pub fn send_daemon_build_submit_to_target(
                 &state,
                 &target_node_id,
                 build_submit_rpc_call(&request, source_bundle.as_deref())?,
-                sinomo_core::network::ClusterObjectRpcOptions::default(),
+                main_daemon_build_target_rpc_options(
+                    sinomo_core::network::ClusterObjectRpcOptions::default(),
+                ),
             )
             .await?;
         decode_build_submit_rpc_result(result).await
@@ -2701,7 +2713,9 @@ pub fn send_daemon_build_artifact_to_target(
                 &state,
                 &target_node_id,
                 build_artifact_rpc_call(&request)?,
-                sinomo_core::network::ClusterObjectRpcOptions::default(),
+                main_daemon_build_target_rpc_options(
+                    sinomo_core::network::ClusterObjectRpcOptions::default(),
+                ),
             )
             .await?;
         receive_build_artifact_rpc_result(result, &request, &destination_path).await

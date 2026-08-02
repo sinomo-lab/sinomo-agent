@@ -973,7 +973,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .iter()
             .find(|shard| shard.primary_node_id != self.node_id)
         {
-            self.unlock_cross_shard_namespace_path(&file_system_id, &job.root_path);
             // Replicas retain the running job as a failover reservation, but
             // must never append a local failure or otherwise advance its
             // journal. Only the current source-shard primary may drive the
@@ -986,7 +985,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 epoch: shard.epoch,
             }));
         }
-        self.lock_cross_shard_namespace_path(&file_system_id, &job.root_path);
+        self.apply_cross_shard_namespace_job_guard(&job)?;
         let mut steps = 0usize;
         while let Some(frame) = job.pending_frames.pop() {
             if steps >= max_steps {
@@ -1069,7 +1068,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Err(error) => {
                     // Structured POSIX rejection from validation: abort before
                     // any local mutation happened.
-                    self.unlock_cross_shard_namespace_path(&file_system_id, &job.root_path);
                     self.fail_namespace_job(job, error.to_string())?;
                     return Err(error);
                 }
@@ -1080,7 +1078,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         job.updated_at = now;
         job.completed_at = Some(now);
         self.persist_namespace_job(&job)?;
-        self.unlock_cross_shard_namespace_path(&file_system_id, &job.root_path);
         Ok(job)
     }
 

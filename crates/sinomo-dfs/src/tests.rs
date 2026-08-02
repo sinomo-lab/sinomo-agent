@@ -12099,6 +12099,118 @@ fn replica_journal_ingest_keeps_visible_namespace_in_backend_not_service_mirror(
 }
 
 #[test]
+fn exact_resident_snapshot_install_keeps_namespace_out_of_service_mirror() {
+    let root = temp_root("exact-resident-snapshot-does-not-mirror-namespace");
+    let primary =
+        NodeId::from_legacy_named("node_exact_snapshot_primary").expect("primary node id");
+    let replica =
+        NodeId::from_legacy_named("node_exact_snapshot_replica").expect("replica node id");
+    let file_system = file_system(primary.clone());
+    let shard_id = DfsMetadataShardId::new("root");
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: shard_id.0.clone(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![replica.clone()],
+        epoch: 7,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    control_plane.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .put_metadata_shard(&shard)
+            .expect("metadata shard")
+    });
+
+    let mut source = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source-metadata"))
+        .expect("source metadata");
+    source
+        .put_file_system(&file_system)
+        .expect("source filesystem");
+    let mut object = file_metadata(primary.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.object_id =
+        DfsObjectId::from_legacy_named("obj_exact_snapshot_probe").expect("object id");
+    object.path = "/services/exact-snapshot/probe.txt".to_string();
+    source.put_object(&object).expect("source object");
+    let next_after_sequence = source.journal_last_sequence();
+    let snapshot = source.export_table_snapshot();
+
+    let resident =
+        LocalShardedMetadataBackend::new(root.join("receiver-metadata"), vec![shard.clone()])
+            .expect("receiver sharded metadata")
+            .into_resident();
+    let exact_backend = resident
+        .scope_shard(&file_system.file_system_id, &shard_id)
+        .expect("exact receiver shard")
+        .checkout()
+        .expect("exact receiver checkout");
+    let mut service = NetworkedDfsService::new(
+        DroppingSendTransport {
+            local_node_id: replica,
+        },
+        LocalContentStore::new(root.join("content")).expect("content store"),
+    )
+    .with_control_plane(control_plane)
+    .with_resident_metadata_shard_backend_lazy(exact_backend)
+    .expect("lazy exact replica service");
+
+    crate::service_hydration::reset_full_metadata_hydration_calls();
+    let event = service
+        .handle_metadata_snapshot_install(
+            primary,
+            DfsMetadataSnapshotInstallCommand {
+                request_id: "request-exact-resident-snapshot".to_string(),
+                source_node_id: shard.primary_node_id.clone(),
+                file_system_id: Some(file_system.file_system_id.clone()),
+                authority_epoch: Some(shard.epoch),
+                primary_handoff_id: None,
+                shard_id: shard_id.clone(),
+                next_after_sequence,
+                snapshot,
+                reason: "repair exact resident replica".to_string(),
+            },
+        )
+        .expect("snapshot install");
+
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::MetadataSnapshotInstalled { .. }
+    ));
+    assert_eq!(
+        crate::service_hydration::full_metadata_hydration_calls(),
+        0,
+        "exact replica snapshot install must not scan and retain the full namespace"
+    );
+    assert!(
+        service.metadata().objects.is_empty(),
+        "the resident shard tables, not the request shell, own replica objects"
+    );
+    assert_eq!(
+        service
+            .metadata_backend()
+            .expect("resident receiver backend")
+            .get_object(&object.object_id)
+            .expect("durable object lookup"),
+        Some(object.clone())
+    );
+    assert_eq!(
+        service
+            .current_read_object_metadata(&object.object_id)
+            .expect("targeted backend read"),
+        object
+    );
+    assert_eq!(
+        service.local_metadata_journal_cursors.get(&shard_id),
+        Some(&next_after_sequence)
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn replica_command_refreshes_stale_receiver_authority_before_cache_decisions() {
     let root = temp_root("replica-command-refreshes-stale-authority");
     let primary =
@@ -13818,7 +13930,7 @@ fn metadata_journal_missing_namespace_transaction_payload_uses_keyed_replay() {
     let content = LocalContentStore::new(root.join("content")).expect("content");
     let mut dfs = NetworkedDfsService::new(network.add_node(owner), content);
     dfs.metadata.add_file_system(file_system);
-    dfs.metadata_backend = Some(Box::new(backend));
+    dfs.set_metadata_backend_unhydrated(backend);
 
     dfs.apply_metadata_journal_batch_to_service_state(&DfsMetadataJournalBatch {
         shard_id: entry.shard_id.clone(),
@@ -13918,7 +14030,7 @@ fn metadata_journal_compact_namespace_commit_refreshes_affected_service_objects(
     .expect("seed stale service state");
     assert_eq!(dfs.metadata.object(&current.object_id), Some(&current));
 
-    dfs.metadata_backend = Some(Box::new(backend));
+    dfs.set_metadata_backend_unhydrated(backend);
     crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
     dfs.apply_metadata_journal_batch_to_service_state(&DfsMetadataJournalBatch {
         shard_id: shard_id.clone(),
@@ -13982,7 +14094,7 @@ fn metadata_journal_missing_namespace_transaction_record_fails_without_full_scan
     let content = LocalContentStore::new(root.join("content")).expect("content");
     let mut dfs = NetworkedDfsService::new(network.add_node(owner), content);
     dfs.metadata.add_file_system(file_system);
-    dfs.metadata_backend = Some(Box::new(backend));
+    dfs.set_metadata_backend_unhydrated(backend);
 
     let error = dfs
         .apply_metadata_journal_batch_to_service_state(&DfsMetadataJournalBatch {
@@ -21157,7 +21269,7 @@ fn explicit_recovery_hydration_queues_once_and_deduplicates_through_shared_state
         ),
         LocalContentStore::new(&fixture.content_root).expect("reopened recovery content"),
     );
-    recovery.metadata_backend = Some(Box::new(backend));
+    recovery.set_metadata_backend_unhydrated(backend);
     recovery
         .hydrate_from_metadata_backend_for_commit_promotion_recovery()
         .expect("explicit recovery hydration");
@@ -21180,7 +21292,7 @@ fn explicit_recovery_hydration_queues_once_and_deduplicates_through_shared_state
         ),
         LocalContentStore::new(fixture.content_root).expect("second reopened content"),
     );
-    rebuilt_lane.metadata_backend = Some(Box::new(reopened_backend));
+    rebuilt_lane.set_metadata_backend_unhydrated(reopened_backend);
     rebuilt_lane
         .hydrate_from_metadata_backend_for_commit_promotion_recovery()
         .expect("recovery hydration after service rebuild");
@@ -21265,10 +21377,10 @@ fn recovery_hydration_does_not_promote_from_non_authoritative_object_owner() {
         LocalContentStore::new(fixture.content_root).expect("reopened owner content"),
     )
     .with_control_plane(control_plane);
-    recovery.metadata_backend = Some(Box::new(
+    recovery.set_metadata_backend_unhydrated(
         LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), fixture.metadata_root)
             .expect("reopen modified metadata"),
-    ));
+    );
     recovery
         .hydrate_from_metadata_backend_for_commit_promotion_recovery()
         .expect("explicit recovery hydration");
@@ -21387,7 +21499,7 @@ fn recovery_hydration_can_cancel_between_synchronous_backend_phases() {
         InProcessNetwork::new().add_node(node),
         LocalContentStore::new(root.join("content")).expect("content store"),
     );
-    service.metadata_backend = Some(Box::new(backend));
+    service.set_metadata_backend_unhydrated(backend);
     let cancellation_checks = AtomicUsize::new(0);
 
     let completed = service
@@ -21427,7 +21539,7 @@ fn cold_sifs_scale_fixture_stays_preemptible() {
         InProcessNetwork::new().add_node(node),
         LocalContentStore::new(root.join("content")).expect("content store"),
     );
-    service.metadata_backend = Some(Box::new(backend));
+    service.set_metadata_backend_unhydrated(backend);
     let cancellation_checks = AtomicUsize::new(0);
     let completed = service
         .hydrate_from_metadata_backend_for_commit_promotion_recovery_until_cancelled(&|| {
@@ -21552,7 +21664,7 @@ fn recovery_hydration_skips_fully_repaired_committed_pending_write() {
         recovered_transport,
         LocalContentStore::new(root.join("owner-content")).expect("recovered content"),
     );
-    recovered_owner.metadata_backend = Some(Box::new(recovered_backend));
+    recovered_owner.set_metadata_backend_unhydrated(recovered_backend);
     recovered_owner
         .hydrate_from_metadata_backend_for_commit_promotion_recovery()
         .expect("recovered metadata and post-response work");
@@ -36032,6 +36144,300 @@ fn lazy_metadata_hydration_restores_running_cross_shard_mutation_guards() {
         ),
         Err(DfsError::Busy { .. })
     ));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn request_shells_share_live_cross_shard_namespace_guards() {
+    let root = temp_root("shared-cross-shard-namespace-guards");
+    let node = NodeId::from_legacy_named("node_shared_cross_shard_guards").expect("node");
+    let file_system = distributed_sifs(node.clone());
+    let registry = DfsCrossShardNamespaceLockRegistry::default();
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let global_shell = NetworkedDfsService::new(
+        InProcessNetwork::new().add_node(node.clone()),
+        content.clone(),
+    )
+    .with_cross_shard_namespace_lock_registry(registry.clone());
+    let exact_shell = NetworkedDfsService::new(InProcessNetwork::new().add_node(node), content)
+        .with_cross_shard_namespace_lock_registry(registry.clone());
+
+    registry.upsert_job(
+        None,
+        "shared-guard-job".to_string(),
+        file_system.file_system_id.clone(),
+        "/services/moving-tree".to_string(),
+    );
+    assert!(matches!(
+        exact_shell.ensure_path_not_in_cross_shard_flight(
+            &file_system.file_system_id,
+            "/services/moving-tree/child.txt",
+        ),
+        Err(DfsError::Busy { .. })
+    ));
+
+    registry.remove_job("shared-guard-job");
+    exact_shell
+        .ensure_path_not_in_cross_shard_flight(
+            &file_system.file_system_id,
+            "/services/moving-tree/child.txt",
+        )
+        .expect("unlock is visible to every request shell");
+    assert!(
+        global_shell.cross_shard_namespace_locks.is_empty(),
+        "the global shell observes the same job removal"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cross_shard_namespace_guards_are_job_owned_and_shard_replaceable() {
+    let registry = DfsCrossShardNamespaceLockRegistry::default();
+    let file_system_id = sifs_file_system_id();
+    let root_shard = DfsMetadataShardId::new("root");
+    let services_shard = DfsMetadataShardId::new("services");
+    let path = "/services/reused-path";
+    registry.replace_jobs([
+        (
+            Some(root_shard.clone()),
+            "older-job".to_string(),
+            file_system_id.clone(),
+            path.to_string(),
+        ),
+        (
+            Some(services_shard.clone()),
+            "newer-job".to_string(),
+            file_system_id.clone(),
+            path.to_string(),
+        ),
+    ]);
+
+    registry.remove_job("older-job");
+    assert!(
+        registry.blocks(&file_system_id, path),
+        "a delayed terminal transition must not remove another job's same-path guard"
+    );
+
+    registry.replace_shard_jobs(&services_shard, []);
+    assert!(
+        !registry.blocks(&file_system_id, path),
+        "an exact shard snapshot with no running jobs removes that shard's obsolete guards"
+    );
+    assert!(root_shard != services_shard);
+}
+
+#[test]
+fn exact_resident_hydration_replaces_only_its_shard_namespace_guards() {
+    let root = temp_root("exact-resident-namespace-guard-hydration");
+    let node = NodeId::from_legacy_named("node_exact_guard_hydration").expect("node");
+    let file_system_id = sifs_file_system_id();
+    let root_shard_id = DfsMetadataShardId::new("root");
+    let services_shard_id = DfsMetadataShardId::new("services");
+    let shard = |shard_id: &str, assignment| DfsMetadataShardConfig {
+        file_system_id: file_system_id.clone(),
+        shard_id: shard_id.to_string(),
+        primary_node_id: node.clone(),
+        replica_node_ids: Vec::new(),
+        epoch: 1,
+        assignment,
+        namespace_prepare_codec: Default::default(),
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let resident = LocalShardedMetadataBackend::new(
+        root.join("metadata"),
+        vec![
+            shard("root", DfsMetadataShardAssignment::Root),
+            shard(
+                "services",
+                DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+            ),
+        ],
+    )
+    .expect("sharded backend")
+    .into_resident();
+    let registry = DfsCrossShardNamespaceLockRegistry::default();
+    registry.replace_jobs([
+        (
+            Some(root_shard_id.clone()),
+            "stale-root-job".to_string(),
+            file_system_id.clone(),
+            "/root-stale".to_string(),
+        ),
+        (
+            Some(services_shard_id),
+            "live-services-job".to_string(),
+            file_system_id.clone(),
+            "/services/live".to_string(),
+        ),
+    ]);
+
+    let service = NetworkedDfsService::new(
+        InProcessNetwork::new().add_node(node),
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_cross_shard_namespace_lock_registry(registry)
+    .with_resident_metadata_shard_backend_lazy(
+        resident
+            .scope_shard(&file_system_id, &root_shard_id)
+            .expect("root shard handle")
+            .checkout()
+            .expect("root shard checkout"),
+    )
+    .expect("exact resident service");
+
+    service
+        .ensure_path_not_in_cross_shard_flight(&file_system_id, "/root-stale/child")
+        .expect("empty exact root snapshot removes the stale root guard");
+    assert!(matches!(
+        service.ensure_path_not_in_cross_shard_flight(&file_system_id, "/services/live/child"),
+        Err(DfsError::Busy { .. })
+    ));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn lazy_service_rebuild_preserves_shared_namespace_guard_registry() {
+    let root = temp_root("lazy-service-shared-namespace-guards");
+    let node = NodeId::from_legacy_named("node_lazy_shared_namespace_guards").expect("node");
+    let file_system_id = sifs_file_system_id();
+    let registry = DfsCrossShardNamespaceLockRegistry::default();
+    let mut service = NetworkedDfsService::new(
+        InProcessNetwork::new().add_node(node),
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_cross_shard_namespace_lock_registry(registry.clone());
+    service.next_frame_id = 41;
+    service.next_message_id = 42;
+    service.next_request_id = 43;
+    service.repair_retry_tick = 44;
+    let replica = NodeId::from_legacy_named("node_lazy_shared_replica").expect("replica");
+    service
+        .metadata_replication_cursors
+        .insert((replica.clone(), DfsMetadataShardId::new("services")), 45);
+    let committed_work_tracker = DfsCommittedWorkTracker::new();
+    service.set_committed_work_tracker(committed_work_tracker.clone());
+    let cancellation = DfsCancellationFlag::new();
+    service.set_cancellation(Some(cancellation.clone()));
+
+    let mut rebuilt = service
+        .into_lazy_metadata_backend_service()
+        .expect("lazy service rebuild");
+    assert!(
+        rebuilt
+            .cross_shard_namespace_locks
+            .shares_state_with(&registry),
+        "disaster-recovery collapse must retain the generation's shared registry"
+    );
+    assert_eq!(rebuilt.next_frame_id, 41);
+    assert_eq!(rebuilt.next_message_id, 42);
+    assert_eq!(rebuilt.next_request_id, 43);
+    assert_eq!(rebuilt.repair_retry_tick, 44);
+    assert_eq!(
+        rebuilt
+            .metadata_replication_cursors
+            .get(&(replica, DfsMetadataShardId::new("services"),)),
+        Some(&45)
+    );
+    rebuilt.record_message_committed_work(DfsMessageCommittedWork {
+        metadata_replica_progress: true,
+        ..DfsMessageCommittedWork::default()
+    });
+    assert!(
+        committed_work_tracker.take().metadata_replica_progress,
+        "a rebuilt service must retain the caller-owned committed-work edge"
+    );
+    cancellation.cancel();
+    assert!(matches!(
+        rebuilt.check_cancelled("lazy rebuild test"),
+        Err(DfsError::Cancelled { .. })
+    ));
+    registry.upsert_job(
+        None,
+        "post-rebuild-job".to_string(),
+        file_system_id.clone(),
+        "/services/post-rebuild".to_string(),
+    );
+    assert!(matches!(
+        rebuilt
+            .ensure_path_not_in_cross_shard_flight(&file_system_id, "/services/post-rebuild/child"),
+        Err(DfsError::Busy { .. })
+    ));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn exact_namespace_projection_collapse_keeps_only_shard_runtime_state() {
+    let root = temp_root("exact-namespace-projection-collapse");
+    let node = NodeId::from_legacy_named("node_exact_namespace_collapse").expect("node");
+    let file_system_id = sifs_file_system_id();
+    let shard_id = DfsMetadataShardId::new("root");
+    let resident = LocalShardedMetadataBackend::new(
+        root.join("metadata"),
+        vec![DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: shard_id.0.clone(),
+            primary_node_id: node.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        }],
+    )
+    .expect("sharded metadata")
+    .into_resident();
+    let registry = DfsCrossShardNamespaceLockRegistry::default();
+    let mut service = NetworkedDfsService::new(
+        InProcessNetwork::new().add_node(node.clone()),
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_cross_shard_namespace_lock_registry(registry.clone())
+    .with_resident_metadata_shard_backend_lazy(
+        resident
+            .scope_shard(&file_system_id, &shard_id)
+            .expect("exact shard")
+            .checkout()
+            .expect("exact checkout"),
+    )
+    .expect("lazy exact service");
+    registry.upsert_job(
+        Some(shard_id.clone()),
+        "collapse-running-job".to_string(),
+        file_system_id.clone(),
+        "/services/collapse-running".to_string(),
+    );
+    let mut object = file_metadata(node);
+    object.file_system_id = file_system_id.clone();
+    object.path = "/services/collapse-object".to_string();
+    service
+        .metadata
+        .add_object(object.clone())
+        .expect("cached object");
+    service.coordinator.set_committed_version(
+        file_system_id.clone(),
+        object.object_id.clone(),
+        object.version.clone(),
+    );
+    service
+        .local_metadata_journal_cursors
+        .insert(shard_id.clone(), 91);
+    service.next_request_id = 92;
+
+    service
+        .collapse_exact_namespace_request_projection()
+        .expect("collapse exact namespace projection");
+
+    assert!(service.metadata().object(&object.object_id).is_none());
+    assert_eq!(service.coordinator().committed_version_count(), 0);
+    assert!(service.metadata.filesystems.contains_key(&file_system_id));
+    assert_eq!(
+        service.local_metadata_journal_cursors.get(&shard_id),
+        Some(&91)
+    );
+    assert_eq!(service.next_request_id, 92);
+    assert!(registry.blocks(&file_system_id, "/services/collapse-running/child"));
     std::fs::remove_dir_all(root).ok();
 }
 

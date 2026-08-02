@@ -455,24 +455,37 @@ writes, plus content hashing, replica transfer, and transport work; one metadata
 shard is not designed to consume every host CPU.
 
 Daemon object-RPC ingress remains Tokio-concurrent, while the synchronous DFS
-state machine runs on admitted blocking workers. Authority-scoped routed writes
-and single-shard namespace commands carry a full filesystem/shard authority
-stamp; direct journal and snapshot commands carry the exact backend identity.
-The daemon validates those identities in the DFS service, queues same-shard
-mutations before `spawn_blocking`, and gives disjoint current shards independent
-service lanes. An exact request reserves its shard before awaiting the global
-read fence. A same-shard backlog therefore holds no global read guards, and a
-queued global writer waits only for currently active exact owners. Neither kind
-of waiter consumes a blocking worker. The admission guard moves into the
-non-cancellable blocking closure, so disconnecting a caller cannot release
-shard ownership while its mutation is still running. Read-only requests bypass
-mutation admission and select the least-loaded service lane, growing the pool
-only when every existing lane is assigned. Replica-transfer authority stamps
-that are not yet compared with the receiver's complete current shard config,
-rolling-upgrade messages without a provable footprint, responses whose state
-owner is local, and multi-path namespace requests retain the global
-compatibility lane. Wire-derived gate state is bounded, and cached exact
-services are created only for shards present in the committed topology.
+state machine runs on admitted blocking workers. Direct journal and snapshot
+commands carry an exact filesystem/shard authority identity. Single-shard
+namespace mutations carry the receiver-validated complete authority assignment
+for their path set. Once the cache has a proven-current topology generation,
+these operations reserve only that shard and use an independent service lane.
+An exact request reserves its shard before awaiting the global read fence. A
+same-shard backlog therefore holds no global read guards, and a queued global
+writer waits only for currently active exact owners. Neither kind of waiter
+consumes a blocking worker. The admission guard moves into the non-cancellable
+blocking closure, so disconnecting a caller cannot release ownership while its
+mutation is still running.
+
+The lanes borrow one resident metadata generation. That generation owns exactly
+one live authority-bearing backend instance per shard. An exact lane checks out
+only its shard for one request; global compatibility and maintenance work
+temporarily reconstruct the sharded router from those same instances in
+canonical shard order. Dropping either lease returns the instances without
+reopen or recovery. A topology generation can be replaced only while holding
+global admission, after all exact leases have drained; a missing or stale exact
+stamp falls back to the global lane for structured service validation.
+
+Fully addressed content reads do not initialize metadata and bypass mutation
+admission. Metadata-assisted reads reuse the resident global lane instead of
+opening a second inspection backend. A single-shard namespace lane owns its
+durable request, prepare, retry, and replay state; packed local-eventual batches
+for disjoint shard primaries therefore no longer share the primary service
+mutex. Coordinator-bearing distributed writes and their response/repair state
+remain globally admitted until every related message carries a complete shard
+identity. Running cross-shard namespace guards are shared across every shell in
+the resident generation, while multi-shard namespace operations retain global
+admission.
 
 The current Rust scheduler deliberately implements the exact single-shard and
 global subset of the formal model. Atomic multi-shard admission and explicit

@@ -39,19 +39,22 @@ use sinomo_dfs::{
     sifs_node_files_path, write_dfs_repair_attempt_snapshot,
 };
 use sinomo_dfs::{
-    DfsCommittedWorkTracker, DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture,
-    DfsDataPlaneResponse, DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions,
-    DfsFileSystemId, DfsInboundAttachment, DfsMaintenanceExecutionExclusions,
-    DfsMaintenanceTickOptions, DfsMaintenanceTickReport, DfsMessageCommand,
-    DfsMessageCommittedWork, DfsMessageExecutionScope, DfsMessageProcessResult, DfsMessageResponse,
-    DfsMetadataBackend, DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
+    DfsCommittedWorkTracker, DfsCrossShardNamespaceLockRegistry, DfsDataPlaneHost,
+    DfsDataPlaneHostError, DfsDataPlaneHostFuture, DfsDataPlaneResponse,
+    DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions, DfsFileSystemId,
+    DfsInboundAttachment, DfsMaintenanceExecutionExclusions, DfsMaintenanceTickOptions,
+    DfsMaintenanceTickReport, DfsMessageCommand, DfsMessageCommittedWork, DfsMessageExecutionScope,
+    DfsMessageProcessResult, DfsMessageResponse, DfsMetadataBackend,
+    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
     DfsMetadataPublishScheduleOptions, DfsMetadataPublishScheduleStart, DfsMetadataShardId,
     DfsMetadataShardMembershipHandoff, DfsNodeDetachedSendState, DfsNodeDetachedSendWorker,
     DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport,
     DfsPeerTransportError, DfsPlacementReconciliationJob, DfsPlacementReconciliationState,
     DfsRepairAttemptRecord, LocalDfsRepairQueueStore, NetworkedDfsService,
+    ResidentLocalMetadataShardHandle, ResidentLocalShardedMetadataBackend,
     cluster_dfs_all_metadata_shard_membership_handoffs, default_dfs_repair_attempt_snapshot_path,
-    dfs_message_execution_scope, read_dfs_repair_attempt_snapshot,
+    dfs_message_execution_scope, dfs_message_is_read_only_request,
+    open_cluster_sharded_dfs_metadata_backend, read_dfs_repair_attempt_snapshot,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
@@ -267,6 +270,25 @@ impl DaemonDfsMetadataAuthorityGeneration {
 
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    fn shard_projection_state(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        shard_id: &DfsMetadataShardId,
+    ) -> (u64, bool) {
+        let key = sinomo_dfs::metadata_shard_key(file_system_id, &shard_id.0);
+        let Ok(projection) = self.projection.lock() else {
+            return (self.generation(), false);
+        };
+        let contains_shard = projection
+            .entries
+            .binary_search_by(|(entry_key, _)| entry_key.as_str().cmp(key.as_str()))
+            .is_ok();
+        // `observe` updates both the projection and generation while retaining
+        // this mutex. Loading the generation here prevents pairing an old
+        // generation number with new shard membership during admission.
+        (self.generation(), contains_shard)
     }
 
     #[cfg(test)]
@@ -549,6 +571,7 @@ fn daemon_dfs_metadata_authority_snapshot_watcher(
 struct DaemonDfsMessageServiceLane {
     service: DaemonDfsMessageService,
     peer_node_ids: Vec<NodeId>,
+    resident_metadata_scope: Option<DaemonDfsResidentMetadataScope>,
 }
 
 impl DaemonDfsMessageServiceLane {
@@ -559,6 +582,25 @@ impl DaemonDfsMessageServiceLane {
         self.service
             .refresh_message_peer_targets(peer_node_ids.clone());
         self.peer_node_ids = peer_node_ids;
+    }
+}
+
+#[derive(Clone, Debug)]
+enum DaemonDfsResidentMetadataScope {
+    ExactShard(ResidentLocalMetadataShardHandle),
+    Global(ResidentLocalShardedMetadataBackend),
+}
+
+impl DaemonDfsResidentMetadataScope {
+    fn attach(&self, service: &mut DaemonDfsMessageService) -> Result<(), sinomo_dfs::DfsError> {
+        match self {
+            Self::ExactShard(shard) => {
+                service.attach_resident_metadata_shard_backend(shard.checkout()?)
+            }
+            Self::Global(backend) => {
+                service.attach_resident_sharded_metadata_backend(backend.checkout_global()?)
+            }
+        }
     }
 }
 
@@ -634,14 +676,22 @@ struct DaemonDfsMessageServiceCacheEntry {
     /// Clones retain the same bounded manifest and packed-index caches and avoid
     /// repeating the 256-shard layout and reservation publication fences.
     content_store: sinomo_dfs::LocalContentStore,
+    /// The one authority-bearing metadata generation for this daemon. Exact
+    /// lanes check out one shard; compatibility and maintenance scopes check
+    /// out the same instances as a complete router.
+    resident_metadata_backend: Option<ResidentLocalShardedMetadataBackend>,
+    resident_metadata_initialized: bool,
+    /// Live namespace-job guards shared by every request shell over this
+    /// resident metadata generation.
+    cross_shard_namespace_locks: DfsCrossShardNamespaceLockRegistry,
     /// Lazily opened mutation/full-hydrate lane. Maintenance drops only this
     /// lane so its broad metadata generation cannot overlap mutable message
     /// state.
     primary_service: Option<Arc<DaemonDfsMessageServiceLaneHandle>>,
-    /// Lazily opened lane for targeted immutable reads and namespace lookups.
-    /// It is never fully hydrated, so keeping reads off the mutation lane does
-    /// not retain a second all-shard metadata projection while idle.
-    lightweight_read_service: Option<Arc<DaemonDfsMessageServiceLaneHandle>>,
+    /// Request state is serialized only with other operations for the same
+    /// exact shard. Backend ownership remains in `resident_metadata_backend`.
+    exact_shard_services:
+        BTreeMap<DaemonDfsMutationLaneKey, Arc<DaemonDfsMessageServiceLaneHandle>>,
     /// Lazily opened lane for exact immutable content reads. These requests
     /// already carry the selected version and content identity, so serving
     /// them must not open or rebind a metadata backend on the RPC path.
@@ -802,6 +852,16 @@ enum DaemonDfsMutationAdmission {
         _scheduler: Arc<DaemonDfsMutationScheduler>,
         _global: tokio::sync::OwnedRwLockWriteGuard<()>,
     },
+}
+
+impl DaemonDfsMutationAdmission {
+    fn is_global(&self) -> bool {
+        matches!(self, Self::Global { .. })
+    }
+
+    fn is_exact(&self) -> bool {
+        matches!(self, Self::ExactShard { .. })
+    }
 }
 
 static DAEMON_DFS_MESSAGE_SERVICE_CACHE: OnceLock<
@@ -1587,24 +1647,35 @@ async fn handle_daemon_dfs_status_async(
             &cluster_paths,
             &peer_snapshot,
             &status_runtime,
-            DaemonDfsMessageLaneKind::Mutation,
+            DaemonDfsMessageLaneKind::MutationGlobal,
+            true,
         )?;
         let mut lane = lane.lock().map_err(|_| DaemonError::Network {
             address: "DFS status".to_string(),
             detail: "DFS mutation service lane is poisoned".to_string(),
         })?;
         lane.refresh_peer_targets(peer_snapshot.peer_node_ids);
-        let metadata = lane
+        let resident_scope = lane.resident_metadata_scope.clone();
+        if let Some(scope) = resident_scope.as_ref() {
+            scope.attach(&mut lane.service)?;
+        }
+        // A prior standalone inspection may have retained a duplicate decoded
+        // generation. The daemon-owned lane is now the reusable source.
+        sinomo_dfs::evict_cluster_aware_dfs_metadata_inspection_cache(&data_dir);
+        let result = lane
             .service
             .metadata_backend()
             .ok_or_else(|| DaemonError::Parse {
                 detail: "DFS mutation service lane has no metadata backend".to_string(),
-            })?;
-        // A prior standalone inspection may have retained a duplicate decoded
-        // generation. The daemon-owned lane is now the reusable source.
-        sinomo_dfs::evict_cluster_aware_dfs_metadata_inspection_cache(&data_dir);
-        sinomo_dfs::inspect_dfs_status_from_metadata(&data_dir, &cluster_paths, metadata)
-            .map_err(DaemonError::from)
+            })
+            .and_then(|metadata| {
+                sinomo_dfs::inspect_dfs_status_from_metadata(&data_dir, &cluster_paths, metadata)
+                    .map_err(DaemonError::from)
+            });
+        if resident_scope.is_some() {
+            lane.service.release_resident_metadata_backend()?;
+        }
+        result
     })
     .await
     .map_err(|source| DaemonError::Network {
@@ -1649,6 +1720,7 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
             &peer_snapshot,
             &self.runtime,
             DaemonDfsMessageLaneKind::ContentRead,
+            false,
         )
         .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))?;
         let lane = lane
@@ -3362,6 +3434,9 @@ fn take_daemon_dfs_message_mutation_service_for_maintenance(
                 Some(content_store) => content_store,
                 None => sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?,
             };
+            let resident_metadata_backend =
+                open_cluster_sharded_dfs_metadata_backend(data_dir, cluster_paths)?
+                    .map(|backend| backend.into_resident());
             cache.insert(
                 cache_key.clone(),
                 DaemonDfsMessageServiceCacheEntry {
@@ -3369,8 +3444,11 @@ fn take_daemon_dfs_message_mutation_service_for_maintenance(
                     metadata_authority_generation: Arc::clone(&metadata_authority_generation),
                     peer_node_ids: peer_node_ids.clone(),
                     content_store,
+                    resident_metadata_backend,
+                    resident_metadata_initialized: true,
+                    cross_shard_namespace_locks: Default::default(),
                     primary_service: None,
-                    lightweight_read_service: None,
+                    exact_shard_services: BTreeMap::new(),
                     content_read_service: None,
                 },
             );
@@ -3379,10 +3457,21 @@ fn take_daemon_dfs_message_mutation_service_for_maintenance(
             .get_mut(&cache_key)
             .expect("daemon DFS message cache entry inserted");
         entry.peer_node_ids.clone_from(&peer_node_ids);
-        (entry.primary_service.take(), entry.content_store.clone())
+        if !entry.resident_metadata_initialized {
+            entry.resident_metadata_backend =
+                open_cluster_sharded_dfs_metadata_backend(data_dir, cluster_paths)?
+                    .map(|backend| backend.into_resident());
+            entry.resident_metadata_initialized = true;
+        }
+        (
+            entry.primary_service.take(),
+            entry.content_store.clone(),
+            entry.resident_metadata_backend.clone(),
+            entry.cross_shard_namespace_locks.clone(),
+        )
     };
 
-    let (cached, content_store) = cached;
+    let (cached, content_store, resident_metadata_backend, cross_shard_namespace_locks) = cached;
     let handle = match cached {
         Some(handle) => handle,
         None => open_daemon_dfs_message_service_lane_with_content(
@@ -3392,6 +3481,8 @@ fn take_daemon_dfs_message_mutation_service_for_maintenance(
             peer_node_ids.clone(),
             runtime,
             content_store,
+            resident_metadata_backend.map(DaemonDfsResidentMetadataScope::Global),
+            cross_shard_namespace_locks,
         )?,
     };
     let handle = Arc::try_unwrap(handle).map_err(|_| sinomo_dfs::DfsError::Network {
@@ -3407,6 +3498,9 @@ fn take_daemon_dfs_message_mutation_service_for_maintenance(
         .into_inner()
         .map_err(|_| daemon_dfs_cache_lock_error())?;
     lane.refresh_peer_targets(peer_node_ids.clone());
+    if let Some(scope) = lane.resident_metadata_scope.clone() {
+        scope.attach(&mut lane.service)?;
+    }
     Ok(DaemonDfsMaintenanceServiceLane {
         signature,
         metadata_authority_generation,
@@ -3466,6 +3560,9 @@ fn restore_daemon_dfs_message_mutation_service_after_maintenance(
     retained
         .peer_node_ids
         .clone_from(&peer_snapshot.peer_node_ids);
+    if retained.lane.resident_metadata_scope.is_some() {
+        retained.lane.service.release_resident_metadata_backend()?;
+    }
 
     let cache_key = data_dir.root();
     let mut cache = daemon_dfs_message_service_cache()
@@ -4209,6 +4306,8 @@ fn open_daemon_dfs_message_service_lane(
         peer_node_ids,
         runtime,
         content,
+        None,
+        Default::default(),
     )
 }
 
@@ -4219,6 +4318,8 @@ fn open_daemon_dfs_message_service_lane_with_content(
     peer_node_ids: Vec<NodeId>,
     runtime: &tokio::runtime::Handle,
     content: sinomo_dfs::LocalContentStore,
+    resident_metadata_scope: Option<DaemonDfsResidentMetadataScope>,
+    cross_shard_namespace_locks: DfsCrossShardNamespaceLockRegistry,
 ) -> Result<Arc<DaemonDfsMessageServiceLaneHandle>, sinomo_dfs::DfsError> {
     open_daemon_dfs_message_metadata_lane_with_content(
         data_dir,
@@ -4227,14 +4328,9 @@ fn open_daemon_dfs_message_service_lane_with_content(
         peer_node_ids,
         runtime,
         content,
-        DaemonDfsMetadataLaneBootstrap::MutationGuards,
+        resident_metadata_scope,
+        cross_shard_namespace_locks,
     )
-}
-
-#[derive(Clone, Copy)]
-enum DaemonDfsMetadataLaneBootstrap {
-    MutationGuards,
-    ReadOnly,
 }
 
 fn open_daemon_dfs_message_metadata_lane_with_content(
@@ -4244,10 +4340,17 @@ fn open_daemon_dfs_message_metadata_lane_with_content(
     peer_node_ids: Vec<NodeId>,
     runtime: &tokio::runtime::Handle,
     content: sinomo_dfs::LocalContentStore,
-    bootstrap: DaemonDfsMetadataLaneBootstrap,
+    resident_metadata_scope: Option<DaemonDfsResidentMetadataScope>,
+    cross_shard_namespace_locks: DfsCrossShardNamespaceLockRegistry,
 ) -> Result<Arc<DaemonDfsMessageServiceLaneHandle>, sinomo_dfs::DfsError> {
-    let metadata_backend =
-        sinomo_dfs::open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
+    let metadata_backend = if resident_metadata_scope.is_none() {
+        Some(sinomo_dfs::open_cluster_aware_dfs_metadata_backend(
+            data_dir,
+            cluster_paths,
+        )?)
+    } else {
+        None
+    };
     #[cfg(test)]
     record_daemon_dfs_test_message_service_lane_open(data_dir);
     let detached_send_runtime = daemon_dfs_detached_send_runtime(data_dir, cluster_paths)?;
@@ -4261,49 +4364,39 @@ fn open_daemon_dfs_message_metadata_lane_with_content(
             detached_send_runtime.state.clone(),
         );
     let service = with_daemon_dfs_control_plane_on_runtime(
-        NetworkedDfsService::new(transport, content),
+        NetworkedDfsService::new(transport, content)
+            .with_cross_shard_namespace_lock_registry(cross_shard_namespace_locks),
         cluster_paths,
         Some(runtime),
     );
-    let service = match bootstrap {
-        DaemonDfsMetadataLaneBootstrap::MutationGuards => {
+    let mut service = match resident_metadata_scope.as_ref() {
+        Some(scope) => match scope {
+            DaemonDfsResidentMetadataScope::ExactShard(shard) => {
+                service.with_resident_metadata_shard_backend_lazy(shard.checkout()?)?
+            }
+            DaemonDfsResidentMetadataScope::Global(backend) => {
+                service.with_resident_sharded_metadata_backend_lazy(backend.checkout_global()?)?
+            }
+        },
+        None => {
             // Mutation lanes retain the filesystem catalog and durable namespace
             // guards without hydrating the complete metadata projection.
-            service.with_boxed_metadata_backend_lazy(metadata_backend)?
-        }
-        DaemonDfsMetadataLaneBootstrap::ReadOnly => {
-            // Read-only admission resolves authority from the control plane and
-            // reads the backend directly, so global bootstrap scans add no
-            // correctness evidence.
-            service.with_boxed_metadata_backend_for_read_only_requests(metadata_backend)
+            service.with_boxed_metadata_backend_lazy(
+                metadata_backend.expect("owned mutation lane opened a metadata backend"),
+            )?
         }
     };
+    if resident_metadata_scope.is_some() {
+        service.release_resident_metadata_backend()?;
+    }
     Ok(Arc::new(DaemonDfsMessageServiceLaneHandle {
         lane: Mutex::new(DaemonDfsMessageServiceLane {
             service,
             peer_node_ids,
+            resident_metadata_scope,
         }),
         detached_send_runtime,
     }))
-}
-
-fn open_daemon_dfs_message_read_service_lane_with_content(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    local_node_id: &sinomo_core::node::NodeId,
-    peer_node_ids: Vec<NodeId>,
-    runtime: &tokio::runtime::Handle,
-    content: sinomo_dfs::LocalContentStore,
-) -> Result<Arc<DaemonDfsMessageServiceLaneHandle>, sinomo_dfs::DfsError> {
-    open_daemon_dfs_message_metadata_lane_with_content(
-        data_dir,
-        cluster_paths,
-        local_node_id,
-        peer_node_ids,
-        runtime,
-        content,
-        DaemonDfsMetadataLaneBootstrap::ReadOnly,
-    )
 }
 
 fn open_daemon_dfs_message_content_read_lane_with_content(
@@ -4328,6 +4421,7 @@ fn open_daemon_dfs_message_content_read_lane_with_content(
         lane: Mutex::new(DaemonDfsMessageServiceLane {
             service: NetworkedDfsService::new(transport, content),
             peer_node_ids,
+            resident_metadata_scope: None,
         }),
         detached_send_runtime,
     }))
@@ -4457,11 +4551,111 @@ fn daemon_dfs_message_uses_content_read_lane(command: &DfsMessageCommand) -> boo
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Admit work whose complete mutable state is owned by one shard runtime.
+///
+/// Replica application is backend-contained. A namespace request carrying one
+/// exact authority stamp owns its durable request ledger, prepare state, and
+/// replay state in that same shard; cross-shard jobs retain the global shell.
+/// Distributed writes still retain coordinator and repair state across several
+/// message families and therefore remain global until those responses carry a
+/// complete shard identity too.
+fn daemon_dfs_message_supports_exact_service_lane(command: &DfsMessageCommand) -> bool {
+    matches!(
+        &command.routed_message.message,
+        sinomo_dfs::DfsNetworkMessage::MetadataJournalBatch(_)
+            | sinomo_dfs::DfsNetworkMessage::MetadataSnapshotInstall(_)
+    ) || matches!(
+        &command.routed_message.message,
+        sinomo_dfs::DfsNetworkMessage::NamespaceRequest(namespace)
+            if namespace.authority_shards.len() == 1
+                && !dfs_message_is_read_only_request(command)
+    )
+}
+
+/// Prove that an exact admission can borrow the already-installed resident
+/// generation. This check deliberately never opens a backend. A missing cache,
+/// a topology edge, or a stale shard stamp falls back to global admission so
+/// generation rollover and structured authority validation happen only after
+/// all exact leases have drained.
+fn daemon_dfs_message_cache_exact_admission_is_current(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    peer_snapshot: &DaemonDfsMessagePeerSnapshot,
+    key: &DaemonDfsMutationLaneKey,
+    runtime: &tokio::runtime::Handle,
+) -> Result<bool, sinomo_dfs::DfsError> {
+    let metadata_authority_generation = daemon_dfs_metadata_authority_generation_for_identity(
+        cluster_paths,
+        &peer_snapshot.cluster_id,
+        &peer_snapshot.local_node_id,
+        Some(runtime),
+    )?;
+    let (observed_generation, contains_shard) =
+        metadata_authority_generation.shard_projection_state(&key.file_system_id, &key.shard_id);
+    if !contains_shard {
+        return Ok(false);
+    }
+
+    let cache = daemon_dfs_message_service_cache()
+        .lock()
+        .map_err(|_| daemon_dfs_cache_lock_error())?;
+    let Some(entry) = cache.get(&data_dir.root()) else {
+        return Ok(false);
+    };
+    if entry.signature.cluster_id != peer_snapshot.cluster_id
+        || entry.signature.local_node_id != peer_snapshot.local_node_id
+        || entry.signature.kv_snapshot_available != peer_snapshot.kv_snapshot_available
+        || entry.signature.metadata_authority_generation != observed_generation
+        || !Arc::ptr_eq(
+            &entry.metadata_authority_generation,
+            &metadata_authority_generation,
+        )
+        || !entry.resident_metadata_initialized
+    {
+        return Ok(false);
+    }
+    Ok(entry
+        .resident_metadata_backend
+        .as_ref()
+        .is_some_and(|backend| {
+            backend
+                .scope_shard(&key.file_system_id, &key.shard_id)
+                .is_ok()
+        }))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum DaemonDfsMessageLaneKind {
-    Mutation,
-    LightweightRead,
+    MutationGlobal,
+    MutationExact(DaemonDfsMutationLaneKey),
     ContentRead,
+}
+
+fn daemon_dfs_global_message_lane(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    runtime: &tokio::runtime::Handle,
+    entry: &mut DaemonDfsMessageServiceCacheEntry,
+) -> Result<Arc<DaemonDfsMessageServiceLaneHandle>, sinomo_dfs::DfsError> {
+    if let Some(lane) = entry.primary_service.as_ref() {
+        return Ok(Arc::clone(lane));
+    }
+    let resident_scope = entry
+        .resident_metadata_backend
+        .clone()
+        .map(DaemonDfsResidentMetadataScope::Global);
+    let lane = open_daemon_dfs_message_service_lane_with_content(
+        data_dir,
+        cluster_paths,
+        &entry.signature.local_node_id,
+        entry.peer_node_ids.clone(),
+        runtime,
+        entry.content_store.clone(),
+        resident_scope,
+        entry.cross_shard_namespace_locks.clone(),
+    )?;
+    entry.primary_service = Some(Arc::clone(&lane));
+    Ok(lane)
 }
 
 fn daemon_dfs_message_lane(
@@ -4470,6 +4664,7 @@ fn daemon_dfs_message_lane(
     peer_snapshot: &DaemonDfsMessagePeerSnapshot,
     runtime: &tokio::runtime::Handle,
     kind: DaemonDfsMessageLaneKind,
+    allow_generation_rollover: bool,
 ) -> Result<(Arc<DaemonDfsMessageServiceLaneHandle>, Duration), sinomo_dfs::DfsError> {
     let cache_key = data_dir.root();
     let peer_node_ids = &peer_snapshot.peer_node_ids;
@@ -4498,10 +4693,10 @@ fn daemon_dfs_message_lane(
         kv_snapshot_available: peer_snapshot.kv_snapshot_available,
         metadata_authority_generation: metadata_authority_generation.generation(),
     };
-    if cache
+    let generation_changed = cache
         .get(&cache_key)
-        .is_none_or(|entry| entry.signature != signature)
-    {
+        .is_some_and(|entry| entry.signature != signature);
+    if cache.get(&cache_key).is_none() || (generation_changed && allow_generation_rollover) {
         // Release the superseded backend-bearing lanes before opening their
         // replacement, while retaining the one process-local content store.
         let content_store = match cache.remove(&cache_key) {
@@ -4521,10 +4716,28 @@ fn daemon_dfs_message_lane(
                 metadata_authority_generation,
                 peer_node_ids: peer_node_ids.clone(),
                 content_store,
+                resident_metadata_backend: None,
+                resident_metadata_initialized: false,
+                cross_shard_namespace_locks: Default::default(),
                 primary_service: None,
-                lightweight_read_service: None,
+                exact_shard_services: BTreeMap::new(),
                 content_read_service: None,
             },
+        );
+    } else if generation_changed {
+        // An authority observer may advance while an exact-shard operation is
+        // already admitted on the prior generation. Never open a replacement
+        // beside that live capability. The next globally admitted command (or
+        // maintenance pass) performs the rollover after every exact lease has
+        // drained.
+        tracing::debug!(
+            data_root = %cache_key.display(),
+            observed_generation = signature.metadata_authority_generation,
+            retained_generation = cache
+                .get(&cache_key)
+                .map(|entry| entry.signature.metadata_authority_generation)
+                .unwrap_or_default(),
+            "deferred daemon DFS resident generation rollover until global admission"
         );
     }
 
@@ -4532,73 +4745,102 @@ fn daemon_dfs_message_lane(
         .get_mut(&cache_key)
         .expect("daemon DFS message cache entry inserted");
     entry.peer_node_ids.clone_from(peer_node_ids);
-    let slot = match kind {
-        DaemonDfsMessageLaneKind::Mutation => &mut entry.primary_service,
-        DaemonDfsMessageLaneKind::LightweightRead => &mut entry.lightweight_read_service,
-        DaemonDfsMessageLaneKind::ContentRead => &mut entry.content_read_service,
-    };
-    if slot.is_none() {
-        let lane = match kind {
-            DaemonDfsMessageLaneKind::Mutation => {
-                open_daemon_dfs_message_service_lane_with_content(
-                    data_dir,
-                    cluster_paths,
-                    &entry.signature.local_node_id,
-                    entry.peer_node_ids.clone(),
-                    runtime,
-                    entry.content_store.clone(),
-                )?
-            }
-            DaemonDfsMessageLaneKind::LightweightRead => {
-                open_daemon_dfs_message_read_service_lane_with_content(
-                    data_dir,
-                    cluster_paths,
-                    &entry.signature.local_node_id,
-                    entry.peer_node_ids.clone(),
-                    runtime,
-                    entry.content_store.clone(),
-                )?
-            }
-            DaemonDfsMessageLaneKind::ContentRead => {
-                open_daemon_dfs_message_content_read_lane_with_content(
-                    data_dir,
-                    cluster_paths,
-                    &entry.signature.local_node_id,
-                    entry.peer_node_ids.clone(),
-                    runtime,
-                    entry.content_store.clone(),
-                )?
-            }
-        };
-        tracing::info!(
-            data_root = %cache_key.display(),
-            lane = ?kind,
-            "opened bounded daemon DFS service lane"
-        );
-        *slot = Some(lane);
+    if matches!(
+        &kind,
+        DaemonDfsMessageLaneKind::MutationExact(_) | DaemonDfsMessageLaneKind::MutationGlobal
+    ) && !entry.resident_metadata_initialized
+    {
+        entry.resident_metadata_backend =
+            open_cluster_sharded_dfs_metadata_backend(data_dir, cluster_paths)?
+                .map(|backend| backend.into_resident());
+        entry.resident_metadata_initialized = true;
     }
-    Ok((
-        Arc::clone(slot.as_ref().expect("daemon DFS service lane inserted")),
-        cache_lock_wait,
-    ))
+    let lane_kind = kind.clone();
+    let lane = match kind {
+        DaemonDfsMessageLaneKind::MutationExact(key)
+            if entry.resident_metadata_backend.is_some() =>
+        {
+            if let Some(lane) = entry.exact_shard_services.get(&key) {
+                Arc::clone(lane)
+            } else {
+                let resident = entry
+                    .resident_metadata_backend
+                    .as_ref()
+                    .expect("exact resident lane checked above");
+                let shard = match resident.scope_shard(&key.file_system_id, &key.shard_id) {
+                    Ok(shard) => shard,
+                    Err(error) if allow_generation_rollover => {
+                        tracing::debug!(
+                            file_system_id = %key.file_system_id,
+                            shard_id = %key.shard_id.0,
+                            reason = %error,
+                            "falling back to globally admitted DFS service validation for a stale exact-shard stamp"
+                        );
+                        return daemon_dfs_global_message_lane(
+                            data_dir,
+                            cluster_paths,
+                            runtime,
+                            entry,
+                        )
+                        .map(|lane| (lane, cache_lock_wait));
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let lane = open_daemon_dfs_message_service_lane_with_content(
+                    data_dir,
+                    cluster_paths,
+                    &entry.signature.local_node_id,
+                    entry.peer_node_ids.clone(),
+                    runtime,
+                    entry.content_store.clone(),
+                    Some(DaemonDfsResidentMetadataScope::ExactShard(shard)),
+                    entry.cross_shard_namespace_locks.clone(),
+                )?;
+                entry.exact_shard_services.insert(key, Arc::clone(&lane));
+                lane
+            }
+        }
+        DaemonDfsMessageLaneKind::MutationExact(_) | DaemonDfsMessageLaneKind::MutationGlobal => {
+            daemon_dfs_global_message_lane(data_dir, cluster_paths, runtime, entry)?
+        }
+        DaemonDfsMessageLaneKind::ContentRead => {
+            if let Some(lane) = entry.content_read_service.as_ref() {
+                Arc::clone(lane)
+            } else {
+                let lane = open_daemon_dfs_message_content_read_lane_with_content(
+                    data_dir,
+                    cluster_paths,
+                    &entry.signature.local_node_id,
+                    entry.peer_node_ids.clone(),
+                    runtime,
+                    entry.content_store.clone(),
+                )?;
+                entry.content_read_service = Some(Arc::clone(&lane));
+                lane
+            }
+        }
+    };
+    tracing::trace!(
+        data_root = %cache_key.display(),
+        lane = ?lane_kind,
+        "selected bounded daemon DFS service lane"
+    );
+    Ok((lane, cache_lock_wait))
 }
 
 fn daemon_dfs_message_content_store(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
+    peer_snapshot: &DaemonDfsMessagePeerSnapshot,
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_dfs::LocalContentStore, sinomo_dfs::DfsError> {
-    let Some(peer_snapshot) = read_daemon_dfs_message_peer_snapshot(cluster_paths)? else {
-        return Err(sinomo_dfs::DfsError::Network {
-            message: "DFS content ingest requires initialized cluster state".to_string(),
-        });
-    };
     let (lane, _) = daemon_dfs_message_lane(
         data_dir,
         cluster_paths,
-        &peer_snapshot,
+        peer_snapshot,
         runtime,
         DaemonDfsMessageLaneKind::ContentRead,
+        false,
     )?;
     let lane = lane.lock().map_err(|_| daemon_dfs_cache_lock_error())?;
     Ok(lane.service.content().clone())
@@ -4607,9 +4849,13 @@ fn daemon_dfs_message_content_store(
 fn process_daemon_dfs_message_command_on_runtime(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
+    peer_snapshot: &DaemonDfsMessagePeerSnapshot,
     command: DfsMessageCommand,
     preingested_blob: Option<sinomo_dfs::ContentStoreQuarantinedBlob>,
     execution_scope: &DfsMessageExecutionScope,
+    allow_exact_service_lane: bool,
+    allow_generation_rollover: bool,
+    peer_snapshot_elapsed: Duration,
     runtime: &tokio::runtime::Handle,
     traceparent: Option<String>,
 ) -> Result<Option<DaemonDfsMessageCommandProcessResult>, sinomo_dfs::DfsError> {
@@ -4617,7 +4863,7 @@ fn process_daemon_dfs_message_command_on_runtime(
     // Daemon startup owns data-directory initialization. Repeating its six
     // create_dir_all calls here turns every routed DFS message into layout I/O.
     let cache_key = data_dir.root();
-    let is_read_only = matches!(execution_scope, DfsMessageExecutionScope::ReadOnly);
+    let is_read_only = dfs_message_is_read_only_request(&command);
     let use_content_read_lane = daemon_dfs_message_uses_content_read_lane(&command);
     let request_id = command.request_id.clone();
     let source_node_id = command.routed_message.source_node_id.clone();
@@ -4625,6 +4871,10 @@ fn process_daemon_dfs_message_command_on_runtime(
     let frame_id = command.routed_message.frame_id;
     let message_id = command.routed_message.message_id;
     let message_kind = daemon_dfs_message_kind(&command.routed_message.message);
+    let is_namespace_request = matches!(
+        &command.routed_message.message,
+        sinomo_dfs::DfsNetworkMessage::NamespaceRequest(_)
+    );
     daemon_dfs_perf_trace(format_args!(
         "dfs-message-dispatch-start request={} kind={} source={} target={} frame_id={} message_id={} read_lane={} content_lane={}",
         request_id,
@@ -4636,11 +4886,7 @@ fn process_daemon_dfs_message_command_on_runtime(
         is_read_only,
         use_content_read_lane
     ));
-    let peer_snapshot_started = Instant::now();
-    let Some(peer_snapshot) = read_daemon_dfs_message_peer_snapshot(cluster_paths)? else {
-        return Ok(None);
-    };
-    let peer_snapshot_ms = peer_snapshot_started.elapsed().as_millis();
+    let peer_snapshot_ms = peer_snapshot_elapsed.as_millis();
     if command.routed_message.target_node_id != peer_snapshot.local_node_id {
         return Err(sinomo_dfs::DfsError::Network {
             message: format!(
@@ -4653,13 +4899,21 @@ fn process_daemon_dfs_message_command_on_runtime(
     let cache_select_started = Instant::now();
     let lane_kind = if use_content_read_lane {
         DaemonDfsMessageLaneKind::ContentRead
-    } else if is_read_only {
-        DaemonDfsMessageLaneKind::LightweightRead
+    } else if allow_exact_service_lane
+        && let Some(key) = DaemonDfsMutationLaneKey::from_scope(execution_scope)
+    {
+        DaemonDfsMessageLaneKind::MutationExact(key)
     } else {
-        DaemonDfsMessageLaneKind::Mutation
+        DaemonDfsMessageLaneKind::MutationGlobal
     };
-    let (service_lane_handle, cache_lock_wait) =
-        daemon_dfs_message_lane(data_dir, cluster_paths, &peer_snapshot, runtime, lane_kind)?;
+    let (service_lane_handle, cache_lock_wait) = daemon_dfs_message_lane(
+        data_dir,
+        cluster_paths,
+        peer_snapshot,
+        runtime,
+        lane_kind,
+        allow_generation_rollover,
+    )?;
     let cache_select = cache_select_started.elapsed();
 
     let lane_lock_wait_started = Instant::now();
@@ -4668,9 +4922,15 @@ fn process_daemon_dfs_message_command_on_runtime(
         .map_err(|_| daemon_dfs_cache_lock_error())?;
     let lane_lock_wait = lane_lock_wait_started.elapsed();
     service_lane.refresh_peer_targets(peer_node_ids);
+    let resident_metadata_scope = service_lane.resident_metadata_scope.clone();
+    let backend_checkout_started = Instant::now();
+    if let Some(scope) = resident_metadata_scope.as_ref() {
+        scope.attach(&mut service_lane.service)?;
+    }
+    let backend_checkout = backend_checkout_started.elapsed();
     let process_started = Instant::now();
     daemon_dfs_perf_trace(format_args!(
-        "dfs-message-dispatch-before-process request={} kind={} peer_snapshot_ms={} cache_select_ms={} cache_select_us={} cache_lock_wait_ms={} cache_lock_wait_us={} lane_lock_wait_ms={} lane_lock_wait_us={} pre_process_total_ms={}",
+        "dfs-message-dispatch-before-process request={} kind={} peer_snapshot_ms={} cache_select_ms={} cache_select_us={} cache_lock_wait_ms={} cache_lock_wait_us={} lane_lock_wait_ms={} lane_lock_wait_us={} backend_checkout_ms={} backend_checkout_us={} pre_process_total_ms={}",
         request_id,
         message_kind,
         peer_snapshot_ms,
@@ -4680,6 +4940,8 @@ fn process_daemon_dfs_message_command_on_runtime(
         cache_lock_wait.as_micros(),
         lane_lock_wait.as_millis(),
         lane_lock_wait.as_micros(),
+        backend_checkout.as_millis(),
+        backend_checkout.as_micros(),
         trace_started.elapsed().as_millis()
     ));
     let mut process_report = service_lane
@@ -4706,6 +4968,31 @@ fn process_daemon_dfs_message_command_on_runtime(
         std::mem::take(&mut process_report.committed_repair_records)
     };
     let repair_queue_record_count = repair_queue_records.len();
+    let exact_namespace_projection_reset_error = if is_namespace_request
+        && matches!(
+            &resident_metadata_scope,
+            Some(DaemonDfsResidentMetadataScope::ExactShard(_))
+        ) {
+        service_lane
+            .service
+            .collapse_exact_namespace_request_projection()
+            .err()
+    } else {
+        None
+    };
+    let resident_backend_release_error = if resident_metadata_scope.is_some() {
+        service_lane
+            .service
+            .release_resident_metadata_backend()
+            .err()
+    } else {
+        None
+    };
+    let process = process_started.elapsed();
+    // Everything below operates on owned output from the served command. The
+    // resident backend lease has already returned to its shard pool; release
+    // the request-state lane before repair-queue I/O and follow-up events too.
+    drop(service_lane);
     let repair_queue_started = Instant::now();
     let repair_queue_persistence = if repair_queue_records.is_empty() {
         Ok(0)
@@ -4713,14 +5000,13 @@ fn process_daemon_dfs_message_command_on_runtime(
         persist_daemon_dfs_repair_queue_records(data_dir, repair_queue_records)
     };
     let repair_queue_elapsed = repair_queue_started.elapsed();
-    let process = process_started.elapsed();
     let (outbound_message_count, event_count) = process_report
         .outcome
         .as_ref()
         .map(|result| (result.response.outbound_messages.len(), result.events.len()))
         .unwrap_or_default();
     daemon_dfs_perf_trace(format_args!(
-        "dfs-message-dispatch request={} read_lane={} peer_snapshot_ms={} cache_select_ms={} cache_select_us={} cache_lock_wait_ms={} cache_lock_wait_us={} lane_lock_wait_ms={} lane_lock_wait_us={} process_ms={} process_us={} repair_queue_records={} repair_queue_appended={} repair_queue_ms={} repair_queue_us={} process_ok={} outbound_messages={} events={} total_ms={}",
+        "dfs-message-dispatch request={} read_lane={} peer_snapshot_ms={} cache_select_ms={} cache_select_us={} cache_lock_wait_ms={} cache_lock_wait_us={} lane_lock_wait_ms={} lane_lock_wait_us={} backend_checkout_ms={} backend_checkout_us={} process_ms={} process_us={} repair_queue_records={} repair_queue_appended={} repair_queue_ms={} repair_queue_us={} process_ok={} outbound_messages={} events={} total_ms={}",
         request_id,
         is_read_only,
         peer_snapshot_ms,
@@ -4730,6 +5016,8 @@ fn process_daemon_dfs_message_command_on_runtime(
         cache_lock_wait.as_micros(),
         lane_lock_wait.as_millis(),
         lane_lock_wait.as_micros(),
+        backend_checkout.as_millis(),
+        backend_checkout.as_micros(),
         process.as_millis(),
         process.as_micros(),
         repair_queue_record_count,
@@ -4744,7 +5032,6 @@ fn process_daemon_dfs_message_command_on_runtime(
         event_count,
         trace_started.elapsed().as_millis()
     ));
-    drop(service_lane);
     if let Err(error) = repair_queue_persistence {
         tracing::error!(
             target: "sinomo.dfs.fault_healing",
@@ -4793,6 +5080,12 @@ fn process_daemon_dfs_message_command_on_runtime(
         events: _,
     } = process_report.outcome?;
     if let Some(error) = deferred_work_error {
+        return Err(error);
+    }
+    if let Some(error) = exact_namespace_projection_reset_error {
+        return Err(error);
+    }
+    if let Some(error) = resident_backend_release_error {
         return Err(error);
     }
     Ok(Some(DaemonDfsMessageCommandProcessResult {
@@ -4960,10 +5253,25 @@ async fn handle_daemon_dfs_message_async(
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
+    let peer_snapshot_started = Instant::now();
+    let Some(peer_snapshot) = read_daemon_dfs_message_peer_snapshot(&cluster_paths)? else {
+        return Err(DaemonError::ClusterOrphan);
+    };
+    let peer_snapshot_elapsed = peer_snapshot_started.elapsed();
+    if command.routed_message.target_node_id != peer_snapshot.local_node_id {
+        return Err(DaemonError::Network {
+            address: "DFS message".to_string(),
+            detail: format!(
+                "dfs message target {} does not match local node {}",
+                command.routed_message.target_node_id, peer_snapshot.local_node_id
+            ),
+        });
+    }
     let content = if attachment.is_some() {
         Some(daemon_dfs_message_content_store(
             &data_dir,
             &cluster_paths,
+            &peer_snapshot,
             runtime,
         )?)
     } else {
@@ -4996,15 +5304,59 @@ async fn handle_daemon_dfs_message_async(
     );
     let process_data_dir = data_dir.clone();
     let process_cluster_paths = cluster_paths.clone();
+    let process_peer_snapshot = peer_snapshot.clone();
     let process_runtime = runtime.clone();
     let process_traceparent = traceparent.clone();
     let process_data_owner_lock = daemon_dfs_data_owner_lock(paths)?;
     let scheduler = daemon_dfs_mutation_scheduler(&data_dir)?;
+    let exact_service_lane_candidate = daemon_dfs_message_supports_exact_service_lane(&command)
+        && DaemonDfsMutationLaneKey::from_scope(&execution_scope).is_some();
+    let admission_scope = if daemon_dfs_message_uses_content_read_lane(&command) {
+        DfsMessageExecutionScope::ReadOnly
+    } else if exact_service_lane_candidate {
+        execution_scope.clone()
+    } else {
+        // Metadata-assisted reads, coordinator-bearing mutations, cache
+        // initialization, and topology rollover all borrow the one global
+        // resident generation. This prevents a second decoded backend and
+        // ensures an obsolete exact stamp reaches service-level validation.
+        DfsMessageExecutionScope::GlobalExclusive
+    };
     let admission_started = Instant::now();
-    // The mutation scheduler is the sole foreground/maintenance admission
-    // owner. Immutable reads use their separately locked service lane and do
-    // not queue behind metadata mutation or maintenance admission.
-    let admission = admit_daemon_dfs_foreground_message(&scheduler, &execution_scope).await?;
+    let mut admission = admit_daemon_dfs_foreground_message(&scheduler, &admission_scope).await?;
+    let mut exact_service_lane = if exact_service_lane_candidate && admission.is_exact() {
+        match DaemonDfsMutationLaneKey::from_scope(&execution_scope) {
+            Some(key) => daemon_dfs_message_cache_exact_admission_is_current(
+                &data_dir,
+                &cluster_paths,
+                &peer_snapshot,
+                &key,
+                runtime,
+            )?,
+            None => false,
+        }
+    } else {
+        false
+    };
+    if exact_service_lane_candidate && !exact_service_lane {
+        if !admission.is_global() {
+            drop(admission);
+            admission = admit_daemon_dfs_foreground_message(
+                &scheduler,
+                &DfsMessageExecutionScope::GlobalExclusive,
+            )
+            .await?;
+        }
+        // Global admission is needed to initialize or roll the resident
+        // backend generation after every prior exact owner drains. It does not
+        // require the replica command itself to run through the global service
+        // shell: once inside that fence, lane selection can open the proven
+        // exact shard (or fall back to global for structured stale-stamp
+        // validation). This keeps the first snapshot after daemon start from
+        // retaining a complete replica namespace in the global shell.
+        exact_service_lane = true;
+    }
+    let allow_generation_rollover = admission.is_global();
     let admission_wait = admission_started.elapsed();
     let process_execution_scope = execution_scope.clone();
     let spawn_started = Instant::now();
@@ -5021,9 +5373,13 @@ async fn handle_daemon_dfs_message_async(
             process_daemon_dfs_message_command_on_runtime(
                 &process_data_dir,
                 &process_cluster_paths,
+                &process_peer_snapshot,
                 command,
                 preingested_blob,
                 &process_execution_scope,
+                exact_service_lane,
+                allow_generation_rollover,
+                peer_snapshot_elapsed,
                 &process_runtime,
                 process_traceparent.clone(),
             )
@@ -5086,12 +5442,19 @@ fn handle_daemon_dfs_message_on_runtime(
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
     let execution_scope = dfs_message_execution_scope(&command);
+    let Some(peer_snapshot) = read_daemon_dfs_message_peer_snapshot(&cluster_paths)? else {
+        return Err(DaemonError::ClusterOrphan);
+    };
     let result = process_daemon_dfs_message_command_on_runtime(
         &data_dir,
         &cluster_paths,
+        &peer_snapshot,
         command,
         None,
         &execution_scope,
+        false,
+        true,
+        Duration::ZERO,
         runtime,
         None,
     )?;
@@ -5214,6 +5577,36 @@ impl DaemonDefaultDfsParkedHandoff {
             .filter(|(key, _)| self.wake_keys.iter().any(|owned| owned == key))
             .cloned()
             .collect()
+    }
+
+    /// Whether this exact parked generation needs the local retiring-primary
+    /// maintenance executor.
+    ///
+    /// Any voter may win the placement CAS which creates a handoff. The
+    /// writer-side notification therefore cannot prove that the retiring
+    /// primary's otherwise quiet maintenance loop was woken. The default DFS
+    /// reactor already owns the exact handoff projection on every node; use
+    /// that committed edge to transfer locally owned work to maintenance.
+    fn is_owned_by_retiring_primary(
+        &self,
+        local_node_id: &NodeId,
+        inputs: &[(String, Vec<u8>)],
+    ) -> bool {
+        let handoff_key = &self.wake_keys[1];
+        inputs
+            .iter()
+            .find(|(key, _)| key == handoff_key)
+            .and_then(|(_, value)| {
+                sinomo_core::kv::decode_kv_value::<DfsMetadataShardMembershipHandoff>(value).ok()
+            })
+            .is_some_and(|handoff| {
+                handoff.handoff_id == self.handoff_id
+                    && handoff.retiring_shard.file_system_id == self.file_system_id
+                    && handoff.retiring_shard.shard_id == self.shard_id.0
+                    && handoff.retiring_shard.epoch == self.retiring_epoch
+                    && handoff.desired_shard.epoch == self.desired_epoch
+                    && handoff.retiring_shard.primary_node_id == *local_node_id
+            })
     }
 }
 
@@ -5621,7 +6014,12 @@ impl DaemonDefaultDfsReconciliationReactor {
                     self.complete_default_reconciliation(&work);
                 }
                 DaemonDefaultDfsLifecycleOutcome::Parked(handoff) => {
+                    let notify_local_retiring_primary =
+                        handoff.is_owned_by_retiring_primary(expected_node_id, &work.inputs);
                     self.park_default_reconciliation(&work, handoff);
+                    if notify_local_retiring_primary {
+                        notify_daemon_dfs_maintenance_work();
+                    }
                     if let Some(error) = deferred_recovery_error {
                         return Err(error);
                     }
@@ -6777,6 +7175,7 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     } = retained_lane;
     let DaemonDfsMessageServiceLane {
         service: mut maintenance_service,
+        resident_metadata_scope,
         ..
     } = lane;
     let authority_generation_before_maintenance = metadata_authority_generation.generation();
@@ -6944,6 +7343,7 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
             lane: DaemonDfsMessageServiceLane {
                 service,
                 peer_node_ids,
+                resident_metadata_scope,
             },
             detached_send_runtime,
         };
@@ -13960,7 +14360,7 @@ mod tests {
             .expect("reopen replica backend")
             .get_object(&object.object_id)
             .expect("read replicated object"),
-            Some(object),
+            Some(object.clone()),
             "the replica journal batch must be durable before RPC cancellation"
         );
         rpc.abort();
@@ -13985,6 +14385,36 @@ mod tests {
                 .has_changed()
                 .expect("reconciliation wake channel remains open"),
             "a cancelled RPC must still emit the subscribed replica-progress generation"
+        );
+        let cache = daemon_dfs_message_service_cache()
+            .lock()
+            .expect("message service cache lock");
+        let entry = cache
+            .get(&data_dir.root())
+            .expect("cold message cache entry");
+        assert_eq!(
+            entry.exact_shard_services.len(),
+            1,
+            "the first exact replica command must initialize its shard lane inside global admission"
+        );
+        let exact_lane = entry
+            .exact_shard_services
+            .values()
+            .next()
+            .expect("exact replica lane")
+            .lock()
+            .expect("exact replica lane lock");
+        assert!(
+            exact_lane
+                .service
+                .metadata()
+                .object(&object.object_id)
+                .is_none(),
+            "the cold exact lane must retain replica objects only in its resident backend"
+        );
+        assert!(
+            entry.primary_service.is_none(),
+            "cold exact replica admission must not construct an unused global shell"
         );
     }
 
@@ -14316,7 +14746,7 @@ mod tests {
         assert_eq!(
             daemon_dfs_test_message_service_lane_open_count(&data_dir),
             1,
-            "a cold exact-shard mutation must reuse the one backend-bearing cache lane"
+            "a cold routed mutation must reuse the one backend-bearing cache lane"
         );
         for _ in 0..2 {
             let status = runtime
@@ -14343,33 +14773,29 @@ mod tests {
             runtime.handle(),
         )
         .expect("lightweight lookup DFS message");
-        let read_service = {
+        {
             let cache = daemon_dfs_message_service_cache()
                 .lock()
                 .expect("cache lock");
-            Arc::clone(
+            assert!(Arc::ptr_eq(
+                &primary_service,
                 cache
                     .get(&cache_key)
                     .expect("cache entry")
-                    .lightweight_read_service
+                    .primary_service
                     .as_ref()
-                    .expect("lightweight read lane"),
-            )
-        };
+                    .expect("resident metadata lane"),
+            ));
+        }
         let lane_open_count_before_maintenance =
             daemon_dfs_test_message_service_lane_open_count(&data_dir);
         let weak_primary = Arc::downgrade(&primary_service);
-        let weak_read = Arc::downgrade(&read_service);
         drop(primary_service);
         run_daemon_dfs_maintenance_body_for_test(&paths, &runtime)
             .expect("successful maintenance tick");
         assert!(
             weak_primary.upgrade().is_none(),
             "maintenance transfers ownership out of the old cache handle"
-        );
-        assert!(
-            weak_read.upgrade().is_some(),
-            "maintenance must preserve the independently locked lightweight read lane"
         );
         {
             let cache = daemon_dfs_message_service_cache()
@@ -14582,19 +15008,14 @@ mod tests {
                 .is_none(),
             "a rejected authority generation must leave the mutation lane empty"
         );
-        drop(read_service);
         assert!(
             evict_daemon_dfs_message_service_cache(&data_dir).expect("evict message cache"),
             "shutdown must release the complete message cache"
         );
-        assert!(
-            weak_read.upgrade().is_none(),
-            "shutdown must collect the lightweight read lane"
-        );
     }
 
     #[test]
-    fn daemon_dfs_lookup_message_reuses_service_without_full_hydrate() {
+    fn daemon_dfs_lookup_message_reuses_resident_service_without_full_hydrate() {
         let root = temp_root("daemon_dfs_message_warm_cache");
         let data_root = root.join("data");
         let paths = DaemonPaths::with_root(data_root.join("daemon"));
@@ -14624,15 +15045,11 @@ mod tests {
                 .lock()
                 .expect("cache lock");
             let entry = cache.get(&cache_key).expect("cache entry");
-            assert!(
-                entry.primary_service.is_none(),
-                "a cold lightweight lookup must not open the mutation lane"
-            );
             Arc::clone(
                 entry
-                    .lightweight_read_service
+                    .primary_service
                     .as_ref()
-                    .expect("lookup opens lightweight read lane"),
+                    .expect("lookup opens the resident metadata lane"),
             )
         };
         let response = handle_daemon_dfs_message_on_runtime(
@@ -14666,27 +15083,26 @@ mod tests {
                 .lock()
                 .expect("cache lock");
             let entry = cache.get(&cache_key).expect("cache entry");
-            assert!(entry.primary_service.is_none());
             Arc::clone(
                 entry
-                    .lightweight_read_service
+                    .primary_service
                     .as_ref()
-                    .expect("lightweight read lane"),
+                    .expect("resident metadata lane"),
             )
         };
         assert!(
             Arc::ptr_eq(&read_service, &second_read_service),
-            "endpoint-list refreshes should reuse the lightweight read lane"
+            "endpoint-list refreshes should reuse the resident metadata lane"
         );
         assert_eq!(
             daemon_dfs_test_message_service_lane_open_count(&SinomoDataDir::new(&data_root)),
             1,
-            "lightweight reads should open only their targeted lane"
+            "metadata reads should reuse one resident backend generation"
         );
     }
 
     #[test]
-    fn daemon_dfs_peer_membership_refresh_reuses_lightweight_lane() {
+    fn daemon_dfs_peer_membership_refresh_reuses_resident_lane() {
         let root = temp_root("daemon_dfs_message_peer_refresh");
         let data_root = root.join("data");
         let data_dir = SinomoDataDir::new(&data_root);
@@ -14715,9 +15131,9 @@ mod tests {
                 cache
                     .get(&cache_key)
                     .expect("cache entry")
-                    .lightweight_read_service
+                    .primary_service
                     .as_ref()
-                    .expect("lightweight read lane"),
+                    .expect("resident metadata lane"),
             )
         };
         let cluster_id =
@@ -14746,14 +15162,14 @@ mod tests {
                 .expect("cache lock");
             let entry = cache.get(&cache_key).expect("cache entry");
             let current = entry
-                .lightweight_read_service
+                .primary_service
                 .as_ref()
-                .expect("lightweight read lane");
+                .expect("resident metadata lane");
             assert!(
                 Arc::ptr_eq(&read_service, current),
-                "peer addition must not reopen the lightweight metadata backend"
+                "peer addition must not reopen the resident metadata backend"
             );
-            let lane = current.lock().expect("lightweight lane lock");
+            let lane = current.lock().expect("resident lane lock");
             assert!(lane.peer_node_ids.contains(&remote));
             assert!(lane.peer_node_ids.contains(&added));
         }
@@ -14765,6 +15181,320 @@ mod tests {
         assert!(
             evict_daemon_dfs_message_service_cache(&data_dir).expect("evict message cache"),
             "test cleanup must release the cached lane"
+        );
+    }
+
+    #[test]
+    fn daemon_dfs_resident_mutation_lanes_are_scoped_by_exact_shard() {
+        let root = temp_root("daemon_dfs_resident_exact_shard_lanes");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let local = NodeId::from_legacy_named("node_dfs_resident_lanes_local").expect("local node");
+        let remote =
+            NodeId::from_legacy_named("node_dfs_resident_lanes_remote").expect("remote node");
+        write_test_cluster_state_with_remote_endpoint(&data_root, &local, &remote, "127.0.0.1:9");
+
+        let file_system = distributed_sifs(local.clone());
+        let root_shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: vec![remote.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let services_shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "services".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: vec![remote],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/services".to_string(),
+            },
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    sinomo_core::kv::KvOp::put_serde(
+                        file_system_config_key(&file_system.file_system_id),
+                        &DfsFileSystemConfig::from(&file_system),
+                        None,
+                    )
+                    .expect("filesystem config"),
+                    sinomo_core::kv::KvOp::put_serde(
+                        metadata_shard_key(&file_system.file_system_id, "root"),
+                        &root_shard,
+                        None,
+                    )
+                    .expect("root shard config"),
+                    sinomo_core::kv::KvOp::put_serde(
+                        metadata_shard_key(&file_system.file_system_id, "services"),
+                        &services_shard,
+                        None,
+                    )
+                    .expect("services shard config"),
+                ],
+                failure: Vec::new(),
+            }),
+        )
+        .expect("write resident lane control plane");
+
+        let runtime = daemon_test_runtime("daemon-dfs-resident-exact-shard-lanes");
+        let peer_snapshot = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
+            .expect("read peer snapshot")
+            .expect("initialized cluster state");
+        let root_key = DaemonDfsMutationLaneKey {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new("root"),
+        };
+        let services_key = DaemonDfsMutationLaneKey {
+            file_system_id: file_system.file_system_id,
+            shard_id: DfsMetadataShardId::new("services"),
+        };
+        let select = |kind| {
+            let allow_generation_rollover =
+                matches!(&kind, DaemonDfsMessageLaneKind::MutationGlobal);
+            daemon_dfs_message_lane(
+                &data_dir,
+                &cluster_paths,
+                &peer_snapshot,
+                runtime.handle(),
+                kind,
+                allow_generation_rollover,
+            )
+            .map(|(lane, _)| lane)
+            .expect("select resident mutation lane")
+        };
+
+        let root_lane = select(DaemonDfsMessageLaneKind::MutationExact(root_key.clone()));
+        let same_root_lane = select(DaemonDfsMessageLaneKind::MutationExact(root_key.clone()));
+        let services_lane = select(DaemonDfsMessageLaneKind::MutationExact(services_key));
+        {
+            let cache = daemon_dfs_message_service_cache()
+                .lock()
+                .expect("message service cache lock");
+            let entry = cache.get(&data_dir.root()).expect("message cache entry");
+            assert!(
+                entry.primary_service.is_none(),
+                "exact-shard selection must not construct the all-shard service"
+            );
+        }
+        assert_eq!(
+            daemon_dfs_test_message_service_lane_open_count(&data_dir),
+            2,
+            "two exact shards must construct only their two request shells"
+        );
+        let global_lane = select(DaemonDfsMessageLaneKind::MutationGlobal);
+
+        assert!(
+            Arc::ptr_eq(&root_lane, &same_root_lane),
+            "repeated exact-shard selection must reuse one request-state mutex"
+        );
+        assert!(
+            !Arc::ptr_eq(&root_lane, &services_lane),
+            "disjoint exact shards must not share a request-state mutex"
+        );
+        assert!(
+            !Arc::ptr_eq(&root_lane, &global_lane) && !Arc::ptr_eq(&services_lane, &global_lane),
+            "global compatibility work must retain its own request-state mutex"
+        );
+
+        let root_guard = root_lane.lock().expect("root lane lock");
+        assert!(
+            same_root_lane.try_lock().is_err(),
+            "the reused same-shard lane must serialize concurrent request state"
+        );
+        let services_guard = services_lane
+            .try_lock()
+            .expect("a disjoint shard lane must remain independently lockable");
+        let global_guard = global_lane
+            .try_lock()
+            .expect("the global lane mutex must be distinct from exact-shard lanes");
+        assert!(matches!(
+            root_guard.resident_metadata_scope,
+            Some(DaemonDfsResidentMetadataScope::ExactShard(_))
+        ));
+        assert!(matches!(
+            services_guard.resident_metadata_scope,
+            Some(DaemonDfsResidentMetadataScope::ExactShard(_))
+        ));
+        assert!(matches!(
+            global_guard.resident_metadata_scope,
+            Some(DaemonDfsResidentMetadataScope::Global(_))
+        ));
+        drop((root_guard, services_guard, global_guard));
+
+        let cache = daemon_dfs_message_service_cache()
+            .lock()
+            .expect("message service cache lock");
+        let entry = cache.get(&data_dir.root()).expect("message cache entry");
+        assert_eq!(entry.exact_shard_services.len(), 2);
+        assert!(Arc::ptr_eq(
+            entry.primary_service.as_ref().expect("global lane"),
+            &global_lane,
+        ));
+        drop(cache);
+        assert_eq!(
+            daemon_dfs_test_message_service_lane_open_count(&data_dir),
+            3,
+            "two exact-shard lanes and one global lane must share one resident backend generation"
+        );
+        assert!(
+            daemon_dfs_message_cache_exact_admission_is_current(
+                &data_dir,
+                &cluster_paths,
+                &peer_snapshot,
+                &root_key,
+                runtime.handle(),
+            )
+            .expect("validate current exact admission"),
+            "a resident exact lane must be admitted only against its observed topology generation"
+        );
+
+        let changed_root_shard = DfsMetadataShardConfig {
+            epoch: root_shard.epoch.saturating_add(1),
+            ..root_shard
+        };
+        append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
+                    metadata_shard_key(
+                        &changed_root_shard.file_system_id,
+                        &changed_root_shard.shard_id,
+                    ),
+                    &changed_root_shard,
+                    None,
+                )
+                .expect("updated root shard config"),
+            ),
+        )
+        .expect("commit updated root shard authority");
+        assert!(
+            !daemon_dfs_message_cache_exact_admission_is_current(
+                &data_dir,
+                &cluster_paths,
+                &peer_snapshot,
+                &root_key,
+                runtime.handle(),
+            )
+            .expect("reject stale exact admission"),
+            "an authority edge must fail closed until global admission replaces the resident generation"
+        );
+        assert!(
+            evict_daemon_dfs_message_service_cache(&data_dir).expect("evict message cache"),
+            "test cleanup must release resident lanes"
+        );
+    }
+
+    #[test]
+    fn daemon_dfs_exact_service_lane_requires_complete_single_shard_state() {
+        let source = NodeId::from_legacy_named("node_dfs_exact_scope_source").expect("source");
+        let target = NodeId::from_legacy_named("node_dfs_exact_scope_target").expect("target");
+        let file_system_id = sinomo_dfs::sifs_file_system_id();
+        let shard = |shard_id: &str, assignment| DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: shard_id.to_string(),
+            primary_node_id: target.clone(),
+            replica_node_ids: vec![source.clone()],
+            epoch: 1,
+            assignment,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let services = shard(
+            "services",
+            DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/services".to_string(),
+            },
+        );
+        let root = shard("root", DfsMetadataShardAssignment::Root);
+        let namespace_command = |operation, authority_shards| {
+            test_dfs_message_command(
+                "dfs-exact-scope",
+                DfsRoutedMessage {
+                    source_node_id: source.clone(),
+                    target_node_id: target.clone(),
+                    frame_id: 1,
+                    message_id: 1,
+                    message: DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                        request_id: "dfs-exact-scope-namespace".to_string(),
+                        file_system_id: file_system_id.clone(),
+                        requesting_node_id: source.clone(),
+                        include_metadata_journal_batches: false,
+                        metadata_journal_after_sequences: Vec::new(),
+                        authority_shards,
+                        operation,
+                    }),
+                },
+            )
+        };
+
+        let single = namespace_command(
+            DfsNamespaceOperation::Mkdir {
+                path: "/services/exact".to_string(),
+            },
+            vec![services.clone()],
+        );
+        assert!(daemon_dfs_message_supports_exact_service_lane(&single));
+        assert!(matches!(
+            dfs_message_execution_scope(&single),
+            DfsMessageExecutionScope::ExactShard { .. }
+        ));
+
+        let read_only = namespace_command(
+            DfsNamespaceOperation::LookupPath {
+                path: "/services/exact".to_string(),
+            },
+            vec![services.clone()],
+        );
+        assert!(
+            !daemon_dfs_message_supports_exact_service_lane(&read_only),
+            "read-only lookups retain their non-mutating lane"
+        );
+
+        let cross_shard = namespace_command(
+            DfsNamespaceOperation::Rename {
+                from: "/services/exact".to_string(),
+                to: "/users/exact".to_string(),
+            },
+            vec![services, root],
+        );
+        assert!(
+            !daemon_dfs_message_supports_exact_service_lane(&cross_shard),
+            "multi-shard namespace state must stay globally owned"
+        );
+
+        let mut distributed_write =
+            test_dfs_write_routed_message(&source, &target, 2, "/services/exact-write.txt");
+        let DfsNetworkMessage::DistributedWriteRequest(write) = &mut distributed_write.message
+        else {
+            unreachable!("test helper builds a distributed write")
+        };
+        write.authority_shard = Some(shard(
+            "services",
+            DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/services".to_string(),
+            },
+        ));
+        let distributed_write = test_dfs_message_command("dfs-exact-write", distributed_write);
+        assert!(matches!(
+            dfs_message_execution_scope(&distributed_write),
+            DfsMessageExecutionScope::ExactShard { .. }
+        ));
+        assert!(
+            !daemon_dfs_message_supports_exact_service_lane(&distributed_write),
+            "distributed-write coordinator and repair state is not shard-owned yet"
         );
     }
 
@@ -14795,8 +15525,10 @@ mod tests {
             .expect("cache lock");
         let entry = cache.get(&data_dir.root()).expect("cache entry");
         assert!(entry.content_read_service.is_some());
-        assert!(entry.lightweight_read_service.is_none());
         assert!(entry.primary_service.is_none());
+        assert!(entry.exact_shard_services.is_empty());
+        assert!(entry.resident_metadata_backend.is_none());
+        assert!(!entry.resident_metadata_initialized);
         drop(cache);
         assert_eq!(
             daemon_dfs_test_message_service_lane_open_count(&data_dir),
@@ -15648,6 +16380,11 @@ mod tests {
             retiring.epoch,
             desired.epoch,
         );
+        assert!(parked.is_owned_by_retiring_primary(&local, &work.inputs));
+        assert!(
+            !parked.is_owned_by_retiring_primary(&replica, &work.inputs),
+            "only the exact retiring primary should receive the maintenance wake"
+        );
         reactor.park_default_reconciliation(&work, parked);
         assert_eq!(
             reactor.pending_work(),
@@ -16220,9 +16957,9 @@ mod tests {
                 cache
                     .get(&cache_key)
                     .expect("cache entry")
-                    .lightweight_read_service
+                    .primary_service
                     .as_ref()
-                    .expect("lightweight read lane"),
+                    .expect("resident metadata lane"),
             )
         };
         let first_lane_weak = Arc::downgrade(&first_lane);
@@ -16254,9 +16991,9 @@ mod tests {
                 cache
                     .get(&cache_key)
                     .expect("cache entry")
-                    .lightweight_read_service
+                    .primary_service
                     .as_ref()
-                    .expect("lightweight read lane"),
+                    .expect("resident metadata lane"),
             )
         };
         assert!(Arc::ptr_eq(&first_lane, &unchanged_lane));
@@ -16312,9 +17049,9 @@ mod tests {
                 cache
                     .get(&cache_key)
                     .expect("cache entry")
-                    .lightweight_read_service
+                    .primary_service
                     .as_ref()
-                    .expect("lightweight read lane"),
+                    .expect("resident metadata lane"),
             )
         };
         assert!(!Arc::ptr_eq(&first_lane, &rebuilt_lane));
