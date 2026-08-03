@@ -21,7 +21,7 @@ use crate::control_plane::{DfsMetadataNamespacePrepareCodec, DfsMetadataShardCon
 use crate::metadata_api::{
     DfsMetadataBackend, DfsMetadataReplicaApplyReport, DfsMetadataReplicaIngestPermit,
     DfsMetadataShardWriteFreeze, DfsNamespaceRequestAdmissionSnapshot,
-    DfsNormalizedNamespacePrepare, DfsValidatedNamespaceAuthorityProof,
+    DfsNormalizedNamespacePrepare, DfsObjectLocationUpdate, DfsValidatedNamespaceAuthorityProof,
     namespace_prepare_expectations_from_lookups,
 };
 use crate::metadata_cursor;
@@ -2622,13 +2622,10 @@ impl LocalSobjMetadataBackend {
             &mut self.table_snapshot_fingerprint,
             &mut self.prefix_proof,
         )?;
+        self.release_obsolete_read_snapshot_cache_after_refresh();
         let storage_generation_after = metadata_table_storage_generation(&self.root)?;
         self.table_storage_generation = (storage_generation_before == storage_generation_after)
             .then_some(storage_generation_after);
-        *self
-            .read_snapshot_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         require_version_pin_table_invariants(&self.tables)?;
         self.next_sequence = read_next_journal_sequence_lenient(&self.root)?
             .max(self.materialized_through_sequence.saturating_add(1))
@@ -6067,11 +6064,26 @@ impl LocalSobjMetadataBackend {
         self.materialized_through_sequence = state.materialized_through_sequence.unwrap_or(0);
         self.prefix_proof = state.prefix_proof;
         self.table_snapshot_fingerprint = state.snapshot_fingerprint;
+        self.release_obsolete_read_snapshot_cache_after_refresh();
         self.table_storage_generation = Some(metadata_table_storage_generation(&self.root)?);
-        if let Ok(mut cache) = self.read_snapshot_cache.lock() {
-            *cache = None;
-        }
         Ok(())
+    }
+
+    fn release_obsolete_read_snapshot_cache(&self) -> bool {
+        self.read_snapshot_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .is_some()
+    }
+
+    fn release_obsolete_read_snapshot_cache_after_refresh(&self) {
+        if self.release_obsolete_read_snapshot_cache() {
+            metadata_backend_perf_trace(format_args!(
+                "metadata-read-snapshot-cache-released shard={} materialized_sequence={}",
+                self.shard_id.0, self.materialized_through_sequence,
+            ));
+        }
     }
 
     fn refresh_after_metadata_write_lock(&mut self) -> Result<()> {
@@ -6086,6 +6098,7 @@ impl LocalSobjMetadataBackend {
         let durable_next_sequence = self.next_sequence.max(1);
         let previous_materialized_sequence = self.materialized_through_sequence;
         self.refresh_metadata_tables()?;
+        self.release_obsolete_read_snapshot_cache_after_refresh();
         let durable_next_sequence = durable_next_sequence
             .max(self.materialized_through_sequence.saturating_add(1))
             .max(1);
@@ -7072,7 +7085,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         expected_version: &DfsVersion,
         expected_content_hash: &str,
         replica_node_id: &NodeId,
-    ) -> Result<Option<DfsObjectMetadata>> {
+    ) -> Result<Option<DfsObjectLocationUpdate>> {
         let _lock = self.begin_metadata_write()?;
         let Some(mut object) = self.get_object(object_id)? else {
             return Ok(None);
@@ -7098,7 +7111,10 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         if self.get_object(object_id)?.as_ref() == Some(&object)
             && existing_version.as_ref() == Some(&version)
         {
-            return Ok(Some(object));
+            return Ok(Some(DfsObjectLocationUpdate {
+                object,
+                journal_appended: false,
+            }));
         }
 
         let transaction = normalized_namespace_transaction(&DfsNamespaceTransaction {
@@ -7125,7 +7141,10 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             },
             table_ops,
         )?;
-        Ok(Some(object))
+        Ok(Some(DfsObjectLocationUpdate {
+            object,
+            journal_appended: true,
+        }))
     }
 
     fn put_objects(
@@ -19980,8 +19999,9 @@ mod tests {
             LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("writer backend");
         writer.put_file_system(&file_system()).expect("filesystem");
-        let reader = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
-            .expect("reader backend");
+        let mut reader =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("reader backend");
 
         let mut first = object(version("version_1"));
         first.object_id =
@@ -20005,7 +20025,7 @@ mod tests {
         writer.put_object(&second).expect("second object");
         assert_eq!(
             reader.get_object(&second.object_id).expect("second read"),
-            Some(second)
+            Some(second.clone())
         );
         let (second_tables, second_offset) = {
             let cache = reader.read_snapshot_cache.lock().expect("snapshot cache");
@@ -20018,6 +20038,33 @@ mod tests {
             "sequential external reads should reuse the cached table allocation"
         );
         assert!(second_offset > first_offset);
+        assert_eq!(
+            reader
+                .materialize_pending_replica_journal()
+                .expect("refresh live tables"),
+            2,
+            "the retained reader should catch up both external object batches"
+        );
+        assert!(
+            reader
+                .read_snapshot_cache
+                .lock()
+                .expect("snapshot cache")
+                .is_none(),
+            "catching the live table image up must release the obsolete full snapshot"
+        );
+        assert_eq!(
+            reader.get_object(&second.object_id).expect("live read"),
+            Some(second)
+        );
+        assert!(
+            reader
+                .read_snapshot_cache
+                .lock()
+                .expect("snapshot cache")
+                .is_none(),
+            "a caught-up handle should borrow its live tables instead of rebuilding the cache"
+        );
 
         cleanup(&root);
     }

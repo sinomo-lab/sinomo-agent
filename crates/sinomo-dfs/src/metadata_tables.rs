@@ -6,7 +6,8 @@
 
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::Hash;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -1682,35 +1683,41 @@ impl DfsMetadataTables {
 
 #[derive(Debug, Default)]
 pub(crate) struct DfsMetadataTableRollback {
-    file_systems: BTreeMap<DfsFileSystemId, Option<DfsFileSystem>>,
-    objects: BTreeMap<DfsObjectId, Option<DfsObjectMetadata>>,
-    file_system_objects: BTreeMap<(DfsFileSystemId, DfsObjectId), Option<DfsPathRecord>>,
-    paths: BTreeMap<(DfsFileSystemId, String), Option<DfsPathRecord>>,
-    inodes: BTreeMap<DfsInodeId, Option<DfsInodeRecord>>,
-    dirfrags: BTreeMap<(DfsInodeId, DfsDirFragmentId), Option<DfsDirFragmentRecord>>,
-    dentries: BTreeMap<(DfsInodeId, DfsDirFragmentId, u64, String), Option<DfsPathRecord>>,
-    hardlinks: BTreeMap<(DfsObjectId, DfsObjectId), Option<DfsPathRecord>>,
-    compacted_tombstones: BTreeMap<DfsObjectId, Option<DfsObjectMetadata>>,
-    compacted_tombstone_paths: BTreeMap<(DfsFileSystemId, String), Option<DfsObjectId>>,
-    versions: BTreeMap<(DfsObjectId, DfsVersion), Option<DfsObjectVersionRecord>>,
-    version_pins: BTreeMap<(DfsObjectId, DfsVersion, String), Option<DfsMetadataVersionPinRecord>>,
+    // Rollback state is a membership lookup, never an ordered scan. Hash maps
+    // keep a bulk transaction's short-lived undo keys in a few contiguous
+    // allocations instead of interleaving thousands of B-tree nodes with the
+    // live metadata B-trees. That distinction matters after large replica
+    // prepares: dropping the undo log can then return whole allocator spans
+    // instead of leaving the resident tables spread across half-empty arenas.
+    file_systems: HashMap<DfsFileSystemId, Option<DfsFileSystem>>,
+    objects: HashMap<DfsObjectId, Option<DfsObjectMetadata>>,
+    file_system_objects: HashMap<(DfsFileSystemId, DfsObjectId), Option<DfsPathRecord>>,
+    paths: HashMap<(DfsFileSystemId, String), Option<DfsPathRecord>>,
+    inodes: HashMap<DfsInodeId, Option<DfsInodeRecord>>,
+    dirfrags: HashMap<(DfsInodeId, DfsDirFragmentId), Option<DfsDirFragmentRecord>>,
+    dentries: HashMap<(DfsInodeId, DfsDirFragmentId, u64, String), Option<DfsPathRecord>>,
+    hardlinks: HashMap<(DfsObjectId, DfsObjectId), Option<DfsPathRecord>>,
+    compacted_tombstones: HashMap<DfsObjectId, Option<DfsObjectMetadata>>,
+    compacted_tombstone_paths: HashMap<(DfsFileSystemId, String), Option<DfsObjectId>>,
+    versions: HashMap<(DfsObjectId, DfsVersion), Option<DfsObjectVersionRecord>>,
+    version_pins: HashMap<(DfsObjectId, DfsVersion, String), Option<DfsMetadataVersionPinRecord>>,
     cross_shard_pin_transfers:
-        BTreeMap<(DfsObjectId, String), Option<DfsCrossShardPinTransferRecord>>,
-    receipts: BTreeMap<(DfsObjectId, DfsVersion, NodeId), Option<DfsReplicaReceiptRecord>>,
-    intents: BTreeMap<(DfsObjectId, String), Option<DfsWriteIntentRecord>>,
-    intent_receipts: BTreeMap<(DfsObjectId, String), Option<DfsWriteIntentReceipt>>,
+        HashMap<(DfsObjectId, String), Option<DfsCrossShardPinTransferRecord>>,
+    receipts: HashMap<(DfsObjectId, DfsVersion, NodeId), Option<DfsReplicaReceiptRecord>>,
+    intents: HashMap<(DfsObjectId, String), Option<DfsWriteIntentRecord>>,
+    intent_receipts: HashMap<(DfsObjectId, String), Option<DfsWriteIntentReceipt>>,
     intent_receipt_retention: Option<DfsWriteIntentReceiptRetentionState>,
-    conflicts: BTreeMap<(DfsObjectId, String), Option<DfsConflictRecord>>,
-    advisory_lock_states: BTreeMap<DfsObjectId, Option<DfsAdvisoryLockStateRecord>>,
-    visible_commits: BTreeMap<(DfsObjectId, DfsVersion), Option<DfsVisibleVersionCommitRecord>>,
-    namespace_transactions: BTreeMap<String, Option<DfsNamespaceTransaction>>,
-    namespace_transaction_receipts: BTreeMap<String, Option<DfsNamespaceTransactionReceipt>>,
-    namespace_prepares: BTreeMap<String, Option<DfsNamespacePrepareRecord>>,
-    namespace_prepare_receipts: BTreeMap<String, Option<DfsNamespacePrepareReceipt>>,
-    namespace_jobs: BTreeMap<String, Option<DfsNamespaceJobRecord>>,
-    namespace_job_receipts: BTreeMap<String, Option<DfsNamespaceJobReceipt>>,
-    namespace_requests: BTreeMap<(NodeId, String), Option<DfsNamespaceRequestRecord>>,
-    namespace_request_receipts: BTreeMap<(NodeId, String), Option<DfsNamespaceRequestReceipt>>,
+    conflicts: HashMap<(DfsObjectId, String), Option<DfsConflictRecord>>,
+    advisory_lock_states: HashMap<DfsObjectId, Option<DfsAdvisoryLockStateRecord>>,
+    visible_commits: HashMap<(DfsObjectId, DfsVersion), Option<DfsVisibleVersionCommitRecord>>,
+    namespace_transactions: HashMap<String, Option<DfsNamespaceTransaction>>,
+    namespace_transaction_receipts: HashMap<String, Option<DfsNamespaceTransactionReceipt>>,
+    namespace_prepares: HashMap<String, Option<DfsNamespacePrepareRecord>>,
+    namespace_prepare_receipts: HashMap<String, Option<DfsNamespacePrepareReceipt>>,
+    namespace_jobs: HashMap<String, Option<DfsNamespaceJobRecord>>,
+    namespace_job_receipts: HashMap<String, Option<DfsNamespaceJobReceipt>>,
+    namespace_requests: HashMap<(NodeId, String), Option<DfsNamespaceRequestRecord>>,
+    namespace_request_receipts: HashMap<(NodeId, String), Option<DfsNamespaceRequestReceipt>>,
     namespace_receipt_retention: Option<DfsNamespaceReceiptRetentionState>,
 }
 
@@ -2236,16 +2243,14 @@ impl DfsMetadataTableRollback {
     }
 }
 
-fn record_rollback_value<K, V>(
-    rollback: &mut BTreeMap<K, Option<V>>,
-    table: &BTreeMap<K, V>,
-    key: K,
-) where
-    K: Clone + Ord,
+fn record_rollback_value<K, V>(rollback: &mut HashMap<K, Option<V>>, table: &BTreeMap<K, V>, key: K)
+where
+    K: Eq + Hash + Ord,
     V: Clone,
 {
-    if !rollback.contains_key(&key) {
-        rollback.insert(key.clone(), table.get(&key).cloned());
+    if let std::collections::hash_map::Entry::Vacant(entry) = rollback.entry(key) {
+        let previous = table.get(entry.key()).cloned();
+        entry.insert(previous);
     }
 }
 
@@ -2296,7 +2301,7 @@ fn record_compacted_tombstone_path_rollback(
     }
 }
 
-fn rollback_map<K, V>(table: &mut BTreeMap<K, V>, rollback: BTreeMap<K, Option<V>>)
+fn rollback_map<K, V>(table: &mut BTreeMap<K, V>, rollback: HashMap<K, Option<V>>)
 where
     K: Ord,
 {
@@ -2306,5 +2311,25 @@ where
         } else {
             table.remove(&key);
         }
+    }
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use super::*;
+
+    #[test]
+    fn rollback_records_only_the_value_before_a_keys_first_mutation() {
+        let key = "same-key".to_string();
+        let mut table = BTreeMap::from([(key.clone(), 1_u64)]);
+        let mut rollback = HashMap::new();
+
+        record_rollback_value(&mut rollback, &table, key.clone());
+        table.insert(key.clone(), 2);
+        record_rollback_value(&mut rollback, &table, key.clone());
+        table.insert(key.clone(), 3);
+
+        rollback_map(&mut table, rollback);
+        assert_eq!(table.get(&key), Some(&1));
     }
 }

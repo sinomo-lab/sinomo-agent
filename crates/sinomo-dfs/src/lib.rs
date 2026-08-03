@@ -103,6 +103,16 @@ mod service_write;
 mod smoke;
 mod transfer;
 
+/// Return unused allocator pages after a bounded metadata expansion has
+/// released all shard leases and temporary replay bodies.
+///
+/// This is public only for the daemon integration crate; ordinary DFS callers
+/// should not need allocator-specific lifecycle hooks.
+#[doc(hidden)]
+pub fn release_unused_metadata_allocator_pages() -> bool {
+    metadata_table_apply::release_metadata_allocator_pages()
+}
+
 pub use advisory_lock::{
     DFS_ADVISORY_LOCK_REQUEST_OUTCOME_LIMIT, DfsAdvisoryLockApplyResult, DfsAdvisoryLockCommand,
     DfsAdvisoryLockConflict, DfsAdvisoryLockGrant, DfsAdvisoryLockMode, DfsAdvisoryLockOutcome,
@@ -178,6 +188,7 @@ pub use default_cluster::{
     default_cluster_sifs, default_cluster_sifs_owner, default_cluster_sifs_subtree_policies,
     default_metadata_shard_primary_node_id, default_metadata_shard_replica_node_ids,
     dfs_service_members, ensure_default_cluster_dfs, ensure_default_cluster_dfs_async,
+    ensure_default_cluster_dfs_async_with_resident_metadata,
     ensure_default_distributed_dfs_with_async_host, ensure_default_distributed_dfs_with_host,
     invalidate_default_cluster_dfs_materialization_for_replica_progress,
     metadata_shard_layout_matches, metadata_shard_primary_transfer_ready_from_local_backend,
@@ -230,10 +241,10 @@ pub use local_state::{
     cluster_dfs_metadata_shards, default_dfs_metadata_root, default_dfs_metadata_shards_root,
     default_dfs_pin_root, dfs_import_metadata_root, dfs_import_namespace_root, dfs_import_root,
     evict_cluster_aware_dfs_metadata_inspection_cache, inspect_cluster_aware_dfs,
-    inspect_cluster_aware_dfs_status, inspect_dfs_conflicts, inspect_dfs_file_system,
-    inspect_dfs_object, inspect_dfs_path, inspect_dfs_repairs, inspect_dfs_status,
-    inspect_dfs_status_from_metadata, list_local_dfs_pins, local_dfs_metadata_shard_path,
-    open_cluster_aware_dfs_metadata_backend,
+    inspect_cluster_aware_dfs_from_metadata, inspect_cluster_aware_dfs_status,
+    inspect_dfs_conflicts, inspect_dfs_file_system, inspect_dfs_object, inspect_dfs_path,
+    inspect_dfs_repairs, inspect_dfs_status, inspect_dfs_status_from_metadata, list_local_dfs_pins,
+    local_dfs_metadata_shard_path, open_cluster_aware_dfs_metadata_backend,
     open_cluster_aware_dfs_metadata_backend_for_inspection,
     open_cluster_sharded_dfs_metadata_backend, open_local_metadata_shard_backend,
     open_local_sharded_metadata_backend, open_local_sharded_metadata_backend_for_replica_repair,
@@ -298,7 +309,7 @@ pub(crate) use message_transport::{
 pub use metadata_api::{
     DfsMetadataBackend, DfsMetadataReplicaApplyReport, DfsMetadataReplicaIngestPermit,
     DfsMetadataShardWriteFreeze, DfsNamespaceRequestAdmissionSnapshot,
-    DfsNormalizedNamespacePrepare,
+    DfsNormalizedNamespacePrepare, DfsObjectLocationUpdate,
 };
 pub use metadata_backend::LocalSobjMetadataBackend;
 pub use metadata_error::MetadataBackendError;
@@ -360,6 +371,7 @@ pub use metadata_replication::{
     dfs_metadata_replication_report_needs_retry, dfs_metadata_replication_sent_count,
     execute_prepared_cluster_dfs_metadata_publish_with_async_peer_transport,
     materialize_default_sifs_metadata, materialize_default_sifs_metadata_on_shards,
+    prepare_cluster_dfs_metadata_shard_publish_with_backend_and_execution_exclusions,
     prepare_cluster_dfs_metadata_shard_publish_with_execution_exclusions,
     process_cluster_dfs_metadata_journal_batch, process_cluster_dfs_metadata_snapshot_install,
     process_dfs_metadata_journal_batch, process_dfs_metadata_snapshot_install,

@@ -469,6 +469,54 @@ struct SendFailure {
     wrote_any: bool,
 }
 
+/// Owns the independently scheduled request writer until it is either joined
+/// or deliberately transferred to a detached streaming-response waiter.
+///
+/// Tokio detaches a task when its bare `JoinHandle` is dropped. Object-RPC
+/// callers, however, are routinely cancelled by an enclosing deadline. In
+/// that case detaching the writer would retain its prepared request body (and
+/// potentially a complete encoded DFS prepare) until transport progress or
+/// connection teardown happened independently.
+struct OwnedRequestSendTask {
+    task: Option<tokio::task::JoinHandle<Result<(), SendFailure>>>,
+}
+
+impl OwnedRequestSendTask {
+    fn new(task: tokio::task::JoinHandle<Result<(), SendFailure>>) -> Self {
+        Self { task: Some(task) }
+    }
+
+    fn abort(&self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+
+    async fn join(&mut self) -> Result<Result<(), SendFailure>, tokio::task::JoinError> {
+        let result = self
+            .task
+            .as_mut()
+            .expect("owned request send task is joined once")
+            .await;
+        self.task.take();
+        result
+    }
+
+    fn detach_to_streaming_response(mut self) {
+        tokio::spawn(async move {
+            let _ = self.join().await;
+        });
+    }
+}
+
+impl Drop for OwnedRequestSendTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 fn serialization_error(detail: impl Into<String>) -> NetworkError {
     NetworkError::Serialization {
         detail: detail.into(),
@@ -1941,16 +1989,16 @@ where
                 Err(error) => return RpcDeliveryOutcome::PossiblyApplied { error },
             }
         } else {
-            let mut task = tokio::spawn(send_request(
+            let mut task = OwnedRequestSendTask::new(tokio::spawn(send_request(
                 writer,
                 request_id.clone(),
                 head_payload,
                 body,
                 options,
                 timeline_trace,
-            ));
+            )));
             let (frame, last_nonce, completed) = tokio::select! {
-                send_result = &mut task => {
+                send_result = task.join() => {
                     match send_result {
                         Ok(Ok(())) => match read_response_head_with_progress(
                             &mut reader,
@@ -1980,7 +2028,7 @@ where
                     match response {
                         Ok((frame, last_nonce)) => (frame, last_nonce, false),
                         Err(error) => {
-                            let send_result = task.await;
+                            let send_result = task.join().await;
                             return match send_result {
                                 Ok(Err(failure)) if !failure.wrote_any => {
                                     RpcDeliveryOutcome::NotSent { error: failure.error }
@@ -2056,11 +2104,10 @@ where
             // reader and drives it directly. Only an independently running
             // request producer still needs to be detached here.
             if !request_send_completed {
-                tokio::spawn(async move {
-                    let _ = send_task
-                        .expect("an incomplete object RPC request has a writer task")
-                        .await;
-                });
+                send_task
+                    .take()
+                    .expect("an incomplete object RPC request has a writer task")
+                    .detach_to_streaming_response();
             }
             drop(receive_completion);
             return RpcDeliveryOutcome::Completed(value);
@@ -2072,11 +2119,10 @@ where
         Err(error) => return RpcDeliveryOutcome::PossiblyApplied { error },
     };
     if !request_send_completed {
-        match send_task
+        let mut send_task = send_task
             .take()
-            .expect("an incomplete object RPC request has a writer task")
-            .await
-        {
+            .expect("an incomplete object RPC request has a writer task");
+        match send_task.join().await {
             Ok(Ok(())) => {}
             Ok(Err(failure)) => {
                 return RpcDeliveryOutcome::PossiblyApplied {
@@ -2486,6 +2532,16 @@ mod tests {
     use std::io::Cursor;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
+
+    struct LifetimeDropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for LifetimeDropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
 
     struct TestChunkReader {
         receiver: tokio::sync::mpsc::Receiver<Option<ChunkLease>>,
@@ -3642,6 +3698,55 @@ mod tests {
         assert!(
             validate_incoming_finish(&request_id, 4, &BodyDescriptor::Deferred, &finish,).is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_call_aborts_request_writer_and_releases_prepared_body() {
+        let (client, mut blocked_server) = tokio::io::duplex(64);
+        let (client_context, _) = peer_contexts();
+        let (body_dropped_sender, body_dropped_receiver) = tokio::sync::oneshot::channel();
+        let source =
+            ObjectRpcBodySource::bytes(vec![0x5a; OBJECT_RPC_STREAM_INLINE_BODY_BYTES + 1])
+                .with_lifetime_guard(LifetimeDropSignal(Some(body_dropped_sender)))
+                .expect("attach prepared body lifetime signal");
+        let call = ObjectRpcStreamCall::new(
+            "test.cancelled-request-writer",
+            ObjectRpcStreamBody::source(source),
+        );
+        let call_task = tokio::spawn(async move {
+            call_object_rpc_stream(
+                client,
+                &client_context,
+                call,
+                ObjectFrameIoOptions { idle_timeout: None },
+                |_response| async { Ok(()) },
+            )
+            .await
+        });
+
+        // Seeing the first head byte proves the independently spawned writer
+        // owns the prepared body. The tiny unread duplex then keeps that
+        // writer blocked after its bare JoinHandle would otherwise detach.
+        let mut first_head_byte = [0_u8; 1];
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            blocked_server.read_exact(&mut first_head_byte),
+        )
+        .await
+        .expect("request writer did not start")
+        .expect("read request head byte");
+
+        call_task.abort();
+        assert!(
+            call_task
+                .await
+                .expect_err("cancelled object RPC call must not complete")
+                .is_cancelled()
+        );
+        tokio::time::timeout(Duration::from_secs(1), body_dropped_receiver)
+            .await
+            .expect("cancelled request writer retained its prepared body")
+            .expect("prepared body lifetime signal closed without firing");
     }
 
     #[tokio::test]

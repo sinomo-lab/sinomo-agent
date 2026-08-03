@@ -279,11 +279,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut ready_drains = 0;
         loop {
             if Instant::now() >= settle_deadline {
+                self.compact_pending_routed_write(&intent_id);
                 return Ok(outcome);
             }
-            self.check_cancelled("write settle")?;
-            let mut events = self.process_incoming()?;
-            outcome = self.write_outcome(&intent_id)?;
+            if let Err(error) = self.check_cancelled("write settle") {
+                self.compact_pending_routed_write(&intent_id);
+                return Err(error);
+            }
+            let mut events = match self.process_incoming() {
+                Ok(events) => events,
+                Err(error) => {
+                    self.compact_pending_routed_write(&intent_id);
+                    return Err(error);
+                }
+            };
+            outcome = match self.take_write_outcome(&intent_id) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.abandon_pending_routed_write(&intent_id);
+                    return Err(error);
+                }
+            };
             if let NetworkedDfsWriteOutcome::Pending {
                 intent_id: next_intent_id,
                 ..
@@ -335,13 +351,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if events.is_empty() || ready_drains >= POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT {
                 let now = Instant::now();
                 if now >= settle_deadline {
+                    self.compact_pending_routed_write(&intent_id);
                     return Ok(outcome);
                 }
                 let wait = POSIX_WAIT_FOR_COMMIT_IDLE_SLEEP
                     .min(settle_deadline.saturating_duration_since(now));
-                self.transport
-                    .wait_for_incoming(wait)
-                    .map_err(DfsError::from_network)?;
+                if let Err(error) = self.transport.wait_for_incoming(wait) {
+                    self.compact_pending_routed_write(&intent_id);
+                    return Err(DfsError::from_network(error));
+                }
                 ready_drains = 0;
             } else {
                 ready_drains += 1;

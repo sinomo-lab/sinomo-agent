@@ -139,7 +139,7 @@ pub struct DfsMetadataShardMigrationReport {
     pub reached_limit: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub struct DfsInodeId(pub String);
 
 impl DfsInodeId {
@@ -148,7 +148,7 @@ impl DfsInodeId {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub struct DfsDirFragmentId(pub String);
 
 impl DfsDirFragmentId {

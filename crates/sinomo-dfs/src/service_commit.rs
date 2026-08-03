@@ -538,12 +538,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(pending) = self.pending_writes.get(intent_id).cloned() else {
             return Ok(());
         };
-        self.mark_repaired_location(
-            &pending.object_id,
-            &pending.version,
-            replica_node_id,
-            &pending.content_hash,
-        )?;
         if replica_node_id == &self.node_id || replica_node_id == &intent.requesting_node_id {
             return Ok(());
         }
@@ -886,7 +880,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         version: &DfsVersion,
         replica_node_id: &NodeId,
         content_hash: &str,
-    ) -> Result<(), DfsError> {
+    ) -> Result<bool, DfsError> {
         if self.metadata_backend.is_some() {
             let durable_object = self
                 .metadata_backend
@@ -898,11 +892,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 // before the destination journal is materialized. Never fall
                 // back to the stale in-memory source path for a durable
                 // metadata mutation in that window.
-                return Ok(());
+                return Ok(false);
             };
             if durable_object.kind == DfsObjectKind::Tombstone || &durable_object.version != version
             {
-                return Ok(());
+                return Ok(false);
             }
             if let Some(expected_hash) = durable_object.content_hash.as_deref()
                 && expected_hash != content_hash
@@ -922,15 +916,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     content_hash,
                     replica_node_id,
                 )?;
-            if let Some(updated) = updated {
-                self.apply_metadata_object_to_service_state(updated)?;
+            if let Some(update) = updated {
+                self.apply_metadata_object_to_service_state(update.object)?;
+                return Ok(update.journal_appended);
             }
-            return Ok(());
+            return Ok(false);
         }
 
         let mut object = self.current_read_object_metadata(object_id)?;
         if &object.version != version {
-            return Ok(());
+            return Ok(false);
         }
         if let Some(expected_hash) = object.content_hash.as_deref() {
             if expected_hash != content_hash {
@@ -941,14 +936,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         if object.current_locations.contains(replica_node_id) {
-            self.metadata.add_object(object.clone())?;
-            self.put_visible_object_in_metadata_backend(&object)?;
-            return Ok(());
+            return Ok(false);
         }
         object.current_locations.push(replica_node_id.clone());
         self.metadata.add_object(object.clone())?;
         self.put_visible_object_in_metadata_backend(&object)?;
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn put_metadata_receipt(
@@ -1017,9 +1010,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 metadata_materialization: false,
             });
         }
-        match self.mark_repaired_location(object_id, version, replica_node_id, content_hash) {
-            Ok(()) | Err(DfsError::UnknownObject { .. }) => {}
-            Err(error) => return Err(error),
+        let location_changed =
+            match self.mark_repaired_location(object_id, version, replica_node_id, content_hash) {
+                Ok(changed) => changed,
+                Err(DfsError::UnknownObject { .. }) => false,
+                Err(error) => return Err(error),
+            };
+        if location_changed && !inserted {
+            // A retry can observe the receipt from an earlier partial success
+            // while still needing to journal the visible replica location.
+            // Retain that second durable edge independently so it cannot leave
+            // every replica exactly one entry behind the primary.
+            self.record_message_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                repair_maintenance,
+                ..DfsMessageCommittedWork::default()
+            });
         }
         Ok(inserted)
     }
@@ -1121,7 +1127,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 replica_node_id,
                 content_hash,
             ) {
-                Ok(()) | Err(DfsError::UnknownObject { .. }) => {}
+                Ok(_) | Err(DfsError::UnknownObject { .. }) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -1948,8 +1954,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Some(Err(error)) => return Err(error.clone()),
                 None => {}
             }
-            if pending.command.request_id != intent_id
-                && let Some(canonical) = self.pending_routed_writes.get(&pending.command.request_id)
+            if pending.canonical_request_id != intent_id
+                && let Some(canonical) = self
+                    .pending_routed_writes
+                    .get(&pending.canonical_request_id)
             {
                 match &canonical.result {
                     Some(Ok(outcome)) => return Ok(outcome.clone()),

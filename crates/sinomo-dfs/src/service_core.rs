@@ -399,6 +399,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             content,
             cross_shard_namespace_locks,
             metadata_replication_cursors,
+            pending_namespace_request_recovery_cursor,
             committed_work_tracker,
             repair_retry_tick,
             next_frame_id,
@@ -415,6 +416,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // recovery collapses its fully hydrated service back to lazy state.
         service.cross_shard_namespace_locks = cross_shard_namespace_locks;
         service.metadata_replication_cursors = metadata_replication_cursors;
+        // This cursor is tiny but provides bounded-scan fairness across routine
+        // maintenance ticks. Restarting at the first durable page after every
+        // lazy rebuild could starve later locally authoritative requests behind
+        // a large prefix of foreign requests.
+        service.pending_namespace_request_recovery_cursor =
+            pending_namespace_request_recovery_cursor;
         service.committed_work_tracker = committed_work_tracker;
         // Rebuilding a shell is not a process restart. Preserve monotonic
         // transport/request identities and lifecycle state so delayed replies
@@ -426,6 +433,81 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         service.cancellation = cancellation;
         service.hydrate_file_systems_from_metadata_backend()?;
         Ok(service)
+    }
+
+    /// Whether this service owns no request-local state that would be lost by
+    /// rebuilding it as a lazy metadata shell.
+    ///
+    /// The hydrated metadata store, coordinator history, tombstones, lookup
+    /// cache, journal cursors, freshness observations, repair-attempt cache,
+    /// and retained events are all rebuildable from durable state (or are
+    /// advisory caches). The small bounded-recovery cursor, shared cross-shard
+    /// lock registry, replica cursors, committed-work tracker, transport
+    /// counters, and cancellation flag are preserved by
+    /// [`Self::into_lazy_metadata_backend_service`].
+    /// Everything checked below instead owns a live request, response,
+    /// replication, repair, or namespace transition and must fail closed.
+    pub fn can_release_hydrated_metadata_projection(&self) -> bool {
+        let metadata_lookup_scope_quiescent = self
+            .metadata_lookup_cache_depth
+            .lock()
+            .is_ok_and(|depth| *depth == 0);
+        let committed_work_has_durable_owner = self.message_committed_work
+            == DfsMessageCommittedWork::default()
+            || self.committed_work_tracker.is_some();
+        let repair_attempts_are_not_in_flight = self
+            .repair_attempt_records
+            .values()
+            .all(|record| !record.in_flight);
+
+        metadata_lookup_scope_quiescent
+            && self.active_replica_stages.is_empty()
+            && self.pending_writes.is_empty()
+            && self.pending_reads.is_empty()
+            && repair_attempts_are_not_in_flight
+            && self.pending_metadata_replications.is_empty()
+            && self.pending_metadata_authority_probes.is_empty()
+            && self.metadata_authority_probe_results.is_empty()
+            && self.pending_routed_writes.is_empty()
+            && self.pending_remote_write_responses.is_empty()
+            && self.deferred_routed_create_parent_touches.is_empty()
+            && self.deferred_untracked_routed_write_responses.is_empty()
+            && self.pending_routed_namespace_ops.is_empty()
+            && self.active_namespace_operation_context.is_none()
+            && self.active_durable_namespace_request.is_none()
+            && !self.active_durable_namespace_prepare_recorded
+            && self.routed_namespace_settle_depth == 0
+            && committed_work_has_durable_owner
+    }
+
+    /// Release a quiescent exact-shard lane's rebuildable metadata mirror.
+    ///
+    /// `false` means some live operation state still owns the projection and
+    /// nothing was changed. Broad maintenance services use
+    /// [`Self::can_release_hydrated_metadata_projection`] before consuming the
+    /// service through [`Self::into_lazy_metadata_backend_service`]; exact
+    /// request lanes can use this mutating form because their resident backend
+    /// lease remains attached until the caller's ordinary release boundary.
+    pub fn release_hydrated_metadata_projection_if_quiescent(&mut self) -> Result<bool, DfsError> {
+        if !self.can_release_hydrated_metadata_projection() {
+            return Ok(false);
+        }
+        self.collapse_exact_namespace_request_projection()?;
+        // These fields are intentionally outside the live-operation predicate:
+        // they are durable/reconstructable retry inventory or advisory caches,
+        // not owners of an in-flight request. `pending_writes` above is the
+        // exact live owner for an executable repair and prevents this reset.
+        self.repair_attempt_records.clear();
+        self.transient_remote_read_pruned_locations.clear();
+        self.local_metadata_journal_cursors.clear();
+        self.recent_namespace_freshness_syncs.clear();
+        self.last_events.clear();
+        self.message_committed_work = DfsMessageCommittedWork::default();
+        // Re-seed the exact durable cursor after clearing a possibly stale
+        // hydrated high-water mark. This retains incremental replication
+        // correctness without retaining the old projection.
+        self.hydrate_file_systems_from_metadata_backend()?;
+        Ok(true)
     }
 
     pub fn node_id(&self) -> &NodeId {
@@ -456,7 +538,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
-    pub(crate) fn set_committed_work_tracker(&mut self, tracker: DfsCommittedWorkTracker) {
+    /// Retain durable work outside this service generation.
+    ///
+    /// Daemon request shells install one tracker before processing and consume
+    /// it only after draining synchronous follow-up work. Maintenance uses the
+    /// same contract across cancellable broad projections.
+    pub fn set_committed_work_tracker(&mut self, tracker: DfsCommittedWorkTracker) {
         self.committed_work_tracker = Some(tracker);
     }
 
@@ -474,6 +561,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn metadata_backend(&self) -> Option<&dyn DfsMetadataBackend> {
         self.metadata_backend.as_deref()
+    }
+
+    /// Borrow the request-scoped metadata capability for an operator mutation.
+    /// Resident callers must still hold the daemon's ordinary metadata
+    /// admission until this borrow and the surrounding lease are released.
+    pub fn metadata_backend_mut(&mut self) -> Option<&mut (dyn DfsMetadataBackend + 'static)> {
+        self.metadata_backend.as_deref_mut()
     }
 
     pub fn operational_metrics(&self) -> Result<DfsOperationalMetrics, DfsError> {
@@ -559,5 +653,217 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             metadata_backend_configured: self.metadata_backend.is_some(),
             content: self.content.stats()?,
         })
+    }
+}
+
+#[cfg(test)]
+mod projection_release_tests {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    use sinomo_core::DfsObjectPolicy;
+    use sinomo_core::network::{InProcessNetwork, InProcessTransport};
+    use time::OffsetDateTime;
+
+    use super::*;
+    use crate::transfer::PendingNetworkedWrite;
+    use crate::{
+        DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardId, DfsObjectId,
+        DfsVersion, LocalShardedMetadataBackend, directory_object, sifs_file_system_id,
+    };
+
+    fn temporary_root(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sinomo-dfs-{name}-{}-{unique}", std::process::id()))
+    }
+
+    fn service_at(root: &std::path::Path, node: NodeId) -> NetworkedDfsService<InProcessTransport> {
+        NetworkedDfsService::new(
+            InProcessNetwork::new().add_node(node),
+            LocalContentStore::new(root.join("content")).expect("content store"),
+        )
+    }
+
+    #[test]
+    fn projection_release_quiescence_fails_closed_for_live_operation_state() {
+        let root = temporary_root("projection-release-quiescence");
+        let node = NodeId::from_legacy_named("node_projection_release_quiescence").expect("node");
+        let mut service = service_at(&root, node);
+        assert!(service.can_release_hydrated_metadata_projection());
+
+        service.pending_writes.insert(
+            "intent-live".to_string(),
+            PendingNetworkedWrite::new(
+                DfsObjectId::from_legacy_named("object_projection_release").expect("object"),
+                DfsVersion::from_legacy_named("version_projection_release").expect("version"),
+                "content-hash".to_string(),
+                0,
+            ),
+        );
+        assert!(!service.can_release_hydrated_metadata_projection());
+        assert_eq!(
+            service
+                .release_hydrated_metadata_projection_if_quiescent()
+                .expect("blocked release"),
+            false
+        );
+        service.pending_writes.clear();
+
+        service
+            .deferred_routed_create_parent_touches
+            .insert("request-parent-touch".to_string());
+        assert!(!service.can_release_hydrated_metadata_projection());
+        service.deferred_routed_create_parent_touches.clear();
+
+        service.active_durable_namespace_prepare_recorded = true;
+        assert!(!service.can_release_hydrated_metadata_projection());
+        service.active_durable_namespace_prepare_recorded = false;
+        assert!(service.can_release_hydrated_metadata_projection());
+
+        service.pending_namespace_request_recovery_cursor =
+            Some(crate::DfsPendingNamespaceRequestPageCursor {
+                updated_at: OffsetDateTime::UNIX_EPOCH,
+                requester_node_id: service.node_id().clone(),
+                request_id: "bounded-recovery-progress".to_string(),
+            });
+        let rebuilt = service
+            .into_lazy_metadata_backend_service()
+            .expect("lazy rebuild");
+        assert_eq!(
+            rebuilt
+                .pending_namespace_request_recovery_cursor
+                .as_ref()
+                .map(|cursor| cursor.request_id.as_str()),
+            Some("bounded-recovery-progress")
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn quiescent_exact_lane_releases_only_the_rebuildable_projection() {
+        let root = temporary_root("projection-release-exact-lane");
+        let node = NodeId::from_legacy_named("node_projection_release_exact").expect("node");
+        let file_system_id = sifs_file_system_id();
+        let shard_id = DfsMetadataShardId::new("root");
+        let resident = LocalShardedMetadataBackend::new(
+            root.join("metadata"),
+            vec![DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: shard_id.0.clone(),
+                primary_node_id: node.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            }],
+        )
+        .expect("resident backend")
+        .into_resident();
+        let mut service = service_at(&root, node)
+            .with_resident_metadata_shard_backend_lazy(
+                resident
+                    .scope_shard(&file_system_id, &shard_id)
+                    .expect("exact scope")
+                    .checkout()
+                    .expect("exact checkout"),
+            )
+            .expect("exact service");
+        let object = directory_object("/services/projection-release", service.node_id().clone());
+        service.metadata.add_object(object.clone()).expect("object");
+        let replica =
+            NodeId::from_legacy_named("node_projection_release_replica").expect("replica");
+        service.repair_attempt_records.insert(
+            ("durable-repair".to_string(), replica.clone()),
+            crate::DfsRepairAttemptRecord {
+                intent_id: "durable-repair".to_string(),
+                object_id: object.object_id.clone(),
+                version: object.version.clone(),
+                content_hash: "repair-content".to_string(),
+                missing_replica_node_id: replica.clone(),
+                attempts: 2,
+                in_flight: false,
+                last_attempt_unix_nanos: 3,
+                next_retry_unix_nanos: 4,
+                transfer_request_id: None,
+                last_error: Some("retry later".to_string()),
+            },
+        );
+        service.transient_remote_read_pruned_locations.insert(
+            (object.object_id.clone(), object.version.clone(), None),
+            BTreeSet::from([replica.clone()]),
+        );
+        service
+            .local_metadata_journal_cursors
+            .insert(shard_id.clone(), 91);
+        service.recent_namespace_freshness_syncs.insert(
+            (file_system_id.clone(), shard_id.clone(), replica.clone()),
+            Instant::now(),
+        );
+        service.pending_namespace_request_recovery_cursor =
+            Some(crate::DfsPendingNamespaceRequestPageCursor {
+                updated_at: OffsetDateTime::UNIX_EPOCH,
+                requester_node_id: replica.clone(),
+                request_id: "recovery-cursor".to_string(),
+            });
+        service
+            .last_events
+            .push(NetworkedDfsServiceEvent::RepairRetryFailed {
+                reason: "retained observation".to_string(),
+            });
+        service
+            .metadata_replication_cursors
+            .insert((replica.clone(), shard_id.clone()), 92);
+        let committed_work_tracker = DfsCommittedWorkTracker::new();
+        service.set_committed_work_tracker(committed_work_tracker.clone());
+        service.record_message_committed_work(DfsMessageCommittedWork {
+            publish_metadata: true,
+            ..DfsMessageCommittedWork::default()
+        });
+        service.next_request_id = 73;
+
+        assert!(service.can_release_hydrated_metadata_projection());
+        assert!(
+            service
+                .release_hydrated_metadata_projection_if_quiescent()
+                .expect("projection release")
+        );
+        assert!(service.metadata().object(&object.object_id).is_none());
+        assert!(service.metadata.filesystems.contains_key(&file_system_id));
+        assert!(service.repair_attempt_records.is_empty());
+        assert!(service.transient_remote_read_pruned_locations.is_empty());
+        assert_eq!(
+            service.local_metadata_journal_cursors.get(&shard_id),
+            Some(&0)
+        );
+        assert!(service.recent_namespace_freshness_syncs.is_empty());
+        assert_eq!(
+            service
+                .pending_namespace_request_recovery_cursor
+                .as_ref()
+                .map(|cursor| cursor.request_id.as_str()),
+            Some("recovery-cursor")
+        );
+        assert!(service.last_events.is_empty());
+        assert_eq!(
+            service
+                .metadata_replication_cursors
+                .get(&(replica, shard_id)),
+            Some(&92)
+        );
+        assert_eq!(
+            service.message_committed_work,
+            DfsMessageCommittedWork::default()
+        );
+        assert!(committed_work_tracker.take().publish_metadata);
+        assert_eq!(service.next_request_id, 73);
+        assert!(service.metadata_backend().is_some());
+
+        std::fs::remove_dir_all(root).ok();
     }
 }

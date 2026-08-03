@@ -1887,18 +1887,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         authority_shard: DfsMetadataShardConfig,
         command: DfsDistributedWriteCommand,
     ) -> NetworkedDfsWriteOutcome {
+        self.prune_retained_routed_writes();
         self.pending_routed_writes.insert(
             request_id.clone(),
             PendingRoutedWrite {
+                canonical_request_id: request_id.clone(),
                 object_id,
                 primary_node_id,
                 authority_shard,
-                command,
+                command: Some(command),
                 authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
                 remote_intent_id: None,
                 durable_receipts: 0,
                 required_receipts: 1,
                 result: None,
+                compact_retained_at: None,
             },
         );
         NetworkedDfsWriteOutcome::Pending {

@@ -33,18 +33,16 @@ use crate::{
     DfsMetadataNamespacePrepareCodec, DfsMetadataShardAssignment, DfsMetadataShardConfig,
     DfsMetadataShardHeadWatermark, DfsMetadataShardId, DfsMetadataShardMembershipHandoff,
     DfsMetadataShardMembershipHandoffProof, DfsMetadataSnapshotInstallSender, DfsNodeAdvertisement,
-    DfsPeerTransport, DfsSmokeOptions, DfsSmokeReport, DfsSubtreePolicy, SIFS_SERVICES_PATH,
-    SIFS_USERS_PATH, content_service_key, default_dfs_metadata_shards_root,
-    dfs_message_sender_from_peer_transport, dfs_metadata_journal_batch_sender_from_peer_transport,
+    DfsPeerTransport, DfsSmokeOptions, DfsSmokeReport, DfsSubtreePolicy,
+    ResidentLocalShardedMetadataBackend, SIFS_SERVICES_PATH, SIFS_USERS_PATH, content_service_key,
+    default_dfs_metadata_shards_root, dfs_message_sender_from_peer_transport,
+    dfs_metadata_journal_batch_sender_from_peer_transport,
     dfs_metadata_snapshot_install_sender_from_peer_transport, distributed_sifs,
     file_system_config_key, local_dfs_metadata_shard_path, materialize_default_sifs_metadata,
-    metadata_replication::{
-        default_sifs_migration_has_backend_continuation,
-        materialize_default_sifs_metadata_on_bound_primary_shards,
-    },
+    metadata_replication::materialize_default_sifs_metadata_on_bound_primary_shards,
     metadata_service_key, metadata_shard_key, metadata_shard_membership_handoff_key,
     metadata_shard_membership_handoff_proof_key, open_cluster_aware_dfs_metadata_backend,
-    open_local_metadata_shard_backend, open_local_sharded_metadata_backend,
+    open_local_metadata_shard_backend, open_local_sharded_metadata_backend_for_replica_repair,
     run_cluster_dfs_smoke_with_message_sender, sifs_node_files_path,
 };
 
@@ -528,20 +526,39 @@ pub struct DfsControlPlaneDefaultClusterAsyncBootstrapHost {
     cluster_paths: ClusterPaths,
     local_node_id: NodeId,
     control_plane: Box<dyn AsyncDfsControlPlaneKvClient>,
+    resident_metadata_backend: Option<ResidentLocalShardedMetadataBackend>,
 }
 
 impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
+    #[cfg(test)]
     pub(crate) fn new(
         data_dir: SinomoDataDir,
         cluster_paths: ClusterPaths,
         local_node_id: NodeId,
         control_plane: Box<dyn AsyncDfsControlPlaneKvClient>,
     ) -> Self {
+        Self::new_with_resident_metadata_backend(
+            data_dir,
+            cluster_paths,
+            local_node_id,
+            control_plane,
+            None,
+        )
+    }
+
+    pub fn new_with_resident_metadata_backend(
+        data_dir: SinomoDataDir,
+        cluster_paths: ClusterPaths,
+        local_node_id: NodeId,
+        control_plane: Box<dyn AsyncDfsControlPlaneKvClient>,
+        resident_metadata_backend: Option<ResidentLocalShardedMetadataBackend>,
+    ) -> Self {
         Self {
             data_dir,
             cluster_paths,
             local_node_id,
             control_plane,
+            resident_metadata_backend,
         }
     }
 
@@ -759,7 +776,6 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
     ) -> Result<(), DfsError> {
         let mut active_primary_shard_ids = BTreeSet::new();
         let mut completion_evidence = Vec::with_capacity(shards.len());
-        let mut active_primary_shards = Vec::new();
         for active in &shards {
             let store = DfsControlPlaneStore::new(self.control_plane.as_mut());
             let pending = store
@@ -769,45 +785,34 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
                 &active.shard_id,
             )?;
             if active.primary_node_id == self.local_node_id && pending.is_none() {
-                active_primary_shards.push(active.clone());
                 active_primary_shard_ids.insert(DfsMetadataShardId::new(active.shard_id.clone()));
             }
             completion_evidence.push((pending, proof));
         }
+        if active_primary_shard_ids.is_empty() {
+            return Ok(());
+        }
         let metadata_root = default_dfs_metadata_shards_root(&self.data_dir);
-        let has_continuation = default_sifs_migration_has_backend_continuation(
-            &metadata_root,
-            &file_system.file_system_id,
+        let mut backend = open_local_sharded_metadata_backend_for_replica_repair(
+            metadata_root.clone(),
+            shards.clone(),
             &self.local_node_id,
-            &shards,
-            &active_primary_shard_ids,
-        );
-        let mut bound_primary_backend = if active_primary_shards.is_empty() || has_continuation {
-            None
-        } else {
-            Some(open_local_sharded_metadata_backend(
-                metadata_root.clone(),
-                active_primary_shards,
-            )?)
-        };
-        if let Some(backend) = bound_primary_backend.as_mut() {
-            for (active, (pending, proof)) in shards.iter().zip(&completion_evidence) {
-                if active_primary_shard_ids
-                    .contains(&DfsMetadataShardId::new(active.shard_id.clone()))
-                {
-                    rebind_completed_metadata_shard_membership_handoff(
-                        backend,
-                        &self.local_node_id,
-                        active,
-                        pending.as_ref(),
-                        proof.as_ref(),
-                    )?;
-                }
+        )?;
+        for (active, (pending, proof)) in shards.iter().zip(&completion_evidence) {
+            if active_primary_shard_ids.contains(&DfsMetadataShardId::new(active.shard_id.clone()))
+            {
+                rebind_completed_metadata_shard_membership_handoff(
+                    &mut backend,
+                    &self.local_node_id,
+                    active,
+                    pending.as_ref(),
+                    proof.as_ref(),
+                )?;
             }
         }
         materialize_default_sifs_metadata_on_bound_primary_shards(
             metadata_root,
-            bound_primary_backend,
+            &mut backend,
             file_system,
             &shards,
             &active_primary_shard_ids,
@@ -1015,37 +1020,17 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
             #[cfg(test)]
             record_default_materialization_run(&data_root);
             let mut active_primary_shard_ids = BTreeSet::new();
-            let active_primary_shards = shards
-                .iter()
-                .zip(&completion_evidence)
-                .filter_map(|(active, (pending, _))| {
+            active_primary_shard_ids.extend(shards.iter().zip(&completion_evidence).filter_map(
+                |(active, (pending, _))| {
                     (active.primary_node_id == self.local_node_id && pending.is_none())
-                        .then_some(active.clone())
-                })
-                .collect::<Vec<_>>();
-            active_primary_shard_ids.extend(
-                active_primary_shards
-                    .iter()
-                    .map(|active| DfsMetadataShardId::new(active.shard_id.clone())),
-            );
-            let metadata_root = default_dfs_metadata_shards_root(&self.data_dir);
-            let has_continuation = default_sifs_migration_has_backend_continuation(
-                &metadata_root,
-                &file_system.file_system_id,
-                &self.local_node_id,
-                &shards,
-                &active_primary_shard_ids,
-            );
-            let mut bound_primary_backend = if active_primary_shards.is_empty() || has_continuation
-            {
-                None
-            } else {
-                Some(open_local_sharded_metadata_backend(
-                    metadata_root.clone(),
-                    active_primary_shards,
-                )?)
-            };
-            if let Some(backend) = bound_primary_backend.as_mut() {
+                        .then(|| DfsMetadataShardId::new(active.shard_id.clone()))
+                },
+            ));
+            if active_primary_shard_ids.is_empty() {
+                record_default_materialization(data_root, signature, false);
+                return Ok(());
+            }
+            let run_materialization = |backend: &mut crate::LocalShardedMetadataBackend| {
                 for (active, (pending, proof)) in shards.iter().zip(&completion_evidence) {
                     if active_primary_shard_ids
                         .contains(&DfsMetadataShardId::new(active.shard_id.clone()))
@@ -1059,18 +1044,36 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
                         )?;
                     }
                 }
-            }
-            let materialization = materialize_default_sifs_metadata_on_bound_primary_shards(
-                metadata_root,
-                bound_primary_backend,
-                &file_system,
-                &shards,
-                &active_primary_shard_ids,
-                &self.local_node_id,
-                bootstrap_owner_node_ids,
-                fallback_owner_node_id,
-                OffsetDateTime::now_utc(),
-            )?;
+                materialize_default_sifs_metadata_on_bound_primary_shards(
+                    default_dfs_metadata_shards_root(&self.data_dir),
+                    backend,
+                    &file_system,
+                    &shards,
+                    &active_primary_shard_ids,
+                    &self.local_node_id,
+                    bootstrap_owner_node_ids,
+                    fallback_owner_node_id,
+                    OffsetDateTime::now_utc(),
+                )
+            };
+            let metadata_root = default_dfs_metadata_shards_root(&self.data_dir);
+            let resident = match self.resident_metadata_backend.as_ref() {
+                Some(resident) if resident.matches_topology(&metadata_root, &shards)? => {
+                    Some(resident)
+                }
+                Some(_) | None => None,
+            };
+            let materialization = if let Some(resident) = resident {
+                let mut lease = resident.checkout_global()?;
+                run_materialization(&mut lease)?
+            } else {
+                let mut backend = open_local_sharded_metadata_backend_for_replica_repair(
+                    metadata_root,
+                    shards.clone(),
+                    &self.local_node_id,
+                )?;
+                run_materialization(&mut backend)?
+            };
             if !materialization.migration.reached_limit {
                 record_default_materialization(
                     data_root,
@@ -1539,6 +1542,23 @@ pub async fn ensure_default_cluster_dfs_async(
     control_plane: Box<dyn AsyncDfsControlPlaneKvClient>,
     options: DfsDefaultClusterBootstrapOptions,
 ) -> Result<Option<DfsDefaultClusterBootstrapReport>, DfsError> {
+    ensure_default_cluster_dfs_async_with_resident_metadata(
+        data_dir,
+        cluster_paths,
+        control_plane,
+        None,
+        options,
+    )
+    .await
+}
+
+pub async fn ensure_default_cluster_dfs_async_with_resident_metadata(
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    control_plane: Box<dyn AsyncDfsControlPlaneKvClient>,
+    resident_metadata_backend: Option<ResidentLocalShardedMetadataBackend>,
+    options: DfsDefaultClusterBootstrapOptions,
+) -> Result<Option<DfsDefaultClusterBootstrapReport>, DfsError> {
     data_dir
         .ensure_root_layout()
         .map_err(|source| DfsError::Metadata {
@@ -1553,12 +1573,14 @@ pub async fn ensure_default_cluster_dfs_async(
         sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
     }
     .map_err(DfsError::from_network)?;
-    let mut host = DfsControlPlaneDefaultClusterAsyncBootstrapHost::new(
-        data_dir.clone(),
-        cluster_paths.clone(),
-        state.local_node_id.clone(),
-        control_plane,
-    );
+    let mut host =
+        DfsControlPlaneDefaultClusterAsyncBootstrapHost::new_with_resident_metadata_backend(
+            data_dir.clone(),
+            cluster_paths.clone(),
+            state.local_node_id.clone(),
+            control_plane,
+            resident_metadata_backend,
+        );
     ensure_default_distributed_dfs_with_async_host(&state, &mut host, options)
         .await
         .map(Some)

@@ -26,11 +26,12 @@ use crate::{
     DFS_INSPECTION_ROUTE, DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
     DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse,
     DfsFileSystemId, DfsMessageCommand, DfsMessageResponse, DfsMetadataJournalBatchCommand,
-    DfsMetadataReplicaShardContext, DfsMetadataShardConfig, DfsMetadataShardId,
-    DfsMetadataShardMembershipHandoff, DfsMetadataSnapshotInstallCommand, DfsOperatorStatus,
-    DfsOutboundAttachment, DfsSmokeReport, LocalContentStore, dfs_module_surfaces,
-    dfs_route_is_message_data_plane, inspect_cluster_aware_dfs, inspect_cluster_aware_dfs_status,
-    metadata_shard_key, metadata_shard_membership_handoff_key,
+    DfsMetadataJournalBatchResponse, DfsMetadataReplicaShardContext, DfsMetadataShardConfig,
+    DfsMetadataShardId, DfsMetadataShardMembershipHandoff, DfsMetadataSnapshotInstallCommand,
+    DfsMetadataSnapshotInstallResponse, DfsOperatorStatus, DfsOutboundAttachment, DfsSmokeReport,
+    LocalContentStore, dfs_module_surfaces, dfs_route_is_message_data_plane,
+    inspect_cluster_aware_dfs, inspect_cluster_aware_dfs_status, metadata_shard_key,
+    metadata_shard_membership_handoff_key,
 };
 use sinomo_core::local::SinomoDataDir;
 #[cfg(test)]
@@ -198,6 +199,41 @@ pub trait DfsDataPlaneHost: Send + Sync {
 
     fn run_smoke<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, DfsSmokeReport>;
 
+    /// Inspect or mutate operator-visible metadata through the same resident
+    /// backend generation and admission fences as ordinary daemon traffic.
+    fn inspect<'a>(
+        &'a self,
+        data_dir: Arc<SinomoDataDir>,
+        request: DaemonDfsInspectionRequest,
+    ) -> DfsDataPlaneHostFuture<'a, DaemonDfsInspectionResponse>;
+
+    /// Persist an already-authorized replica journal command through the
+    /// process-resident exact shard backend. The service boundary supplies the
+    /// committed authority context so the host must not repeat a remote KV
+    /// refresh while holding replica ingress.
+    fn apply_metadata_journal_batch<'a>(
+        &'a self,
+        data_dir: Arc<SinomoDataDir>,
+        authenticated_source_node_id: NodeId,
+        command: DfsMetadataJournalBatchCommand,
+        context: Option<DfsMetadataReplicaShardContext>,
+    ) -> DfsDataPlaneHostFuture<'a, DfsMetadataJournalBatchResponse>;
+
+    /// Install an already-authorized replica snapshot through the same
+    /// resident exact shard generation used by ordinary journal ingress.
+    fn install_metadata_snapshot<'a>(
+        &'a self,
+        data_dir: Arc<SinomoDataDir>,
+        authenticated_source_node_id: NodeId,
+        command: DfsMetadataSnapshotInstallCommand,
+        context: Option<DfsMetadataReplicaShardContext>,
+    ) -> DfsDataPlaneHostFuture<'a, DfsMetadataSnapshotInstallResponse>;
+
+    /// Process one authenticated routed DFS message through the host's
+    /// canonical authority and resident-backend path. Implementations must
+    /// fail closed on stale topology, shard epoch, handoff, freeze, and inner
+    /// source claims; the service adapter validates the outer signer and
+    /// response envelope but cannot validate host-owned authority state.
     fn handle_message<'a>(
         &'a self,
         command: DfsMessageCommand,
@@ -333,16 +369,39 @@ impl Service for DfsService {
                 DFS_METADATA_JOURNAL_BATCH_ROUTE => {
                     let command: DfsMetadataJournalBatchCommand =
                         ctx.decode_request_body(&request).await?;
+                    let authenticated_source_node_id = authenticated_dfs_cluster_source_node_id(
+                        &ctx,
+                        DFS_METADATA_JOURNAL_BATCH_ROUTE,
+                    )?;
+                    if command.source_node_id.as_ref() != Some(&authenticated_source_node_id) {
+                        let response = DfsMetadataJournalBatchResponse {
+                            request_id: command.request_id.clone(),
+                            shard_id: command.batch.shard_id.clone(),
+                            next_after_sequence: command.batch.next_after_sequence,
+                            applied_entries: 0,
+                            verified_prefix_only: false,
+                            verified_authority_probe_id: None,
+                            result: crate::DfsMetadataJournalBatchResult::Rejected {
+                                reason: format!(
+                                    "authenticated metadata journal caller {authenticated_source_node_id} does not match claimed source {}",
+                                    command
+                                        .source_node_id
+                                        .as_ref()
+                                        .map(ToString::to_string)
+                                        .unwrap_or_else(|| "<missing>".to_string())
+                                ),
+                            },
+                        };
+                        ctx.respond_value(DFS_METADATA_JOURNAL_BATCH_ROUTE, response)?;
+                        operation_metrics.succeed();
+                        return Ok(ServiceDisposition::Continue);
+                    }
                     let may_have_deferred_materialization = command.durable_replication.is_some()
                         || command
                             .authority_probe
                             .as_ref()
                             .is_some_and(|probe| probe.durable_journal_ack);
                     let materialize_shard_id = command.batch.shard_id.clone();
-                    let authenticated_source_node_id = authenticated_dfs_cluster_source_node_id(
-                        &ctx,
-                        DFS_METADATA_JOURNAL_BATCH_ROUTE,
-                    )?;
                     let context = authoritative_metadata_replica_shard_context(
                         ctx.cluster.clone(),
                         Arc::clone(&ctx.data_dir),
@@ -356,6 +415,20 @@ impl Service for DfsService {
                             .and_then(|probe| probe.primary_handoff_id.clone()),
                     )
                     .await?;
+                    if let Some(host) = host {
+                        let response = host
+                            .apply_metadata_journal_batch(
+                                Arc::clone(&ctx.data_dir),
+                                authenticated_source_node_id,
+                                command,
+                                context,
+                            )
+                            .await
+                            .map_err(service_error)?;
+                        ctx.respond_value(DFS_METADATA_JOURNAL_BATCH_ROUTE, response)?;
+                        operation_metrics.succeed();
+                        return Ok(ServiceDisposition::Continue);
+                    }
                     let data_dir = Arc::clone(&ctx.data_dir);
                     let response = tokio::task::spawn_blocking(move || {
                         crate::metadata_replication::process_cluster_dfs_metadata_journal_batch_with_context(
@@ -372,8 +445,9 @@ impl Service for DfsService {
                     .map_err(service_error)?;
                     // Exact frames become durable before acknowledgement-floor
                     // persistence and response delivery. Schedule the bounded
-                    // rebuild as soon as that persistence attempt returns;
-                    // rejected pre-ingest requests simply make this a no-op.
+                    // rebuild even if the later acknowledgement-floor write
+                    // rejects the request; pre-ingest rejections are a no-op,
+                    // while post-ingest rejections still own a durable tail.
                     if may_have_deferred_materialization {
                         let data_dir = Arc::clone(&ctx.data_dir);
                         crate::metadata_replication::schedule_cluster_dfs_metadata_replica_materialization_on_runtime(
@@ -391,6 +465,22 @@ impl Service for DfsService {
                         &ctx,
                         DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
                     )?;
+                    if command.source_node_id != authenticated_source_node_id {
+                        let response = DfsMetadataSnapshotInstallResponse {
+                            request_id: command.request_id.clone(),
+                            shard_id: command.shard_id.clone(),
+                            next_after_sequence: command.next_after_sequence,
+                            result: crate::DfsMetadataSnapshotInstallResult::Rejected {
+                                reason: format!(
+                                    "authenticated metadata snapshot caller {authenticated_source_node_id} does not match claimed source {}",
+                                    command.source_node_id
+                                ),
+                            },
+                        };
+                        ctx.respond_value(DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, response)?;
+                        operation_metrics.succeed();
+                        return Ok(ServiceDisposition::Continue);
+                    }
                     let context = authoritative_metadata_replica_shard_context(
                         ctx.cluster.clone(),
                         Arc::clone(&ctx.data_dir),
@@ -401,6 +491,20 @@ impl Service for DfsService {
                         command.primary_handoff_id.clone(),
                     )
                     .await?;
+                    if let Some(host) = host {
+                        let response = host
+                            .install_metadata_snapshot(
+                                Arc::clone(&ctx.data_dir),
+                                authenticated_source_node_id,
+                                command,
+                                context,
+                            )
+                            .await
+                            .map_err(service_error)?;
+                        ctx.respond_value(DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, response)?;
+                        operation_metrics.succeed();
+                        return Ok(ServiceDisposition::Continue);
+                    }
                     let data_dir = Arc::clone(&ctx.data_dir);
                     let response = tokio::task::spawn_blocking(move || {
                         crate::metadata_replication::process_cluster_dfs_metadata_snapshot_install_with_context(
@@ -422,15 +526,24 @@ impl Service for DfsService {
                 DFS_INSPECTION_ROUTE => {
                     let inspection: DaemonDfsInspectionRequest =
                         ctx.decode_request_body(&request).await?;
-                    let data_dir = Arc::clone(&ctx.data_dir);
-                    let response =
-                        tokio::task::spawn_blocking(move || dfs_inspection(&data_dir, inspection))
+                    let response = match host {
+                        Some(host) => host
+                            .inspect(Arc::clone(&ctx.data_dir), inspection)
+                            .await
+                            .map_err(service_error)?,
+                        None => {
+                            let data_dir = Arc::clone(&ctx.data_dir);
+                            tokio::task::spawn_blocking(move || {
+                                dfs_inspection(&data_dir, inspection)
+                            })
                             .await
                             .map_err(|source| {
                                 ServiceError::Service(format!(
                                     "DFS inspection task failed: {source}"
                                 ))
-                            })??;
+                            })??
+                        }
+                    };
                     ctx.respond_value(DFS_INSPECTION_ROUTE, response)?;
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
@@ -831,6 +944,11 @@ mod tests {
     struct StubDfsDataPlaneHost {
         status_calls: Mutex<usize>,
         smoke_calls: Mutex<usize>,
+        inspection_calls: Mutex<usize>,
+        journal_request_ids: Mutex<Vec<String>>,
+        journal_contexts: Mutex<Vec<DfsMetadataReplicaShardContext>>,
+        snapshot_request_ids: Mutex<Vec<String>>,
+        snapshot_contexts: Mutex<Vec<DfsMetadataReplicaShardContext>>,
         message_request_ids: Mutex<Vec<String>>,
         message_traceparents: Mutex<Vec<Option<String>>>,
         shared_content_store: Mutex<Option<Arc<LocalContentStore>>>,
@@ -897,6 +1015,112 @@ mod tests {
                         committed: true,
                         detail: "ok".to_string(),
                     }],
+                })
+            })
+        }
+
+        fn inspect<'a>(
+            &'a self,
+            data_dir: Arc<SinomoDataDir>,
+            request: DaemonDfsInspectionRequest,
+        ) -> DfsDataPlaneHostFuture<'a, DaemonDfsInspectionResponse> {
+            Box::pin(async move {
+                *self.inspection_calls.lock().expect("inspection calls") += 1;
+                dfs_inspection(data_dir.as_ref(), request)
+                    .map_err(|error| DfsDataPlaneHostError::new(error.to_string()))
+            })
+        }
+
+        fn apply_metadata_journal_batch<'a>(
+            &'a self,
+            _data_dir: Arc<SinomoDataDir>,
+            authenticated_source_node_id: NodeId,
+            command: DfsMetadataJournalBatchCommand,
+            context: Option<DfsMetadataReplicaShardContext>,
+        ) -> DfsDataPlaneHostFuture<'a, DfsMetadataJournalBatchResponse> {
+            Box::pin(async move {
+                let valid_context = context.as_ref().is_some_and(|context| {
+                    command.source_node_id.as_ref() == Some(&authenticated_source_node_id)
+                        && command.file_system_id.as_ref() == Some(&context.shard.file_system_id)
+                        && command.batch.shard_id.0 == context.shard.shard_id
+                        && command.authority_epoch == Some(context.shard.epoch)
+                        && context.shard.primary_node_id == authenticated_source_node_id
+                        && metadata_replica_context_has_local_ingest_membership(context)
+                });
+                if !valid_context {
+                    return Ok(DfsMetadataJournalBatchResponse {
+                        request_id: command.request_id,
+                        shard_id: command.batch.shard_id,
+                        next_after_sequence: command.batch.next_after_sequence,
+                        applied_entries: 0,
+                        verified_prefix_only: false,
+                        verified_authority_probe_id: None,
+                        result: crate::DfsMetadataJournalBatchResult::Rejected {
+                            reason: "missing or stale hosted replica context".to_string(),
+                        },
+                    });
+                }
+                self.journal_request_ids
+                    .lock()
+                    .expect("journal request ids")
+                    .push(command.request_id.clone());
+                self.journal_contexts
+                    .lock()
+                    .expect("journal contexts")
+                    .push(context.expect("validated journal context"));
+                Ok(DfsMetadataJournalBatchResponse {
+                    request_id: command.request_id,
+                    shard_id: command.batch.shard_id,
+                    next_after_sequence: command.batch.next_after_sequence,
+                    applied_entries: command.batch.entries.len(),
+                    verified_prefix_only: command.verify_prefix_only,
+                    verified_authority_probe_id: None,
+                    result: crate::DfsMetadataJournalBatchResult::Applied,
+                })
+            })
+        }
+
+        fn install_metadata_snapshot<'a>(
+            &'a self,
+            _data_dir: Arc<SinomoDataDir>,
+            authenticated_source_node_id: NodeId,
+            command: DfsMetadataSnapshotInstallCommand,
+            context: Option<DfsMetadataReplicaShardContext>,
+        ) -> DfsDataPlaneHostFuture<'a, DfsMetadataSnapshotInstallResponse> {
+            Box::pin(async move {
+                let valid_context = context.as_ref().is_some_and(|context| {
+                    command.source_node_id == authenticated_source_node_id
+                        && command.file_system_id.as_ref() == Some(&context.shard.file_system_id)
+                        && command.shard_id.0 == context.shard.shard_id
+                        && command.authority_epoch == Some(context.shard.epoch)
+                        && context.shard.primary_node_id == authenticated_source_node_id
+                        && metadata_replica_context_has_local_ingest_membership(context)
+                });
+                if !valid_context {
+                    return Ok(DfsMetadataSnapshotInstallResponse {
+                        request_id: command.request_id,
+                        shard_id: command.shard_id,
+                        next_after_sequence: command.next_after_sequence,
+                        result: DfsMetadataSnapshotInstallResult::Rejected {
+                            reason: "missing or stale hosted replica context".to_string(),
+                        },
+                    });
+                }
+                self.snapshot_request_ids
+                    .lock()
+                    .expect("snapshot request ids")
+                    .push(command.request_id.clone());
+                self.snapshot_contexts
+                    .lock()
+                    .expect("snapshot contexts")
+                    .push(context.expect("validated snapshot context"));
+                Ok(DfsMetadataSnapshotInstallResponse {
+                    request_id: command.request_id,
+                    shard_id: command.shard_id,
+                    next_after_sequence: command.next_after_sequence,
+                    result: DfsMetadataSnapshotInstallResult::Installed {
+                        archived_existing: false,
+                    },
                 })
             })
         }
@@ -1543,6 +1767,219 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_replica_routes_use_direct_authorized_host_methods() {
+        let host = Arc::new(StubDfsDataPlaneHost::default());
+        let registry =
+            register_services_with_data_plane_host(ServiceRegistry::builder(), host.clone())
+                .build();
+        let (_root, data_dir) = temp_data_dir();
+        let primary =
+            NodeId::from_legacy_named("node_dfs_hosted_replica_primary").expect("primary");
+        let local = NodeId::from_legacy_named("node_dfs_hosted_replica_local").expect("local");
+        let signer = ServiceSigner::Remote {
+            node_id: primary.to_string(),
+            public_key: "pk-dfs-hosted-replica-primary".to_string(),
+        };
+        let cluster_paths = ClusterPaths::new(data_dir.as_ref());
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_hosted_replica")
+                .expect("cluster"),
+            "hosted replica service test",
+            local.clone(),
+            "local",
+            "pk-local",
+            OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("cluster kv state");
+        let shard = DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: primary.clone(),
+            replica_node_ids: vec![local.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut cluster_kv = sinomo_core::kv::InProcessKvStore::restore(
+            sinomo_core::kv::read_cluster_kv_cached_snapshot(&cluster_paths.kv_paths())
+                .expect("cluster kv snapshot"),
+        )
+        .expect("cluster kv store");
+        cluster_kv
+            .put_serde(
+                metadata_shard_key(&shard.file_system_id, &shard.shard_id),
+                &shard,
+                None,
+            )
+            .expect("shard op");
+        let kv_snapshot = cluster_kv.snapshot().expect("cluster kv snapshot");
+        sinomo_core::kv::write_cluster_kv_snapshot(&cluster_paths.kv_paths(), &kv_snapshot)
+            .expect("write shard config");
+        let journal = DfsMetadataJournalBatchCommand {
+            request_id: "hosted-replica-journal".to_string(),
+            source_node_id: Some(primary.clone()),
+            file_system_id: Some(sifs_file_system_id()),
+            authority_epoch: Some(1),
+            verify_prefix_only: false,
+            prefix_probe: None,
+            authority_probe: None,
+            durable_replication: None,
+            batch: DfsMetadataJournalBatch {
+                shard_id: DfsMetadataShardId::new("root"),
+                entries: Vec::new(),
+                next_after_sequence: 11,
+            },
+        };
+        let (_, response) = dispatch_with_signer(
+            &registry,
+            Arc::clone(&data_dir),
+            DFS_METADATA_JOURNAL_BATCH_ROUTE,
+            &journal,
+            signer.clone(),
+        )
+        .await
+        .expect("hosted journal route");
+        let response: DfsMetadataJournalBatchResponse = response.decode_body().expect("journal");
+        assert_eq!(response.request_id, journal.request_id);
+        assert!(matches!(
+            response.result,
+            crate::DfsMetadataJournalBatchResult::Applied
+        ));
+
+        let snapshot_backend = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("snapshot-source"),
+            data_dir.root().join("hosted-snapshot-source"),
+        )
+        .expect("snapshot source");
+        let snapshot = DfsMetadataSnapshotInstallCommand {
+            request_id: "hosted-replica-snapshot".to_string(),
+            source_node_id: primary.clone(),
+            file_system_id: Some(sifs_file_system_id()),
+            authority_epoch: Some(1),
+            primary_handoff_id: None,
+            shard_id: DfsMetadataShardId::new("root"),
+            next_after_sequence: 12,
+            snapshot: snapshot_backend.export_table_snapshot(),
+            reason: "hosted route test".to_string(),
+        };
+        let (_, response) = dispatch_with_signer(
+            &registry,
+            Arc::clone(&data_dir),
+            DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+            &snapshot,
+            signer.clone(),
+        )
+        .await
+        .expect("hosted snapshot route");
+        let response: DfsMetadataSnapshotInstallResponse =
+            response.decode_body().expect("snapshot");
+        assert_eq!(response.request_id, snapshot.request_id);
+        assert!(matches!(
+            response.result,
+            DfsMetadataSnapshotInstallResult::Installed { .. }
+        ));
+
+        let claimed =
+            NodeId::from_legacy_named("node_dfs_hosted_replica_claimed").expect("claimed");
+        let mut mismatched_journal = journal.clone();
+        mismatched_journal.request_id = "hosted-replica-journal-mismatch".to_string();
+        mismatched_journal.source_node_id = Some(claimed.clone());
+        let (_, response) = dispatch_with_signer(
+            &registry,
+            Arc::clone(&data_dir),
+            DFS_METADATA_JOURNAL_BATCH_ROUTE,
+            &mismatched_journal,
+            signer.clone(),
+        )
+        .await
+        .expect("hosted journal mismatch response");
+        let response: DfsMetadataJournalBatchResponse = response.decode_body().expect("journal");
+        assert!(matches!(
+            response.result,
+            crate::DfsMetadataJournalBatchResult::Rejected { .. }
+        ));
+
+        let mut mismatched_snapshot = snapshot.clone();
+        mismatched_snapshot.request_id = "hosted-replica-snapshot-mismatch".to_string();
+        mismatched_snapshot.source_node_id = claimed;
+        let (_, response) = dispatch_with_signer(
+            &registry,
+            Arc::clone(&data_dir),
+            DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+            &mismatched_snapshot,
+            signer,
+        )
+        .await
+        .expect("hosted snapshot mismatch response");
+        let response: DfsMetadataSnapshotInstallResponse =
+            response.decode_body().expect("snapshot");
+        assert!(matches!(
+            response.result,
+            DfsMetadataSnapshotInstallResult::Rejected { .. }
+        ));
+
+        let mut missing_context_journal = journal.clone();
+        missing_context_journal.request_id = "hosted-replica-journal-missing-context".to_string();
+        missing_context_journal.file_system_id = Some(
+            DfsFileSystemId::from_legacy_named("filesystem_dfs_hosted_replica_missing")
+                .expect("missing filesystem"),
+        );
+        let (_, response) = dispatch_with_signer(
+            &registry,
+            Arc::clone(&data_dir),
+            DFS_METADATA_JOURNAL_BATCH_ROUTE,
+            &missing_context_journal,
+            ServiceSigner::Remote {
+                node_id: primary.to_string(),
+                public_key: "pk-dfs-hosted-replica-primary".to_string(),
+            },
+        )
+        .await
+        .expect("hosted missing context response");
+        let response: DfsMetadataJournalBatchResponse = response.decode_body().expect("journal");
+        assert!(matches!(
+            response.result,
+            crate::DfsMetadataJournalBatchResult::Rejected { .. }
+        ));
+        assert_eq!(
+            host.journal_request_ids
+                .lock()
+                .expect("journal request ids")
+                .as_slice(),
+            ["hosted-replica-journal"]
+        );
+        assert_eq!(
+            host.snapshot_request_ids
+                .lock()
+                .expect("snapshot request ids")
+                .as_slice(),
+            ["hosted-replica-snapshot"]
+        );
+        let journal_contexts = host.journal_contexts.lock().expect("journal contexts");
+        let snapshot_contexts = host.snapshot_contexts.lock().expect("snapshot contexts");
+        assert_eq!(
+            journal_contexts.as_slice(),
+            &[DfsMetadataReplicaShardContext {
+                local_node_id: local.clone(),
+                shard: shard.clone(),
+                pending_membership_handoff: None,
+            }]
+        );
+        assert_eq!(snapshot_contexts.as_slice(), journal_contexts.as_slice());
+        assert!(
+            host.message_request_ids
+                .lock()
+                .expect("message request ids")
+                .is_empty(),
+            "replica control-plane routes must not enter the routed message host"
+        );
+    }
+
+    #[tokio::test]
     async fn dfs_replica_routes_bind_authenticated_caller_to_claimed_source() {
         let registry = register_services(ServiceRegistry::builder()).build();
         let (_root, data_dir) = temp_data_dir();
@@ -1636,6 +2073,26 @@ mod tests {
         assert_eq!(disposition, ServiceDisposition::Continue);
         let result: DaemonDfsInspectionResponse = response.decode_body().expect("decode");
         assert!(matches!(result, DaemonDfsInspectionResponse::Status { .. }));
+    }
+
+    #[tokio::test]
+    async fn hosted_dfs_inspection_reuses_the_process_host() {
+        let host = Arc::new(StubDfsDataPlaneHost::default());
+        let registry =
+            register_services_with_data_plane_host(ServiceRegistry::builder(), host.clone())
+                .build();
+        let (_test_root, test_data_dir) = temp_data_dir();
+        let (disposition, response) = dispatch_local(
+            &registry,
+            test_data_dir,
+            DFS_INSPECTION_ROUTE,
+            &DaemonDfsInspectionRequest::Status,
+        )
+        .await;
+        assert_eq!(disposition, ServiceDisposition::Continue);
+        let result: DaemonDfsInspectionResponse = response.decode_body().expect("decode");
+        assert!(matches!(result, DaemonDfsInspectionResponse::Status { .. }));
+        assert_eq!(*host.inspection_calls.lock().expect("inspection calls"), 1);
     }
 
     #[tokio::test]

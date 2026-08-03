@@ -89,6 +89,19 @@ impl<'a> DfsNormalizedNamespacePrepare<'a> {
     }
 }
 
+/// Result of fencing a replica-location update against the current object.
+///
+/// `None` from [`DfsMetadataBackend::add_object_location_if_current`] means
+/// the object no longer names the expected visible version. A returned value
+/// always carries the current object and explicitly says whether the backend
+/// appended a journal entry, so callers can retain the matching replication
+/// wake across partial receipt/location retries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsObjectLocationUpdate {
+    pub object: DfsObjectMetadata,
+    pub journal_appended: bool,
+}
+
 /// Durable shard-local freeze installed while a same-primary membership
 /// handoff carries the retiring authority's exact state.
 ///
@@ -578,15 +591,16 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     /// expected visible version and content. Implementations must fence the
     /// check and update as one metadata write so a concurrent rename or unlink
     /// cannot be followed by a stale location update that resurrects the old
-    /// path. Returns the updated object, or `None` when the durable object has
-    /// moved, advanced, disappeared, or become a tombstone.
+    /// path. Returns the current object plus whether a journal entry was
+    /// appended, or `None` when the durable object has moved, advanced,
+    /// disappeared, or become a tombstone.
     fn add_object_location_if_current(
         &mut self,
         object_id: &DfsObjectId,
         expected_version: &DfsVersion,
         expected_content_hash: &str,
         replica_node_id: &NodeId,
-    ) -> Result<Option<DfsObjectMetadata>>;
+    ) -> Result<Option<DfsObjectLocationUpdate>>;
 
     /// Store several object records using the backend's default single-record
     /// path unless the implementation overrides it with an atomic batch.

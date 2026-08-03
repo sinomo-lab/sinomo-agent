@@ -27,7 +27,7 @@ use crate::intent::write_intent_status_is_active;
 use crate::metadata_api::{
     DfsMetadataBackend, DfsMetadataReplicaApplyReport, DfsMetadataReplicaIngestPermit,
     DfsMetadataShardWriteFreeze, DfsNamespaceRequestAdmissionSnapshot,
-    DfsNormalizedNamespacePrepare,
+    DfsNormalizedNamespacePrepare, DfsObjectLocationUpdate,
 };
 use crate::metadata_backend::LocalSobjMetadataBackend;
 use crate::metadata_error::{MetadataBackendError, Result};
@@ -920,6 +920,10 @@ impl ResidentLocalMetadataShardLease {
     pub fn shard_id(&self) -> &DfsMetadataShardId {
         &self.shard_id
     }
+
+    pub fn shard_root(&self) -> &Path {
+        &self.slot.root
+    }
 }
 
 impl Deref for ResidentLocalMetadataShardLease {
@@ -987,6 +991,24 @@ impl ResidentLocalShardedMetadataBackend {
                     shard_id.0
                 ))
             })
+    }
+
+    /// Verify that this resident generation is the exact durable router the
+    /// caller intends to borrow. This is used at boundaries where cluster KV
+    /// may have changed after a resident handle was captured.
+    pub fn matches_topology(
+        &self,
+        metadata_root: &Path,
+        shards: &[DfsMetadataShardConfig],
+    ) -> Result<bool> {
+        let expected = shards
+            .iter()
+            .map(|shard| (shard.shard_id.clone(), shard.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if expected.len() != shards.len() {
+            return Ok(false);
+        }
+        self.with_router(|router| router.root == metadata_root && router.shard_configs == expected)
     }
 
     /// Scope a handle to an exact filesystem and shard identity.
@@ -1244,19 +1266,6 @@ impl LocalMetadataShardSlot {
 
     fn opened_backend_mut(&mut self) -> Option<&mut LocalSobjMetadataBackend> {
         self.backend.get_mut()
-    }
-
-    fn into_backend(self) -> Result<LocalSobjMetadataBackend> {
-        if self.backend.get().is_none() {
-            let backend = self.open_backend()?;
-            self.backend
-                .set(backend)
-                .expect("exclusive metadata shard slot initialization succeeds");
-        }
-        Ok(self
-            .backend
-            .into_inner()
-            .expect("metadata shard slot initialized above"))
     }
 }
 
@@ -1528,22 +1537,6 @@ impl LocalShardedMetadataBackend {
                 .get(&shard_id.0)
                 .is_some_and(|config| config.primary_node_id == *local_node_id)
         })
-    }
-
-    /// Consume this router without reopening its shard-local backends.
-    ///
-    /// Some control-plane operations bind write authority to the exact
-    /// in-memory backend instance that validated a completed handoff. Moving
-    /// those instances into a bounded multi-shard operation preserves that
-    /// capability; reopening the same durable paths would intentionally
-    /// produce unbound, fenced instances instead.
-    pub(crate) fn into_shard_backends(
-        self,
-    ) -> Result<BTreeMap<DfsMetadataShardId, LocalSobjMetadataBackend>> {
-        self.shards
-            .into_iter()
-            .map(|(shard_id, slot)| slot.into_backend().map(|backend| (shard_id, backend)))
-            .collect()
     }
 
     #[cfg(test)]
@@ -2854,6 +2847,40 @@ mod lazy_replica_slot_tests {
     }
 
     #[test]
+    fn resident_topology_match_requires_exact_root_and_config_generation() {
+        let root = sinomo_testdir::TestDir::new("dfs-resident-topology-identity");
+        let metadata_root = root.path().join("metadata");
+        let local_node_id = node("resident-topology-local");
+        let shards = configs(&local_node_id);
+        let resident = LocalShardedMetadataBackend::new(&metadata_root, shards.clone())
+            .expect("open resident topology")
+            .into_resident();
+
+        assert!(
+            resident
+                .matches_topology(&metadata_root, &shards)
+                .expect("matching topology")
+        );
+        assert!(
+            !resident
+                .matches_topology(&root.path().join("other-metadata"), &shards)
+                .expect("mismatched root")
+        );
+        let mut advanced = shards.clone();
+        advanced[0].epoch = advanced[0].epoch.saturating_add(1);
+        assert!(
+            !resident
+                .matches_topology(&metadata_root, &advanced)
+                .expect("mismatched epoch")
+        );
+        assert!(
+            !resident
+                .matches_topology(&metadata_root, &shards[1..])
+                .expect("missing shard")
+        );
+    }
+
+    #[test]
     fn resident_handles_share_instance_local_handoff_authority() {
         let root = sinomo_testdir::TestDir::new("dfs-resident-shard-handoff-authority");
         let metadata_root = root.path().join("metadata");
@@ -3124,7 +3151,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         expected_version: &DfsVersion,
         expected_content_hash: &str,
         replica_node_id: &NodeId,
-    ) -> Result<Option<DfsObjectMetadata>> {
+    ) -> Result<Option<DfsObjectLocationUpdate>> {
         let Some((shard_id, authoritative_object)) =
             self.authoritative_object_placement(object_id)?
         else {
@@ -3144,8 +3171,8 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 expected_content_hash,
                 replica_node_id,
             )?;
-        if let Some(object) = updated.as_ref() {
-            self.write_object_shard_index(object, &shard_id)?;
+        if let Some(update) = updated.as_ref() {
+            self.write_object_shard_index(&update.object, &shard_id)?;
         }
         Ok(updated)
     }

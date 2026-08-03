@@ -180,20 +180,19 @@ fn metadata_table_checkpoint_coordination_lock() -> Result<MetadataTableCheckpoi
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn release_metadata_table_checkpoint_allocator_pages() -> bool {
+pub(crate) fn release_metadata_allocator_pages() -> bool {
     unsafe extern "C" {
         fn malloc_trim(pad: usize) -> std::ffi::c_int;
     }
 
-    // A fold temporarily owns a decoded copy of the complete retained table
-    // image plus its encoded snapshot. glibc otherwise keeps those thread
-    // arenas at the high-water mark, so co-located shards accumulate the RSS
-    // of every fold even after all temporary values have been dropped.
+    // Table folds and replica replay temporarily own large decoded metadata
+    // bodies. glibc otherwise keeps those thread arenas at the high-water
+    // mark, so co-located shards accumulate their RSS after the values drop.
     unsafe { malloc_trim(0) != 0 }
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn release_metadata_table_checkpoint_allocator_pages() -> bool {
+pub(crate) fn release_metadata_allocator_pages() -> bool {
     false
 }
 
@@ -1574,7 +1573,7 @@ fn run_coordinated_metadata_table_checkpoint_worker(
         drop(_fold_observation);
         let should_trim = result.as_ref().map_or(true, |run| run.snapshot_bytes > 0);
         let allocator_trim_started = Instant::now();
-        let allocator_trimmed = should_trim && release_metadata_table_checkpoint_allocator_pages();
+        let allocator_trimmed = should_trim && release_metadata_allocator_pages();
         let allocator_trim_ms = if should_trim {
             allocator_trim_started.elapsed().as_millis()
         } else {

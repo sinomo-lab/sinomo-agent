@@ -5503,10 +5503,11 @@ fn daemon_service_registry(
         .register(RolloutBinaryService {
             paths: paths.clone(),
         });
-    // Both daemon processes authenticate as the same cluster node, so a peer
-    // request may arrive over either process's network session. Keep the DFS
-    // protocol route set identical on both registries; otherwise route selection
-    // can turn a healthy replica or metadata primary into an "unknown route".
+    // Keep the peer DFS protocol routes on both registries as a fail-closed
+    // mixed-version surface. Current DFS callers require a main-daemon terminal;
+    // a legacy affinity-neutral replica mutation that reaches the shadow must
+    // receive the explicit data-owner rejection instead of an ambiguous
+    // "unknown route".
     let builder = if let Some(runtime) = service_runtime {
         sinomo_dfs::register_services_with_data_plane_host(
             builder,

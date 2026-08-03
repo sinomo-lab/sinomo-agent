@@ -1526,6 +1526,28 @@ fn test_routed_authority_shard(primary_node_id: &NodeId, epoch: u64) -> DfsMetad
     }
 }
 
+fn test_pending_routed_write(
+    request_id: &str,
+    requester: &NodeId,
+    object_id: &DfsObjectId,
+    primary_node_id: &NodeId,
+    authority_shard: DfsMetadataShardConfig,
+) -> PendingRoutedWrite {
+    PendingRoutedWrite {
+        canonical_request_id: request_id.to_string(),
+        object_id: object_id.clone(),
+        primary_node_id: primary_node_id.clone(),
+        authority_shard,
+        command: Some(test_routed_write_command(request_id, requester, object_id)),
+        authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
+        remote_intent_id: None,
+        durable_receipts: 0,
+        required_receipts: 1,
+        result: None,
+        compact_retained_at: None,
+    }
+}
+
 fn test_routed_authority_control_plane(
     authority_shard: &DfsMetadataShardConfig,
 ) -> SharedDfsControlPlaneKvClient<InProcessKvStore> {
@@ -15197,17 +15219,13 @@ fn routed_write_response_tracks_remote_intent_alias() {
     .with_control_plane(test_routed_authority_control_plane(&authority_shard));
     dfs.pending_routed_writes.insert(
         "dfs_net_req_1".to_string(),
-        PendingRoutedWrite {
-            object_id: object_id.clone(),
-            primary_node_id: primary.clone(),
+        test_pending_routed_write(
+            "dfs_net_req_1",
+            &requester,
+            &object_id,
+            &primary,
             authority_shard,
-            command: test_routed_write_command("dfs_net_req_1", &requester, &object_id),
-            authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
-            remote_intent_id: None,
-            durable_receipts: 0,
-            required_receipts: 1,
-            result: None,
-        },
+        ),
     );
 
     dfs.handle_distributed_write_response(
@@ -15239,6 +15257,40 @@ fn routed_write_response_tracks_remote_intent_alias() {
         dfs.pending_routed_writes
             .contains_key("intent_remote_alias")
     );
+    assert!(
+        dfs.pending_routed_writes["dfs_net_req_1"].command.is_some(),
+        "the canonical request retains its retry command while unresolved"
+    );
+    assert!(
+        dfs.pending_routed_writes["intent_remote_alias"]
+            .command
+            .is_none(),
+        "a remote intent alias must not clone the full routed command"
+    );
+
+    let event = dfs
+        .handle_distributed_write_response(
+            primary.clone(),
+            DfsDistributedWriteResponse {
+                request_id: "dfs_net_req_1".to_string(),
+                object_id: object_id.clone(),
+                result: DfsDistributedWriteResult::Rejected {
+                    reason: "exclusive retry observed the pending create".to_string(),
+                    current_primary_node_id: None,
+                },
+                metadata_journal_batches: Vec::new(),
+            },
+        )
+        .expect("stale retry rejection");
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::RemoteResponseDiscarded { .. }
+    ));
+    assert!(matches!(
+        dfs.write_outcome("intent_remote_alias")
+            .expect("intent remains pending"),
+        NetworkedDfsWriteOutcome::Pending { .. }
+    ));
 
     dfs.handle_distributed_write_response(
         primary,
@@ -15258,8 +15310,14 @@ fn routed_write_response_tracks_remote_intent_alias() {
     )
     .expect("committed response");
 
+    assert!(
+        dfs.pending_routed_writes
+            .values()
+            .all(|pending| pending.command.is_none()),
+        "terminal routed-write state must release every command body"
+    );
     assert!(matches!(
-        dfs.write_outcome("intent_remote_alias")
+        dfs.take_write_outcome("intent_remote_alias")
             .expect("alias outcome"),
         NetworkedDfsWriteOutcome::Committed {
             intent_id,
@@ -15267,46 +15325,74 @@ fn routed_write_response_tracks_remote_intent_alias() {
             ..
         } if intent_id == "intent_remote_alias" && committed_version == version
     ));
+    assert!(
+        dfs.pending_routed_writes.is_empty(),
+        "consuming the terminal outcome must remove the request and its aliases"
+    );
 
     std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
-fn pending_routed_write_ready_waits_for_final_result_not_remote_intent_alias() {
+fn pending_routed_write_timeout_compacts_request_and_publishes_late_commit_manifest() {
     let requester =
         NodeId::from_legacy_named("node_routed_write_ready_requester").expect("requester");
     let primary = NodeId::from_legacy_named("node_routed_write_ready_primary").expect("primary");
-    let object_id = DfsObjectId::from_legacy_named("obj_routed_write_ready").expect("object");
+    let alias_object_id =
+        DfsObjectId::from_legacy_named("obj_routed_write_ready_alias").expect("alias object");
+    let target_object_id =
+        DfsObjectId::from_legacy_named("obj_routed_write_ready_target").expect("target object");
     let version = DfsVersion::from_legacy_named("version_routed_write_ready").expect("version");
     let root = temp_root("routed-write-ready-final-result");
     let authority_shard = test_routed_authority_shard(&primary, 1);
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let local_bytes = b"late routed write manifest publication bytes";
+    let staged = content
+        .put_object_version_blob_only(
+            "obj_routed_write_ready_staging",
+            "version_routed_write_ready_staging",
+            local_bytes,
+        )
+        .expect("pre-stage requester blob");
     let mut dfs = NetworkedDfsService::new(
         FailingSendTransport {
             local_node_id: requester.clone(),
         },
-        LocalContentStore::new(root.join("content")).expect("content"),
+        content,
     )
     .with_control_plane(test_routed_authority_control_plane(&authority_shard));
-    dfs.pending_routed_writes.insert(
-        "dfs_net_req_1".to_string(),
-        PendingRoutedWrite {
-            object_id: object_id.clone(),
-            primary_node_id: primary.clone(),
-            authority_shard,
-            command: test_routed_write_command("dfs_net_req_1", &requester, &object_id),
-            authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
-            remote_intent_id: None,
-            durable_receipts: 0,
-            required_receipts: 1,
-            result: None,
-        },
+    let mut target = file_metadata(requester.clone());
+    target.object_id = target_object_id.clone();
+    target.path = "/services/routed-write-ready-target".to_string();
+    dfs.add_transient_object_metadata(target)
+        .expect("target metadata");
+    let mut alias = file_metadata(requester.clone());
+    alias.object_id = alias_object_id.clone();
+    alias.path = "/services/routed-write-ready-alias".to_string();
+    alias.kind = DfsObjectKind::Hardlink;
+    alias.link_target_object_id = Some(target_object_id.clone());
+    dfs.add_transient_object_metadata(alias)
+        .expect("hardlink metadata");
+    let mut pending = test_pending_routed_write(
+        "dfs_net_req_1",
+        &requester,
+        &alias_object_id,
+        &primary,
+        authority_shard,
     );
+    let command = pending.command.as_mut().expect("full retry command");
+    command.bytes = vec![0x5a; 1024 * 1024];
+    command.content_hash = Some(staged.content_hash.clone());
+    command.content_size_bytes = Some(local_bytes.len() as u64);
+    command.requester_blob_pre_staged = true;
+    dfs.pending_routed_writes
+        .insert("dfs_net_req_1".to_string(), pending);
 
     dfs.handle_distributed_write_response(
         primary.clone(),
         DfsDistributedWriteResponse {
             request_id: "dfs_net_req_1".to_string(),
-            object_id: object_id.clone(),
+            object_id: alias_object_id.clone(),
             result: DfsDistributedWriteResult::Outcome {
                 outcome: NetworkedDfsWriteOutcome::Pending {
                     intent_id: "intent_remote_alias".to_string(),
@@ -15326,33 +15412,119 @@ fn pending_routed_write_ready_waits_for_final_result_not_remote_intent_alias() {
         matches!(error, DfsError::Network { ref message } if message.contains("routed write responses did not arrive")),
         "unexpected readiness error: {error}"
     );
-
-    dfs.handle_distributed_write_response(
-        primary,
-        DfsDistributedWriteResponse {
-            request_id: "dfs_net_req_1".to_string(),
-            object_id,
-            result: DfsDistributedWriteResult::Outcome {
-                outcome: NetworkedDfsWriteOutcome::Committed {
-                    intent_id: "intent_remote_alias".to_string(),
-                    version,
-                    content_hash: "blake3:routed-write-ready".to_string(),
-                    repair_jobs: Vec::new(),
-                },
-            },
-            metadata_journal_batches: Vec::new(),
-        },
-    )
-    .expect("canonical final response");
     assert!(
-        dfs.pending_routed_writes
-            .get("intent_remote_alias")
-            .is_some_and(|pending| pending.result.is_none()),
-        "the alias intentionally retains the pending snapshot; readiness must resolve it through the canonical request"
+        !dfs.pending_routed_writes.is_empty()
+            && dfs
+                .pending_routed_writes
+                .values()
+                .all(|pending| pending.command.is_none()),
+        "a timed-out routed write must release every body while retaining late-response identity"
     );
-    dfs.process_incoming_until_pending_routed_writes_ready(Duration::from_millis(1))
-        .expect("canonical completion should mark both the request and its alias ready");
 
+    let event = dfs
+        .handle_distributed_write_response(
+            primary,
+            DfsDistributedWriteResponse {
+                request_id: "dfs_net_req_1".to_string(),
+                object_id: alias_object_id.clone(),
+                result: DfsDistributedWriteResult::Outcome {
+                    outcome: NetworkedDfsWriteOutcome::Committed {
+                        intent_id: "intent_remote_alias".to_string(),
+                        version: version.clone(),
+                        content_hash: staged.content_hash.clone(),
+                        repair_jobs: Vec::new(),
+                    },
+                },
+                metadata_journal_batches: Vec::new(),
+            },
+        )
+        .expect("late canonical final response");
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::RemoteWriteCompleted { .. }
+    ));
+    let manifest = dfs
+        .content
+        .read_manifest(target_object_id.as_str(), version.as_str())
+        .expect("late commit publishes canonical hardlink-target manifest");
+    assert_eq!(manifest.content_hash, staged.content_hash);
+    assert_eq!(manifest.size_bytes, local_bytes.len() as u64);
+    assert!(
+        dfs.content
+            .read_manifest(alias_object_id.as_str(), version.as_str())
+            .is_err(),
+        "manifest publication must follow the compact receipt through the current hardlink identity"
+    );
+    assert!(matches!(
+        dfs.take_write_outcome("intent_remote_alias")
+            .expect("late completion outcome"),
+        NetworkedDfsWriteOutcome::Committed { .. }
+    ));
+    assert!(dfs.pending_routed_writes.is_empty());
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn compact_routed_write_late_response_ledger_is_bounded_and_expires_aliases() {
+    let requester =
+        NodeId::from_legacy_named("node_routed_write_bound_requester").expect("requester");
+    let primary = NodeId::from_legacy_named("node_routed_write_bound_primary").expect("primary");
+    let object_id = DfsObjectId::from_legacy_named("obj_routed_write_bound").expect("object");
+    let root = temp_root("routed-write-late-response-bound");
+    let authority_shard = test_routed_authority_shard(&primary, 1);
+    let mut dfs = NetworkedDfsService::new(
+        FailingSendTransport {
+            local_node_id: requester.clone(),
+        },
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_control_plane(test_routed_authority_control_plane(&authority_shard));
+    let retained_at = Instant::now();
+    let request_count =
+        crate::service_routed_write::DFS_ROUTED_WRITE_LATE_RESPONSE_MAX_REQUESTS.saturating_add(1);
+    for index in 0..request_count {
+        let request_id = format!("dfs_net_req_bound_{index:04}");
+        let mut pending = test_pending_routed_write(
+            &request_id,
+            &requester,
+            &object_id,
+            &primary,
+            authority_shard.clone(),
+        );
+        pending.command = None;
+        pending.compact_retained_at = Some(retained_at + Duration::from_nanos(index as u64));
+        dfs.pending_routed_writes.insert(request_id, pending);
+    }
+
+    dfs.prune_retained_routed_writes();
+    assert_eq!(
+        dfs.pending_routed_writes.len(),
+        crate::service_routed_write::DFS_ROUTED_WRITE_LATE_RESPONSE_MAX_REQUESTS
+    );
+    assert!(
+        !dfs.pending_routed_writes
+            .contains_key("dfs_net_req_bound_0000")
+    );
+
+    let canonical_request_id = "dfs_net_req_bound_0001";
+    let mut alias = dfs.pending_routed_writes[canonical_request_id].clone();
+    alias.command = None;
+    alias.canonical_request_id = canonical_request_id.to_string();
+    dfs.pending_routed_writes
+        .insert("intent_routed_write_bound_alias".to_string(), alias);
+    let expired_at = Instant::now()
+        - crate::service_routed_write::DFS_ROUTED_WRITE_LATE_RESPONSE_TTL
+        - Duration::from_millis(1);
+    for pending in dfs.pending_routed_writes.values_mut() {
+        pending.compact_retained_at = Some(expired_at);
+    }
+
+    dfs.prune_retained_routed_writes();
+    assert!(
+        dfs.pending_routed_writes.is_empty(),
+        "expired canonical requests and every alias must be released together"
+    );
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -15374,17 +15546,13 @@ fn routed_write_stale_pending_response_does_not_downgrade_completion() {
     .with_control_plane(test_routed_authority_control_plane(&authority_shard));
     dfs.pending_routed_writes.insert(
         "dfs_net_req_1".to_string(),
-        PendingRoutedWrite {
-            object_id: object_id.clone(),
-            primary_node_id: primary.clone(),
+        test_pending_routed_write(
+            "dfs_net_req_1",
+            &requester,
+            &object_id,
+            &primary,
             authority_shard,
-            command: test_routed_write_command("dfs_net_req_1", &requester, &object_id),
-            authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
-            remote_intent_id: None,
-            durable_receipts: 0,
-            required_receipts: 1,
-            result: None,
-        },
+        ),
     );
 
     dfs.handle_distributed_write_response(
@@ -15511,15 +15679,21 @@ fn local_write_outcome_wins_over_stale_routed_alias_shadow() {
     dfs.pending_routed_writes.insert(
         intent_id.clone(),
         PendingRoutedWrite {
+            canonical_request_id: "dfs_net_req_shadow".to_string(),
             object_id: object_id.clone(),
             primary_node_id: primary.clone(),
             authority_shard: test_routed_authority_shard(&primary, 1),
-            command: test_routed_write_command("dfs_net_req_shadow", &local, &object_id),
+            command: Some(test_routed_write_command(
+                "dfs_net_req_shadow",
+                &local,
+                &object_id,
+            )),
             authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
             remote_intent_id: Some(intent_id.clone()),
             durable_receipts: 1,
             required_receipts: 2,
             result: None,
+            compact_retained_at: None,
         },
     );
 
@@ -16091,17 +16265,13 @@ fn routed_write_response_replays_primary_metadata_journal() {
     .expect("requester dfs");
     dfs.pending_routed_writes.insert(
         "dfs_net_req_journal".to_string(),
-        PendingRoutedWrite {
-            object_id: object_id.clone(),
-            primary_node_id: primary.clone(),
+        test_pending_routed_write(
+            "dfs_net_req_journal",
+            &requester,
+            &object_id,
+            &primary,
             authority_shard,
-            command: test_routed_write_command("dfs_net_req_journal", &requester, &object_id),
-            authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
-            remote_intent_id: None,
-            durable_receipts: 0,
-            required_receipts: 1,
-            result: None,
-        },
+        ),
     );
 
     dfs.handle_distributed_write_response(
@@ -16180,21 +16350,13 @@ fn routed_write_response_rejects_late_retired_primary_journal_without_mutation()
     .expect("receiver service");
     dfs.pending_routed_writes.insert(
         "dfs_net_req_retired_primary".to_string(),
-        PendingRoutedWrite {
-            object_id: object_id.clone(),
-            primary_node_id: retired_primary.clone(),
-            authority_shard: dispatch_authority,
-            command: test_routed_write_command(
-                "dfs_net_req_retired_primary",
-                &requester,
-                &object_id,
-            ),
-            authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
-            remote_intent_id: None,
-            durable_receipts: 0,
-            required_receipts: 1,
-            result: None,
-        },
+        test_pending_routed_write(
+            "dfs_net_req_retired_primary",
+            &requester,
+            &object_id,
+            &retired_primary,
+            dispatch_authority,
+        ),
     );
 
     let event = dfs
@@ -16262,17 +16424,13 @@ fn routed_write_response_rejects_retired_primary_outcome_without_journal_batches
     let request_id = "dfs_net_req_retired_primary_without_journal";
     dfs.pending_routed_writes.insert(
         request_id.to_string(),
-        PendingRoutedWrite {
-            object_id: object_id.clone(),
-            primary_node_id: retired_primary.clone(),
-            authority_shard: dispatch_authority,
-            command: test_routed_write_command(request_id, &requester, &object_id),
-            authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
-            remote_intent_id: None,
-            durable_receipts: 0,
-            required_receipts: 1,
-            result: None,
-        },
+        test_pending_routed_write(
+            request_id,
+            &requester,
+            &object_id,
+            &retired_primary,
+            dispatch_authority,
+        ),
     );
 
     let event = dfs
@@ -16348,17 +16506,13 @@ fn routed_write_response_rejects_same_primary_stale_dispatch_epoch_without_mutat
     .expect("receiver service");
     dfs.pending_routed_writes.insert(
         "dfs_net_req_stale_epoch".to_string(),
-        PendingRoutedWrite {
-            object_id: object_id.clone(),
-            primary_node_id: primary.clone(),
-            authority_shard: dispatch_authority,
-            command: test_routed_write_command("dfs_net_req_stale_epoch", &requester, &object_id),
-            authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
-            remote_intent_id: None,
-            durable_receipts: 0,
-            required_receipts: 1,
-            result: None,
-        },
+        test_pending_routed_write(
+            "dfs_net_req_stale_epoch",
+            &requester,
+            &object_id,
+            &primary,
+            dispatch_authority,
+        ),
     );
 
     let event = dfs
@@ -18300,13 +18454,39 @@ fn routed_write_nonforeground_response_replay_is_one_batch() {
     let responses = Arc::new(Mutex::new(Vec::<DfsDistributedWriteResponse>::new()));
     let responses_for_sender = Arc::clone(&responses);
     let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
-        if let DfsNetworkMessage::DistributedWriteResponse(response) =
-            &command.routed_message.message
-        {
-            responses_for_sender
-                .lock()
-                .expect("responses")
-                .push(response.clone());
+        match &command.routed_message.message {
+            DfsNetworkMessage::DistributedWriteResponse(response) => {
+                responses_for_sender
+                    .lock()
+                    .expect("responses")
+                    .push(response.clone());
+            }
+            DfsNetworkMessage::MetadataJournalBatch(batch) => {
+                return Ok(DfsMessageResponse {
+                    request_id: command.request_id.clone(),
+                    outbound_messages: vec![DfsRoutedMessage {
+                        source_node_id: command.routed_message.target_node_id.clone(),
+                        target_node_id: command.routed_message.source_node_id.clone(),
+                        frame_id: command.routed_message.frame_id.saturating_add(100),
+                        message_id: command.routed_message.message_id.saturating_add(100),
+                        message: DfsNetworkMessage::MetadataJournalBatchResponse(
+                            DfsMetadataJournalBatchResponse {
+                                request_id: batch.request_id.clone(),
+                                shard_id: batch.batch.shard_id.clone(),
+                                next_after_sequence: batch.batch.next_after_sequence,
+                                applied_entries: applied_metadata_journal_command_entry_count(
+                                    batch,
+                                ),
+                                verified_prefix_only: batch.verify_prefix_only,
+                                verified_authority_probe_id:
+                                    applied_metadata_journal_command_confirmation(batch),
+                                result: DfsMetadataJournalBatchResult::Applied,
+                            },
+                        ),
+                    }],
+                });
+            }
+            _ => {}
         }
         Ok(DfsMessageResponse {
             request_id: command.request_id.clone(),
@@ -30573,9 +30753,16 @@ fn duplicate_metadata_receipt_publication_is_idempotent() {
         content_hash,
     )
     .expect("first receipt");
-    let journal_count_before = std::fs::read_dir(root.join("metadata/journal"))
-        .expect("journal dir")
-        .count();
+    let journal_sequence_before = dfs
+        .metadata_backend
+        .as_ref()
+        .expect("metadata backend")
+        .metadata_shard_statuses()
+        .expect("metadata shard status")
+        .into_iter()
+        .map(|status| status.journal_last_sequence)
+        .max()
+        .unwrap_or_default();
 
     dfs.put_metadata_receipt(
         &sifs_file_system_id(),
@@ -30586,13 +30773,124 @@ fn duplicate_metadata_receipt_publication_is_idempotent() {
     )
     .expect("duplicate receipt");
 
-    let journal_count_after = std::fs::read_dir(root.join("metadata/journal"))
-        .expect("journal dir")
-        .count();
+    let journal_sequence_after = dfs
+        .metadata_backend
+        .as_ref()
+        .expect("metadata backend")
+        .metadata_shard_statuses()
+        .expect("metadata shard status")
+        .into_iter()
+        .map(|status| status.journal_last_sequence)
+        .max()
+        .unwrap_or_default();
     assert_eq!(
-        journal_count_after, journal_count_before,
+        journal_sequence_after, journal_sequence_before,
         "duplicate replica receipts for the same content hash should not emit journal entries"
     );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn receipt_replay_publishes_a_missing_location_then_becomes_exactly_idempotent() {
+    let root = temp_root("metadata-receipt-partial-location-replay");
+    let owner = NodeId::from_legacy_named("node_receipt_partial_owner").expect("owner");
+    let replica = NodeId::from_legacy_named("node_receipt_partial_replica").expect("replica");
+    let object_id = DfsObjectId::from_legacy_named("obj_receipt_partial").expect("object");
+    let version = DfsVersion::from_legacy_named("version_receipt_partial").expect("version");
+    let content_hash = "blake3:receipt-partial";
+
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let mut object = file_metadata(owner.clone());
+    object.object_id = object_id.clone();
+    object.path = "/receipt-partial.bin".to_string();
+    object.version = version.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![owner.clone()];
+    object.content_hash = Some(content_hash.to_string());
+    object.content_size_bytes = Some(1);
+    dfs.add_object_metadata(object.clone())
+        .expect("visible object");
+    dfs.put_visible_object_in_metadata_backend(&object)
+        .expect("durable visible object");
+
+    // Model a crash after the receipt commit but before its separately
+    // journaled visible-location update.
+    dfs.metadata_backend
+        .as_mut()
+        .expect("metadata backend")
+        .put_receipt(&DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                committed_version: version.clone(),
+                owner_node_id: owner,
+                event_id: EventId::generate(),
+            },
+            replica_node_id: replica.clone(),
+            content_hash: Some(content_hash.to_string()),
+            received_at: OffsetDateTime::now_utc(),
+        })
+        .expect("partial durable receipt");
+    let journal_sequence_before_location = dfs
+        .metadata_backend
+        .as_ref()
+        .expect("metadata backend")
+        .metadata_shard_statuses()
+        .expect("metadata shard status")[0]
+        .journal_last_sequence;
+
+    let committed_work = DfsCommittedWorkTracker::new();
+    dfs.set_committed_work_tracker(committed_work.clone());
+    assert!(
+        !dfs.put_metadata_receipt(
+            &sifs_file_system_id(),
+            &object_id,
+            &version,
+            &replica,
+            content_hash,
+        )
+        .expect("repair partial receipt"),
+        "the receipt itself was already durable"
+    );
+    let journal_sequence_after_location = dfs
+        .metadata_backend
+        .as_ref()
+        .expect("metadata backend")
+        .metadata_shard_statuses()
+        .expect("metadata shard status")[0]
+        .journal_last_sequence;
+    assert_eq!(
+        journal_sequence_after_location,
+        journal_sequence_before_location + 1,
+        "repairing the missing location must append exactly one journal entry"
+    );
+    assert!(
+        committed_work.take().publish_metadata,
+        "the location-only journal append must retain its publication edge"
+    );
+
+    assert!(
+        !dfs.put_metadata_receipt(
+            &sifs_file_system_id(),
+            &object_id,
+            &version,
+            &replica,
+            content_hash,
+        )
+        .expect("exact receipt replay")
+    );
+    assert_eq!(
+        dfs.metadata_backend
+            .as_ref()
+            .expect("metadata backend")
+            .metadata_shard_statuses()
+            .expect("metadata shard status")[0]
+            .journal_last_sequence,
+        journal_sequence_after_location,
+        "an exact replay must not append another location transaction"
+    );
+    assert_eq!(committed_work.take(), DfsCommittedWork::default());
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -34735,9 +35033,27 @@ fn sifs_posix_cluster_pump_until(
         }
         let activity = sifs_posix_cluster_pump_round(cluster);
         if Instant::now() >= deadline {
+            let writer_pending = cluster
+                .writer
+                .pending_routed_writes
+                .iter()
+                .map(|(request_id, pending)| {
+                    format!(
+                        "{}=>canonical:{} remote:{:?} receipts:{}/{} command:{} result:{:?}",
+                        request_id,
+                        pending.canonical_request_id,
+                        pending.remote_intent_id,
+                        pending.durable_receipts,
+                        pending.required_receipts,
+                        pending.command.is_some(),
+                        pending.result,
+                    )
+                })
+                .collect::<Vec<_>>();
             panic!(
-                "SIFS cluster did not converge within deadline: {what}; journal rejections: {:?}",
-                cluster.rejections
+                "SIFS cluster did not converge within deadline: {what}; writer pending: {writer_pending:?}; primary pending responses: {:?}; journal rejections: {:?}",
+                cluster.primary.pending_remote_write_responses.keys(),
+                cluster.rejections,
             );
         }
         if activity == 0 {
@@ -38373,7 +38689,8 @@ fn sifs_cluster_retried_pending_routed_create_preserves_parent_mtime_touch() {
         .next()
         .expect("pending routed create")
         .command
-        .clone();
+        .clone()
+        .expect("pending routed create command");
 
     cluster
         .primary
@@ -39092,16 +39409,18 @@ fn sifs_cluster_empty_create_routes_retries_replicates_and_survives_restart() {
         .pending_routed_writes
         .values()
         .find(|pending| {
-            pending.command.exclusive_create
-                && pending
-                    .command
-                    .object_metadata
-                    .as_ref()
-                    .is_some_and(|object| object.path == exclusive_path)
+            pending.command.as_ref().is_some_and(|command| {
+                command.exclusive_create
+                    && command
+                        .object_metadata
+                        .as_ref()
+                        .is_some_and(|object| object.path == exclusive_path)
+            })
         })
         .expect("pending routed empty create")
         .command
-        .clone();
+        .clone()
+        .expect("pending routed empty create command");
     assert!(command.exclusive_create);
     assert!(command.bytes.is_empty());
     assert_eq!(command.content_hash, None);
@@ -45196,17 +45515,13 @@ fn late_routed_responses_are_discarded_without_failing_the_event_loop() {
     let primary = NodeId::from_legacy_named("node_late_response_primary").expect("primary");
     dfs.pending_routed_writes.insert(
         "dfs_net_req_tracked".to_string(),
-        PendingRoutedWrite {
-            object_id: object_id.clone(),
-            primary_node_id: primary.clone(),
-            authority_shard: test_routed_authority_shard(&primary, 1),
-            command: test_routed_write_command("dfs_net_req_tracked", &local, &object_id),
-            authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
-            remote_intent_id: None,
-            durable_receipts: 0,
-            required_receipts: 1,
-            result: None,
-        },
+        test_pending_routed_write(
+            "dfs_net_req_tracked",
+            &local,
+            &object_id,
+            &primary,
+            test_routed_authority_shard(&primary, 1),
+        ),
     );
     let event = dfs
         .handle_distributed_write_response(
@@ -47651,17 +47966,13 @@ fn served_requester_completion_does_not_claim_authority_repair_work() {
     let request_id = "dfs_committed_work_completion";
     dfs.pending_routed_writes.insert(
         request_id.to_string(),
-        PendingRoutedWrite {
-            object_id: object_id.clone(),
-            primary_node_id: primary.clone(),
+        test_pending_routed_write(
+            request_id,
+            &requester,
+            &object_id,
+            &primary,
             authority_shard,
-            command: test_routed_write_command(request_id, &requester, &object_id),
-            authority_redirects_remaining: DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT,
-            remote_intent_id: None,
-            durable_receipts: 0,
-            required_receipts: 1,
-            result: None,
-        },
+        ),
     );
     let report = dfs.process_message_command_report(test_dfs_message_command(
         "dfs_message_committed_work_completion",

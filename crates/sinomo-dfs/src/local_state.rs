@@ -919,109 +919,138 @@ pub fn inspect_cluster_aware_dfs(
     cluster_paths: &ClusterPaths,
     request: DaemonDfsInspectionRequest,
 ) -> Result<DaemonDfsInspectionResponse, DfsError> {
+    match &request {
+        DaemonDfsInspectionRequest::ResolveConflicts { .. }
+        | DaemonDfsInspectionRequest::UseConflictVersion { .. } => {
+            let mut metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
+            inspect_cluster_aware_dfs_from_metadata(
+                data_dir,
+                cluster_paths,
+                metadata.as_mut(),
+                request,
+            )
+        }
+        read_only_request => {
+            with_cached_cluster_aware_dfs_metadata_inspection(data_dir, cluster_paths, |metadata| {
+                inspect_cluster_aware_dfs_read_only_from_metadata(
+                    data_dir,
+                    cluster_paths,
+                    metadata,
+                    read_only_request.clone(),
+                )
+            })
+        }
+    }
+}
+
+/// Serve one inspection request from the metadata generation already owned by
+/// the embedding daemon. Callers must fence writable requests with their
+/// ordinary metadata mutation admission before borrowing this backend.
+pub fn inspect_cluster_aware_dfs_from_metadata(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    metadata: &mut dyn DfsMetadataBackend,
+    request: DaemonDfsInspectionRequest,
+) -> Result<DaemonDfsInspectionResponse, DfsError> {
     match request {
-        DaemonDfsInspectionRequest::Status => Ok(DaemonDfsInspectionResponse::Status {
-            status: inspect_cluster_aware_dfs_status(data_dir, cluster_paths)?,
-        }),
         DaemonDfsInspectionRequest::ResolveConflicts {
             file_system_id,
             object_id,
             conflict_ids,
-        } => {
-            let mut metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
-            Ok(DaemonDfsInspectionResponse::ResolveConflicts {
-                report: resolve_dfs_conflicts(
-                    metadata.as_mut(),
-                    file_system_id.as_ref(),
-                    object_id.as_ref(),
-                    &conflict_ids,
-                )?,
-            })
-        }
+        } => Ok(DaemonDfsInspectionResponse::ResolveConflicts {
+            report: resolve_dfs_conflicts(
+                metadata,
+                file_system_id.as_ref(),
+                object_id.as_ref(),
+                &conflict_ids,
+            )?,
+        }),
         DaemonDfsInspectionRequest::UseConflictVersion {
             object_id,
             version,
             conflict_ids,
-        } => {
-            let mut metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
-            Ok(DaemonDfsInspectionResponse::UseConflictVersion {
-                report: use_dfs_conflict_version(
-                    metadata.as_mut(),
-                    &object_id,
-                    &version,
-                    &conflict_ids,
-                )?,
-            })
-        }
-        read_only_request => {
-            with_cached_cluster_aware_dfs_metadata_inspection(data_dir, cluster_paths, |metadata| {
-                let inspector = DfsOperatorInspector::new(metadata);
-                Ok(match read_only_request {
-                    DaemonDfsInspectionRequest::Status
-                    | DaemonDfsInspectionRequest::ResolveConflicts { .. }
-                    | DaemonDfsInspectionRequest::UseConflictVersion { .. } => {
-                        unreachable!("status and mutations handled before inspection cache")
-                    }
-                    DaemonDfsInspectionRequest::FileSystem { file_system_id } => {
-                        DaemonDfsInspectionResponse::FileSystem {
-                            file_system: inspector.file_system(&file_system_id)?,
-                        }
-                    }
-                    DaemonDfsInspectionRequest::Path {
-                        file_system_id,
-                        path,
-                    } => DaemonDfsInspectionResponse::Path {
-                        object: inspector.object_by_path(&file_system_id, &path)?,
-                    },
-                    DaemonDfsInspectionRequest::Object { object_id } => {
-                        DaemonDfsInspectionResponse::Object {
-                            object: inspector.object(&object_id)?,
-                        }
-                    }
-                    DaemonDfsInspectionRequest::Conflicts {
-                        file_system_id,
-                        object_id,
-                        limit,
-                        cursor,
-                    } => {
-                        let page = inspector.conflicts_page(
-                            file_system_id.as_ref(),
-                            object_id.as_ref(),
-                            limit,
-                            cursor.as_ref(),
-                        )?;
-                        DaemonDfsInspectionResponse::Conflicts {
-                            conflicts: page.conflicts,
-                            next_cursor: page.next_cursor,
-                        }
-                    }
-                    DaemonDfsInspectionRequest::ConflictVersions {
-                        object_id,
-                        conflict_ids,
-                    } => DaemonDfsInspectionResponse::ConflictVersions {
-                        report: inspector.conflict_versions(&object_id, &conflict_ids)?,
-                    },
-                    DaemonDfsInspectionRequest::Repair {
-                        file_system_id,
-                        object_id,
-                        limit,
-                        cursor,
-                    } => {
-                        let page = inspector.repairs_page(
-                            file_system_id.as_ref(),
-                            object_id.as_ref(),
-                            limit,
-                            cursor.as_ref(),
-                        )?;
-                        DaemonDfsInspectionResponse::Repair {
-                            repairs: page.repairs,
-                            next_cursor: page.next_cursor,
-                        }
-                    }
-                })
-            })
-        }
+        } => Ok(DaemonDfsInspectionResponse::UseConflictVersion {
+            report: use_dfs_conflict_version(metadata, &object_id, &version, &conflict_ids)?,
+        }),
+        read_only_request => inspect_cluster_aware_dfs_read_only_from_metadata(
+            data_dir,
+            cluster_paths,
+            metadata,
+            read_only_request,
+        ),
     }
+}
+
+fn inspect_cluster_aware_dfs_read_only_from_metadata(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    metadata: &dyn DfsMetadataBackend,
+    request: DaemonDfsInspectionRequest,
+) -> Result<DaemonDfsInspectionResponse, DfsError> {
+    let inspector = DfsOperatorInspector::new(metadata);
+    Ok(match request {
+        DaemonDfsInspectionRequest::Status => DaemonDfsInspectionResponse::Status {
+            status: inspect_dfs_status_from_metadata(data_dir, cluster_paths, metadata)?,
+        },
+        DaemonDfsInspectionRequest::FileSystem { file_system_id } => {
+            DaemonDfsInspectionResponse::FileSystem {
+                file_system: inspector.file_system(&file_system_id)?,
+            }
+        }
+        DaemonDfsInspectionRequest::Path {
+            file_system_id,
+            path,
+        } => DaemonDfsInspectionResponse::Path {
+            object: inspector.object_by_path(&file_system_id, &path)?,
+        },
+        DaemonDfsInspectionRequest::Object { object_id } => DaemonDfsInspectionResponse::Object {
+            object: inspector.object(&object_id)?,
+        },
+        DaemonDfsInspectionRequest::Conflicts {
+            file_system_id,
+            object_id,
+            limit,
+            cursor,
+        } => {
+            let page = inspector.conflicts_page(
+                file_system_id.as_ref(),
+                object_id.as_ref(),
+                limit,
+                cursor.as_ref(),
+            )?;
+            DaemonDfsInspectionResponse::Conflicts {
+                conflicts: page.conflicts,
+                next_cursor: page.next_cursor,
+            }
+        }
+        DaemonDfsInspectionRequest::ConflictVersions {
+            object_id,
+            conflict_ids,
+        } => DaemonDfsInspectionResponse::ConflictVersions {
+            report: inspector.conflict_versions(&object_id, &conflict_ids)?,
+        },
+        DaemonDfsInspectionRequest::Repair {
+            file_system_id,
+            object_id,
+            limit,
+            cursor,
+        } => {
+            let page = inspector.repairs_page(
+                file_system_id.as_ref(),
+                object_id.as_ref(),
+                limit,
+                cursor.as_ref(),
+            )?;
+            DaemonDfsInspectionResponse::Repair {
+                repairs: page.repairs,
+                next_cursor: page.next_cursor,
+            }
+        }
+        DaemonDfsInspectionRequest::ResolveConflicts { .. }
+        | DaemonDfsInspectionRequest::UseConflictVersion { .. } => {
+            unreachable!("writable inspection request reached the read-only backend")
+        }
+    })
 }
 
 #[cfg(test)]

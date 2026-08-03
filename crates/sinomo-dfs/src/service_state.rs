@@ -833,18 +833,28 @@ pub(crate) struct PendingMetadataAuthorityProbe {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PendingRoutedWrite {
+    /// Stable requester identity for this routed write. Remote intent aliases
+    /// point back to this key without cloning the full wire command.
+    pub(crate) canonical_request_id: String,
     pub(crate) object_id: DfsObjectId,
     pub(crate) primary_node_id: NodeId,
     /// Exact committed shard assignment used to choose `primary_node_id` for
     /// this dispatch. Response journals are admitted only while this remains
     /// the current assignment, including its authority epoch.
     pub(crate) authority_shard: DfsMetadataShardConfig,
-    pub(crate) command: DfsDistributedWriteCommand,
+    /// Full retry command while the request is unresolved. Terminal outcomes
+    /// are compact polling receipts; durable metadata owns exact replay after
+    /// this body is released.
+    pub(crate) command: Option<DfsDistributedWriteCommand>,
     pub(crate) authority_redirects_remaining: usize,
     pub(crate) remote_intent_id: Option<String>,
     pub(crate) durable_receipts: usize,
     pub(crate) required_receipts: usize,
     pub(crate) result: Option<Result<NetworkedDfsWriteOutcome, DfsError>>,
+    /// When the full retry body was released. The requester accepts late
+    /// authoritative completion only for a bounded recovery window; durable
+    /// intent receipts own reconciliation after this compact state expires.
+    pub(crate) compact_retained_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

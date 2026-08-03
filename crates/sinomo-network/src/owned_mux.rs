@@ -1208,6 +1208,23 @@ fn lookup_slot(streams: &StreamMap, stream_id: u64) -> Option<Arc<StreamSlot>> {
         .and_then(|slot| slot.upgrade())
 }
 
+fn register_slot(
+    streams: &StreamMap,
+    slot: &Arc<StreamSlot>,
+    operation: &'static str,
+) -> Result<(), NetworkError> {
+    let mut streams = streams
+        .lock()
+        .map_err(|_| mux_error(operation, "stream map lock poisoned"))?;
+    // Stream IDs are never reused, so completed slots have no future lookup
+    // value. The carrier itself is intentionally long-lived; prune dead weak
+    // registrations whenever either endpoint opens another logical stream so
+    // historical RPCs do not accumulate for the carrier's entire lifetime.
+    streams.retain(|_, registered| registered.strong_count() != 0);
+    streams.insert(slot.stream_id, Arc::downgrade(slot));
+    Ok(())
+}
+
 fn fail_slots(streams: &StreamMap, detail: &str) {
     if let Ok(mut streams) = streams.lock() {
         for slot in streams.values().filter_map(Weak::upgrade) {
@@ -1424,10 +1441,7 @@ async fn run_owned_carrier_receiver(
                 .ok_or_else(|| mux_error("accept owned logical stream", "carrier closed"))?;
             let slot = StreamSlot::new(record.stream_id, &tx, &connection);
             tx.register_stream(record.stream_id, true)?;
-            streams
-                .lock()
-                .map_err(|_| mux_error("accept owned logical stream", "stream map lock poisoned"))?
-                .insert(record.stream_id, Arc::downgrade(&slot));
+            register_slot(&streams, &slot, "accept owned logical stream")?;
             if matches!(record.kind, FRAME_OPEN_DATA | FRAME_OPEN_DATA_FINISH) {
                 if record.kind == FRAME_OPEN_DATA_FINISH {
                     // Set this before publishing the first lease for the same
@@ -1624,15 +1638,7 @@ impl OwnedRoutedStreamClient {
         }
         let slot = StreamSlot::new(stream_id, &self.tx, &self.connection);
         self.tx.register_stream(stream_id, false)?;
-        self.streams
-            .lock()
-            .map_err(|_| {
-                mux_error(
-                    "open owned routed logical stream",
-                    "stream map lock poisoned",
-                )
-            })?
-            .insert(stream_id, Arc::downgrade(&slot));
+        register_slot(&self.streams, &slot, "open owned routed logical stream")?;
         peer_stream_for_slot(
             &self.metadata,
             slot,
@@ -1776,6 +1782,46 @@ mod tests {
             connection.returned_credit.load(Ordering::Acquire),
             charged,
             "carrier credit return must not depend on the completed stream slot"
+        );
+    }
+
+    #[test]
+    fn stream_registration_prunes_completed_slots_without_touching_live_streams() {
+        let tx = TxScheduler::new();
+        let connection = CarrierCredits::new(&tx);
+        let streams = Arc::new(Mutex::new(BTreeMap::new()));
+        let live = StreamSlot::new(1, &tx, &connection);
+        register_slot(&streams, &live, "register test live stream").expect("register live stream");
+
+        for stream_id in (3..2051).step_by(2) {
+            let completed = StreamSlot::new(stream_id, &tx, &connection);
+            register_slot(&streams, &completed, "register test completed stream")
+                .expect("register completed stream");
+            assert!(Arc::ptr_eq(
+                &lookup_slot(&streams, live.stream_id).expect("live stream remains registered"),
+                &live,
+            ));
+            assert!(
+                streams.lock().expect("stream map").len() <= 2,
+                "one live and at most one newly completed registration remain"
+            );
+            drop(completed);
+        }
+
+        let second_live = StreamSlot::new(2051, &tx, &connection);
+        register_slot(&streams, &second_live, "register test second live stream")
+            .expect("register second live stream");
+        let streams = streams.lock().expect("stream map");
+        assert_eq!(streams.len(), 2);
+        assert!(
+            streams
+                .get(&live.stream_id)
+                .is_some_and(|registered| registered.ptr_eq(&Arc::downgrade(&live)))
+        );
+        assert!(
+            streams
+                .get(&second_live.stream_id)
+                .is_some_and(|registered| registered.ptr_eq(&Arc::downgrade(&second_live)))
         );
     }
 

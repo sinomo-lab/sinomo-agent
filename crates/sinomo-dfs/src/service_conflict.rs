@@ -382,12 +382,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 &local_node_id,
                                 &manifest.content_hash,
                             )?;
-                            self.mark_repaired_location(
-                                &object.object_id,
-                                &object.version,
-                                &local_node_id,
-                                &manifest.content_hash,
-                            )?;
                             if receipt_inserted {
                                 refreshed_receipts += 1;
                             }

@@ -50,6 +50,13 @@ use crate::{
 const DFS_SERVED_MESSAGE_REPAIR_MAX_JOBS: usize = 2;
 /// Refinement of `PromotionFanoutCap` in `replica_quorum_fanout.qnt`.
 const DFS_COMMIT_PROMOTION_MAX_INFLIGHT: usize = 2;
+/// Process-local terminal promotion identities suppress redundant hydration
+/// replay, but durable committed intents and replica receipts own recovery.
+/// Keep a recent window rather than retaining one entry for every object ever
+/// promoted by this daemon.
+const DFS_TERMINAL_COMMIT_PROMOTION_MAX_ENTRIES: usize = 4_096;
+const DFS_TERMINAL_COMMIT_PROMOTION_RETAIN_ENTRIES: usize =
+    DFS_TERMINAL_COMMIT_PROMOTION_MAX_ENTRIES / 2;
 /// Refinement of the bounded metadata-checkpoint fan-out model. Direct
 /// checkpoint RPCs are best-effort accelerators: later catch-up retains
 /// correctness when a sibling is slow or unavailable.
@@ -215,7 +222,9 @@ impl DfsObjectRpcSendOptions {
         if let Some(overall_timeout) = self.overall_timeout {
             route_options = route_options.with_overall_timeout(overall_timeout);
         }
-        route_options
+        route_options.with_destination_process_affinity(
+            sinomo_core::network::DestinationProcessAffinity::MainDaemon,
+        )
     }
 
     pub fn with_observe_connectivity(mut self, observe_connectivity: bool) -> Self {
@@ -627,6 +636,29 @@ struct DfsNodeDetachedSendOutbox {
     terminal_commit_promotions:
         BTreeMap<DfsCommitPromotionSettlementKey, DfsTerminalCommitPromotion>,
     next_promotion_sequence: u64,
+}
+
+impl DfsNodeDetachedSendOutbox {
+    fn compact_terminal_commit_promotions_if_needed(&mut self) {
+        if self.terminal_commit_promotions.len() <= DFS_TERMINAL_COMMIT_PROMOTION_MAX_ENTRIES {
+            return;
+        }
+
+        // Terminal outcomes are process-local replay suppression, not recovery
+        // evidence. A committed target is idempotent, not-desired retirement
+        // is authority-derived, and repair-pending has already durably removed
+        // the stale receipt. Forgetting an old entry can therefore only permit
+        // one safe replay reconstructed from the durable intent/receipt state.
+        // Compact with hysteresis so high-churn workloads do not sort the
+        // bounded window after every newly settled object.
+        let mut retained = std::mem::take(&mut self.terminal_commit_promotions)
+            .into_iter()
+            .collect::<Vec<_>>();
+        retained
+            .sort_unstable_by(|left, right| right.1.enqueue_sequence.cmp(&left.1.enqueue_sequence));
+        retained.truncate(DFS_TERMINAL_COMMIT_PROMOTION_RETAIN_ENTRIES);
+        self.terminal_commit_promotions.extend(retained);
+    }
 }
 
 /// Queue and replay indexes shared by DFS served-message transports.
@@ -2307,6 +2339,7 @@ impl DfsNodeTransport {
                     outcome,
                 },
             );
+            outbox.compact_terminal_commit_promotions_if_needed();
         }
         Ok(())
     }
@@ -3689,6 +3722,21 @@ mod tests {
     use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
+
+    #[test]
+    fn dfs_peer_rpc_options_require_a_main_daemon_terminal() {
+        let overall_timeout = Duration::from_secs(7);
+        let actual = DfsObjectRpcSendOptions::default()
+            .with_overall_timeout(overall_timeout)
+            .cluster_rpc_options();
+        let expected = sinomo_core::network::ClusterObjectRpcOptions::default()
+            .with_overall_timeout(overall_timeout)
+            .with_destination_process_affinity(
+                sinomo_core::network::DestinationProcessAffinity::MainDaemon,
+            );
+
+        assert_eq!(actual, expected);
+    }
 
     fn node_id(name: &str) -> NodeId {
         NodeId::from_legacy_named(name).expect("node id")
@@ -6289,6 +6337,69 @@ mod tests {
             .expect("settled duplicate should be suppressed");
         assert_eq!(transport.detached_send_count(), 0);
         assert_eq!(calls.load(Ordering::SeqCst), 32);
+    }
+
+    #[test]
+    fn detached_commit_promotion_terminal_history_evicts_oldest_safe_replays() {
+        let local = node_id("node_commit_promotion_eviction_local");
+        let remote = node_id("node_commit_promotion_eviction_remote");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender_calls = Arc::clone(&calls);
+        let sender: DfsMessageSender = Arc::new(move |_target, command, _options| {
+            sender_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(test_committed_promotion_rpc_response(command))
+        });
+        let mut transport = DfsNodeTransport::with_connect_timeout(
+            local.clone(),
+            vec![remote.clone()],
+            Duration::from_secs(1),
+            Arc::clone(&sender),
+        );
+        let oldest = test_commit_version_message(&local, &remote, 1);
+        let newest_frame = DFS_TERMINAL_COMMIT_PROMOTION_MAX_ENTRIES as u64 + 1;
+        let newest = test_commit_version_message(&local, &remote, newest_frame);
+
+        // Populate terminal outcomes directly: the bounded-history behavior is
+        // independent of RPC fan-out, and avoiding thousands of test threads
+        // keeps this regression focused on the retained outbox state.
+        for frame_id in 1..=newest_frame {
+            let send = DeferredDfsPeerSend {
+                sender: Arc::clone(&sender),
+                options: DfsObjectRpcSendOptions::new(Duration::from_secs(1)),
+                operation_deadline: None,
+                target_node_id: remote.clone(),
+                routed_message: test_commit_version_message(&local, &remote, frame_id),
+                promotion_sequence: Some(frame_id),
+                retry_attempts: 0,
+            };
+            transport
+                .mark_commit_promotion_terminal(&send, DfsCommitPromotionTerminalOutcome::Committed)
+                .expect("record terminal promotion");
+        }
+
+        assert_eq!(
+            transport.settled_commit_promotion_count(),
+            DFS_TERMINAL_COMMIT_PROMOTION_RETAIN_ENTRIES,
+            "terminal promotion history should compact to its recent window"
+        );
+        transport
+            .send_detached_routed_message(&remote, newest)
+            .expect("recent terminal duplicate");
+        assert_eq!(
+            transport.detached_send_count(),
+            0,
+            "the retained recent window should still suppress exact replay"
+        );
+
+        transport
+            .send_detached_routed_message(&remote, oldest)
+            .expect("evicted terminal replay");
+        assert_eq!(transport.detached_send_count(), 1);
+        transport
+            .flush_detached_sends()
+            .expect("evicted committed promotion replays idempotently");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.pending_commit_promotion_count(), 0);
     }
 
     #[test]

@@ -28,8 +28,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
         let pending_request_ids = self
             .pending_routed_writes
-            .keys()
-            .cloned()
+            .iter()
+            .filter(|(request_id, pending)| *request_id == &pending.canonical_request_id)
+            .map(|(request_id, _)| request_id.clone())
             .collect::<Vec<_>>();
         if pending_request_ids.is_empty() {
             return self.process_incoming();
@@ -37,20 +38,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let started = Instant::now();
         let mut events = Vec::new();
         loop {
-            events.extend(self.process_incoming()?);
-            if pending_request_ids.iter().all(|request_id| {
-                if !self.pending_routed_writes.contains_key(request_id) {
-                    return true;
+            match self.process_incoming() {
+                Ok(incoming) => events.extend(incoming),
+                Err(error) => {
+                    for request_id in &pending_request_ids {
+                        self.compact_pending_routed_write(request_id);
+                    }
+                    return Err(error);
                 }
-                !matches!(
-                    self.write_outcome(request_id),
+            }
+            let mut all_ready = true;
+            for request_id in &pending_request_ids {
+                if !self.pending_routed_writes.contains_key(request_id) {
+                    continue;
+                }
+                if matches!(
+                    self.take_write_outcome(request_id),
                     Ok(NetworkedDfsWriteOutcome::Pending { .. })
-                )
-            }) {
+                ) {
+                    all_ready = false;
+                }
+            }
+            if all_ready {
                 return Ok(events);
             }
             let elapsed = started.elapsed();
             if elapsed >= timeout {
+                for request_id in &pending_request_ids {
+                    self.compact_pending_routed_write(request_id);
+                }
                 return Err(DfsError::Network {
                     message: format!(
                         "DFS routed write responses did not arrive within {}ms",
@@ -59,9 +75,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
             let wait = Duration::from_millis(10).min(timeout.saturating_sub(elapsed));
-            self.transport
-                .wait_for_incoming(wait)
-                .map_err(DfsError::from_network)?;
+            if let Err(error) = self.transport.wait_for_incoming(wait) {
+                for request_id in &pending_request_ids {
+                    self.compact_pending_routed_write(request_id);
+                }
+                return Err(DfsError::from_network(error));
+            }
         }
     }
 

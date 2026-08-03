@@ -441,12 +441,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             &response.intent_id,
                             response.replica_node_id.clone(),
                         )?;
-                        service.mark_repaired_location(
-                            &response.object_id,
-                            &response.version,
-                            &response.replica_node_id,
-                            content_hash,
-                        )?;
                         service.record_repair_metadata_settle(
                             &response.intent_id,
                             &response.replica_node_id,
@@ -1092,6 +1086,7 @@ where
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn prune_idle_transfer_state(&mut self) {
+        self.prune_retained_routed_writes();
         // Requesters give up on routed writes after their settle timeout;
         // response obligations they will never consume must not accumulate.
         if !self.pending_remote_write_responses.is_empty() {
