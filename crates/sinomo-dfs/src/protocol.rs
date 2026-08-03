@@ -1,13 +1,14 @@
 use crate::{
     DfsAdvisoryLockCommand, DfsAdvisoryLockOutcome, DfsAdvisoryLockStateRecord, DfsConflictRecord,
     DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest, DfsFileSystemId,
-    DfsMetadataJournalBatch, DfsMetadataPrefixProof, DfsMetadataShardConfig, DfsMetadataShardId,
-    DfsMetadataTableSnapshot, DfsMetadataVersionPinRecord, DfsNamespaceJobRecord,
-    DfsNamespaceTransaction, DfsObjectId, DfsObjectMetadata, DfsObjectVersionRecord,
-    DfsPosixCreateAttrs, DfsPosixDirectorySyncCertificate, DfsPosixDirectorySyncTarget,
-    DfsPosixFileSyncCertificate, DfsPosixFileSyncTarget, DfsReplicaReceiptRecord,
-    DfsReplicationPolicy, DfsVersion, DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState,
-    DfsWriteIntentRecord, NetworkedDfsWriteOutcome,
+    DfsMetadataJournalBatch, DfsMetadataJournalFrameRecord, DfsMetadataPrefixProof,
+    DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataTableSnapshot,
+    DfsMetadataVersionPinRecord, DfsNamespaceJobRecord, DfsNamespaceTransaction, DfsObjectId,
+    DfsObjectMetadata, DfsObjectVersionRecord, DfsPosixCreateAttrs,
+    DfsPosixDirectorySyncCertificate, DfsPosixDirectorySyncTarget, DfsPosixFileSyncCertificate,
+    DfsPosixFileSyncTarget, DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsVersion,
+    DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord,
+    NetworkedDfsWriteOutcome,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
@@ -1009,7 +1010,21 @@ pub struct DfsMetadataJournalBatchCommand {
     /// cannot accidentally satisfy the new authority fast path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_probe: Option<DfsMetadataAuthorityProbe>,
+    /// Versioned durable-journal carrier for ordinary replica catch-up. The
+    /// typed legacy batch stays empty so the authoritative entry is not encoded
+    /// twice. A sender may advance its replica cursor only when the receiver
+    /// echoes `confirmation_id` after validating and persisting the exact
+    /// frames. Older receivers safely treat the empty batch as a no-op but
+    /// cannot produce that confirmation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_replication: Option<DfsMetadataDurableReplication>,
     pub batch: DfsMetadataJournalBatch,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataDurableReplication {
+    pub confirmation_id: String,
+    pub journal_frames: Vec<DfsMetadataJournalFrameRecord>,
 }
 
 /// Restart-unique, exact-state identity used by a fresh metadata durability
@@ -1044,6 +1059,21 @@ pub struct DfsMetadataAuthorityProbe {
     pub probe_id: String,
     pub expected_shard: DfsMetadataShardConfig,
     pub operation: DfsMetadataAuthorityOperation,
+    /// Request the versioned durable-journal acknowledgement path. A peer may
+    /// echo the corresponding confirmation only after the exact journal
+    /// prefix and operation payload are durable, even when its rebuildable
+    /// materialized tables are intentionally caught up after the response.
+    ///
+    /// Older peers ignore this field and emit the legacy confirmation
+    /// identity, so they cannot accidentally satisfy the stronger boundary.
+    #[serde(default)]
+    pub durable_journal_ack: bool,
+    /// Exact journal frames for the durable-ACK path. New senders leave the
+    /// legacy typed batch empty, avoiding a second serialization of the same
+    /// prepare. Older receivers ignore these frames and cannot produce the V2
+    /// confirmation identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub journal_frames: Vec<DfsMetadataJournalFrameRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepared_prefix: Option<DfsMetadataPrefixProof>,
 }
@@ -1115,9 +1145,10 @@ pub struct DfsMetadataJournalBatchResponse {
     /// accidentally satisfying the stronger durability certificate.
     #[serde(default)]
     pub verified_prefix_only: bool,
-    /// Echoed only after the receiver validates an exact write-authority probe
-    /// or durably installs the marker named by a primary-handoff prefix probe.
-    /// Missing on older peers, which forces the sender onto the safe path.
+    /// Echoed only after the receiver validates an exact write-authority probe,
+    /// persists an ordinary durable-replication prefix, or durably installs the
+    /// marker named by a primary-handoff prefix probe. Missing on older peers,
+    /// which forces the sender onto the safe path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_authority_probe_id: Option<String>,
     pub result: DfsMetadataJournalBatchResult,

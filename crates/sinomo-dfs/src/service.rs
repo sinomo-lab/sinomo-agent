@@ -333,6 +333,12 @@ impl Service for DfsService {
                 DFS_METADATA_JOURNAL_BATCH_ROUTE => {
                     let command: DfsMetadataJournalBatchCommand =
                         ctx.decode_request_body(&request).await?;
+                    let may_have_deferred_materialization = command.durable_replication.is_some()
+                        || command
+                            .authority_probe
+                            .as_ref()
+                            .is_some_and(|probe| probe.durable_journal_ack);
+                    let materialize_shard_id = command.batch.shard_id.clone();
                     let authenticated_source_node_id = authenticated_dfs_cluster_source_node_id(
                         &ctx,
                         DFS_METADATA_JOURNAL_BATCH_ROUTE,
@@ -344,6 +350,10 @@ impl Service for DfsService {
                         command.batch.shard_id.clone(),
                         authenticated_source_node_id.clone(),
                         command.authority_epoch,
+                        command
+                            .prefix_probe
+                            .as_ref()
+                            .and_then(|probe| probe.primary_handoff_id.clone()),
                     )
                     .await?;
                     let data_dir = Arc::clone(&ctx.data_dir);
@@ -360,6 +370,18 @@ impl Service for DfsService {
                         ServiceError::Service(format!("DFS metadata journal task failed: {source}"))
                     })?
                     .map_err(service_error)?;
+                    // Exact frames become durable before acknowledgement-floor
+                    // persistence and response delivery. Schedule the bounded
+                    // rebuild as soon as that persistence attempt returns;
+                    // rejected pre-ingest requests simply make this a no-op.
+                    if may_have_deferred_materialization {
+                        let data_dir = Arc::clone(&ctx.data_dir);
+                        crate::metadata_replication::schedule_cluster_dfs_metadata_replica_materialization_on_runtime(
+                            tokio::runtime::Handle::current(),
+                            (*data_dir).clone(),
+                            materialize_shard_id,
+                        );
+                    }
                     ctx.respond_value(DFS_METADATA_JOURNAL_BATCH_ROUTE, response)?;
                 }
                 DFS_METADATA_SNAPSHOT_INSTALL_ROUTE => {
@@ -376,6 +398,7 @@ impl Service for DfsService {
                         command.shard_id.clone(),
                         authenticated_source_node_id.clone(),
                         command.authority_epoch,
+                        command.primary_handoff_id.clone(),
                     )
                     .await?;
                     let data_dir = Arc::clone(&ctx.data_dir);
@@ -580,10 +603,13 @@ async fn authoritative_metadata_replica_shard_context(
     shard_id: DfsMetadataShardId,
     source_node_id: NodeId,
     authority_epoch: Option<u64>,
+    primary_handoff_id: Option<String>,
 ) -> Result<Option<DfsMetadataReplicaShardContext>, ServiceError> {
+    let started_at = Instant::now();
     let Some(file_system_id) = file_system_id else {
         return Ok(None);
     };
+    let local_read_started_at = Instant::now();
     let local_data_dir = Arc::clone(&data_dir);
     let local_shard_id = shard_id.clone();
     let local_context = tokio::task::spawn_blocking(move || {
@@ -599,31 +625,62 @@ async fn authoritative_metadata_replica_shard_context(
         ))
     })?
     .map_err(service_error)?;
-    if local_context.as_ref().is_some_and(|context| {
-        metadata_replica_context_matches_authority(
-            context,
-            &file_system_id,
-            &shard_id,
-            &source_node_id,
-            authority_epoch,
-        )
-    }) {
+    let local_read_ms = local_read_started_at.elapsed().as_millis();
+    if metadata_replica_context_can_skip_authoritative_read(
+        local_context.as_ref(),
+        &file_system_id,
+        &shard_id,
+        &source_node_id,
+        authority_epoch,
+        primary_handoff_id.as_deref(),
+    ) {
+        dfs_service_perf_trace(format_args!(
+            "metadata-replica-authority-context shard={} mode=local local_read_ms={} total_ms={}",
+            shard_id.0,
+            local_read_ms,
+            started_at.elapsed().as_millis(),
+        ));
         return Ok(local_context);
     }
     let Some(cluster) = cluster else {
-        return Ok(local_context);
+        // A role-rotation probe can persist a promotion marker and authorize
+        // the next primary generation. A locally coherent but retired KV
+        // snapshot is therefore not sufficient; fail closed without a
+        // current-term authoritative read.
+        dfs_service_perf_trace(format_args!(
+            "metadata-replica-authority-context shard={} mode=no-cluster local_read_ms={} handoff={} total_ms={}",
+            shard_id.0,
+            local_read_ms,
+            primary_handoff_id.is_some(),
+            started_at.elapsed().as_millis(),
+        ));
+        return if primary_handoff_id.is_some() {
+            Ok(None)
+        } else {
+            Ok(local_context)
+        };
     };
     let shard_key = metadata_shard_key(&file_system_id, &shard_id.0);
+    let shard_read_started_at = Instant::now();
     let shard = cluster
         .kv_get_authoritative_async(&shard_key)
         .await?
         .value
         .map(|entry| entry.decode::<DfsMetadataShardConfig>())
         .transpose()?;
+    let shard_read_ms = shard_read_started_at.elapsed().as_millis();
     let Some(shard) = shard else {
+        dfs_service_perf_trace(format_args!(
+            "metadata-replica-authority-context shard={} mode=authoritative-missing local_read_ms={} shard_read_ms={} total_ms={}",
+            shard_id.0,
+            local_read_ms,
+            shard_read_ms,
+            started_at.elapsed().as_millis(),
+        ));
         return Ok(None);
     };
     let handoff_key = metadata_shard_membership_handoff_key(&shard.file_system_id, &shard.shard_id);
+    let handoff_read_started_at = Instant::now();
     let pending_membership_handoff = cluster
         .kv_get_authoritative_async(&handoff_key)
         .await?
@@ -636,13 +693,66 @@ async fn authoritative_metadata_replica_shard_context(
                 && handoff.desired_shard.shard_id == shard.shard_id
                 && handoff.desired_shard.epoch == shard.epoch.saturating_add(1)
         });
+    let handoff_read_ms = handoff_read_started_at.elapsed().as_millis();
     let state =
         sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(data_dir.as_ref()))?;
-    Ok(Some(DfsMetadataReplicaShardContext {
+    let context = DfsMetadataReplicaShardContext {
         local_node_id: state.local_node_id,
         shard,
         pending_membership_handoff,
-    }))
+    };
+    dfs_service_perf_trace(format_args!(
+        "metadata-replica-authority-context shard={} mode=authoritative local_read_ms={} shard_read_ms={} handoff_read_ms={} handoff={} total_ms={}",
+        shard_id.0,
+        local_read_ms,
+        shard_read_ms,
+        handoff_read_ms,
+        primary_handoff_id.is_some(),
+        started_at.elapsed().as_millis(),
+    ));
+    Ok(Some(context))
+}
+
+fn metadata_replica_context_can_skip_authoritative_read(
+    context: Option<&DfsMetadataReplicaShardContext>,
+    file_system_id: &DfsFileSystemId,
+    shard_id: &DfsMetadataShardId,
+    source_node_id: &NodeId,
+    authority_epoch: Option<u64>,
+    primary_handoff_id: Option<&str>,
+) -> bool {
+    primary_handoff_id.is_none()
+        && context.is_some_and(|context| {
+            metadata_replica_context_matches_authority(
+                context,
+                file_system_id,
+                shard_id,
+                source_node_id,
+                authority_epoch,
+                None,
+            ) && metadata_replica_context_has_local_ingest_membership(context)
+        })
+}
+
+fn metadata_replica_context_has_local_ingest_membership(
+    context: &DfsMetadataReplicaShardContext,
+) -> bool {
+    context
+        .shard
+        .replica_node_ids
+        .contains(&context.local_node_id)
+        || context
+            .pending_membership_handoff
+            .as_ref()
+            .is_some_and(|handoff| {
+                handoff.retiring_shard == context.shard
+                    && handoff.desired_shard.file_system_id == context.shard.file_system_id
+                    && handoff.desired_shard.shard_id == context.shard.shard_id
+                    && handoff.desired_shard.epoch == context.shard.epoch.saturating_add(1)
+                    && std::iter::once(&handoff.desired_shard.primary_node_id)
+                        .chain(handoff.desired_shard.replica_node_ids.iter())
+                        .any(|node_id| node_id == &context.local_node_id)
+            })
 }
 
 fn metadata_replica_context_matches_authority(
@@ -651,11 +761,18 @@ fn metadata_replica_context_matches_authority(
     shard_id: &DfsMetadataShardId,
     source_node_id: &NodeId,
     authority_epoch: Option<u64>,
+    primary_handoff_id: Option<&str>,
 ) -> bool {
     context.shard.file_system_id == *file_system_id
         && context.shard.shard_id == shard_id.0
         && context.shard.primary_node_id == *source_node_id
         && authority_epoch == Some(context.shard.epoch)
+        && primary_handoff_id.is_none_or(|handoff_id| {
+            context
+                .pending_membership_handoff
+                .as_ref()
+                .is_some_and(|handoff| handoff.handoff_id == handoff_id)
+        })
 }
 
 fn authenticated_dfs_cluster_source_node_id(
@@ -845,6 +962,15 @@ mod tests {
             &shard_id,
             &primary_node_id,
             Some(64),
+            None,
+        ));
+        assert!(metadata_replica_context_can_skip_authoritative_read(
+            Some(&context),
+            &file_system_id,
+            &shard_id,
+            &primary_node_id,
+            Some(64),
+            None,
         ));
         assert!(!metadata_replica_context_matches_authority(
             &context,
@@ -852,6 +978,7 @@ mod tests {
             &shard_id,
             &primary_node_id,
             Some(63),
+            None,
         ));
         assert!(!metadata_replica_context_matches_authority(
             &context,
@@ -860,6 +987,77 @@ mod tests {
             &NodeId::from_legacy_named("node_dfs_service_replica_fast_path_stale")
                 .expect("stale node"),
             Some(64),
+            None,
+        ));
+        assert!(!metadata_replica_context_matches_authority(
+            &context,
+            &file_system_id,
+            &shard_id,
+            &primary_node_id,
+            Some(64),
+            Some("missing-primary-handoff"),
+        ));
+
+        let mut stale_handoff_context = context.clone();
+        stale_handoff_context.pending_membership_handoff =
+            Some(DfsMetadataShardMembershipHandoff {
+                handoff_id: "stale-primary-handoff".to_string(),
+                retiring_shard: context.shard.clone(),
+                desired_shard: DfsMetadataShardConfig {
+                    primary_node_id: context.local_node_id.clone(),
+                    replica_node_ids: vec![primary_node_id.clone()],
+                    epoch: context.shard.epoch + 1,
+                    ..context.shard.clone()
+                },
+                required_prepared_sequence: 0,
+                required_head_watermark: None,
+                retiring_primary_fence: None,
+            });
+        assert!(metadata_replica_context_matches_authority(
+            &stale_handoff_context,
+            &file_system_id,
+            &shard_id,
+            &primary_node_id,
+            Some(64),
+            Some("stale-primary-handoff"),
+        ));
+        assert!(!metadata_replica_context_can_skip_authoritative_read(
+            Some(&stale_handoff_context),
+            &file_system_id,
+            &shard_id,
+            &primary_node_id,
+            Some(64),
+            Some("stale-primary-handoff"),
+        ));
+
+        let mut desired_only_context = stale_handoff_context;
+        desired_only_context.shard.replica_node_ids.clear();
+        desired_only_context
+            .pending_membership_handoff
+            .as_mut()
+            .expect("pending handoff")
+            .retiring_shard
+            .replica_node_ids
+            .clear();
+        assert!(metadata_replica_context_has_local_ingest_membership(
+            &desired_only_context
+        ));
+        assert!(metadata_replica_context_can_skip_authoritative_read(
+            Some(&desired_only_context),
+            &file_system_id,
+            &shard_id,
+            &primary_node_id,
+            Some(64),
+            None,
+        ));
+        desired_only_context.pending_membership_handoff = None;
+        assert!(!metadata_replica_context_can_skip_authoritative_read(
+            Some(&desired_only_context),
+            &file_system_id,
+            &shard_id,
+            &primary_node_id,
+            Some(64),
+            None,
         ));
     }
 
@@ -1281,6 +1479,7 @@ mod tests {
             verify_prefix_only: false,
             prefix_probe: None,
             authority_probe: None,
+            durable_replication: None,
             batch: DfsMetadataJournalBatch {
                 shard_id: DfsMetadataShardId::new("shard-local"),
                 entries: Vec::new(),
@@ -1362,6 +1561,7 @@ mod tests {
             verify_prefix_only: false,
             prefix_probe: None,
             authority_probe: None,
+            durable_replication: None,
             batch: DfsMetadataJournalBatch {
                 shard_id: DfsMetadataShardId::new("root"),
                 entries: Vec::new(),

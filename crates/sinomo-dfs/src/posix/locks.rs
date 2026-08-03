@@ -466,14 +466,35 @@ mod tests {
             self.next_frame_id = self.next_frame_id.saturating_add(1);
             let response = match message.message {
                 DfsNetworkMessage::MetadataJournalBatch(command) => {
+                    let applied_entries = command
+                        .durable_replication
+                        .as_ref()
+                        .map(|replication| replication.journal_frames.len())
+                        .or_else(|| {
+                            command.authority_probe.as_ref().and_then(|probe| {
+                                probe
+                                    .durable_journal_ack
+                                    .then_some(probe.journal_frames.len())
+                            })
+                        })
+                        .unwrap_or(command.batch.entries.len());
+                    let verified_authority_probe_id = command
+                        .durable_replication
+                        .as_ref()
+                        .map(|replication| replication.confirmation_id.clone())
+                        .or_else(|| {
+                            command.authority_probe.as_ref().and_then(
+                                crate::service_replica::metadata_authority_probe_confirmation_id,
+                            )
+                        });
                     DfsNetworkMessage::MetadataJournalBatchResponse(
                         DfsMetadataJournalBatchResponse {
                             request_id: command.request_id,
                             shard_id: command.batch.shard_id,
                             next_after_sequence: command.batch.next_after_sequence,
-                            applied_entries: command.batch.entries.len(),
+                            applied_entries,
                             verified_prefix_only: command.verify_prefix_only,
-                            verified_authority_probe_id: None,
+                            verified_authority_probe_id,
                             result: DfsMetadataJournalBatchResult::Applied,
                         },
                     )

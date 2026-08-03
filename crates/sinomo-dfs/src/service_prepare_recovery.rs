@@ -675,15 +675,32 @@ mod tests {
                 .expect("object"),
             Some(committed)
         );
-        let durable = recovered
-            .metadata_backend()
-            .expect("backend")
-            .get_namespace_prepare(&prepare.operation_id)
-            .expect("prepare")
-            .expect("durable prepare");
-        assert_eq!(durable.owner_epoch, 2);
-        assert_eq!(durable.status, DfsNamespacePrepareStatus::Committed);
-        assert_eq!(durable.transaction, prepare.transaction);
+        assert!(
+            recovered
+                .metadata_backend()
+                .expect("backend")
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("prepare")
+                .is_none(),
+            "recovery must compact the committed prepare body"
+        );
+        assert!(
+            recovered
+                .metadata_backend()
+                .expect("backend")
+                .journal_since(0)
+                .expect("journal")
+                .iter()
+                .any(|entry| matches!(
+                    &entry.mutation,
+                    DfsMetadataMutation::CommitNamespacePrepare {
+                        operation_id,
+                        owner_epoch: 2,
+                        ..
+                    } if operation_id == &prepare.operation_id
+                )),
+            "the authoritative commit must retain the rebound owner epoch"
+        );
         assert_eq!(
             recovered
                 .metadata_backend()
@@ -825,14 +842,42 @@ mod tests {
             Some(committed),
             "recovery must materialize the persisted transaction, not replan it"
         );
-        let durable_prepare = service
-            .metadata_backend()
-            .expect("backend")
-            .get_namespace_prepare(&prepare.operation_id)
-            .expect("prepare")
-            .expect("durable prepare");
-        assert_eq!(durable_prepare.status, DfsNamespacePrepareStatus::Committed);
-        assert_eq!(durable_prepare.transaction, prepare.transaction);
+        assert!(
+            service
+                .metadata_backend()
+                .expect("backend")
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("prepare")
+                .is_none(),
+            "request recovery must compact the committed prepare body"
+        );
+        assert!(
+            service
+                .metadata_backend()
+                .expect("backend")
+                .get_namespace_transaction(&prepare.transaction.transaction_id)
+                .expect("transaction")
+                .is_none(),
+            "request recovery must compact the committed transaction body"
+        );
+        assert!(
+            service
+                .metadata_backend()
+                .expect("backend")
+                .journal_since(0)
+                .expect("journal")
+                .iter()
+                .any(|entry| matches!(
+                    &entry.mutation,
+                    DfsMetadataMutation::CommitNamespacePrepare {
+                        operation_id,
+                        owner_epoch,
+                        ..
+                    } if operation_id == &prepare.operation_id
+                        && *owner_epoch == prepare.owner_epoch
+                )),
+            "request recovery must retain the authoritative fenced commit"
+        );
         assert_eq!(
             service
                 .metadata_backend()
@@ -1341,15 +1386,41 @@ mod tests {
             )
             .expect("recover prepared create on new epoch primary");
 
-        let durable_prepare = recovered
-            .metadata_backend()
-            .expect("backend")
-            .get_namespace_prepare(&prepare.operation_id)
-            .expect("prepare")
-            .expect("durable prepare");
-        assert_eq!(durable_prepare.owner_epoch, 2);
-        assert_eq!(durable_prepare.status, DfsNamespacePrepareStatus::Committed);
-        assert_eq!(durable_prepare.transaction, exact_transaction);
+        assert!(
+            recovered
+                .metadata_backend()
+                .expect("backend")
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("prepare")
+                .is_none(),
+            "epoch recovery must compact the committed prepare body"
+        );
+        assert!(
+            recovered
+                .metadata_backend()
+                .expect("backend")
+                .get_namespace_transaction(&exact_transaction.transaction_id)
+                .expect("transaction")
+                .is_none(),
+            "epoch recovery must compact the committed transaction body"
+        );
+        assert!(
+            recovered
+                .metadata_backend()
+                .expect("backend")
+                .journal_since(0)
+                .expect("journal")
+                .iter()
+                .any(|entry| matches!(
+                    &entry.mutation,
+                    DfsMetadataMutation::CommitNamespacePrepare {
+                        operation_id,
+                        owner_epoch: 2,
+                        ..
+                    } if operation_id == &prepare.operation_id
+                )),
+            "epoch recovery must retain the rebound authoritative commit"
+        );
         assert_eq!(
             recovered
                 .metadata_backend()

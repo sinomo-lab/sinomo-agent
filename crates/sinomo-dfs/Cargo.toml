@@ -17,6 +17,7 @@ test-support = []
 
 [dependencies]
 blake3.workspace = true
+bytes.workspace = true
 fs2.workspace = true
 metrics.workspace = true
 serde.workspace = true

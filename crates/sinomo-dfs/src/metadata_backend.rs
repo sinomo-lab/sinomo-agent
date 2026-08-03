@@ -12,11 +12,10 @@ use crate::advisory_lock::{
     DfsAdvisoryLockTransitionContext, transition_advisory_lock_state,
 };
 use crate::content_root_catalog::{
-    DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES, DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
-    DFS_CONTENT_ROOT_CATALOG_TARGET_PAGE_BYTES, DfsContentRootCatalogCoverage,
-    DfsContentRootCatalogCursor, DfsContentRootCatalogEntry, DfsContentRootCatalogIncompleteReason,
-    DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest,
-    dfs_content_root_catalog_entries_from_canonical_protection,
+    DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES, DFS_CONTENT_ROOT_CATALOG_TARGET_PAGE_BYTES,
+    DfsContentRootCatalogCoverage, DfsContentRootCatalogCursor, DfsContentRootCatalogEntry,
+    DfsContentRootCatalogIncompleteReason, DfsContentRootCatalogPage,
+    DfsContentRootCatalogPageRequest, dfs_content_root_catalog_entries_from_canonical_protection,
 };
 use crate::control_plane::{DfsMetadataNamespacePrepareCodec, DfsMetadataShardConfig};
 use crate::metadata_api::{
@@ -42,10 +41,12 @@ use crate::metadata_journal::DfsMetadataJournalHead;
 use crate::metadata_journal::persist_replayed_journal_entry;
 use crate::metadata_journal::{
     DfsMetadataReplayCursor, bounded_metadata_journal_batch, durable_journal_entries_since_limited,
-    journal_entries_since_limited_with_next_sequence, migrate_legacy_journal_entries,
-    persist_replayed_journal_entries, read_next_journal_sequence_lenient,
-    recover_next_journal_sequence, write_local_journal_entries,
-    write_local_journal_entry_with_record_bytes,
+    journal_entries_since_limited_with_next_sequence, metadata_prefix_proof_after_exact_frame,
+    migrate_legacy_journal_entries, persist_replayed_journal_entries,
+    persist_replayed_journal_frames, read_next_journal_sequence_lenient,
+    read_segmented_journal_frame_at_sequence, read_segmented_journal_frames_at_sequences,
+    recover_next_journal_sequence, recover_next_journal_sequence_after_append_error,
+    write_local_journal_entries, write_local_journal_entry_with_frame_bytes,
 };
 use crate::metadata_keys::{
     directory_page_cursor_with_dentry, normalize_path, path_record_for_object,
@@ -151,6 +152,7 @@ const DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES: u64 = 8 * 1024 * 1024;
 const METADATA_RECOVERY_WATERMARK_FORMAT_VERSION: u16 = 1;
 const METADATA_RECOVERY_WATERMARK_FILE_NAME: &str = "recovery-clean.sobj";
 const METADATA_RECOVERY_WATERMARK_MAX_BYTES: u64 = 16 * 1024;
+const MAX_DEFERRED_REPLICA_ENTRIES: u64 = 8;
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, Eq, PartialEq)]
 struct DfsMetadataRecoveryFileFingerprint {
@@ -1180,30 +1182,6 @@ fn validate_namespace_prepare_shape(
                 prepare.operation_id, receipt.receipt.object_id
             )));
         }
-        if let Some(existing) = tables.receipts.get(&(
-            receipt.receipt.object_id.clone(),
-            receipt.receipt.committed_version.clone(),
-            receipt.replica_node_id.clone(),
-        )) && !replay_receipt_matches_existing(existing, receipt)
-        {
-            return Err(MetadataBackendError::Serde(format!(
-                "namespace prepare {} conflicts with the durable content receipt for object {} version {} replica {}",
-                prepare.operation_id,
-                receipt.receipt.object_id,
-                receipt.receipt.committed_version,
-                receipt.replica_node_id
-            )));
-        }
-    }
-    if let Some(existing) = tables
-        .namespace_transactions
-        .get(&prepare.transaction.transaction_id)
-        && existing != &prepare.transaction
-    {
-        return Err(MetadataBackendError::Serde(format!(
-            "namespace prepare {} reuses transaction id {} with a different payload",
-            prepare.operation_id, prepare.transaction.transaction_id
-        )));
     }
     let completion_attachment_count = usize::from(prepare.completed_request.is_some())
         + usize::from(prepare.completed_request_completion.is_some());
@@ -1234,6 +1212,69 @@ fn validate_namespace_prepare_shape(
                 prepare.operation_id
             )));
         }
+    }
+    if let Some(completion) = &prepare.completed_request_completion {
+        validate_namespace_request_completion_shape(completion)?;
+        if completion.file_system_id != prepare.file_system_id
+            || completion.authority_shard_id != prepare.shard_id
+            || completion.transaction_id != prepare.transaction.transaction_id
+            || !prepare
+                .operation_id
+                .starts_with(&format!("namespace-request:{}:", completion.operation_id))
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {} has an invalid compact completed request attachment",
+                prepare.operation_id
+            )));
+        }
+    }
+    validate_namespace_prepare_current_state(tables, prepare, &prepare.status)?;
+    Ok(ValidatedNamespacePreparePlan {
+        footprint: DfsNamespacePrepareFootprint::from_validated_parts(
+            prepare,
+            expected_object_ids,
+            expected_paths,
+        ),
+    })
+}
+
+/// Validate the table-dependent portion of a namespace prepare separately from
+/// its immutable payload shape. Admission calls this before installing the
+/// hidden record; commit calls it again after replica acknowledgement because
+/// receipts, transaction/request identities, and terminal outcomes can change
+/// while the Prepared footprint remains reserved.
+fn validate_namespace_prepare_current_state(
+    tables: &DfsMetadataTables,
+    prepare: &DfsNamespacePrepareRecord,
+    effective_status: &DfsNamespacePrepareStatus,
+) -> Result<()> {
+    for receipt in &prepare.content_receipts {
+        if let Some(existing) = tables.receipts.get(&(
+            receipt.receipt.object_id.clone(),
+            receipt.receipt.committed_version.clone(),
+            receipt.replica_node_id.clone(),
+        )) && !replay_receipt_matches_existing(existing, receipt)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "namespace prepare {} conflicts with the durable content receipt for object {} version {} replica {}",
+                prepare.operation_id,
+                receipt.receipt.object_id,
+                receipt.receipt.committed_version,
+                receipt.replica_node_id
+            )));
+        }
+    }
+    if let Some(existing) = tables
+        .namespace_transactions
+        .get(&prepare.transaction.transaction_id)
+        && existing != &prepare.transaction
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "namespace prepare {} reuses transaction id {} with a different payload",
+            prepare.operation_id, prepare.transaction.transaction_id
+        )));
+    }
+    if let Some(completed_request) = &prepare.completed_request {
         let request_key = (
             completed_request.requester_node_id.clone(),
             completed_request.request_id.clone(),
@@ -1274,7 +1315,7 @@ fn validate_namespace_prepare_shape(
                         completed_request.request_id
                     )));
                 }
-                None if prepare.status == DfsNamespacePrepareStatus::Prepared => {
+                None if effective_status == &DfsNamespacePrepareStatus::Prepared => {
                     // A request-owned prepare is itself the first durable
                     // operation boundary for the fused admission path. The table
                     // planner below materializes a derived Pending admission in
@@ -1293,19 +1334,6 @@ fn validate_namespace_prepare_shape(
         }
     }
     if let Some(completion) = &prepare.completed_request_completion {
-        validate_namespace_request_completion_shape(completion)?;
-        if completion.file_system_id != prepare.file_system_id
-            || completion.authority_shard_id != prepare.shard_id
-            || completion.transaction_id != prepare.transaction.transaction_id
-            || !prepare
-                .operation_id
-                .starts_with(&format!("namespace-request:{}:", completion.operation_id))
-        {
-            return Err(MetadataBackendError::Serde(format!(
-                "namespace prepare {} has an invalid compact completed request attachment",
-                prepare.operation_id
-            )));
-        }
         let request_key = completion.request_key();
         if let Some(receipt) = tables.namespace_request_receipts.get(&request_key) {
             if !receipt.matches_completion(completion) {
@@ -1326,7 +1354,7 @@ fn validate_namespace_prepare_shape(
                         prepare.operation_id, completion.requester_node_id, completion.request_id
                     )));
                 }
-                None if prepare.status == DfsNamespacePrepareStatus::Prepared => {
+                None if effective_status == &DfsNamespacePrepareStatus::Prepared => {
                     // The compact attachment and hidden prepare are the first
                     // durable boundary. Unlike the legacy full attachment, no
                     // duplicate Pending request body is materialized.
@@ -1352,13 +1380,14 @@ fn validate_namespace_prepare_shape(
             }
         }
     }
-    Ok(ValidatedNamespacePreparePlan {
-        footprint: DfsNamespacePrepareFootprint::from_validated_parts(
-            prepare,
-            expected_object_ids,
-            expected_paths,
-        ),
-    })
+    Ok(())
+}
+
+fn validate_prepared_namespace_commit_state(
+    tables: &DfsMetadataTables,
+    prepare: &DfsNamespacePrepareRecord,
+) -> Result<()> {
+    validate_namespace_prepare_current_state(tables, prepare, &DfsNamespacePrepareStatus::Committed)
 }
 
 fn namespace_prepare_request_completion_is_materialized(
@@ -1652,6 +1681,7 @@ fn namespace_prepare_table_plan_for_payload(
                         operation_id: prepare.operation_id.clone(),
                         operation_digest: prepare.operation_digest.clone(),
                         owner_epoch: prepare.owner_epoch,
+                        retained_at: None,
                     }],
                     prepared_footprint: None,
                 });
@@ -1853,6 +1883,7 @@ fn namespace_prepare_commit_table_ops_for_reference(
     operation_digest: &str,
     owner_epoch: u64,
     object_ids: &[DfsObjectId],
+    retained_at: OffsetDateTime,
 ) -> Result<Vec<DfsMetadataTableOp>> {
     if object_ids.windows(2).any(|ids| ids[0] >= ids[1]) {
         return Err(MetadataBackendError::Serde(format!(
@@ -1919,7 +1950,17 @@ fn namespace_prepare_commit_table_ops_for_reference(
         )));
     }
     prepare.status = DfsNamespacePrepareStatus::Committed;
-    namespace_prepare_table_ops_for_record(tables, shard_id, &prepare)
+    let mut ops = namespace_prepare_table_ops_for_record(tables, shard_id, &prepare)?;
+    for op in &mut ops {
+        if let DfsMetadataTableOp::CommitNamespacePrepare {
+            retained_at: marker_retained_at,
+            ..
+        } = op
+        {
+            *marker_retained_at = Some(retained_at);
+        }
+    }
+    Ok(ops)
 }
 
 fn require_replica_snapshot_record_file_system(
@@ -2267,6 +2308,7 @@ pub(crate) enum DfsConditionalSourceEviction {
 
 #[derive(Clone, Debug)]
 struct DfsContentRootCatalogSnapshotCache {
+    prefix_proof_version: u32,
     journal_sequence: u64,
     state_fingerprint: String,
     entries: Arc<Vec<DfsContentRootCatalogEntry>>,
@@ -2317,7 +2359,7 @@ fn content_root_catalog_page_from_snapshot(
             topology_digest: request.expected_topology_digest.clone(),
             generated_at_unix_nanos,
             coverage: DfsContentRootCatalogCoverage::Complete {
-                prefix_proof_version: DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
+                prefix_proof_version: snapshot.prefix_proof_version,
                 journal_sequence,
                 state_fingerprint: state_fingerprint.clone(),
             },
@@ -2695,11 +2737,27 @@ impl LocalSobjMetadataBackend {
         self.tables.namespace_prepares.get(operation_id)
     }
 
+    pub(crate) fn namespace_prepare_receipt_ref(
+        &self,
+        operation_id: &str,
+    ) -> Option<&DfsNamespacePrepareReceipt> {
+        self.tables.namespace_prepare_receipts.get(operation_id)
+    }
+
     pub(crate) fn has_current_namespace_prepare(&self, operation_id: &str) -> Result<bool> {
         Ok(self
             .current_tables_snapshot()?
             .namespace_prepares
             .contains_key(operation_id))
+    }
+
+    pub(crate) fn has_current_namespace_prepare_identity(
+        &self,
+        operation_id: &str,
+    ) -> Result<bool> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables.namespace_prepares.contains_key(operation_id)
+            || tables.namespace_prepare_receipts.contains_key(operation_id))
     }
 
     #[cfg(test)]
@@ -2804,6 +2862,424 @@ impl LocalSobjMetadataBackend {
         self.apply_journal_batch_with_replica_permit_internal(permit, batch, true)
     }
 
+    /// Persist one authority-bound replica batch and return after the
+    /// append-only journal, exact prefix, and canonical operation identity are
+    /// durable. Rebuildable table expansion is deliberately left behind the
+    /// response; normal writes, snapshots, handoff, and promotion still enter
+    /// through refresh paths which synchronously close that gap.
+    pub(crate) fn persist_journal_batch_with_replica_permit_report(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+    ) -> Result<DfsMetadataReplicaApplyReport> {
+        self.persist_journal_frames_with_replica_permit_report_internal(permit, batch, None, None)
+    }
+
+    pub(crate) fn persist_journal_frames_with_replica_permit_report(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+        frames: &[DfsMetadataJournalFrameRecord],
+    ) -> Result<DfsMetadataReplicaApplyReport> {
+        self.persist_exact_journal_frames_with_replica_permit_report(permit, batch, frames, None)
+    }
+
+    pub(crate) fn persist_authority_journal_frames_with_replica_permit_report(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+        frames: &[DfsMetadataJournalFrameRecord],
+        expected_target_prefix: &DfsMetadataPrefixProof,
+    ) -> Result<DfsMetadataReplicaApplyReport> {
+        self.persist_exact_journal_frames_with_replica_permit_report(
+            permit,
+            batch,
+            frames,
+            Some(expected_target_prefix),
+        )
+    }
+
+    fn persist_exact_journal_frames_with_replica_permit_report(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+        frames: &[DfsMetadataJournalFrameRecord],
+        expected_target_prefix: Option<&DfsMetadataPrefixProof>,
+    ) -> Result<DfsMetadataReplicaApplyReport> {
+        if !batch.entries.is_empty() || frames.is_empty() {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata shard {} exact-frame ingest requires one carrier",
+                batch.shard_id.0
+            )));
+        }
+        if let Some(expected_target_prefix) = expected_target_prefix
+            && (!expected_target_prefix.is_well_formed()
+                || expected_target_prefix.journal_sequence != batch.next_after_sequence)
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata shard {} authority ingest has an invalid expected prefix at sequence {}",
+                batch.shard_id.0, batch.next_after_sequence
+            )));
+        }
+        let decode_started = Instant::now();
+        let entries = frames
+            .iter()
+            .map(crate::metadata_journal::decode_metadata_journal_frame_record)
+            .collect::<Result<Vec<_>>>()?;
+        let decode_ms = decode_started.elapsed().as_millis();
+        metadata_backend_perf_trace(format_args!(
+            "metadata-replica-frame-decode shard={} entries={} bytes={} decode_ms={decode_ms}",
+            batch.shard_id.0,
+            frames.len(),
+            frames
+                .iter()
+                .map(|frame| frame.exact_bytes.len())
+                .sum::<usize>(),
+        ));
+        let decoded_batch = DfsMetadataJournalBatch {
+            shard_id: batch.shard_id.clone(),
+            entries,
+            next_after_sequence: batch.next_after_sequence,
+        };
+        self.persist_journal_frames_with_replica_permit_report_internal(
+            permit,
+            &decoded_batch,
+            Some(frames),
+            expected_target_prefix,
+        )
+    }
+
+    fn persist_journal_frames_with_replica_permit_report_internal(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+        supplied_frames: Option<&[DfsMetadataJournalFrameRecord]>,
+        expected_target_prefix: Option<&DfsMetadataPrefixProof>,
+    ) -> Result<DfsMetadataReplicaApplyReport> {
+        self.require_replication_source_shard(&batch.shard_id)?;
+        validate_replicated_journal_batch_entry_order(batch)?;
+        if batch.entries.is_empty() {
+            return Ok(DfsMetadataReplicaApplyReport::default());
+        }
+        let trace_started = Instant::now();
+        let validation_started = Instant::now();
+
+        let encoded_frames;
+        let frames = if let Some(frames) = supplied_frames {
+            if frames.len() != batch.entries.len() {
+                return Err(MetadataBackendError::Serde(format!(
+                    "metadata journal frame count {} does not match decoded batch count {} for shard {}",
+                    frames.len(),
+                    batch.entries.len(),
+                    batch.shard_id.0
+                )));
+            }
+            for (entry, frame) in batch.entries.iter().zip(frames) {
+                if frame.sequence != entry.sequence {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal exact frame {} does not match batch entry {} for shard {}",
+                        frame.sequence, entry.sequence, batch.shard_id.0
+                    )));
+                }
+            }
+            frames
+        } else {
+            encoded_frames = batch
+                .entries
+                .iter()
+                .map(crate::metadata_journal::encode_metadata_journal_frame_record)
+                .collect::<Result<Vec<_>>>()?;
+            encoded_frames.as_slice()
+        };
+
+        let mut namespace_authority_proof = None;
+        for entry in &batch.entries {
+            if let Some(payload) =
+                require_replica_journal_entry_file_system(entry, permit.file_system_id())?
+            {
+                namespace_authority_proof =
+                    DfsValidatedNamespaceAuthorityProof::from_validated_payload(
+                        &payload,
+                        entry.sequence,
+                    );
+            }
+        }
+        let validation_ms = validation_started.elapsed().as_millis();
+
+        let lock_started = Instant::now();
+        let _lock = self.begin_metadata_replica_durable_ingest(permit, &batch.shard_id)?;
+        let lock_ms = lock_started.elapsed().as_millis();
+        let head_started = Instant::now();
+        // `Self::new` performs the crash-only tail recovery once. While this
+        // resident backend is alive, every successful local or replayed append
+        // advances both `self.next_sequence` and the durable head while holding
+        // this same shard writer lock. Re-running tail recovery here decoded
+        // the last (often multi-megabyte) prepare on every replica ACK and made
+        // latency grow with retained history. The head also observes a writer
+        // from another compatible resident handle; the in-memory maximum
+        // preserves an append whose derived head update was the failing step.
+        let durable_next_sequence = read_next_journal_sequence_lenient(&self.root)?
+            .max(self.next_sequence)
+            .max(1);
+        let head_ms = head_started.elapsed().as_millis();
+        let persisted_through_sequence = durable_next_sequence.saturating_sub(1);
+        self.next_sequence = self.next_sequence.max(durable_next_sequence);
+        let target_sequence = batch.next_after_sequence;
+        let prospective_persisted_through_sequence =
+            persisted_through_sequence.max(target_sequence);
+        let materialize_before_ack = prospective_persisted_through_sequence
+            .saturating_sub(self.materialized_through_sequence)
+            > MAX_DEFERRED_REPLICA_ENTRIES;
+
+        let prefix_started = Instant::now();
+        let authority_floor =
+            metadata_cursor::metadata_authority_ack_floor(&self.root, &batch.shard_id)?;
+        let prefix_ack_floor =
+            metadata_cursor::metadata_prefix_ack_floor(&self.root, &batch.shard_id)?;
+        if let Some(floor) = authority_floor.as_ref()
+            && floor.journal_sequence > target_sequence
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata shard {} cannot retry acknowledged prefix {} behind authority floor {}",
+                self.shard_id.0, target_sequence, floor.journal_sequence
+            )));
+        }
+
+        // Once asynchronous table expansion advances through (or beyond) an
+        // acknowledged operation, the current materialized proof can no
+        // longer reconstruct that historical target. The exact authority
+        // floor is the durable target proof. Returning it is safe only after
+        // the common journal persistence path below byte-verifies every
+        // supplied frame against the local journal.
+        let acknowledged_retry_prefix = authority_floor
+            .as_ref()
+            .filter(|floor| floor.journal_sequence == target_sequence)
+            .and_then(|floor| floor.durable_prefix_proof.as_ref())
+            .filter(|proof| proof.is_well_formed() && proof.journal_sequence == target_sequence)
+            .filter(|_| self.materialized_through_sequence >= target_sequence)
+            .cloned();
+        if let (Some(retry_prefix), Some(materialized_prefix)) = (
+            acknowledged_retry_prefix.as_ref(),
+            self.prefix_proof.as_ref(),
+        ) && materialized_prefix.journal_sequence == target_sequence
+            && materialized_prefix != retry_prefix
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata shard {} materialized prefix conflicts with authority floor at sequence {}",
+                self.shard_id.0, target_sequence
+            )));
+        }
+
+        // A delayed authority operation can arrive after ordinary exact-frame
+        // catch-up has already materialized a later prefix. The current table
+        // proof cannot move backward, so authenticate the authority's target
+        // proof by extending it through the local immutable journal to the
+        // later ordinary durable prefix floor. This escape hatch is available
+        // only to the authority-specific ingest entry point: an ordinary
+        // replica batch never supplies `expected_target_prefix`.
+        let historical_expected_prefix = if acknowledged_retry_prefix.is_none()
+            && self
+                .prefix_proof
+                .as_ref()
+                .is_some_and(|proof| proof.journal_sequence > target_sequence)
+        {
+            let expected_target_prefix = expected_target_prefix.ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "metadata shard {} cannot reconstruct acknowledged prefix {} behind durable proof {}",
+                    self.shard_id.0,
+                    target_sequence,
+                    self.prefix_proof
+                        .as_ref()
+                        .map_or(0, |proof| proof.journal_sequence)
+                ))
+            })?;
+            let later_floor = prefix_ack_floor.as_ref().ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "metadata shard {} cannot authenticate historical authority prefix {} without a later durable exact prefix floor",
+                    self.shard_id.0, target_sequence
+                ))
+            })?;
+            self.verify_historical_prefix_against_durable_floor(
+                expected_target_prefix,
+                later_floor,
+                persisted_through_sequence,
+                &batch.shard_id,
+            )?;
+            Some(expected_target_prefix.clone())
+        } else {
+            None
+        };
+
+        let (target_prefix, newly_persisted) = if let Some(retry_prefix) = acknowledged_retry_prefix
+        {
+            (retry_prefix, 0)
+        } else if let Some(historical_prefix) = historical_expected_prefix {
+            (historical_prefix, 0)
+        } else {
+            let mut durable_prefix = self.prefix_proof.clone().ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "metadata shard {} has no materialized prefix for durable replica ingest",
+                    self.shard_id.0
+                ))
+            })?;
+            for floor_prefix in [
+                prefix_ack_floor
+                    .as_ref()
+                    .and_then(|floor| floor.durable_prefix_proof.as_ref()),
+                authority_floor
+                    .as_ref()
+                    .and_then(|floor| floor.durable_prefix_proof.as_ref()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if floor_prefix.is_well_formed()
+                    && floor_prefix.journal_sequence <= target_sequence
+                    && floor_prefix.journal_sequence > durable_prefix.journal_sequence
+                {
+                    durable_prefix = floor_prefix.clone();
+                }
+            }
+            if durable_prefix.journal_sequence > target_sequence {
+                return Err(MetadataBackendError::Serde(format!(
+                    "metadata shard {} cannot reconstruct acknowledged prefix {} behind durable proof {}",
+                    self.shard_id.0, target_sequence, durable_prefix.journal_sequence
+                )));
+            }
+
+            let mut target_prefix = (durable_prefix.journal_sequence == target_sequence)
+                .then(|| durable_prefix.clone());
+            while durable_prefix.journal_sequence < persisted_through_sequence {
+                let entries = journal_entries_since_limited_with_next_sequence(
+                    &self.root,
+                    durable_prefix.journal_sequence,
+                    DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                    durable_next_sequence,
+                )?;
+                if entries.is_empty() {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata shard {} durable journal ends before sequence {}",
+                        self.shard_id.0, persisted_through_sequence
+                    )));
+                }
+                for entry in entries {
+                    if entry.sequence > persisted_through_sequence {
+                        break;
+                    }
+                    durable_prefix = self.prefix_proof_after_entry_for_shard(
+                        &durable_prefix,
+                        &entry,
+                        &batch.shard_id,
+                    )?;
+                    if entry.sequence == target_sequence {
+                        target_prefix = Some(durable_prefix.clone());
+                    }
+                }
+            }
+
+            let mut newly_persisted = 0usize;
+            for entry in &batch.entries {
+                if entry.sequence <= persisted_through_sequence {
+                    continue;
+                }
+                if entry.sequence != durable_prefix.journal_sequence.saturating_add(1) {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal batch for shard {} starts unseen history at sequence {} but durable journal requires {}",
+                        batch.shard_id.0,
+                        entry.sequence,
+                        durable_prefix.journal_sequence.saturating_add(1)
+                    )));
+                }
+                let frame = frames
+                    .iter()
+                    .find(|frame| frame.sequence == entry.sequence)
+                    .ok_or_else(|| {
+                        MetadataBackendError::Serde(format!(
+                            "metadata journal batch for shard {} has no exact frame for sequence {}",
+                            batch.shard_id.0, entry.sequence
+                        ))
+                    })?;
+                durable_prefix = metadata_prefix_proof_after_exact_frame(
+                    &durable_prefix,
+                    entry,
+                    &batch.shard_id,
+                    &frame.exact_bytes,
+                )?;
+                newly_persisted = newly_persisted.saturating_add(1);
+                if entry.sequence == target_sequence {
+                    target_prefix = Some(durable_prefix.clone());
+                }
+            }
+            let target_prefix = target_prefix.ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "metadata journal batch for shard {} does not establish requested prefix {}",
+                    batch.shard_id.0, target_sequence
+                ))
+            })?;
+            (target_prefix, newly_persisted)
+        };
+        if let Some(expected_target_prefix) = expected_target_prefix
+            && &target_prefix != expected_target_prefix
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata shard {} durable authority prefix {} does not match the expected prepared history",
+                batch.shard_id.0, target_sequence
+            )));
+        }
+        let prefix_ms = prefix_started.elapsed().as_millis();
+
+        let journal_started = Instant::now();
+        let frame_pairs = batch.entries.iter().zip(frames).collect::<Vec<_>>();
+        let persisted = match persist_replayed_journal_frames(
+            &self.root,
+            &frame_pairs,
+            persisted_through_sequence,
+        ) {
+            Ok(persisted) => persisted,
+            Err(error) => {
+                return Err(self.recover_after_replayed_journal_persistence_error(error));
+            }
+        };
+        if let Some(max_sequence) = persisted
+            && let Err(error) = self.advance_journal_head_after_replayed_entry(max_sequence)
+        {
+            return Err(self.recover_after_replayed_journal_persistence_error(error));
+        }
+        let journal_ms = journal_started.elapsed().as_millis();
+        let materialization_started = Instant::now();
+        if materialize_before_ack {
+            // Preserve the authority's immutable frames as the journal source
+            // of truth, then close an oversized prospective table lag before
+            // acknowledging it. Routing through decoded replay here would
+            // re-encode the frames and could replace a compatible authority
+            // representation with different local bytes.
+            self.refresh_after_metadata_write_lock()?;
+        }
+        let materialization_ms = materialization_started.elapsed().as_millis();
+        let materialization_pending = target_sequence > self.materialized_through_sequence;
+        let report = DfsMetadataReplicaApplyReport::with_durable_ingest(
+            newly_persisted,
+            namespace_authority_proof,
+            target_prefix,
+            materialization_pending,
+        );
+        metadata_backend_perf_trace(format_args!(
+            "metadata-replica-durable-ingest shard={} target={} entries={} newly_persisted={} validation_ms={validation_ms} lock_ms={lock_ms} head_ms={head_ms} prefix_ms={prefix_ms} journal_ms={journal_ms} materialization_ms={materialization_ms} materialization_pending={materialization_pending} total_ms={}",
+            batch.shard_id.0,
+            target_sequence,
+            batch.entries.len(),
+            newly_persisted,
+            trace_started.elapsed().as_millis(),
+        ));
+        Ok(report)
+    }
+
+    pub(crate) fn materialize_pending_replica_journal(&mut self) -> Result<usize> {
+        let before = self.materialized_through_sequence;
+        let _lock = self.begin_metadata_write_allow_frozen()?;
+        Ok(self.materialized_through_sequence.saturating_sub(before) as usize)
+    }
+
     fn apply_journal_batch_with_replica_permit_internal(
         &mut self,
         permit: &DfsMetadataReplicaIngestPermit,
@@ -2896,11 +3372,6 @@ impl LocalSobjMetadataBackend {
                     batch.shard_id.0, entry.sequence, expected_sequence
                 )));
             }
-            candidate_prefix_proof = self.prefix_proof_after_entry_for_shard(
-                &candidate_prefix_proof,
-                entry,
-                &batch.shard_id,
-            )?;
             replay_entries.push(entry);
             if entry.sequence > local_cursor.last_sequence {
                 local_cursor.last_sequence = entry.sequence;
@@ -2915,6 +3386,13 @@ impl LocalSobjMetadataBackend {
         self.persist_replayed_journal_entries_unlocked(&all_entries, persisted_through_sequence)?;
         if replay_entries.is_empty() {
             return Ok(DfsMetadataReplicaApplyReport::default());
+        }
+        for entry in &replay_entries {
+            candidate_prefix_proof = self.prefix_proof_after_entry_for_shard(
+                &candidate_prefix_proof,
+                entry,
+                &batch.shard_id,
+            )?;
         }
 
         let mut table_ops = Vec::new();
@@ -3163,13 +3641,21 @@ impl LocalSobjMetadataBackend {
             metadata_cursor::metadata_prefix_ack_floor(&self.root, &source_shard_id)?;
         let authority_floor =
             metadata_cursor::metadata_authority_ack_floor(&self.root, &source_shard_id)?;
-        if let Some(floor) = authority_floor.as_ref()
-            && replayed_through_sequence <= floor.journal_sequence
-        {
-            return Err(MetadataBackendError::Serde(format!(
-                "replicated metadata snapshot sequence {replayed_through_sequence} would replace shard {} at or behind locally acknowledged authority operation {}",
-                source_shard_id.0, floor.journal_sequence
-            )));
+        if let Some(floor) = authority_floor.as_ref() {
+            if replayed_through_sequence < floor.journal_sequence {
+                return Err(MetadataBackendError::Serde(format!(
+                    "replicated metadata snapshot sequence {replayed_through_sequence} would replace shard {} behind locally acknowledged authority operation {}",
+                    source_shard_id.0, floor.journal_sequence
+                )));
+            }
+            if replayed_through_sequence == floor.journal_sequence
+                && floor.durable_prefix_proof.as_ref() != Some(&replacement_prefix_proof)
+            {
+                return Err(MetadataBackendError::Serde(format!(
+                    "replicated metadata snapshot prefix conflicts with locally acknowledged authority operation for shard {} sequence {replayed_through_sequence}",
+                    source_shard_id.0
+                )));
+            }
         }
         if let Some(floor) = acknowledged_floor.as_ref() {
             if replayed_through_sequence < floor.journal_sequence {
@@ -3179,21 +3665,31 @@ impl LocalSobjMetadataBackend {
                 )));
             }
             if replayed_through_sequence == floor.journal_sequence {
-                let matches = dfs_metadata_table_snapshot_matches_checkpoint(
-                    &snapshot,
-                    replayed_through_sequence,
-                    &floor.state_fingerprint,
-                )
-                .map_err(|source| {
-                    MetadataBackendError::Serde(format!(
-                        "encode replicated metadata snapshot acknowledgement check: {source}"
-                    ))
-                })?;
-                if !matches {
+                if let Some(durable_prefix) = floor.durable_prefix_proof.as_ref()
+                    && durable_prefix != &replacement_prefix_proof
+                {
                     return Err(MetadataBackendError::Serde(format!(
-                        "replicated metadata snapshot conflicts with locally acknowledged checkpoint for shard {} sequence {replayed_through_sequence}",
+                        "replicated metadata snapshot journal prefix conflicts with locally acknowledged checkpoint for shard {} sequence {replayed_through_sequence}",
                         source_shard_id.0
                     )));
+                }
+                if !floor.state_fingerprint.is_empty() {
+                    let matches = dfs_metadata_table_snapshot_matches_checkpoint(
+                        &snapshot,
+                        replayed_through_sequence,
+                        &floor.state_fingerprint,
+                    )
+                    .map_err(|source| {
+                        MetadataBackendError::Serde(format!(
+                            "encode replicated metadata snapshot acknowledgement check: {source}"
+                        ))
+                    })?;
+                    if !matches {
+                        return Err(MetadataBackendError::Serde(format!(
+                            "replicated metadata snapshot conflicts with locally acknowledged checkpoint for shard {} sequence {replayed_through_sequence}",
+                            source_shard_id.0
+                        )));
+                    }
                 }
             }
         }
@@ -3242,6 +3738,7 @@ impl LocalSobjMetadataBackend {
     ) -> Result<Option<DfsMetadataJournalEntry>> {
         let _lock = self.begin_metadata_write()?;
         let validated_namespace_prepare = require_journal_entry_replay_payloads(entry)?;
+        self.persist_replayed_journal_entry_unlocked(entry)?;
         let candidate_prefix_proof = self.prefix_proof_after_entry(
             self.prefix_proof.as_ref().ok_or_else(|| {
                 MetadataBackendError::Serde(format!(
@@ -3251,7 +3748,6 @@ impl LocalSobjMetadataBackend {
             })?,
             entry,
         )?;
-        self.persist_replayed_journal_entry_unlocked(entry)?;
         let previous_prefix_proof = self.prefix_proof.replace(candidate_prefix_proof);
         let changed = match self
             .materialize_replayed_journal_entry_unlocked(entry, validated_namespace_prepare)
@@ -3290,12 +3786,36 @@ impl LocalSobjMetadataBackend {
         entries: &[&DfsMetadataJournalEntry],
         persisted_through_sequence: u64,
     ) -> Result<()> {
-        if let Some(max_sequence) =
-            persist_replayed_journal_entries(&self.root, entries, persisted_through_sequence)?
+        let persisted =
+            match persist_replayed_journal_entries(&self.root, entries, persisted_through_sequence)
+            {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    return Err(self.recover_after_replayed_journal_persistence_error(error));
+                }
+            };
+        if let Some(max_sequence) = persisted
+            && let Err(error) = self.advance_journal_head_after_replayed_entry(max_sequence)
         {
-            self.advance_journal_head_after_replayed_entry(max_sequence)?;
+            return Err(self.recover_after_replayed_journal_persistence_error(error));
         }
         Ok(())
+    }
+
+    fn recover_after_replayed_journal_persistence_error(
+        &mut self,
+        error: MetadataBackendError,
+    ) -> MetadataBackendError {
+        match recover_next_journal_sequence_after_append_error(&self.root) {
+            Ok(recovered_next_sequence) => {
+                self.next_sequence = self.next_sequence.max(recovered_next_sequence).max(1);
+                error
+            }
+            Err(recovery_error) => MetadataBackendError::Serde(format!(
+                "metadata shard {} journal persistence failed: {error}; exact tail recovery also failed: {recovery_error}",
+                self.shard_id.0
+            )),
+        }
     }
 
     fn advance_journal_head_after_replayed_entry(&mut self, sequence: u64) -> Result<()> {
@@ -4295,6 +4815,7 @@ impl LocalSobjMetadataBackend {
                     operation_digest,
                     *owner_epoch,
                     object_ids,
+                    entry.created_at,
                 )?;
                 if ops.is_empty() {
                     return Ok(false);
@@ -4676,12 +5197,93 @@ impl LocalSobjMetadataBackend {
                 expected_shard_id.0, previous.journal_sequence, entry.shard_id.0, entry.sequence
             )));
         }
-        dfs_metadata_prefix_proof_after(previous, entry).map_err(|source| {
-            MetadataBackendError::Serde(format!(
-                "encode metadata shard {} journal prefix entry {}: {source}",
-                expected_shard_id.0, entry.sequence
-            ))
-        })
+        let frame = read_segmented_journal_frame_at_sequence(&self.root, entry.sequence)?
+            .ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "metadata shard {} has no exact journal frame at sequence {}",
+                    expected_shard_id.0, entry.sequence
+                ))
+            })?;
+        metadata_prefix_proof_after_exact_frame(
+            previous,
+            entry,
+            expected_shard_id,
+            frame.exact_bytes(),
+        )
+    }
+
+    fn verify_historical_prefix_against_durable_floor(
+        &self,
+        expected_prefix: &DfsMetadataPrefixProof,
+        later_floor: &DfsMetadataPrefixAckFloor,
+        persisted_through_sequence: u64,
+        expected_shard_id: &DfsMetadataShardId,
+    ) -> Result<()> {
+        if &later_floor.shard_id != expected_shard_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata shard {} historical authority prefix cannot use durable floor for shard {}",
+                expected_shard_id.0, later_floor.shard_id.0
+            )));
+        }
+        let later_prefix = later_floor
+            .durable_prefix_proof
+            .as_ref()
+            .filter(|proof| {
+                proof.is_well_formed()
+                    && proof.journal_sequence == later_floor.journal_sequence
+                    && proof.journal_sequence > expected_prefix.journal_sequence
+                    && proof.journal_sequence <= persisted_through_sequence
+            })
+            .ok_or_else(|| {
+                MetadataBackendError::Serde(format!(
+                    "metadata shard {} cannot authenticate historical authority prefix {} without a later durable exact prefix floor",
+                    expected_shard_id.0, expected_prefix.journal_sequence
+                ))
+            })?;
+
+        let mut reconstructed = expected_prefix.clone();
+        while reconstructed.journal_sequence < later_prefix.journal_sequence {
+            let entries = journal_entries_since_limited_with_next_sequence(
+                &self.root,
+                reconstructed.journal_sequence,
+                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                later_prefix.journal_sequence.saturating_add(1),
+            )?;
+            if entries.is_empty() {
+                return Err(MetadataBackendError::Serde(format!(
+                    "metadata shard {} durable journal cannot extend historical authority prefix {} through exact prefix floor {}",
+                    expected_shard_id.0,
+                    expected_prefix.journal_sequence,
+                    later_prefix.journal_sequence
+                )));
+            }
+            let before = reconstructed.journal_sequence;
+            for entry in entries {
+                if entry.sequence > later_prefix.journal_sequence {
+                    break;
+                }
+                reconstructed = self.prefix_proof_after_entry_for_shard(
+                    &reconstructed,
+                    &entry,
+                    expected_shard_id,
+                )?;
+            }
+            if reconstructed.journal_sequence == before {
+                return Err(MetadataBackendError::Serde(format!(
+                    "metadata shard {} durable journal did not advance while authenticating historical authority prefix {}",
+                    expected_shard_id.0, expected_prefix.journal_sequence
+                )));
+            }
+        }
+        if &reconstructed != later_prefix {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata shard {} historical authority prefix {} does not extend to durable exact prefix floor {}",
+                expected_shard_id.0,
+                expected_prefix.journal_sequence,
+                later_prefix.journal_sequence
+            )));
+        }
+        Ok(())
     }
 
     fn advance_metadata_prefix_proof_unlocked(
@@ -4735,7 +5337,7 @@ impl LocalSobjMetadataBackend {
         &mut self,
         mutation: DfsMetadataMutation,
     ) -> Result<(DfsMetadataJournalEntry, u64)> {
-        let (entry, record_bytes) = write_local_journal_entry_with_record_bytes(
+        let (entry, record_bytes, exact_bytes) = write_local_journal_entry_with_frame_bytes(
             &self.root,
             &self.shard_id,
             &mut self.next_sequence,
@@ -4743,7 +5345,18 @@ impl LocalSobjMetadataBackend {
         )?;
         #[cfg(test)]
         METADATA_JOURNAL_WRITE_COUNT.set(METADATA_JOURNAL_WRITE_COUNT.get().saturating_add(1));
-        self.advance_metadata_prefix_proof_unlocked(std::slice::from_ref(&entry))?;
+        let previous = self.prefix_proof.clone().ok_or_else(|| {
+            MetadataBackendError::Serde(format!(
+                "metadata shard {} has no exact prefix checkpoint",
+                self.shard_id.0
+            ))
+        })?;
+        self.prefix_proof = Some(metadata_prefix_proof_after_exact_frame(
+            &previous,
+            &entry,
+            &self.shard_id,
+            exact_bytes.as_ref(),
+        )?);
         Ok((entry, record_bytes))
     }
 
@@ -5344,6 +5957,7 @@ impl LocalSobjMetadataBackend {
                 operation_digest,
                 *owner_epoch,
                 object_ids,
+                entry.created_at,
             )?,
             DfsMetadataMutation::PutNamespacePrepareReceipt { receipt, .. } => {
                 vec![DfsMetadataTableOp::PutNamespacePrepareReceipt {
@@ -5555,6 +6169,34 @@ impl LocalSobjMetadataBackend {
             }
         }
         self.refresh_after_metadata_write_lock()?;
+        Ok(lock)
+    }
+
+    fn begin_metadata_replica_durable_ingest(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        source_shard_id: &DfsMetadataShardId,
+    ) -> Result<MetadataWriteLock> {
+        if permit.shard_id() != source_shard_id || source_shard_id != &self.shard_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata replica durable-ingest permit for filesystem {} shard {} source {} epoch {} cannot mutate backend shard {} from source shard {}",
+                permit.file_system_id(),
+                permit.shard_id().0,
+                permit.source_node_id(),
+                permit.source_epoch(),
+                self.shard_id.0,
+                source_shard_id.0,
+            )));
+        }
+        let lock = self.metadata_write_lock()?;
+        if let Some(freeze) = self.membership_handoff_write_freeze()?
+            && !permit.admits_write_freeze(&freeze)
+        {
+            return Err(MetadataBackendError::MembershipHandoffFrozen {
+                shard_id: self.shard_id.clone(),
+                handoff_id: freeze.handoff_id,
+            });
+        }
         Ok(lock)
     }
 
@@ -8816,11 +9458,10 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 vec![DfsMetadataTableOp::PutNamespacePrepareReceipt { receipt }],
             );
         }
-        let mut prepare = self
+        let prepare = self
             .tables
             .namespace_prepares
             .get(operation_id)
-            .cloned()
             .ok_or_else(|| {
                 if self.tables.namespace_prepare_history_has_evictions() {
                     MetadataBackendError::Serde(format!(
@@ -8845,37 +9486,40 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 "namespace prepare {operation_id} is aborted"
             )));
         }
-        let transitions_from_prepared = prepare.status == DfsNamespacePrepareStatus::Prepared;
-        prepare.status = DfsNamespacePrepareStatus::Committed;
-
-        if transitions_from_prepared {
+        if prepare.status == DfsNamespacePrepareStatus::Prepared {
             // Validate against the still-hidden namespace before making the
             // committed marker durable. The materialized log can then refer to
             // that exact prepared body instead of encoding every derived table
             // operation again. The journal remains the source of truth across
             // a table append failure or crash.
-            let shape_started = Instant::now();
-            let validated =
-                validate_namespace_prepare_shape(&self.tables, &self.shard_id, &prepare)?;
-            let shape_ms = shape_started.elapsed().as_millis();
+            //
+            // Payload shape and active-footprint overlap were already validated
+            // under the write lock which installed this exact durable Prepared
+            // record. Recheck only table state which could change while the
+            // primary waited for replica acknowledgement.
+            let commit_state_started = Instant::now();
+            validate_prepared_namespace_commit_state(&self.tables, prepare)?;
+            let commit_state_ms = commit_state_started.elapsed().as_millis();
             let expectations_started = Instant::now();
-            validate_namespace_prepare_expectations(&self.tables, &prepare)?;
+            validate_namespace_prepare_expectations(&self.tables, prepare)?;
             let expectations_ms = expectations_started.elapsed().as_millis();
-            let overlap_started = Instant::now();
-            validate_namespace_prepare_does_not_overlap(
-                &self.tables,
-                &prepare,
-                &validated.footprint,
-            )?;
-            let overlap_ms = overlap_started.elapsed().as_millis();
             let preconditions_started = Instant::now();
             validate_namespace_transaction_preconditions(&self.tables, &prepare.transaction)?;
             let preconditions_ms = preconditions_started.elapsed().as_millis();
 
+            let mutation = DfsMetadataMutation::commit_namespace_prepare(prepare);
+            let object_count = prepare.transaction.objects.len();
+            let version_count = prepare.transaction.versions.len();
+            let receipt_count = prepare.content_receipts.len();
             let journal_started = Instant::now();
-            let entry = self
-                .write_journal_unlocked(DfsMetadataMutation::commit_namespace_prepare(&prepare))?;
+            let entry = self.write_journal_unlocked(mutation)?;
             let journal_ms = journal_started.elapsed().as_millis();
+            let table_op = DfsMetadataTableOp::CommitNamespacePrepare {
+                operation_id: operation_id.to_string(),
+                operation_digest: expected_operation_digest.to_string(),
+                owner_epoch: expected_owner_epoch,
+                retained_at: Some(entry.created_at),
+            };
             // The preceding Prepared table record already owns the complete
             // transaction, receipt set, and routed-request evidence. Persist
             // one semantic commit marker, then expand it directly into the
@@ -8883,30 +9527,22 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             // as tens of thousands of derived table operations while keeping
             // the authoritative journal and crash replay exact.
             let table_started = Instant::now();
-            self.append_and_apply_table_ops(
-                entry.sequence,
-                vec![DfsMetadataTableOp::CommitNamespacePrepare {
-                    operation_id: prepare.operation_id.clone(),
-                    operation_digest: prepare.operation_digest.clone(),
-                    owner_epoch: prepare.owner_epoch,
-                }],
-            )?;
+            self.append_and_apply_table_ops(entry.sequence, vec![table_op])?;
             let table_ms = table_started.elapsed().as_millis();
             let checkpoint_started = Instant::now();
             self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
             let checkpoint_ms = checkpoint_started.elapsed().as_millis();
             metadata_backend_perf_trace(format_args!(
-                "metadata-commit-namespace-prepare shard={} operation={} objects={} versions={} receipts={} lock_ms={} lookup_ms={} shape_ms={} expectations_ms={} overlap_ms={} preconditions_ms={} journal_ms={} table_ms={} checkpoint_ms={} total_ms={}",
+                "metadata-commit-namespace-prepare shard={} operation={} objects={} versions={} receipts={} lock_ms={} lookup_ms={} commit_state_ms={} expectations_ms={} preconditions_ms={} journal_ms={} table_ms={} checkpoint_ms={} total_ms={}",
                 self.shard_id.0,
                 operation_id,
-                prepare.transaction.objects.len(),
-                prepare.transaction.versions.len(),
-                prepare.content_receipts.len(),
+                object_count,
+                version_count,
+                receipt_count,
                 lock_ms,
                 lookup_ms,
-                shape_ms,
+                commit_state_ms,
                 expectations_ms,
-                overlap_ms,
                 preconditions_ms,
                 journal_ms,
                 table_ms,
@@ -8919,6 +9555,8 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         // A repeated commit can be repairing a durable Committed marker whose
         // namespace table batch was interrupted. Keep that idempotent recovery
         // path on the recovery/reference planner.
+        let mut prepare = prepare.clone();
+        prepare.status = DfsNamespacePrepareStatus::Committed;
         let mut table_ops =
             namespace_prepare_table_ops_for_record(&self.tables, &self.shard_id, &prepare)?;
         if table_ops.is_empty() {
@@ -9155,6 +9793,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             )));
         }
         let state_fingerprint = prefix_proof.digest.clone();
+        let prefix_proof_version = u32::from(prefix_proof.version);
 
         let cut_changed = request.after.as_ref().is_some_and(|after| {
             after.journal_sequence != journal_sequence
@@ -9178,6 +9817,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             .as_ref()
             .is_some_and(|cache| {
                 cache.journal_sequence == journal_sequence
+                    && cache.prefix_proof_version == prefix_proof_version
                     && cache.state_fingerprint == state_fingerprint
             });
         if !cache_matches {
@@ -9187,6 +9827,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 self.content_root_catalog_snapshot_cache.take();
             self.content_root_catalog_snapshot_cache =
                 Some(Arc::new(DfsContentRootCatalogSnapshotCache {
+                    prefix_proof_version,
                     journal_sequence,
                     state_fingerprint: state_fingerprint.clone(),
                     entries: Arc::new(entries),
@@ -9691,6 +10332,42 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         )
     }
 
+    fn journal_frames_for_batch(
+        &self,
+        batch: &DfsMetadataJournalBatch,
+    ) -> Result<Vec<DfsMetadataJournalFrameRecord>> {
+        self.require_replication_source_shard(&batch.shard_id)?;
+        let sequences = batch
+            .entries
+            .iter()
+            .map(|entry| entry.sequence)
+            .collect::<Vec<_>>();
+        let exact_frames = read_segmented_journal_frames_at_sequences(&self.root, &sequences)?;
+        batch
+            .entries
+            .iter()
+            .zip(exact_frames)
+            .map(|(entry, frame)| {
+                let frame = frame.ok_or_else(|| {
+                    MetadataBackendError::Serde(format!(
+                        "metadata shard {} has no exact journal frame at sequence {}",
+                        self.shard_id.0, entry.sequence
+                    ))
+                })?;
+                if frame.entry() != entry {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata shard {} exact journal frame {} differs from selected batch entry",
+                        self.shard_id.0, entry.sequence
+                    )));
+                }
+                Ok(DfsMetadataJournalFrameRecord {
+                    sequence: entry.sequence,
+                    exact_bytes: bytes::Bytes::from_owner(frame.exact_bytes_arc()),
+                })
+            })
+            .collect()
+    }
+
     fn journal_last_sequence(&self) -> Result<u64> {
         Ok(LocalSobjMetadataBackend::journal_last_sequence(self))
     }
@@ -9825,7 +10502,10 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     }
 
     fn put_metadata_prefix_ack_floor(&mut self, floor: &DfsMetadataPrefixAckFloor) -> Result<()> {
-        let _lock = self.begin_metadata_write_allow_frozen()?;
+        // Prefix acknowledgements are durable sidecars. Ordinary replica ACKs
+        // deliberately persist the exact journal proof before rebuildable
+        // tables catch up, so this path must not force materialization.
+        let _lock = self.metadata_write_lock()?;
         metadata_cursor::put_metadata_prefix_ack_floor(&self.root, floor)
     }
 
@@ -9895,6 +10575,47 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         LocalSobjMetadataBackend::apply_journal_batch_with_replica_permit_report(
             self, permit, batch,
         )
+    }
+
+    fn persist_journal_batch_with_replica_permit_report(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+    ) -> Result<DfsMetadataReplicaApplyReport> {
+        LocalSobjMetadataBackend::persist_journal_batch_with_replica_permit_report(
+            self, permit, batch,
+        )
+    }
+
+    fn persist_journal_frames_with_replica_permit_report(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+        frames: &[DfsMetadataJournalFrameRecord],
+    ) -> Result<DfsMetadataReplicaApplyReport> {
+        LocalSobjMetadataBackend::persist_journal_frames_with_replica_permit_report(
+            self, permit, batch, frames,
+        )
+    }
+
+    fn persist_authority_journal_frames_with_replica_permit_report(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+        frames: &[DfsMetadataJournalFrameRecord],
+        expected_target_prefix: &DfsMetadataPrefixProof,
+    ) -> Result<DfsMetadataReplicaApplyReport> {
+        LocalSobjMetadataBackend::persist_authority_journal_frames_with_replica_permit_report(
+            self,
+            permit,
+            batch,
+            frames,
+            expected_target_prefix,
+        )
+    }
+
+    fn materialize_pending_replica_journal(&mut self) -> Result<usize> {
+        LocalSobjMetadataBackend::materialize_pending_replica_journal(self)
     }
 
     fn replace_with_replicated_snapshot(
@@ -11500,7 +12221,7 @@ mod tests {
                     &pending_request.request_id,
                 )
                 .expect("reopened pending request"),
-            Some(pending_request)
+            Some(pending_request.clone())
         );
         assert_eq!(
             reopened
@@ -11514,6 +12235,31 @@ mod tests {
                 .expect("reopened hidden object"),
             Some(current.clone())
         );
+
+        let mut conflicting_pending_request = pending_request.clone();
+        conflicting_pending_request.command_digest =
+            "blake3:conflicting-request-while-prepare-waits".to_string();
+        reopened
+            .tables
+            .apply(DfsMetadataTableOp::PutNamespaceRequest {
+                request: conflicting_pending_request,
+            });
+        let conflict = reopened
+            .commit_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect_err("commit must revalidate current request state");
+        assert!(
+            conflict.to_string().contains("completed request conflicts"),
+            "unexpected request-state error: {conflict}"
+        );
+        reopened
+            .tables
+            .apply(DfsMetadataTableOp::PutNamespaceRequest {
+                request: pending_request,
+            });
 
         reopened
             .commit_prepared_namespace_transaction(
@@ -11538,12 +12284,26 @@ mod tests {
                 .expect("committed object"),
             Some(committed)
         );
-        assert_eq!(
+        assert!(
             reopened
                 .get_namespace_prepare(&prepare.operation_id)
                 .expect("committed prepare")
-                .map(|record| record.status),
-            Some(DfsNamespacePrepareStatus::Committed)
+                .is_none(),
+            "the committed prepare body must be compacted immediately"
+        );
+        assert_eq!(
+            reopened
+                .tables
+                .namespace_prepare_receipts
+                .get(&prepare.operation_id)
+                .map(|receipt| &receipt.status),
+            Some(&DfsNamespacePrepareStatus::Committed)
+        );
+        assert!(
+            reopened
+                .tables
+                .namespace_transaction_receipts
+                .contains_key(&prepare.transaction.transaction_id)
         );
         cleanup(&root);
     }
@@ -11833,6 +12593,30 @@ mod tests {
                 .expect("committed object"),
             Some(committed)
         );
+        assert!(
+            reopened
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("committed full prepare")
+                .is_none()
+        );
+        assert!(
+            reopened
+                .get_namespace_transaction(&prepare.transaction.transaction_id)
+                .expect("committed full transaction")
+                .is_none()
+        );
+        let prepare_receipt = reopened
+            .tables
+            .namespace_prepare_receipts
+            .get(&prepare.operation_id)
+            .cloned()
+            .expect("compact prepare receipt");
+        let transaction_receipt = reopened
+            .tables
+            .namespace_transaction_receipts
+            .get(&prepare.transaction.transaction_id)
+            .cloned()
+            .expect("compact transaction receipt");
 
         force_table_replay_from_journal(&reopened, &root, 0);
         drop(reopened);
@@ -11846,6 +12630,20 @@ mod tests {
                 )
                 .expect("replayed compact terminal receipt"),
             Some(expected_receipt)
+        );
+        assert_eq!(
+            recovered
+                .tables
+                .namespace_prepare_receipts
+                .get(&prepare.operation_id),
+            Some(&prepare_receipt)
+        );
+        assert_eq!(
+            recovered
+                .tables
+                .namespace_transaction_receipts
+                .get(&prepare.transaction.transaction_id),
+            Some(&transaction_receipt)
         );
         recovered
             .put_namespace_request_on_shard(&shard_id, &completed_request)
@@ -11952,19 +12750,40 @@ mod tests {
                 .expect("replica object"),
             Some(committed.clone())
         );
-        assert_eq!(
+        assert!(
             replica
                 .get_namespace_prepare(&prepare.operation_id)
                 .expect("replica prepare")
-                .map(|record| record.status),
-            Some(DfsNamespacePrepareStatus::Committed)
+                .is_none(),
+            "replica commit must compact the full prepare body"
         );
-        assert_eq!(
+        assert!(
             replica
                 .get_namespace_transaction(&prepare.transaction.transaction_id)
-                .expect("replica transaction"),
-            Some(prepare.transaction.clone())
+                .expect("replica transaction")
+                .is_none(),
+            "replica commit must compact the full transaction body"
         );
+        let commit_retry = replica
+            .commit_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect("replica exact commit retry from compact receipt");
+        assert!(matches!(
+            commit_retry.mutation,
+            DfsMetadataMutation::PutNamespacePrepareReceipt { .. }
+        ));
+        let transaction_retry = replica
+            .shard_backend_mut(&shard_id)
+            .expect("replica shard backend")
+            .apply_namespace_transaction(&prepare.transaction)
+            .expect("replica exact transaction retry from compact receipt");
+        assert!(matches!(
+            transaction_retry.mutation,
+            DfsMetadataMutation::PutNamespaceTransactionReceipt { .. }
+        ));
         assert_eq!(
             replica
                 .read_object_shard_index(&current.object_id)
@@ -12077,6 +12896,30 @@ mod tests {
                 .map(|record| record.status),
             Some(DfsNamespacePrepareStatus::Prepared)
         );
+        assert!(
+            !replica
+                .tables
+                .namespace_prepares
+                .contains_key(&prepare_a.operation_id)
+        );
+        assert!(
+            !replica
+                .tables
+                .namespace_transactions
+                .contains_key(&prepare_a.transaction.transaction_id)
+        );
+        assert!(
+            replica
+                .tables
+                .namespace_prepare_receipts
+                .contains_key(&prepare_a.operation_id)
+        );
+        assert!(
+            replica
+                .tables
+                .namespace_transaction_receipts
+                .contains_key(&prepare_a.transaction.transaction_id)
+        );
 
         drop(replica);
         let replica =
@@ -12093,6 +12936,18 @@ mod tests {
                 .expect("reopened prepare b")
                 .map(|record| record.status),
             Some(DfsNamespacePrepareStatus::Prepared)
+        );
+        assert!(
+            !replica
+                .tables
+                .namespace_prepares
+                .contains_key(&prepare_a.operation_id)
+        );
+        assert!(
+            replica
+                .tables
+                .namespace_prepare_receipts
+                .contains_key(&prepare_a.operation_id)
         );
         cleanup(&root);
     }
@@ -12297,6 +13152,8 @@ mod tests {
             Some(DfsNamespacePrepareStatus::Prepared),
             "the failed append must leave the durable prepare uncommitted"
         );
+        assert!(replica.tables.namespace_prepare_receipts.is_empty());
+        assert!(replica.tables.namespace_transaction_receipts.is_empty());
         assert_eq!(
             replica.materialized_through_sequence, prepared_sequence,
             "a journal-only compact commit must not advance table materialization"
@@ -12323,6 +13180,30 @@ mod tests {
                 .expect("visible object after compact commit retry"),
             Some(committed.clone())
         );
+        assert!(
+            !replica
+                .tables
+                .namespace_prepares
+                .contains_key(&prepare.operation_id)
+        );
+        assert!(
+            !replica
+                .tables
+                .namespace_transactions
+                .contains_key(&prepare.transaction.transaction_id)
+        );
+        assert!(
+            replica
+                .tables
+                .namespace_prepare_receipts
+                .contains_key(&prepare.operation_id)
+        );
+        assert!(
+            replica
+                .tables
+                .namespace_transaction_receipts
+                .contains_key(&prepare.transaction.transaction_id)
+        );
 
         drop(replica);
         let replica =
@@ -12332,6 +13213,18 @@ mod tests {
                 .get_object(&current.object_id)
                 .expect("reopened compact commit object"),
             Some(committed)
+        );
+        assert!(
+            !replica
+                .tables
+                .namespace_prepares
+                .contains_key(&prepare.operation_id)
+        );
+        assert!(
+            replica
+                .tables
+                .namespace_prepare_receipts
+                .contains_key(&prepare.operation_id)
         );
         cleanup(&root);
     }
@@ -12718,6 +13611,8 @@ mod tests {
             probe_id: "probe-packed-prepare".to_string(),
             expected_shard: config.clone(),
             operation,
+            durable_journal_ack: false,
+            journal_frames: Vec::new(),
             prepared_prefix: Some(source_prefix.clone()),
         };
         let permit = DfsMetadataReplicaIngestPermit::new_validated(
@@ -13348,9 +14243,15 @@ mod tests {
         backend.put_file_system(&file_system).expect("filesystem");
         backend.put_object(&current).expect("current object");
 
+        crate::metadata_tables::reset_namespace_prepare_footprint_constructions();
         let prepare_entry = backend
             .prepare_namespace_transaction(&prepare)
             .expect("prepare namespace transaction");
+        assert_eq!(
+            crate::metadata_tables::namespace_prepare_footprint_constructions(),
+            1,
+            "prepare admission must construct its validated footprint once"
+        );
         assert!(matches!(
             prepare_entry.mutation,
             DfsMetadataMutation::PutNamespacePrepare {
@@ -13414,6 +14315,7 @@ mod tests {
         );
 
         reset_namespace_prepared_commit_reference_planner_calls();
+        crate::metadata_tables::reset_namespace_prepare_footprint_constructions();
         let commit_entry = reopened
             .commit_prepared_namespace_transaction(
                 &prepare.operation_id,
@@ -13421,6 +14323,11 @@ mod tests {
                 prepare.owner_epoch,
             )
             .expect("commit prepared namespace transaction");
+        assert_eq!(
+            crate::metadata_tables::namespace_prepare_footprint_constructions(),
+            0,
+            "normal Prepared -> Committed publication must not rebuild a validated footprint"
+        );
         assert_eq!(
             namespace_prepared_commit_reference_planner_calls(),
             0,
@@ -13436,33 +14343,57 @@ mod tests {
                 .expect("committed object"),
             Some(committed.clone())
         );
-        assert_eq!(
+        assert!(
             reopened
                 .get_namespace_prepare(&prepare.operation_id)
                 .expect("committed prepare")
-                .map(|record| record.status),
-            Some(DfsNamespacePrepareStatus::Committed)
+                .is_none(),
+            "committing must release the full prepared body"
         );
+        let prepare_receipt = reopened
+            .tables
+            .namespace_prepare_receipts
+            .get(&prepare.operation_id)
+            .cloned()
+            .expect("compact committed prepare receipt");
+        assert_eq!(prepare_receipt.status, DfsNamespacePrepareStatus::Committed);
+        assert_eq!(prepare_receipt.retained_at, commit_entry.created_at);
         assert!(
             reopened
                 .tables
                 .namespace_prepare_footprint_indexes_match_history(),
             "Prepared -> Committed table apply must release active ownership"
         );
-        assert_eq!(
+        assert!(
             reopened
                 .get_namespace_transaction(&prepare.transaction.transaction_id)
-                .expect("committed transaction"),
-            Some(prepare.transaction.clone()),
-            "the visible transaction and committed marker must share one table batch"
+                .expect("committed transaction")
+                .is_none(),
+            "the canonical table state and compact receipt replace the full transaction"
         );
-        reopened
+        let transaction_receipt = reopened
+            .tables
+            .namespace_transaction_receipts
+            .get(&prepare.transaction.transaction_id)
+            .cloned()
+            .expect("compact committed transaction receipt");
+        assert!(
+            transaction_receipt
+                .matches_transaction(&prepare.transaction)
+                .expect("transaction receipt identity")
+        );
+        assert_eq!(transaction_receipt.retained_at, commit_entry.created_at);
+        let repeated_commit = reopened
             .commit_prepared_namespace_transaction(
                 &prepare.operation_id,
                 &prepare.operation_digest,
                 prepare.owner_epoch,
             )
             .expect("repeated committed transaction uses the idempotent recovery path");
+        assert!(matches!(
+            repeated_commit.mutation,
+            DfsMetadataMutation::PutNamespacePrepareReceipt { .. }
+        ));
         assert_eq!(
             reopened
                 .get_object(&current.object_id)
@@ -13478,12 +14409,25 @@ mod tests {
                 .expect("durable committed object"),
             Some(committed)
         );
-        assert_eq!(
+        assert!(
             reopened
                 .get_namespace_prepare(&prepare.operation_id)
                 .expect("durable committed prepare")
-                .map(|record| record.status),
-            Some(DfsNamespacePrepareStatus::Committed)
+                .is_none()
+        );
+        assert_eq!(
+            reopened
+                .tables
+                .namespace_prepare_receipts
+                .get(&prepare.operation_id),
+            Some(&prepare_receipt)
+        );
+        assert_eq!(
+            reopened
+                .tables
+                .namespace_transaction_receipts
+                .get(&prepare.transaction.transaction_id),
+            Some(&transaction_receipt)
         );
         assert!(
             reopened
@@ -13868,6 +14812,139 @@ mod tests {
             "a failed commit must leave the hidden prepare and visible namespace unchanged"
         );
 
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_namespace_prepare_commit_revalidates_transaction_identity() {
+        let root = temp_root("local_backend_namespace_prepare_transaction_identity_race");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+
+        let current_a = object(version("version_prepare_transaction_a_1"));
+        let mut committed_a = current_a.clone();
+        committed_a.version = version("version_prepare_transaction_a_2");
+        let prepare_a = namespace_prepare(
+            "operation-transaction-identity-a",
+            &shard_id.0,
+            &current_a,
+            committed_a,
+        );
+
+        let mut current_b = object(version("version_prepare_transaction_b_1"));
+        current_b.object_id =
+            DfsObjectId::from_legacy_named("obj_prepare_transaction_b").expect("object id");
+        current_b.path = "/docs/prepare-transaction-b".to_string();
+        let mut committed_b = current_b.clone();
+        committed_b.version = version("version_prepare_transaction_b_2");
+        let mut prepare_b = namespace_prepare(
+            "operation-transaction-identity-b",
+            &shard_id.0,
+            &current_b,
+            committed_b,
+        );
+        prepare_b.transaction.transaction_id = prepare_a.transaction.transaction_id.clone();
+        prepare_b.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare_b)
+                .expect("second prepare digest");
+
+        backend.put_object(&current_a).expect("current object a");
+        backend.put_object(&current_b).expect("current object b");
+        backend
+            .prepare_namespace_transaction(&prepare_a)
+            .expect("first disjoint prepare");
+        backend
+            .prepare_namespace_transaction(&prepare_b)
+            .expect("second disjoint prepare with unresolved transaction id");
+        backend
+            .commit_prepared_namespace_transaction(
+                &prepare_a.operation_id,
+                &prepare_a.operation_digest,
+                prepare_a.owner_epoch,
+            )
+            .expect("first transaction commit");
+
+        let conflict = backend
+            .commit_prepared_namespace_transaction(
+                &prepare_b.operation_id,
+                &prepare_b.operation_digest,
+                prepare_b.owner_epoch,
+            )
+            .expect_err("second commit must revalidate transaction identity");
+        assert!(
+            conflict.to_string().contains("reuses transaction id"),
+            "unexpected transaction identity error: {conflict}"
+        );
+        assert_eq!(
+            backend
+                .get_namespace_prepare(&prepare_b.operation_id)
+                .expect("second prepare")
+                .map(|prepare| prepare.status),
+            Some(DfsNamespacePrepareStatus::Prepared)
+        );
+        assert_eq!(
+            backend.get_object(&current_b.object_id).expect("object b"),
+            Some(current_b)
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_namespace_prepare_commit_revalidates_advisory_lock_state() {
+        let root = temp_root("local_backend_namespace_prepare_advisory_lock_race");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        let current = object(version("version_prepare_lock_1"));
+        let mut committed = current.clone();
+        committed.version = version("version_prepare_lock_2");
+        let mut prepare = namespace_prepare(
+            "operation-advisory-lock-race",
+            &shard_id.0,
+            &current,
+            committed,
+        );
+        let prepared_lock = DfsAdvisoryLockStateRecord::empty(
+            current.file_system_id.clone(),
+            current.object_id.clone(),
+            7,
+        );
+        prepare
+            .transaction
+            .advisory_lock_states
+            .push(prepared_lock.clone());
+        prepare.operation_digest =
+            crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+                .expect("prepare digest");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_object(&current).expect("current object");
+        backend
+            .prepare_namespace_transaction(&prepare)
+            .expect("prepare with advisory-lock state");
+
+        let mut raced_lock = prepared_lock;
+        raced_lock.authority_epoch += 1;
+        backend
+            .tables
+            .apply(DfsMetadataTableOp::PutAdvisoryLockState { state: raced_lock });
+        let conflict = backend
+            .commit_prepared_namespace_transaction(
+                &prepare.operation_id,
+                &prepare.operation_digest,
+                prepare.owner_epoch,
+            )
+            .expect_err("commit must revalidate advisory-lock state");
+        assert!(
+            matches!(&conflict, MetadataBackendError::AdvisoryLock(_)),
+            "unexpected advisory-lock error: {conflict}"
+        );
+        assert_eq!(
+            backend
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("prepare after lock race")
+                .map(|prepare| prepare.status),
+            Some(DfsNamespacePrepareStatus::Prepared)
+        );
         cleanup(&root);
     }
 
@@ -22808,6 +23885,139 @@ mod tests {
     }
 
     #[test]
+    fn durable_replica_ack_materializes_a_batch_over_the_prospective_lag_bound() {
+        let root = temp_root("durable_replica_ack_prospective_lag_bound");
+        let shard_id = DfsMetadataShardId::new("root");
+        let source_node_id = node("node_owner");
+        let mut source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source")).expect("source");
+        source.set_namespace_prepare_codec(DfsMetadataNamespacePrepareCodec::PackedV2);
+
+        let mut source_file_system = file_system();
+        source
+            .put_file_system(&source_file_system)
+            .expect("source filesystem");
+        let current = object(version("version_prospective_lag_1"));
+        source.put_object(&current).expect("source object");
+        for index in 0..MAX_DEFERRED_REPLICA_ENTRIES.saturating_sub(2) {
+            source_file_system.display_name = format!("prospective lag entry {index}");
+            source
+                .put_file_system(&source_file_system)
+                .expect("source lag entry");
+        }
+        let mut committed = current.clone();
+        committed.version = version("version_prospective_lag_2");
+        committed.mode = 0o600;
+        let prepare = namespace_prepare(
+            "operation-prospective-lag-bound",
+            &shard_id.0,
+            &current,
+            committed,
+        );
+        source
+            .prepare_namespace_transaction(&prepare)
+            .expect("source namespace prepare");
+
+        let batch = source
+            .journal_batch_since_limited(
+                0,
+                MAX_DEFERRED_REPLICA_ENTRIES.saturating_add(1) as usize,
+                usize::MAX,
+            )
+            .expect("source journal batch")
+            .expect("source journal entries");
+        assert_eq!(
+            batch.entries.len(),
+            MAX_DEFERRED_REPLICA_ENTRIES.saturating_add(1) as usize,
+            "one incoming batch must cross the deferred materialization bound"
+        );
+        let exact_frames =
+            DfsMetadataBackend::journal_frames_for_batch(&source, &batch).expect("exact frames");
+        let source_prefix = source.metadata_prefix_proof().expect("source prefix");
+        let target_sequence = batch.next_after_sequence;
+
+        let mut shard = root_shard_config_at_epoch(&shard_id.0, prepare.owner_epoch);
+        shard.namespace_prepare_codec = DfsMetadataNamespacePrepareCodec::PackedV2;
+        let operation = crate::service_replica::metadata_authority_operation_for_namespace_prepare(
+            &prepare,
+            target_sequence,
+        )
+        .expect("namespace authority operation");
+        let probe = DfsMetadataAuthorityProbe {
+            probe_id: "probe-prospective-lag-bound".to_string(),
+            expected_shard: shard.clone(),
+            operation,
+            durable_journal_ack: true,
+            journal_frames: exact_frames.clone(),
+            prepared_prefix: Some(source_prefix.clone()),
+        };
+        let expected_confirmation =
+            crate::service_replica::metadata_authority_probe_confirmation_id(&probe)
+                .expect("authority confirmation");
+        let permit = DfsMetadataReplicaIngestPermit::new_validated(
+            source_file_system.file_system_id.clone(),
+            shard_id.clone(),
+            source_node_id,
+            prepare.owner_epoch,
+        );
+        let wire_batch = DfsMetadataJournalBatch {
+            shard_id: shard_id.clone(),
+            entries: Vec::new(),
+            next_after_sequence: target_sequence,
+        };
+        let mut replica =
+            LocalSobjMetadataBackend::new(shard_id, root.join("replica")).expect("replica");
+
+        let report = replica
+            .persist_authority_journal_frames_with_replica_permit_report(
+                &permit,
+                &wire_batch,
+                &exact_frames,
+                &source_prefix,
+            )
+            .expect("durable exact-frame ingest");
+
+        assert_eq!(report.applied_entries(), exact_frames.len());
+        assert!(
+            !report.materialization_pending(),
+            "an ACK over the prospective lag bound must wait for table materialization"
+        );
+        assert_eq!(
+            crate::service_replica::verify_persisted_metadata_authority_probe_after_apply(
+                &replica, &shard, &probe, &report,
+            )
+            .expect("verify exact authority proof"),
+            expected_confirmation,
+        );
+        assert_eq!(replica.journal_last_sequence(), target_sequence);
+        assert_eq!(replica.materialized_through_sequence, target_sequence);
+        assert_eq!(
+            replica
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("materialized prepare"),
+            Some(prepare),
+        );
+        assert_eq!(
+            replica.metadata_prefix_proof().expect("replica prefix"),
+            source_prefix,
+        );
+        assert_eq!(
+            DfsMetadataBackend::journal_frames_for_batch(&replica, &batch)
+                .expect("retained exact frames"),
+            exact_frames,
+            "bounded synchronous materialization must retain the authority's immutable bytes"
+        );
+        assert_eq!(
+            replica
+                .materialize_pending_replica_journal()
+                .expect("no pending materialization"),
+            0,
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn local_backend_rejects_replication_from_foreign_logical_shard() {
         let root = temp_root("local_backend_rejects_foreign_replication_shard");
         let source_shard_id = DfsMetadataShardId::new("source-shard");
@@ -23097,6 +24307,107 @@ mod tests {
     }
 
     #[test]
+    fn replicated_snapshot_matching_exact_authority_floor_repairs_same_sequence() {
+        let leader_root = temp_root("snapshot_matching_exact_authority_floor_leader");
+        let replica_root = temp_root("snapshot_matching_exact_authority_floor_replica");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut leader =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &leader_root).expect("leader");
+        leader
+            .put_file_system(&file_system())
+            .expect("leader filesystem");
+        let sequence = leader.journal_last_sequence();
+        let snapshot = leader.export_table_snapshot();
+        let prefix = snapshot
+            .prefix_proof
+            .clone()
+            .expect("authoritative snapshot prefix");
+
+        let mut replica =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &replica_root).expect("replica");
+        replica
+            .put_metadata_authority_ack_floor(&DfsMetadataAuthorityAckFloor {
+                shard_id: shard_id.clone(),
+                journal_sequence: sequence,
+                durable_prefix_proof: Some(prefix.clone()),
+            })
+            .expect("exact authority floor");
+
+        replica
+            .replace_with_replicated_snapshot(shard_id, sequence, snapshot)
+            .expect("matching exact snapshot repair");
+        assert_eq!(
+            replica.metadata_prefix_proof().expect("installed prefix"),
+            prefix
+        );
+
+        cleanup(&leader_root);
+        cleanup(&replica_root);
+    }
+
+    #[test]
+    fn replicated_snapshot_rejects_divergent_or_legacy_same_sequence_authority_floor() {
+        let leader_root = temp_root("snapshot_divergent_authority_floor_leader");
+        let divergent_root = temp_root("snapshot_divergent_authority_floor_replica");
+        let legacy_root = temp_root("snapshot_legacy_authority_floor_replica");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut leader =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &leader_root).expect("leader");
+        leader
+            .put_file_system(&file_system())
+            .expect("leader filesystem");
+        let sequence = leader.journal_last_sequence();
+        let snapshot = leader.export_table_snapshot();
+        let mut divergent_prefix = snapshot
+            .prefix_proof
+            .clone()
+            .expect("authoritative snapshot prefix");
+        let final_digit = divergent_prefix.digest.pop().expect("digest digit");
+        divergent_prefix
+            .digest
+            .push(if final_digit == '0' { '1' } else { '0' });
+        assert!(divergent_prefix.is_well_formed());
+
+        let mut divergent =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &divergent_root).expect("replica");
+        divergent
+            .put_metadata_authority_ack_floor(&DfsMetadataAuthorityAckFloor {
+                shard_id: shard_id.clone(),
+                journal_sequence: sequence,
+                durable_prefix_proof: Some(divergent_prefix),
+            })
+            .expect("divergent exact authority floor");
+        assert!(
+            divergent
+                .replace_with_replicated_snapshot(shard_id.clone(), sequence, snapshot.clone(),)
+                .expect_err("divergent exact floor must reject same-sequence repair")
+                .to_string()
+                .contains("prefix conflicts with locally acknowledged authority operation")
+        );
+
+        let mut legacy =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &legacy_root).expect("replica");
+        legacy
+            .put_metadata_authority_ack_floor(&DfsMetadataAuthorityAckFloor {
+                shard_id: shard_id.clone(),
+                journal_sequence: sequence,
+                durable_prefix_proof: None,
+            })
+            .expect("legacy authority floor");
+        assert!(
+            legacy
+                .replace_with_replicated_snapshot(shard_id, sequence, snapshot)
+                .expect_err("legacy floor must fail closed at the same sequence")
+                .to_string()
+                .contains("prefix conflicts with locally acknowledged authority operation")
+        );
+
+        cleanup(&leader_root);
+        cleanup(&divergent_root);
+        cleanup(&legacy_root);
+    }
+
+    #[test]
     fn unreadable_replica_can_install_authoritative_snapshot() {
         let leader_root = temp_root("unreadable_snapshot_repair_leader");
         let replica_root = temp_root("unreadable_snapshot_repair_replica");
@@ -23337,6 +24648,7 @@ mod tests {
         let floor = DfsMetadataAuthorityAckFloor {
             shard_id: shard_id.clone(),
             journal_sequence: materialized_sequence_before,
+            durable_prefix_proof: None,
         };
 
         backend
@@ -25311,7 +26623,7 @@ mod tests {
     }
 
     #[test]
-    fn table_checkpoint_preserves_terminal_namespace_history_without_journaled_gc() {
+    fn table_checkpoint_preserves_compact_terminal_namespace_history() {
         let root = temp_root("terminal_namespace_history_checkpoint");
         let shard_id = DfsMetadataShardId::new("root");
         let file_system = file_system();
@@ -25333,7 +26645,7 @@ mod tests {
             &current,
             committed,
         );
-        prepare.transaction.created_at = now;
+        prepare.transaction.created_at = OffsetDateTime::UNIX_EPOCH;
         prepare.completed_request = Some(completed_request.clone());
         prepare.operation_digest =
             crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
@@ -25350,7 +26662,7 @@ mod tests {
         backend
             .prepare_namespace_transaction(&prepare)
             .expect("hidden prepare");
-        backend
+        let commit_entry = backend
             .commit_prepared_namespace_transaction(
                 &prepare.operation_id,
                 &prepare.operation_digest,
@@ -25358,14 +26670,38 @@ mod tests {
             )
             .expect("commit prepare");
 
-        let durable_transaction = backend
-            .get_namespace_transaction(&transaction.transaction_id)
-            .expect("durable transaction lookup")
-            .expect("full durable transaction");
-        let durable_prepare = backend
-            .get_namespace_prepare(&prepare.operation_id)
-            .expect("durable prepare lookup")
-            .expect("full durable prepare");
+        assert!(
+            backend
+                .get_namespace_transaction(&transaction.transaction_id)
+                .expect("durable transaction lookup")
+                .is_none()
+        );
+        assert!(
+            backend
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("durable prepare lookup")
+                .is_none()
+        );
+        let durable_transaction_receipt = backend
+            .tables
+            .namespace_transaction_receipts
+            .get(&transaction.transaction_id)
+            .cloned()
+            .expect("durable compact transaction receipt");
+        let durable_prepare_receipt = backend
+            .tables
+            .namespace_prepare_receipts
+            .get(&prepare.operation_id)
+            .cloned()
+            .expect("durable compact prepare receipt");
+        assert_eq!(
+            durable_transaction_receipt.retained_at, commit_entry.created_at,
+            "transaction retry retention starts at the authoritative commit"
+        );
+        assert_eq!(
+            durable_prepare_receipt.retained_at, commit_entry.created_at,
+            "prepare retry retention starts at the authoritative commit"
+        );
         let durable_request = backend
             .get_namespace_request(
                 &completed_request.requester_node_id,
@@ -25377,17 +26713,17 @@ mod tests {
             .compact_metadata_table_log_if_needed(0)
             .expect("force exact table checkpoint");
 
-        assert_eq!(
+        assert!(
             backend
                 .get_namespace_transaction(&transaction.transaction_id)
-                .expect("checkpoint transaction lookup"),
-            Some(durable_transaction.clone())
+                .expect("checkpoint transaction lookup")
+                .is_none()
         );
-        assert_eq!(
+        assert!(
             backend
                 .get_namespace_prepare(&prepare.operation_id)
-                .expect("checkpoint prepare lookup"),
-            Some(durable_prepare.clone())
+                .expect("checkpoint prepare lookup")
+                .is_none()
         );
         assert_eq!(
             backend
@@ -25398,24 +26734,50 @@ mod tests {
                 .expect("checkpoint request lookup"),
             Some(durable_request.clone())
         );
-        assert!(backend.tables.namespace_transaction_receipts.is_empty());
-        assert!(backend.tables.namespace_prepare_receipts.is_empty());
+        assert_eq!(
+            backend
+                .tables
+                .namespace_transaction_receipts
+                .get(&transaction.transaction_id),
+            Some(&durable_transaction_receipt)
+        );
+        assert_eq!(
+            backend
+                .tables
+                .namespace_prepare_receipts
+                .get(&prepare.operation_id),
+            Some(&durable_prepare_receipt)
+        );
         assert!(backend.tables.namespace_request_receipts.is_empty());
 
         drop(backend);
         let mut reopened =
             LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("reopen checkpoint");
-        assert_eq!(
+        assert!(
             reopened
                 .get_namespace_transaction(&transaction.transaction_id)
-                .expect("reopened transaction lookup"),
-            Some(durable_transaction)
+                .expect("reopened transaction lookup")
+                .is_none()
+        );
+        assert!(
+            reopened
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("reopened prepare lookup")
+                .is_none()
         );
         assert_eq!(
             reopened
-                .get_namespace_prepare(&prepare.operation_id)
-                .expect("reopened prepare lookup"),
-            Some(durable_prepare)
+                .tables
+                .namespace_transaction_receipts
+                .get(&transaction.transaction_id),
+            Some(&durable_transaction_receipt)
+        );
+        assert_eq!(
+            reopened
+                .tables
+                .namespace_prepare_receipts
+                .get(&prepare.operation_id),
+            Some(&durable_prepare_receipt)
         );
         assert_eq!(
             reopened
@@ -25436,7 +26798,14 @@ mod tests {
             .expect("exact committed prepare retry");
         assert!(matches!(
             commit_retry.mutation,
-            DfsMetadataMutation::CommitNamespacePrepare { .. }
+            DfsMetadataMutation::PutNamespacePrepareReceipt { .. }
+        ));
+        let prepare_retry = reopened
+            .prepare_namespace_transaction(&prepare)
+            .expect("exact prepared body retry from compact receipt");
+        assert!(matches!(
+            prepare_retry.mutation,
+            DfsMetadataMutation::PutNamespacePrepareReceipt { .. }
         ));
         let request_retry = reopened
             .put_namespace_request_on_shard(&shard_id, &completed_request)
@@ -25450,7 +26819,7 @@ mod tests {
             .expect("exact materialized transaction retry");
         assert!(matches!(
             transaction_retry.mutation,
-            DfsMetadataMutation::ApplyNamespaceTransaction { .. }
+            DfsMetadataMutation::PutNamespaceTransactionReceipt { .. }
         ));
 
         let mut conflicting_transaction = transaction.clone();
@@ -27021,8 +28390,8 @@ mod tests {
     }
 
     #[test]
-    fn metadata_history_gc_roots_request_receipt_through_prepare_recovery_and_reopen() {
-        let root = temp_root("metadata-history-gc-prepare-request-recovery-root");
+    fn metadata_history_gc_evicts_immediate_prepare_receipts_and_preserves_floors() {
+        let root = temp_root("metadata-history-gc-immediate-prepare-receipts");
         let shard_id = DfsMetadataShardId::new("root");
         let current = object(version("version_gc_prepare_request_current"));
         let mut committed = current.clone();
@@ -27056,13 +28425,37 @@ mod tests {
         backend
             .prepare_namespace_transaction(&prepare)
             .expect("fused request admission and prepare");
-        backend
+        let commit_entry = backend
             .commit_prepared_namespace_transaction(
                 &prepare.operation_id,
                 &prepare.operation_digest,
                 prepare.owner_epoch,
             )
             .expect("commit request-owned prepare");
+        assert!(
+            backend
+                .get_namespace_prepare(&prepare.operation_id)
+                .expect("committed prepare body")
+                .is_none()
+        );
+        assert!(
+            backend
+                .get_namespace_transaction(&prepare.transaction.transaction_id)
+                .expect("committed transaction body")
+                .is_none()
+        );
+        assert!(
+            backend
+                .tables
+                .namespace_prepare_receipts
+                .contains_key(&prepare.operation_id)
+        );
+        assert!(
+            backend
+                .tables
+                .namespace_transaction_receipts
+                .contains_key(&prepare.transaction.transaction_id)
+        );
         assert_eq!(
             backend
                 .get_namespace_request(
@@ -27072,122 +28465,63 @@ mod tests {
                 .expect("completed request"),
             Some(completed_request.clone())
         );
-
-        // Model an interrupted/later-overwritten materialization after the
-        // committed prepare and request outcome became durable. The retained
-        // namespace transaction must restore the committed object on reopen,
-        // while the full prepare depends on the compact request witness.
         backend
-            .put_object(&current)
-            .expect("make committed namespace transaction incomplete");
-        assert_eq!(
-            backend
-                .get_object(&current.object_id)
-                .expect("incomplete transaction object"),
-            Some(current.clone())
-        );
-        let compacted = backend
-            .gc_metadata_history_authoritative(
-                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
-                    .with_now_unix_nanos(10_000_000_000),
-            )
-            .expect("compact terminal request while prepare needs recovery");
-        assert_eq!(compacted.compacted_namespace_request_count, 1);
-        assert!(
-            backend
-                .get_namespace_request(
-                    &completed_request.requester_node_id,
-                    &completed_request.request_id,
-                )
-                .expect("compacted request body")
-                .is_none()
-        );
-        let compact_request_receipt = backend
-            .get_namespace_request_receipt(
-                &completed_request.requester_node_id,
-                &completed_request.request_id,
-            )
-            .expect("compacted request receipt lookup")
-            .expect("compacted request receipt");
-
-        let protected = backend
-            .gc_metadata_history_authoritative(
-                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
-                    .with_now_unix_nanos(11_000_000_000),
-            )
-            .expect("retain prepare-dependent request receipt");
-        assert_eq!(protected.removed_namespace_request_receipt_count, 0);
-        assert_eq!(
-            backend
-                .get_namespace_request_receipt(
-                    &completed_request.requester_node_id,
-                    &completed_request.request_id,
-                )
-                .expect("protected request receipt"),
-            Some(compact_request_receipt.clone())
-        );
-        assert_eq!(
-            backend
-                .get_namespace_prepare(&prepare.operation_id)
-                .expect("recovery-root prepare"),
-            Some({
-                let mut committed_prepare = prepare.clone();
-                committed_prepare.status = DfsNamespacePrepareStatus::Committed;
-                committed_prepare
-            })
-        );
+            .compact_metadata_table_log_if_needed(0)
+            .expect("checkpoint compact terminal identities");
         drop(backend);
 
-        let mut reopened =
-            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("reopen for recovery");
+        let mut reopened = LocalSobjMetadataBackend::new(shard_id.clone(), &root)
+            .expect("reopen compact terminal identities");
         assert_eq!(
             reopened
                 .get_object(&committed.object_id)
-                .expect("recovered transaction object"),
+                .expect("committed transaction object"),
             Some(committed)
         );
         assert!(
             reopened
-                .get_namespace_request(
-                    &completed_request.requester_node_id,
-                    &completed_request.request_id,
-                )
-                .expect("request body after recovery")
-                .is_none(),
-            "prepare recovery must not resurrect a full terminal request body"
+                .tables
+                .namespace_prepare_receipts
+                .contains_key(&prepare.operation_id)
         );
-        assert_eq!(
+        assert!(
             reopened
-                .get_namespace_request_receipt(
-                    &completed_request.requester_node_id,
-                    &completed_request.request_id,
-                )
-                .expect("request receipt after recovery"),
-            Some(compact_request_receipt)
+                .tables
+                .namespace_transaction_receipts
+                .contains_key(&prepare.transaction.transaction_id)
         );
 
-        let mut compacted_prepare = false;
-        for _ in 0..16 {
+        let now_unix_nanos = u64::try_from(commit_entry.created_at.unix_timestamp_nanos())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let mut compacted_request = false;
+        let mut removed_prepare_receipt = false;
+        let mut removed_transaction_receipt = false;
+        let mut removed_request_receipt = false;
+        for _ in 0..32 {
             let report = reopened
                 .gc_metadata_history_authoritative(
                     DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
-                        .with_now_unix_nanos(20_000_000_000)
+                        .with_now_unix_nanos(now_unix_nanos)
                         .with_max_removals(1),
                 )
-                .expect("drain recovered prepare history");
-            compacted_prepare |= report.compacted_namespace_prepare_count != 0;
+                .expect("drain compact terminal history");
+            compacted_request |= report.compacted_namespace_request_count != 0;
+            removed_prepare_receipt |= report.removed_namespace_prepare_receipt_count != 0;
+            removed_transaction_receipt |= report.removed_namespace_transaction_receipt_count != 0;
+            removed_request_receipt |= report.removed_namespace_request_receipt_count != 0;
             if report.applied_record_count() == 0 {
                 break;
             }
         }
-        assert!(
-            compacted_prepare,
-            "the recovered prepare must become collectible"
-        );
+        assert!(compacted_request);
+        assert!(removed_prepare_receipt);
+        assert!(removed_transaction_receipt);
+        assert!(removed_request_receipt);
         assert!(
             reopened
                 .get_namespace_prepare(&prepare.operation_id)
-                .expect("drained full prepare")
+                .expect("drained prepare")
                 .is_none()
         );
         assert!(
@@ -27196,7 +28530,7 @@ mod tests {
                 .namespace_prepare_receipts
                 .get(&prepare.operation_id)
                 .is_none(),
-            "the compact prepare receipt must not leak"
+            "the compact prepare receipt must be bounded"
         );
         assert!(
             reopened
@@ -27250,6 +28584,13 @@ mod tests {
                     prepare.owner_epoch,
                 )
                 .expect_err("evicted prepare retry must fail closed")
+                .to_string()
+                .contains("history expired")
+        );
+        assert!(
+            reopened
+                .apply_namespace_transaction(&prepare.transaction)
+                .expect_err("evicted transaction retry must fail closed")
                 .to_string()
                 .contains("history expired")
         );

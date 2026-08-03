@@ -281,17 +281,6 @@ impl DfsPackedNamespacePrepareV1 {
             visit(&object.object_id);
         }
     }
-
-    pub(crate) fn record_count(&self) -> usize {
-        self.transaction
-            .objects
-            .len()
-            .saturating_add(self.transaction.versions.len())
-            .saturating_add(self.transaction.advisory_lock_states.len())
-            .saturating_add(self.expected_object_versions.len())
-            .saturating_add(self.expected_path_occupants.len())
-            .saturating_add(self.content_receipts.len())
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1689,17 +1678,6 @@ impl DfsPackedNamespacePrepareV2 {
                 "object_ids",
             ));
         }
-    }
-
-    pub(crate) fn record_count(&self) -> usize {
-        self.objects
-            .object_ids
-            .len()
-            .saturating_add(self.versions.object_ids.len())
-            .saturating_add(self.advisory_lock_states.len())
-            .saturating_add(self.expected_object_versions.object_ids.len())
-            .saturating_add(self.expected_path_occupants.paths.len())
-            .saturating_add(self.content_receipts.object_ids.len())
     }
 
     fn object_id_at(&self, index: u32, field: &'static str, row: usize) -> DfsObjectId {

@@ -19,13 +19,12 @@ const DFS_METADATA_AUTHORITY_PROBE_TIMEOUT: Duration = Duration::from_millis(250
 /// means the optional all-replica fast path should yield to the exact quorum
 /// fence instead of holding the served write lane indefinitely.
 const DFS_METADATA_AUTHORITY_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
-// A large streamed prepare needs longer than an ordinary probe on a healthy
-// debug/WAN path, but this is only an optimization before the exact
-// operation-bound cluster-quorum fence. Waiting five seconds for one wedged
-// sibling made a single batch exceed seven seconds once the fallback ran.
-const DFS_METADATA_AUTHORITY_LARGE_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+// Namespace ACKs share one durable exact-frame path regardless of record
+// count. Give that path enough time to get behind an already-running bounded
+// materialization pass; abandoning it after the ordinary 250ms probe budget
+// turns a sub-second wait into a multi-second cluster-quorum fallback.
+const DFS_METADATA_AUTHORITY_NAMESPACE_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const DFS_METADATA_AUTHORITY_PROBE_IDLE_WAIT: Duration = Duration::from_millis(5);
-const DFS_METADATA_AUTHORITY_LARGE_NAMESPACE_RECORDS: usize = 256;
 
 static DFS_METADATA_SHARD_PUBLICATION_LOCKS: OnceLock<(Mutex<BTreeSet<String>>, Condvar)> =
     OnceLock::new();
@@ -88,30 +87,22 @@ fn metadata_authority_probe_timeout(
     }
     // `prepared_batch` is the exact locally-authored suffix returned by the
     // backend after this process prepared the operation. Its packed body was
-    // validated while it was built and persisted; timeout selection only
-    // needs its bounded identity and row count, so do not rescan every packed
-    // column before the real replica apply validates the wire value.
+    // validated while it was built and persisted; timeout selection needs
+    // only the retained identity, so do not rescan the packed columns.
     let Some(prepare) = entry.mutation.namespace_prepare_payload_ref_prevalidated() else {
         return DFS_METADATA_AUTHORITY_PROBE_TIMEOUT;
     };
-    if prepare.validate_file_system_scope(file_system_id).is_err()
-        || !prepare.matches_authority(
-            file_system_id,
-            operation_id,
-            &DfsNamespacePrepareStatus::Prepared,
-            &entry.shard_id,
-            shard.epoch,
-            payload_digest,
-        )
-    {
+    if !prepare.matches_authority(
+        file_system_id,
+        operation_id,
+        &DfsNamespacePrepareStatus::Prepared,
+        &entry.shard_id,
+        shard.epoch,
+        payload_digest,
+    ) {
         return DFS_METADATA_AUTHORITY_PROBE_TIMEOUT;
     }
-    let record_count = prepare.record_count();
-    if record_count > DFS_METADATA_AUTHORITY_LARGE_NAMESPACE_RECORDS {
-        DFS_METADATA_AUTHORITY_LARGE_PROBE_TIMEOUT
-    } else {
-        DFS_METADATA_AUTHORITY_PROBE_TIMEOUT
-    }
+    DFS_METADATA_AUTHORITY_NAMESPACE_PROBE_TIMEOUT
 }
 
 /// Process-wide serialization between the final canonical metadata publication
@@ -693,6 +684,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     // Background replication can close the gap independently.
                     continue;
                 };
+                let durable_journal_ack = matches!(
+                    operation,
+                    DfsMetadataAuthorityOperation::NamespaceMutation { .. }
+                );
+                let journal_frames = if durable_journal_ack {
+                    let frames = self
+                        .metadata_backend
+                        .as_ref()
+                        .ok_or_else(|| DfsError::Metadata {
+                            message: "metadata authority frame selection has no durable backend"
+                                .to_string(),
+                        })?
+                        .journal_frames_for_batch(&target_batch)?;
+                    if frames.len() != target_batch.entries.len() {
+                        return Err(DfsError::Metadata {
+                            message: format!(
+                                "metadata authority frame selection for shard {} returned {} frames for {} entries",
+                                target_batch.shard_id.0,
+                                frames.len(),
+                                target_batch.entries.len()
+                            ),
+                        });
+                    }
+                    frames
+                } else {
+                    Vec::new()
+                };
+                let wire_batch = if durable_journal_ack {
+                    DfsMetadataJournalBatch {
+                        shard_id: target_batch.shard_id.clone(),
+                        entries: Vec::new(),
+                        next_after_sequence: target_batch.next_after_sequence,
+                    }
+                } else {
+                    target_batch
+                };
                 let request_id = self.next_request_id();
                 let probe_id = sinomo_core::Id::generate().to_string();
                 let command = DfsMetadataJournalBatchCommand {
@@ -706,13 +733,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         probe_id,
                         expected_shard: shard.clone(),
                         operation: operation.clone(),
+                        durable_journal_ack,
+                        journal_frames,
                         prepared_prefix: Some(prepared_prefix.clone()),
                     }),
                     // Include every entry the target has not yet acknowledged,
                     // through the exact prepare. The receiver refuses gaps;
                     // older peers can still apply the prefix but cannot echo
                     // the nonce and therefore cannot authorize publication.
-                    batch: target_batch,
+                    durable_replication: None,
+                    batch: wire_batch,
                 };
                 authority_groups.push(DfsMetadataJournalBatchDirectGroup::new(
                     target_node_ids,
@@ -747,6 +777,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 || response.shard_id != group.command.batch.shard_id
                                 || response.next_after_sequence
                                     != group.command.batch.next_after_sequence
+                                || response.verified_prefix_only
                                 || response.result != DfsMetadataJournalBatchResult::Applied
                                 || response.verified_authority_probe_id.as_deref()
                                     != expected_confirmation_id.as_deref()
@@ -761,10 +792,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             acknowledged_node_ids.insert(target_node_id.clone());
                         }
                     }
-                    return Ok(acknowledged_node_ids);
+                    if acknowledged_node_ids.len() == required_acknowledgements {
+                        return Ok(acknowledged_node_ids);
+                    }
                 }
                 Ok(None) => {}
-                Err(_) => return Ok(acknowledged_node_ids),
+                Err(_) => {}
             }
 
             // Routed responses are correlated through one process-wide pending
@@ -774,9 +807,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // an otherwise unused extra copy even on this compatibility path.
             let mut authority_requests = Vec::with_capacity(required_acknowledgements - 1);
             for group in authority_groups {
-                let target_count = group.target_node_ids.len();
+                let unresolved_target_node_ids = group
+                    .target_node_ids
+                    .into_iter()
+                    .filter(|target_node_id| !acknowledged_node_ids.contains(target_node_id))
+                    .collect::<Vec<_>>();
+                let target_count = unresolved_target_node_ids.len();
                 let mut shared_command = Some(group.command);
-                for (target_index, target_node_id) in group.target_node_ids.into_iter().enumerate()
+                for (target_index, target_node_id) in
+                    unresolved_target_node_ids.into_iter().enumerate()
                 {
                     if Instant::now() >= operation_deadline {
                         return Ok(acknowledged_node_ids);
@@ -828,6 +867,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             target_node_id: target_node_id.clone(),
                             confirmation_id,
                             expected_shard: shard.clone(),
+                            expected_next_after_sequence: command.batch.next_after_sequence,
                         },
                     );
                     let sent = match self.send_dfs_message_if_routable(
@@ -1656,19 +1696,24 @@ pub(crate) fn metadata_authority_probe_confirmation_id(
     {
         return None;
     }
+    let version = if probe.durable_journal_ack {
+        "v2"
+    } else {
+        "v1"
+    };
     Some(format!(
-        "dfs-authority-prefix-v1:{}:{}:{}",
+        "dfs-authority-prefix-{version}:{}:{}:{}",
         probe.probe_id, prefix.journal_sequence, prefix.digest
     ))
 }
 
 /// Verify an authority probe immediately after applying its journal batch.
 ///
-/// A newly applied PackedV2 prepare carries compact evidence computed from the
-/// exact canonical allocation installed into the table. Reuse that evidence
-/// instead of fetching, cloning, normalizing, and hashing the full prepare a
-/// second time. Duplicate delivery and recovery intentionally carry no fresh
-/// evidence and retain the durable-table fallback.
+/// A newly ingested PackedV2 prepare carries compact evidence from its exact,
+/// structurally validated journal payload. Reuse that evidence instead of
+/// expanding the rebuildable table record before the durable ACK. Ordinary
+/// apply can provide the same evidence from its canonical allocation;
+/// duplicate delivery and recovery retain the durable-table fallback.
 pub(crate) fn verify_persisted_metadata_authority_probe_after_apply(
     backend: &dyn DfsMetadataBackend,
     shard: &DfsMetadataShardConfig,
@@ -1678,6 +1723,35 @@ pub(crate) fn verify_persisted_metadata_authority_probe_after_apply(
     let operation_verified = apply_report
         .namespace_authority_proof_for(shard, &probe.operation)
         .is_some();
+    if let Some(durable_prefix) = apply_report.durable_prefix_proof() {
+        if !operation_verified
+            || !metadata_authority_operation_is_well_formed_for_shard(&probe.operation, shard)
+        {
+            return Err(DfsError::Metadata {
+                message: format!(
+                    "durable metadata authority ingest did not validate the exact operation for shard {} epoch {}",
+                    shard.shard_id, shard.epoch
+                ),
+            });
+        }
+        let confirmation_id = metadata_authority_probe_confirmation_id(probe).ok_or_else(|| {
+            DfsError::Metadata {
+                message: format!(
+                    "metadata authority probe has no well-formed exact prepared prefix for shard {} epoch {}",
+                    shard.shard_id, shard.epoch
+                ),
+            }
+        })?;
+        if probe.prepared_prefix.as_ref() != Some(durable_prefix) {
+            return Err(DfsError::Metadata {
+                message: format!(
+                    "durable metadata authority journal for shard {} does not match the primary's exact prepared history",
+                    shard.shard_id
+                ),
+            });
+        }
+        return Ok(confirmation_id);
+    }
     verify_persisted_metadata_authority_probe_inner(backend, shard, probe, operation_verified)
 }
 
@@ -1950,6 +2024,8 @@ mod authority_probe_tests {
         direct_commands: Vec<DfsMetadataJournalBatchCommand>,
         direct_group_target_counts: Vec<usize>,
         direct_next_after_sequence_override: Option<u64>,
+        direct_verified_prefix_only: bool,
+        direct_omitted_node_ids: BTreeSet<NodeId>,
         unroutable_node_ids: BTreeSet<NodeId>,
         incoming: VecDeque<DfsRoutedMessage>,
         sent: Arc<Mutex<Vec<DfsRoutedMessage>>>,
@@ -1966,6 +2042,8 @@ mod authority_probe_tests {
                 direct_commands: Vec::new(),
                 direct_group_target_counts: Vec::new(),
                 direct_next_after_sequence_override: None,
+                direct_verified_prefix_only: false,
+                direct_omitted_node_ids: BTreeSet::new(),
                 unroutable_node_ids: BTreeSet::new(),
                 incoming: VecDeque::new(),
                 sent: Arc::new(Mutex::new(Vec::new())),
@@ -2067,7 +2145,7 @@ mod authority_probe_tests {
                     .direct_next_after_sequence_override
                     .unwrap_or(command.batch.next_after_sequence),
                 applied_entries: 0,
-                verified_prefix_only: false,
+                verified_prefix_only: self.direct_verified_prefix_only,
                 verified_authority_probe_id: accepted
                     .then(|| metadata_authority_probe_confirmation_id(probe))
                     .flatten(),
@@ -2094,6 +2172,9 @@ mod authority_probe_tests {
             let mut responses = Vec::new();
             for group in groups {
                 for target_node_id in &group.target_node_ids {
+                    if self.direct_omitted_node_ids.contains(target_node_id) {
+                        continue;
+                    }
                     let Some(response) =
                         self.send_metadata_journal_batch_direct(target_node_id, &group.command)?
                     else {
@@ -2751,11 +2832,12 @@ mod authority_probe_tests {
     }
 
     #[test]
-    fn malformed_direct_authority_next_sequence_cannot_advance_cursor() {
+    fn malformed_direct_authority_next_sequence_uses_routed_fallback() {
         let replica = node("node_malformed_direct_authority_cursor_replica");
         let (mut service, object, intent, shard, _, _) =
             authority_fixture(ProbeBehavior::Accept, vec![replica.clone()]);
         service.transport.direct_metadata_journal_batches = true;
+        let sent = Arc::clone(&service.transport.sent);
         let (operation, prepared_batch) =
             prepared_authority_fixture(&mut service, &object, &intent, &shard);
         service.transport.direct_next_after_sequence_override =
@@ -2770,23 +2852,94 @@ mod authority_probe_tests {
             )
             .expect("malformed response is ignored");
 
-        assert_eq!(acknowledged, BTreeSet::from([service.node_id.clone()]));
+        assert_eq!(
+            acknowledged,
+            BTreeSet::from([service.node_id.clone(), replica.clone()])
+        );
         assert_eq!(
             service
                 .metadata_backend
                 .as_ref()
                 .expect("metadata backend")
                 .metadata_replication_cursor(&replica, &prepared_batch.shard_id)
-                .expect("durable cursor after malformed response"),
-            0,
-            "an untrusted response must not advance beyond the command's primary journal head"
+                .expect("durable cursor after routed fallback"),
+            prepared_batch.next_after_sequence,
+            "only the exact routed response may advance the cursor"
         );
         assert!(
-            !service
-                .metadata_replication_cursors
-                .contains_key(&(replica, prepared_batch.shard_id)),
-            "the in-memory optimization cursor must reject the malformed response too"
+            !sent.lock().expect("sent messages").is_empty(),
+            "a malformed direct response must not suppress the routed compatibility path"
         );
+    }
+
+    #[test]
+    fn prefix_only_direct_authority_response_uses_routed_fallback() {
+        let replica = node("node_prefix_only_direct_authority_replica");
+        let (mut service, object, intent, shard, _, _) =
+            authority_fixture(ProbeBehavior::Accept, vec![replica.clone()]);
+        service.transport.direct_metadata_journal_batches = true;
+        service.transport.direct_verified_prefix_only = true;
+        let sent = Arc::clone(&service.transport.sent);
+        let (operation, prepared_batch) =
+            prepared_authority_fixture(&mut service, &object, &intent, &shard);
+
+        let acknowledged = service
+            .fresh_metadata_shard_authority_acknowledgements(
+                &shard,
+                &operation,
+                &prepared_batch,
+                DFS_METADATA_AUTHORITY_PROBE_TIMEOUT,
+            )
+            .expect("prefix-only direct response falls back");
+
+        assert_eq!(
+            acknowledged,
+            BTreeSet::from([service.node_id.clone(), replica])
+        );
+        assert_eq!(
+            sent.lock().expect("sent messages").len(),
+            1,
+            "a prefix proof must not satisfy an authority operation ACK"
+        );
+    }
+
+    #[test]
+    fn partial_direct_authority_fanout_routes_only_unresolved_replicas() {
+        let direct_replica = node("node_partial_direct_authority_replica");
+        let routed_replica = node("node_partial_routed_authority_replica");
+        let (mut service, object, intent, shard, _, _) = authority_fixture(
+            ProbeBehavior::Accept,
+            vec![direct_replica.clone(), routed_replica.clone()],
+        );
+        service.transport.direct_metadata_journal_batches = true;
+        service
+            .transport
+            .direct_omitted_node_ids
+            .insert(routed_replica.clone());
+        let sent = Arc::clone(&service.transport.sent);
+        let (operation, prepared_batch) =
+            prepared_authority_fixture(&mut service, &object, &intent, &shard);
+
+        let acknowledged = service
+            .fresh_metadata_shard_authority_acknowledgements(
+                &shard,
+                &operation,
+                &prepared_batch,
+                DFS_METADATA_AUTHORITY_PROBE_TIMEOUT,
+            )
+            .expect("partial direct authority fanout");
+
+        assert_eq!(
+            acknowledged,
+            BTreeSet::from([
+                service.node_id.clone(),
+                direct_replica,
+                routed_replica.clone(),
+            ])
+        );
+        let sent = sent.lock().expect("sent messages");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].target_node_id, routed_replica);
     }
 
     #[test]
@@ -2918,7 +3071,7 @@ mod authority_probe_tests {
             prepared_namespace_authority_fixture(&mut service, &object, &shard, 257);
         assert_eq!(
             metadata_authority_probe_timeout(&shard, &operation, &prepared_batch),
-            DFS_METADATA_AUTHORITY_LARGE_PROBE_TIMEOUT
+            DFS_METADATA_AUTHORITY_NAMESPACE_PROBE_TIMEOUT
         );
 
         let authorization = service
@@ -3041,6 +3194,26 @@ mod authority_probe_tests {
                 .all(|command| command == &service.transport.direct_commands[0]),
             "equal direct suffixes must share request/probe identity so transport encoding can be replayed"
         );
+        let command = &service.transport.direct_commands[0];
+        assert!(
+            command.batch.entries.is_empty(),
+            "the wire command must not carry a second typed copy of the prepare"
+        );
+        let probe = command
+            .authority_probe
+            .as_ref()
+            .expect("direct authority probe");
+        assert!(probe.durable_journal_ack);
+        assert_eq!(probe.journal_frames.len(), 1);
+        assert_eq!(
+            crate::metadata_journal::decode_metadata_journal_frame_record(&probe.journal_frames[0])
+                .expect("decode shared exact frame"),
+            *prepared_batch.entries.last().expect("prepared suffix")
+        );
+        assert!(
+            metadata_authority_probe_confirmation_id(probe)
+                .is_some_and(|confirmation| confirmation.starts_with("dfs-authority-prefix-v2:"))
+        );
     }
 
     #[test]
@@ -3075,7 +3248,7 @@ mod authority_probe_tests {
         crate::metadata_records::reset_namespace_prepare_payload_validation_passes();
         assert_eq!(
             metadata_authority_probe_timeout(&shard, &operation, &prepared_batch),
-            DFS_METADATA_AUTHORITY_LARGE_PROBE_TIMEOUT
+            DFS_METADATA_AUTHORITY_NAMESPACE_PROBE_TIMEOUT
         );
         assert_eq!(
             crate::metadata_records::namespace_prepare_payload_validation_passes(),
@@ -3117,7 +3290,7 @@ mod authority_probe_tests {
             persisted_small_namespace_authority_fixture(&mut service, &object, &shard);
         assert_eq!(
             metadata_authority_probe_timeout(&shard, &operation, &prepared_batch),
-            DFS_METADATA_AUTHORITY_PROBE_TIMEOUT
+            DFS_METADATA_AUTHORITY_NAMESPACE_PROBE_TIMEOUT
         );
 
         let authorization = service
@@ -3234,8 +3407,11 @@ mod authority_probe_tests {
                     prepare_sequence: 1,
                     payload_digest: content_hash(b"stale-authority"),
                 },
+                durable_journal_ack: false,
+                journal_frames: Vec::new(),
                 prepared_prefix: None,
             }),
+            durable_replication: None,
             batch: DfsMetadataJournalBatch {
                 shard_id: DfsMetadataShardId::new(stale_shard.shard_id.clone()),
                 entries: Vec::new(),

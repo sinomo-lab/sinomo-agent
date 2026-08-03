@@ -1014,6 +1014,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 repair_maintenance,
                 namespace_maintenance: false,
                 metadata_replica_progress: false,
+                metadata_materialization: false,
             });
         }
         match self.mark_repaired_location(object_id, version, replica_node_id, content_hash) {

@@ -4290,6 +4290,7 @@ mod tests {
                         verify_prefix_only: false,
                         prefix_probe: None,
                         authority_probe: None,
+                        durable_replication: None,
                         batch: crate::DfsMetadataJournalBatch {
                             shard_id: shard_id.clone(),
                             entries: Vec::new(),
@@ -4331,6 +4332,8 @@ mod tests {
                         prepare_sequence: command.batch.next_after_sequence,
                         payload_digest: "blake3:metadata-authority-fanout".to_string(),
                     },
+                    durable_journal_ack: false,
+                    journal_frames: Vec::new(),
                     prepared_prefix: None,
                 });
                 (target_node_id, command)
@@ -4687,7 +4690,7 @@ mod tests {
                 coverage: DfsContentRootCatalogCoverage::Complete {
                     prefix_proof_version: DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
                     journal_sequence: 3,
-                    state_fingerprint: format!("dfs-metadata-prefix-v1:blake3:{}", "a".repeat(64)),
+                    state_fingerprint: format!("dfs-metadata-prefix-v2:blake3:{}", "a".repeat(64)),
                 },
                 entries: Vec::new(),
                 next_cursor: None,

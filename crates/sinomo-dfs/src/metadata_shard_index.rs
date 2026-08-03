@@ -121,25 +121,45 @@ pub(crate) fn write_transaction_object_shard_indexes(
     objects: &[DfsObjectMetadata],
     shard_id: &DfsMetadataShardId,
 ) -> Result<()> {
+    let records = objects
+        .iter()
+        .map(|object| object_shard_index_record(object, shard_id))
+        .collect::<Vec<_>>();
+    write_object_shard_index_records(root, &records)
+}
+
+/// Persist a batch of lightweight routing identities without retaining or
+/// cloning their complete object metadata bodies.
+pub(crate) fn write_object_shard_index_records(
+    root: &Path,
+    records: &[DfsObjectShardIndexRecord],
+) -> Result<()> {
     let mut new_objects = Vec::new();
     let mut existing_objects = Vec::new();
-    for object in objects {
-        let desired = object_shard_index_record(object, shard_id);
+    for desired in records {
         let (current, rebuild_existing) =
-            read_object_shard_index_for_rebuild(root, &object.object_id)?;
+            read_object_shard_index_for_rebuild(root, &desired.object_id)?;
         match current {
-            Some(current) if current == desired => {}
-            Some(_) => existing_objects.push(object),
-            None if rebuild_existing => existing_objects.push(object),
-            None => new_objects.push(object),
+            Some(current) if &current == desired => {}
+            Some(_) => existing_objects.push(desired),
+            None if rebuild_existing => existing_objects.push(desired),
+            None => new_objects.push(desired),
         }
     }
-    write_new_object_shard_indexes(
-        root,
-        new_objects.into_iter().map(|object| (object, shard_id)),
-    )?;
-    for object in existing_objects {
-        write_object_shard_index(root, object, shard_id)?;
+    let new_files = new_objects
+        .into_iter()
+        .map(|record| {
+            Ok((
+                object_shard_index_path(root, &record.object_id),
+                encode_sobj(record)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    write_sobj_files_create_new_relaxed(new_files)?;
+    for record in existing_objects {
+        #[cfg(test)]
+        OBJECT_SHARD_INDEX_WRITE_COUNT.set(OBJECT_SHARD_INDEX_WRITE_COUNT.get().saturating_add(1));
+        write_sobj_atomic(&object_shard_index_path(root, &record.object_id), record)?;
     }
     Ok(())
 }
@@ -164,7 +184,7 @@ pub(crate) fn remove_object_shard_index(root: &Path, object_id: &DfsObjectId) ->
     remove_file_if_exists(&object_shard_index_path(root, object_id))
 }
 
-fn object_shard_index_record(
+pub(crate) fn object_shard_index_record(
     object: &DfsObjectMetadata,
     shard_id: &DfsMetadataShardId,
 ) -> DfsObjectShardIndexRecord {

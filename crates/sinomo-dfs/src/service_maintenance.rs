@@ -9,6 +9,7 @@ use sinomo_core::node::NodeId;
 
 use std::collections::BTreeSet;
 
+use crate::service_state::PendingMetadataReplicationResponseKind;
 use crate::*;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -455,6 +456,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 verify_prefix_only: false,
                 prefix_probe: None,
                 authority_probe: None,
+                durable_replication: None,
                 batch: batch.clone(),
             }),
         )?;
@@ -545,6 +547,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     target_node_id: target_node_id.clone(),
                     shard_id: shard_id.clone(),
                     next_after_sequence,
+                    expected_response_kind: PendingMetadataReplicationResponseKind::JournalBatch,
                     verify_prefix_only: false,
                     required_authority_confirmation_id: None,
                     created_at: std::time::Instant::now(),
@@ -560,6 +563,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     verify_prefix_only: false,
                     prefix_probe: None,
                     authority_probe: None,
+                    durable_replication: None,
                     batch,
                 }),
             )?;

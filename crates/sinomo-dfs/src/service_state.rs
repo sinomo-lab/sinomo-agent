@@ -497,6 +497,10 @@ pub struct DfsCommittedWork {
     pub repair_maintenance: bool,
     pub namespace_maintenance: bool,
     pub metadata_replica_progress: bool,
+    /// A replica ACK advanced the durable journal beyond its rebuildable table
+    /// cursor. The daemon consumes this edge on the same resident shard and
+    /// coalesces asynchronous materialization behind the response.
+    pub metadata_materialization: bool,
 }
 
 impl DfsCommittedWork {
@@ -505,6 +509,7 @@ impl DfsCommittedWork {
         self.repair_maintenance |= work.repair_maintenance;
         self.namespace_maintenance |= work.namespace_maintenance;
         self.metadata_replica_progress |= work.metadata_replica_progress;
+        self.metadata_materialization |= work.metadata_materialization;
     }
 }
 
@@ -515,6 +520,7 @@ const DFS_COMMITTED_WORK_PUBLISH_METADATA: u8 = 1 << 0;
 const DFS_COMMITTED_WORK_REPAIR_MAINTENANCE: u8 = 1 << 1;
 const DFS_COMMITTED_WORK_NAMESPACE_MAINTENANCE: u8 = 1 << 2;
 const DFS_COMMITTED_WORK_METADATA_REPLICA_PROGRESS: u8 = 1 << 3;
+const DFS_COMMITTED_WORK_METADATA_MATERIALIZATION: u8 = 1 << 4;
 
 /// Caller-retained committed-work receipt for cancellable DFS operations.
 ///
@@ -546,6 +552,9 @@ impl DfsCommittedWorkTracker {
         if work.metadata_replica_progress {
             bits |= DFS_COMMITTED_WORK_METADATA_REPLICA_PROGRESS;
         }
+        if work.metadata_materialization {
+            bits |= DFS_COMMITTED_WORK_METADATA_MATERIALIZATION;
+        }
         if bits != 0 {
             self.bits.fetch_or(bits, Ordering::Release);
         }
@@ -558,6 +567,7 @@ impl DfsCommittedWorkTracker {
             repair_maintenance: bits & DFS_COMMITTED_WORK_REPAIR_MAINTENANCE != 0,
             namespace_maintenance: bits & DFS_COMMITTED_WORK_NAMESPACE_MAINTENANCE != 0,
             metadata_replica_progress: bits & DFS_COMMITTED_WORK_METADATA_REPLICA_PROGRESS != 0,
+            metadata_materialization: bits & DFS_COMMITTED_WORK_METADATA_MATERIALIZATION != 0,
         }
     }
 }
@@ -795,10 +805,17 @@ pub enum DfsMetadataReplicationOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PendingMetadataReplicationResponseKind {
+    JournalBatch,
+    SnapshotInstall,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PendingMetadataReplication {
     pub(crate) target_node_id: NodeId,
     pub(crate) shard_id: DfsMetadataShardId,
     pub(crate) next_after_sequence: u64,
+    pub(crate) expected_response_kind: PendingMetadataReplicationResponseKind,
     pub(crate) verify_prefix_only: bool,
     /// Optional authority identity that a rolling-upgrade-safe response must
     /// echo before an exact-prefix acknowledgement can count.
@@ -811,6 +828,7 @@ pub(crate) struct PendingMetadataAuthorityProbe {
     pub(crate) target_node_id: NodeId,
     pub(crate) confirmation_id: String,
     pub(crate) expected_shard: DfsMetadataShardConfig,
+    pub(crate) expected_next_after_sequence: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

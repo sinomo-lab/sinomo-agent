@@ -2441,7 +2441,7 @@ mod causal_time_tests {
         let generated_at_unix_nanos = 10;
         let installed_at_unix_nanos = 100;
         let state_fingerprint = format!(
-            "dfs-metadata-prefix-v1:blake3:{}",
+            "dfs-metadata-prefix-v2:blake3:{}",
             blake3::hash(b"causal-time-state").to_hex()
         );
         let catalog = DfsContentRootCatalog::from_fragments(

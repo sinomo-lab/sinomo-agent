@@ -27,13 +27,12 @@ use sinomo_dfs::{
     DfsContentRootCatalogCollectionValidation, DfsContentRootCatalogIncompleteReason,
     DfsMaintenanceRunOptions, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
     DfsMetadataJournalBatchResult, DfsMetadataJournalBatchSender, DfsMetadataPeerTransportError,
-    DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardStatus,
-    DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult,
-    DfsMetadataSnapshotInstallSender, DfsMetadataSummary, DfsObjectId, DfsObjectMetadata,
-    DfsObjectVersionRecord, DfsOperatorInspector, DfsOperatorRepairView, DfsRepairAttemptSnapshot,
-    DfsReplicaReceiptRecord, DfsVersion, DfsWriteIntentRecord, DfsWriteIntentStatus,
-    LocalSobjMetadataBackend, cluster_dfs_all_file_system_configs,
-    cluster_dfs_all_metadata_shard_head_watermarks, cluster_dfs_all_metadata_shards,
+    DfsMetadataShardAssignment, DfsMetadataShardStatus, DfsMetadataSnapshotInstallResponse,
+    DfsMetadataSnapshotInstallResult, DfsMetadataSnapshotInstallSender, DfsMetadataSummary,
+    DfsObjectId, DfsObjectMetadata, DfsObjectVersionRecord, DfsOperatorInspector,
+    DfsOperatorRepairView, DfsRepairAttemptSnapshot, DfsReplicaReceiptRecord, DfsVersion,
+    DfsWriteIntentRecord, DfsWriteIntentStatus, LocalSobjMetadataBackend,
+    cluster_dfs_all_file_system_configs, cluster_dfs_all_metadata_shard_head_watermarks,
     default_dfs_content_root_catalog_store, default_dfs_metadata_root, distributed_sifs,
     distributed_sifs_bootstrap_objects, file_system_config_key, metadata_shard_key,
     sifs_node_files_path, write_dfs_repair_attempt_snapshot,
@@ -46,15 +45,17 @@ use sinomo_dfs::{
     DfsMaintenanceTickReport, DfsMessageCommand, DfsMessageCommittedWork, DfsMessageExecutionScope,
     DfsMessageProcessResult, DfsMessageResponse, DfsMetadataBackend,
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
-    DfsMetadataPublishScheduleOptions, DfsMetadataPublishScheduleStart, DfsMetadataShardId,
-    DfsMetadataShardMembershipHandoff, DfsNodeDetachedSendState, DfsNodeDetachedSendWorker,
-    DfsNodeServedMessageTransport, DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport,
-    DfsPeerTransportError, DfsPlacementReconciliationJob, DfsPlacementReconciliationState,
-    DfsRepairAttemptRecord, LocalDfsRepairQueueStore, NetworkedDfsService,
-    ResidentLocalMetadataShardHandle, ResidentLocalShardedMetadataBackend,
-    cluster_dfs_all_metadata_shard_membership_handoffs, default_dfs_repair_attempt_snapshot_path,
+    DfsMetadataPublishScheduleOptions, DfsMetadataPublishScheduleStart, DfsMetadataShardConfig,
+    DfsMetadataShardId, DfsMetadataShardMembershipHandoff, DfsMetadataShardMembershipHandoffProof,
+    DfsNodeDetachedSendState, DfsNodeDetachedSendWorker, DfsNodeServedMessageTransport,
+    DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
+    DfsPlacementReconciliationJob, DfsPlacementReconciliationState, DfsRepairAttemptRecord,
+    LocalDfsRepairQueueStore, NetworkedDfsService, ResidentLocalMetadataShardHandle,
+    ResidentLocalShardedMetadataBackend, cluster_dfs_all_metadata_shard_membership_handoffs,
+    cluster_dfs_all_metadata_shards, default_dfs_repair_attempt_snapshot_path,
     dfs_message_execution_scope, dfs_message_is_read_only_request,
-    open_cluster_sharded_dfs_metadata_backend, read_dfs_repair_attempt_snapshot,
+    metadata_shard_membership_handoff_proof_key, open_cluster_sharded_dfs_metadata_backend,
+    read_dfs_repair_attempt_snapshot, read_local_dfs_metadata_shard_write_freeze,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
@@ -602,6 +603,31 @@ impl DaemonDfsResidentMetadataScope {
             }
         }
     }
+
+    fn exact_shard_handle(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<ResidentLocalMetadataShardHandle, sinomo_dfs::DfsError> {
+        match self {
+            Self::ExactShard(handle)
+                if handle.file_system_id() == file_system_id && handle.shard_id() == shard_id =>
+            {
+                Ok(handle.clone())
+            }
+            Self::ExactShard(handle) => Err(sinomo_dfs::DfsError::Metadata {
+                message: format!(
+                    "resident metadata shard {}/{} cannot materialize requested shard {file_system_id}/{}",
+                    handle.file_system_id(),
+                    handle.shard_id().0,
+                    shard_id.0
+                ),
+            }),
+            Self::Global(backend) => backend
+                .scope_shard(file_system_id, shard_id)
+                .map_err(Into::into),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -891,6 +917,9 @@ static DAEMON_DFS_MUTATION_SCHEDULERS: OnceLock<
 static DAEMON_DFS_METADATA_PUBLISH_SCHEDULERS: OnceLock<
     Mutex<BTreeMap<DaemonDfsMetadataPublishLaneKey, Weak<sinomo_dfs::DfsMetadataPublishScheduler>>>,
 > = OnceLock::new();
+static DAEMON_DFS_METADATA_MATERIALIZATION_SCHEDULERS: OnceLock<
+    Mutex<BTreeMap<DaemonDfsMetadataPublishLaneKey, Weak<sinomo_dfs::DfsMetadataPublishScheduler>>>,
+> = OnceLock::new();
 static DAEMON_DFS_METADATA_PUBLISH_DISCOVERY_SCHEDULERS: OnceLock<
     Mutex<BTreeMap<PathBuf, Weak<sinomo_dfs::DfsMetadataPublishScheduler>>>,
 > = OnceLock::new();
@@ -994,6 +1023,7 @@ pub(crate) struct DaemonDfsPendingMaintenanceWork {
     pub actionable_placement_reconciliation_count: usize,
     pub metadata_replica_lag_count: usize,
     pub pending_local_membership_handoff_count: usize,
+    pub completed_local_primary_handoff_rebind_count: usize,
 }
 
 impl DaemonDfsPendingMaintenanceWork {
@@ -1006,6 +1036,7 @@ impl DaemonDfsPendingMaintenanceWork {
             || self.actionable_placement_reconciliation_count > 0
             || self.metadata_replica_lag_count > 0
             || self.pending_local_membership_handoff_count > 0
+            || self.completed_local_primary_handoff_rebind_count > 0
             || self.due_time_based_maintenance_count > 0
     }
 
@@ -1021,6 +1052,7 @@ impl DaemonDfsPendingMaintenanceWork {
             || self.actionable_conflict_count > 0
             || self.actionable_placement_reconciliation_count > 0
             || self.pending_local_membership_handoff_count > 0
+            || self.completed_local_primary_handoff_rebind_count > 0
             || self.due_repair_attempt_count > 0
             || self.unattempted_repair_count > 0
             || self.due_time_based_maintenance_count > 0
@@ -2733,6 +2765,7 @@ fn daemon_dfs_pending_work_from_records(
         actionable_placement_reconciliation_count,
         metadata_replica_lag_count,
         pending_local_membership_handoff_count,
+        completed_local_primary_handoff_rebind_count: 0,
     }
 }
 
@@ -3173,6 +3206,85 @@ fn persist_daemon_dfs_repair_queue_records(
     Ok(appended)
 }
 
+fn daemon_dfs_completed_promoted_primary_handoff_matches(
+    local_node_id: &NodeId,
+    active: &DfsMetadataShardConfig,
+    handoff_id: &str,
+    retiring_epoch: u64,
+    proof: &DfsMetadataShardMembershipHandoffProof,
+) -> bool {
+    proof.handoff_id == handoff_id
+        && proof.retiring_shard.file_system_id == active.file_system_id
+        && proof.retiring_shard.shard_id == active.shard_id
+        && proof.retiring_shard.epoch == retiring_epoch
+        && proof.retiring_shard.primary_node_id != proof.desired_shard.primary_node_id
+        && retiring_epoch.checked_add(1) == Some(active.epoch)
+        && proof.desired_shard == *active
+        && active.primary_node_id == *local_node_id
+        && proof.acknowledged_node_ids.contains(local_node_id)
+}
+
+/// Count exact completed primary transfers whose durable local marker has not
+/// yet been consumed by the promoted router generation.
+///
+/// This reads one bounded marker and one compact proof per current local
+/// primary. It never opens, recovers, or scans a metadata backend. Successful
+/// rebind advances `activated_epoch`, durably clearing this retry projection.
+fn daemon_dfs_completed_local_primary_handoff_rebind_count(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    local_node_id: &NodeId,
+    pending_handoffs: &[DfsMetadataShardMembershipHandoff],
+) -> Result<usize, DaemonError> {
+    let pending_shards = pending_handoffs
+        .iter()
+        .map(|handoff| {
+            (
+                handoff.retiring_shard.file_system_id.clone(),
+                handoff.retiring_shard.shard_id.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut count = 0usize;
+    for active in cluster_dfs_all_metadata_shards(cluster_paths)?
+        .into_iter()
+        .filter(|shard| shard.primary_node_id == *local_node_id)
+    {
+        if pending_shards.contains(&(active.file_system_id.clone(), active.shard_id.clone())) {
+            continue;
+        }
+        let shard_id = DfsMetadataShardId::new(active.shard_id.clone());
+        let Some(freeze) = read_local_dfs_metadata_shard_write_freeze(data_dir, &shard_id)? else {
+            continue;
+        };
+        if freeze.activated_epoch.is_some() {
+            continue;
+        }
+        let Some(proof) = sinomo_core::cluster::read_cluster_kv_latest_observed_entry(
+            cluster_paths,
+            &metadata_shard_membership_handoff_proof_key(&active.file_system_id, &active.shard_id),
+        )?
+        .map(|entry| entry.decode::<DfsMetadataShardMembershipHandoffProof>())
+        .transpose()?
+        else {
+            continue;
+        };
+        if freeze.journal_sequence == proof.journal_sequence
+            && freeze.state_fingerprint == proof.state_fingerprint
+            && daemon_dfs_completed_promoted_primary_handoff_matches(
+                local_node_id,
+                &active,
+                &freeze.handoff_id,
+                freeze.retiring_epoch,
+                &proof,
+            )
+        {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
 /// Inspect only the bounded durable queues owned by normal reactive healing.
 ///
 /// This function is safe on daemon startup and notification handling: it does
@@ -3228,11 +3340,18 @@ pub(crate) fn daemon_dfs_pending_reactive_maintenance_work(
     // the first shard/replica transition.
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
         .map_err(DaemonError::from)?;
-    let pending_local_membership_handoff_count =
-        cluster_dfs_all_metadata_shard_membership_handoffs(&cluster_paths)?
-            .into_iter()
-            .filter(|handoff| handoff.retiring_shard.primary_node_id == state.local_node_id)
-            .count();
+    let membership_handoffs = cluster_dfs_all_metadata_shard_membership_handoffs(&cluster_paths)?;
+    let pending_local_membership_handoff_count = membership_handoffs
+        .iter()
+        .filter(|handoff| handoff.retiring_shard.primary_node_id == state.local_node_id)
+        .count();
+    let completed_local_primary_handoff_rebind_count =
+        daemon_dfs_completed_local_primary_handoff_rebind_count(
+            &data_dir,
+            &cluster_paths,
+            &state.local_node_id,
+            &membership_handoffs,
+        )?;
 
     Ok(DaemonDfsPendingMaintenanceWork {
         pending_repair_count: repair_attempt_records.len(),
@@ -3241,6 +3360,7 @@ pub(crate) fn daemon_dfs_pending_reactive_maintenance_work(
         next_repair_retry_unix_nanos,
         actionable_placement_reconciliation_count,
         pending_local_membership_handoff_count,
+        completed_local_primary_handoff_rebind_count,
         ..DaemonDfsPendingMaintenanceWork::default()
     })
 }
@@ -3285,6 +3405,14 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
                     .map(|entry| count.saturating_add(usize::from(entry.is_some())))
                     .map_err(DaemonError::from)
             })?;
+    let membership_handoffs = cluster_dfs_all_metadata_shard_membership_handoffs(&cluster_paths)?;
+    let completed_local_primary_handoff_rebind_count =
+        daemon_dfs_completed_local_primary_handoff_rebind_count(
+            &data_dir,
+            &cluster_paths,
+            &state.local_node_id,
+            &membership_handoffs,
+        )?;
     let repair_attempt_records =
         read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))?
             .map(|snapshot| snapshot.records)
@@ -3319,7 +3447,7 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         &offline_node_ids,
         &state.local_node_id,
     );
-    let work = daemon_dfs_pending_work_from_records(
+    let mut work = daemon_dfs_pending_work_from_records(
         summary.pending_write_count,
         summary.pending_repair_count,
         summary.pending_namespace_job_count,
@@ -3337,6 +3465,8 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
         pending_local_membership_handoff_count,
         now_unix_nanos,
     );
+    work.completed_local_primary_handoff_rebind_count =
+        completed_local_primary_handoff_rebind_count;
     Ok(work)
 }
 
@@ -3650,17 +3780,54 @@ fn daemon_dfs_metadata_publish_lane_scheduler(
     file_system_id: &DfsFileSystemId,
     shard_id: &DfsMetadataShardId,
 ) -> Result<Arc<sinomo_dfs::DfsMetadataPublishScheduler>, DaemonError> {
+    daemon_dfs_keyed_metadata_scheduler(
+        &DAEMON_DFS_METADATA_PUBLISH_SCHEDULERS,
+        "DFS metadata publish scheduler",
+        data_dir,
+        file_system_id,
+        shard_id,
+    )
+}
+
+fn daemon_dfs_metadata_materialization_lane_scheduler(
+    data_dir: &SinomoDataDir,
+    file_system_id: &DfsFileSystemId,
+    shard_id: &DfsMetadataShardId,
+) -> Result<Arc<sinomo_dfs::DfsMetadataPublishScheduler>, DaemonError> {
+    daemon_dfs_keyed_metadata_scheduler(
+        &DAEMON_DFS_METADATA_MATERIALIZATION_SCHEDULERS,
+        "DFS metadata materialization scheduler",
+        data_dir,
+        file_system_id,
+        shard_id,
+    )
+}
+
+fn daemon_dfs_keyed_metadata_scheduler(
+    registry: &'static OnceLock<
+        Mutex<
+            BTreeMap<
+                DaemonDfsMetadataPublishLaneKey,
+                Weak<sinomo_dfs::DfsMetadataPublishScheduler>,
+            >,
+        >,
+    >,
+    label: &'static str,
+    data_dir: &SinomoDataDir,
+    file_system_id: &DfsFileSystemId,
+    shard_id: &DfsMetadataShardId,
+) -> Result<Arc<sinomo_dfs::DfsMetadataPublishScheduler>, DaemonError> {
     let key = DaemonDfsMetadataPublishLaneKey {
         data_root: data_dir.root(),
         file_system_id: file_system_id.clone(),
         shard_id: shard_id.clone(),
     };
-    let mut schedulers = DAEMON_DFS_METADATA_PUBLISH_SCHEDULERS
+    let mut schedulers = registry
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
         .map_err(|_| DaemonError::Network {
-            address: "DFS metadata publish scheduler".to_string(),
-            detail: "DFS metadata publish scheduler map is poisoned".to_string(),
+            address: label.to_string(),
+            detail: format!("{label} map is poisoned"),
         })?;
     if let Some(scheduler) = schedulers.get(&key).and_then(Weak::upgrade) {
         return Ok(scheduler);
@@ -4947,6 +5114,26 @@ fn process_daemon_dfs_message_command_on_runtime(
     let mut process_report = service_lane
         .service
         .process_message_command_report_with_preingested_blob(command, preingested_blob);
+    let replica_materialization_shard = process_report
+        .committed_work
+        .metadata_materialization
+        .then(|| {
+            let Some(lane) = DaemonDfsMutationLaneKey::from_scope(execution_scope) else {
+                return Err(sinomo_dfs::DfsError::Metadata {
+                    message:
+                        "durable replica ingest completed without an exact materialization lane"
+                            .to_string(),
+                });
+            };
+            resident_metadata_scope
+                .as_ref()
+                .ok_or_else(|| sinomo_dfs::DfsError::Metadata {
+                    message: "durable replica ingest has no resident metadata generation"
+                        .to_string(),
+                })?
+                .exact_shard_handle(&lane.file_system_id, &lane.shard_id)
+        })
+        .transpose();
     let deferred_work = if is_read_only {
         Ok(None)
     } else {
@@ -4993,6 +5180,26 @@ fn process_daemon_dfs_message_command_on_runtime(
     // resident backend lease has already returned to its shard pool; release
     // the request-state lane before repair-queue I/O and follow-up events too.
     drop(service_lane);
+    match replica_materialization_shard {
+        Ok(Some(shard)) => match daemon_dfs_data_owner_lock(&DaemonPaths::new(data_dir)) {
+            Ok(Some(data_owner_lock)) => schedule_daemon_dfs_replica_materialization_on_runtime(
+                data_dir.clone(),
+                runtime,
+                shard,
+                data_owner_lock,
+            ),
+            Ok(None) => tracing::warn!(
+                "durable DFS replica ingest could not retain the daemon data-owner lock for asynchronous materialization"
+            ),
+            Err(error) => tracing::warn!(
+                "durable DFS replica ingest could not schedule asynchronous materialization: {error}"
+            ),
+        },
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            "durable DFS replica ingest could not resolve its resident materialization shard: {error}"
+        ),
+    }
     let repair_queue_started = Instant::now();
     let repair_queue_persistence = if repair_queue_records.is_empty() {
         Ok(0)
@@ -5608,6 +5815,47 @@ impl DaemonDefaultDfsParkedHandoff {
                     && handoff.retiring_shard.primary_node_id == *local_node_id
             })
     }
+
+    /// Whether the exact parked handoff has committed this node as its
+    /// successor primary.
+    ///
+    /// This predicate transfers only a control-plane observation into the
+    /// existing maintenance executor. The executor still owns the durable
+    /// marker/proof comparison and router rebind, so this wake cannot grant
+    /// authority by itself.
+    fn is_completed_by_desired_primary(
+        &self,
+        local_node_id: &NodeId,
+        inputs: &[(String, Vec<u8>)],
+    ) -> bool {
+        let active_shard = inputs
+            .iter()
+            .find(|(key, _)| key == &self.wake_keys[0])
+            .and_then(|(_, value)| {
+                sinomo_core::kv::decode_kv_value::<DfsMetadataShardConfig>(value).ok()
+            });
+        let pending_handoff_absent = inputs.iter().all(|(key, _)| key != &self.wake_keys[1]);
+        let completion_proof = inputs
+            .iter()
+            .find(|(key, _)| key == &self.wake_keys[2])
+            .and_then(|(_, value)| {
+                sinomo_core::kv::decode_kv_value::<DfsMetadataShardMembershipHandoffProof>(value)
+                    .ok()
+            });
+        active_shard
+            .zip(completion_proof)
+            .is_some_and(|(active, proof)| {
+                pending_handoff_absent
+                    && active.epoch == self.desired_epoch
+                    && daemon_dfs_completed_promoted_primary_handoff_matches(
+                        local_node_id,
+                        &active,
+                        &self.handoff_id,
+                        self.retiring_epoch,
+                        &proof,
+                    )
+            })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5936,6 +6184,27 @@ impl DaemonDefaultDfsReconciliationReactor {
         }
     }
 
+    fn complete_default_reconciliation_after_control_plane_observation(
+        &mut self,
+        work: &DaemonDefaultDfsReconciliationWork,
+        local_node_id: &NodeId,
+    ) -> bool {
+        let promoted_primary_rebind = self.parked_generation.as_ref().is_some_and(|parked| {
+            parked
+                .handoff
+                .is_completed_by_desired_primary(local_node_id, &work.inputs)
+        });
+        self.complete_default_reconciliation(work);
+        if promoted_primary_rebind {
+            // Completion is a control-plane edge, not a metadata mutation on
+            // the promoted node. Wake the normal maintenance lane so it can
+            // reuse the proof-bound durable-marker rebind before local status
+            // or a foreground mutation has to discover the new generation.
+            notify_daemon_dfs_maintenance_work();
+        }
+        promoted_primary_rebind
+    }
+
     fn park_default_reconciliation(
         &mut self,
         work: &DaemonDefaultDfsReconciliationWork,
@@ -6011,7 +6280,10 @@ impl DaemonDefaultDfsReconciliationReactor {
             .await?
             {
                 DaemonDefaultDfsLifecycleOutcome::Completed => {
-                    self.complete_default_reconciliation(&work);
+                    self.complete_default_reconciliation_after_control_plane_observation(
+                        &work,
+                        expected_node_id,
+                    );
                 }
                 DaemonDefaultDfsLifecycleOutcome::Parked(handoff) => {
                     let notify_local_retiring_primary =
@@ -7649,6 +7921,77 @@ fn schedule_daemon_dfs_metadata_publish_for_data_dir_on_runtime(
         runtime,
         traceparent,
     )
+}
+
+fn schedule_daemon_dfs_replica_materialization_on_runtime(
+    data_dir: SinomoDataDir,
+    runtime: &tokio::runtime::Handle,
+    shard: ResidentLocalMetadataShardHandle,
+    data_owner_lock: Arc<DaemonDataOwnerLock>,
+) {
+    let file_system_id = shard.file_system_id().clone();
+    let shard_id = shard.shard_id().clone();
+    let scheduler = match daemon_dfs_metadata_materialization_lane_scheduler(
+        &data_dir,
+        &file_system_id,
+        &shard_id,
+    ) {
+        Ok(scheduler) => scheduler,
+        Err(error) => {
+            tracing::warn!(
+                file_system_id = %file_system_id,
+                shard_id = %shard_id.0,
+                "sinomo daemon DFS replica materialization could not be scheduled: {error}"
+            );
+            return;
+        }
+    };
+    let report_file_system_id = file_system_id.clone();
+    let report_shard_id = shard_id.clone();
+    let error_file_system_id = file_system_id;
+    let error_shard_id = shard_id;
+    sinomo_dfs::schedule_dfs_metadata_publish_async_on_runtime(
+        scheduler,
+        runtime.clone(),
+        daemon_dfs_metadata_publish_schedule_options(),
+        move || {
+            let shard = shard.clone();
+            let materialize_file_system_id = shard.file_system_id().clone();
+            let materialize_shard_id = shard.shard_id().clone();
+            let data_owner_lock = Arc::clone(&data_owner_lock);
+            async move {
+                let materialized = tokio::task::spawn_blocking(move || {
+                    let _data_owner_lock = data_owner_lock;
+                    shard.with_backend(|backend| {
+                        DfsMetadataBackend::materialize_pending_replica_journal(backend)
+                    })
+                })
+                .await
+                .map_err(|error| format!("DFS replica materialization task failed: {error}"))?
+                .map_err(|error| error.to_string())?;
+                daemon_dfs_perf_trace(format_args!(
+                    "dfs-replica-materialization filesystem={} shard={} entries={materialized}",
+                    materialize_file_system_id, materialize_shard_id.0,
+                ));
+                Ok(DfsMetadataJournalReplicationReport {
+                    outcomes: Vec::new(),
+                })
+            }
+        },
+        move |_| {
+            daemon_dfs_perf_trace(format_args!(
+                "dfs-replica-materialization-complete filesystem={} shard={}",
+                report_file_system_id, report_shard_id.0
+            ));
+        },
+        move |error| {
+            tracing::warn!(
+                file_system_id = %error_file_system_id,
+                shard_id = %error_shard_id.0,
+                "sinomo daemon DFS replica materialization failed: {error}"
+            );
+        },
+    );
 }
 
 fn daemon_dfs_metadata_publish_discovery_lanes(
@@ -9908,7 +10251,7 @@ mod tests {
             &local,
             &shard,
         );
-        let state_fingerprint = format!("dfs-metadata-prefix-v1:blake3:{}", "0".repeat(64));
+        let state_fingerprint = format!("dfs-metadata-prefix-v2:blake3:{}", "0".repeat(64));
         let watermark = sinomo_dfs::DfsMetadataShardHeadWatermark {
             file_system_id: shard.file_system_id.clone(),
             shard_id: shard.shard_id.clone(),
@@ -10143,7 +10486,7 @@ mod tests {
                 coverage: sinomo_dfs::DfsContentRootCatalogCoverage::Complete {
                     prefix_proof_version: sinomo_dfs::DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
                     journal_sequence: watermark.journal_sequence.saturating_sub(1),
-                    state_fingerprint: format!("dfs-metadata-prefix-v1:blake3:{}", "1".repeat(64)),
+                    state_fingerprint: format!("dfs-metadata-prefix-v2:blake3:{}", "1".repeat(64)),
                 },
                 entries: vec![sinomo_dfs::DfsContentRootCatalogEntry::Version(
                     sinomo_dfs::DfsMetadataVersionIdentity::new(covered_object_id, covered_version),
@@ -10721,6 +11064,7 @@ mod tests {
                 verify_prefix_only: false,
                 prefix_probe: None,
                 authority_probe: None,
+                durable_replication: None,
                 batch,
             },
         )
@@ -10792,6 +11136,7 @@ mod tests {
                 verify_prefix_only: false,
                 prefix_probe: None,
                 authority_probe: None,
+                durable_replication: None,
                 batch,
             },
         )
@@ -10892,6 +11237,7 @@ mod tests {
                 verify_prefix_only: false,
                 prefix_probe: None,
                 authority_probe: None,
+                durable_replication: None,
                 batch,
             },
         )
@@ -12730,6 +13076,126 @@ mod tests {
     }
 
     #[test]
+    fn daemon_dfs_reactive_probe_retains_completed_promoted_primary_rebind_until_maintenance() {
+        let root = temp_root("reactive-probe-completed-primary-rebind");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let local_node_id =
+            NodeId::from_legacy_named("node_completed_rebind_promoted").expect("local node");
+        let retiring_node_id =
+            NodeId::from_legacy_named("node_completed_rebind_retiring").expect("retiring node");
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_completed_primary_rebind").expect("cluster"),
+            "completed primary rebind probe",
+            local_node_id.clone(),
+            "local",
+            "pk-local",
+            OffsetDateTime::now_utc(),
+        );
+        state.members[0].capabilities =
+            sinomo_core::node::main_daemon_capabilities(&state.members[0].role);
+        state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("write state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("sync raft");
+
+        let file_system = distributed_sifs(local_node_id.clone());
+        let file_system_id = file_system.file_system_id.clone();
+        let shard_id = DfsMetadataShardId::new("root");
+        let retiring = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: shard_id.0.clone(),
+            primary_node_id: retiring_node_id.clone(),
+            replica_node_ids: vec![local_node_id.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        let active = DfsMetadataShardConfig {
+            primary_node_id: local_node_id.clone(),
+            replica_node_ids: vec![retiring_node_id.clone()],
+            epoch: retiring.epoch + 1,
+            ..retiring.clone()
+        };
+        let handoff_id = "completed-primary-rebind-root";
+        let freeze = {
+            let mut backend =
+                sinomo_dfs::open_local_metadata_shard_backend(&data_dir, shard_id.clone())
+                    .expect("local promoted replica backend");
+            backend
+                .put_file_system(&file_system)
+                .expect("local filesystem metadata");
+            backend
+                .freeze_metadata_shard_for_membership_handoff(&shard_id, handoff_id, retiring.epoch)
+                .expect("install promoted-replica freeze")
+                .expect("matching local shard")
+        };
+        let proof = DfsMetadataShardMembershipHandoffProof {
+            handoff_id: handoff_id.to_string(),
+            retiring_shard: retiring,
+            desired_shard: active.clone(),
+            journal_sequence: freeze.journal_sequence,
+            state_fingerprint: freeze.state_fingerprint,
+            acknowledged_node_ids: vec![retiring_node_id, local_node_id.clone()],
+        };
+        append_cluster_raft_command(
+            &cluster_paths,
+            &local_node_id,
+            sinomo_core::kv::KvCommand::Txn(KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    KvOp::put_serde(
+                        file_system_config_key(&file_system_id),
+                        &DfsFileSystemConfig::from(&file_system),
+                        None,
+                    )
+                    .expect("filesystem config op"),
+                    KvOp::put_serde(
+                        metadata_shard_key(&file_system_id, &shard_id.0),
+                        &active,
+                        None,
+                    )
+                    .expect("active shard op"),
+                    KvOp::put_serde(
+                        metadata_shard_membership_handoff_proof_key(&file_system_id, &shard_id.0),
+                        &proof,
+                        None,
+                    )
+                    .expect("completion proof op"),
+                ],
+                failure: Vec::new(),
+            }),
+        )
+        .expect("commit completed handoff image");
+
+        let pending = daemon_dfs_pending_reactive_maintenance_work(&paths)
+            .expect("completed rebind projection");
+        assert_eq!(pending.pending_local_membership_handoff_count, 0);
+        assert_eq!(pending.completed_local_primary_handoff_rebind_count, 1);
+        assert!(
+            pending.should_trigger_background_maintenance(),
+            "the durable unactivated marker must survive a lost or coalesced completion wake"
+        );
+
+        let runtime = daemon_test_runtime("daemon-dfs-completed-primary-rebind");
+        run_daemon_dfs_maintenance_body_for_test(&paths, &runtime)
+            .expect("maintenance consumes promoted-primary rebind");
+        let activated = read_local_dfs_metadata_shard_write_freeze(&data_dir, &shard_id)
+            .expect("read activated marker")
+            .expect("durable marker remains for stale handles");
+        assert_eq!(activated.activated_epoch, Some(active.epoch));
+        let cleared =
+            daemon_dfs_pending_reactive_maintenance_work(&paths).expect("post-rebind projection");
+        assert_eq!(cleared.completed_local_primary_handoff_rebind_count, 0);
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn daemon_dfs_handoff_probe_only_tracks_locally_primary_shards() {
         let local_node_id = NodeId::from_legacy_named("node_handoff_probe_local").expect("node");
         let remote_node_id = NodeId::from_legacy_named("node_handoff_probe_remote").expect("node");
@@ -14336,6 +14802,7 @@ mod tests {
                     verify_prefix_only: false,
                     prefix_probe: None,
                     authority_probe: None,
+                    durable_replication: None,
                     batch,
                 }),
             },
@@ -16315,9 +16782,10 @@ mod tests {
         data_dir.ensure_root_layout().expect("data dir");
         let cluster_paths = ClusterPaths::new(&data_dir);
         cluster_paths.ensure().expect("cluster paths");
-        let local = NodeId::from_legacy_named("node_default_dfs_parked").expect("local node");
-        let replica =
-            NodeId::from_legacy_named("node_default_dfs_parked_replica").expect("replica node");
+        let local =
+            NodeId::from_legacy_named("node_default_dfs_parked_promoted").expect("local node");
+        let retiring_primary =
+            NodeId::from_legacy_named("node_default_dfs_parked_retiring").expect("retiring node");
         let mut reactor =
             DaemonDefaultDfsReconciliationReactor::new(&cluster_paths, &local).expect("reactor");
         let startup = reactor.pending_work().expect("startup work");
@@ -16328,16 +16796,16 @@ mod tests {
         let retiring = DfsMetadataShardConfig {
             file_system_id: file_system_id.clone(),
             shard_id: "root".to_string(),
-            primary_node_id: local.clone(),
-            replica_node_ids: vec![replica.clone()],
+            primary_node_id: retiring_primary.clone(),
+            replica_node_ids: vec![local.clone()],
             epoch: 1,
             assignment: DfsMetadataShardAssignment::Root,
             namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
         let desired = DfsMetadataShardConfig {
-            primary_node_id: replica.clone(),
-            replica_node_ids: vec![local.clone()],
+            primary_node_id: local.clone(),
+            replica_node_ids: vec![retiring_primary.clone()],
             epoch: 2,
             ..retiring.clone()
         };
@@ -16354,8 +16822,9 @@ mod tests {
             sinomo_dfs::metadata_shard_membership_handoff_key(&file_system_id, "root");
         let proof_key =
             sinomo_dfs::metadata_shard_membership_handoff_proof_key(&file_system_id, "root");
-        let unrelated_key =
-            format!("{DAEMON_DEFAULT_DFS_CONNECTIVITY_PREFIX}{local}/{replica}/test-endpoint");
+        let unrelated_key = format!(
+            "{DAEMON_DEFAULT_DFS_CONNECTIVITY_PREFIX}{local}/{retiring_primary}/test-endpoint"
+        );
         let parked_entries = vec![
             (
                 shard_key.clone(),
@@ -16380,9 +16849,9 @@ mod tests {
             retiring.epoch,
             desired.epoch,
         );
-        assert!(parked.is_owned_by_retiring_primary(&local, &work.inputs));
+        assert!(parked.is_owned_by_retiring_primary(&retiring_primary, &work.inputs));
         assert!(
-            !parked.is_owned_by_retiring_primary(&replica, &work.inputs),
+            !parked.is_owned_by_retiring_primary(&local, &work.inputs),
             "only the exact retiring primary should receive the maintenance wake"
         );
         reactor.park_default_reconciliation(&work, parked);
@@ -16415,15 +16884,15 @@ mod tests {
             desired_shard: desired.clone(),
             journal_sequence: 7,
             state_fingerprint: "blake3:default-dfs-parked".to_string(),
-            acknowledged_node_ids: vec![local.clone(), replica],
+            acknowledged_node_ids: vec![retiring_primary.clone(), local.clone()],
         };
         let completed_entries = vec![
             (
-                shard_key,
+                shard_key.clone(),
                 sinomo_core::kv::encode_kv_value(&desired).expect("active shard"),
             ),
             (
-                proof_key,
+                proof_key.clone(),
                 sinomo_core::kv::encode_kv_value(&proof).expect("completion proof"),
             ),
             (unrelated_key, vec![2]),
@@ -16436,7 +16905,50 @@ mod tests {
         let completion = reactor
             .pending_work()
             .expect("proof and authority completion generation");
-        reactor.complete_default_reconciliation(&completion);
+        let parked = &reactor
+            .parked_generation
+            .as_ref()
+            .expect("exact parked generation")
+            .handoff;
+        assert!(
+            parked.is_completed_by_desired_primary(&local, &completion.inputs),
+            "the reactor's actual local desired primary must inherit a proactive rebind wake"
+        );
+        assert!(
+            !parked.is_completed_by_desired_primary(&retiring_primary, &completion.inputs),
+            "the retiring primary must not consume the promoted-primary rebind edge"
+        );
+        let same_primary_desired = DfsMetadataShardConfig {
+            primary_node_id: retiring_primary.clone(),
+            replica_node_ids: vec![local.clone()],
+            ..desired.clone()
+        };
+        let same_primary_proof = DfsMetadataShardMembershipHandoffProof {
+            desired_shard: same_primary_desired.clone(),
+            ..proof.clone()
+        };
+        let same_primary_inputs = vec![
+            (
+                shard_key,
+                sinomo_core::kv::encode_kv_value(&same_primary_desired)
+                    .expect("same-primary active shard"),
+            ),
+            (
+                proof_key,
+                sinomo_core::kv::encode_kv_value(&same_primary_proof).expect("same-primary proof"),
+            ),
+        ];
+        assert!(
+            !parked.is_completed_by_desired_primary(&retiring_primary, &same_primary_inputs,),
+            "same-primary membership changes complete in the retiring lane and must not schedule promoted-primary rebind"
+        );
+        assert!(
+            reactor.complete_default_reconciliation_after_control_plane_observation(
+                &completion,
+                &local,
+            ),
+            "completion must transfer the exact promoted generation to maintenance"
+        );
         assert_eq!(reactor.pending_work(), None);
         observe_daemon_default_dfs_reconciliation(
             &reactor._projection_tx,

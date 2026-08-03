@@ -263,10 +263,18 @@ pub(crate) fn put_metadata_prefix_ack_floor(
     root: &Path,
     floor: &DfsMetadataPrefixAckFloor,
 ) -> Result<()> {
-    if floor.state_fingerprint.is_empty() {
+    if floor.state_fingerprint.is_empty() && floor.durable_prefix_proof.is_none() {
         return Err(MetadataBackendError::Serde(format!(
-            "metadata prefix acknowledgement for shard {} has an empty state fingerprint",
+            "metadata prefix acknowledgement for shard {} has no durable evidence",
             floor.shard_id.0
+        )));
+    }
+    if let Some(proof) = floor.durable_prefix_proof.as_ref()
+        && (!proof.is_well_formed() || proof.journal_sequence != floor.journal_sequence)
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "metadata prefix acknowledgement for shard {} has an invalid durable prefix at sequence {}",
+            floor.shard_id.0, floor.journal_sequence
         )));
     }
     if let Some(current) = metadata_prefix_ack_floor(root, &floor.shard_id)? {
@@ -274,13 +282,45 @@ pub(crate) fn put_metadata_prefix_ack_floor(
             return Ok(());
         }
         if floor.journal_sequence == current.journal_sequence {
-            if floor.state_fingerprint == current.state_fingerprint {
+            if !floor.state_fingerprint.is_empty()
+                && !current.state_fingerprint.is_empty()
+                && floor.state_fingerprint != current.state_fingerprint
+            {
+                return Err(MetadataBackendError::Serde(format!(
+                    "metadata prefix acknowledgement for shard {} sequence {} conflicts with the durable fingerprint",
+                    floor.shard_id.0, floor.journal_sequence
+                )));
+            }
+            if let (Some(current), Some(new)) = (
+                current.durable_prefix_proof.as_ref(),
+                floor.durable_prefix_proof.as_ref(),
+            ) && current != new
+            {
+                return Err(MetadataBackendError::Serde(format!(
+                    "metadata prefix acknowledgement for shard {} sequence {} conflicts with the durable journal prefix",
+                    floor.shard_id.0, floor.journal_sequence
+                )));
+            }
+            let merged = DfsMetadataPrefixAckFloor {
+                shard_id: floor.shard_id.clone(),
+                journal_sequence: floor.journal_sequence,
+                state_fingerprint: if floor.state_fingerprint.is_empty() {
+                    current.state_fingerprint.clone()
+                } else {
+                    floor.state_fingerprint.clone()
+                },
+                durable_prefix_proof: floor
+                    .durable_prefix_proof
+                    .clone()
+                    .or_else(|| current.durable_prefix_proof.clone()),
+            };
+            if merged == current {
                 return Ok(());
             }
-            return Err(MetadataBackendError::Serde(format!(
-                "metadata prefix acknowledgement for shard {} sequence {} conflicts with the durable fingerprint",
-                floor.shard_id.0, floor.journal_sequence
-            )));
+            return write_sobj_atomic(
+                &metadata_prefix_ack_floor_path(root, &floor.shard_id),
+                &merged,
+            );
         }
     }
     write_sobj_atomic(
@@ -306,10 +346,37 @@ pub(crate) fn put_metadata_authority_ack_floor(
             floor.shard_id.0
         )));
     }
-    if let Some(current) = metadata_authority_ack_floor(root, &floor.shard_id)?
-        && floor.journal_sequence <= current.journal_sequence
+    if let Some(proof) = floor.durable_prefix_proof.as_ref()
+        && (!proof.is_well_formed() || proof.journal_sequence != floor.journal_sequence)
     {
-        return Ok(());
+        return Err(MetadataBackendError::Serde(format!(
+            "metadata authority acknowledgement for shard {} has an invalid durable prefix at sequence {}",
+            floor.shard_id.0, floor.journal_sequence
+        )));
+    }
+    if let Some(current) = metadata_authority_ack_floor(root, &floor.shard_id)? {
+        if floor.journal_sequence < current.journal_sequence {
+            return Ok(());
+        }
+        if floor.journal_sequence == current.journal_sequence {
+            match (
+                current.durable_prefix_proof.as_ref(),
+                floor.durable_prefix_proof.as_ref(),
+            ) {
+                (_, None) => return Ok(()),
+                (None, Some(_)) => {
+                    // Upgrade a legacy sequence-only floor with the exact
+                    // durable proof learned by a versioned retry.
+                }
+                (Some(current), Some(new)) if current == new => return Ok(()),
+                (Some(_), Some(_)) => {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata authority acknowledgement for shard {} sequence {} conflicts with its durable prefix",
+                        floor.shard_id.0, floor.journal_sequence
+                    )));
+                }
+            }
+        }
     }
     write_sobj_atomic(
         &metadata_authority_ack_floor_path(root, &floor.shard_id),
@@ -327,6 +394,7 @@ pub(crate) fn write_journal_head(root: &Path, next_sequence: u64) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DfsMetadataPrefixProof;
     use crate::metadata_io::read_sobj;
 
     fn node(value: &str) -> NodeId {
@@ -374,6 +442,7 @@ mod tests {
             shard_id: shard_id.clone(),
             journal_sequence: 10,
             state_fingerprint: "blake3:first".to_string(),
+            durable_prefix_proof: None,
         };
         put_metadata_prefix_ack_floor(&root, &first).expect("write first floor");
         put_metadata_prefix_ack_floor(
@@ -382,6 +451,7 @@ mod tests {
                 shard_id: shard_id.clone(),
                 journal_sequence: 7,
                 state_fingerprint: "blake3:stale".to_string(),
+                durable_prefix_proof: None,
             },
         )
         .expect("stale floor is ignored");
@@ -396,15 +466,39 @@ mod tests {
                     shard_id: shard_id.clone(),
                     journal_sequence: 10,
                     state_fingerprint: "blake3:conflict".to_string(),
+                    durable_prefix_proof: None,
                 },
             )
             .is_err(),
             "equal sequence with different state must not replace an acknowledgement"
         );
+        let exact_prefix = DfsMetadataPrefixProof {
+            version: 2,
+            journal_sequence: 10,
+            digest: format!("dfs-metadata-prefix-v2:blake3:{}", "a".repeat(64)),
+        };
+        put_metadata_prefix_ack_floor(
+            &root,
+            &DfsMetadataPrefixAckFloor {
+                shard_id: shard_id.clone(),
+                journal_sequence: 10,
+                state_fingerprint: String::new(),
+                durable_prefix_proof: Some(exact_prefix.clone()),
+            },
+        )
+        .expect("enrich semantic floor with exact journal prefix");
+        assert_eq!(
+            metadata_prefix_ack_floor(&root, &shard_id).expect("read enriched floor"),
+            Some(DfsMetadataPrefixAckFloor {
+                durable_prefix_proof: Some(exact_prefix),
+                ..first
+            })
+        );
         let advanced = DfsMetadataPrefixAckFloor {
             shard_id: shard_id.clone(),
             journal_sequence: 11,
             state_fingerprint: "blake3:advanced".to_string(),
+            durable_prefix_proof: None,
         };
         put_metadata_prefix_ack_floor(&root, &advanced).expect("advance floor");
         assert_eq!(
@@ -442,6 +536,7 @@ mod tests {
         let first = DfsMetadataAuthorityAckFloor {
             shard_id: shard_id.clone(),
             journal_sequence: 10,
+            durable_prefix_proof: None,
         };
         put_metadata_authority_ack_floor(&root, &first).expect("write first floor");
         put_metadata_authority_ack_floor(
@@ -449,6 +544,7 @@ mod tests {
             &DfsMetadataAuthorityAckFloor {
                 shard_id: shard_id.clone(),
                 journal_sequence: 7,
+                durable_prefix_proof: None,
             },
         )
         .expect("stale floor is ignored");
@@ -459,12 +555,43 @@ mod tests {
         let advanced = DfsMetadataAuthorityAckFloor {
             shard_id: shard_id.clone(),
             journal_sequence: 11,
+            durable_prefix_proof: None,
         };
         put_metadata_authority_ack_floor(&root, &advanced).expect("advance floor");
         assert_eq!(
             metadata_authority_ack_floor(&root, &shard_id).expect("read advanced floor"),
-            Some(advanced)
+            Some(advanced.clone())
         );
+        let exact = DfsMetadataAuthorityAckFloor {
+            shard_id: shard_id.clone(),
+            journal_sequence: 11,
+            durable_prefix_proof: Some(DfsMetadataPrefixProof {
+                version: 2,
+                journal_sequence: 11,
+                digest: format!("dfs-metadata-prefix-v2:blake3:{}", "a".repeat(64)),
+            }),
+        };
+        put_metadata_authority_ack_floor(&root, &exact).expect("upgrade exact floor");
+        put_metadata_authority_ack_floor(&root, &exact).expect("repeat exact floor");
+        assert_eq!(
+            metadata_authority_ack_floor(&root, &shard_id).expect("read exact floor"),
+            Some(exact.clone())
+        );
+        let conflicting = DfsMetadataAuthorityAckFloor {
+            durable_prefix_proof: Some(DfsMetadataPrefixProof {
+                version: 2,
+                journal_sequence: 11,
+                digest: format!("dfs-metadata-prefix-v2:blake3:{}", "b".repeat(64)),
+            }),
+            ..exact.clone()
+        };
+        assert!(put_metadata_authority_ack_floor(&root, &conflicting).is_err());
+        let wrong_sequence = DfsMetadataAuthorityAckFloor {
+            journal_sequence: 12,
+            durable_prefix_proof: exact.durable_prefix_proof,
+            ..advanced
+        };
+        assert!(put_metadata_authority_ack_floor(&root, &wrong_sequence).is_err());
     }
 
     fn cleanup(root: &Path) {

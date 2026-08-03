@@ -62,6 +62,9 @@
 #   SINOMO_DFS_PERF_WARMUP_MS               launch/grace interval (250)
 #   SINOMO_DFS_PERF_TIMEOUT_SECONDS         per-lane timeout (300)
 #   SINOMO_DFS_PERF_CONVERGENCE_SECONDS     final clean-status wait (60)
+#   SINOMO_DFS_PERF_QUIESCENCE_SECONDS      idle settle time before final memory snapshot (10)
+#   SINOMO_DFS_PERF_MEMORY_TREE_TIMEOUT_SECONDS
+#                                             per-node /data tree snapshot timeout (30)
 #   SINOMO_DFS_PERF_ARTIFACTS               output directory
 #
 # `cluster.dfs.bulk-write` must expose probe-level retry_count diagnostics. Any
@@ -122,6 +125,8 @@ MAX_IDLE_MS="${SINOMO_DFS_PERF_MAX_IDLE_MS:-100}"
 WARMUP_MS="${SINOMO_DFS_PERF_WARMUP_MS:-250}"
 TIMEOUT_SECONDS="${SINOMO_DFS_PERF_TIMEOUT_SECONDS:-300}"
 CONVERGENCE_SECONDS="${SINOMO_DFS_PERF_CONVERGENCE_SECONDS:-60}"
+QUIESCENCE_SECONDS="${SINOMO_DFS_PERF_QUIESCENCE_SECONDS:-10}"
+MEMORY_TREE_TIMEOUT_SECONDS="${SINOMO_DFS_PERF_MEMORY_TREE_TIMEOUT_SECONDS:-30}"
 CGROUP_ROOT="${SINOMO_CGROUP_ROOT:-/sys/fs/cgroup}"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ARTIFACTS="${SINOMO_DFS_PERF_ARTIFACTS:-$REPO_ROOT/target/dfs-shard-perf/$RUN_ID}"
@@ -230,6 +235,16 @@ summarize_dfs_perf_traces() {
               record = "posix-bulk-local-write"
             } else if (has_record("metadata-authority-confirmation")) {
               record = "metadata-authority-confirmation"
+            } else if (has_record("metadata-replica-frame-decode")) {
+              record = "metadata-replica-frame-decode"
+            } else if (has_record("metadata-replica-durable-ingest")) {
+              record = "metadata-replica-durable-ingest"
+            } else if (has_record("metadata-replica-authority-context")) {
+              record = "metadata-replica-authority-context"
+            } else if (has_record("metadata-journal-source-validation")) {
+              record = "metadata-journal-source-validation"
+            } else if (has_record("metadata-prefix-verification")) {
+              record = "metadata-prefix-verification"
             } else if (has_record("content-root-catalog-shard-refresh")) {
               record = "content-root-catalog-shard-refresh"
             } else if (has_record("content-root-catalog-refresh")) {
@@ -274,6 +289,32 @@ summarize_dfs_perf_traces() {
               emit("assignment_ms", "ms")
               emit("quorum_ms", "ms")
               emit("total_ms", "ms")
+            } else if (record == "metadata-replica-frame-decode") {
+              emit("entries", "count")
+              emit("bytes", "bytes")
+              emit("decode_ms", "ms")
+            } else if (record == "metadata-replica-durable-ingest") {
+              emit("target", "count")
+              emit("entries", "count")
+              emit("newly_persisted", "count")
+              emit("validation_ms", "ms")
+              emit("lock_ms", "ms")
+              emit("head_ms", "ms")
+              emit("prefix_ms", "ms")
+              emit("journal_ms", "ms")
+              emit("materialization_ms", "ms")
+              emit("total_ms", "ms")
+            } else if (record == "metadata-replica-authority-context") {
+              emit("local_read_ms", "ms")
+              emit("shard_read_ms", "ms")
+              emit("handoff_read_ms", "ms")
+              emit("total_ms", "ms")
+            } else if (record == "metadata-journal-source-validation") {
+              emit("refresh_ms", "ms")
+              emit("lookup_ms", "ms")
+              emit("total_ms", "ms")
+            } else if (record == "metadata-prefix-verification") {
+              emit("verify_ms", "ms")
             } else if (record == "content-root-catalog-shard-refresh") {
               emit("pages", "count")
               emit("entries", "count")
@@ -412,6 +453,19 @@ bulk-prepare	posix-bulk-local-write	prepare_setup_ms	build committed objects and
 bulk-prepare	posix-bulk-local-write	group_prepare_ms	build per-authority transactions and write proofs
 bulk-commit	posix-bulk-authority-commit	commit_ms	per-authority local or routed namespace commit
 replication-confirmation	metadata-authority-confirmation	total_ms	full-shard acknowledgement or cluster-quorum permit
+replication-frame	metadata-replica-frame-decode	decode_ms	exact immutable replica frame decoding
+replication-ingest	metadata-replica-durable-ingest	validation_ms	canonical prepare and authority validation before durable admission
+replication-ingest	metadata-replica-durable-ingest	journal_ms	durable exact-frame append before acknowledgement
+replication-ingest	metadata-replica-durable-ingest	materialization_ms	synchronous follower table materialization when required before acknowledgement
+replication-ingest	metadata-replica-durable-ingest	total_ms	complete durable replica ingest before acknowledgement
+replication-authority	metadata-replica-authority-context	local_read_ms	resident local shard-context lookup before deciding whether authority refresh is required
+replication-authority	metadata-replica-authority-context	total_ms	local cached context validation or authoritative shard and handoff lookup
+replication-authority	metadata-replica-authority-context	shard_read_ms	authoritative shard-config lookup when the local context cannot be reused
+replication-authority	metadata-replica-authority-context	handoff_read_ms	authoritative membership-handoff lookup when the request carries a handoff identity
+replication-authority	metadata-journal-source-validation	refresh_ms	cluster authority-view refresh before routed journal admission
+replication-authority	metadata-journal-source-validation	lookup_ms	validated shard and optional handoff lookup after refresh
+replication-authority	metadata-journal-source-validation	total_ms	complete routed journal source validation
+replication-prefix	metadata-prefix-verification	verify_ms	canonical local prefix-proof verification for a handoff probe
 catalog	content-root-catalog-shard-refresh	total_ms	one exact-cut shard fragment refresh
 catalog	content-root-catalog-refresh	total_ms	complete multi-shard catalog refresh and durable install
 content-ingest	blob-only-write	blob_write_ms	loose blob write when emitted
@@ -461,7 +515,7 @@ run_container_timeout() {
     docker exec -i "${container_id[$node]}" "$@"
 }
 
-for command in docker jq timeout date awk sed grep cmp getconf sort wc mv; do
+for command in docker jq timeout date awk sed grep cmp du find getconf sort stat wc mv; do
   require_command "$command"
 done
 case "$BINARY_PROFILE" in
@@ -498,6 +552,9 @@ require_uint SINOMO_DFS_PERF_MAX_IDLE_MS "$MAX_IDLE_MS"
 require_uint SINOMO_DFS_PERF_WARMUP_MS "$WARMUP_MS"
 require_positive_uint SINOMO_DFS_PERF_TIMEOUT_SECONDS "$TIMEOUT_SECONDS"
 require_positive_uint SINOMO_DFS_PERF_CONVERGENCE_SECONDS "$CONVERGENCE_SECONDS"
+require_positive_uint SINOMO_DFS_PERF_QUIESCENCE_SECONDS "$QUIESCENCE_SECONDS"
+require_positive_uint \
+  SINOMO_DFS_PERF_MEMORY_TREE_TIMEOUT_SECONDS "$MEMORY_TREE_TIMEOUT_SECONDS"
 [[ "$SAMPLE_SECONDS" =~ ^0\.[0-9]+$|^[1-9][0-9]*(\.[0-9]+)?$ ]] \
   || die "SINOMO_DFS_PERF_SAMPLE_SECONDS must be a positive decimal"
 CLK_TCK="$(getconf CLK_TCK)"
@@ -618,7 +675,7 @@ for node in "${NODES[@]}"; do
   [[ -r "$CGROUP_ROOT$cgroup_path/cgroup.procs" ]] \
     || die "cannot inspect cgroup processes for $node at $CGROUP_ROOT$cgroup_path"
   for cgroup_file in \
-    cpu.pressure io.pressure memory.pressure memory.current memory.peak memory.events \
+    cpu.pressure io.pressure memory.pressure memory.current memory.peak memory.events memory.stat \
     io.stat cpu.max cpuset.cpus.effective; do
     [[ -r "$CGROUP_ROOT$cgroup_path/$cgroup_file" ]] \
       || die "cannot read cgroup metric $cgroup_file for $node at $CGROUP_ROOT$cgroup_path"
@@ -817,6 +874,8 @@ done
   printf 'min_sustained_aggregate_files_per_second\t%s\n' \
     "$MIN_SUSTAINED_AGGREGATE_FILES_PER_SECOND"
   printf 'sample_seconds\t%s\n' "$SAMPLE_SECONDS"
+  printf 'post_workload_quiescence_seconds\t%s\n' "$QUIESCENCE_SECONDS"
+  printf 'memory_tree_snapshot_timeout_seconds\t%s\n' "$MEMORY_TREE_TIMEOUT_SECONDS"
   printf 'clock_ticks_per_second\t%s\n' "$CLK_TCK"
   printf 'min_primary_cpu_percent\t%s\n' "$MIN_PRIMARY_CPU_PERCENT"
   printf 'max_idle_ms\t%s\n' "$MAX_IDLE_MS"
@@ -846,6 +905,11 @@ sample_pressure_some=0
 sample_pressure_full=0
 sample_memory_current=0
 sample_memory_peak=0
+sample_memory_stat_anon=-1
+sample_memory_stat_file=-1
+sample_memory_stat_shmem=-1
+sample_memory_stat_kernel=-1
+sample_memory_stat_slab=-1
 sample_memory_low=0
 sample_memory_high=0
 sample_memory_max=0
@@ -994,6 +1058,206 @@ read_memory_observation() {
       oom_group_kill) sample_memory_oom_group_kill="$value" ;;
     esac
   done <"$cgroup/memory.events"
+}
+
+read_memory_stat_breakdown() {
+  local file="$1" key value
+  sample_memory_stat_anon=-1
+  sample_memory_stat_file=-1
+  sample_memory_stat_shmem=-1
+  sample_memory_stat_kernel=-1
+  sample_memory_stat_slab=-1
+  while read -r key value _; do
+    case "$key" in
+      anon) sample_memory_stat_anon="$value" ;;
+      file) sample_memory_stat_file="$value" ;;
+      shmem) sample_memory_stat_shmem="$value" ;;
+      kernel) sample_memory_stat_kernel="$value" ;;
+      slab) sample_memory_stat_slab="$value" ;;
+    esac
+  done <"$file"
+}
+
+capture_smaps_rollup() {
+  local timestamp_ns="$1" elapsed_ms="$2" phase="$3" node="$4"
+  local scope="$5" host_pid="$6" file="/proc/$6/smaps_rollup"
+  local key value _unit value_bytes available=no process_comm=na
+  local rss=na pss=na pss_dirty=na pss_anon=na pss_file=na pss_shmem=na
+  local shared_clean=na shared_dirty=na private_clean=na private_dirty=na
+  local referenced=na anonymous=na ksm=na lazy_free=na anon_huge_pages=na
+  local shmem_pmd_mapped=na file_pmd_mapped=na
+  local shared_hugetlb=na private_hugetlb=na swap=na swap_pss=na locked=na
+
+  if [[ -r "$file" ]]; then
+    while read -r key value _unit; do
+      [[ "$value" =~ ^[0-9]+$ ]] || continue
+      value_bytes=$((value * 1024))
+      case "$key" in
+        Rss:) rss="$value_bytes" ;;
+        Pss:) pss="$value_bytes" ;;
+        Pss_Dirty:) pss_dirty="$value_bytes" ;;
+        Pss_Anon:) pss_anon="$value_bytes" ;;
+        Pss_File:) pss_file="$value_bytes" ;;
+        Pss_Shmem:) pss_shmem="$value_bytes" ;;
+        Shared_Clean:) shared_clean="$value_bytes" ;;
+        Shared_Dirty:) shared_dirty="$value_bytes" ;;
+        Private_Clean:) private_clean="$value_bytes" ;;
+        Private_Dirty:) private_dirty="$value_bytes" ;;
+        Referenced:) referenced="$value_bytes" ;;
+        Anonymous:) anonymous="$value_bytes" ;;
+        KSM:) ksm="$value_bytes" ;;
+        LazyFree:) lazy_free="$value_bytes" ;;
+        AnonHugePages:) anon_huge_pages="$value_bytes" ;;
+        ShmemPmdMapped:) shmem_pmd_mapped="$value_bytes" ;;
+        FilePmdMapped:) file_pmd_mapped="$value_bytes" ;;
+        Shared_Hugetlb:) shared_hugetlb="$value_bytes" ;;
+        Private_Hugetlb:) private_hugetlb="$value_bytes" ;;
+        Swap:) swap="$value_bytes" ;;
+        SwapPss:) swap_pss="$value_bytes" ;;
+        Locked:) locked="$value_bytes" ;;
+      esac
+    done <"$file" 2>>"$ARTIFACTS/memory-observability-errors.log" || :
+    [[ "$rss" != na ]] && available=yes
+  fi
+  if [[ -r "/proc/$host_pid/comm" ]]; then
+    IFS= read -r process_comm <"/proc/$host_pid/comm" || process_comm=na
+    process_comm="${process_comm//$'\t'/ }"
+  fi
+
+  {
+    printf '%s' "$timestamp_ns"
+    printf '\t%s' "$elapsed_ms" "$phase" "$node" "$scope" "$host_pid" \
+      "$process_comm" "$available" "$rss" "$pss" "$pss_dirty" "$pss_anon" "$pss_file" \
+      "$pss_shmem" "$shared_clean" "$shared_dirty" "$private_clean" \
+      "$private_dirty" "$referenced" "$anonymous" "$ksm" "$lazy_free" \
+      "$anon_huge_pages" "$shmem_pmd_mapped" "$file_pmd_mapped" \
+      "$shared_hugetlb" "$private_hugetlb" "$swap" "$swap_pss" "$locked" "$file"
+    printf '\n'
+  } >>"$ARTIFACTS/process-smaps-rollup.tsv"
+}
+
+capture_filesystem_usage() {
+  local timestamp_ns="$1" elapsed_ms="$2" phase="$3" node="$4"
+  local data_path="/proc/${container_pid[$4]}/root/data"
+  local observation fs_type block_size blocks_total blocks_free blocks_available
+  local inodes_total inodes_free available=no
+  local bytes_total=na bytes_used=na bytes_available=na inodes_used=na
+  local tree_observation tree_status tree_available=no
+  local tree_apparent_bytes=na tree_disk_bytes=na tree_file_count=na
+  local tree_directory_count=na
+
+  observation="$(
+    stat -f -c '%T %S %b %f %a %c %d' "$data_path" \
+      2>>"$ARTIFACTS/memory-observability-errors.log"
+  )" || observation=""
+  read -r fs_type block_size blocks_total blocks_free blocks_available \
+    inodes_total inodes_free <<<"$observation" || :
+  if [[ "$block_size" =~ ^[0-9]+$ && "$blocks_total" =~ ^[0-9]+$ \
+      && "$blocks_free" =~ ^[0-9]+$ && "$blocks_available" =~ ^[0-9]+$ \
+      && "$inodes_total" =~ ^[0-9]+$ && "$inodes_free" =~ ^[0-9]+$ ]]; then
+    available=yes
+    bytes_total=$((block_size * blocks_total))
+    bytes_used=$((block_size * (blocks_total - blocks_free)))
+    bytes_available=$((block_size * blocks_available))
+    inodes_used=$((inodes_total - inodes_free))
+  else
+    fs_type="${fs_type:-${data_fs_type[$node]}}"
+    block_size=na
+    blocks_total=na
+    blocks_free=na
+    blocks_available=na
+    inodes_total=na
+    inodes_free=na
+  fi
+
+  if tree_observation="$(
+    timeout --kill-after=5s "${MEMORY_TREE_TIMEOUT_SECONDS}s" \
+      bash -o pipefail -c '
+        data_path="$1"
+        apparent_output="$(du -s -x -B1 --apparent-size -- "$data_path")" || exit
+        disk_output="$(du -s -x -B1 -- "$data_path")" || exit
+        apparent_bytes="${apparent_output%%[[:space:]]*}"
+        disk_bytes="${disk_output%%[[:space:]]*}"
+        counts="$(
+          find "$data_path" -xdev -printf "%y\n" \
+            | awk "{
+                if (\$1 == \"f\") files++
+                else if (\$1 == \"d\") directories++
+              }
+              END { print files + 0, directories + 0 }"
+        )" || exit
+        printf "%s %s %s\n" "$apparent_bytes" "$disk_bytes" "$counts"
+      ' bash "$data_path" 2>>"$ARTIFACTS/memory-observability-errors.log"
+  )"; then
+    read -r tree_apparent_bytes tree_disk_bytes tree_file_count \
+      tree_directory_count <<<"$tree_observation" || :
+    if [[ "$tree_apparent_bytes" =~ ^[0-9]+$ && "$tree_disk_bytes" =~ ^[0-9]+$ \
+        && "$tree_file_count" =~ ^[0-9]+$ && "$tree_directory_count" =~ ^[0-9]+$ ]]; then
+      tree_available=yes
+    else
+      tree_apparent_bytes=na
+      tree_disk_bytes=na
+      tree_file_count=na
+      tree_directory_count=na
+    fi
+  else
+    tree_status=$?
+    printf '%s phase=%s node=%s /data tree snapshot unavailable exit=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)" "$phase" "$node" "$tree_status" \
+      >>"$ARTIFACTS/memory-observability-errors.log"
+  fi
+
+  printf '%s\t%s\t%s\t%s\t/data\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$timestamp_ns" "$elapsed_ms" "$phase" "$node" "$fs_type" "$available" \
+    "$block_size" "$blocks_total" "$blocks_free" "$blocks_available" \
+    "$bytes_total" "$bytes_used" "$bytes_available" "$inodes_total" \
+    "$inodes_free" "$inodes_used" "$tree_available" "$tree_apparent_bytes" \
+    "$tree_disk_bytes" "$tree_file_count" "$tree_directory_count" \
+    >>"$ARTIFACTS/filesystem-usage.tsv"
+}
+
+capture_memory_observability_snapshot() {
+  local phase="$1" timestamp_ns elapsed_ms node cgroup process_pid process_scope
+  local main_daemon_seen container_init_seen
+  for node in "${NODES[@]}"; do
+    timestamp_ns="$(date +%s%N)"
+    elapsed_ms=$(((timestamp_ns - measurement_started_ns) / 1000000))
+    cgroup="${container_cgroup[$node]}"
+    read_memory_observation "$cgroup"
+    read_memory_stat_breakdown "$cgroup/memory.stat"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$timestamp_ns" "$elapsed_ms" "$phase" "$node" \
+      "$sample_memory_current" "$sample_memory_peak" \
+      "$sample_memory_stat_anon" "$sample_memory_stat_file" \
+      "$sample_memory_stat_shmem" "$sample_memory_stat_kernel" \
+      "$sample_memory_stat_slab" \
+      >>"$ARTIFACTS/memory-breakdown.tsv"
+    main_daemon_seen=0
+    container_init_seen=0
+    while read -r process_pid; do
+      [[ "$process_pid" =~ ^[1-9][0-9]*$ ]] || continue
+      process_scope=cgroup-process
+      if [[ "$process_pid" == "${main_daemon_host_pid[$node]}" ]]; then
+        process_scope=main-daemon
+        main_daemon_seen=1
+      elif [[ "$process_pid" == "${container_pid[$node]}" ]]; then
+        process_scope=container-init
+        container_init_seen=1
+      fi
+      capture_smaps_rollup "$timestamp_ns" "$elapsed_ms" "$phase" "$node" \
+        "$process_scope" "$process_pid"
+    done <"$cgroup/cgroup.procs"
+    if (( main_daemon_seen == 0 )); then
+      capture_smaps_rollup "$timestamp_ns" "$elapsed_ms" "$phase" "$node" \
+        main-daemon "${main_daemon_host_pid[$node]}"
+    fi
+    if [[ "${container_pid[$node]}" != "${main_daemon_host_pid[$node]}" ]] \
+      && (( container_init_seen == 0 )); then
+      capture_smaps_rollup "$timestamp_ns" "$elapsed_ms" "$phase" "$node" \
+        container-init "${container_pid[$node]}"
+    fi
+    capture_filesystem_usage "$timestamp_ns" "$elapsed_ms" "$phase" "$node"
+  done
 }
 
 read_host_memory_observation() {
@@ -1239,6 +1503,16 @@ docker_log_since="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
 printf '%s\n' \
   'timestamp_ns,elapsed_ms,phase,workload_lanes,memory_total_bytes,memory_available_bytes,swap_total_bytes,swap_free_bytes' \
   >"$ARTIFACTS/host-memory.csv"
+printf '%s\n' \
+  $'timestamp_ns\telapsed_ms\tphase\tnode\tmemory_current_bytes\tmemory_peak_bytes\tmemory_stat_anon_bytes\tmemory_stat_file_bytes\tmemory_stat_shmem_bytes\tmemory_stat_kernel_bytes\tmemory_stat_slab_bytes' \
+  >"$ARTIFACTS/memory-breakdown.tsv"
+printf '%s\n' \
+  $'timestamp_ns\telapsed_ms\tphase\tnode\tprocess_scope\thost_pid\tprocess_comm\tavailable\trss_bytes\tpss_bytes\tpss_dirty_bytes\tpss_anon_bytes\tpss_file_bytes\tpss_shmem_bytes\tshared_clean_bytes\tshared_dirty_bytes\tprivate_clean_bytes\tprivate_dirty_bytes\treferenced_bytes\tanonymous_bytes\tksm_bytes\tlazy_free_bytes\tanon_huge_pages_bytes\tshmem_pmd_mapped_bytes\tfile_pmd_mapped_bytes\tshared_hugetlb_bytes\tprivate_hugetlb_bytes\tswap_bytes\tswap_pss_bytes\tlocked_bytes\tsource' \
+  >"$ARTIFACTS/process-smaps-rollup.tsv"
+printf '%s\n' \
+  $'timestamp_ns\telapsed_ms\tphase\tnode\tmount\tfs_type\tavailable\tblock_size_bytes\tblocks_total\tblocks_free\tblocks_available\tbytes_total\tbytes_used\tbytes_available\tinodes_total\tinodes_free\tinodes_used\ttree_available\ttree_apparent_bytes\ttree_disk_bytes\ttree_file_count\ttree_directory_count' \
+  >"$ARTIFACTS/filesystem-usage.tsv"
+: >"$ARTIFACTS/memory-observability-errors.log"
 host_min_memory_available_bytes=-1
 host_last_memory_available_bytes=0
 host_last_swap_free_bytes=0
@@ -1247,6 +1521,7 @@ host_initial_memory_total_bytes="$sample_host_memory_total_bytes"
 host_initial_memory_available_bytes="$sample_host_memory_available_bytes"
 host_initial_swap_total_bytes="$sample_host_swap_total_bytes"
 host_initial_swap_free_bytes="$sample_host_swap_free_bytes"
+capture_memory_observability_snapshot preflight
 declare -A main_daemon_stderr_start_bytes=()
 declare -A main_daemon_stdout_start_bytes=()
 main_daemon_stderr_capture_done=0
@@ -2591,6 +2866,15 @@ for node in "${NODES[@]}"; do
     gate_failed=1
   fi
 done
+
+# Preserve an immediate postflight view, then leave the cluster entirely idle
+# for a bounded interval before the final snapshot. This makes deferred replica
+# materialization, catalog refresh, allocator retention, and tmpfs growth
+# visible without changing the high-frequency workload timeline schema.
+capture_memory_observability_snapshot postflight
+log "postflight: allowing ${QUIESCENCE_SECONDS}s for deferred DFS work to settle before final memory capture"
+sleep "$QUIESCENCE_SECONDS"
+capture_memory_observability_snapshot postflight-quiescent
 
 printf '%s\n' \
   'phase,workload_lanes,node,samples,memory_current_first_bytes,memory_current_last_bytes,memory_current_min_bytes,memory_current_max_bytes,memory_peak_first_bytes,memory_peak_last_bytes' \

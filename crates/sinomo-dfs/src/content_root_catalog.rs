@@ -22,7 +22,8 @@ use crate::{
 };
 
 pub const DFS_CONTENT_ROOT_CATALOG_FORMAT_VERSION: u32 = 2;
-pub const DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION: u32 = 1;
+pub const DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION: u32 = 2;
+const DFS_CONTENT_ROOT_CATALOG_LEGACY_PREFIX_PROOF_VERSION: u32 = 1;
 /// Historical conservative page size retained for callers that deliberately
 /// prefer the old, smaller transfer unit.
 pub const DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES: usize = 256;
@@ -36,7 +37,8 @@ pub const DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES: usize = 256 * 1024;
 pub const DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT: usize = 2048;
 pub const DEFAULT_DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRIES: usize =
     DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT;
-const DFS_METADATA_PREFIX_PROOF_DIGEST_PREFIX: &str = "dfs-metadata-prefix-v1:blake3:";
+const DFS_METADATA_PREFIX_PROOF_V1_DIGEST_PREFIX: &str = "dfs-metadata-prefix-v1:blake3:";
+const DFS_METADATA_PREFIX_PROOF_V2_DIGEST_PREFIX: &str = "dfs-metadata-prefix-v2:blake3:";
 const DFS_CONTENT_ROOT_CATALOG_JSON_TOPOLOGY_PREFIX: &[u8] =
     b"sinomo-dfs-content-root-catalog-topology-json-v1\0";
 
@@ -52,11 +54,21 @@ fn valid_fingerprint(value: &str) -> bool {
 }
 
 fn valid_state_fingerprint(value: &str) -> bool {
-    value
-        .strip_prefix(DFS_METADATA_PREFIX_PROOF_DIGEST_PREFIX)
-        .is_some_and(|digest| {
-            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })
+    valid_state_fingerprint_for_version(DFS_CONTENT_ROOT_CATALOG_LEGACY_PREFIX_PROOF_VERSION, value)
+        || valid_state_fingerprint_for_version(DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION, value)
+}
+
+fn valid_state_fingerprint_for_version(version: u32, value: &str) -> bool {
+    let prefix = match version {
+        DFS_CONTENT_ROOT_CATALOG_LEGACY_PREFIX_PROOF_VERSION => {
+            DFS_METADATA_PREFIX_PROOF_V1_DIGEST_PREFIX
+        }
+        DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION => DFS_METADATA_PREFIX_PROOF_V2_DIGEST_PREFIX,
+        _ => return false,
+    };
+    value.strip_prefix(prefix).is_some_and(|digest| {
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
@@ -328,14 +340,9 @@ impl DfsContentRootCatalogCoverage {
                 state_fingerprint,
                 ..
             } => {
-                if *prefix_proof_version != DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION {
+                if !valid_state_fingerprint_for_version(*prefix_proof_version, state_fingerprint) {
                     return Err(catalog_error(
                         "DFS content-root catalog uses an unsupported prefix proof",
-                    ));
-                }
-                if !valid_state_fingerprint(state_fingerprint) {
-                    return Err(catalog_error(
-                        "DFS content-root catalog has an invalid state fingerprint",
                     ));
                 }
             }
@@ -465,9 +472,8 @@ impl DfsContentRootCatalogPage {
                 journal_sequence,
                 state_fingerprint,
             } => {
-                if *prefix_proof_version != DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION
+                if !valid_state_fingerprint_for_version(*prefix_proof_version, state_fingerprint)
                     || *journal_sequence < request.minimum_journal_sequence
-                    || !valid_state_fingerprint(state_fingerprint)
                     || (*journal_sequence == request.minimum_journal_sequence
                         && request
                             .minimum_state_fingerprint
@@ -1970,7 +1976,7 @@ mod tests {
 
     fn state_fingerprint(value: &str) -> String {
         format!(
-            "{DFS_METADATA_PREFIX_PROOF_DIGEST_PREFIX}{}",
+            "{DFS_METADATA_PREFIX_PROOF_V2_DIGEST_PREFIX}{}",
             blake3::hash(value.as_bytes()).to_hex()
         )
     }
@@ -2109,6 +2115,18 @@ mod tests {
         legacy_page
             .validate_for_request(&legacy_request)
             .expect("legacy 256-entry page remains valid");
+        let mut legacy_proof_page = complete_page(&legacy_request, 9, Vec::new());
+        legacy_proof_page.coverage = DfsContentRootCatalogCoverage::Complete {
+            prefix_proof_version: DFS_CONTENT_ROOT_CATALOG_LEGACY_PREFIX_PROOF_VERSION,
+            journal_sequence: legacy_request.minimum_journal_sequence,
+            state_fingerprint: format!(
+                "{DFS_METADATA_PREFIX_PROOF_V1_DIGEST_PREFIX}{}",
+                blake3::hash(b"legacy-catalog-proof").to_hex()
+            ),
+        };
+        legacy_proof_page
+            .validate_for_request(&legacy_request)
+            .expect("stored V1 catalog proof remains valid during migration");
 
         let mut target_request = request();
         target_request.max_entries = DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRY_LIMIT;

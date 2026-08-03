@@ -1214,10 +1214,15 @@ fn metadata_shard_local_replica_failover_ready_from_local_backend(
     {
         return Ok(false);
     }
-    let Some(ack_floor) = backend.metadata_authority_ack_floor(&shard_id)? else {
-        return Ok(false);
-    };
-    if ack_floor.journal_sequence < watermark.journal_sequence {
+    let authority_floor = backend.metadata_authority_ack_floor(&shard_id)?;
+    let prefix_floor = backend.metadata_prefix_ack_floor(&shard_id)?;
+    if !authority_floor
+        .as_ref()
+        .is_some_and(|floor| floor.journal_sequence >= watermark.journal_sequence)
+        && !prefix_floor
+            .as_ref()
+            .is_some_and(|floor| floor.journal_sequence >= watermark.journal_sequence)
+    {
         return Ok(false);
     }
     if status.journal_last_sequence == watermark.journal_sequence {
@@ -1787,21 +1792,11 @@ pub fn default_cluster_metadata_shard_with_host(
         let _ = select_metadata_namespace_prepare_codec(state, &mut desired, None);
         return Ok(desired);
     };
-    let current_primary_unavailable =
-        host.metadata_shard_node_routing_unavailable(state, &current.primary_node_id);
-    let default_target_unavailable = if default_target_primary_node_id == current.primary_node_id {
-        current_primary_unavailable
-    } else {
-        host.metadata_shard_node_routing_unavailable(state, &default_target_primary_node_id)
-    };
-    desired.primary_node_id = default_metadata_shard_target_primary_node_id(
-        current_primary_unavailable,
-        default_target_unavailable,
-        &state.local_node_id,
-        &service_node_ids,
-        default_target_primary_node_id,
-        &current,
-    );
+    // Default placement must be identical on every daemon. A process-local
+    // routing view is not durable authority to promote that daemon's replica;
+    // the transfer-readiness fence below retains the current primary until the
+    // deterministic target can safely take over.
+    desired.primary_node_id = default_target_primary_node_id;
     desired.replica_node_ids =
         default_metadata_shard_replica_node_ids(&service_node_ids, &desired.primary_node_id);
     if current.primary_node_id != desired.primary_node_id
@@ -1879,21 +1874,9 @@ pub async fn default_cluster_metadata_shard_with_async_host(
         let _ = select_metadata_namespace_prepare_codec(state, &mut desired, None);
         return Ok(desired);
     };
-    let current_primary_unavailable =
-        host.metadata_shard_node_routing_unavailable(state, &current.primary_node_id);
-    let default_target_unavailable = if default_target_primary_node_id == current.primary_node_id {
-        current_primary_unavailable
-    } else {
-        host.metadata_shard_node_routing_unavailable(state, &default_target_primary_node_id)
-    };
-    desired.primary_node_id = default_metadata_shard_target_primary_node_id(
-        current_primary_unavailable,
-        default_target_unavailable,
-        &state.local_node_id,
-        &service_node_ids,
-        default_target_primary_node_id,
-        &current,
-    );
+    // See the synchronous planner above. Failover requires durable, shared
+    // authority; a daemon's transient route suspicion cannot change placement.
+    desired.primary_node_id = default_target_primary_node_id;
     desired.replica_node_ids =
         default_metadata_shard_replica_node_ids(&service_node_ids, &desired.primary_node_id);
     if current.primary_node_id != desired.primary_node_id
@@ -1931,36 +1914,6 @@ pub async fn default_cluster_metadata_shard_with_async_host(
     }
     desired.epoch = current.epoch.saturating_add(1);
     Ok(desired)
-}
-
-fn default_metadata_shard_target_primary_node_id(
-    current_primary_unavailable: bool,
-    default_target_unavailable: bool,
-    local_node_id: &NodeId,
-    service_node_ids: &[NodeId],
-    default_target_primary_node_id: NodeId,
-    current: &DfsMetadataShardConfig,
-) -> NodeId {
-    if current.primary_node_id == *local_node_id {
-        if default_target_primary_node_id != *local_node_id && default_target_unavailable {
-            return local_node_id.clone();
-        }
-        return default_target_primary_node_id;
-    }
-    let local_is_eligible_replica = service_node_ids
-        .iter()
-        .any(|node_id| node_id == local_node_id)
-        && current
-            .replica_node_ids
-            .iter()
-            .any(|node_id| node_id == local_node_id);
-    if current_primary_unavailable && local_is_eligible_replica {
-        return local_node_id.clone();
-    }
-    if default_target_unavailable {
-        return current.primary_node_id.clone();
-    }
-    default_target_primary_node_id
 }
 
 pub fn default_metadata_shard_primary_node_id(
@@ -3421,6 +3374,7 @@ mod tests {
             .put_metadata_authority_ack_floor(&DfsMetadataAuthorityAckFloor {
                 shard_id: DfsMetadataShardId::new("root"),
                 journal_sequence: target_root_sequence,
+                durable_prefix_proof: None,
             })
             .expect("certify root replica");
         drop(certified_root);
@@ -3493,6 +3447,7 @@ mod tests {
             .put_metadata_authority_ack_floor(&DfsMetadataAuthorityAckFloor {
                 shard_id: DfsMetadataShardId::new("services"),
                 journal_sequence: services_replica_sequence,
+                durable_prefix_proof: None,
             })
             .expect("certify services replica");
         drop(certified_services);
@@ -3584,6 +3539,7 @@ mod tests {
             .put_metadata_authority_ack_floor(&DfsMetadataAuthorityAckFloor {
                 shard_id: DfsMetadataShardId::new("services"),
                 journal_sequence: target_sequence,
+                durable_prefix_proof: None,
             })
             .expect("certify wrong target replica");
         drop(target);
@@ -3892,6 +3848,7 @@ mod tests {
             .put_metadata_authority_ack_floor(&DfsMetadataAuthorityAckFloor {
                 shard_id: services_shard_id.clone(),
                 journal_sequence: target_sequence,
+                durable_prefix_proof: None,
             })
             .expect("certify compacted target");
         drop(target);
@@ -4184,7 +4141,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_shard_failover_targets_local_replica_when_current_primary_unhealthy() {
+    fn metadata_shard_reconciliation_ignores_divergent_local_route_views() {
         let state = test_cluster_state_with_members(
             "cluster_dfs_default_unhealthy_primary",
             "node_dfs_unhealthy_primary_c",
@@ -4201,18 +4158,15 @@ mod tests {
             .expect("local service node");
         let unreachable_index = (local_index + 1) % service_nodes.len();
         let unreachable_primary = service_nodes[unreachable_index].clone();
-        let bootstrap_primary = service_nodes
-            .iter()
-            .find(|node_id| *node_id != &state.local_node_id && *node_id != &unreachable_primary)
-            .cloned()
-            .expect("bootstrap peer");
-
         let file_system = default_cluster_sifs(&state);
         let current = DfsMetadataShardConfig {
             file_system_id: file_system.file_system_id.clone(),
             shard_id: "services".to_string(),
             primary_node_id: unreachable_primary.clone(),
-            replica_node_ids: vec![bootstrap_primary.clone(), state.local_node_id.clone()],
+            replica_node_ids: default_metadata_shard_replica_node_ids(
+                &service_nodes,
+                &unreachable_primary,
+            ),
             epoch: 7,
             assignment: DfsMetadataShardAssignment::PathPrefix {
                 prefix: SIFS_SERVICES_PATH.to_string(),
@@ -4220,15 +4174,21 @@ mod tests {
             namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        let mut host = TestDefaultClusterBootstrapHost {
+        let mut unavailable_view = TestDefaultClusterBootstrapHost {
             current_shard: Some(current.clone()),
             unavailable_node_ids: BTreeSet::from([unreachable_primary.clone()]),
             primary_transfer_ready: true,
             primary_transfer_targets: Vec::new(),
         };
+        let mut reachable_view = TestDefaultClusterBootstrapHost {
+            current_shard: Some(current.clone()),
+            unavailable_node_ids: BTreeSet::new(),
+            primary_transfer_ready: true,
+            primary_transfer_targets: Vec::new(),
+        };
 
-        let shard = default_cluster_metadata_shard_with_host(
-            &mut host,
+        let unavailable_plan = default_cluster_metadata_shard_with_host(
+            &mut unavailable_view,
             &state,
             &file_system,
             "services",
@@ -4237,120 +4197,24 @@ mod tests {
             },
             unreachable_index,
         )
-        .expect("services shard");
-
-        assert_eq!(shard.primary_node_id, state.local_node_id);
-        assert_eq!(shard.epoch, current.epoch + 1);
-        assert_eq!(
-            host.primary_transfer_targets,
-            vec![state.local_node_id.clone()]
-        );
-        assert!(
-            shard
-                .replica_node_ids
-                .iter()
-                .any(|node_id| node_id == &unreachable_primary),
-            "offline members stay in the replica set so they can catch up after recovery"
-        );
-    }
-
-    #[test]
-    fn metadata_primary_failover_matrix_matches_safety_rules() {
-        let state = test_cluster_state_with_members(
-            "cluster_dfs_quint_failover_matrix",
-            "node_dfs_quint_failover_local",
-            &[
-                "node_dfs_quint_failover_current",
-                "node_dfs_quint_failover_default",
-            ],
-        );
-        let service_nodes = stable_dfs_service_node_ids(&state);
-        let current_primary =
-            NodeId::from_legacy_named("node_dfs_quint_failover_current").expect("current primary");
-        let default_primary =
-            NodeId::from_legacy_named("node_dfs_quint_failover_default").expect("default primary");
-        let file_system = default_cluster_sifs(&state);
-        let current = DfsMetadataShardConfig {
-            file_system_id: file_system.file_system_id.clone(),
-            shard_id: "services".to_string(),
-            primary_node_id: current_primary.clone(),
-            replica_node_ids: vec![default_primary.clone(), state.local_node_id.clone()],
-            epoch: 3,
-            assignment: DfsMetadataShardAssignment::PathPrefix {
+        .expect("plan from unavailable route view");
+        let reachable_plan = default_cluster_metadata_shard_with_host(
+            &mut reachable_view,
+            &state,
+            &file_system,
+            "services",
+            DfsMetadataShardAssignment::PathPrefix {
                 prefix: SIFS_SERVICES_PATH.to_string(),
             },
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedEventual,
-        };
-        assert_eq!(
-            default_metadata_shard_target_primary_node_id(
-                false,
-                false,
-                &state.local_node_id,
-                &service_nodes,
-                default_primary.clone(),
-                &current,
-            ),
-            default_primary,
-            "reachable current primary keeps normal default placement"
-        );
-        assert_eq!(
-            default_metadata_shard_target_primary_node_id(
-                false,
-                false,
-                &state.local_node_id,
-                &service_nodes,
-                default_primary.clone(),
-                &current,
-            ),
-            default_primary,
-            "missing connectivity graph is not enough evidence for local promotion"
-        );
-        assert_eq!(
-            default_metadata_shard_target_primary_node_id(
-                true,
-                false,
-                &state.local_node_id,
-                &service_nodes,
-                default_primary.clone(),
-                &DfsMetadataShardConfig {
-                    replica_node_ids: vec![default_primary.clone()],
-                    ..current.clone()
-                },
-            ),
-            default_primary,
-            "non-replica local node cannot self-promote"
-        );
-        assert_eq!(
-            default_metadata_shard_target_primary_node_id(
-                true,
-                false,
-                &state.local_node_id,
-                &service_nodes,
-                default_primary.clone(),
-                &current,
-            ),
-            state.local_node_id,
-            "unreachable current primary lets the local replica become target primary"
-        );
+            unreachable_index,
+        )
+        .expect("plan from reachable route view");
 
-        let local_primary = DfsMetadataShardConfig {
-            primary_node_id: state.local_node_id.clone(),
-            replica_node_ids: vec![current_primary],
-            ..current
-        };
-        assert_eq!(
-            default_metadata_shard_target_primary_node_id(
-                false,
-                true,
-                &state.local_node_id,
-                &service_nodes,
-                default_primary,
-                &local_primary,
-            ),
-            state.local_node_id,
-            "a failover primary must remain authoritative while the default target is unavailable"
-        );
+        assert_eq!(unavailable_plan, current);
+        assert_eq!(reachable_plan, current);
+        assert_eq!(unavailable_plan, reachable_plan);
+        assert!(unavailable_view.primary_transfer_targets.is_empty());
+        assert!(reachable_view.primary_transfer_targets.is_empty());
     }
 
     #[test]
@@ -4488,6 +4352,7 @@ mod tests {
             .put_metadata_authority_ack_floor(&DfsMetadataAuthorityAckFloor {
                 shard_id: shard_id.clone(),
                 journal_sequence: batch.next_after_sequence,
+                durable_prefix_proof: None,
             })
             .expect("persist certified replica authority floor");
         let state_fingerprint = crate::service_sync::metadata_shard_state_fingerprint_at(

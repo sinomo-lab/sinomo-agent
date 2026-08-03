@@ -8866,6 +8866,7 @@ name = "sinomo-dfs"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "bytes",
  "fs2",
  "metrics",
  "serde",

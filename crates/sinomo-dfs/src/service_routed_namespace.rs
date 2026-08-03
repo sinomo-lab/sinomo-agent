@@ -1681,6 +1681,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 repair_maintenance: false,
                 namespace_maintenance: false,
                 metadata_replica_progress: false,
+                metadata_materialization: false,
             });
         }
         let journal_started = Instant::now();

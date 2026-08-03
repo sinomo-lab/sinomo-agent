@@ -34,8 +34,9 @@ use crate::node_transport::value_response_from_rpc_result;
 use crate::{
     AsyncDfsPeerTransport, DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
     DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, DfsDistributedWriteResult, DfsError, DfsFileSystem,
-    DfsFileSystemId, DfsMetadataBackend, DfsMetadataJournalBatch, DfsMetadataJournalBatchCommand,
-    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataPrefixProbe,
+    DfsFileSystemId, DfsMetadataBackend, DfsMetadataDurableReplication, DfsMetadataJournalBatch,
+    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
+    DfsMetadataJournalFrameRecord, DfsMetadataPrefixProbe, DfsMetadataReplicaApplyReport,
     DfsMetadataReplicaIngestPermit, DfsMetadataReplicationSuppressionRecord,
     DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataShardMembershipHandoff,
     DfsMetadataShardMigrationReport, DfsMetadataSnapshotInstallCommand,
@@ -1484,6 +1485,29 @@ fn cluster_dfs_metadata_publish_scheduler(
     scheduler
 }
 
+fn cluster_dfs_metadata_materialization_scheduler(
+    data_dir: &SinomoDataDir,
+    shard_id: &DfsMetadataShardId,
+) -> Arc<DfsMetadataPublishScheduler> {
+    static SCHEDULERS: OnceLock<
+        Mutex<BTreeMap<(PathBuf, DfsMetadataShardId), Weak<DfsMetadataPublishScheduler>>>,
+    > = OnceLock::new();
+    let key = (data_dir.root(), shard_id.clone());
+    let Ok(mut schedulers) = SCHEDULERS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    else {
+        return Arc::new(DfsMetadataPublishScheduler::new());
+    };
+    if let Some(scheduler) = schedulers.get(&key).and_then(Weak::upgrade) {
+        return scheduler;
+    }
+    schedulers.retain(|_, scheduler| scheduler.strong_count() > 0);
+    let scheduler = Arc::new(DfsMetadataPublishScheduler::new());
+    schedulers.insert(key, Arc::downgrade(&scheduler));
+    scheduler
+}
+
 pub fn schedule_default_dfs_metadata_publish_async_on_runtime<P, Fut, R, E>(
     runtime: tokio::runtime::Handle,
     options: DfsMetadataPublishScheduleOptions,
@@ -2783,7 +2807,38 @@ fn validate_dfs_metadata_journal_replication_response(
     {
         return Err("metadata journal replication returned mismatched response".to_string());
     }
+    if matches!(&response.result, DfsMetadataJournalBatchResult::Applied)
+        && command
+            .durable_replication
+            .as_ref()
+            .is_some_and(|replication| {
+                response.verified_authority_probe_id.as_deref()
+                    != Some(replication.confirmation_id.as_str())
+            })
+    {
+        return Err(
+            "ordinary durable metadata replication returned no matching prefix confirmation"
+                .to_string(),
+        );
+    }
     Ok(())
+}
+
+fn dfs_metadata_journal_batch_command_entry_count(
+    command: &DfsMetadataJournalBatchCommand,
+) -> usize {
+    command
+        .durable_replication
+        .as_ref()
+        .map(|replication| replication.journal_frames.len())
+        .or_else(|| {
+            command.authority_probe.as_ref().and_then(|probe| {
+                probe
+                    .durable_journal_ack
+                    .then_some(probe.journal_frames.len())
+            })
+        })
+        .unwrap_or(command.batch.entries.len())
 }
 
 fn validate_dfs_metadata_snapshot_install_response(
@@ -3325,6 +3380,7 @@ mod metadata_publish_membership_tests {
                 verify_prefix_only: false,
                 prefix_probe: None,
                 authority_probe: None,
+                durable_replication: None,
                 batch: DfsMetadataJournalBatch {
                     shard_id: DfsMetadataShardId::new("root"),
                     entries: Vec::new(),
@@ -3649,9 +3705,38 @@ enum DfsPreparedMetadataJournalPayload {
         reason: String,
     },
     Batches {
-        batches: Vec<DfsMetadataJournalBatch>,
+        batches: Vec<DfsPreparedMetadataJournalFrameBatch>,
         backlog_after_sequence: Option<u64>,
     },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DfsPreparedMetadataJournalFrameBatch {
+    shard_id: DfsMetadataShardId,
+    next_after_sequence: u64,
+    journal_frames: Vec<DfsMetadataJournalFrameRecord>,
+}
+
+pub(crate) fn prepare_dfs_metadata_journal_frame_batch(
+    backend: &dyn DfsMetadataBackend,
+    batch: &DfsMetadataJournalBatch,
+) -> Result<DfsPreparedMetadataJournalFrameBatch, DfsError> {
+    let journal_frames = backend.journal_frames_for_batch(batch)?;
+    if journal_frames.len() != batch.entries.len() || journal_frames.is_empty() {
+        return Err(DfsError::Metadata {
+            message: format!(
+                "metadata replication frame selection for shard {} returned {} frames for {} entries",
+                batch.shard_id.0,
+                journal_frames.len(),
+                batch.entries.len()
+            ),
+        });
+    }
+    Ok(DfsPreparedMetadataJournalFrameBatch {
+        shard_id: batch.shard_id.clone(),
+        next_after_sequence: batch.next_after_sequence,
+        journal_frames,
+    })
 }
 
 fn prepare_dfs_metadata_journal_target_publish(
@@ -3717,7 +3802,7 @@ fn prepare_dfs_metadata_journal_target_publish(
                 };
 
                 next_after_sequence = batch.next_after_sequence;
-                batches.push(batch);
+                batches.push(prepare_dfs_metadata_journal_frame_batch(backend, &batch)?);
                 if batches.len() >= options.max_batches_per_target {
                     if backend
                         .journal_batch_for_shard_since_limited(
@@ -3826,7 +3911,7 @@ fn prepare_dfs_metadata_journal_target_publish(
             let commands = batches
                 .into_iter()
                 .map(|batch| {
-                    dfs_metadata_journal_batch_command(
+                    dfs_metadata_durable_journal_batch_command(
                         local_node_id,
                         &target_node_id,
                         &file_system_id,
@@ -4759,7 +4844,7 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
                     outcomes.push(DfsMetadataJournalReplicationOutcome::Applied {
                         target_node_id: target_node_id.clone(),
                         shard_id: shard_id.clone(),
-                        entries: command.batch.entries.len(),
+                        entries: dfs_metadata_journal_batch_command_entry_count(&command),
                         next_after_sequence,
                     });
                 }
@@ -4948,6 +5033,7 @@ mod concurrent_target_publish_tests {
                 verify_prefix_only: false,
                 prefix_probe: None,
                 authority_probe: None,
+                durable_replication: None,
                 batch: DfsMetadataJournalBatch {
                     shard_id,
                     entries: Vec::new(),
@@ -5448,7 +5534,7 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
                     outcomes.push(DfsMetadataJournalReplicationOutcome::Applied {
                         target_node_id: target_node_id.clone(),
                         shard_id: shard_id.clone(),
-                        entries: command.batch.entries.len(),
+                        entries: dfs_metadata_journal_batch_command_entry_count(&command),
                         next_after_sequence,
                     });
                 }
@@ -5900,25 +5986,204 @@ pub async fn publish_dfs_metadata_journal_with_async_host_and_execution_exclusio
     .await
 }
 
+pub(crate) fn validate_durable_metadata_journal_frames(
+    command: &DfsMetadataJournalBatchCommand,
+) -> Result<(), String> {
+    if let Some(replication) = command.durable_replication.as_ref() {
+        if command.authority_probe.is_some()
+            || command.verify_prefix_only
+            || command.prefix_probe.is_some()
+            || !command.batch.entries.is_empty()
+            || replication.confirmation_id.is_empty()
+            || replication.journal_frames.is_empty()
+        {
+            return Err(
+                "ordinary durable metadata replication requires one exact-frame carrier and an empty legacy batch"
+                    .to_string(),
+            );
+        }
+        return validate_durable_metadata_journal_frame_order(
+            "ordinary durable metadata replication",
+            &replication.journal_frames,
+            command.batch.next_after_sequence,
+        );
+    }
+    let Some(probe) = command.authority_probe.as_ref() else {
+        return Ok(());
+    };
+    if !probe.durable_journal_ack {
+        return if probe.journal_frames.is_empty() {
+            Ok(())
+        } else {
+            Err("legacy metadata authority probe cannot carry exact journal frames".to_string())
+        };
+    }
+    if !command.batch.entries.is_empty() || probe.journal_frames.is_empty() {
+        return Err(
+            "durable metadata authority ingest requires exact frames and an empty legacy batch"
+                .to_string(),
+        );
+    }
+    if !probe.prepared_prefix.as_ref().is_some_and(|prefix| {
+        prefix.is_well_formed() && prefix.journal_sequence == command.batch.next_after_sequence
+    }) {
+        return Err(
+            "durable metadata authority ingest requires a well-formed exact target prefix"
+                .to_string(),
+        );
+    }
+    validate_durable_metadata_journal_frame_order(
+        "durable metadata authority",
+        &probe.journal_frames,
+        command.batch.next_after_sequence,
+    )
+}
+
+fn validate_durable_metadata_journal_frame_order(
+    carrier: &str,
+    frames: &[DfsMetadataJournalFrameRecord],
+    next_after_sequence: u64,
+) -> Result<(), String> {
+    let mut previous_sequence = None;
+    for frame in frames {
+        if previous_sequence.is_some_and(|previous| frame.sequence <= previous) {
+            return Err(format!(
+                "{carrier} frames are not strictly sequence ordered"
+            ));
+        }
+        previous_sequence = Some(frame.sequence);
+    }
+    if previous_sequence != Some(next_after_sequence) {
+        return Err(format!(
+            "{carrier} frames end at {:?}, not requested sequence {}",
+            previous_sequence, next_after_sequence
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod durable_metadata_journal_frame_validation_tests {
+    use super::*;
+
+    #[test]
+    fn durable_authority_without_prepared_prefix_is_rejected_before_ingest() {
+        let primary = NodeId::from_legacy_named("node_missing_durable_prefix_primary")
+            .expect("primary node id");
+        let replica = NodeId::from_legacy_named("node_missing_durable_prefix_replica")
+            .expect("replica node id");
+        let file_system_id = sifs_file_system_id();
+        let shard_id = DfsMetadataShardId::new("root");
+        let command = DfsMetadataJournalBatchCommand {
+            request_id: "missing-durable-authority-prefix".to_string(),
+            source_node_id: Some(primary.clone()),
+            file_system_id: Some(file_system_id.clone()),
+            authority_epoch: Some(3),
+            verify_prefix_only: false,
+            prefix_probe: None,
+            authority_probe: Some(crate::DfsMetadataAuthorityProbe {
+                probe_id: "missing-durable-authority-prefix-probe".to_string(),
+                expected_shard: DfsMetadataShardConfig {
+                    file_system_id: file_system_id.clone(),
+                    shard_id: shard_id.0.clone(),
+                    primary_node_id: primary,
+                    replica_node_ids: vec![replica],
+                    epoch: 3,
+                    assignment: crate::DfsMetadataShardAssignment::Root,
+                    namespace_prepare_codec: Default::default(),
+                    default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+                },
+                operation: crate::DfsMetadataAuthorityOperation::NamespaceMutation {
+                    operation_id: "missing-durable-authority-prefix-operation".to_string(),
+                    file_system_id,
+                    prepare_sequence: 1,
+                    payload_digest: "blake3:missing-durable-authority-prefix".to_string(),
+                },
+                durable_journal_ack: true,
+                journal_frames: vec![DfsMetadataJournalFrameRecord {
+                    sequence: 1,
+                    exact_bytes: bytes::Bytes::from_static(b"malformed-frame-is-not-decoded"),
+                }],
+                prepared_prefix: None,
+            }),
+            durable_replication: None,
+            batch: DfsMetadataJournalBatch {
+                shard_id,
+                entries: Vec::new(),
+                next_after_sequence: 1,
+            },
+        };
+
+        let error = validate_durable_metadata_journal_frames(&command)
+            .expect_err("missing durable authority prefix must be rejected");
+        assert!(error.contains("well-formed exact target prefix"));
+    }
+}
+
+pub(crate) fn persist_durable_metadata_replication_ack(
+    backend: &mut dyn DfsMetadataBackend,
+    command: &DfsMetadataJournalBatchCommand,
+    apply_report: &DfsMetadataReplicaApplyReport,
+) -> Result<Option<String>, String> {
+    let Some(replication) = command.durable_replication.as_ref() else {
+        return Ok(None);
+    };
+    let durable_prefix = apply_report
+        .durable_prefix_proof()
+        .filter(|proof| {
+            proof.is_well_formed() && proof.journal_sequence == command.batch.next_after_sequence
+        })
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "ordinary durable metadata replication did not establish shard {} prefix {}",
+                command.batch.shard_id.0, command.batch.next_after_sequence
+            )
+        })?;
+    backend
+        .put_metadata_prefix_ack_floor(&crate::DfsMetadataPrefixAckFloor {
+            shard_id: command.batch.shard_id.clone(),
+            journal_sequence: command.batch.next_after_sequence,
+            state_fingerprint: String::new(),
+            durable_prefix_proof: Some(durable_prefix),
+        })
+        .map_err(|error| {
+            format!(
+                "persist ordinary metadata replication prefix floor for shard {} sequence {}: {error}",
+                command.batch.shard_id.0, command.batch.next_after_sequence
+            )
+        })?;
+    Ok(Some(replication.confirmation_id.clone()))
+}
+
 pub fn process_dfs_metadata_journal_batch(
     backend: &mut dyn DfsMetadataBackend,
     context: Option<&DfsMetadataReplicaShardContext>,
     command: DfsMetadataJournalBatchCommand,
 ) -> DfsMetadataJournalBatchResponse {
+    if let Err(reason) = validate_durable_metadata_journal_frames(&command) {
+        return dfs_metadata_journal_rejection_response(&command, reason);
+    }
     if let Some(response) = validate_dfs_metadata_journal_batch_source(context, &command) {
         return response;
     }
     let shard_id = command.batch.shard_id.clone();
     let next_after_sequence = command.batch.next_after_sequence;
     if command.verify_prefix_only {
-        return match verify_dfs_metadata_journal_prefix(backend, &command) {
-            Ok(()) => DfsMetadataJournalBatchResponse {
+        let context = context.expect("validated metadata prefix probe has a shard context");
+        let source_node_id = command
+            .source_node_id
+            .as_ref()
+            .expect("validated metadata prefix probe has a source node");
+        return match verify_dfs_metadata_journal_prefix(backend, context, source_node_id, &command)
+        {
+            Ok(verified_primary_handoff_id) => DfsMetadataJournalBatchResponse {
                 request_id: command.request_id,
                 shard_id,
                 next_after_sequence,
                 applied_entries: 0,
                 verified_prefix_only: true,
-                verified_authority_probe_id: None,
+                verified_authority_probe_id: verified_primary_handoff_id,
                 result: DfsMetadataJournalBatchResult::Applied,
             },
             Err(reason) => DfsMetadataJournalBatchResponse {
@@ -5932,7 +6197,10 @@ pub fn process_dfs_metadata_journal_batch(
             },
         };
     }
-    if command.authority_probe.is_some()
+    if command
+        .authority_probe
+        .as_ref()
+        .is_some_and(|probe| !probe.durable_journal_ack)
         && let Err(reason) = validate_contiguous_metadata_authority_batch(backend, &command.batch)
     {
         return dfs_metadata_journal_rejection_response(&command, reason);
@@ -5944,7 +6212,31 @@ pub fn process_dfs_metadata_journal_batch(
         context.shard.primary_node_id.clone(),
         context.shard.epoch,
     );
-    let apply_result = if command.authority_probe.is_some() {
+    let apply_result = if let Some(replication) = command.durable_replication.as_ref() {
+        backend.persist_journal_frames_with_replica_permit_report(
+            &permit,
+            &command.batch,
+            &replication.journal_frames,
+        )
+    } else if command
+        .authority_probe
+        .as_ref()
+        .is_some_and(|probe| probe.durable_journal_ack)
+    {
+        let probe = command
+            .authority_probe
+            .as_ref()
+            .expect("durable authority probe checked above");
+        backend.persist_authority_journal_frames_with_replica_permit_report(
+            &permit,
+            &command.batch,
+            &probe.journal_frames,
+            probe
+                .prepared_prefix
+                .as_ref()
+                .expect("durable authority prefix validated above"),
+        )
+    } else if command.authority_probe.is_some() {
         backend.apply_journal_batch_with_replica_permit_report(&permit, &command.batch)
     } else {
         backend
@@ -5954,8 +6246,16 @@ pub fn process_dfs_metadata_journal_batch(
     match apply_result {
         Ok(apply_report) => {
             let applied_entries = apply_report.applied_entries();
-            let verified_authority_probe_id = if let Some(probe) = command.authority_probe.as_ref()
-            {
+            let verified_durable_replication_id =
+                match persist_durable_metadata_replication_ack(backend, &command, &apply_report) {
+                    Ok(confirmation_id) => confirmation_id,
+                    Err(reason) => {
+                        return dfs_metadata_journal_rejection_response(&command, reason);
+                    }
+                };
+            let verified_authority_probe_id = if verified_durable_replication_id.is_some() {
+                verified_durable_replication_id
+            } else if let Some(probe) = command.authority_probe.as_ref() {
                 let confirmation_id =
                     match crate::service_replica::verify_persisted_metadata_authority_probe_after_apply(
                         backend,
@@ -5975,6 +6275,7 @@ pub fn process_dfs_metadata_journal_batch(
                     backend.put_metadata_authority_ack_floor(&crate::DfsMetadataAuthorityAckFloor {
                         shard_id: command.batch.shard_id.clone(),
                         journal_sequence: command.batch.next_after_sequence,
+                        durable_prefix_proof: apply_report.durable_prefix_proof().cloned(),
                     })
                 {
                     return dfs_metadata_journal_rejection_response(
@@ -6072,10 +6373,12 @@ fn validate_contiguous_metadata_authority_batch(
     Ok(())
 }
 
-fn verify_dfs_metadata_journal_prefix(
+pub(crate) fn verify_dfs_metadata_journal_prefix(
     backend: &mut dyn DfsMetadataBackend,
+    context: &DfsMetadataReplicaShardContext,
+    source_node_id: &NodeId,
     command: &DfsMetadataJournalBatchCommand,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let batch = &command.batch;
     let Some(probe) = command.prefix_probe.as_ref() else {
         return Err(
@@ -6098,6 +6401,8 @@ fn verify_dfs_metadata_journal_prefix(
             batch.shard_id.0, batch.next_after_sequence
         ));
     }
+    let verified_primary_handoff_id =
+        validated_pending_primary_handoff_prefix_probe_id(context, source_node_id, probe)?;
     backend
         .refresh_metadata_shard_durable_view(&probe.shard_id)
         .map_err(|error| {
@@ -6123,11 +6428,64 @@ fn verify_dfs_metadata_journal_prefix(
             batch.shard_id.0, probe.journal_sequence
         ));
     }
+    let durable_prefix_proof = backend
+        .metadata_prefix_proof(&probe.shard_id)
+        .map_err(|error| {
+            format!(
+                "read durable metadata prefix for probe shard {} sequence {}: {error}",
+                batch.shard_id.0, probe.journal_sequence
+            )
+        })?
+        .filter(|proof| {
+            proof.is_well_formed() && proof.journal_sequence == probe.journal_sequence
+        })
+        .ok_or_else(|| {
+            format!(
+                "metadata journal prefix probe has no exact durable prefix for shard {} sequence {}",
+                batch.shard_id.0, probe.journal_sequence
+            )
+        })?;
+    if let Some(primary_handoff_id) = verified_primary_handoff_id.as_deref() {
+        let handoff = context
+            .pending_membership_handoff
+            .as_ref()
+            .expect("validated primary handoff prefix probe has a pending handoff");
+        let freeze = backend
+            .freeze_metadata_shard_for_membership_handoff(
+                &probe.shard_id,
+                primary_handoff_id,
+                handoff.retiring_shard.epoch,
+            )
+            .map_err(|error| {
+                format!(
+                    "persist metadata primary-handoff {primary_handoff_id} promoted-replica marker for shard {}: {error}",
+                    probe.shard_id.0
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "metadata primary-handoff {primary_handoff_id} could not persist its promoted-replica marker for shard {}",
+                    probe.shard_id.0
+                )
+            })?;
+        if freeze.handoff_id != primary_handoff_id
+            || freeze.retiring_epoch != handoff.retiring_shard.epoch
+            || freeze.activated_epoch.is_some()
+            || freeze.journal_sequence != probe.journal_sequence
+            || freeze.state_fingerprint != probe.state_fingerprint
+        {
+            return Err(format!(
+                "metadata primary-handoff {primary_handoff_id} persisted a non-exact promoted-replica marker for shard {}",
+                probe.shard_id.0
+            ));
+        }
+    }
     backend
         .put_metadata_prefix_ack_floor(&crate::DfsMetadataPrefixAckFloor {
             shard_id: probe.shard_id.clone(),
             journal_sequence: probe.journal_sequence,
             state_fingerprint: probe.state_fingerprint.clone(),
+            durable_prefix_proof: Some(durable_prefix_proof),
         })
         .map_err(|error| {
             format!(
@@ -6135,7 +6493,7 @@ fn verify_dfs_metadata_journal_prefix(
                 batch.shard_id.0, probe.journal_sequence
             )
         })?;
-    Ok(())
+    Ok(verified_primary_handoff_id)
 }
 
 pub fn cluster_dfs_metadata_replica_shard_context(
@@ -6255,6 +6613,76 @@ pub(crate) fn process_cluster_dfs_metadata_journal_batch_with_context(
         context.as_ref(),
         command,
     ))
+}
+
+pub(crate) fn materialize_cluster_dfs_metadata_replica_journal(
+    data_dir: &SinomoDataDir,
+    shard_id: &DfsMetadataShardId,
+) -> Result<usize, DfsError> {
+    let backend = match cached_cluster_metadata_backend(data_dir, shard_id) {
+        Ok(backend) => backend,
+        Err(CachedClusterMetadataBackendError::CachePoisoned) => {
+            return Err(DfsError::Metadata {
+                message: "cluster metadata backend cache lock is poisoned".to_string(),
+            });
+        }
+        Err(CachedClusterMetadataBackendError::Open(error)) => return Err(error.into()),
+    };
+    let mut backend = backend.lock().map_err(|_| DfsError::Metadata {
+        message: format!(
+            "cluster metadata backend lock is poisoned for shard {}",
+            shard_id.0
+        ),
+    })?;
+    backend
+        .materialize_pending_replica_journal()
+        .map_err(Into::into)
+}
+
+pub(crate) fn schedule_cluster_dfs_metadata_replica_materialization_on_runtime(
+    runtime: tokio::runtime::Handle,
+    data_dir: SinomoDataDir,
+    shard_id: DfsMetadataShardId,
+) {
+    let scheduler = cluster_dfs_metadata_materialization_scheduler(&data_dir, &shard_id);
+    let report_shard_id = shard_id.clone();
+    let error_shard_id = shard_id.clone();
+    schedule_dfs_metadata_publish_async_on_runtime(
+        scheduler,
+        runtime,
+        DfsMetadataPublishScheduleOptions {
+            max_retry_rounds: 3,
+            retry_delay: Duration::from_millis(50),
+            max_retry_delay: Duration::from_secs(1),
+        },
+        move || {
+            let data_dir = data_dir.clone();
+            let shard_id = shard_id.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    materialize_cluster_dfs_metadata_replica_journal(&data_dir, &shard_id)
+                })
+                .await
+                .map_err(|error| format!("DFS replica materialization task failed: {error}"))?
+                .map(|_| DfsMetadataJournalReplicationReport {
+                    outcomes: Vec::new(),
+                })
+                .map_err(|error| error.to_string())
+            }
+        },
+        move |_| {
+            tracing::trace!(
+                shard_id = %report_shard_id.0,
+                "DFS service materialized a durably acknowledged replica journal"
+            );
+        },
+        move |error| {
+            tracing::warn!(
+                shard_id = %error_shard_id.0,
+                "DFS service could not materialize a durably acknowledged replica journal: {error}"
+            );
+        },
+    );
 }
 
 pub fn process_dfs_metadata_snapshot_install(
@@ -6385,13 +6813,22 @@ pub(crate) fn validate_dfs_metadata_snapshot_install_state(
             )));
         }
     }
-    if let Some(authority_floor) = backend.metadata_authority_ack_floor(&command.shard_id)?
-        && command.next_after_sequence <= authority_floor.journal_sequence
-    {
-        return Ok(Some(format!(
-            "metadata snapshot sequence {} would replace shard {} at or behind locally acknowledged authority operation {}",
-            command.next_after_sequence, command.shard_id.0, authority_floor.journal_sequence
-        )));
+    if let Some(authority_floor) = backend.metadata_authority_ack_floor(&command.shard_id)? {
+        if command.next_after_sequence < authority_floor.journal_sequence {
+            return Ok(Some(format!(
+                "metadata snapshot sequence {} would replace shard {} behind locally acknowledged authority operation {}",
+                command.next_after_sequence, command.shard_id.0, authority_floor.journal_sequence
+            )));
+        }
+        if command.next_after_sequence == authority_floor.journal_sequence
+            && authority_floor.durable_prefix_proof.as_ref()
+                != command.snapshot.prefix_proof.as_ref()
+        {
+            return Ok(Some(format!(
+                "metadata snapshot prefix conflicts with locally acknowledged authority operation for shard {} sequence {}",
+                command.shard_id.0, command.next_after_sequence
+            )));
+        }
     }
     let Some(floor) = backend.metadata_prefix_ack_floor(&command.shard_id)? else {
         return Ok(None);
@@ -6403,22 +6840,32 @@ pub(crate) fn validate_dfs_metadata_snapshot_install_state(
         )));
     }
     if command.next_after_sequence == floor.journal_sequence {
-        let matches = crate::metadata_records::dfs_metadata_table_snapshot_matches_checkpoint(
-            &command.snapshot,
-            command.next_after_sequence,
-            &floor.state_fingerprint,
-        )
-        .map_err(|source| DfsError::Serialization {
-            message: format!(
-                "encode metadata snapshot local acknowledgement check for {}: {source}",
-                command.shard_id.0
-            ),
-        })?;
-        if !matches {
+        if let Some(durable_prefix) = floor.durable_prefix_proof.as_ref()
+            && command.snapshot.prefix_proof.as_ref() != Some(durable_prefix)
+        {
             return Ok(Some(format!(
-                "metadata snapshot state does not match locally acknowledged checkpoint for shard {} sequence {}",
+                "metadata snapshot journal prefix conflicts with locally acknowledged checkpoint for shard {} sequence {}",
                 command.shard_id.0, command.next_after_sequence
             )));
+        }
+        if !floor.state_fingerprint.is_empty() {
+            let matches = crate::metadata_records::dfs_metadata_table_snapshot_matches_checkpoint(
+                &command.snapshot,
+                command.next_after_sequence,
+                &floor.state_fingerprint,
+            )
+            .map_err(|source| DfsError::Serialization {
+                message: format!(
+                    "encode metadata snapshot local acknowledgement check for {}: {source}",
+                    command.shard_id.0
+                ),
+            })?;
+            if !matches {
+                return Ok(Some(format!(
+                    "metadata snapshot state does not match locally acknowledged checkpoint for shard {} sequence {}",
+                    command.shard_id.0, command.next_after_sequence
+                )));
+            }
         }
     }
     Ok(None)
@@ -8521,9 +8968,13 @@ fn migrate_default_sifs_metadata_on_active_primary_shards(
         };
         let journal_sequence = backend.journal_last_sequence();
         let authority_floor = backend.metadata_authority_ack_floor(&shard_id)?;
+        let prefix_floor = backend.metadata_prefix_ack_floor(&shard_id)?;
         if local_replica_assigned
             && (journal_sequence == 0
                 || authority_floor
+                    .as_ref()
+                    .is_some_and(|floor| floor.journal_sequence >= journal_sequence)
+                || prefix_floor
                     .as_ref()
                     .is_some_and(|floor| floor.journal_sequence >= journal_sequence))
         {
@@ -8925,10 +9376,12 @@ pub fn validate_dfs_metadata_journal_batch_source(
             ),
         ));
     }
-    if let Some(probe) = command.authority_probe.as_ref()
-        && (command.verify_prefix_only
+    if let Some(probe) = command.authority_probe.as_ref() {
+        let has_authority_payload = !command.batch.entries.is_empty()
+            || (probe.durable_journal_ack && !probe.journal_frames.is_empty());
+        if command.verify_prefix_only
             || command.prefix_probe.is_some()
-            || command.batch.entries.is_empty()
+            || !has_authority_payload
             || probe.probe_id.is_empty()
             || probe.expected_shard != context.shard
             || !crate::service_replica::metadata_authority_operation_is_well_formed_for_shard(
@@ -8937,15 +9390,16 @@ pub fn validate_dfs_metadata_journal_batch_source(
             )
             || crate::service_replica::metadata_authority_operation_prepare_sequence(
                 &probe.operation,
-            ) != command.batch.next_after_sequence)
-    {
-        return Some(dfs_metadata_journal_rejection_response(
-            command,
-            format!(
-                "metadata authority probe does not match the exact committed assignment for shard {} epoch {}",
-                context.shard.shard_id, context.shard.epoch
-            ),
-        ));
+            ) != command.batch.next_after_sequence
+        {
+            return Some(dfs_metadata_journal_rejection_response(
+                command,
+                format!(
+                    "metadata authority probe does not match the exact committed assignment for shard {} epoch {}",
+                    context.shard.shard_id, context.shard.epoch
+                ),
+            ));
+        }
     }
     if command.verify_prefix_only
         && command.prefix_probe.as_ref().is_none_or(|probe| {
@@ -9083,11 +9537,6 @@ pub(crate) fn validated_pending_primary_handoff_snapshot_id(
             "metadata primary-handoff snapshot {primary_handoff_id} has no pending handoff"
         ));
     };
-    let topology_preserving_replicas =
-        crate::control_plane::topology_preserving_metadata_shard_replicas(
-            &handoff.retiring_shard,
-            &handoff.desired_shard.primary_node_id,
-        );
     let exact_fence = if let Some(fence) = handoff.retiring_primary_fence.as_ref() {
         fence.handoff_id == primary_handoff_id
             && fence.primary_node_id == command.source_node_id
@@ -9106,9 +9555,74 @@ pub(crate) fn validated_pending_primary_handoff_snapshot_id(
     } else {
         false
     };
+    validated_pending_primary_handoff_role_rotation_id(
+        context,
+        primary_handoff_id,
+        &command.source_node_id,
+        command.file_system_id.as_ref(),
+        command.authority_epoch,
+        exact_fence,
+        "snapshot",
+    )
+    .map(Some)
+}
+
+fn validated_pending_primary_handoff_prefix_probe_id(
+    context: &DfsMetadataReplicaShardContext,
+    source_node_id: &NodeId,
+    probe: &DfsMetadataPrefixProbe,
+) -> Result<Option<String>, String> {
+    let Some(primary_handoff_id) = probe.primary_handoff_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(handoff) = context.pending_membership_handoff.as_ref() else {
+        return Err(format!(
+            "metadata primary-handoff prefix probe {primary_handoff_id} has no pending handoff"
+        ));
+    };
+    let exact_fence = handoff
+        .retiring_primary_fence
+        .as_ref()
+        .is_some_and(|fence| {
+            fence.handoff_id == primary_handoff_id
+                && fence.primary_node_id == *source_node_id
+                && fence.journal_sequence == probe.journal_sequence
+                && fence.state_fingerprint == probe.state_fingerprint
+        });
+    validated_pending_primary_handoff_role_rotation_id(
+        context,
+        primary_handoff_id,
+        source_node_id,
+        probe.file_system_id.as_ref(),
+        probe.authority_epoch,
+        exact_fence,
+        "prefix probe",
+    )
+    .map(Some)
+}
+
+fn validated_pending_primary_handoff_role_rotation_id(
+    context: &DfsMetadataReplicaShardContext,
+    primary_handoff_id: &str,
+    source_node_id: &NodeId,
+    file_system_id: Option<&DfsFileSystemId>,
+    authority_epoch: Option<u64>,
+    exact_fence: bool,
+    operation: &str,
+) -> Result<String, String> {
+    let Some(handoff) = context.pending_membership_handoff.as_ref() else {
+        return Err(format!(
+            "metadata primary-handoff {operation} {primary_handoff_id} has no pending handoff"
+        ));
+    };
+    let topology_preserving_replicas =
+        crate::control_plane::topology_preserving_metadata_shard_replicas(
+            &handoff.retiring_shard,
+            &handoff.desired_shard.primary_node_id,
+        );
     let exact_role_rotation = handoff.handoff_id == primary_handoff_id
         && handoff.retiring_shard == context.shard
-        && handoff.retiring_shard.primary_node_id == command.source_node_id
+        && handoff.retiring_shard.primary_node_id == *source_node_id
         && handoff
             .retiring_shard
             .replica_node_ids
@@ -9116,16 +9630,16 @@ pub(crate) fn validated_pending_primary_handoff_snapshot_id(
         && handoff.desired_shard.primary_node_id == context.local_node_id
         && handoff.desired_shard.epoch == handoff.retiring_shard.epoch.saturating_add(1)
         && topology_preserving_replicas == Some(handoff.desired_shard.replica_node_ids.clone())
-        && command.file_system_id.as_ref() == Some(&handoff.retiring_shard.file_system_id)
-        && command.authority_epoch == Some(handoff.retiring_shard.epoch)
+        && file_system_id == Some(&handoff.retiring_shard.file_system_id)
+        && authority_epoch == Some(handoff.retiring_shard.epoch)
         && exact_fence;
     if !exact_role_rotation {
         return Err(format!(
-            "metadata primary-handoff snapshot {primary_handoff_id} is not bound to the exact fenced role rotation for shard {}",
-            command.shard_id.0
+            "metadata primary-handoff {operation} {primary_handoff_id} is not bound to the exact fenced role rotation for shard {}",
+            context.shard.shard_id
         ));
     }
-    Ok(Some(primary_handoff_id.to_string()))
+    Ok(primary_handoff_id.to_string())
 }
 
 fn metadata_membership_handoff_allows_local_target(
@@ -9202,6 +9716,7 @@ fn dfs_metadata_caught_up_probe_command(
             primary_handoff_id: None,
         }),
         authority_probe: None,
+        durable_replication: None,
         batch: DfsMetadataJournalBatch {
             shard_id: shard_id.clone(),
             entries: Vec::new(),
@@ -9210,6 +9725,7 @@ fn dfs_metadata_caught_up_probe_command(
     }
 }
 
+#[cfg(test)]
 fn dfs_metadata_journal_batch_command(
     local_node_id: &NodeId,
     target_node_id: &NodeId,
@@ -9229,7 +9745,39 @@ fn dfs_metadata_journal_batch_command(
         verify_prefix_only: false,
         prefix_probe: None,
         authority_probe: None,
+        durable_replication: None,
         batch,
+    }
+}
+
+pub(crate) fn dfs_metadata_durable_journal_batch_command(
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+    file_system_id: &DfsFileSystemId,
+    authority_epoch: u64,
+    batch: DfsPreparedMetadataJournalFrameBatch,
+) -> DfsMetadataJournalBatchCommand {
+    let confirmation_id = sinomo_core::Id::generate().to_string();
+    DfsMetadataJournalBatchCommand {
+        request_id: format!(
+            "dfs_meta_{}_{}_{}",
+            local_node_id, target_node_id, batch.next_after_sequence
+        ),
+        source_node_id: Some(local_node_id.clone()),
+        file_system_id: Some(file_system_id.clone()),
+        authority_epoch: Some(authority_epoch),
+        verify_prefix_only: false,
+        prefix_probe: None,
+        authority_probe: None,
+        durable_replication: Some(DfsMetadataDurableReplication {
+            confirmation_id,
+            journal_frames: batch.journal_frames,
+        }),
+        batch: DfsMetadataJournalBatch {
+            shard_id: batch.shard_id,
+            entries: Vec::new(),
+            next_after_sequence: batch.next_after_sequence,
+        },
     }
 }
 
@@ -9317,7 +9865,7 @@ fn handle_dfs_metadata_journal_batch_response(
             outcomes.push(DfsMetadataJournalReplicationOutcome::Applied {
                 target_node_id: target_node_id.clone(),
                 shard_id: shard_id.clone(),
-                entries: command.batch.entries.len(),
+                entries: dfs_metadata_journal_batch_command_entry_count(command),
                 next_after_sequence,
             });
             Ok(DfsMetadataJournalReplicationStep::Continue {
@@ -9500,7 +10048,8 @@ pub fn replicate_dfs_metadata_shard_to_target(
             break;
         }
 
-        let command = dfs_metadata_journal_batch_command(
+        let batch = prepare_dfs_metadata_journal_frame_batch(backend, &batch)?;
+        let command = dfs_metadata_durable_journal_batch_command(
             local_node_id,
             target_node_id,
             file_system_id,
@@ -12407,6 +12956,7 @@ mod cursor_update_tests {
                 verify_prefix_only: false,
                 prefix_probe: None,
                 authority_probe: None,
+                durable_replication: None,
                 batch: DfsMetadataJournalBatch {
                     shard_id: shard_id.clone(),
                     entries: Vec::new(),

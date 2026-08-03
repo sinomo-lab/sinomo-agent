@@ -19,8 +19,8 @@ use crate::metadata_keys::{
     dentry_key, intent_key, normalize_path, write_intent_scan_key, write_intent_target_key,
 };
 use crate::metadata_namespace_transaction::{
-    materialize_namespace_transaction_table_state,
-    preapply_namespace_transaction_table_state_with_rollback,
+    materialize_committed_namespace_transaction_table_state,
+    preapply_committed_namespace_transaction_table_state_with_rollback,
 };
 use crate::metadata_object_index::object_index_table_ops_with_previous;
 use crate::metadata_records::{
@@ -418,10 +418,12 @@ impl DfsMetadataTables {
                 operation_id,
                 operation_digest,
                 owner_epoch,
+                retained_at,
             } => self.materialize_committed_namespace_prepare(
                 &operation_id,
                 &operation_digest,
                 owner_epoch,
+                retained_at,
             ),
             op => {
                 #[cfg(test)]
@@ -489,6 +491,7 @@ impl DfsMetadataTables {
             operation_id,
             operation_digest,
             owner_epoch,
+            ..
         } = op
         {
             self.validated_committed_namespace_prepare(
@@ -519,6 +522,7 @@ impl DfsMetadataTables {
             operation_id,
             operation_digest,
             owner_epoch,
+            retained_at,
         } = op
         else {
             self.apply_with_rollback(op, rollback);
@@ -532,6 +536,13 @@ impl DfsMetadataTables {
         );
         let mut prepare =
             self.committed_namespace_prepare(&operation_id, &operation_digest, owner_epoch)?;
+        prepare.status = DfsNamespacePrepareStatus::Committed;
+        let retained_at = retained_at.unwrap_or(prepare.transaction.created_at);
+        let transaction_receipt =
+            DfsNamespaceTransactionReceipt::from_transaction(&prepare.transaction, retained_at)
+                .expect("namespace transaction JSON identity serialization is infallible");
+        let prepare_receipt = DfsNamespacePrepareReceipt::from_prepare(&prepare, retained_at)
+            .expect("a committed prepare always produces a terminal receipt");
         for receipt in &prepare.content_receipts {
             self.apply_with_rollback(
                 DfsMetadataTableOp::PutReceipt {
@@ -540,15 +551,15 @@ impl DfsMetadataTables {
                 rollback,
             );
         }
-        preapply_namespace_transaction_table_state_with_rollback(
+        preapply_committed_namespace_transaction_table_state_with_rollback(
             self,
             &prepare.transaction,
+            transaction_receipt,
             rollback,
         );
-        prepare.status = DfsNamespacePrepareStatus::Committed;
         self.apply_with_rollback(
-            DfsMetadataTableOp::PutNamespacePrepare {
-                prepare: prepare.clone(),
+            DfsMetadataTableOp::PutNamespacePrepareReceipt {
+                receipt: prepare_receipt,
             },
             rollback,
         );
@@ -630,6 +641,7 @@ impl DfsMetadataTables {
         operation_id: &str,
         operation_digest: &str,
         owner_epoch: u64,
+        retained_at: Option<OffsetDateTime>,
     ) -> Result<()> {
         #[cfg(test)]
         NAMESPACE_COMMIT_DIRECT_MATERIALIZATIONS.set(
@@ -637,19 +649,34 @@ impl DfsMetadataTables {
                 .get()
                 .saturating_add(1),
         );
-        let mut prepare =
-            self.committed_namespace_prepare(operation_id, operation_digest, owner_epoch)?;
+        self.validated_committed_namespace_prepare(operation_id, operation_digest, owner_epoch)?;
+        // This path runs only after the compact table marker is durable. Take
+        // ownership of the hidden body, materialize its canonical state, then
+        // retain only compact exact-retry evidence.
+        let mut prepare = self
+            .namespace_prepares
+            .remove(operation_id)
+            .expect("validated namespace prepare must remain present");
+        self.unindex_namespace_prepare_footprint(&prepare);
+        self.unindex_namespace_prepare_request(&prepare);
         for receipt in &prepare.content_receipts {
             self.apply(DfsMetadataTableOp::PutReceipt {
                 receipt: receipt.clone(),
             });
         }
-        materialize_namespace_transaction_table_state(self, &prepare.transaction);
         prepare.status = DfsNamespacePrepareStatus::Committed;
-        self.apply(DfsMetadataTableOp::PutNamespacePrepare {
-            prepare: prepare.clone(),
-        });
-        if let Some(request) = prepare.completed_request {
+        let retained_at = retained_at.unwrap_or(prepare.transaction.created_at);
+        let transaction_receipt =
+            DfsNamespaceTransactionReceipt::from_transaction(&prepare.transaction, retained_at)
+                .expect("namespace transaction JSON identity serialization is infallible");
+        let prepare_receipt = DfsNamespacePrepareReceipt::from_prepare(&prepare, retained_at)
+            .expect("a committed prepare always produces a terminal receipt");
+        materialize_committed_namespace_transaction_table_state(
+            self,
+            &prepare.transaction,
+            transaction_receipt,
+        );
+        let request_op = if let Some(request) = prepare.completed_request.take() {
             let key = (
                 request.requester_node_id.clone(),
                 request.request_id.clone(),
@@ -661,9 +688,11 @@ impl DfsMetadataTables {
                 .get(&key)
                 .is_some_and(|receipt| receipt.matches_completed_request(&request));
             if !materialized {
-                self.apply(DfsMetadataTableOp::PutNamespaceRequest { request });
+                Some(DfsMetadataTableOp::PutNamespaceRequest { request })
+            } else {
+                None
             }
-        } else if let Some(completion) = prepare.completed_request_completion {
+        } else if let Some(completion) = prepare.completed_request_completion.take() {
             let key = completion.request_key();
             let materialized = self
                 .namespace_requests
@@ -674,10 +703,20 @@ impl DfsMetadataTables {
                     .get(&key)
                     .is_some_and(|receipt| receipt.matches_completion(&completion));
             if !materialized {
-                self.apply(DfsMetadataTableOp::PutNamespaceRequestReceipt {
+                Some(DfsMetadataTableOp::PutNamespaceRequestReceipt {
                     receipt: DfsNamespaceRequestReceipt::from_completion(&completion),
-                });
+                })
+            } else {
+                None
             }
+        } else {
+            None
+        };
+        self.apply(DfsMetadataTableOp::PutNamespacePrepareReceipt {
+            receipt: prepare_receipt,
+        });
+        if let Some(request_op) = request_op {
+            self.apply(request_op);
         }
         Ok(())
     }
@@ -969,18 +1008,32 @@ impl DfsMetadataTables {
         if prepare.status != DfsNamespacePrepareStatus::Prepared {
             return;
         }
-        let (object_ids, paths) = namespace_prepare_footprint(prepare).into_parts();
-        for object_id in object_ids {
+        // The payload was shape-validated before this Prepared record entered
+        // the table. Walk its borrowed keys directly when releasing ownership;
+        // rebuilding an owned footprint here would clone every object ID and
+        // retain another pair of large sets on the foreground commit path.
+        for object_id in prepare
+            .expected_object_versions
+            .iter()
+            .map(|expected| &expected.object_id)
+            .chain(
+                prepare
+                    .transaction
+                    .objects
+                    .iter()
+                    .map(|object| &object.object_id),
+            )
+        {
             let remove_file_system = self
                 .namespace_prepare_object_owners
                 .get_mut(&prepare.file_system_id)
                 .is_some_and(|objects| {
-                    let remove_object = objects.get_mut(&object_id).is_some_and(|owners| {
+                    let remove_object = objects.get_mut(object_id).is_some_and(|owners| {
                         owners.remove(&prepare.operation_id);
                         owners.is_empty()
                     });
                     if remove_object {
-                        objects.remove(&object_id);
+                        objects.remove(object_id);
                     }
                     objects.is_empty()
                 });
@@ -989,7 +1042,18 @@ impl DfsMetadataTables {
                     .remove(&prepare.file_system_id);
             }
         }
-        for path in paths {
+        for path in prepare
+            .expected_path_occupants
+            .iter()
+            .map(|expected| normalize_path(&expected.path))
+            .chain(
+                prepare
+                    .transaction
+                    .objects
+                    .iter()
+                    .map(|object| normalize_path(&object.path)),
+            )
+        {
             let remove_file_system = self
                 .namespace_prepare_path_owners
                 .get_mut(&prepare.file_system_id)
@@ -1026,6 +1090,15 @@ impl DfsMetadataTables {
     }
 
     fn put_namespace_prepare_indexed(&mut self, prepare: DfsNamespacePrepareRecord) {
+        if prepare.status != DfsNamespacePrepareStatus::Prepared {
+            let operation_id = prepare.operation_id.clone();
+            if let Some(previous) = self.namespace_prepares.remove(&operation_id) {
+                self.unindex_namespace_prepare_footprint(&previous);
+                self.unindex_namespace_prepare_request(&previous);
+            }
+            self.namespace_prepares.insert(operation_id, prepare);
+            return;
+        }
         let footprint = namespace_prepare_footprint(&prepare);
         self.put_namespace_prepare_indexed_with_footprint(prepare, footprint);
     }
@@ -1397,11 +1470,13 @@ impl DfsMetadataTables {
                 operation_id,
                 operation_digest,
                 owner_epoch,
+                retained_at,
             } => {
                 self.materialize_committed_namespace_prepare(
                     &operation_id,
                     &operation_digest,
                     owner_epoch,
+                    retained_at,
                 )
                 .expect("compact namespace commit must reference its exact durable prepare");
             }

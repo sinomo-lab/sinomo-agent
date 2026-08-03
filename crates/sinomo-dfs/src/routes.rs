@@ -700,6 +700,7 @@ mod tests {
             verify_prefix_only: false,
             prefix_probe: None,
             authority_probe: None,
+            durable_replication: None,
             batch: DfsMetadataJournalBatch {
                 shard_id: DfsMetadataShardId::new("scope-shard"),
                 entries: Vec::new(),

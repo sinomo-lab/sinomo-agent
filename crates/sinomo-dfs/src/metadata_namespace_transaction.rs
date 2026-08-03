@@ -16,7 +16,8 @@ use crate::metadata_object_index::{
 };
 use crate::metadata_pages::child_objects_for_directory_from_tables;
 use crate::metadata_records::{
-    DfsInodeId, DfsMetadataTableOp, DfsNamespaceTransaction, normalized_version_record,
+    DfsInodeId, DfsMetadataTableOp, DfsNamespaceTransaction, DfsNamespaceTransactionReceipt,
+    normalized_version_record,
 };
 use crate::metadata_tables::{DfsMetadataTableRollback, DfsMetadataTables};
 use crate::{DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata};
@@ -159,6 +160,18 @@ pub(crate) fn validate_namespace_transaction_preconditions(
     tables: &DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
 ) -> Result<()> {
+    if let Some(receipt) = tables
+        .namespace_transaction_receipts
+        .get(&transaction.transaction_id)
+        && !receipt
+            .matches_transaction(transaction)
+            .map_err(|source| MetadataBackendError::Serde(source.to_string()))?
+    {
+        return Err(MetadataBackendError::Serde(format!(
+            "namespace transaction {} reuses transaction id with a different payload",
+            transaction.transaction_id
+        )));
+    }
     validate_advisory_lock_state_preconditions(tables, transaction)?;
     if !transaction
         .objects
@@ -408,44 +421,70 @@ pub(crate) fn preapply_namespace_transaction_table_ops(
 /// derived operations are needed to update the table image and rollback maps,
 /// but collecting a second copy can contain tens of thousands of operations
 /// for a bulk transaction.
-pub(crate) fn preapply_namespace_transaction_table_state_with_rollback(
+pub(crate) fn preapply_committed_namespace_transaction_table_state_with_rollback(
     tables: &mut DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
+    receipt: DfsNamespaceTransactionReceipt,
     rollback: &mut DfsMetadataTableRollback,
 ) {
     let mut table_op_sink = None;
     let mut rollback = Some(rollback);
-    plan_namespace_transaction_table_ops_in_place(
+    plan_namespace_transaction_table_ops_in_place_with_record(
         tables,
         transaction,
+        DfsMetadataTableOp::PutNamespaceTransactionReceipt { receipt },
         &mut table_op_sink,
         &mut rollback,
     );
 }
 
-/// Materialize a transaction directly into an already-authorized table image.
-///
-/// A committed namespace prepare is itself the durable semantic body. Its
-/// materialized table log therefore records one compact commit marker instead
-/// of serializing every derived object/path/inode/version operation again.
-/// Table replay resolves that marker against the preceding durable prepare and
-/// calls this function. The decisions intentionally mirror the normal planner,
-/// but no derived operation vector or rollback clone is needed because the
-/// compact table marker is durable before it is applied to the in-memory view.
-pub(crate) fn materialize_namespace_transaction_table_state(
+#[cfg(test)]
+fn materialize_namespace_transaction_table_state(
     tables: &mut DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
 ) {
+    materialize_namespace_transaction_table_state_with_record(
+        tables,
+        transaction,
+        DfsMetadataTableOp::PutNamespaceTransaction {
+            transaction: transaction.clone(),
+        },
+    );
+}
+
+/// Materialize a committed prepare without retaining its full transaction a
+/// second time. The compact receipt is sufficient for exact retry because the
+/// canonical objects, versions, and indexes are installed by this same table
+/// transition.
+pub(crate) fn materialize_committed_namespace_transaction_table_state(
+    tables: &mut DfsMetadataTables,
+    transaction: &DfsNamespaceTransaction,
+    receipt: DfsNamespaceTransactionReceipt,
+) {
+    materialize_namespace_transaction_table_state_with_record(
+        tables,
+        transaction,
+        DfsMetadataTableOp::PutNamespaceTransactionReceipt { receipt },
+    );
+}
+
+fn materialize_namespace_transaction_table_state_with_record(
+    tables: &mut DfsMetadataTables,
+    transaction: &DfsNamespaceTransaction,
+    transaction_record: DfsMetadataTableOp,
+) {
     if transaction.objects.len() == 1 {
-        for op in plan_single_object_namespace_transaction_table_ops(tables, transaction) {
+        for op in plan_single_object_namespace_transaction_table_ops_with_record(
+            tables,
+            transaction,
+            transaction_record,
+        ) {
             tables.apply(op);
         }
         return;
     }
 
-    tables.apply(DfsMetadataTableOp::PutNamespaceTransaction {
-        transaction: transaction.clone(),
-    });
+    tables.apply(transaction_record);
     for object in transaction
         .objects
         .iter()
@@ -484,8 +523,30 @@ fn plan_namespace_transaction_table_ops_in_place(
     table_ops: &mut Option<&mut Vec<DfsMetadataTableOp>>,
     rollback: &mut Option<&mut DfsMetadataTableRollback>,
 ) {
+    plan_namespace_transaction_table_ops_in_place_with_record(
+        tables,
+        transaction,
+        DfsMetadataTableOp::PutNamespaceTransaction {
+            transaction: transaction.clone(),
+        },
+        table_ops,
+        rollback,
+    );
+}
+
+fn plan_namespace_transaction_table_ops_in_place_with_record(
+    tables: &mut DfsMetadataTables,
+    transaction: &DfsNamespaceTransaction,
+    transaction_record: DfsMetadataTableOp,
+    table_ops: &mut Option<&mut Vec<DfsMetadataTableOp>>,
+    rollback: &mut Option<&mut DfsMetadataTableRollback>,
+) {
     if transaction.objects.len() == 1 {
-        for op in plan_single_object_namespace_transaction_table_ops(tables, transaction) {
+        for op in plan_single_object_namespace_transaction_table_ops_with_record(
+            tables,
+            transaction,
+            transaction_record,
+        ) {
             apply_namespace_transaction_planned_op(tables, table_ops, rollback, op);
         }
         return;
@@ -493,6 +554,7 @@ fn plan_namespace_transaction_table_ops_in_place(
     plan_multi_object_namespace_transaction_table_ops_in_place(
         tables,
         transaction,
+        transaction_record,
         table_ops,
         rollback,
     );
@@ -501,17 +563,11 @@ fn plan_namespace_transaction_table_ops_in_place(
 fn plan_multi_object_namespace_transaction_table_ops_in_place(
     scratch: &mut DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
+    transaction_record: DfsMetadataTableOp,
     table_ops: &mut Option<&mut Vec<DfsMetadataTableOp>>,
     rollback: &mut Option<&mut DfsMetadataTableRollback>,
 ) {
-    apply_namespace_transaction_planned_op(
-        scratch,
-        table_ops,
-        rollback,
-        DfsMetadataTableOp::PutNamespaceTransaction {
-            transaction: transaction.clone(),
-        },
-    );
+    apply_namespace_transaction_planned_op(scratch, table_ops, rollback, transaction_record);
     for object in transaction
         .objects
         .iter()
@@ -558,10 +614,22 @@ fn plan_single_object_namespace_transaction_table_ops(
     tables: &DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
 ) -> Vec<DfsMetadataTableOp> {
+    plan_single_object_namespace_transaction_table_ops_with_record(
+        tables,
+        transaction,
+        DfsMetadataTableOp::PutNamespaceTransaction {
+            transaction: transaction.clone(),
+        },
+    )
+}
+
+fn plan_single_object_namespace_transaction_table_ops_with_record(
+    tables: &DfsMetadataTables,
+    transaction: &DfsNamespaceTransaction,
+    transaction_record: DfsMetadataTableOp,
+) -> Vec<DfsMetadataTableOp> {
     let mut table_ops = Vec::new();
-    table_ops.push(DfsMetadataTableOp::PutNamespaceTransaction {
-        transaction: transaction.clone(),
-    });
+    table_ops.push(transaction_record);
     if let Some(object) = transaction.objects.first()
         && !tables.compacted_tombstone_matches(object)
     {

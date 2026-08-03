@@ -141,14 +141,14 @@ pub struct DfsMetadataReplicaIngestPermit {
     pending_primary_handoff_id: Option<String>,
 }
 
-/// Compact evidence derived from a newly materialized namespace prepare.
+/// Compact evidence derived from one validated namespace-prepare payload.
 ///
-/// The replica backend creates this only after decoding the journal payload,
-/// independently hashing the resulting canonical record, and durably applying
-/// the corresponding table batch. It lets the immediate authority ACK reuse
-/// that work instead of cloning, normalizing, and hashing the complete prepare
-/// again. A retry that applies no new entry carries no such proof and therefore
-/// falls back to the ordinary durable-table verification path.
+/// The durable-journal ACK path constructs this from the identity retained in
+/// the exact, structurally validated journal payload. It therefore does not
+/// need to expand a packed prepare into the rebuildable materialized tables
+/// before acknowledging it. The ordinary apply path can construct the same
+/// evidence from its canonical allocation, and retries without fresh evidence
+/// retain the durable verification fallback.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DfsValidatedNamespaceAuthorityProof {
     file_system_id: DfsFileSystemId,
@@ -161,6 +161,74 @@ pub(crate) struct DfsValidatedNamespaceAuthorityProof {
 }
 
 impl DfsValidatedNamespaceAuthorityProof {
+    pub(crate) fn from_validated_payload(
+        payload: &DfsNamespacePreparePayloadRef<'_>,
+        prepare_sequence: u64,
+    ) -> Option<Self> {
+        if prepare_sequence == 0 {
+            return None;
+        }
+        let (file_system_id, operation_id, status, shard_id, owner_epoch, payload_digest) =
+            match payload {
+                DfsNamespacePreparePayloadRef::Canonical {
+                    file_system_id,
+                    operation_id,
+                    status,
+                    prepare,
+                } => {
+                    if prepare.file_system_id != **file_system_id
+                        || prepare.operation_id != *operation_id
+                        || prepare.status != **status
+                    {
+                        return None;
+                    }
+                    (
+                        *file_system_id,
+                        *operation_id,
+                        *status,
+                        &prepare.shard_id,
+                        prepare.owner_epoch,
+                        prepare.operation_digest.as_str(),
+                    )
+                }
+                DfsNamespacePreparePayloadRef::PackedV1 {
+                    file_system_id,
+                    operation_id,
+                    status,
+                    prepare,
+                } => (
+                    *file_system_id,
+                    *operation_id,
+                    *status,
+                    prepare.shard_id(),
+                    prepare.owner_epoch(),
+                    prepare.operation_digest(),
+                ),
+                DfsNamespacePreparePayloadRef::PackedV2 {
+                    file_system_id,
+                    operation_id,
+                    status,
+                    prepare,
+                } => (
+                    *file_system_id,
+                    *operation_id,
+                    *status,
+                    prepare.shard_id(),
+                    prepare.owner_epoch(),
+                    prepare.operation_digest(),
+                ),
+            };
+        Some(Self {
+            file_system_id: file_system_id.clone(),
+            shard_id: shard_id.clone(),
+            owner_epoch,
+            operation_id: operation_id.to_string(),
+            status: status.clone(),
+            prepare_sequence,
+            payload_digest: payload_digest.to_string(),
+        })
+    }
+
     pub(crate) fn from_canonical_prepare(
         prepare: &DfsNamespacePrepareRecord,
         prepare_sequence: u64,
@@ -211,6 +279,8 @@ impl DfsValidatedNamespaceAuthorityProof {
 pub struct DfsMetadataReplicaApplyReport {
     applied_entries: usize,
     namespace_authority_proof: Option<DfsValidatedNamespaceAuthorityProof>,
+    durable_prefix_proof: Option<DfsMetadataPrefixProof>,
+    materialization_pending: bool,
 }
 
 impl DfsMetadataReplicaApplyReport {
@@ -218,6 +288,8 @@ impl DfsMetadataReplicaApplyReport {
         Self {
             applied_entries,
             namespace_authority_proof: None,
+            durable_prefix_proof: None,
+            materialization_pending: false,
         }
     }
 
@@ -228,11 +300,35 @@ impl DfsMetadataReplicaApplyReport {
         Self {
             applied_entries,
             namespace_authority_proof,
+            durable_prefix_proof: None,
+            materialization_pending: false,
+        }
+    }
+
+    pub(crate) fn with_durable_ingest(
+        applied_entries: usize,
+        namespace_authority_proof: Option<DfsValidatedNamespaceAuthorityProof>,
+        durable_prefix_proof: DfsMetadataPrefixProof,
+        materialization_pending: bool,
+    ) -> Self {
+        Self {
+            applied_entries,
+            namespace_authority_proof,
+            durable_prefix_proof: Some(durable_prefix_proof),
+            materialization_pending,
         }
     }
 
     pub(crate) fn applied_entries(&self) -> usize {
         self.applied_entries
+    }
+
+    pub(crate) fn durable_prefix_proof(&self) -> Option<&DfsMetadataPrefixProof> {
+        self.durable_prefix_proof.as_ref()
+    }
+
+    pub(crate) fn materialization_pending(&self) -> bool {
+        self.materialization_pending
     }
 
     pub(crate) fn namespace_authority_proof_for(
@@ -2296,6 +2392,21 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         self.journal_batch_since_limited(after_sequence, max_entries, max_encoded_bytes)
     }
 
+    /// Return the exact immutable SOBJ frames for a previously selected
+    /// journal batch. Durable local backends override this to borrow the bytes
+    /// already stored in the authoritative journal; the default remains a
+    /// deterministic encode-once compatibility path.
+    fn journal_frames_for_batch(
+        &self,
+        batch: &DfsMetadataJournalBatch,
+    ) -> Result<Vec<DfsMetadataJournalFrameRecord>> {
+        batch
+            .entries
+            .iter()
+            .map(crate::metadata_journal::encode_metadata_journal_frame_record)
+            .collect()
+    }
+
     /// Return the next journal sequence that should be sent to a target node
     /// for a shard.
     fn metadata_replication_cursor(
@@ -2419,6 +2530,76 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     ) -> Result<DfsMetadataReplicaApplyReport> {
         self.apply_journal_batch_with_replica_permit(permit, batch)
             .map(DfsMetadataReplicaApplyReport::without_authority_proofs)
+    }
+
+    /// Persist and validate an exact replica batch without requiring the
+    /// rebuildable materialized table cache to reach the same boundary before
+    /// returning. Durable local backends override this for versioned authority
+    /// probes; compatibility backends retain the stronger synchronous apply.
+    fn persist_journal_batch_with_replica_permit_report(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+    ) -> Result<DfsMetadataReplicaApplyReport> {
+        self.apply_journal_batch_with_replica_permit_report(permit, batch)
+    }
+
+    fn persist_journal_frames_with_replica_permit_report(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+        frames: &[DfsMetadataJournalFrameRecord],
+    ) -> Result<DfsMetadataReplicaApplyReport> {
+        if !batch.entries.is_empty() || frames.is_empty() {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata shard {} exact-frame ingest requires one carrier",
+                batch.shard_id.0
+            )));
+        }
+        let entries = frames
+            .iter()
+            .map(crate::metadata_journal::decode_metadata_journal_frame_record)
+            .collect::<Result<Vec<_>>>()?;
+        self.persist_journal_batch_with_replica_permit_report(
+            permit,
+            &DfsMetadataJournalBatch {
+                shard_id: batch.shard_id.clone(),
+                entries,
+                next_after_sequence: batch.next_after_sequence,
+            },
+        )
+    }
+
+    /// Persist an authority operation whose exact target prefix is known.
+    ///
+    /// Durable local backends use `expected_target_prefix` to authenticate a
+    /// delayed authority operation after a later ordinary catch-up prefix has
+    /// already materialized. Compatibility backends keep their stronger
+    /// synchronous apply boundary; the common authority verifier still checks
+    /// their resulting materialized prefix before acknowledging the probe.
+    fn persist_authority_journal_frames_with_replica_permit_report(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+        frames: &[DfsMetadataJournalFrameRecord],
+        expected_target_prefix: &DfsMetadataPrefixProof,
+    ) -> Result<DfsMetadataReplicaApplyReport> {
+        if !expected_target_prefix.is_well_formed()
+            || expected_target_prefix.journal_sequence != batch.next_after_sequence
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata shard {} authority ingest has an invalid expected prefix at sequence {}",
+                batch.shard_id.0, batch.next_after_sequence
+            )));
+        }
+        self.persist_journal_frames_with_replica_permit_report(permit, batch, frames)
+    }
+
+    /// Materialize any journal suffix previously admitted at the durable ACK
+    /// boundary. Promotion, snapshots, and ordinary authoritative writes must
+    /// continue to use their existing synchronous refresh fences.
+    fn materialize_pending_replica_journal(&mut self) -> Result<usize> {
+        Ok(0)
     }
 
     /// Replace local metadata tables with a replicated snapshot.

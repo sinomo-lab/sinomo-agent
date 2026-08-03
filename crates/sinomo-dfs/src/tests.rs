@@ -2281,12 +2281,14 @@ impl RecordingPeerTransport {
                 ObjectRpcResponse::encode_body(
                     DFS_METADATA_JOURNAL_BATCH_ROUTE,
                     &DfsMetadataJournalBatchResponse {
-                        request_id: command.request_id,
-                        shard_id: command.batch.shard_id,
+                        request_id: command.request_id.clone(),
+                        shard_id: command.batch.shard_id.clone(),
                         next_after_sequence: command.batch.next_after_sequence,
-                        applied_entries: command.batch.entries.len(),
+                        applied_entries: applied_metadata_journal_command_entry_count(&command),
                         verified_prefix_only: command.verify_prefix_only,
-                        verified_authority_probe_id: None,
+                        verified_authority_probe_id: applied_metadata_journal_command_confirmation(
+                            &command,
+                        ),
                         result: DfsMetadataJournalBatchResult::Applied,
                     },
                 )
@@ -2447,6 +2449,7 @@ fn dfs_peer_transport_adapters_delegate_all_routes() {
             verify_prefix_only: false,
             prefix_probe: None,
             authority_probe: None,
+            durable_replication: None,
             batch: DfsMetadataJournalBatch {
                 shard_id: shard_id.clone(),
                 entries: Vec::new(),
@@ -2537,8 +2540,11 @@ fn direct_authority_probe_uses_canonical_route_and_old_peer_fails_closed() {
                 prepare_sequence: batch.next_after_sequence,
                 payload_digest: "blake3:direct-authority-operation".to_string(),
             },
+            durable_journal_ack: false,
+            journal_frames: Vec::new(),
             prepared_prefix: None,
         }),
+        durable_replication: None,
         batch,
     };
 
@@ -2617,6 +2623,7 @@ fn direct_metadata_authority_fans_out_to_replicas_concurrently() {
                     verify_prefix_only: false,
                     prefix_probe: None,
                     authority_probe: None,
+                    durable_replication: None,
                     batch: DfsMetadataJournalBatch {
                         shard_id: shard_id.clone(),
                         entries: Vec::new(),
@@ -2818,6 +2825,7 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         verify_prefix_only: false,
         prefix_probe: None,
         authority_probe: None,
+        durable_replication: None,
         batch: DfsMetadataJournalBatch {
             shard_id: shard_id.clone(),
             entries: Vec::new(),
@@ -4312,11 +4320,34 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
         .find(|intent| intent.object_id == stat.object_id)
         .expect("committed create intent");
     assert_eq!(intent.status, DfsWriteIntentStatus::Committed);
-    let prepare = backend
-        .get_namespace_prepare(&format!("namespace:create:{}", intent.intent_id))
-        .expect("read create prepare")
-        .expect("durable create prepare");
-    assert_eq!(prepare.status, DfsNamespacePrepareStatus::Committed);
+    let operation_id = format!("namespace:create:{}", intent.intent_id);
+    assert!(
+        backend
+            .get_namespace_prepare(&operation_id)
+            .expect("read create prepare")
+            .is_none(),
+        "the committed create prepare must retain only compact retry evidence"
+    );
+    let journal = backend.journal_since(0).expect("create journal");
+    let prepare_entry = journal
+        .iter()
+        .find(|entry| {
+            matches!(
+                &entry.mutation,
+                DfsMetadataMutation::PutNamespacePrepare {
+                    operation_id: candidate,
+                    status: DfsNamespacePrepareStatus::Prepared,
+                    ..
+                } if candidate == &operation_id
+            )
+        })
+        .expect("authoritative create prepare entry");
+    let prepare = prepare_entry
+        .mutation
+        .namespace_prepare_payload()
+        .expect("decode create prepare")
+        .expect("create prepare payload")
+        .into_owned();
     assert_eq!(
         prepare.operation_digest,
         crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
@@ -4398,17 +4429,39 @@ fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare
         .into_iter()
         .find(|intent| intent.object_id == child_only_id)
         .expect("child-only create intent");
-    let child_only_prepare = backend
-        .get_namespace_prepare(&format!("namespace:create:{}", child_only_intent.intent_id))
-        .expect("read child-only prepare")
-        .expect("durable child-only prepare");
+    let child_only_operation_id = format!("namespace:create:{}", child_only_intent.intent_id);
+    assert!(
+        backend
+            .get_namespace_prepare(&child_only_operation_id)
+            .expect("read child-only prepare")
+            .is_none()
+    );
+    let child_only_journal = backend.journal_since(0).expect("child-only journal");
+    let child_only_prepare = child_only_journal
+        .iter()
+        .find(|entry| {
+            matches!(
+                &entry.mutation,
+                DfsMetadataMutation::PutNamespacePrepare {
+                    operation_id: candidate,
+                    status: DfsNamespacePrepareStatus::Prepared,
+                    ..
+                } if candidate == &child_only_operation_id
+            )
+        })
+        .expect("authoritative child-only prepare entry")
+        .mutation
+        .namespace_prepare_payload()
+        .expect("decode child-only prepare")
+        .expect("child-only prepare payload")
+        .into_owned();
     let child_only_visible = backend
         .get_object(&child_only_id)
         .expect("read child-only object")
         .expect("visible child-only object");
     assert_eq!(
         child_only_prepare.status,
-        DfsNamespacePrepareStatus::Committed
+        DfsNamespacePrepareStatus::Prepared
     );
     assert_eq!(
         child_only_prepare.transaction.objects,
@@ -5686,6 +5739,36 @@ struct ApplyingMetadataJournalTransport {
     snapshot_installs: usize,
 }
 
+fn applied_metadata_journal_command_entry_count(command: &DfsMetadataJournalBatchCommand) -> usize {
+    command
+        .durable_replication
+        .as_ref()
+        .map(|replication| replication.journal_frames.len())
+        .or_else(|| {
+            command.authority_probe.as_ref().and_then(|probe| {
+                probe
+                    .durable_journal_ack
+                    .then_some(probe.journal_frames.len())
+            })
+        })
+        .unwrap_or(command.batch.entries.len())
+}
+
+fn applied_metadata_journal_command_confirmation(
+    command: &DfsMetadataJournalBatchCommand,
+) -> Option<String> {
+    command
+        .durable_replication
+        .as_ref()
+        .map(|replication| replication.confirmation_id.clone())
+        .or_else(|| {
+            command
+                .authority_probe
+                .as_ref()
+                .and_then(crate::service_replica::metadata_authority_probe_confirmation_id)
+        })
+}
+
 impl ApplyingMetadataJournalTransport {
     fn new(target_node_id: NodeId) -> Self {
         Self {
@@ -5715,9 +5798,9 @@ impl DfsMetadataJournalReplicationTransport for ApplyingMetadataJournalTransport
             request_id: command.request_id.clone(),
             shard_id: command.batch.shard_id.clone(),
             next_after_sequence: command.batch.next_after_sequence,
-            applied_entries: command.batch.entries.len(),
+            applied_entries: applied_metadata_journal_command_entry_count(command),
             verified_prefix_only: command.verify_prefix_only,
-            verified_authority_probe_id: None,
+            verified_authority_probe_id: applied_metadata_journal_command_confirmation(command),
             result: DfsMetadataJournalBatchResult::Applied,
         })
     }
@@ -6959,7 +7042,7 @@ fn content_root_catalog_refresh_failure_durably_invalidates_previous_catalog() {
                 prefix_proof_version: DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
                 journal_sequence: 1,
                 state_fingerprint: format!(
-                    "dfs-metadata-prefix-v1:blake3:{}",
+                    "dfs-metadata-prefix-v2:blake3:{}",
                     blake3::hash(b"catalog-before-refresh-failure").to_hex()
                 ),
             },
@@ -7222,7 +7305,7 @@ fn lifecycle_maintenance_runs_version_blob_and_tombstone_collection() {
         )
         .expect("catalog topology");
         let state_fingerprint = format!(
-            "dfs-metadata-prefix-v1:blake3:{}",
+            "dfs-metadata-prefix-v2:blake3:{}",
             blake3::hash(generation.as_bytes()).to_hex()
         );
         let identity = DfsContentRootCatalogShardIdentity::from_config(&catalog_shard);
@@ -7953,18 +8036,22 @@ fn maintenance_tick_runs_lifecycle_and_metadata_journal_publish() {
         vec![(replica.clone(), shard_id.clone())]
     );
     assert_eq!(transport.batches, 1);
-    assert!(matches!(
-        report.metadata_replication.outcomes.as_slice(),
-        [DfsMetadataJournalReplicationOutcome::Applied {
-            target_node_id,
-            shard_id: outcome_shard_id,
-            entries,
-            next_after_sequence,
-        }] if target_node_id == &replica
-            && outcome_shard_id == &shard_id
-            && *entries == 2
-            && *next_after_sequence == 2
-    ));
+    assert!(
+        matches!(
+            report.metadata_replication.outcomes.as_slice(),
+            [DfsMetadataJournalReplicationOutcome::Applied {
+                target_node_id,
+                shard_id: outcome_shard_id,
+                entries,
+                next_after_sequence,
+            }] if target_node_id == &replica
+                && outcome_shard_id == &shard_id
+                && *entries == 2
+                && *next_after_sequence == 2
+        ),
+        "unexpected metadata replication outcomes: {:?}",
+        report.metadata_replication.outcomes
+    );
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -8268,6 +8355,7 @@ fn maintenance_tick_drains_inflight_repair_response_without_new_schedule() {
             repair_maintenance: false,
             namespace_maintenance: false,
             metadata_replica_progress: false,
+            metadata_materialization: false,
         },
         "a maintenance-consumed durable receipt must retain its publication edge outside the service generation"
     );
@@ -8352,13 +8440,20 @@ fn cluster_maintenance_tick_opens_service_and_publishes_metadata() {
         ))
     });
     let sender: DfsMetadataJournalBatchSender = Arc::new(|_target_node_id, command, _timeout| {
+        assert!(
+            command
+                .durable_replication
+                .as_ref()
+                .is_some_and(|replication| !replication.journal_frames.is_empty()),
+            "cluster maintenance must send exact durable frames: {command:?}"
+        );
         Ok(DfsMetadataJournalBatchResponse {
             request_id: command.request_id.clone(),
             shard_id: command.batch.shard_id.clone(),
             next_after_sequence: command.batch.next_after_sequence,
-            applied_entries: command.batch.entries.len(),
+            applied_entries: applied_metadata_journal_command_entry_count(command),
             verified_prefix_only: command.verify_prefix_only,
-            verified_authority_probe_id: None,
+            verified_authority_probe_id: applied_metadata_journal_command_confirmation(command),
             result: DfsMetadataJournalBatchResult::Applied,
         })
     });
@@ -8383,18 +8478,22 @@ fn cluster_maintenance_tick_opens_service_and_publishes_metadata() {
 
     assert_eq!(report.lifecycle_reports.len(), 1);
     assert!(report.scheduled_repairs.is_empty());
-    assert!(matches!(
-        report.metadata_replication.outcomes.as_slice(),
-        [DfsMetadataJournalReplicationOutcome::Applied {
-            target_node_id,
-            shard_id,
-            entries,
-            next_after_sequence,
-        }] if target_node_id == &replica
-            && shard_id == &DfsMetadataShardId::new("root")
-            && *entries == 2
-            && *next_after_sequence == 2
-    ));
+    assert!(
+        matches!(
+            report.metadata_replication.outcomes.as_slice(),
+            [DfsMetadataJournalReplicationOutcome::Applied {
+                target_node_id,
+                shard_id,
+                entries,
+                next_after_sequence,
+            }] if target_node_id == &replica
+                && shard_id == &DfsMetadataShardId::new("root")
+                && *entries == 2
+                && *next_after_sequence == 2
+        ),
+        "unexpected cluster metadata replication outcomes: {:?}",
+        report.metadata_replication.outcomes
+    );
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -8464,17 +8563,17 @@ fn cluster_smoke_opens_service_and_publishes_metadata() {
     let sent_for_sender = Arc::clone(&sent);
     let sender: DfsMetadataJournalBatchSender =
         Arc::new(move |target_node_id, command, _timeout| {
-            sent_for_sender
-                .lock()
-                .expect("sent lock")
-                .push((target_node_id.to_string(), command.batch.entries.len()));
+            sent_for_sender.lock().expect("sent lock").push((
+                target_node_id.to_string(),
+                applied_metadata_journal_command_entry_count(command),
+            ));
             Ok(DfsMetadataJournalBatchResponse {
                 request_id: command.request_id.clone(),
                 shard_id: command.batch.shard_id.clone(),
                 next_after_sequence: command.batch.next_after_sequence,
-                applied_entries: command.batch.entries.len(),
+                applied_entries: applied_metadata_journal_command_entry_count(command),
                 verified_prefix_only: command.verify_prefix_only,
-                verified_authority_probe_id: None,
+                verified_authority_probe_id: applied_metadata_journal_command_confirmation(command),
                 result: DfsMetadataJournalBatchResult::Applied,
             })
         });
@@ -10996,17 +11095,17 @@ fn cluster_metadata_journal_publish_reads_cluster_state_and_shards() {
     let sent_for_sender = Arc::clone(&sent);
     let sender: DfsMetadataJournalBatchSender =
         Arc::new(move |target_node_id, command, _timeout| {
-            sent_for_sender
-                .lock()
-                .expect("sent lock")
-                .push((target_node_id.to_string(), command.batch.entries.len()));
+            sent_for_sender.lock().expect("sent lock").push((
+                target_node_id.to_string(),
+                applied_metadata_journal_command_entry_count(command),
+            ));
             Ok(DfsMetadataJournalBatchResponse {
                 request_id: command.request_id.clone(),
                 shard_id: command.batch.shard_id.clone(),
                 next_after_sequence: command.batch.next_after_sequence,
-                applied_entries: command.batch.entries.len(),
+                applied_entries: applied_metadata_journal_command_entry_count(command),
                 verified_prefix_only: command.verify_prefix_only,
-                verified_authority_probe_id: None,
+                verified_authority_probe_id: applied_metadata_journal_command_confirmation(command),
                 result: DfsMetadataJournalBatchResult::Applied,
             })
         });
@@ -11380,6 +11479,7 @@ fn metadata_node_transport_sends_one_target_attempt() {
         verify_prefix_only: false,
         prefix_probe: None,
         authority_probe: None,
+        durable_replication: None,
         batch: DfsMetadataJournalBatch {
             shard_id: DfsMetadataShardId::new("root"),
             entries: Vec::new(),
@@ -11444,6 +11544,7 @@ fn metadata_node_transport_rejects_mismatched_journal_response() {
         verify_prefix_only: false,
         prefix_probe: None,
         authority_probe: None,
+        durable_replication: None,
         batch: DfsMetadataJournalBatch {
             shard_id: DfsMetadataShardId::new("root"),
             entries: Vec::new(),
@@ -11511,6 +11612,7 @@ fn async_metadata_node_transport_rejects_mismatched_journal_response() {
             verify_prefix_only: false,
             prefix_probe: None,
             authority_probe: None,
+            durable_replication: None,
             batch: DfsMetadataJournalBatch {
                 shard_id: DfsMetadataShardId::new("root"),
                 entries: Vec::new(),
@@ -11730,6 +11832,7 @@ fn metadata_journal_batch_processor_rejects_non_primary_source() {
             verify_prefix_only: false,
             prefix_probe: None,
             authority_probe: None,
+            durable_replication: None,
             batch: DfsMetadataJournalBatch {
                 shard_id,
                 entries: Vec::new(),
@@ -11774,6 +11877,7 @@ fn clustered_metadata_journal_batch_requires_exact_authority_identity() {
         verify_prefix_only: false,
         prefix_probe: None,
         authority_probe: None,
+        durable_replication: None,
         batch: DfsMetadataJournalBatch {
             shard_id: DfsMetadataShardId::new("root"),
             entries: Vec::new(),
@@ -11852,6 +11956,7 @@ fn networked_metadata_journal_batch_requires_exact_authority_identity() {
         verify_prefix_only: false,
         prefix_probe: None,
         authority_probe: None,
+        durable_replication: None,
         batch: DfsMetadataJournalBatch {
             shard_id: DfsMetadataShardId::new("root"),
             entries: Vec::new(),
@@ -11936,6 +12041,7 @@ fn networked_metadata_journal_batch_refreshes_stale_receiver_authority() {
                 verify_prefix_only: false,
                 prefix_probe: None,
                 authority_probe: None,
+                durable_replication: None,
                 batch: DfsMetadataJournalBatch {
                     shard_id: DfsMetadataShardId::new("root"),
                     entries: Vec::new(),
@@ -12054,6 +12160,7 @@ fn replica_journal_ingest_keeps_visible_namespace_in_backend_not_service_mirror(
                 verify_prefix_only: false,
                 prefix_probe: None,
                 authority_probe: None,
+                durable_replication: None,
                 batch: batch.clone(),
             },
         )
@@ -12338,6 +12445,7 @@ fn networked_metadata_replica_ingest_without_control_plane_fails_closed_without_
                 verify_prefix_only: false,
                 prefix_probe: None,
                 authority_probe: None,
+                durable_replication: None,
                 batch,
             },
         )
@@ -12437,8 +12545,11 @@ fn metadata_authority_probe_requires_exact_cluster_context() {
                 prepare_sequence: batch.next_after_sequence,
                 payload_digest: "blake3:authority-exact-context".to_string(),
             },
+            durable_journal_ack: false,
+            journal_frames: Vec::new(),
             prepared_prefix: None,
         }),
+        durable_replication: None,
         batch,
     };
     let mut backend =
@@ -12588,6 +12699,8 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
         probe_id,
         expected_shard: shard,
         operation,
+        durable_journal_ack: false,
+        journal_frames: Vec::new(),
         prepared_prefix: Some(prepared_prefix),
     };
     let confirmation_id =
@@ -12605,6 +12718,7 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
             verify_prefix_only: false,
             prefix_probe: None,
             authority_probe: Some(authority_probe.clone()),
+            durable_replication: None,
             batch: batch.clone(),
         },
     );
@@ -12624,7 +12738,340 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
         Some(DfsMetadataAuthorityAckFloor {
             shard_id: DfsMetadataShardId::new("root"),
             journal_sequence: authority_sequence,
+            durable_prefix_proof: None,
         })
+    );
+
+    let exact_frames = DfsMetadataBackend::journal_frames_for_batch(&source, &batch)
+        .expect("source exact journal frames");
+    let mut durable_probe = authority_probe.clone();
+    durable_probe.durable_journal_ack = true;
+    durable_probe.journal_frames = exact_frames.clone();
+    let durable_prefix = durable_probe
+        .prepared_prefix
+        .clone()
+        .expect("durable prepared prefix");
+    let durable_confirmation_id =
+        crate::service_replica::metadata_authority_probe_confirmation_id(&durable_probe)
+            .expect("durable prefix-bound authority confirmation");
+    let durable_wire_batch = DfsMetadataJournalBatch {
+        shard_id: DfsMetadataShardId::new("root"),
+        entries: Vec::new(),
+        next_after_sequence: authority_sequence,
+    };
+    let mut durable_receiver = LocalSobjMetadataBackend::new(
+        DfsMetadataShardId::new("root"),
+        root.join("durable-receiver"),
+    )
+    .expect("durable receiver metadata backend");
+    crate::metadata_journal::reset_metadata_journal_tail_recovery_calls();
+    crate::service_replica::reset_namespace_prepare_canonical_digest_passes();
+    let durable_response = process_dfs_metadata_journal_batch(
+        &mut durable_receiver,
+        Some(&context),
+        DfsMetadataJournalBatchCommand {
+            request_id: "request-authority-durable-frame".to_string(),
+            source_node_id: Some(primary.clone()),
+            file_system_id: Some(context.shard.file_system_id.clone()),
+            authority_epoch: Some(context.shard.epoch),
+            verify_prefix_only: false,
+            prefix_probe: None,
+            authority_probe: Some(durable_probe.clone()),
+            durable_replication: None,
+            batch: durable_wire_batch.clone(),
+        },
+    );
+    assert_eq!(
+        durable_response.result,
+        DfsMetadataJournalBatchResult::Applied
+    );
+    assert!(durable_response.applied_entries > 0);
+    assert_eq!(
+        durable_response.verified_authority_probe_id,
+        Some(durable_confirmation_id.clone())
+    );
+    assert_eq!(
+        crate::service_replica::namespace_prepare_canonical_digest_passes(),
+        0,
+        "durable PackedV2 ingest must validate its exact retained identity without canonical expansion"
+    );
+    assert_eq!(
+        crate::metadata_journal::metadata_journal_tail_recovery_calls(),
+        0,
+        "a resident durable ACK must trust its maintained head instead of rerunning crash recovery"
+    );
+    assert_eq!(durable_receiver.journal_last_sequence(), authority_sequence);
+    assert!(
+        durable_receiver
+            .get_namespace_prepare(&prepare.operation_id)
+            .expect("durable receiver prepare before materialization")
+            .is_none(),
+        "durable ACK must not wait for rebuildable table expansion"
+    );
+    assert_eq!(
+        durable_receiver
+            .metadata_authority_ack_floor(&DfsMetadataShardId::new("root"))
+            .expect("durable authority acknowledgement floor"),
+        Some(DfsMetadataAuthorityAckFloor {
+            shard_id: DfsMetadataShardId::new("root"),
+            journal_sequence: authority_sequence,
+            durable_prefix_proof: Some(durable_prefix.clone()),
+        })
+    );
+
+    let durable_retry = process_dfs_metadata_journal_batch(
+        &mut durable_receiver,
+        Some(&context),
+        DfsMetadataJournalBatchCommand {
+            request_id: "request-authority-durable-frame-retry".to_string(),
+            source_node_id: Some(primary.clone()),
+            file_system_id: Some(context.shard.file_system_id.clone()),
+            authority_epoch: Some(context.shard.epoch),
+            verify_prefix_only: false,
+            prefix_probe: None,
+            authority_probe: Some(durable_probe.clone()),
+            durable_replication: None,
+            batch: durable_wire_batch.clone(),
+        },
+    );
+    assert_eq!(durable_retry.result, DfsMetadataJournalBatchResult::Applied);
+    assert_eq!(durable_retry.applied_entries, 0);
+    assert_eq!(
+        durable_retry.verified_authority_probe_id,
+        Some(durable_confirmation_id.clone())
+    );
+    assert!(
+        durable_receiver
+            .materialize_pending_replica_journal()
+            .expect("materialize durable journal tail")
+            > 0
+    );
+    let assert_canonical_prepare = |actual: Option<DfsNamespacePrepareRecord>| {
+        let actual = actual.expect("canonical namespace prepare");
+        assert_eq!(actual.operation_id, prepare.operation_id);
+        assert_eq!(actual.operation_digest, prepare.operation_digest);
+        assert_eq!(actual.owner_epoch, prepare.owner_epoch);
+        assert_eq!(actual.status, DfsNamespacePrepareStatus::Prepared);
+    };
+    assert_canonical_prepare(
+        durable_receiver
+            .get_namespace_prepare(&prepare.operation_id)
+            .expect("durable receiver prepare after materialization"),
+    );
+    assert_eq!(
+        durable_receiver
+            .metadata_prefix_proof()
+            .expect("durable receiver materialized prefix"),
+        durable_prefix
+    );
+
+    let materialized_retry = process_dfs_metadata_journal_batch(
+        &mut durable_receiver,
+        Some(&context),
+        DfsMetadataJournalBatchCommand {
+            request_id: "request-authority-durable-materialized-retry".to_string(),
+            source_node_id: Some(primary.clone()),
+            file_system_id: Some(context.shard.file_system_id.clone()),
+            authority_epoch: Some(context.shard.epoch),
+            verify_prefix_only: false,
+            prefix_probe: None,
+            authority_probe: Some(durable_probe.clone()),
+            durable_replication: None,
+            batch: durable_wire_batch.clone(),
+        },
+    );
+    assert_eq!(
+        materialized_retry.result,
+        DfsMetadataJournalBatchResult::Applied
+    );
+    assert_eq!(materialized_retry.applied_entries, 0);
+    assert_eq!(
+        materialized_retry.verified_authority_probe_id,
+        Some(durable_confirmation_id.clone()),
+        "an exact retry must retain its acknowledged target after async materialization"
+    );
+
+    let mut advanced_file_system = file_system.clone();
+    advanced_file_system.display_name = "advanced past durable retry".to_string();
+    durable_receiver
+        .put_file_system(&advanced_file_system)
+        .expect("advance materialized journal past acknowledged target");
+    assert!(durable_receiver.journal_last_sequence() > authority_sequence);
+    let advanced_materialized_retry = process_dfs_metadata_journal_batch(
+        &mut durable_receiver,
+        Some(&context),
+        DfsMetadataJournalBatchCommand {
+            request_id: "request-authority-durable-advanced-materialized-retry".to_string(),
+            source_node_id: Some(primary.clone()),
+            file_system_id: Some(context.shard.file_system_id.clone()),
+            authority_epoch: Some(context.shard.epoch),
+            verify_prefix_only: false,
+            prefix_probe: None,
+            authority_probe: Some(durable_probe.clone()),
+            durable_replication: None,
+            batch: durable_wire_batch.clone(),
+        },
+    );
+    assert_eq!(
+        advanced_materialized_retry.result,
+        DfsMetadataJournalBatchResult::Applied
+    );
+    assert_eq!(advanced_materialized_retry.applied_entries, 0);
+    assert_eq!(
+        advanced_materialized_retry.verified_authority_probe_id,
+        Some(durable_confirmation_id.clone()),
+        "an exact floor must preserve the acknowledged proof after later materialization"
+    );
+
+    let mut divergent_retry_probe = durable_probe.clone();
+    let mut divergent_retry_entry = crate::metadata_journal::decode_metadata_journal_frame_record(
+        divergent_retry_probe
+            .journal_frames
+            .first()
+            .expect("durable retry frame"),
+    )
+    .expect("decode durable retry frame");
+    divergent_retry_entry.created_at += time::Duration::nanoseconds(1);
+    divergent_retry_probe.journal_frames[0] =
+        crate::metadata_journal::encode_metadata_journal_frame_record(&divergent_retry_entry)
+            .expect("encode divergent retry frame");
+    let divergent_materialized_retry = process_dfs_metadata_journal_batch(
+        &mut durable_receiver,
+        Some(&context),
+        DfsMetadataJournalBatchCommand {
+            request_id: "request-authority-durable-divergent-materialized-retry".to_string(),
+            source_node_id: Some(primary.clone()),
+            file_system_id: Some(context.shard.file_system_id.clone()),
+            authority_epoch: Some(context.shard.epoch),
+            verify_prefix_only: false,
+            prefix_probe: None,
+            authority_probe: Some(divergent_retry_probe),
+            durable_replication: None,
+            batch: durable_wire_batch.clone(),
+        },
+    );
+    assert!(matches!(
+        divergent_materialized_retry.result,
+        DfsMetadataJournalBatchResult::Rejected { ref reason }
+            if reason.contains("different exact bytes")
+    ));
+    let advanced_sequence = durable_receiver.journal_last_sequence();
+    let advanced_prefix = durable_receiver
+        .metadata_prefix_proof()
+        .expect("advanced materialized prefix");
+    durable_receiver
+        .put_metadata_authority_ack_floor(&DfsMetadataAuthorityAckFloor {
+            shard_id: DfsMetadataShardId::new("root"),
+            journal_sequence: advanced_sequence,
+            durable_prefix_proof: Some(advanced_prefix),
+        })
+        .expect("advance exact authority floor");
+    let retry_behind_advanced_floor = process_dfs_metadata_journal_batch(
+        &mut durable_receiver,
+        Some(&context),
+        DfsMetadataJournalBatchCommand {
+            request_id: "request-authority-durable-behind-advanced-floor".to_string(),
+            source_node_id: Some(primary.clone()),
+            file_system_id: Some(context.shard.file_system_id.clone()),
+            authority_epoch: Some(context.shard.epoch),
+            verify_prefix_only: false,
+            prefix_probe: None,
+            authority_probe: Some(durable_probe.clone()),
+            durable_replication: None,
+            batch: durable_wire_batch.clone(),
+        },
+    );
+    assert!(matches!(
+        retry_behind_advanced_floor.result,
+        DfsMetadataJournalBatchResult::Rejected { ref reason }
+            if reason.contains("behind authority floor")
+    ));
+
+    let mut crash_receiver = LocalSobjMetadataBackend::new(
+        DfsMetadataShardId::new("root"),
+        root.join("durable-crash-receiver"),
+    )
+    .expect("durable crash receiver metadata backend");
+    let crash_response = process_dfs_metadata_journal_batch(
+        &mut crash_receiver,
+        Some(&context),
+        DfsMetadataJournalBatchCommand {
+            request_id: "request-authority-durable-crash".to_string(),
+            source_node_id: Some(primary.clone()),
+            file_system_id: Some(context.shard.file_system_id.clone()),
+            authority_epoch: Some(context.shard.epoch),
+            verify_prefix_only: false,
+            prefix_probe: None,
+            authority_probe: Some(durable_probe.clone()),
+            durable_replication: None,
+            batch: durable_wire_batch.clone(),
+        },
+    );
+    assert_eq!(
+        crash_response.result,
+        DfsMetadataJournalBatchResult::Applied
+    );
+    assert!(
+        crash_receiver
+            .get_namespace_prepare(&prepare.operation_id)
+            .expect("crash receiver prepare before reopen")
+            .is_none()
+    );
+    drop(crash_receiver);
+    let reopened_crash_receiver = LocalSobjMetadataBackend::new(
+        DfsMetadataShardId::new("root"),
+        root.join("durable-crash-receiver"),
+    )
+    .expect("reopen durable crash receiver");
+    assert_canonical_prepare(
+        reopened_crash_receiver
+            .get_namespace_prepare(&prepare.operation_id)
+            .expect("crash receiver prepare after reopen"),
+    );
+    assert_eq!(
+        reopened_crash_receiver
+            .metadata_prefix_proof()
+            .expect("crash receiver prefix after reopen"),
+        durable_probe
+            .prepared_prefix
+            .clone()
+            .expect("crash receiver expected prefix")
+    );
+
+    let mut malformed_probe = durable_probe;
+    let mut malformed_bytes = malformed_probe.journal_frames[0].exact_bytes.to_vec();
+    malformed_bytes[0] ^= 0xff;
+    malformed_probe.journal_frames[0].exact_bytes = bytes::Bytes::from(malformed_bytes);
+    let mut malformed_receiver = LocalSobjMetadataBackend::new(
+        DfsMetadataShardId::new("root"),
+        root.join("malformed-frame-receiver"),
+    )
+    .expect("malformed frame receiver");
+    let malformed = process_dfs_metadata_journal_batch(
+        &mut malformed_receiver,
+        Some(&context),
+        DfsMetadataJournalBatchCommand {
+            request_id: "request-authority-malformed-frame".to_string(),
+            source_node_id: Some(primary.clone()),
+            file_system_id: Some(context.shard.file_system_id.clone()),
+            authority_epoch: Some(context.shard.epoch),
+            verify_prefix_only: false,
+            prefix_probe: None,
+            authority_probe: Some(malformed_probe),
+            durable_replication: None,
+            batch: durable_wire_batch,
+        },
+    );
+    assert!(matches!(
+        malformed.result,
+        DfsMetadataJournalBatchResult::Rejected { .. }
+    ));
+    assert_eq!(malformed_receiver.journal_last_sequence(), 0);
+    assert_eq!(
+        malformed_receiver
+            .metadata_authority_ack_floor(&DfsMetadataShardId::new("root"))
+            .expect("malformed authority floor"),
+        None
     );
 
     let mut divergent_probe = authority_probe;
@@ -12632,7 +13079,7 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
         .prepared_prefix
         .as_mut()
         .expect("prepared prefix")
-        .digest = format!("dfs-metadata-prefix-v1:blake3:{}", "0".repeat(64));
+        .digest = format!("dfs-metadata-prefix-v2:blake3:{}", "0".repeat(64));
     let mut divergent_receiver = LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("root"),
         root.join("divergent-receiver"),
@@ -12649,6 +13096,7 @@ fn metadata_authority_probe_applies_batch_before_echoing_nonce() {
             verify_prefix_only: false,
             prefix_probe: None,
             authority_probe: Some(divergent_probe),
+            durable_replication: None,
             batch,
         },
     );
@@ -12817,8 +13265,11 @@ fn metadata_authority_probe_rejects_a_gap_before_the_hidden_prepare() {
                         prepare_sequence,
                     )
                     .expect("authority operation"),
+                durable_journal_ack: false,
+                journal_frames: Vec::new(),
                 prepared_prefix: Some(prepared_prefix),
             }),
+            durable_replication: None,
             batch: DfsMetadataJournalBatch {
                 shard_id: shard_id.clone(),
                 entries: vec![prepare_entry],
@@ -12989,6 +13440,7 @@ fn metadata_prefix_probe_accepts_only_the_exact_materialized_checkpoint() {
                 primary_handoff_id: None,
             }),
             authority_probe: None,
+            durable_replication: None,
             batch: DfsMetadataJournalBatch {
                 shard_id,
                 entries: Vec::new(),
@@ -13092,6 +13544,7 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
                     primary_handoff_id: None,
                 }),
                 authority_probe: None,
+                durable_replication: None,
                 batch: DfsMetadataJournalBatch {
                     shard_id: shard_id.clone(),
                     entries: Vec::new(),
@@ -13106,6 +13559,13 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
         committed_work.metadata_replica_progress,
         "the durable prefix floor must retain its local progress edge when ACK delivery fails"
     );
+    let durable_prefix_proof = service
+        .metadata_backend
+        .as_ref()
+        .expect("service backend")
+        .metadata_prefix_proof(&shard_id)
+        .expect("durable prefix proof")
+        .expect("exact durable prefix proof");
     assert_eq!(
         service
             .metadata_backend
@@ -13117,6 +13577,7 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
             shard_id: shard_id.clone(),
             journal_sequence,
             state_fingerprint,
+            durable_prefix_proof: Some(durable_prefix_proof),
         })
     );
     fail_sends.store(false, Ordering::SeqCst);
@@ -13234,8 +13695,11 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
                     probe_id: "service-authority-probe-id".to_string(),
                     expected_shard: shard,
                     operation: authority_operation,
+                    durable_journal_ack: false,
+                    journal_frames: Vec::new(),
                     prepared_prefix: Some(prepared_prefix),
                 }),
+                durable_replication: None,
                 batch: authority_batch,
             },
         )
@@ -13259,6 +13723,7 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
         Some(DfsMetadataAuthorityAckFloor {
             shard_id: DfsMetadataShardId::new("root"),
             journal_sequence: prepare_entry.sequence,
+            durable_prefix_proof: None,
         }),
         "in-service authority ACK must persist its rollback floor before responding"
     );
@@ -13267,7 +13732,7 @@ fn service_prefix_ack_retains_progress_before_failed_delivery_and_conflicting_sn
 }
 
 #[test]
-fn promoted_replica_auto_rebinds_cached_lane_before_stamped_routed_write() {
+fn canonical_prefix_probe_persists_marker_before_promoted_lane_rebind() {
     let root = temp_root("service-primary-handoff-marker");
     let retiring_primary =
         NodeId::from_legacy_named("node_primary_handoff_retiring").expect("retiring primary");
@@ -13380,9 +13845,10 @@ fn promoted_replica_auto_rebinds_cached_lane_before_stamped_routed_write() {
     assert_eq!(durable_prefix.digest, state_fingerprint);
     drop(canonical_writer);
 
-    let event = service
-        .handle_metadata_journal_batch(
-            retiring_primary.clone(),
+    let response =
+        crate::metadata_replication::process_cluster_dfs_metadata_journal_batch_with_context(
+            &receiver_data_dir,
+            &retiring_primary,
             DfsMetadataJournalBatchCommand {
                 request_id: "primary-handoff-prefix-probe".to_string(),
                 source_node_id: Some(retiring_primary.clone()),
@@ -13399,36 +13865,38 @@ fn promoted_replica_auto_rebinds_cached_lane_before_stamped_routed_write() {
                     primary_handoff_id: Some(handoff.handoff_id.clone()),
                 }),
                 authority_probe: None,
+                durable_replication: None,
                 batch: DfsMetadataJournalBatch {
                     shard_id: shard_id.clone(),
                     entries: Vec::new(),
                     next_after_sequence: journal_sequence,
                 },
             },
+            Some(DfsMetadataReplicaShardContext {
+                local_node_id: promoted.clone(),
+                shard: retiring.clone(),
+                pending_membership_handoff: Some(handoff.clone()),
+            }),
         )
-        .expect("verify promoted prefix");
-    assert!(matches!(
-        event,
-        NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
-            verified_prefix_only: true,
-            ..
-        }
-    ));
+        .expect("process canonical promoted-prefix probe");
+    assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
+    assert!(response.verified_prefix_only);
+    assert_eq!(
+        response.verified_authority_probe_id,
+        Some(handoff.handoff_id.clone())
+    );
     assert_eq!(
         service
             .metadata_backend
             .as_deref()
-            .expect("refreshed routed backend")
+            .expect("still-cached routed backend")
             .metadata_prefix_proof(&shard_id)
-            .expect("refreshed routed prefix"),
-        Some(durable_prefix),
+            .expect("still-cached routed prefix"),
+        Some(routed_prefix_before),
+        "the direct route must not depend on mutating the resident routed lane"
     );
-    let marker = service
-        .metadata_backend
-        .as_deref()
-        .expect("promoted backend")
-        .metadata_shard_write_freeze(&shard_id)
-        .expect("promoted marker")
+    let marker = read_local_dfs_metadata_shard_write_freeze(&receiver_data_dir, &shard_id)
+        .expect("read promoted marker")
         .expect("durable marker before ACK");
     assert_eq!(marker.handoff_id, handoff.handoff_id);
     assert_eq!(marker.retiring_epoch, retiring.epoch);
@@ -13564,6 +14032,7 @@ fn pending_membership_handoff_authorizes_exact_suffix_and_prefix_for_new_replica
             primary_handoff_id: None,
         }),
         authority_probe: None,
+        durable_replication: None,
         batch: DfsMetadataJournalBatch {
             shard_id,
             entries: Vec::new(),
@@ -13602,6 +14071,320 @@ fn pending_membership_handoff_authorizes_exact_suffix_and_prefix_for_new_replica
             ..
         }) if reason.contains("neither a configured replica nor an exact pending membership-handoff catch-up target")
     ));
+}
+
+#[test]
+fn ordinary_durable_catchup_does_not_mask_delayed_authority_operation() {
+    let root = temp_root("metadata-handoff-durable-catchup");
+    let primary =
+        NodeId::from_legacy_named("node_meta_handoff_durable_primary").expect("primary node id");
+    let retiring_replica =
+        NodeId::from_legacy_named("node_meta_handoff_durable_retiring").expect("retiring replica");
+    let desired_replica =
+        NodeId::from_legacy_named("node_meta_handoff_durable_desired").expect("desired replica");
+    let shard_id = DfsMetadataShardId::new("root");
+    let file_system = file_system(primary.clone());
+    let retiring_shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: shard_id.0.clone(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![retiring_replica, desired_replica.clone()],
+        epoch: 8,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let desired_shard = DfsMetadataShardConfig {
+        replica_node_ids: vec![desired_replica.clone()],
+        epoch: retiring_shard.epoch + 1,
+        ..retiring_shard.clone()
+    };
+    let context = DfsMetadataReplicaShardContext {
+        local_node_id: desired_replica.clone(),
+        shard: retiring_shard.clone(),
+        pending_membership_handoff: Some(DfsMetadataShardMembershipHandoff {
+            handoff_id: "membership-handoff-durable-catchup".to_string(),
+            retiring_shard: retiring_shard.clone(),
+            desired_shard,
+            required_prepared_sequence: 0,
+            required_head_watermark: None,
+            retiring_primary_fence: None,
+        }),
+    };
+
+    let mut source = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("source"))
+        .expect("source metadata backend");
+    source
+        .put_file_system(&file_system)
+        .expect("source filesystem");
+    let mut object = file_metadata(primary.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.path = "/delayed-authority-after-catchup".to_string();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    let transaction = DfsNamespaceTransaction {
+        transaction_id: "transaction-delayed-authority-after-catchup".to_string(),
+        file_system_id: file_system.file_system_id.clone(),
+        objects: vec![object.clone()],
+        versions: vec![object_version_record(&object, object.content_size_bytes)],
+        advisory_lock_states: Vec::new(),
+        created_at: OffsetDateTime::now_utc(),
+    };
+    let mut prepare = DfsNamespacePrepareRecord {
+        operation_id: "namespace-delayed-authority-after-catchup".to_string(),
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: shard_id.clone(),
+        owner_epoch: retiring_shard.epoch,
+        operation_digest: String::new(),
+        expected_object_versions: vec![DfsNamespaceObjectVersionExpectation {
+            object_id: object.object_id.clone(),
+            expected_version: None,
+        }],
+        expected_path_occupants: vec![DfsNamespacePathOccupantExpectation {
+            path: object.path.clone(),
+            expected_object_id: None,
+        }],
+        content_receipts: Vec::new(),
+        transaction,
+        completed_request: None,
+        completed_request_completion: None,
+        status: DfsNamespacePrepareStatus::Prepared,
+    };
+    prepare.operation_digest =
+        crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+            .expect("prepare digest");
+    let prepare_entry = source
+        .prepare_namespace_transaction(&prepare)
+        .expect("source namespace prepare");
+    let authority_sequence = prepare_entry.sequence;
+    let authority_prefix = source
+        .metadata_prefix_proof()
+        .expect("authority operation prefix");
+    let authority_batch = source
+        .journal_batch_since_limited(
+            0,
+            DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+            DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+        )
+        .expect("authority source journal")
+        .expect("authority source batch");
+    assert_eq!(authority_batch.next_after_sequence, authority_sequence);
+    let authority_frames = DfsMetadataBackend::journal_frames_for_batch(&source, &authority_batch)
+        .expect("authority exact frames");
+    let authority_probe = DfsMetadataAuthorityProbe {
+        probe_id: "probe-delayed-authority-after-catchup".to_string(),
+        expected_shard: retiring_shard.clone(),
+        operation: crate::service_replica::metadata_authority_operation_for_namespace_prepare(
+            &prepare,
+            authority_sequence,
+        )
+        .expect("authority operation"),
+        durable_journal_ack: true,
+        journal_frames: authority_frames,
+        prepared_prefix: Some(authority_prefix.clone()),
+    };
+    let authority_confirmation =
+        crate::service_replica::metadata_authority_probe_confirmation_id(&authority_probe)
+            .expect("authority confirmation");
+
+    let mut later_file_system = file_system.clone();
+    later_file_system.display_name = "ordinary catch-up past delayed authority".to_string();
+    source
+        .put_file_system(&later_file_system)
+        .expect("advance ordinary source journal");
+    let source_batch = source
+        .journal_batch_since_limited(
+            0,
+            DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+            DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+        )
+        .expect("source journal")
+        .expect("source journal batch");
+    let target_sequence = source_batch.next_after_sequence;
+    let expected_prefix = source.metadata_prefix_proof().expect("source prefix");
+    let prepared = crate::metadata_replication::prepare_dfs_metadata_journal_frame_batch(
+        &source,
+        &source_batch,
+    )
+    .expect("prepare exact catch-up frames");
+    let command = crate::metadata_replication::dfs_metadata_durable_journal_batch_command(
+        &primary,
+        &desired_replica,
+        &file_system.file_system_id,
+        retiring_shard.epoch,
+        prepared,
+    );
+    let expected_confirmation = command
+        .durable_replication
+        .as_ref()
+        .expect("durable replication carrier")
+        .confirmation_id
+        .clone();
+    assert!(command.authority_probe.is_none());
+    assert!(command.batch.entries.is_empty());
+
+    let mut replica = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("replica"))
+        .expect("replica metadata backend");
+    let response =
+        process_dfs_metadata_journal_batch(&mut replica, Some(&context), command.clone());
+
+    assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
+    assert_eq!(response.next_after_sequence, target_sequence);
+    assert_eq!(
+        response.verified_authority_probe_id,
+        Some(expected_confirmation)
+    );
+    assert_eq!(replica.journal_last_sequence(), target_sequence);
+    assert!(target_sequence > authority_sequence);
+    assert!(
+        replica
+            .get_file_system(&file_system.file_system_id)
+            .expect("filesystem before materialization")
+            .is_none(),
+        "ordinary handoff catch-up ACK must not wait for rebuildable table expansion"
+    );
+    assert_eq!(
+        replica
+            .metadata_authority_ack_floor(&shard_id)
+            .expect("operation-specific authority floor"),
+        None,
+        "ordinary catch-up must not alias the operation-specific authority floor"
+    );
+    assert_eq!(
+        replica
+            .metadata_prefix_ack_floor(&shard_id)
+            .expect("ordinary durable prefix floor"),
+        Some(DfsMetadataPrefixAckFloor {
+            shard_id: shard_id.clone(),
+            journal_sequence: target_sequence,
+            state_fingerprint: String::new(),
+            durable_prefix_proof: Some(expected_prefix.clone()),
+        })
+    );
+
+    let delayed_command = || DfsMetadataJournalBatchCommand {
+        request_id: "request-delayed-authority-after-catchup".to_string(),
+        source_node_id: Some(primary.clone()),
+        file_system_id: Some(context.shard.file_system_id.clone()),
+        authority_epoch: Some(context.shard.epoch),
+        verify_prefix_only: false,
+        prefix_probe: None,
+        authority_probe: Some(authority_probe.clone()),
+        durable_replication: None,
+        batch: DfsMetadataJournalBatch {
+            shard_id: shard_id.clone(),
+            entries: Vec::new(),
+            next_after_sequence: authority_sequence,
+        },
+    };
+
+    let mut materialized_first_replica =
+        LocalSobjMetadataBackend::new(shard_id.clone(), root.join("materialized-first-replica"))
+            .expect("materialized-first replica metadata backend");
+    let materialized_first_catchup = process_dfs_metadata_journal_batch(
+        &mut materialized_first_replica,
+        Some(&context),
+        command,
+    );
+    assert_eq!(
+        materialized_first_catchup.result,
+        DfsMetadataJournalBatchResult::Applied
+    );
+    assert!(
+        materialized_first_replica
+            .materialize_pending_replica_journal()
+            .expect("materialize catch-up before first authority operation")
+            > 0
+    );
+    assert_eq!(
+        materialized_first_replica
+            .metadata_prefix_proof()
+            .expect("materialized-first prefix"),
+        expected_prefix
+    );
+    assert_eq!(
+        materialized_first_replica
+            .metadata_authority_ack_floor(&shard_id)
+            .expect("materialized-first authority floor before operation"),
+        None
+    );
+    let materialized_first_delayed = process_dfs_metadata_journal_batch(
+        &mut materialized_first_replica,
+        Some(&context),
+        delayed_command(),
+    );
+    assert_eq!(
+        materialized_first_delayed.result,
+        DfsMetadataJournalBatchResult::Applied,
+        "the first delayed authority delivery at M must remain provable after tables materialize through N"
+    );
+    assert_eq!(materialized_first_delayed.applied_entries, 0);
+    assert_eq!(
+        materialized_first_delayed.verified_authority_probe_id,
+        Some(authority_confirmation.clone())
+    );
+    assert_eq!(
+        materialized_first_replica
+            .metadata_authority_ack_floor(&shard_id)
+            .expect("materialized-first delayed operation authority floor"),
+        Some(DfsMetadataAuthorityAckFloor {
+            shard_id: shard_id.clone(),
+            journal_sequence: authority_sequence,
+            durable_prefix_proof: Some(authority_prefix.clone()),
+        })
+    );
+
+    let delayed =
+        process_dfs_metadata_journal_batch(&mut replica, Some(&context), delayed_command());
+    assert_eq!(delayed.result, DfsMetadataJournalBatchResult::Applied);
+    assert_eq!(delayed.applied_entries, 0);
+    assert_eq!(
+        delayed.verified_authority_probe_id,
+        Some(authority_confirmation.clone())
+    );
+    assert_eq!(
+        replica
+            .metadata_authority_ack_floor(&shard_id)
+            .expect("delayed operation authority floor"),
+        Some(DfsMetadataAuthorityAckFloor {
+            shard_id: shard_id.clone(),
+            journal_sequence: authority_sequence,
+            durable_prefix_proof: Some(authority_prefix.clone()),
+        }),
+        "a monotonic ordinary prefix floor at N must not mask exact operation M"
+    );
+    assert!(
+        replica
+            .materialize_pending_replica_journal()
+            .expect("materialize deferred catch-up")
+            > 0
+    );
+    let retry = process_dfs_metadata_journal_batch(&mut replica, Some(&context), delayed_command());
+    assert_eq!(retry.result, DfsMetadataJournalBatchResult::Applied);
+    assert_eq!(retry.applied_entries, 0);
+    assert_eq!(
+        retry.verified_authority_probe_id,
+        Some(authority_confirmation),
+        "the exact M receipt must remain provable after deferred tables materialize through N"
+    );
+    assert_eq!(
+        replica
+            .metadata_prefix_ack_floor(&shard_id)
+            .expect("ordinary prefix floor after delayed retry"),
+        Some(DfsMetadataPrefixAckFloor {
+            shard_id: shard_id.clone(),
+            journal_sequence: target_sequence,
+            state_fingerprint: String::new(),
+            durable_prefix_proof: Some(expected_prefix),
+        }),
+        "operation retries must not move the ordinary prefix floor backward"
+    );
+    assert_eq!(
+        replica
+            .get_file_system(&file_system.file_system_id)
+            .expect("filesystem after materialization"),
+        Some(later_file_system)
+    );
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -13652,6 +14435,7 @@ fn metadata_prefix_probe_rejects_same_head_with_different_state_and_is_legacy_sa
             primary_handoff_id: None,
         }),
         authority_probe: None,
+        durable_replication: None,
         batch: DfsMetadataJournalBatch {
             shard_id: shard_id.clone(),
             entries: Vec::new(),
@@ -13722,6 +14506,10 @@ fn metadata_snapshot_install_processor_replaces_backend_snapshot() {
 
     let snapshot = source_backend.export_table_snapshot();
     let next_after_sequence = source_backend.journal_last_sequence();
+    let snapshot_prefix = snapshot
+        .prefix_proof
+        .clone()
+        .expect("snapshot exact prefix");
     let mut replica_backend =
         LocalSobjMetadataBackend::new(shard_id.clone(), root.join("replica-meta"))
             .expect("replica metadata backend");
@@ -13739,19 +14527,26 @@ fn metadata_snapshot_install_processor_replaces_backend_snapshot() {
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
     };
+    replica_backend
+        .put_metadata_authority_ack_floor(&DfsMetadataAuthorityAckFloor {
+            shard_id: shard_id.clone(),
+            journal_sequence: next_after_sequence,
+            durable_prefix_proof: Some(snapshot_prefix.clone()),
+        })
+        .expect("matching exact authority floor");
 
     let response = process_dfs_metadata_snapshot_install(
         &mut replica_backend,
         Some(&context),
         DfsMetadataSnapshotInstallCommand {
             request_id: "request-install-snapshot".to_string(),
-            source_node_id: primary,
+            source_node_id: primary.clone(),
             file_system_id: Some(context.shard.file_system_id.clone()),
             authority_epoch: Some(context.shard.epoch),
             primary_handoff_id: None,
             shard_id: shard_id.clone(),
             next_after_sequence,
-            snapshot,
+            snapshot: snapshot.clone(),
             reason: "repair sequence conflict".to_string(),
         },
     );
@@ -13768,6 +14563,42 @@ fn metadata_snapshot_install_processor_replaces_backend_snapshot() {
             .map(|object| object.path.as_str()),
         Some(object.path.as_str())
     );
+
+    let mut divergent_prefix = snapshot_prefix;
+    let final_digit = divergent_prefix.digest.pop().expect("digest digit");
+    divergent_prefix
+        .digest
+        .push(if final_digit == '0' { '1' } else { '0' });
+    let mut divergent_replica =
+        LocalSobjMetadataBackend::new(shard_id.clone(), root.join("divergent-replica-meta"))
+            .expect("divergent replica metadata backend");
+    divergent_replica
+        .put_metadata_authority_ack_floor(&DfsMetadataAuthorityAckFloor {
+            shard_id: shard_id.clone(),
+            journal_sequence: next_after_sequence,
+            durable_prefix_proof: Some(divergent_prefix),
+        })
+        .expect("divergent exact authority floor");
+    let divergent_response = process_dfs_metadata_snapshot_install(
+        &mut divergent_replica,
+        Some(&context),
+        DfsMetadataSnapshotInstallCommand {
+            request_id: "request-install-divergent-snapshot".to_string(),
+            source_node_id: primary,
+            file_system_id: Some(context.shard.file_system_id.clone()),
+            authority_epoch: Some(context.shard.epoch),
+            primary_handoff_id: None,
+            shard_id,
+            next_after_sequence,
+            snapshot,
+            reason: "same-sequence divergent repair".to_string(),
+        },
+    );
+    assert!(matches!(
+        divergent_response.result,
+        DfsMetadataSnapshotInstallResult::Rejected { ref reason }
+            if reason.contains("prefix conflicts with locally acknowledged authority operation")
+    ));
 
     std::fs::remove_dir_all(root).ok();
 }

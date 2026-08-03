@@ -21,12 +21,13 @@ use crate::{
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsConflictRecord, DfsError,
     DfsFileSystemConfig, DfsFileSystemId, DfsMetadataBackend, DfsMetadataShardConfig,
     DfsMetadataShardHeadWatermark, DfsMetadataShardId, DfsMetadataShardMembershipHandoff,
-    DfsMetadataSummary, DfsObjectId, DfsOperatorFileSystemView, DfsOperatorInspector,
-    DfsOperatorObjectView, DfsOperatorRepairView, DfsOperatorStatus, DfsPinAddRequest, DfsPinMode,
-    DfsPinRecord, DfsPinStoreError, LocalDfsPinStore, LocalShardedMetadataBackend,
-    LocalSobjMetadataBackend, MetadataBackendError, default_dfs_repair_attempt_snapshot_path,
-    metadata_shards_prefix, read_dfs_repair_attempt_snapshot, resolve_dfs_conflicts,
-    sifs_file_system_id, use_dfs_conflict_version,
+    DfsMetadataShardWriteFreeze, DfsMetadataSummary, DfsObjectId, DfsOperatorFileSystemView,
+    DfsOperatorInspector, DfsOperatorObjectView, DfsOperatorRepairView, DfsOperatorStatus,
+    DfsPinAddRequest, DfsPinMode, DfsPinRecord, DfsPinStoreError, LocalDfsPinStore,
+    LocalShardedMetadataBackend, LocalSobjMetadataBackend, MetadataBackendError,
+    default_dfs_repair_attempt_snapshot_path, metadata_shards_prefix,
+    read_dfs_repair_attempt_snapshot, resolve_dfs_conflicts, sifs_file_system_id,
+    use_dfs_conflict_version,
 };
 
 const DFS_STATUS_REPAIR_ATTEMPT_SAMPLE_LIMIT: usize = 32;
@@ -239,6 +240,18 @@ pub fn local_dfs_metadata_shard_path(
     shard_id: &DfsMetadataShardId,
 ) -> PathBuf {
     default_dfs_metadata_shards_root(data_dir).join(dfs_path_safe_segment(&shard_id.0))
+}
+
+/// Read only the bounded durable authority marker for one local metadata
+/// shard without opening or recovering its metadata backend.
+pub fn read_local_dfs_metadata_shard_write_freeze(
+    data_dir: &SinomoDataDir,
+    shard_id: &DfsMetadataShardId,
+) -> Result<Option<DfsMetadataShardWriteFreeze>, DfsError> {
+    let path = local_dfs_metadata_shard_path(data_dir, shard_id)
+        .join("journal")
+        .join("membership-handoff-write-freeze.sobj");
+    crate::metadata_io::read_sobj_optional(&path).map_err(Into::into)
 }
 
 pub fn open_local_metadata_shard_backend(

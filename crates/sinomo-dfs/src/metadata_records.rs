@@ -4,6 +4,7 @@
 //! persistence and coordination; this module owns the data shapes that callers
 //! see through the crate-root re-exports.
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sinomo_core::DfsWriteReceipt;
 use sinomo_core::events::EventId;
@@ -93,17 +94,25 @@ pub struct DfsMetadataReplayCursorStatus {
 }
 
 /// Replica-local durable floor established before acknowledging an exact
-/// metadata checkpoint probe. Snapshot repair may not move the shard below
-/// this sequence or install different state at the same sequence.
+/// metadata prefix. Snapshot repair may not move the shard below this sequence
+/// or install a different prefix at the same sequence.
+///
+/// A materialized checkpoint probe records `state_fingerprint`; ordinary
+/// durable journal replication records `durable_prefix_proof` without forcing
+/// rebuildable table expansion onto the ACK path. A later checkpoint probe may
+/// enrich the same-sequence floor with its semantic fingerprint.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataPrefixAckFloor {
     pub shard_id: DfsMetadataShardId,
     pub journal_sequence: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub state_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_prefix_proof: Option<DfsMetadataPrefixProof>,
 }
 
-/// Replica-local durable floor established before acknowledging an ordinary
-/// metadata authority probe.
+/// Replica-local durable floor established before acknowledging one exact
+/// metadata authority operation.
 ///
 /// Unlike an exact prefix checkpoint, this floor deliberately carries no
 /// whole-shard fingerprint: the receiver has already re-read and verified the
@@ -113,6 +122,11 @@ pub struct DfsMetadataPrefixAckFloor {
 pub struct DfsMetadataAuthorityAckFloor {
     pub shard_id: DfsMetadataShardId,
     pub journal_sequence: u64,
+    /// Exact durable journal prefix acknowledged at this floor. Legacy and
+    /// fully-materialized acknowledgements omit it; the materialized table
+    /// prefix remains their authoritative proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_prefix_proof: Option<DfsMetadataPrefixProof>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -625,17 +639,41 @@ pub struct DfsMetadataPrefixProof {
 }
 
 pub(crate) const DFS_METADATA_PREFIX_PROOF_VERSION: u16 = 1;
+pub(crate) const DFS_METADATA_PREFIX_PROOF_EXACT_FRAME_VERSION: u16 = 2;
 const DFS_METADATA_PREFIX_PROOF_DIGEST_PREFIX: &str = "dfs-metadata-prefix-v1:blake3:";
+const DFS_METADATA_PREFIX_PROOF_EXACT_FRAME_DIGEST_PREFIX: &str = "dfs-metadata-prefix-v2:blake3:";
 
 impl DfsMetadataPrefixProof {
+    pub(crate) fn from_digest(journal_sequence: u64, digest: impl Into<String>) -> Option<Self> {
+        let digest = digest.into();
+        [
+            DFS_METADATA_PREFIX_PROOF_VERSION,
+            DFS_METADATA_PREFIX_PROOF_EXACT_FRAME_VERSION,
+        ]
+        .into_iter()
+        .find_map(|version| {
+            let proof = Self {
+                version,
+                journal_sequence,
+                digest: digest.clone(),
+            };
+            proof.is_well_formed().then_some(proof)
+        })
+    }
+
     pub(crate) fn is_well_formed(&self) -> bool {
-        self.version == DFS_METADATA_PREFIX_PROOF_VERSION
-            && self
+        let digest = match self.version {
+            DFS_METADATA_PREFIX_PROOF_VERSION => self
                 .digest
-                .strip_prefix(DFS_METADATA_PREFIX_PROOF_DIGEST_PREFIX)
-                .is_some_and(|digest| {
-                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-                })
+                .strip_prefix(DFS_METADATA_PREFIX_PROOF_DIGEST_PREFIX),
+            DFS_METADATA_PREFIX_PROOF_EXACT_FRAME_VERSION => self
+                .digest
+                .strip_prefix(DFS_METADATA_PREFIX_PROOF_EXACT_FRAME_DIGEST_PREFIX),
+            _ => None,
+        };
+        digest.is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
     }
 }
 
@@ -648,6 +686,19 @@ fn metadata_prefix_digest(parts: &[&[u8]]) -> String {
     }
     format!(
         "{DFS_METADATA_PREFIX_PROOF_DIGEST_PREFIX}{}",
+        hasher.finalize().to_hex()
+    )
+}
+
+fn metadata_exact_frame_prefix_digest(parts: &[&[u8]]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo-dfs-metadata-prefix-proof\0v2\0");
+    for part in parts {
+        hasher.update(&(part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    format!(
+        "{DFS_METADATA_PREFIX_PROOF_EXACT_FRAME_DIGEST_PREFIX}{}",
         hasher.finalize().to_hex()
     )
 }
@@ -676,6 +727,7 @@ pub(crate) fn dfs_metadata_prefix_proof_seed(
 /// Extend a validated contiguous prefix with one payload-complete journal
 /// entry. Replicas hash the exact entry received from the authority, so equal
 /// proofs imply equal journal payloads rather than merely equal sequence IDs.
+#[cfg(test)]
 pub(crate) fn dfs_metadata_prefix_proof_after(
     previous: &DfsMetadataPrefixProof,
     entry: &DfsMetadataJournalEntry,
@@ -692,6 +744,37 @@ pub(crate) fn dfs_metadata_prefix_proof_after(
             &encoded_entry,
         ]),
     })
+}
+
+/// Extend an exact prefix from the immutable bytes of one encoded journal
+/// frame.
+///
+/// This is a format-compatible successor to [`dfs_metadata_prefix_proof_after`].
+/// The legacy helper deliberately continues hashing canonical JSON and
+/// producing a version-1 proof. New journal code can instead encode its SOBJ
+/// frame once, append those exact bytes, and pass the same bytes here. The
+/// previous version and sequence are included explicitly so the first V2
+/// extension can safely start from an existing V1 semantic checkpoint.
+pub(crate) fn dfs_metadata_prefix_proof_v2_after_bytes(
+    previous: &DfsMetadataPrefixProof,
+    journal_sequence: u64,
+    exact_frame_bytes: &[u8],
+) -> DfsMetadataPrefixProof {
+    let previous_version = previous.version.to_be_bytes();
+    let previous_sequence = previous.journal_sequence.to_be_bytes();
+    let journal_sequence_bytes = journal_sequence.to_be_bytes();
+    DfsMetadataPrefixProof {
+        version: DFS_METADATA_PREFIX_PROOF_EXACT_FRAME_VERSION,
+        journal_sequence,
+        digest: metadata_exact_frame_prefix_digest(&[
+            b"journal-frame",
+            &previous_version,
+            &previous_sequence,
+            previous.digest.as_bytes(),
+            &journal_sequence_bytes,
+            exact_frame_bytes,
+        ]),
+    }
 }
 
 /// Mutation payload stored in the metadata journal.
@@ -1147,22 +1230,6 @@ impl<'a> DfsNamespacePreparePayloadRef<'a> {
                     && *outer_status == status
                     && prepare.matches_prepare_identity(shard_id, owner_epoch, operation_digest)
             }
-        }
-    }
-
-    pub(crate) fn record_count(&self) -> usize {
-        match self {
-            Self::Canonical { prepare, .. } => prepare
-                .transaction
-                .objects
-                .len()
-                .saturating_add(prepare.transaction.versions.len())
-                .saturating_add(prepare.transaction.advisory_lock_states.len())
-                .saturating_add(prepare.expected_object_versions.len())
-                .saturating_add(prepare.expected_path_occupants.len())
-                .saturating_add(prepare.content_receipts.len()),
-            Self::PackedV1 { prepare, .. } => prepare.record_count(),
-            Self::PackedV2 { prepare, .. } => prepare.record_count(),
         }
     }
 }
@@ -1793,6 +1860,17 @@ pub struct DfsMetadataJournalBatch {
     pub next_after_sequence: u64,
 }
 
+/// Exact immutable SOBJ bytes for one journal entry carried by versioned
+/// authority and ordinary replica-catch-up paths. `sequence` is duplicated
+/// outside the bytes so bounds, ordering, and response correlation can be
+/// checked before decoding a large payload; receivers must still verify that
+/// the decoded entry matches it.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataJournalFrameRecord {
+    pub sequence: u64,
+    pub exact_bytes: Bytes,
+}
+
 /// Atomic namespace batch used to publish related object and version records.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsNamespaceTransaction {
@@ -1827,11 +1905,12 @@ impl DfsNamespaceTransactionReceipt {
         transaction: &DfsNamespaceTransaction,
         retained_at: OffsetDateTime,
     ) -> Result<Self, serde_json::Error> {
-        let encoded = serde_json::to_vec(transaction)?;
+        let mut hasher = blake3::Hasher::new();
+        serde_json::to_writer(Blake3HashWriter(&mut hasher), transaction)?;
         Ok(Self {
             transaction_id: transaction.transaction_id.clone(),
             file_system_id: transaction.file_system_id.clone(),
-            transaction_digest: format!("blake3:{}", blake3::hash(&encoded).to_hex()),
+            transaction_digest: format!("blake3:{}", hasher.finalize().to_hex()),
             created_at: transaction.created_at,
             retained_at,
         })
@@ -1842,6 +1921,21 @@ impl DfsNamespaceTransactionReceipt {
         transaction: &DfsNamespaceTransaction,
     ) -> Result<bool, serde_json::Error> {
         Ok(self == &Self::from_transaction(transaction, self.retained_at)?)
+    }
+}
+
+/// Streaming sink used for stable JSON identities without allocating another
+/// complete copy of a bulk namespace transaction.
+struct Blake3HashWriter<'a>(&'a mut blake3::Hasher);
+
+impl std::io::Write for Blake3HashWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -2812,12 +2906,13 @@ pub(crate) fn dfs_metadata_table_snapshot_matches_checkpoint(
     journal_sequence: u64,
     expected_fingerprint: &str,
 ) -> Result<bool, serde_json::Error> {
-    if expected_fingerprint.starts_with(DFS_METADATA_PREFIX_PROOF_DIGEST_PREFIX) {
-        return Ok(snapshot.prefix_proof.as_ref().is_some_and(|proof| {
-            proof.is_well_formed()
-                && proof.journal_sequence == journal_sequence
-                && proof.digest == expected_fingerprint
-        }));
+    if let Some(expected_proof) =
+        DfsMetadataPrefixProof::from_digest(journal_sequence, expected_fingerprint.to_string())
+    {
+        return Ok(snapshot
+            .prefix_proof
+            .as_ref()
+            .is_some_and(|proof| proof.is_well_formed() && proof == &expected_proof));
     }
     Ok(dfs_metadata_table_snapshot_state_fingerprint(snapshot)? == expected_fingerprint)
 }
@@ -3090,6 +3185,15 @@ pub(crate) enum DfsMetadataTableOp {
         operation_id: String,
         operation_digest: String,
         owner_epoch: u64,
+        /// Deterministic terminal-window start copied from the authoritative
+        /// commit journal entry. Legacy table markers omit it and fall back to
+        /// the prepared transaction timestamp.
+        #[serde(
+            default,
+            with = "time::serde::rfc3339::option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        retained_at: Option<OffsetDateTime>,
     },
     PutNamespacePrepareReceipt {
         receipt: DfsNamespacePrepareReceipt,
@@ -3373,6 +3477,73 @@ mod tests {
             "DfsMetadataJournalEntry grew to {} bytes",
             std::mem::size_of::<DfsMetadataJournalEntry>()
         );
+    }
+
+    fn prefix_test_entry(sequence: u64) -> DfsMetadataJournalEntry {
+        DfsMetadataJournalEntry {
+            shard_id: DfsMetadataShardId::new("services"),
+            sequence,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            mutation: DfsMetadataMutation::PutFileSystem {
+                file_system_id: DfsFileSystemId::from_legacy_named("sifs-prefix-proof-test")
+                    .expect("filesystem id"),
+                file_system: None,
+            },
+        }
+    }
+
+    #[test]
+    fn legacy_prefix_proof_encoding_remains_v1_json_compatible() {
+        let seed = dfs_metadata_prefix_proof_seed(
+            &DfsMetadataShardId::new("services"),
+            0,
+            "semantic-state",
+        );
+        let entry = prefix_test_entry(1);
+        let proof = dfs_metadata_prefix_proof_after(&seed, &entry).expect("legacy proof");
+
+        assert_eq!(proof.version, DFS_METADATA_PREFIX_PROOF_VERSION);
+        assert!(proof.is_well_formed());
+        assert_eq!(
+            proof.digest,
+            "dfs-metadata-prefix-v1:blake3:9a12f641231be2f7a1986dd2282b4b5e59820e230b267b631507b77c5cf762ae"
+        );
+        assert_eq!(
+            serde_json::from_value::<DfsMetadataPrefixProof>(
+                serde_json::to_value(&proof).expect("encode legacy proof")
+            )
+            .expect("decode legacy proof"),
+            proof
+        );
+    }
+
+    #[test]
+    fn exact_frame_prefix_proof_is_byte_sensitive_and_chains_from_v1() {
+        let seed = dfs_metadata_prefix_proof_seed(
+            &DfsMetadataShardId::new("services"),
+            0,
+            "semantic-state",
+        );
+        let first_bytes = b"exact-sobj-frame";
+        let first = dfs_metadata_prefix_proof_v2_after_bytes(&seed, 1, first_bytes);
+        let same = dfs_metadata_prefix_proof_v2_after_bytes(&seed, 1, first_bytes);
+        let changed = dfs_metadata_prefix_proof_v2_after_bytes(&seed, 1, b"exact-sobj-framf");
+
+        assert_eq!(first, same);
+        assert_ne!(first.digest, changed.digest);
+        assert_eq!(first.version, DFS_METADATA_PREFIX_PROOF_EXACT_FRAME_VERSION);
+        assert!(first.is_well_formed());
+
+        let second = dfs_metadata_prefix_proof_v2_after_bytes(&first, 2, b"next-frame");
+        assert_eq!(second.journal_sequence, 2);
+        assert!(second.is_well_formed());
+
+        let mut wrong_prefix = second.clone();
+        wrong_prefix.digest =
+            wrong_prefix
+                .digest
+                .replacen("dfs-metadata-prefix-v2", "dfs-metadata-prefix-v1", 1);
+        assert!(!wrong_prefix.is_well_formed());
     }
 
     fn node(value: &str) -> NodeId {

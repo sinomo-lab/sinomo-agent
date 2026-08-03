@@ -368,6 +368,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 repair_maintenance: false,
                 namespace_maintenance: job.status == DfsNamespaceJobStatus::Running,
                 metadata_replica_progress: false,
+                metadata_materialization: false,
             });
         }
         if namespace_job_kind_is_cross_shard(&job.kind) {

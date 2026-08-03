@@ -20,14 +20,16 @@ use crate::metadata_cursor::journal_write_lock_path;
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_io::{read_sobj_optional, write_sobj_atomic};
 use crate::metadata_journal::{
-    durable_journal_entries_since_limited, prune_segmented_journal_before_checkpoint,
+    durable_journal_entries_since_limited, metadata_prefix_proof_after_exact_frame,
+    prune_segmented_journal_before_checkpoint, read_segmented_journal_frame_at_sequence,
 };
 use crate::metadata_lock::{
     MetadataWriteActivity, metadata_checkpoint_write_lock, metadata_write_activity,
 };
+#[cfg(test)]
+use crate::metadata_records::dfs_metadata_prefix_proof_after;
 use crate::metadata_records::{
-    DFS_METADATA_PREFIX_PROOF_VERSION, DfsMetadataPrefixProof, DfsMetadataTableBatch,
-    DfsMetadataTableOp, DfsNamespacePrepareRecord, dfs_metadata_prefix_proof_after,
+    DfsMetadataPrefixProof, DfsMetadataTableBatch, DfsMetadataTableOp, DfsNamespacePrepareRecord,
 };
 use crate::metadata_table_store::{
     append_metadata_table_batch, current_metadata_table_log_replay, encode_metadata_table_snapshot,
@@ -1855,11 +1857,17 @@ fn advance_activated_handoff_rebind_checkpoint(
         )));
     }
 
-    let base = DfsMetadataPrefixProof {
-        version: DFS_METADATA_PREFIX_PROOF_VERSION,
-        journal_sequence: freeze.journal_sequence,
-        digest: freeze.state_fingerprint.clone(),
-    };
+    let base = DfsMetadataPrefixProof::from_digest(
+        freeze.journal_sequence,
+        freeze.state_fingerprint.clone(),
+    )
+    .ok_or_else(|| {
+        MetadataBackendError::Serde(format!(
+            "metadata shard handoff {} at {} has a malformed marker prefix",
+            freeze.handoff_id,
+            root.display()
+        ))
+    })?;
     let mut reconstructed = freeze
         .rebind_prefix_proof
         .clone()
@@ -1916,15 +1924,29 @@ fn advance_activated_handoff_rebind_checkpoint(
                         reconstructed.journal_sequence
                     )));
                 }
-                reconstructed =
-                    dfs_metadata_prefix_proof_after(&reconstructed, &entry).map_err(|source| {
+                let frame = read_segmented_journal_frame_at_sequence(root, entry.sequence)?
+                    .ok_or_else(|| {
                         MetadataBackendError::Serde(format!(
-                            "metadata shard handoff {} at {} cannot encode rebind entry {}: {source}",
+                            "metadata shard handoff {} at {} has no exact frame for rebind entry {}",
                             freeze.handoff_id,
                             root.display(),
                             entry.sequence
                         ))
-                })?;
+                    })?;
+                if frame.entry() != &entry {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata shard handoff {} at {} has divergent exact frame for rebind entry {}",
+                        freeze.handoff_id,
+                        root.display(),
+                        entry.sequence
+                    )));
+                }
+                reconstructed = metadata_prefix_proof_after_exact_frame(
+                    &reconstructed,
+                    &entry,
+                    &entry.shard_id,
+                    frame.exact_bytes(),
+                )?;
             }
             if reconstructed.journal_sequence <= previous_sequence {
                 return Err(MetadataBackendError::Serde(format!(
@@ -2387,6 +2409,7 @@ mod tests {
             operation_id: prepare.operation_id.clone(),
             operation_digest: prepare.operation_digest.clone(),
             owner_epoch: prepare.owner_epoch,
+            retained_at: Some(prepare.transaction.created_at),
         }
     }
 
@@ -3123,17 +3146,32 @@ mod tests {
         )
         .expect("append compact commit marker");
 
+        assert!(
+            !tables
+                .namespace_prepares
+                .contains_key(&prepare.operation_id),
+            "a committed prepare must not retain its full body"
+        );
+        assert!(
+            !tables
+                .namespace_transactions
+                .contains_key(&prepare.transaction.transaction_id),
+            "a committed transaction must not retain its full body"
+        );
         assert_eq!(
             tables
-                .namespace_prepares
+                .namespace_prepare_receipts
                 .get(&prepare.operation_id)
-                .map(|prepare| &prepare.status),
+                .map(|receipt| &receipt.status),
             Some(&DfsNamespacePrepareStatus::Committed)
         );
         assert!(
             tables
-                .namespace_transactions
-                .contains_key(&prepare.transaction.transaction_id)
+                .namespace_transaction_receipts
+                .get(&prepare.transaction.transaction_id)
+                .expect("compact transaction receipt")
+                .matches_transaction(&prepare.transaction)
+                .expect("transaction identity")
         );
 
         let reopened =
@@ -3158,11 +3196,22 @@ mod tests {
             "empty-reference-generation",
         ));
         let mut next_sequence = 1;
-        let max_replay_bytes = NAMESPACE_PREPARE_REPLAY_BASE_BYTES.saturating_sub(1);
-        let prepare = namespace_prepare(
+        // Leave room for both compact table markers while keeping the full
+        // authoritative prepare above the logical replay-pressure threshold.
+        let max_replay_bytes = NAMESPACE_PREPARE_REPLAY_BASE_BYTES.saturating_add(512);
+        let with_replay_pressure = |mut prepare: DfsNamespacePrepareRecord| {
+            prepare.expected_path_occupants = (0..3)
+                .map(|index| crate::DfsNamespacePathOccupantExpectation {
+                    path: format!("/replay-pressure/{}/{index}", prepare.operation_id),
+                    expected_object_id: None,
+                })
+                .collect();
+            prepare
+        };
+        let prepare = with_replay_pressure(namespace_prepare(
             "operation_replay_pressure",
             DfsNamespacePrepareStatus::Prepared,
-        );
+        ));
         let entry = write_local_journal_entry(
             root.path(),
             &shard_id,
@@ -3215,7 +3264,8 @@ mod tests {
         );
         assert!(
             table_log_journal_reference_replay_cost_bytes > max_replay_bytes,
-            "the compact reference must cross the reconstructed replay-cost trigger"
+            "the compact reference must cross the reconstructed replay-cost trigger: logical={} threshold={max_replay_bytes}",
+            table_log_journal_reference_replay_cost_bytes,
         );
         assert_eq!(table_log_unpriced_namespace_prepare_references, 0);
 
@@ -3270,10 +3320,10 @@ mod tests {
         let first_snapshot =
             fs::read(metadata_table_snapshot_path(root.path())).expect("first snapshot bytes");
 
-        let second_prepare = namespace_prepare(
+        let second_prepare = with_replay_pressure(namespace_prepare(
             "operation_replay_pressure_second_generation",
             DfsNamespacePrepareStatus::Prepared,
-        );
+        ));
         let second_prepare_entry = write_local_journal_entry(
             root.path(),
             &shard_id,

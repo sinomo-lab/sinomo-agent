@@ -55,9 +55,10 @@ use crate::metadata_records::*;
 #[cfg(test)]
 use crate::metadata_shard_index::object_shard_index_path;
 use crate::metadata_shard_index::{
-    DfsObjectShardIndexRecord, read_object_shard_index, read_object_shard_index_for_rebuild,
-    remove_object_shard_index, write_content_commit_object_shard_index,
-    write_new_object_shard_indexes, write_object_shard_index,
+    DfsObjectShardIndexRecord, object_shard_index_record, read_object_shard_index,
+    read_object_shard_index_for_rebuild, remove_object_shard_index,
+    write_content_commit_object_shard_index, write_new_object_shard_indexes,
+    write_object_shard_index, write_object_shard_index_records,
     write_transaction_object_shard_indexes,
 };
 use crate::metadata_shard_migration::{
@@ -355,13 +356,16 @@ mod namespace_prepare_codec_handoff_tests {
         operation_id: &str,
         expected: DfsNamespacePrepareStatus,
     ) {
-        assert_eq!(
-            backend
-                .get_namespace_prepare(operation_id)
-                .expect("namespace prepare lookup")
-                .map(|prepare| prepare.status),
-            Some(expected)
-        );
+        let full_status = backend
+            .get_namespace_prepare(operation_id)
+            .expect("namespace prepare lookup")
+            .map(|prepare| prepare.status);
+        let receipt_status = backend
+            .shard_backend(&DfsMetadataShardId::new("root"))
+            .expect("root shard")
+            .namespace_prepare_receipt_ref(operation_id)
+            .map(|receipt| receipt.status.clone());
+        assert_eq!(full_status.or(receipt_status), Some(expected));
     }
 
     #[test]
@@ -1576,6 +1580,59 @@ impl LocalShardedMetadataBackend {
         shard_id: &DfsMetadataShardId,
     ) -> Result<()> {
         write_transaction_object_shard_indexes(&self.root, objects, shard_id)
+    }
+
+    fn unique_namespace_prepare_shard_id(
+        &self,
+        operation_id: &str,
+        include_terminal_receipt: bool,
+    ) -> Result<DfsMetadataShardId> {
+        let mut found_shard_id = None;
+        for (shard_id, slot) in &self.shards {
+            let backend = slot.backend()?;
+            let present = if include_terminal_receipt {
+                backend.has_current_namespace_prepare_identity(operation_id)?
+            } else {
+                backend.has_current_namespace_prepare(operation_id)?
+            };
+            if present {
+                if found_shard_id.is_some() {
+                    return Err(MetadataBackendError::Serde(format!(
+                        "namespace prepare {operation_id} exists on multiple local shards"
+                    )));
+                }
+                found_shard_id = Some(shard_id.clone());
+            }
+        }
+        found_shard_id.ok_or_else(|| {
+            MetadataBackendError::Serde(format!("namespace prepare {operation_id} does not exist"))
+        })
+    }
+
+    fn namespace_prepare_routing_records(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        operation_id: &str,
+    ) -> Result<Vec<DfsObjectShardIndexRecord>> {
+        let backend = self.shard_backend(shard_id)?;
+        if let Some(prepare) = backend.namespace_prepare_ref(operation_id) {
+            return Ok(prepare
+                .transaction
+                .objects
+                .iter()
+                .map(|object| object_shard_index_record(object, shard_id))
+                .collect());
+        }
+        if backend
+            .namespace_prepare_receipt_ref(operation_id)
+            .is_some()
+        {
+            return Ok(Vec::new());
+        }
+        Err(MetadataBackendError::Serde(format!(
+            "namespace prepare {operation_id} disappeared from shard {}",
+            shard_id.0
+        )))
     }
 
     fn remove_object_shard_index(&self, object_id: &DfsObjectId) -> Result<()> {
@@ -4913,21 +4970,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         rebound_prepare: &DfsNamespacePrepareRecord,
     ) -> Result<DfsMetadataJournalEntry> {
         let rebound = normalized_namespace_prepare(rebound_prepare);
-        let mut found_shard_id = None;
-        for (shard_id, slot) in &self.shards {
-            let backend = slot.backend()?;
-            if backend.has_current_namespace_prepare(operation_id)? {
-                if found_shard_id.is_some() {
-                    return Err(MetadataBackendError::Serde(format!(
-                        "namespace prepare {operation_id} exists on multiple local shards"
-                    )));
-                }
-                found_shard_id = Some(shard_id.clone());
-            }
-        }
-        let shard_id = found_shard_id.ok_or_else(|| {
-            MetadataBackendError::Serde(format!("namespace prepare {operation_id} does not exist"))
-        })?;
+        let shard_id = self.unique_namespace_prepare_shard_id(operation_id, false)?;
         if rebound.shard_id != shard_id {
             return Err(MetadataBackendError::Serde(format!(
                 "namespace prepare {operation_id} is durable on shard {}, not rebound shard {}",
@@ -4969,35 +5012,21 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         expected_operation_digest: &str,
         expected_owner_epoch: u64,
     ) -> Result<DfsMetadataJournalEntry> {
-        let mut found_shard_id = None;
-        for (shard_id, slot) in &self.shards {
-            let backend = slot.backend()?;
-            if backend.has_current_namespace_prepare(operation_id)? {
-                if found_shard_id.is_some() {
-                    return Err(MetadataBackendError::Serde(format!(
-                        "namespace prepare {operation_id} exists on multiple local shards"
-                    )));
-                }
-                found_shard_id = Some(shard_id.clone());
-            }
-        }
-        let shard_id = found_shard_id.ok_or_else(|| {
-            MetadataBackendError::Serde(format!("namespace prepare {operation_id} does not exist"))
-        })?;
+        let shard_id = self.unique_namespace_prepare_shard_id(operation_id, true)?;
+        let routing_records = self.namespace_prepare_routing_records(&shard_id, operation_id)?;
         let root = self.root.clone();
+        // The object-to-shard index is a disposable routing projection. Install
+        // its exact lightweight rows before the semantic commit so a successful
+        // compacting commit can never lose the body required by a later index
+        // write. If the journal append fails, these ahead-of-state rows still
+        // route to the correct shard and the hidden objects remain invisible.
+        write_object_shard_index_records(&root, &routing_records)?;
         let backend = self.shard_backend_mut(&shard_id)?;
         let entry = backend.commit_prepared_namespace_transaction(
             operation_id,
             expected_operation_digest,
             expected_owner_epoch,
         )?;
-        let prepare = backend.namespace_prepare_ref(operation_id).ok_or_else(|| {
-            MetadataBackendError::Serde(format!(
-                "committed namespace prepare {operation_id} disappeared from shard {}",
-                shard_id.0
-            ))
-        })?;
-        write_transaction_object_shard_indexes(&root, &prepare.transaction.objects, &shard_id)?;
         Ok(entry)
     }
 
@@ -5008,20 +5037,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         expected_operation_digest: &str,
         expected_owner_epoch: u64,
     ) -> Result<DfsMetadataJournalEntry> {
+        let routing_records = self.namespace_prepare_routing_records(shard_id, operation_id)?;
         let root = self.root.clone();
+        write_object_shard_index_records(&root, &routing_records)?;
         let backend = self.shard_backend_mut(shard_id)?;
         let entry = backend.commit_prepared_namespace_transaction(
             operation_id,
             expected_operation_digest,
             expected_owner_epoch,
         )?;
-        let prepare = backend.namespace_prepare_ref(operation_id).ok_or_else(|| {
-            MetadataBackendError::Serde(format!(
-                "committed namespace prepare {operation_id} disappeared from shard {}",
-                shard_id.0
-            ))
-        })?;
-        write_transaction_object_shard_indexes(&root, &prepare.transaction.objects, shard_id)?;
         Ok(entry)
     }
 
@@ -5031,21 +5055,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         expected_operation_digest: &str,
         expected_owner_epoch: u64,
     ) -> Result<DfsMetadataJournalEntry> {
-        let mut found_shard_id = None;
-        for (shard_id, slot) in &self.shards {
-            let backend = slot.backend()?;
-            if backend.has_current_namespace_prepare(operation_id)? {
-                if found_shard_id.is_some() {
-                    return Err(MetadataBackendError::Serde(format!(
-                        "namespace prepare {operation_id} exists on multiple local shards"
-                    )));
-                }
-                found_shard_id = Some(shard_id.clone());
-            }
-        }
-        let shard_id = found_shard_id.ok_or_else(|| {
-            MetadataBackendError::Serde(format!("namespace prepare {operation_id} does not exist"))
-        })?;
+        let shard_id = self.unique_namespace_prepare_shard_id(operation_id, true)?;
         self.shard_backend_mut(&shard_id)?
             .abort_prepared_namespace_transaction(
                 operation_id,
@@ -5926,6 +5936,13 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         )
     }
 
+    fn journal_frames_for_batch(
+        &self,
+        batch: &DfsMetadataJournalBatch,
+    ) -> Result<Vec<DfsMetadataJournalFrameRecord>> {
+        DfsMetadataBackend::journal_frames_for_batch(self.shard_backend(&batch.shard_id)?, batch)
+    }
+
     fn export_shard_table_snapshot(
         &self,
         shard_id: &DfsMetadataShardId,
@@ -6241,6 +6258,34 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             .apply_journal_batch_with_replica_permit_report(permit, batch)?;
         self.reconcile_object_shard_indexes(affected_object_ids.iter())?;
         Ok(report)
+    }
+
+    fn persist_journal_frames_with_replica_permit_report(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+        frames: &[DfsMetadataJournalFrameRecord],
+    ) -> Result<DfsMetadataReplicaApplyReport> {
+        self.require_replica_ingest_permit_for_shard(permit, &batch.shard_id)?;
+        self.shard_backend_mut(&batch.shard_id)?
+            .persist_journal_frames_with_replica_permit_report(permit, batch, frames)
+    }
+
+    fn persist_authority_journal_frames_with_replica_permit_report(
+        &mut self,
+        permit: &DfsMetadataReplicaIngestPermit,
+        batch: &DfsMetadataJournalBatch,
+        frames: &[DfsMetadataJournalFrameRecord],
+        expected_target_prefix: &DfsMetadataPrefixProof,
+    ) -> Result<DfsMetadataReplicaApplyReport> {
+        self.require_replica_ingest_permit_for_shard(permit, &batch.shard_id)?;
+        self.shard_backend_mut(&batch.shard_id)?
+            .persist_authority_journal_frames_with_replica_permit_report(
+                permit,
+                batch,
+                frames,
+                expected_target_prefix,
+            )
     }
 
     fn replace_with_replicated_snapshot(

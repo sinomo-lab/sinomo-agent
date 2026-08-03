@@ -51,6 +51,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             repair_maintenance: durable_nodes.len() < intent.policy.desired_replicas,
             namespace_maintenance: false,
             metadata_replica_progress: false,
+            metadata_materialization: false,
         });
     }
 
