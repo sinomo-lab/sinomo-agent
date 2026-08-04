@@ -471,7 +471,7 @@ impl DfsMetadataTables {
         );
         self.namespace_prepare_receipts
             .remove(&prepare.operation_id);
-        self.put_namespace_prepare_indexed_with_footprint(prepare, footprint);
+        self.put_namespace_prepare_indexed_with_footprint(*prepare, footprint);
         Ok(())
     }
 
@@ -577,7 +577,7 @@ impl DfsMetadataTables {
                 .is_some_and(|receipt| receipt.matches_completed_request(&request));
             if !materialized {
                 self.apply_with_rollback(
-                    DfsMetadataTableOp::PutNamespaceRequest { request },
+                    DfsMetadataTableOp::put_namespace_request(request),
                     rollback,
                 );
             }
@@ -593,9 +593,9 @@ impl DfsMetadataTables {
                     .is_some_and(|receipt| receipt.matches_completion(&completion));
             if !materialized {
                 self.apply_with_rollback(
-                    DfsMetadataTableOp::PutNamespaceRequestReceipt {
-                        receipt: DfsNamespaceRequestReceipt::from_completion(&completion),
-                    },
+                    DfsMetadataTableOp::put_namespace_request_receipt(
+                        DfsNamespaceRequestReceipt::from_completion(&completion),
+                    ),
                     rollback,
                 );
             }
@@ -689,7 +689,7 @@ impl DfsMetadataTables {
                 .get(&key)
                 .is_some_and(|receipt| receipt.matches_completed_request(&request));
             if !materialized {
-                Some(DfsMetadataTableOp::PutNamespaceRequest { request })
+                Some(DfsMetadataTableOp::put_namespace_request(request))
             } else {
                 None
             }
@@ -704,9 +704,9 @@ impl DfsMetadataTables {
                     .get(&key)
                     .is_some_and(|receipt| receipt.matches_completion(&completion));
             if !materialized {
-                Some(DfsMetadataTableOp::PutNamespaceRequestReceipt {
-                    receipt: DfsNamespaceRequestReceipt::from_completion(&completion),
-                })
+                Some(DfsMetadataTableOp::put_namespace_request_receipt(
+                    DfsNamespaceRequestReceipt::from_completion(&completion),
+                ))
             } else {
                 None
             }
@@ -1456,7 +1456,7 @@ impl DfsMetadataTables {
             DfsMetadataTableOp::PutNamespacePrepare { prepare } => {
                 self.namespace_prepare_receipts
                     .remove(&prepare.operation_id);
-                self.put_namespace_prepare_indexed(prepare);
+                self.put_namespace_prepare_indexed(*prepare);
             }
             DfsMetadataTableOp::PutNamespacePrepareJournalReference {
                 journal_sequence,
@@ -1516,7 +1516,7 @@ impl DfsMetadataTables {
                     request.requester_node_id.clone(),
                     request.request_id.clone(),
                 ));
-                self.put_namespace_request_indexed(request);
+                self.put_namespace_request_indexed(*request);
             }
             DfsMetadataTableOp::PutNamespaceRequestReceipt { receipt } => {
                 let key = (
@@ -1529,7 +1529,7 @@ impl DfsMetadataTables {
                     self.pending_namespace_request_order
                         .remove(&Self::namespace_request_order_key(&previous));
                 }
-                self.namespace_request_receipts.insert(key, receipt);
+                self.namespace_request_receipts.insert(key, *receipt);
             }
             DfsMetadataTableOp::RemoveNamespaceRequestReceipt {
                 requester_node_id,

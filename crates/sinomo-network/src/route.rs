@@ -853,15 +853,8 @@ where
         let result = match stream {
             Ok(stream) => {
                 authenticated_stream_established = true;
-                let context = crate::object_rpc_stream::RpcPeerContext::authenticated(
-                    stream.local_node_id.clone(),
-                    stream.peer_node_id.clone(),
-                    stream.session_id.clone(),
-                    stream.channel_binding,
-                )?;
                 crate::service_rpc_stream::call_service_rpc_peer_stream(
                     stream,
-                    &context,
                     call,
                     crate::ObjectFrameIoOptions::idle_timeout(policy.health.no_progress_timeout),
                 )
@@ -974,13 +967,8 @@ where
             establish,
         )
         .await?;
-        let context = crate::object_rpc_stream::RpcPeerContext::unauthenticated_local(
-            stream.session_id.clone(),
-            stream.channel_binding,
-        );
         let result = crate::service_rpc_stream::call_service_rpc_peer_stream(
             stream,
-            &context,
             call,
             crate::ObjectFrameIoOptions::idle_timeout(policy.health.no_progress_timeout),
         )
@@ -1194,18 +1182,11 @@ where
             stream_result.is_ok(),
         );
         let stream = stream_result?;
-        let context = crate::object_rpc_stream::RpcPeerContext::authenticated(
-            stream.local_node_id.clone(),
-            stream.peer_node_id.clone(),
-            stream.session_id.clone(),
-            stream.channel_binding,
-        )?;
         let exchange_started_ns = trace
             .map(|_| crate::network_timeline_monotonic_ns())
             .unwrap_or(0);
         let result = crate::service_rpc_stream::call_service_rpc_peer_stream(
             stream,
-            &context,
             call,
             crate::ObjectFrameIoOptions::idle_timeout(policy.health.no_progress_timeout),
         )

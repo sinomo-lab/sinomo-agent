@@ -1310,6 +1310,7 @@ impl PeerStream {
         Ok(stream)
     }
 
+    #[cfg(test)]
     pub(crate) const fn has_owned_chunks(&self) -> bool {
         self.chunk_io.is_some()
     }

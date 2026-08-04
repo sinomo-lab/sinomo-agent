@@ -3716,9 +3716,6 @@ fn namespace_job_id(
     )
 }
 
-#[allow(dead_code)]
-fn _assert_filesystem_send_sync<T: Send + Sync>(_: &DfsFileSystem) {}
-
 #[cfg(test)]
 mod replica_candidate_tests {
     use super::*;

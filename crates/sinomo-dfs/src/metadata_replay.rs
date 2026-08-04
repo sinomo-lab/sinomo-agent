@@ -694,7 +694,7 @@ pub(crate) fn hydrate_journal_entry_payload<B: DfsMetadataBackend + ?Sized>(
             packed_prepare_v2,
             ..
         } if prepare.is_none() && packed_prepare_v1.is_none() && packed_prepare_v2.is_none() => {
-            *prepare = backend.get_namespace_prepare(operation_id)?;
+            *prepare = backend.get_namespace_prepare(operation_id)?.map(Box::new);
         }
         DfsMetadataMutation::PutNamespaceJob { job_id, job, .. } if job.is_none() => {
             *job = backend.get_namespace_job(job_id)?;
@@ -858,7 +858,7 @@ mod tests {
         else {
             unreachable!("packed constructor returns put-namespace-prepare");
         };
-        *canonical = Some(prepare);
+        *canonical = Some(Box::new(prepare));
         let entry = entry(mutation);
 
         assert!(!journal_entry_has_replay_payloads(&entry));

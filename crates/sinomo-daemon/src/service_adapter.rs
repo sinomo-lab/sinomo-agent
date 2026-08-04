@@ -14,7 +14,6 @@
 //! and call the daemon's own cluster/control handlers. Consuming services receive a real
 //! [`DaemonClusterAccess`] via [`ServiceContext::cluster`] when the node is clustered.
 
-#[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -61,8 +60,8 @@ use crate::control::{
 };
 use crate::dfs::{
     DaemonDfsDataPlaneHost, break_glass_recover_dfs_placement_authority_permit,
-    daemon_dfs_async_peer_transport, daemon_dfs_blocking_peer_transport_on_runtime,
-    inspect_dfs_placement_authority_permit, recover_removed_node_dfs_placement_authority_permit,
+    daemon_dfs_peer_transports_on_runtime, inspect_dfs_placement_authority_permit,
+    recover_removed_node_dfs_placement_authority_permit,
 };
 use crate::error::DaemonError;
 use crate::event_stream::{DaemonEventHub, DaemonEventService};
@@ -877,20 +876,6 @@ fn remote_cluster_kv_authorization_keys(
 /// KV transaction cannot distinguish a caller compare failure from an
 /// authorization-fence failure; permitting a failure branch would let a
 /// revoked caller mutate state when one of these appended guards fails.
-fn fence_remote_cluster_kv_txn_request(
-    snapshot: &sinomo_core::kv::KvSnapshot,
-    signer: &ServiceSigner,
-    request: sinomo_core::kv::KvTxnRequest,
-) -> Result<sinomo_core::kv::KvTxnRequest, ServiceError> {
-    let (member_key, policy_key) = remote_cluster_kv_authorization_keys(signer)?;
-    fence_remote_cluster_kv_txn_request_with_entries(
-        snapshot.get(&member_key),
-        snapshot.get(&policy_key),
-        signer,
-        request,
-    )
-}
-
 fn fence_remote_cluster_kv_txn_request_with_entries(
     member_entry: Option<&KvEntry>,
     policy_entry: Option<&KvEntry>,
@@ -1750,7 +1735,7 @@ impl Service for ClusterKvConsensusService {
                 other => {
                     return Err(ServiceError::UnknownRoute(other.to_string()));
                 }
-            }
+            };
             Ok(ServiceDisposition::Continue)
         })
     }
@@ -2757,84 +2742,6 @@ struct DaemonDfsBrowserService {
     event_hub: Arc<DaemonEventHub>,
 }
 
-enum DaemonDfsBrowserServiceResponse {
-    Status(crate::DaemonDfsBrowserStatusResponse),
-    List(crate::DaemonDfsBrowserListResponse),
-    Stat(crate::DaemonDfsBrowserStatResponse),
-    ReadFile(crate::DaemonDfsBrowserReadFileResponse),
-    ReadObjectVersion(crate::DaemonDfsBrowserReadObjectVersionResponse),
-    ReadFilePrefix(crate::DaemonDfsBrowserReadFilePrefixResponse),
-    ReadFiles(crate::DaemonDfsBrowserReadFilesResponse),
-    WriteFile(crate::DaemonDfsBrowserWriteFileResponse),
-    ReplaceFileIfVersion(crate::DaemonDfsBrowserReplaceFileIfVersionResponse),
-    CreateDirAll(crate::DaemonDfsBrowserCreateDirAllResponse),
-    Rename(crate::DaemonDfsBrowserRenameResponse),
-    Delete(crate::DaemonDfsBrowserDeleteResponse),
-    PinMetadata(crate::DaemonDfsBrowserPinMetadataResponse),
-    UnpinMetadata(crate::DaemonDfsBrowserUnpinMetadataResponse),
-    PinContent(crate::DaemonDfsBrowserPinContentResponse),
-    UnpinContent(crate::DaemonDfsBrowserUnpinContentResponse),
-    TransferMetadataPrimary(crate::DaemonDfsBrowserTransferMetadataPrimaryResponse),
-    PlacementPreview(crate::DaemonDfsBrowserPlacementPreviewResponse),
-    PlacementUpdate(crate::DaemonDfsBrowserPlacementUpdateResponse),
-    PlacementProgress(crate::DaemonDfsBrowserPlacementProgressResponse),
-    PlacementActivity(crate::DaemonDfsBrowserPlacementActivityResponse),
-}
-
-impl DaemonDfsBrowserServiceResponse {
-    fn respond(self, ctx: &mut ServiceContext) -> Result<(), ServiceError> {
-        match self {
-            Self::Status(value) => ctx.respond_value(DAEMON_DFS_BROWSER_STATUS_ROUTE, value),
-            Self::List(value) => ctx.respond_value(DAEMON_DFS_BROWSER_LIST_ROUTE, value),
-            Self::Stat(value) => ctx.respond_value(DAEMON_DFS_BROWSER_STAT_ROUTE, value),
-            Self::ReadFile(value) => ctx.respond_value(DAEMON_DFS_BROWSER_READ_FILE_ROUTE, value),
-            Self::ReadObjectVersion(value) => {
-                ctx.respond_value(DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE, value)
-            }
-            Self::ReadFilePrefix(value) => {
-                ctx.respond_value(DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE, value)
-            }
-            Self::ReadFiles(value) => ctx.respond_value(DAEMON_DFS_BROWSER_READ_FILES_ROUTE, value),
-            Self::WriteFile(value) => ctx.respond_value(DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, value),
-            Self::ReplaceFileIfVersion(value) => {
-                ctx.respond_value(DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE, value)
-            }
-            Self::CreateDirAll(value) => {
-                ctx.respond_value(DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE, value)
-            }
-            Self::Rename(value) => ctx.respond_value(DAEMON_DFS_BROWSER_RENAME_ROUTE, value),
-            Self::Delete(value) => ctx.respond_value(DAEMON_DFS_BROWSER_DELETE_ROUTE, value),
-            Self::PinMetadata(value) => {
-                ctx.respond_value(DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE, value)
-            }
-            Self::UnpinMetadata(value) => {
-                ctx.respond_value(DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE, value)
-            }
-            Self::PinContent(value) => {
-                ctx.respond_value(DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE, value)
-            }
-            Self::UnpinContent(value) => {
-                ctx.respond_value(DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE, value)
-            }
-            Self::TransferMetadataPrimary(value) => {
-                ctx.respond_value(DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE, value)
-            }
-            Self::PlacementPreview(value) => {
-                ctx.respond_value(DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE, value)
-            }
-            Self::PlacementUpdate(value) => {
-                ctx.respond_value(DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE, value)
-            }
-            Self::PlacementProgress(value) => {
-                ctx.respond_value(DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE, value)
-            }
-            Self::PlacementActivity(value) => {
-                ctx.respond_value(DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE, value)
-            }
-        }
-    }
-}
-
 struct DaemonDfsBrowserBackend {
     data_dir: SinomoDataDir,
     service: Mutex<sinomo_dfs::MountedSifsService>,
@@ -2970,10 +2877,12 @@ impl DaemonDfsBrowserBackend {
                 runtime.clone(),
             )) as Box<dyn sinomo_dfs::DfsControlPlaneKvClient>
         });
+        let (peer_transport, async_peer_transport) =
+            daemon_dfs_peer_transports_on_runtime(&data_dir, runtime);
         let opened = sinomo_dfs::open_mounted_sifs_service_with_peer_transports(
             data_dir.clone(),
-            daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, runtime),
-            daemon_dfs_async_peer_transport(&data_dir, runtime),
+            peer_transport,
+            async_peer_transport,
             control_plane,
         )
         .map_err(dfs_browser_service_error)?;
@@ -4038,7 +3947,7 @@ impl Service for DaemonDfsBrowserService {
             let route = request.route.clone();
             let request_traceparent = request.traceparent().map(ToString::to_string);
             let data_dir = Arc::clone(&ctx.data_dir);
-            let response = match route.as_str() {
+            match route.as_str() {
                 DAEMON_DFS_BROWSER_STATUS_ROUTE => {
                     let payload: crate::DaemonDfsBrowserStatusRequest =
                         ctx.decode_request_body(&request).await?;
@@ -4055,11 +3964,14 @@ impl Service for DaemonDfsBrowserService {
                     } else {
                         (None, None)
                     };
-                    DaemonDfsBrowserServiceResponse::Status(crate::DaemonDfsBrowserStatusResponse {
-                        node_id: backend.node_id()?,
-                        health,
-                        health_error,
-                    })
+                    ctx.respond_value(
+                        DAEMON_DFS_BROWSER_STATUS_ROUTE,
+                        crate::DaemonDfsBrowserStatusResponse {
+                            node_id: backend.node_id()?,
+                            health,
+                            health_error,
+                        },
+                    )?;
                 }
                 DAEMON_DFS_BROWSER_LIST_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
@@ -4068,7 +3980,7 @@ impl Service for DaemonDfsBrowserService {
                             DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?.list(payload)
                         })
                         .await?;
-                    DaemonDfsBrowserServiceResponse::List(result)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_LIST_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_STAT_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
@@ -4077,7 +3989,7 @@ impl Service for DaemonDfsBrowserService {
                             DaemonDfsBrowserBackend::for_data_dir(data_dir, &runtime)?.stat(payload)
                         })
                         .await?;
-                    DaemonDfsBrowserServiceResponse::Stat(result)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_STAT_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_READ_FILE_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
@@ -4090,7 +4002,7 @@ impl Service for DaemonDfsBrowserService {
                         },
                     )
                     .await?;
-                    DaemonDfsBrowserServiceResponse::ReadFile(result)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_READ_FILE_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
@@ -4103,7 +4015,7 @@ impl Service for DaemonDfsBrowserService {
                         },
                     )
                     .await?;
-                    DaemonDfsBrowserServiceResponse::ReadObjectVersion(result)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
@@ -4116,7 +4028,7 @@ impl Service for DaemonDfsBrowserService {
                         },
                     )
                     .await?;
-                    DaemonDfsBrowserServiceResponse::ReadFilePrefix(result)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_READ_FILES_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
@@ -4129,7 +4041,7 @@ impl Service for DaemonDfsBrowserService {
                         },
                     )
                     .await?;
-                    DaemonDfsBrowserServiceResponse::ReadFiles(result)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_READ_FILES_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE => {
                     let payload: crate::DaemonDfsBrowserWriteFileRequest =
@@ -4164,7 +4076,7 @@ impl Service for DaemonDfsBrowserService {
                         "write-file",
                         vec![changed_path],
                     );
-                    DaemonDfsBrowserServiceResponse::WriteFile(result.0)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, result.0)?;
                 }
                 DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE => {
                     let payload: crate::DaemonDfsBrowserReplaceFileIfVersionRequest =
@@ -4201,7 +4113,7 @@ impl Service for DaemonDfsBrowserService {
                             vec![changed_path],
                         );
                     }
-                    DaemonDfsBrowserServiceResponse::ReplaceFileIfVersion(result.0)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE, result.0)?;
                 }
                 DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE => {
                     let payload: crate::DaemonDfsBrowserCreateDirAllRequest =
@@ -4236,7 +4148,7 @@ impl Service for DaemonDfsBrowserService {
                         "create-dir-all",
                         vec![changed_path],
                     );
-                    DaemonDfsBrowserServiceResponse::CreateDirAll(result.0)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE, result.0)?;
                 }
                 DAEMON_DFS_BROWSER_RENAME_ROUTE => {
                     let payload: crate::DaemonDfsBrowserRenameRequest =
@@ -4268,7 +4180,7 @@ impl Service for DaemonDfsBrowserService {
                         "rename",
                         changed_paths,
                     );
-                    DaemonDfsBrowserServiceResponse::Rename(result.0)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_RENAME_ROUTE, result.0)?;
                 }
                 DAEMON_DFS_BROWSER_DELETE_ROUTE => {
                     let payload: crate::DaemonDfsBrowserDeleteRequest =
@@ -4300,7 +4212,7 @@ impl Service for DaemonDfsBrowserService {
                         "delete",
                         vec![changed_path],
                     );
-                    DaemonDfsBrowserServiceResponse::Delete(result.0)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_DELETE_ROUTE, result.0)?;
                 }
                 DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE => {
                     let payload: crate::DaemonDfsBrowserPinMetadataRequest =
@@ -4322,7 +4234,7 @@ impl Service for DaemonDfsBrowserService {
                         "pin-metadata",
                         vec![changed_path],
                     );
-                    DaemonDfsBrowserServiceResponse::PinMetadata(result.0)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_PIN_METADATA_ROUTE, result.0)?;
                 }
                 DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE => {
                     let payload: crate::DaemonDfsBrowserUnpinMetadataRequest =
@@ -4346,7 +4258,7 @@ impl Service for DaemonDfsBrowserService {
                             vec![changed_path],
                         );
                     }
-                    DaemonDfsBrowserServiceResponse::UnpinMetadata(result.0)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE, result.0)?;
                 }
                 DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE => {
                     let payload: crate::DaemonDfsBrowserPinContentRequest =
@@ -4368,7 +4280,7 @@ impl Service for DaemonDfsBrowserService {
                         "pin-content",
                         vec![changed_path],
                     );
-                    DaemonDfsBrowserServiceResponse::PinContent(result.0)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_PIN_CONTENT_ROUTE, result.0)?;
                 }
                 DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE => {
                     let payload: crate::DaemonDfsBrowserUnpinContentRequest =
@@ -4392,7 +4304,7 @@ impl Service for DaemonDfsBrowserService {
                             vec![changed_path],
                         );
                     }
-                    DaemonDfsBrowserServiceResponse::UnpinContent(result.0)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE, result.0)?;
                 }
                 DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE => {
                     let payload: crate::DaemonDfsBrowserTransferMetadataPrimaryRequest =
@@ -4416,7 +4328,10 @@ impl Service for DaemonDfsBrowserService {
                             vec![changed_path],
                         );
                     }
-                    DaemonDfsBrowserServiceResponse::TransferMetadataPrimary(result.0)
+                    ctx.respond_value(
+                        DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE,
+                        result.0,
+                    )?;
                 }
                 DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
@@ -4429,7 +4344,7 @@ impl Service for DaemonDfsBrowserService {
                         },
                     )
                     .await?;
-                    DaemonDfsBrowserServiceResponse::PlacementPreview(result)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE => {
                     let _: crate::DaemonDfsBrowserPlacementUpdateRequest =
@@ -4456,7 +4371,7 @@ impl Service for DaemonDfsBrowserService {
                         "update-policy",
                         vec![changed_path],
                     );
-                    DaemonDfsBrowserServiceResponse::PlacementUpdate(result.0)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE, result.0)?;
                 }
                 DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
@@ -4469,7 +4384,7 @@ impl Service for DaemonDfsBrowserService {
                         },
                     )
                     .await?;
-                    DaemonDfsBrowserServiceResponse::PlacementProgress(result)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE, result)?;
                 }
                 DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
@@ -4482,11 +4397,10 @@ impl Service for DaemonDfsBrowserService {
                         },
                     )
                     .await?;
-                    DaemonDfsBrowserServiceResponse::PlacementActivity(result)
+                    ctx.respond_value(DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE, result)?;
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             };
-            response.respond(&mut ctx)?;
             Ok(ServiceDisposition::Continue)
         })
     }
@@ -4858,13 +4772,12 @@ fn sifs_browser_write_options(
         .managed_replication_policy_for_path(path, object_policy, replica_candidates.len())
         .map_err(dfs_browser_service_error)?;
     let candidates = sifs_browser_write_candidates(replica_candidates, &policy);
-    let mut options = sinomo_dfs::DfsWriteOptions {
+    let options = sinomo_dfs::DfsWriteOptions {
         policy,
         replica_candidates: candidates,
         wait_for_commit: true,
         foreground_replica_repair: false,
     };
-    options.foreground_replica_repair = false;
     Ok(options)
 }
 
@@ -5563,7 +5476,7 @@ static DAEMON_SERVICE_REGISTRY_HOSTS: OnceLock<Mutex<HashMap<PathBuf, DaemonServ
     OnceLock::new();
 
 impl DaemonServiceRegistryHost {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn from_registry_for_paths(
         registry: ServiceRegistry,
         paths: &DaemonPaths,
@@ -7474,6 +7387,15 @@ mod tests {
         })
     }
 
+    fn remote_cluster_kv_auth_entries<'a>(
+        snapshot: &'a sinomo_core::kv::KvSnapshot,
+        signer: &ServiceSigner,
+    ) -> (Option<&'a KvEntry>, Option<&'a KvEntry>) {
+        let (member_key, policy_key) =
+            remote_cluster_kv_authorization_keys(signer).expect("authorization keys");
+        (snapshot.get(&member_key), snapshot.get(&policy_key))
+    }
+
     fn assert_remote_cluster_kv_auth_denied(error: ServiceError) {
         assert!(
             matches!(error, ServiceError::Network(NetworkError::AuthDenied)),
@@ -7484,8 +7406,11 @@ mod tests {
     #[test]
     fn remote_cluster_kv_txn_valid_origin_is_fenced_and_commits() {
         let (mut store, signer, member, _) = remote_cluster_kv_auth_fixture();
-        let request = fence_remote_cluster_kv_txn_request(
-            &store.snapshot().expect("authority snapshot"),
+        let snapshot = store.snapshot().expect("authority snapshot");
+        let (member_entry, policy_entry) = remote_cluster_kv_auth_entries(&snapshot, &signer);
+        let request = fence_remote_cluster_kv_txn_request_with_entries(
+            member_entry,
+            policy_entry,
             &signer,
             remote_cluster_kv_test_request(),
         )
@@ -7530,8 +7455,11 @@ mod tests {
                 None,
             )
             .expect("store removed member");
-        let error = fence_remote_cluster_kv_txn_request(
-            &store.snapshot().expect("removed snapshot"),
+        let snapshot = store.snapshot().expect("removed snapshot");
+        let (member_entry, policy_entry) = remote_cluster_kv_auth_entries(&snapshot, &signer);
+        let error = fence_remote_cluster_kv_txn_request_with_entries(
+            member_entry,
+            policy_entry,
             &signer,
             remote_cluster_kv_test_request(),
         )
@@ -7547,8 +7475,11 @@ mod tests {
                 None,
             )
             .expect("store replaced key");
-        let error = fence_remote_cluster_kv_txn_request(
-            &store.snapshot().expect("rekeyed snapshot"),
+        let snapshot = store.snapshot().expect("rekeyed snapshot");
+        let (member_entry, policy_entry) = remote_cluster_kv_auth_entries(&snapshot, &signer);
+        let error = fence_remote_cluster_kv_txn_request_with_entries(
+            member_entry,
+            policy_entry,
             &signer,
             remote_cluster_kv_test_request(),
         )
@@ -7572,8 +7503,11 @@ mod tests {
                 None,
             )
             .expect("store restricted policy");
-        let error = fence_remote_cluster_kv_txn_request(
-            &store.snapshot().expect("restricted snapshot"),
+        let snapshot = store.snapshot().expect("restricted snapshot");
+        let (member_entry, policy_entry) = remote_cluster_kv_auth_entries(&snapshot, &signer);
+        let error = fence_remote_cluster_kv_txn_request_with_entries(
+            member_entry,
+            policy_entry,
             &signer,
             remote_cluster_kv_test_request(),
         )
@@ -7584,8 +7518,11 @@ mod tests {
     #[test]
     fn remote_cluster_kv_txn_policy_revocation_race_fails_cas_without_mutation() {
         let (mut store, signer, member, mut policy) = remote_cluster_kv_auth_fixture();
-        let request = fence_remote_cluster_kv_txn_request(
-            &store.snapshot().expect("authority snapshot"),
+        let snapshot = store.snapshot().expect("authority snapshot");
+        let (member_entry, policy_entry) = remote_cluster_kv_auth_entries(&snapshot, &signer);
+        let request = fence_remote_cluster_kv_txn_request_with_entries(
+            member_entry,
+            policy_entry,
             &signer,
             remote_cluster_kv_test_request(),
         )
@@ -7613,8 +7550,11 @@ mod tests {
     #[test]
     fn remote_cluster_kv_txn_policy_aba_race_fails_revision_guard() {
         let (mut store, signer, member, policy) = remote_cluster_kv_auth_fixture();
-        let request = fence_remote_cluster_kv_txn_request(
-            &store.snapshot().expect("authority snapshot"),
+        let snapshot = store.snapshot().expect("authority snapshot");
+        let (member_entry, policy_entry) = remote_cluster_kv_auth_entries(&snapshot, &signer);
+        let request = fence_remote_cluster_kv_txn_request_with_entries(
+            member_entry,
+            policy_entry,
             &signer,
             remote_cluster_kv_test_request(),
         )
@@ -7657,8 +7597,11 @@ mod tests {
             value: b"must-not-run".to_vec(),
             lease_id: None,
         });
-        let error = fence_remote_cluster_kv_txn_request(
-            &store.snapshot().expect("authority snapshot"),
+        let snapshot = store.snapshot().expect("authority snapshot");
+        let (member_entry, policy_entry) = remote_cluster_kv_auth_entries(&snapshot, &signer);
+        let error = fence_remote_cluster_kv_txn_request_with_entries(
+            member_entry,
+            policy_entry,
             &signer,
             request,
         )

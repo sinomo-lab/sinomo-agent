@@ -7,7 +7,7 @@
 //! `metadata_backend`.
 
 use serde::{Deserialize, Serialize};
-#[allow(unused_imports)]
+#[cfg(test)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
@@ -513,57 +513,6 @@ pub async fn publish_cluster_dfs_metadata_journal_with_peer_transports_async_and
         async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
         async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
         execution_exclusions,
-        options,
-    )
-    .await
-}
-
-/// Publish one locally authoritative metadata-shard lane.
-///
-/// Daemon reactors use this narrower entrypoint so an unavailable replica for
-/// one shard cannot occupy the publication lane for unrelated local primaries.
-/// The journal batch is still planned from the same durable shard backend and
-/// the ordinary receiver-side authority checks remain unchanged.
-#[allow(clippy::too_many_arguments)]
-pub async fn publish_cluster_dfs_metadata_shard_with_peer_transports_async_and_execution_exclusions(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    sync_peer_transport: Arc<dyn DfsPeerTransport>,
-    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
-    file_system_id: DfsFileSystemId,
-    shard_id: DfsMetadataShardId,
-    execution_exclusions: &DfsMaintenanceExecutionExclusions,
-    options: DfsMetadataJournalReplicationOptions,
-) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
-    let plan_data_dir = data_dir.clone();
-    let plan_cluster_paths = cluster_paths.clone();
-    let plan_execution_exclusions = execution_exclusions.clone();
-    let Some(plan) = tokio::task::spawn_blocking(move || {
-        refresh_cluster_dfs_kv_snapshot_with_peer_transport(
-            &plan_cluster_paths,
-            sync_peer_transport,
-        )?;
-        prepare_cluster_dfs_metadata_shard_publish_with_execution_exclusions(
-            &plan_data_dir,
-            &plan_cluster_paths,
-            file_system_id,
-            shard_id,
-            &plan_execution_exclusions,
-            options,
-        )
-    })
-    .await
-    .map_err(|source| DfsError::Metadata {
-        message: format!("DFS metadata publish planning task failed: {source}"),
-    })??
-    else {
-        return Ok(DfsMetadataJournalReplicationReport {
-            outcomes: Vec::new(),
-        });
-    };
-    execute_prepared_cluster_dfs_metadata_publish_with_async_peer_transport(
-        plan,
-        peer_transport,
         options,
     )
     .await
@@ -1462,29 +1411,6 @@ fn default_dfs_metadata_publish_scheduler() -> Arc<DfsMetadataPublishScheduler> 
     Arc::new(DfsMetadataPublishScheduler::new())
 }
 
-fn cluster_dfs_metadata_publish_scheduler(
-    data_dir: &SinomoDataDir,
-) -> Arc<DfsMetadataPublishScheduler> {
-    static SCHEDULERS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<DfsMetadataPublishScheduler>>>> =
-        OnceLock::new();
-    let key = data_dir.root();
-    let Ok(mut schedulers) = SCHEDULERS
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-    else {
-        // A poisoned registry must not alias an unrelated root. A private lane
-        // preserves correctness and merely gives up coalescing for this call.
-        return Arc::new(DfsMetadataPublishScheduler::new());
-    };
-    if let Some(scheduler) = schedulers.get(&key).and_then(Weak::upgrade) {
-        return scheduler;
-    }
-    schedulers.retain(|_, scheduler| scheduler.strong_count() > 0);
-    let scheduler = Arc::new(DfsMetadataPublishScheduler::new());
-    schedulers.insert(key, Arc::downgrade(&scheduler));
-    scheduler
-}
-
 fn cluster_dfs_metadata_materialization_scheduler(
     data_dir: &SinomoDataDir,
     shard_id: &DfsMetadataShardId,
@@ -1606,242 +1532,6 @@ where
         on_report,
         on_error,
     )
-}
-
-pub async fn run_cluster_dfs_metadata_publish_after_events_with_async_peer_transport<R, E>(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
-    events: &[NetworkedDfsServiceEvent],
-    replication_options: DfsMetadataJournalReplicationOptions,
-    on_report: R,
-    on_error: E,
-) -> bool
-where
-    R: FnMut(DfsMetadataJournalReplicationReport),
-    E: FnMut(String),
-{
-    run_dfs_metadata_publish_after_events_async(
-        events,
-        || async {
-            publish_cluster_dfs_metadata_journal_with_async_peer_transport(
-                data_dir,
-                cluster_paths,
-                peer_transport,
-                replication_options,
-            )
-            .await
-            .map_err(|error| error.to_string())
-        },
-        on_report,
-        on_error,
-    )
-    .await
-}
-
-pub fn schedule_cluster_dfs_metadata_publish_async_on_runtime<R, E>(
-    runtime: tokio::runtime::Handle,
-    data_dir: SinomoDataDir,
-    cluster_paths: ClusterPaths,
-    metadata_sender: AsyncDfsMetadataJournalBatchSender,
-    snapshot_sender: AsyncDfsMetadataSnapshotInstallSender,
-    schedule_options: DfsMetadataPublishScheduleOptions,
-    replication_options: DfsMetadataJournalReplicationOptions,
-    on_report: R,
-    on_error: E,
-) -> DfsMetadataPublishScheduleStart
-where
-    R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
-    E: FnMut(String) + Send + 'static,
-{
-    let scheduler = cluster_dfs_metadata_publish_scheduler(&data_dir);
-    schedule_dfs_metadata_publish_async_on_runtime(
-        scheduler,
-        runtime,
-        schedule_options,
-        move || {
-            let data_dir = data_dir.clone();
-            let cluster_paths = cluster_paths.clone();
-            let metadata_sender = Arc::clone(&metadata_sender);
-            let snapshot_sender = Arc::clone(&snapshot_sender);
-            async move {
-                publish_cluster_dfs_metadata_journal_async(
-                    &data_dir,
-                    &cluster_paths,
-                    metadata_sender,
-                    snapshot_sender,
-                    replication_options,
-                )
-                .await
-                .map_err(|error| error.to_string())
-            }
-        },
-        on_report,
-        on_error,
-    )
-}
-
-pub fn schedule_cluster_dfs_metadata_publish_after_events_async_on_runtime<R, E>(
-    runtime: tokio::runtime::Handle,
-    data_dir: SinomoDataDir,
-    cluster_paths: ClusterPaths,
-    metadata_sender: AsyncDfsMetadataJournalBatchSender,
-    snapshot_sender: AsyncDfsMetadataSnapshotInstallSender,
-    events: &[NetworkedDfsServiceEvent],
-    schedule_options: DfsMetadataPublishScheduleOptions,
-    replication_options: DfsMetadataJournalReplicationOptions,
-    on_report: R,
-    on_error: E,
-) -> Option<DfsMetadataPublishScheduleStart>
-where
-    R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
-    E: FnMut(String) + Send + 'static,
-{
-    dfs_events_should_publish_metadata(events).then(|| {
-        schedule_cluster_dfs_metadata_publish_async_on_runtime(
-            runtime,
-            data_dir,
-            cluster_paths,
-            metadata_sender,
-            snapshot_sender,
-            schedule_options,
-            replication_options,
-            on_report,
-            on_error,
-        )
-    })
-}
-
-pub fn schedule_cluster_dfs_metadata_publish_with_async_peer_transport_on_runtime<R, E>(
-    runtime: tokio::runtime::Handle,
-    data_dir: SinomoDataDir,
-    cluster_paths: ClusterPaths,
-    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
-    schedule_options: DfsMetadataPublishScheduleOptions,
-    replication_options: DfsMetadataJournalReplicationOptions,
-    on_report: R,
-    on_error: E,
-) -> DfsMetadataPublishScheduleStart
-where
-    R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
-    E: FnMut(String) + Send + 'static,
-{
-    schedule_cluster_dfs_metadata_publish_async_on_runtime(
-        runtime,
-        data_dir,
-        cluster_paths,
-        async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
-        async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
-        schedule_options,
-        replication_options,
-        on_report,
-        on_error,
-    )
-}
-
-pub fn schedule_cluster_dfs_metadata_publish_after_events_with_async_peer_transport_on_runtime<
-    R,
-    E,
->(
-    runtime: tokio::runtime::Handle,
-    data_dir: SinomoDataDir,
-    cluster_paths: ClusterPaths,
-    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
-    events: &[NetworkedDfsServiceEvent],
-    schedule_options: DfsMetadataPublishScheduleOptions,
-    replication_options: DfsMetadataJournalReplicationOptions,
-    on_report: R,
-    on_error: E,
-) -> Option<DfsMetadataPublishScheduleStart>
-where
-    R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
-    E: FnMut(String) + Send + 'static,
-{
-    dfs_events_should_publish_metadata(events).then(|| {
-        schedule_cluster_dfs_metadata_publish_with_async_peer_transport_on_runtime(
-            runtime,
-            data_dir,
-            cluster_paths,
-            peer_transport,
-            schedule_options,
-            replication_options,
-            on_report,
-            on_error,
-        )
-    })
-}
-
-pub fn schedule_cluster_dfs_metadata_publish_with_peer_transports_on_runtime<R, E>(
-    runtime: tokio::runtime::Handle,
-    data_dir: SinomoDataDir,
-    cluster_paths: ClusterPaths,
-    sync_peer_transport: Arc<dyn DfsPeerTransport>,
-    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
-    schedule_options: DfsMetadataPublishScheduleOptions,
-    replication_options: DfsMetadataJournalReplicationOptions,
-    on_report: R,
-    on_error: E,
-) -> DfsMetadataPublishScheduleStart
-where
-    R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
-    E: FnMut(String) + Send + 'static,
-{
-    let scheduler = cluster_dfs_metadata_publish_scheduler(&data_dir);
-    schedule_dfs_metadata_publish_async_on_runtime(
-        scheduler,
-        runtime,
-        schedule_options,
-        move || {
-            let data_dir = data_dir.clone();
-            let cluster_paths = cluster_paths.clone();
-            let sync_peer_transport = Arc::clone(&sync_peer_transport);
-            let peer_transport = Arc::clone(&peer_transport);
-            async move {
-                publish_cluster_dfs_metadata_journal_with_peer_transports_async(
-                    &data_dir,
-                    &cluster_paths,
-                    sync_peer_transport,
-                    peer_transport,
-                    replication_options,
-                )
-                .await
-                .map_err(|error| error.to_string())
-            }
-        },
-        on_report,
-        on_error,
-    )
-}
-
-pub fn schedule_cluster_dfs_metadata_publish_after_events_with_peer_transports_on_runtime<R, E>(
-    runtime: tokio::runtime::Handle,
-    data_dir: SinomoDataDir,
-    cluster_paths: ClusterPaths,
-    sync_peer_transport: Arc<dyn DfsPeerTransport>,
-    peer_transport: Arc<dyn AsyncDfsPeerTransport>,
-    events: &[NetworkedDfsServiceEvent],
-    schedule_options: DfsMetadataPublishScheduleOptions,
-    replication_options: DfsMetadataJournalReplicationOptions,
-    on_report: R,
-    on_error: E,
-) -> Option<DfsMetadataPublishScheduleStart>
-where
-    R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
-    E: FnMut(String) + Send + 'static,
-{
-    dfs_events_should_publish_metadata(events).then(|| {
-        schedule_cluster_dfs_metadata_publish_with_peer_transports_on_runtime(
-            runtime,
-            data_dir,
-            cluster_paths,
-            sync_peer_transport,
-            peer_transport,
-            schedule_options,
-            replication_options,
-            on_report,
-            on_error,
-        )
-    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2145,24 +1835,6 @@ mod publish_scheduler_tests {
             next_after_sequence: 11,
         };
         assert!(dfs_events_advance_metadata_replica(&[snapshot]));
-    }
-
-    #[test]
-    fn cluster_publish_schedulers_are_isolated_per_data_root() {
-        let first_root = sinomo_testdir::TestDir::new("dfs-publish-scheduler-first-root");
-        let second_root = sinomo_testdir::TestDir::new("dfs-publish-scheduler-second-root");
-        let first_data_dir = SinomoDataDir::new(first_root.join("data"));
-        let second_data_dir = SinomoDataDir::new(second_root.join("data"));
-
-        let first = cluster_dfs_metadata_publish_scheduler(&first_data_dir);
-        let same = cluster_dfs_metadata_publish_scheduler(&first_data_dir);
-        let second = cluster_dfs_metadata_publish_scheduler(&second_data_dir);
-
-        assert!(Arc::ptr_eq(&first, &same));
-        assert!(
-            !Arc::ptr_eq(&first, &second),
-            "one root's active closure must never discard another root's publish"
-        );
     }
 
     #[test]
@@ -6009,28 +5681,6 @@ pub fn publish_dfs_metadata_journal_with_host(
     Ok(DfsMetadataJournalReplicationReport { outcomes })
 }
 
-pub async fn publish_dfs_metadata_journal_with_async_host(
-    file_system_id: DfsFileSystemId,
-    local_node_id: &NodeId,
-    shards: Vec<DfsMetadataShardConfig>,
-    data_dir: &SinomoDataDir,
-    host: &mut impl DfsMetadataJournalPublisherHost,
-    transport: &mut dyn AsyncDfsMetadataJournalReplicationTransport,
-    options: DfsMetadataJournalReplicationOptions,
-) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
-    publish_dfs_metadata_journal_with_async_host_and_execution_exclusions(
-        file_system_id,
-        local_node_id,
-        shards,
-        data_dir,
-        host,
-        transport,
-        &DfsMaintenanceExecutionExclusions::default(),
-        options,
-    )
-    .await
-}
-
 pub async fn publish_dfs_metadata_journal_with_async_host_and_execution_exclusions(
     file_system_id: DfsFileSystemId,
     local_node_id: &NodeId,
@@ -6703,7 +6353,7 @@ pub(crate) fn materialize_cluster_dfs_metadata_replica_journal(
         .map_err(DfsError::from)?;
     drop(backend);
     if materialized > 0 {
-        crate::release_unused_metadata_allocator_pages();
+        crate::metadata_table_apply::release_metadata_allocator_pages();
     }
     Ok(materialized)
 }
@@ -9662,7 +9312,7 @@ enum DfsMetadataJournalReplicationStep {
     },
     SnapshotRepair {
         reason: String,
-        command: DfsMetadataSnapshotInstallCommand,
+        command: Box<DfsMetadataSnapshotInstallCommand>,
     },
     Terminal,
 }
@@ -9863,7 +9513,10 @@ fn handle_dfs_metadata_journal_batch_response(
                     shard_id,
                     reason.clone(),
                 )?;
-                Ok(DfsMetadataJournalReplicationStep::SnapshotRepair { reason, command })
+                Ok(DfsMetadataJournalReplicationStep::SnapshotRepair {
+                    reason,
+                    command: Box::new(command),
+                })
             } else {
                 outcomes.push(DfsMetadataJournalReplicationOutcome::Rejected {
                     target_node_id: target_node_id.clone(),

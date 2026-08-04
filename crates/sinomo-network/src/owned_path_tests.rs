@@ -15,7 +15,6 @@ use sinomo_base::Id;
 use sinomo_node::NodeId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 fn node(name: &str) -> NodeId {
     NodeId::from_legacy_named(name).expect("node id")
@@ -187,27 +186,16 @@ async fn owned_service_values_decode_incrementally_without_byte_fallback() {
         let _ = server_done.await;
     });
 
-    let stream = client
-        .open(Duration::from_secs(1))
-        .await
-        .expect("open owned logical stream");
-    let context = RpcPeerContext::authenticated(
-        stream.local_node_id.clone(),
-        stream.peer_node_id.clone(),
-        stream.session_id.clone(),
-        stream.channel_binding,
-    )
-    .expect("client RPC context");
+    let stream = client.open().expect("open owned logical stream");
     let call = ObjectRpcCall::encode_value(
         "/test/owned-service",
         "test.owned-service",
         expected_request,
     )
     .expect("encode transport-owned request");
-    let result =
-        call_service_rpc_peer_stream(stream, &context, call, ObjectFrameIoOptions::default())
-            .await
-            .expect("call owned service RPC");
+    let result = call_service_rpc_peer_stream(stream, call, ObjectFrameIoOptions::default())
+        .await
+        .expect("call owned service RPC");
     assert!(result.has_streamed_value());
     assert!(result.response.body.is_empty());
     assert_eq!(
@@ -325,23 +313,12 @@ async fn owned_rpc_keeps_slab_identity_through_every_endpoint_layer() {
         .await
         .expect("serve owned layered RPC");
     });
-    let stream = client
-        .open(Duration::from_secs(1))
-        .await
-        .expect("open owned logical stream");
-    let context = RpcPeerContext::authenticated(
-        stream.local_node_id.clone(),
-        stream.peer_node_id.clone(),
-        stream.session_id.clone(),
-        stream.channel_binding,
-    )
-    .expect("client RPC context");
+    let stream = client.open().expect("open owned logical stream");
     let chunks = stream.into_chunk_stream().expect("client logical chunks");
     let body = ObjectRpcBodySource::sobj_value(expected_payload)
         .expect("encode transport-shaped SOBJ body");
     let result = call_object_rpc_chunk_stream_with_consumption(
         chunks,
-        &context,
         ObjectRpcStreamCall {
             request_id: Id::generate(),
             method: "test.identity".to_string(),
@@ -512,21 +489,12 @@ async fn received_rpc_chunks_keep_slab_identity_when_forwarded_to_another_rpc() 
                         incoming.body.into_application_body(),
                     );
                     let downstream = forwarder_client
-                        .open(Duration::from_secs(1))
-                        .await
+                        .open()
                         .expect("open downstream logical stream");
-                    let downstream_context = RpcPeerContext::authenticated(
-                        downstream.local_node_id.clone(),
-                        downstream.peer_node_id.clone(),
-                        downstream.session_id.clone(),
-                        downstream.channel_binding,
-                    )
-                    .expect("forwarder outbound RPC context");
                     let outcome = call_object_rpc_chunk_stream_with_consumption(
                         downstream
                             .into_chunk_stream()
                             .expect("forwarder outbound chunks"),
-                        &downstream_context,
                         ObjectRpcStreamCall {
                             request_id: Id::generate(),
                             method: "test.forward.destination".to_string(),
@@ -568,20 +536,9 @@ async fn received_rpc_chunks_keep_slab_identity_when_forwarded_to_another_rpc() 
         .expect("serve forwarder RPC");
     });
 
-    let source_stream = source_client
-        .open(Duration::from_secs(1))
-        .await
-        .expect("open source logical stream");
-    let source_context = RpcPeerContext::authenticated(
-        source_stream.local_node_id.clone(),
-        source_stream.peer_node_id.clone(),
-        source_stream.session_id.clone(),
-        source_stream.channel_binding,
-    )
-    .expect("source RPC context");
+    let source_stream = source_client.open().expect("open source logical stream");
     let outcome = call_object_rpc_chunk_stream_with_consumption(
         source_stream.into_chunk_stream().expect("source chunks"),
-        &source_context,
         ObjectRpcStreamCall {
             request_id: Id::generate(),
             method: "test.forward.middle".to_string(),

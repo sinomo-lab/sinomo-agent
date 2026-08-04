@@ -1625,14 +1625,14 @@ fn namespace_prepare_table_plan_for_payload(
                     completion.request_id.clone(),
                 );
                 if !tables.namespace_requests.contains_key(&request_key) {
-                    ops.push(DfsMetadataTableOp::PutNamespaceRequest {
-                        request: pending_namespace_request_admission_from_completion(completion),
-                    });
+                    ops.push(DfsMetadataTableOp::put_namespace_request(
+                        pending_namespace_request_admission_from_completion(completion),
+                    ));
                 }
             }
-            ops.push(DfsMetadataTableOp::PutNamespacePrepare {
-                prepare: prepare.into_owned(),
-            });
+            ops.push(DfsMetadataTableOp::put_namespace_prepare(
+                prepare.into_owned(),
+            ));
             Ok(NamespacePrepareTablePlan {
                 ops,
                 prepared_footprint: Some(validated.footprint),
@@ -1704,9 +1704,7 @@ fn namespace_prepare_table_plan_for_payload(
                     .get(&key)
                     .is_some_and(|receipt| receipt.matches_completed_request(request));
                 if !materialized {
-                    ops.push(DfsMetadataTableOp::PutNamespaceRequest {
-                        request: request.clone(),
-                    });
+                    ops.push(DfsMetadataTableOp::put_namespace_request(request.clone()));
                 }
             }
             if let Some(completion) = &prepare.completed_request_completion {
@@ -1720,16 +1718,14 @@ fn namespace_prepare_table_plan_for_payload(
                         .get(&key)
                         .is_some_and(|receipt| receipt.matches_completion(completion));
                 if !materialized {
-                    ops.push(DfsMetadataTableOp::PutNamespaceRequestReceipt {
-                        receipt: DfsNamespaceRequestReceipt::from_completion(completion),
-                    });
+                    ops.push(DfsMetadataTableOp::put_namespace_request_receipt(
+                        DfsNamespaceRequestReceipt::from_completion(completion),
+                    ));
                 }
             }
             ops.insert(
                 prepare_insert_index,
-                DfsMetadataTableOp::PutNamespacePrepare {
-                    prepare: prepare.into_owned(),
-                },
+                DfsMetadataTableOp::put_namespace_prepare(prepare.into_owned()),
             );
             Ok(NamespacePrepareTablePlan {
                 ops,
@@ -1762,9 +1758,9 @@ fn namespace_prepare_table_plan_for_payload(
                 });
             }
             Ok(NamespacePrepareTablePlan {
-                ops: vec![DfsMetadataTableOp::PutNamespacePrepare {
-                    prepare: prepare.into_owned(),
-                }],
+                ops: vec![DfsMetadataTableOp::put_namespace_prepare(
+                    prepare.into_owned(),
+                )],
                 prepared_footprint: None,
             })
         }
@@ -3466,7 +3462,7 @@ impl LocalSobjMetadataBackend {
         let mut snapshot = DfsMetadataTableSnapshot {
             format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
             materialized_through_sequence: Some(self.materialized_through_sequence),
-            tables: Some(metadata_tables_snapshot(&self.tables)),
+            tables: Some(Box::new(metadata_tables_snapshot(&self.tables))),
             ops: Vec::new(),
             semantic_state_fingerprint: None,
             prefix_proof: self.prefix_proof.clone(),
@@ -4976,13 +4972,11 @@ impl LocalSobjMetadataBackend {
                         "journal namespace request {requester_node_id}/{request_id} conflicts with its compacted receipt"
                     )));
                 }
-                if self.tables.namespace_requests.get(&key) == Some(request) {
+                if self.tables.namespace_requests.get(&key) == Some(request.as_ref()) {
                     return Ok(false);
                 }
                 self.plan_preapplied_table_op(
-                    DfsMetadataTableOp::PutNamespaceRequest {
-                        request: request.clone(),
-                    },
+                    DfsMetadataTableOp::put_namespace_request(request.as_ref().clone()),
                     table_ops,
                     rollback,
                 );
@@ -5137,7 +5131,7 @@ impl LocalSobjMetadataBackend {
         let checkpoint = DfsMetadataTableSnapshot {
             format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
             materialized_through_sequence: Some(journal_sequence),
-            tables: Some(metadata_tables_snapshot(&self.tables)),
+            tables: Some(Box::new(metadata_tables_snapshot(&self.tables))),
             ops: Vec::new(),
             semantic_state_fingerprint: None,
             prefix_proof: None,
@@ -5991,9 +5985,9 @@ impl LocalSobjMetadataBackend {
                 }]
             }
             DfsMetadataMutation::PutNamespaceRequest { request, .. } => {
-                vec![DfsMetadataTableOp::PutNamespaceRequest {
-                    request: request.clone(),
-                }]
+                vec![DfsMetadataTableOp::put_namespace_request(
+                    request.as_ref().clone(),
+                )]
             }
             DfsMetadataMutation::PutNamespaceRequestReceipt { receipt, .. } => {
                 vec![DfsMetadataTableOp::PutNamespaceRequestReceipt {
@@ -9320,9 +9314,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             // Committed -> Prepared transition.
             let entry = self.write_namespace_prepare_and_materialize_unlocked(
                 &existing,
-                vec![DfsMetadataTableOp::PutNamespacePrepare {
-                    prepare: existing.clone(),
-                }],
+                vec![DfsMetadataTableOp::put_namespace_prepare(existing.clone())],
             )?;
             return Ok(entry);
         }
@@ -9335,9 +9327,9 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         if table_plan.ops.is_empty() {
             table_plan
                 .ops
-                .push(DfsMetadataTableOp::PutNamespacePrepare {
-                    prepare: (*prepare).clone(),
-                });
+                .push(DfsMetadataTableOp::put_namespace_prepare(
+                    (*prepare).clone(),
+                ));
         }
         let prepared_footprint = table_plan.prepared_footprint.take().ok_or_else(|| {
             MetadataBackendError::Serde(format!(
@@ -9407,9 +9399,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         if current == rebound {
             return self.write_namespace_prepare_and_materialize_unlocked(
                 &rebound,
-                vec![DfsMetadataTableOp::PutNamespacePrepare {
-                    prepare: rebound.clone(),
-                }],
+                vec![DfsMetadataTableOp::put_namespace_prepare(rebound.clone())],
             );
         }
         if current.status != DfsNamespacePrepareStatus::Prepared
@@ -9437,9 +9427,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         validate_namespace_transaction_preconditions(&self.tables, &rebound.transaction)?;
         self.write_namespace_prepare_and_materialize_unlocked(
             &rebound,
-            vec![DfsMetadataTableOp::PutNamespacePrepare {
-                prepare: rebound.clone(),
-            }],
+            vec![DfsMetadataTableOp::put_namespace_prepare(rebound.clone())],
         )
     }
 
@@ -9579,9 +9567,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         let mut table_ops =
             namespace_prepare_table_ops_for_record(&self.tables, &self.shard_id, &prepare)?;
         if table_ops.is_empty() {
-            table_ops.push(DfsMetadataTableOp::PutNamespacePrepare {
-                prepare: prepare.clone(),
-            });
+            table_ops.push(DfsMetadataTableOp::put_namespace_prepare(prepare.clone()));
         }
         self.write_journal_entry_and_apply_table_ops_unlocked(
             DfsMetadataMutation::commit_namespace_prepare(&prepare),
@@ -9651,9 +9637,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         let mut table_ops =
             namespace_prepare_table_ops_for_record(&self.tables, &self.shard_id, &prepare)?;
         if table_ops.is_empty() {
-            table_ops.push(DfsMetadataTableOp::PutNamespacePrepare {
-                prepare: prepare.clone(),
-            });
+            table_ops.push(DfsMetadataTableOp::put_namespace_prepare(prepare.clone()));
         }
         self.write_namespace_prepare_and_materialize_unlocked(&prepare, table_ops)
     }
@@ -9936,7 +9920,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             }
             return self.write_journal_entry_and_apply_table_ops_unlocked(
                 DfsMetadataMutation::put_namespace_request_receipt(&receipt),
-                vec![DfsMetadataTableOp::PutNamespaceRequestReceipt { receipt }],
+                vec![DfsMetadataTableOp::put_namespace_request_receipt(receipt)],
             );
         }
         if let Some(existing) = self.tables.namespace_requests.get(&key)
@@ -9959,9 +9943,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         }
         self.write_journal_entry_and_apply_table_ops_unlocked(
             DfsMetadataMutation::put_namespace_request(request),
-            vec![DfsMetadataTableOp::PutNamespaceRequest {
-                request: request.clone(),
-            }],
+            vec![DfsMetadataTableOp::put_namespace_request(request.clone())],
         )
     }
 
@@ -11840,7 +11822,7 @@ mod tests {
         let mut snapshot = DfsMetadataTableSnapshot {
             format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
             materialized_through_sequence: Some(journal_sequence),
-            tables: Some(metadata_tables_snapshot(&backend.tables)),
+            tables: Some(Box::new(metadata_tables_snapshot(&backend.tables))),
             ops: Vec::new(),
             semantic_state_fingerprint: None,
             prefix_proof: Some(
@@ -12260,9 +12242,9 @@ mod tests {
             "blake3:conflicting-request-while-prepare-waits".to_string();
         reopened
             .tables
-            .apply(DfsMetadataTableOp::PutNamespaceRequest {
-                request: conflicting_pending_request,
-            });
+            .apply(DfsMetadataTableOp::put_namespace_request(
+                conflicting_pending_request,
+            ));
         let conflict = reopened
             .commit_prepared_namespace_transaction(
                 &prepare.operation_id,
@@ -12276,9 +12258,7 @@ mod tests {
         );
         reopened
             .tables
-            .apply(DfsMetadataTableOp::PutNamespaceRequest {
-                request: pending_request,
-            });
+            .apply(DfsMetadataTableOp::put_namespace_request(pending_request));
 
         reopened
             .commit_prepared_namespace_transaction(
@@ -13793,7 +13773,7 @@ mod tests {
             panic!("prepare entry changed mutation kind");
         };
         assert!(packed_prepare_v2.is_some());
-        *canonical = Some(prepare);
+        *canonical = Some(Box::new(prepare));
         let error = require_journal_entry_replay_payloads(&ambiguous)
             .expect_err("dual prepare representations must fail replay");
         assert!(
@@ -13834,6 +13814,18 @@ mod tests {
                 });
             prepare.transaction.objects.push(object);
         }
+        let mut receipt_only_object = current.clone();
+        receipt_only_object.object_id =
+            DfsObjectId::from_legacy_named("obj_compact_commit_receipt_only")
+                .expect("receipt-only object id");
+        receipt_only_object.version =
+            DfsVersion::from_legacy_named("version_compact_commit_receipt_only")
+                .expect("receipt-only version");
+        prepare.content_receipts.push(replica_receipt_record(
+            &receipt_only_object,
+            receipt_only_object.version.clone(),
+            OffsetDateTime::UNIX_EPOCH,
+        ));
         prepare.operation_digest =
             crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
                 .expect("4096-object prepare digest");
@@ -13843,7 +13835,13 @@ mod tests {
             DfsMetadataMutation::put_namespace_prepare_packed_v1(&prepare).expect("pack prepare");
         let compact = DfsMetadataMutation::commit_namespace_prepare(&prepare);
         assert_eq!(packed.affected_object_ids().len(), 4096);
-        assert_eq!(compact.affected_object_ids().len(), 4096);
+        assert_eq!(compact.affected_object_ids().len(), 4097);
+        assert!(
+            compact
+                .affected_object_ids()
+                .contains(&receipt_only_object.object_id),
+            "compact commits must retain independently valid receipt objects"
+        );
         let full_bytes = serde_json::to_vec(&full).expect("encode full prepare");
         let compact_bytes = serde_json::to_vec(&compact).expect("encode compact commit");
         let full_wire_bytes =
@@ -13883,9 +13881,7 @@ mod tests {
         };
         let full_table_batch = DfsMetadataTableBatch {
             sequence: entry.sequence,
-            ops: vec![DfsMetadataTableOp::PutNamespacePrepare {
-                prepare: prepare.clone(),
-            }],
+            ops: vec![DfsMetadataTableOp::put_namespace_prepare(prepare.clone())],
             prefix_proof: None,
             journal_reference_replay_cost_bytes: 0,
         };
@@ -15000,9 +14996,7 @@ mod tests {
             committed,
         );
         let mut tables = DfsMetadataTables::default();
-        tables.apply(DfsMetadataTableOp::PutNamespacePrepare {
-            prepare: active.clone(),
-        });
+        tables.apply(DfsMetadataTableOp::put_namespace_prepare(active.clone()));
         assert!(tables.namespace_prepare_footprint_indexes_match_history());
 
         assert_overlap_equivalent(&tables, &active, true);
@@ -15056,29 +15050,25 @@ mod tests {
             other_file_system_target,
         );
         assert_overlap_equivalent(&tables, &cross_file_system, true);
-        tables.apply(DfsMetadataTableOp::PutNamespacePrepare {
-            prepare: cross_file_system,
-        });
+        tables.apply(DfsMetadataTableOp::put_namespace_prepare(cross_file_system));
         assert!(tables.namespace_prepare_footprint_indexes_match_history());
 
         let mut committed_active = active.clone();
         committed_active.status = DfsNamespacePrepareStatus::Committed;
-        tables.apply(DfsMetadataTableOp::PutNamespacePrepare {
-            prepare: committed_active,
-        });
+        tables.apply(DfsMetadataTableOp::put_namespace_prepare(committed_active));
         let mut replacement = active.clone();
         replacement.operation_id = "operation-footprint-replacement".to_string();
         replacement.transaction.transaction_id = "transaction:footprint-replacement".to_string();
         assert_overlap_equivalent(&tables, &replacement, true);
-        tables.apply(DfsMetadataTableOp::PutNamespacePrepare {
-            prepare: replacement.clone(),
-        });
+        tables.apply(DfsMetadataTableOp::put_namespace_prepare(
+            replacement.clone(),
+        ));
 
         let mut aborted_replacement = replacement.clone();
         aborted_replacement.status = DfsNamespacePrepareStatus::Aborted;
-        tables.apply(DfsMetadataTableOp::PutNamespacePrepare {
-            prepare: aborted_replacement,
-        });
+        tables.apply(DfsMetadataTableOp::put_namespace_prepare(
+            aborted_replacement,
+        ));
         let mut after_abort = replacement;
         after_abort.operation_id = "operation-footprint-after-abort".to_string();
         after_abort.transaction.transaction_id = "transaction:footprint-after-abort".to_string();
@@ -15088,9 +15078,7 @@ mod tests {
         let before_preapply = tables.clone();
         let mut rollback = DfsMetadataTableRollback::default();
         tables.apply_with_rollback(
-            DfsMetadataTableOp::PutNamespacePrepare {
-                prepare: after_abort.clone(),
-            },
+            DfsMetadataTableOp::put_namespace_prepare(after_abort.clone()),
             &mut rollback,
         );
         let mut blocked_during_preapply = after_abort;
@@ -19270,7 +19258,7 @@ mod tests {
                 &DfsMetadataTableSnapshot {
                     format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
                     materialized_through_sequence: None,
-                    tables: Some(metadata_tables_snapshot(&backend.tables)),
+                    tables: Some(Box::new(metadata_tables_snapshot(&backend.tables))),
                     ops: Vec::new(),
                     semantic_state_fingerprint: None,
                     prefix_proof: None,

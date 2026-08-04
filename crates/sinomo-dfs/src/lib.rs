@@ -103,16 +103,6 @@ mod service_write;
 mod smoke;
 mod transfer;
 
-/// Return unused allocator pages after a bounded metadata expansion has
-/// released all shard leases and temporary replay bodies.
-///
-/// This is public only for the daemon integration crate; ordinary DFS callers
-/// should not need allocator-specific lifecycle hooks.
-#[doc(hidden)]
-pub fn release_unused_metadata_allocator_pages() -> bool {
-    metadata_table_apply::release_metadata_allocator_pages()
-}
-
 pub use advisory_lock::{
     DFS_ADVISORY_LOCK_REQUEST_OUTCOME_LIMIT, DfsAdvisoryLockApplyResult, DfsAdvisoryLockCommand,
     DfsAdvisoryLockConflict, DfsAdvisoryLockGrant, DfsAdvisoryLockMode, DfsAdvisoryLockOutcome,
@@ -187,7 +177,7 @@ pub use default_cluster::{
     default_cluster_metadata_shards_with_async_host, default_cluster_metadata_shards_with_host,
     default_cluster_sifs, default_cluster_sifs_owner, default_cluster_sifs_subtree_policies,
     default_metadata_shard_primary_node_id, default_metadata_shard_replica_node_ids,
-    dfs_service_members, ensure_default_cluster_dfs, ensure_default_cluster_dfs_async,
+    dfs_service_members, ensure_default_cluster_dfs,
     ensure_default_cluster_dfs_async_with_resident_metadata,
     ensure_default_distributed_dfs_with_async_host, ensure_default_distributed_dfs_with_host,
     invalidate_default_cluster_dfs_materialization_for_replica_progress,
@@ -381,20 +371,11 @@ pub use metadata_replication::{
     publish_cluster_dfs_metadata_journal_with_peer_transport,
     publish_cluster_dfs_metadata_journal_with_peer_transports_async,
     publish_cluster_dfs_metadata_journal_with_peer_transports_async_and_execution_exclusions,
-    publish_cluster_dfs_metadata_shard_with_peer_transports_async_and_execution_exclusions,
-    publish_dfs_metadata_journal_with_async_host,
     publish_dfs_metadata_journal_with_async_host_and_execution_exclusions,
     publish_dfs_metadata_journal_with_host, refresh_cluster_dfs_kv_snapshot_with_peer_transport,
     replicate_dfs_metadata_shard_to_target, run_cluster_dfs_metadata_publish_after_events,
-    run_cluster_dfs_metadata_publish_after_events_with_async_peer_transport,
     run_cluster_dfs_metadata_publish_after_events_with_peer_transport,
     run_dfs_metadata_publish_after_events, run_dfs_metadata_publish_after_events_async,
-    schedule_cluster_dfs_metadata_publish_after_events_async_on_runtime,
-    schedule_cluster_dfs_metadata_publish_after_events_with_async_peer_transport_on_runtime,
-    schedule_cluster_dfs_metadata_publish_after_events_with_peer_transports_on_runtime,
-    schedule_cluster_dfs_metadata_publish_async_on_runtime,
-    schedule_cluster_dfs_metadata_publish_with_async_peer_transport_on_runtime,
-    schedule_cluster_dfs_metadata_publish_with_peer_transports_on_runtime,
     schedule_default_dfs_metadata_publish_after_events_async_on_runtime,
     schedule_default_dfs_metadata_publish_async_on_runtime,
     schedule_dfs_metadata_publish_after_events_async_on_runtime,

@@ -697,7 +697,6 @@ pub fn try_zeroed_vec(len: usize, operation: &str) -> Result<Vec<u8>, NetworkErr
     Ok(bytes)
 }
 
-#[allow(dead_code)]
 pub(crate) fn try_extend_from_slice(
     vec: &mut Vec<u8>,
     bytes: &[u8],

@@ -1536,22 +1536,6 @@ pub fn ensure_default_cluster_dfs(
     ensure_default_distributed_dfs_with_host(&state, &mut host, options).map(Some)
 }
 
-pub async fn ensure_default_cluster_dfs_async(
-    data_dir: SinomoDataDir,
-    cluster_paths: ClusterPaths,
-    control_plane: Box<dyn AsyncDfsControlPlaneKvClient>,
-    options: DfsDefaultClusterBootstrapOptions,
-) -> Result<Option<DfsDefaultClusterBootstrapReport>, DfsError> {
-    ensure_default_cluster_dfs_async_with_resident_metadata(
-        data_dir,
-        cluster_paths,
-        control_plane,
-        None,
-        options,
-    )
-    .await
-}
-
 pub async fn ensure_default_cluster_dfs_async_with_resident_metadata(
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,

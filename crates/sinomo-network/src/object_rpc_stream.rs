@@ -486,12 +486,6 @@ impl OwnedRequestSendTask {
         Self { task: Some(task) }
     }
 
-    fn abort(&self) {
-        if let Some(task) = &self.task {
-            task.abort();
-        }
-    }
-
     async fn join(&mut self) -> Result<Result<(), SendFailure>, tokio::task::JoinError> {
         let result = self
             .task
@@ -602,10 +596,6 @@ impl Drop for RpcTimelineStageGuard {
     }
 }
 
-fn decode_control<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, NetworkError> {
-    SinomoObjectCodec::network_frame().decode(payload)
-}
-
 /// Encodes one bounded RPC control record. The reliable transport owns byte
 /// delivery and any optional channel protection, so RPC does not add a tag.
 fn encode_rpc_control<T: Serialize>(value: &T, max_bytes: usize) -> Result<Vec<u8>, NetworkError> {
@@ -620,7 +610,7 @@ fn encode_rpc_control<T: Serialize>(value: &T, max_bytes: usize) -> Result<Vec<u
 }
 
 fn decode_rpc_control<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, NetworkError> {
-    decode_control(payload)
+    SinomoObjectCodec::network_frame().decode(payload)
 }
 
 async fn write_wire_frame<W: AsyncWrite + Unpin>(
@@ -1086,9 +1076,7 @@ async fn read_response_head_with_progress_inner<R: RpcRecordReader>(
     }
 }
 
-async fn prepare_outgoing_body(
-    body: ObjectRpcStreamBody,
-) -> Result<PreparedOutgoingBody, NetworkError> {
+fn prepare_outgoing_body(body: ObjectRpcStreamBody) -> Result<PreparedOutgoingBody, NetworkError> {
     match body.kind {
         OutgoingBodyKind::Inline(bytes) => {
             let length = u64::try_from(bytes.len())
@@ -1355,7 +1343,7 @@ impl<R: RpcRecordReader> Drop for PullIncomingBodyReceiver<R> {
     }
 }
 
-async fn make_incoming_body<R>(
+fn make_incoming_body<R>(
     reader: R,
     options: ObjectFrameIoOptions,
     spec: IncomingBodySpec,
@@ -1652,7 +1640,7 @@ fn request_head(
     application_head: Vec<u8>,
     options: ObjectFrameIoOptions,
     body: &PreparedOutgoingBody,
-) -> Result<(RequestHeadUnsigned, Vec<u8>), NetworkError> {
+) -> Result<Vec<u8>, NetworkError> {
     let unsigned = RequestHeadUnsigned {
         protocol: OBJECT_RPC_STREAM_PROTOCOL.to_string(),
         request_id,
@@ -1664,8 +1652,7 @@ fn request_head(
         descriptor: body.descriptor,
         inline_body: body.inline_body.clone(),
     };
-    let payload = encode_rpc_control(&unsigned, OBJECT_RPC_STREAM_MAX_HEAD_BYTES)?;
-    Ok((unsigned, payload))
+    encode_rpc_control(&unsigned, OBJECT_RPC_STREAM_MAX_HEAD_BYTES)
 }
 
 fn validate_request_head(unsigned: &RequestHeadUnsigned) -> Result<(), NetworkError> {
@@ -1679,14 +1666,13 @@ fn validate_request_head(unsigned: &RequestHeadUnsigned) -> Result<(), NetworkEr
 fn response_head(
     request_id: Id,
     disposition: ResponseDisposition,
-) -> Result<(ResponseHeadUnsigned, Vec<u8>), NetworkError> {
+) -> Result<Vec<u8>, NetworkError> {
     let unsigned = ResponseHeadUnsigned {
         protocol: OBJECT_RPC_STREAM_PROTOCOL.to_string(),
         request_id,
         disposition,
     };
-    let payload = encode_rpc_control(&unsigned, OBJECT_RPC_STREAM_MAX_HEAD_BYTES)?;
-    Ok((unsigned, payload))
+    encode_rpc_control(&unsigned, OBJECT_RPC_STREAM_MAX_HEAD_BYTES)
 }
 
 fn validate_response_head(
@@ -1904,7 +1890,6 @@ async fn write_request_frames<W: RpcRecordWriter>(
 async fn call_object_rpc_records_with_consumption<R, W, F, Fut, T>(
     mut reader: R,
     writer: W,
-    _context: &RpcPeerContext,
     call: ObjectRpcStreamCall,
     options: ObjectFrameIoOptions,
     response_consumer: F,
@@ -1928,11 +1913,11 @@ where
         timeline_trace,
     } = call;
     let prepare_started_ns = timeline_started_ns(timeline_trace);
-    let body = match prepare_outgoing_body(body).await {
+    let body = match prepare_outgoing_body(body) {
         Ok(body) => body,
         Err(error) => return RpcDeliveryOutcome::NotSent { error },
     };
-    let (_head, head_payload) = match request_head(
+    let head_payload = match request_head(
         request_id.clone(),
         method,
         operation_id,
@@ -2042,9 +2027,6 @@ where
             (frame, last_nonce, completed, Some(task))
         };
     if response_frame.kind != FRAME_RESPONSE_HEAD {
-        if let Some(task) = &send_task {
-            task.abort();
-        }
         return RpcDeliveryOutcome::PossiblyApplied {
             error: serialization_error("expected object RPC response head"),
         };
@@ -2052,16 +2034,10 @@ where
     let response_head: ResponseHeadUnsigned = match decode_rpc_control(&response_frame.payload) {
         Ok(head) => head,
         Err(error) => {
-            if let Some(task) = &send_task {
-                task.abort();
-            }
             return RpcDeliveryOutcome::PossiblyApplied { error };
         }
     };
     if let Err(error) = validate_response_head(&request_id, &response_head) {
-        if let Some(task) = &send_task {
-            task.abort();
-        }
         return RpcDeliveryOutcome::PossiblyApplied { error };
     }
     let (metadata, application_head, descriptor, inline_body) = match response_head.disposition {
@@ -2072,9 +2048,6 @@ where
             inline_body,
         } => (metadata, application_head, descriptor, inline_body),
         ResponseDisposition::Rejected { detail } => {
-            if let Some(task) = &send_task {
-                task.abort();
-            }
             return RpcDeliveryOutcome::Rejected { detail };
         }
     };
@@ -2089,8 +2062,7 @@ where
             inline_body,
         },
         request_is_inline,
-    )
-    .await;
+    );
     let consumer_result = match response_consumer(ObjectRpcStreamResponse {
         metadata,
         application_head,
@@ -2148,7 +2120,6 @@ where
 #[cfg(test)]
 pub(crate) async fn call_object_rpc_stream_with_consumption<S, F, Fut, T>(
     stream: S,
-    context: &RpcPeerContext,
     call: ObjectRpcStreamCall,
     options: ObjectFrameIoOptions,
     response_consumer: F,
@@ -2159,20 +2130,11 @@ where
     Fut: Future<Output = Result<RpcResponseConsumption<T>, NetworkError>>,
 {
     let (reader, writer) = byte_record_halves(stream);
-    call_object_rpc_records_with_consumption(
-        reader,
-        writer,
-        context,
-        call,
-        options,
-        response_consumer,
-    )
-    .await
+    call_object_rpc_records_with_consumption(reader, writer, call, options, response_consumer).await
 }
 
 pub(crate) async fn call_object_rpc_chunk_stream_with_consumption<F, Fut, T>(
     stream: AuthenticatedChunkStream,
-    context: &RpcPeerContext,
     call: ObjectRpcStreamCall,
     options: ObjectFrameIoOptions,
     response_consumer: F,
@@ -2182,21 +2144,12 @@ where
     Fut: Future<Output = Result<RpcResponseConsumption<T>, NetworkError>>,
 {
     let (reader, writer) = owned_record_halves(stream);
-    call_object_rpc_records_with_consumption(
-        reader,
-        writer,
-        context,
-        call,
-        options,
-        response_consumer,
-    )
-    .await
+    call_object_rpc_records_with_consumption(reader, writer, call, options, response_consumer).await
 }
 
 #[cfg(test)]
 async fn call_object_rpc_stream<S, F, Fut, T>(
     stream: S,
-    context: &RpcPeerContext,
     call: ObjectRpcStreamCall,
     options: ObjectFrameIoOptions,
     response_consumer: F,
@@ -2206,17 +2159,11 @@ where
     F: FnOnce(ObjectRpcStreamResponse) -> Fut,
     Fut: Future<Output = Result<T, NetworkError>>,
 {
-    call_object_rpc_stream_with_consumption(
-        stream,
-        context,
-        call,
-        options,
-        move |response| async move {
-            response_consumer(response)
-                .await
-                .map(RpcResponseConsumption::Complete)
-        },
-    )
+    call_object_rpc_stream_with_consumption(stream, call, options, move |response| async move {
+        response_consumer(response)
+            .await
+            .map(RpcResponseConsumption::Complete)
+    })
     .await
 }
 
@@ -2225,7 +2172,7 @@ async fn write_rejection<W: RpcRecordWriter>(
     request_id: Id,
     detail: String,
 ) -> Result<(), NetworkError> {
-    let (_, payload) = response_head(request_id, ResponseDisposition::Rejected { detail })?;
+    let payload = response_head(request_id, ResponseDisposition::Rejected { detail })?;
     writer
         .write_record(FRAME_RESPONSE_HEAD, &payload, "write object RPC rejection")
         .await
@@ -2283,8 +2230,7 @@ where
             inline_body: head.inline_body,
         },
         true,
-    )
-    .await;
+    );
     let request_ingress_duration_ns = if request_ingress_started_ns == 0 {
         0
     } else {
@@ -2339,21 +2285,7 @@ where
         crate::network_timeline_stage::RPC_RESPONSE_STAGE,
         crate::network_timeline_flag::RESPONSE,
     );
-    let mut prepare_response_body = std::pin::pin!(prepare_outgoing_body(reply.body));
-    let prepared_response_body = match await_with_stream_progress(
-        &mut writer,
-        IncomingDirection::Response,
-        &request_id,
-        negotiated_response_progress_interval,
-        &mut response_progress_nonce,
-        prepare_response_body.as_mut(),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(failure) => return Err(failure.error),
-    };
-    let mut response_body = match prepared_response_body {
+    let mut response_body = match prepare_outgoing_body(reply.body) {
         Ok(body) => body,
         Err(error) => {
             return write_rejection(&mut writer, request_id, error.to_string()).await;
@@ -2387,7 +2319,7 @@ where
         }
     }
     let buffer_entire_response = request_is_inline && response_body.source.is_none();
-    let (_, response_payload) = response_head(
+    let response_payload = response_head(
         request_id.clone(),
         ResponseDisposition::Accepted {
             metadata: reply.metadata,
@@ -2834,8 +2766,7 @@ mod tests {
                 inline_body: None,
             },
             false,
-        )
-        .await;
+        );
 
         assert!(
             !receive_completion.is_ready(),
@@ -2870,7 +2801,7 @@ mod tests {
     #[tokio::test]
     async fn owned_object_rpc_preserves_body_slab_through_delivery() {
         let (client, server, transmitted_data_slab_ids, _, _) = test_owned_chunk_pair();
-        let (client_context, server_context) = peer_contexts();
+        let (_, server_context) = peer_contexts();
         let payload = vec![0x7a; OBJECT_RPC_STREAM_INLINE_BODY_BYTES + 1024];
         let expected = payload.clone();
         let (delivered_id_sender, delivered_id_receiver) = tokio::sync::oneshot::channel();
@@ -2909,7 +2840,6 @@ mod tests {
 
         let result = call_object_rpc_chunk_stream_with_consumption(
             client,
-            &client_context,
             ObjectRpcStreamCall::new("test.owned", ObjectRpcStreamBody::bytes(payload)),
             ObjectFrameIoOptions::default(),
             |response| async move {
@@ -2930,7 +2860,7 @@ mod tests {
     #[tokio::test]
     async fn small_known_owned_rpc_uses_head_and_data_without_redundant_finish() {
         let (client, server, _, client_record_kinds, server_record_kinds) = test_owned_chunk_pair();
-        let (client_context, server_context) = peer_contexts();
+        let (_, server_context) = peer_contexts();
         let request = "small owned request".to_string();
         let expected_request = request.clone();
         let response = "small owned response".to_string();
@@ -2961,7 +2891,6 @@ mod tests {
 
         let outcome = call_object_rpc_chunk_stream_with_consumption(
             client,
-            &client_context,
             ObjectRpcStreamCall::new(
                 "test.small-owned",
                 ObjectRpcStreamBody::source(
@@ -3070,7 +2999,7 @@ mod tests {
     async fn round_trip(request: Vec<u8>, response: Vec<u8>) {
         let capacity = OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES;
         let (client, server) = tokio::io::duplex(capacity);
-        let (client_context, server_context) = peer_contexts();
+        let (_, server_context) = peer_contexts();
         let expected_request = request.clone();
         let expected_response = response.clone();
         let server_task = tokio::spawn(async move {
@@ -3099,7 +3028,6 @@ mod tests {
         });
         let outcome = call_object_rpc_stream(
             client,
-            &client_context,
             ObjectRpcStreamCall::new("test.echo", ObjectRpcStreamBody::bytes(request)),
             ObjectFrameIoOptions { idle_timeout: None },
             move |response| {
@@ -3156,7 +3084,7 @@ mod tests {
             ObjectRpcStreamBody::one_pass_reader(Cursor::new(b"deferred".to_vec()), None),
         ] {
             let (client, server) = tokio::io::duplex(4096);
-            let (client_context, server_context) = peer_contexts();
+            let (_, server_context) = peer_contexts();
             let server_task = tokio::spawn(async move {
                 serve_object_rpc_stream(
                     server,
@@ -3175,7 +3103,6 @@ mod tests {
             });
             let outcome = call_object_rpc_stream(
                 client,
-                &client_context,
                 ObjectRpcStreamCall::new("test.body", body),
                 ObjectFrameIoOptions { idle_timeout: None },
                 |response| async move {
@@ -3192,7 +3119,7 @@ mod tests {
     #[tokio::test]
     async fn handler_rejection_is_not_ambiguous_delivery() {
         let (client, server) = tokio::io::duplex(4096);
-        let (client_context, server_context) = peer_contexts();
+        let (_, server_context) = peer_contexts();
         let server_task = tokio::spawn(async move {
             serve_object_rpc_stream(
                 server,
@@ -3204,7 +3131,6 @@ mod tests {
         });
         let outcome = call_object_rpc_stream(
             client,
-            &client_context,
             ObjectRpcStreamCall::new("test.reject", ObjectRpcStreamBody::bytes(Vec::new())),
             ObjectFrameIoOptions { idle_timeout: None },
             |_response| async { Ok(()) },
@@ -3224,7 +3150,7 @@ mod tests {
         const HANDLER_DELAY: Duration = Duration::from_millis(100);
 
         let (client, server) = tokio::io::duplex(4096);
-        let (client_context, server_context) = peer_contexts();
+        let (_, server_context) = peer_contexts();
         let options = ObjectFrameIoOptions::idle_timeout(IDLE_TIMEOUT);
         let server_task = tokio::spawn(async move {
             serve_object_rpc_stream(server, &server_context, options, |call, _| async move {
@@ -3240,7 +3166,6 @@ mod tests {
         let started_at = tokio::time::Instant::now();
         let outcome = call_object_rpc_stream(
             client,
-            &client_context,
             ObjectRpcStreamCall::new("test.long-handler", ObjectRpcStreamBody::bytes(Vec::new())),
             options,
             |response| async move {
@@ -3329,7 +3254,7 @@ mod tests {
         let expected_request = request_bytes.clone();
         let expected_response = response_bytes.clone();
         let (client, server) = tokio::io::duplex(4096);
-        let (client_context, server_context) = peer_contexts();
+        let (_, server_context) = peer_contexts();
         let options = ObjectFrameIoOptions::idle_timeout(IDLE_TIMEOUT);
         let server_task = tokio::spawn(async move {
             serve_object_rpc_stream(server, &server_context, options, move |call, _| {
@@ -3353,7 +3278,6 @@ mod tests {
         let request_len = request_bytes.len() as u64;
         let outcome = call_object_rpc_stream(
             client,
-            &client_context,
             ObjectRpcStreamCall::new(
                 "test.slow-producers",
                 ObjectRpcStreamBody::one_pass_async_reader(
@@ -3384,7 +3308,7 @@ mod tests {
         let request_bytes = b"slow request behind an early response".to_vec();
         let request_len = request_bytes.len() as u64;
         let (client, server) = tokio::io::duplex(4096);
-        let (client_context, server_context) = peer_contexts();
+        let (_, server_context) = peer_contexts();
         let options = ObjectFrameIoOptions::idle_timeout(IDLE_TIMEOUT);
         let server_task = tokio::spawn(async move {
             serve_object_rpc_stream(
@@ -3405,7 +3329,6 @@ mod tests {
         });
         let outcome = call_object_rpc_stream(
             client,
-            &client_context,
             ObjectRpcStreamCall::new(
                 "test.early-response-slow-request",
                 ObjectRpcStreamBody::one_pass_async_reader(
@@ -3495,7 +3418,7 @@ mod tests {
             observed: Arc::clone(&observed),
         };
         let (client, server) = tokio::io::duplex(32 * 1024);
-        let (client_context, server_context) = peer_contexts();
+        let (_, server_context) = peer_contexts();
         let server_task = tokio::spawn(async move {
             serve_object_rpc_stream(
                 server,
@@ -3513,7 +3436,6 @@ mod tests {
         let consumer_observed = Arc::clone(&observed);
         let outcome = call_object_rpc_stream(
             client,
-            &client_context,
             ObjectRpcStreamCall::new(
                 "test.early",
                 ObjectRpcStreamBody::one_pass_async_reader(source, None),
@@ -3541,7 +3463,7 @@ mod tests {
             Some(bytes.len() as u64 + 1),
         );
         let (client, server) = tokio::io::duplex(64 * 1024);
-        let (client_context, server_context) = peer_contexts();
+        let (_, server_context) = peer_contexts();
         let server_task = tokio::spawn(async move {
             serve_object_rpc_stream(
                 server,
@@ -3558,7 +3480,6 @@ mod tests {
         });
         let outcome = call_object_rpc_stream(
             client,
-            &client_context,
             ObjectRpcStreamCall::new("test.corrupt", body),
             ObjectFrameIoOptions { idle_timeout: None },
             |response| async move {
@@ -3582,7 +3503,7 @@ mod tests {
             polls: Arc::clone(&polls),
         };
         let (client, server) = tokio::io::duplex(4096);
-        let (client_context, server_context) = peer_contexts();
+        let (_, server_context) = peer_contexts();
         let server_task = tokio::spawn(async move {
             serve_object_rpc_stream(
                 server,
@@ -3599,7 +3520,6 @@ mod tests {
         });
         let outcome = call_object_rpc_stream(
             client,
-            &client_context,
             ObjectRpcStreamCall::new(
                 "test.no-retry",
                 ObjectRpcStreamBody::one_pass_async_reader(reader, None),
@@ -3653,7 +3573,7 @@ mod tests {
     #[tokio::test]
     async fn rpc_does_not_reauthenticate_transport_context() {
         let (client, server) = tokio::io::duplex(4096);
-        let (client_context, mut server_context) = peer_contexts();
+        let (_, mut server_context) = peer_contexts();
         server_context.channel_binding = [0x77; 32];
         let server_task = tokio::spawn(async move {
             serve_object_rpc_stream(
@@ -3671,7 +3591,6 @@ mod tests {
         });
         let outcome = call_object_rpc_stream(
             client,
-            &client_context,
             ObjectRpcStreamCall::new("test.binding", ObjectRpcStreamBody::bytes(Vec::new())),
             ObjectFrameIoOptions { idle_timeout: None },
             |response| async move {
@@ -3703,7 +3622,6 @@ mod tests {
     #[tokio::test]
     async fn cancelled_call_aborts_request_writer_and_releases_prepared_body() {
         let (client, mut blocked_server) = tokio::io::duplex(64);
-        let (client_context, _) = peer_contexts();
         let (body_dropped_sender, body_dropped_receiver) = tokio::sync::oneshot::channel();
         let source =
             ObjectRpcBodySource::bytes(vec![0x5a; OBJECT_RPC_STREAM_INLINE_BODY_BYTES + 1])
@@ -3716,7 +3634,6 @@ mod tests {
         let call_task = tokio::spawn(async move {
             call_object_rpc_stream(
                 client,
-                &client_context,
                 call,
                 ObjectFrameIoOptions { idle_timeout: None },
                 |_response| async { Ok(()) },
@@ -3752,12 +3669,10 @@ mod tests {
     #[tokio::test]
     async fn invalid_call_is_not_sent() {
         let (client, _server) = tokio::io::duplex(64);
-        let (client_context, _) = peer_contexts();
         let call = ObjectRpcStreamCall::new(" ", ObjectRpcStreamBody::bytes(Vec::new()));
         assert!(matches!(
             call_object_rpc_stream(
                 client,
-                &client_context,
                 call,
                 ObjectFrameIoOptions { idle_timeout: None },
                 |_response| async { Ok(()) },

@@ -17,14 +17,12 @@ use crate::{
     DaemonDataOwnerLock, DaemonError, DaemonLock, DaemonPaths, DaemonSignerAuthority,
     daemon_paths_are_shadow, handle_daemon_finalize_shadow_rollout, read_daemon_status,
 };
-#[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::events::EventStore;
 use sinomo_core::node::NodeId;
 use sinomo_core::{
     ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterMemberRecord,
-    ClusterModuleRolloutDesiredRecord, ClusterModuleRolloutReconciliationRecord,
-    ClusterModuleRolloutStatusRecord, ClusterTransportKind, cluster_module_rollout_reconcile_key,
+    ClusterModuleRolloutStatusRecord, ClusterTransportKind,
 };
 use sinomo_rollout::{
     AppliedRolloutTransition, RolloutController, RolloutTelemetryAdvanceOptions,
@@ -6410,12 +6408,6 @@ pub(crate) fn run_daemon_rollout_telemetry_reconciliation_tick(
     })
 }
 
-pub fn run_daemon_rollout_telemetry_maintenance_tick(
-    paths: &DaemonPaths,
-) -> Result<Option<AppliedRolloutTransition>, DaemonError> {
-    Ok(run_daemon_rollout_telemetry_reconciliation_tick(paths)?.applied_transition)
-}
-
 fn publish_daemon_module_rollout_status_from_data_dir(
     data_dir: &Path,
     rollout_paths: &SelfRolloutPaths,
@@ -6480,280 +6472,6 @@ fn commit_daemon_rollout_kv_ops(
             failure: Vec::new(),
         },
     )
-}
-
-fn read_daemon_rollout_authoritative_kv_snapshot(
-    cluster_paths: &sinomo_core::network::ClusterPaths,
-    cluster_state: &sinomo_core::ClusterBootstrapState,
-) -> Result<sinomo_core::kv::KvSnapshot, DaemonError> {
-    // An empty transaction is an explicit Raft read barrier. It must still
-    // quorum-commit even though it does not advance the state revision.
-    commit_daemon_rollout_kv_ops(cluster_paths, cluster_state, Vec::new())
-}
-
-pub fn run_daemon_module_rollout_desired_reconciliation_tick(
-    paths: &DaemonPaths,
-) -> Result<Vec<ClusterModuleRolloutReconciliationRecord>, DaemonError> {
-    let data_dir = daemon_data_dir_path(paths)?;
-    let data_dir_handle = sinomo_core::local::SinomoDataDir::new(&data_dir);
-    let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir_handle);
-    let Ok(cluster_state) = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
-    else {
-        return Ok(Vec::new());
-    };
-    let authoritative_snapshot =
-        read_daemon_rollout_authoritative_kv_snapshot(&cluster_paths, &cluster_state)?;
-    let desired_records = sinomo_rollout::project_cluster_module_rollout_desired_from_snapshot(
-        &authoritative_snapshot,
-    )?;
-    if desired_records.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let rollout_paths = SelfRolloutPaths::new(&data_dir);
-    let runtime_state = sinomo_rollout::read_rollout_runtime_state(&rollout_paths)?;
-    let existing_reconciliations: BTreeMap<String, ClusterModuleRolloutReconciliationRecord> =
-        sinomo_rollout::project_cluster_module_rollout_reconciliations_from_snapshot(
-            &authoritative_snapshot,
-        )?
-        .into_iter()
-        .map(|record| {
-            (
-                cluster_module_rollout_reconcile_key(
-                    &record.node_id,
-                    &record.module_id,
-                    &record.rollout_plan_id,
-                ),
-                record,
-            )
-        })
-        .collect();
-    let mut reconciliations = Vec::new();
-    let mut reconciliation_ops = Vec::new();
-    for desired in desired_records {
-        if !daemon_module_rollout_desired_targets_node(&desired, &cluster_state.local_node_id) {
-            continue;
-        }
-        let reconciliation = daemon_module_rollout_reconciliation_record(
-            &data_dir,
-            &cluster_state.cluster_id,
-            &cluster_state.local_node_id,
-            &desired,
-            runtime_state.as_ref(),
-        )?;
-        let reconciliation_key = cluster_module_rollout_reconcile_key(
-            &reconciliation.node_id,
-            &reconciliation.module_id,
-            &reconciliation.rollout_plan_id,
-        );
-        if let Some(existing) = existing_reconciliations.get(&reconciliation_key)
-            && daemon_module_rollout_reconciliation_stable_eq(existing, &reconciliation)
-        {
-            reconciliations.push(existing.clone());
-            continue;
-        }
-        reconciliation_ops.push(
-            sinomo_rollout::build_cluster_module_rollout_reconciliation_put_op(&reconciliation)?,
-        );
-        reconciliations.push(reconciliation);
-    }
-    if !reconciliation_ops.is_empty() {
-        commit_daemon_rollout_kv_ops(&cluster_paths, &cluster_state, reconciliation_ops)?;
-    }
-    Ok(reconciliations)
-}
-
-fn daemon_module_rollout_reconciliation_stable_eq(
-    left: &ClusterModuleRolloutReconciliationRecord,
-    right: &ClusterModuleRolloutReconciliationRecord,
-) -> bool {
-    left.cluster_id == right.cluster_id
-        && left.node_id == right.node_id
-        && left.rollout_plan_id == right.rollout_plan_id
-        && left.module_id == right.module_id
-        && left.artifact_id == right.artifact_id
-        && left.state == right.state
-        && left.reason == right.reason
-        && left.release_id == right.release_id
-        && left.release_material_hash == right.release_material_hash
-        && left.local_runtime_stage == right.local_runtime_stage
-}
-
-fn daemon_module_rollout_desired_targets_node(
-    desired: &ClusterModuleRolloutDesiredRecord,
-    node_id: &NodeId,
-) -> bool {
-    desired.state == "active"
-        && (desired.rollout_plan.target_nodes.is_empty()
-            || desired
-                .rollout_plan
-                .target_nodes
-                .iter()
-                .any(|target| target == node_id))
-}
-
-fn daemon_module_rollout_reconciliation_record(
-    data_dir: &Path,
-    cluster_id: &sinomo_core::node::ClusterId,
-    node_id: &NodeId,
-    desired: &ClusterModuleRolloutDesiredRecord,
-    runtime_state: Option<&sinomo_rollout::RolloutRuntimeState>,
-) -> Result<ClusterModuleRolloutReconciliationRecord, DaemonError> {
-    let mut local_runtime_stage = runtime_state
-        .filter(|state| state.plan.module_id == desired.rollout_plan.module_id)
-        .map(|state| daemon_rollout_stage_label(&state.stage).to_string());
-    let (state, reason, prepared_stage) = if runtime_state.is_some_and(|state| {
-        state.plan.rollout_plan_id == desired.rollout_plan.rollout_plan_id
-            && state.plan.module_id == desired.rollout_plan.module_id
-            && state.plan.artifact_id == desired.rollout_plan.artifact_id
-    }) {
-        (
-            "matched".to_string(),
-            "local runtime state already matches desired rollout plan".to_string(),
-            None,
-        )
-    } else {
-        daemon_module_rollout_material_reconciliation(data_dir, node_id, desired)?
-    };
-    local_runtime_stage = local_runtime_stage.or(prepared_stage);
-
-    Ok(ClusterModuleRolloutReconciliationRecord {
-        cluster_id: cluster_id.clone(),
-        node_id: node_id.clone(),
-        rollout_plan_id: desired.rollout_plan.rollout_plan_id.clone(),
-        module_id: desired.rollout_plan.module_id.clone(),
-        artifact_id: desired.rollout_plan.artifact_id.clone(),
-        state,
-        reason,
-        release_id: desired.release_id.clone(),
-        release_material_hash: desired.release_material_hash.clone(),
-        local_runtime_stage,
-        updated_at: OffsetDateTime::now_utc(),
-    })
-}
-
-fn daemon_module_rollout_material_reconciliation(
-    data_dir: &Path,
-    node_id: &NodeId,
-    desired: &ClusterModuleRolloutDesiredRecord,
-) -> Result<(String, String, Option<String>), DaemonError> {
-    let Some(release_id) = desired.release_id.as_ref() else {
-        return Ok((
-            "blocked".to_string(),
-            "desired rollout does not reference a release id".to_string(),
-            None,
-        ));
-    };
-    let Some(evidence_record) =
-        sinomo_registry::read_artifact_evidence_record(data_dir, release_id)?
-    else {
-        return Ok((
-            "blocked".to_string(),
-            format!("artifact evidence {release_id} is not available in the local registry"),
-            None,
-        ));
-    };
-    if let Some(expected_hash) = desired.release_material_hash.as_deref()
-        && evidence_record.content_hash != expected_hash
-    {
-        return Ok((
-            "blocked".to_string(),
-            format!(
-                "artifact evidence {release_id} hash {} does not match desired hash {expected_hash}",
-                evidence_record.content_hash
-            ),
-            None,
-        ));
-    }
-    let Some(material) = sinomo_registry::read_verified_release_material(data_dir, release_id)?
-    else {
-        return Ok((
-            "blocked".to_string(),
-            format!("verified release material for release {release_id} is not available locally"),
-            None,
-        ));
-    };
-    if let Some(reason) = daemon_verified_rollout_material_mismatch(&material, desired) {
-        return Ok(("blocked".to_string(), reason, None));
-    }
-    let trusted_signers = sinomo_registry::read_trusted_artifact_signers(data_dir)?;
-    let rollout_paths = SelfRolloutPaths::new(data_dir);
-    let preparation = RolloutController::new(node_id.clone())
-        .prepare_and_record_verified_artifact_rollout(
-            &rollout_paths,
-            sinomo_rollout::VerifiedArtifactRolloutRequest {
-                node_id: node_id.clone(),
-                artifact: material.artifact,
-                policy_decision: material.policy_decision,
-                rollout_plan: material.rollout_plan,
-                release_id: evidence_record.evidence_id,
-                release_material_hash: material.release_material_hash,
-                evidence_refs: material.evidence_refs,
-                trusted_signers,
-                active_artifact_id: material.active_artifact_id,
-            },
-        )?;
-    if preparation.accepted {
-        return Ok((
-            "prepared".to_string(),
-            preparation.reason,
-            Some("shadow".to_string()),
-        ));
-    }
-    Ok(("blocked".to_string(), preparation.reason, None))
-}
-
-fn daemon_verified_rollout_material_mismatch(
-    material: &sinomo_registry::VerifiedReleaseMaterialRecord,
-    desired: &ClusterModuleRolloutDesiredRecord,
-) -> Option<String> {
-    if Some(&material.release_id) != desired.release_id.as_ref() {
-        return Some(format!(
-            "verified release material references release {}, but desired references {}",
-            material.release_id,
-            desired
-                .release_id
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "none".to_string())
-        ));
-    }
-    if Some(&material.release_material_hash) != desired.release_material_hash.as_ref() {
-        return Some(
-            "verified release material hash does not match desired release hash".to_string(),
-        );
-    }
-    if material.rollout_plan != desired.rollout_plan {
-        return Some(
-            "verified release material rollout plan does not match desired rollout plan"
-                .to_string(),
-        );
-    }
-    if material.artifact.artifact_id != desired.rollout_plan.artifact_id {
-        return Some(
-            "verified rollout material artifact id does not match desired plan".to_string(),
-        );
-    }
-    if material.artifact.module_id != desired.rollout_plan.module_id {
-        return Some("verified rollout material module id does not match desired plan".to_string());
-    }
-    if material.artifact.target_ring != desired.rollout_plan.target_ring {
-        return Some(
-            "verified rollout material target ring does not match desired plan".to_string(),
-        );
-    }
-    if material.policy_decision.target_artifact_id != desired.rollout_plan.artifact_id {
-        return Some(
-            "verified rollout material policy target artifact does not match desired plan"
-                .to_string(),
-        );
-    }
-    if material.policy_decision.target_ring != desired.rollout_plan.target_ring {
-        return Some(
-            "verified rollout material policy target ring does not match desired plan".to_string(),
-        );
-    }
-    None
 }
 
 fn daemon_rollout_controller_node_id(
@@ -8079,32 +7797,12 @@ mod tests {
         member.allowed_capabilities = capabilities;
     }
 
-    fn append_cluster_module_rollout_desired_for_test(
-        paths: &sinomo_core::network::ClusterPaths,
-        node_id: &NodeId,
-        desired: &ClusterModuleRolloutDesiredRecord,
-    ) -> Result<sinomo_core::kv::KvSnapshot, sinomo_core::network::NetworkError> {
-        let op = sinomo_rollout::build_cluster_module_rollout_desired_put_op(desired)
-            .map_err(sinomo_core::network::NetworkError::directory)?;
-        append_cluster_raft_command(paths, node_id, sinomo_core::kv::KvCommand::Op(op))
-    }
-
     fn cluster_module_rollout_statuses_for_test(
         paths: &sinomo_core::network::ClusterPaths,
     ) -> Result<Vec<ClusterModuleRolloutStatusRecord>, sinomo_core::network::NetworkError> {
         let state = sinomo_core::cluster::read_cluster_state_without_kv(paths)?;
         let snapshot = sinomo_core::cluster::read_cluster_kv_local_snapshot(paths, &state)?.value;
         sinomo_rollout::project_cluster_module_rollout_statuses_from_snapshot(&snapshot)
-            .map_err(sinomo_core::network::NetworkError::directory)
-    }
-
-    fn cluster_module_rollout_reconciliations_for_test(
-        paths: &sinomo_core::network::ClusterPaths,
-    ) -> Result<Vec<ClusterModuleRolloutReconciliationRecord>, sinomo_core::network::NetworkError>
-    {
-        let state = sinomo_core::cluster::read_cluster_state_without_kv(paths)?;
-        let snapshot = sinomo_core::cluster::read_cluster_kv_local_snapshot(paths, &state)?.value;
-        sinomo_rollout::project_cluster_module_rollout_reconciliations_from_snapshot(&snapshot)
             .map_err(sinomo_core::network::NetworkError::directory)
     }
 
@@ -8684,8 +8382,9 @@ mod tests {
             ))
             .expect("append telemetry");
 
-        let applied = run_daemon_rollout_telemetry_maintenance_tick(&daemon_paths)
+        let applied = run_daemon_rollout_telemetry_reconciliation_tick(&daemon_paths)
             .expect("telemetry tick")
+            .applied_transition
             .expect("applied transition");
 
         assert_eq!(
@@ -8750,8 +8449,9 @@ mod tests {
             ))
             .expect("append telemetry");
 
-        let applied =
-            run_daemon_rollout_telemetry_maintenance_tick(&daemon_paths).expect("telemetry tick");
+        let applied = run_daemon_rollout_telemetry_reconciliation_tick(&daemon_paths)
+            .expect("telemetry tick")
+            .applied_transition;
 
         assert_eq!(applied, None);
         assert_eq!(
@@ -8815,8 +8515,9 @@ mod tests {
             ))
             .expect("append telemetry");
 
-        let applied = run_daemon_rollout_telemetry_maintenance_tick(&daemon_paths)
+        let applied = run_daemon_rollout_telemetry_reconciliation_tick(&daemon_paths)
             .expect("telemetry tick")
+            .applied_transition
             .expect("applied transition");
 
         assert_eq!(
@@ -8928,333 +8629,6 @@ mod tests {
         );
         assert_eq!(published.telemetry_last_consumed_sequence, Some(7));
         assert_eq!(statuses, vec![published]);
-    }
-
-    #[test]
-    fn daemon_reconciles_missing_local_module_rollout_material_as_blocked() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-module-rollout-desired-blocked");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("layout");
-        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
-        cluster_paths.ensure().expect("cluster paths");
-        let cluster_id =
-            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_desired_blocked")
-                .expect("cluster");
-        let node = NodeId::from_legacy_named("node_daemon_desired_blocked").expect("node id");
-        let mut cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "daemon desired blocked",
-            node.clone(),
-            "daemon node",
-            "public-key",
-            OffsetDateTime::now_utc(),
-        );
-        authorize_local_raft_voter_for_test(&mut cluster_state);
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &cluster_state)
-            .expect("write cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(
-            &cluster_paths,
-            &cluster_state,
-        )
-        .expect("sync cluster state");
-        sinomo_core::cluster::locked_set_cluster_raft_leader(
-            &cluster_paths,
-            &cluster_state.local_node_id,
-            1,
-        )
-        .expect("set local raft leader");
-
-        let module_id =
-            sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
-        let rollout_plan_id =
-            sinomo_core::Id::from_legacy_named("rollout_daemon_desired_blocked").expect("rollout");
-        let release_id = sinomo_core::Id::from_legacy_named("release_missing").expect("release");
-        let desired = ClusterModuleRolloutDesiredRecord {
-            cluster_id: cluster_id.clone(),
-            state: "active".to_string(),
-            rollout_plan: sinomo_core::RolloutPlan {
-                rollout_plan_id: rollout_plan_id.clone(),
-                artifact_id: sinomo_core::Id::from_legacy_named("artifact_daemon_desired")
-                    .expect("artifact"),
-                module_id: module_id.clone(),
-                target_ring: sinomo_core::TrustRing::R3SandboxedModule,
-                strategy: sinomo_core::RolloutStrategy::Shadow,
-                target_nodes: vec![node.clone()],
-                initial_weight_bps: 0,
-                promotion_steps_bps: vec![500],
-                rollback_policy: sinomo_core::RollbackPolicy::default(),
-            },
-            requested_by_node_id: node.clone(),
-            release_id: Some(release_id.clone()),
-            release_material_hash: Some("blake3:release".to_string()),
-            evidence_refs: vec!["registry://artifact-evidence/release_missing".to_string()],
-            requested_at: Some("2026-06-01T00:00:00Z".to_string()),
-            updated_at: OffsetDateTime::now_utc(),
-        };
-        append_cluster_module_rollout_desired_for_test(&cluster_paths, &node, &desired)
-            .expect("sync desired");
-
-        let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
-        let reconciliations = run_daemon_module_rollout_desired_reconciliation_tick(&daemon_paths)
-            .expect("reconcile desired");
-        let records = cluster_module_rollout_reconciliations_for_test(&cluster_paths)
-            .expect("read reconciliations");
-
-        assert_eq!(reconciliations.len(), 1);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].cluster_id, cluster_id);
-        assert_eq!(records[0].node_id, node);
-        assert_eq!(records[0].module_id, module_id);
-        assert_eq!(records[0].rollout_plan_id, rollout_plan_id);
-        assert_eq!(records[0].state, "blocked");
-        assert_eq!(records[0].release_id.as_ref(), Some(&release_id));
-        assert!(
-            records[0]
-                .reason
-                .contains("is not available in the local registry")
-        );
-        assert!(records[0].local_runtime_stage.is_none());
-        let first_record = records[0].clone();
-        let second_reconciliations =
-            run_daemon_module_rollout_desired_reconciliation_tick(&daemon_paths)
-                .expect("second reconcile desired");
-        let second_records = cluster_module_rollout_reconciliations_for_test(&cluster_paths)
-            .expect("read second reconciliations");
-        assert_eq!(second_reconciliations, vec![first_record.clone()]);
-        assert_eq!(second_records, vec![first_record]);
-    }
-
-    #[test]
-    fn daemon_prepares_verified_local_material_for_desired_module_rollout() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-module-rollout-desired-prepared");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("layout");
-        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
-        cluster_paths.ensure().expect("cluster paths");
-        let cluster_id =
-            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_desired_prepared")
-                .expect("cluster");
-        let node = NodeId::from_legacy_named("node_daemon_desired_prepared").expect("node id");
-        let mut cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "daemon desired prepared",
-            node.clone(),
-            "daemon node",
-            "public-key",
-            OffsetDateTime::now_utc(),
-        );
-        authorize_local_raft_voter_for_test(&mut cluster_state);
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &cluster_state)
-            .expect("write cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(
-            &cluster_paths,
-            &cluster_state,
-        )
-        .expect("sync cluster state");
-        sinomo_core::cluster::locked_set_cluster_raft_leader(
-            &cluster_paths,
-            &cluster_state.local_node_id,
-            1,
-        )
-        .expect("set local raft leader");
-
-        let module_id =
-            sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
-        let artifact_id = sinomo_core::Id::from_legacy_named("artifact_daemon_prepared_candidate")
-            .expect("artifact");
-        let active_artifact_id =
-            sinomo_core::Id::from_legacy_named("artifact_daemon_prepared_active").expect("active");
-        let rollout_plan = sinomo_core::RolloutPlan {
-            rollout_plan_id: sinomo_core::Id::from_legacy_named("rollout_daemon_desired_prepared")
-                .expect("rollout"),
-            artifact_id: artifact_id.clone(),
-            module_id: module_id.clone(),
-            target_ring: sinomo_core::TrustRing::R3SandboxedModule,
-            strategy: sinomo_core::RolloutStrategy::Shadow,
-            target_nodes: vec![node.clone()],
-            initial_weight_bps: 0,
-            promotion_steps_bps: vec![500],
-            rollback_policy: sinomo_core::RollbackPolicy::default(),
-        };
-        let release_id = sinomo_core::Id::from_legacy_named("release_prepared").expect("release");
-        let release_ref = format!("registry://artifact-evidence/{release_id}");
-        let (artifact, signer) = signed_daemon_test_artifact(
-            &root,
-            "daemon-prepared-signer",
-            &artifact_id,
-            &module_id,
-            "blake3:candidate",
-            vec![release_ref.clone()],
-        );
-        let evidence_record = daemon_test_artifact_evidence_record(
-            &root,
-            &release_id,
-            "blake3:release",
-            vec![release_ref.clone()],
-        );
-        sinomo_registry::write_artifact_evidence_record(&root, &evidence_record)
-            .expect("write evidence record");
-        sinomo_registry::write_trusted_artifact_signers(&root, std::slice::from_ref(&signer))
-            .expect("write trusted signer");
-        let material = sinomo_registry::VerifiedReleaseMaterialRecord {
-            release_id: release_id.clone(),
-            release_material_hash: "blake3:release".to_string(),
-            artifact: artifact.clone(),
-            policy_decision: sinomo_core::PolicyDecision {
-                decision_id: sinomo_core::Id::from_legacy_named("policy_daemon_prepared")
-                    .expect("policy"),
-                target_ring: sinomo_core::TrustRing::R3SandboxedModule,
-                target_artifact_id: artifact_id.clone(),
-                action: sinomo_core::PolicyAction::Allow,
-                capability_diff: sinomo_core::CapabilityDiff::default(),
-                required_additional_evals: Vec::new(),
-                max_rollout_weight_bps: Some(500),
-                reason: "verified rollout material accepted".to_string(),
-            },
-            rollout_plan: rollout_plan.clone(),
-            active_artifact_id: active_artifact_id.clone(),
-            evidence_refs: vec![release_ref.clone()],
-            registered_at: OffsetDateTime::now_utc(),
-        };
-        sinomo_registry::write_verified_release_material(&root, &material)
-            .expect("write rollout material");
-        let desired = ClusterModuleRolloutDesiredRecord {
-            cluster_id: cluster_id.clone(),
-            state: "active".to_string(),
-            rollout_plan: rollout_plan.clone(),
-            requested_by_node_id: node.clone(),
-            release_id: Some(release_id.clone()),
-            release_material_hash: Some("blake3:release".to_string()),
-            evidence_refs: vec![release_ref],
-            requested_at: Some("2026-06-01T00:00:00Z".to_string()),
-            updated_at: OffsetDateTime::now_utc(),
-        };
-        append_cluster_module_rollout_desired_for_test(&cluster_paths, &node, &desired)
-            .expect("sync desired");
-
-        let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
-        let reconciliations = run_daemon_module_rollout_desired_reconciliation_tick(&daemon_paths)
-            .expect("reconcile desired");
-        let runtime_state =
-            sinomo_rollout::read_rollout_runtime_state(&SelfRolloutPaths::new(&root))
-                .expect("read runtime state")
-                .expect("runtime state");
-
-        assert_eq!(reconciliations.len(), 1);
-        assert_eq!(reconciliations[0].cluster_id, cluster_id);
-        assert_eq!(reconciliations[0].node_id, node);
-        assert_eq!(reconciliations[0].state, "prepared");
-        assert_eq!(reconciliations[0].release_id.as_ref(), Some(&release_id));
-        assert_eq!(
-            reconciliations[0].local_runtime_stage.as_deref(),
-            Some("shadow")
-        );
-        assert!(reconciliations[0].reason.contains("prepared for rollout"));
-        assert_eq!(runtime_state.plan, rollout_plan);
-        assert_eq!(
-            runtime_state.loader_state.active_artifact_id,
-            active_artifact_id
-        );
-        assert_eq!(
-            runtime_state.loader_state.candidate_artifact_id.as_ref(),
-            Some(&artifact_id)
-        );
-        assert_eq!(runtime_state.stage, sinomo_rollout::RolloutStage::Shadow);
-    }
-
-    #[test]
-    fn daemon_reconciles_matching_local_module_rollout_runtime_state() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-module-rollout-desired-matched");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("layout");
-        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
-        cluster_paths.ensure().expect("cluster paths");
-        let cluster_id =
-            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_desired_matched")
-                .expect("cluster");
-        let node = NodeId::from_legacy_named("node_daemon_desired_matched").expect("node id");
-        let mut cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "daemon desired matched",
-            node.clone(),
-            "daemon node",
-            "public-key",
-            OffsetDateTime::now_utc(),
-        );
-        authorize_local_raft_voter_for_test(&mut cluster_state);
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &cluster_state)
-            .expect("write cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(
-            &cluster_paths,
-            &cluster_state,
-        )
-        .expect("sync cluster state");
-        sinomo_core::cluster::locked_set_cluster_raft_leader(
-            &cluster_paths,
-            &cluster_state.local_node_id,
-            1,
-        )
-        .expect("set local raft leader");
-
-        let module_id =
-            sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
-        let artifact_id = sinomo_core::Id::from_legacy_named("artifact_daemon_desired_matched")
-            .expect("artifact");
-        let plan = sinomo_core::RolloutPlan {
-            rollout_plan_id: sinomo_core::Id::from_legacy_named("rollout_daemon_desired_matched")
-                .expect("rollout"),
-            artifact_id: artifact_id.clone(),
-            module_id: module_id.clone(),
-            target_ring: sinomo_core::TrustRing::R3SandboxedModule,
-            strategy: sinomo_core::RolloutStrategy::Shadow,
-            target_nodes: vec![node.clone()],
-            initial_weight_bps: 0,
-            promotion_steps_bps: vec![500],
-            rollback_policy: sinomo_core::RollbackPolicy::default(),
-        };
-        let active_artifact_id =
-            sinomo_core::Id::from_legacy_named("artifact_daemon_desired_active").expect("active");
-        let mut runtime_state =
-            RolloutController::new(node.clone()).initial_state(plan.clone(), active_artifact_id);
-        runtime_state.stage = sinomo_rollout::RolloutStage::Canary;
-        runtime_state.current_weight_bps = 500;
-        let rollout_paths = SelfRolloutPaths::new(&root);
-        sinomo_rollout::write_rollout_runtime_state(&rollout_paths, &runtime_state)
-            .expect("runtime state");
-        let desired = ClusterModuleRolloutDesiredRecord {
-            cluster_id: cluster_id.clone(),
-            state: "active".to_string(),
-            rollout_plan: plan.clone(),
-            requested_by_node_id: node.clone(),
-            release_id: None,
-            release_material_hash: None,
-            evidence_refs: Vec::new(),
-            requested_at: Some("2026-06-01T00:00:00Z".to_string()),
-            updated_at: OffsetDateTime::now_utc(),
-        };
-        append_cluster_module_rollout_desired_for_test(&cluster_paths, &node, &desired)
-            .expect("sync desired");
-
-        let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
-        let reconciliations = run_daemon_module_rollout_desired_reconciliation_tick(&daemon_paths)
-            .expect("reconcile desired");
-        let records = cluster_module_rollout_reconciliations_for_test(&cluster_paths)
-            .expect("read reconciliations");
-
-        assert_eq!(reconciliations.len(), 1);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].cluster_id, cluster_id);
-        assert_eq!(records[0].node_id, node);
-        assert_eq!(records[0].module_id, module_id);
-        assert_eq!(records[0].rollout_plan_id, plan.rollout_plan_id);
-        assert_eq!(records[0].artifact_id, artifact_id);
-        assert_eq!(records[0].state, "matched");
-        assert_eq!(records[0].local_runtime_stage.as_deref(), Some("canary"));
-        assert!(
-            records[0]
-                .reason
-                .contains("already matches desired rollout plan")
-        );
     }
 
     #[test]
@@ -10102,12 +9476,11 @@ mod tests {
             .split_once("pub(crate) fn run_daemon_rollout_telemetry_reconciliation_tick")
             .expect("telemetry reconciliation function")
             .1
-            .split_once("pub fn run_daemon_rollout_telemetry_maintenance_tick")
-            .expect("telemetry compatibility wrapper")
+            .split_once("fn publish_daemon_module_rollout_status_from_data_dir")
+            .expect("rollout status publisher")
             .0;
         assert!(
-            !telemetry_reconciliation
-                .contains("run_daemon_module_rollout_desired_reconciliation_tick"),
+            !telemetry_reconciliation.contains("module_rollout_desired"),
             "telemetry source reconciliation must not poll or own desired rollout state"
         );
     }
@@ -10477,90 +9850,6 @@ mod tests {
             DAEMON_CLUSTER_TICK_INTERVAL,
             "active main activation keeps the short fallback poll interval"
         );
-    }
-
-    fn signed_daemon_test_artifact(
-        root: &Path,
-        signer_id: &str,
-        artifact_id: &sinomo_core::Id,
-        module_id: &sinomo_core::Id,
-        content_hash: &str,
-        attestations: Vec<String>,
-    ) -> (
-        sinomo_core::ArtifactManifest,
-        sinomo_registry::TrustedArtifactSigner,
-    ) {
-        let identity_path = root.join(format!("{signer_id}.sobj"));
-        let identity = sinomo_core::node::load_or_create_node_identity(&identity_path)
-            .expect("signer identity");
-        let mut artifact = sinomo_core::ArtifactManifest {
-            artifact_id: artifact_id.clone(),
-            module_id: module_id.clone(),
-            target_ring: sinomo_core::TrustRing::R3SandboxedModule,
-            content_hash: content_hash.to_string(),
-            signature: None,
-            source_workspace: None,
-            source_revision: None,
-            module_manifest: sinomo_core::ModuleManifest::r3_wasm(
-                module_id.clone(),
-                "0.1.0",
-                "trigger",
-            ),
-            provenance: sinomo_core::ArtifactProvenance {
-                produced_by: sinomo_core::ActorRef {
-                    kind: sinomo_core::ActorKind::Registry,
-                    id: "local-registry".to_string(),
-                },
-                source_event_id: None,
-                build_log_artifact_id: None,
-                attestations,
-            },
-        };
-        artifact.signature = Some(
-            sinomo_module::sign_artifact_manifest_with_node_identity(&artifact, &identity)
-                .expect("sign artifact"),
-        );
-        let signer = sinomo_registry::TrustedArtifactSigner::local_ed25519(
-            signer_id,
-            identity.public_key,
-            "daemon test signer",
-        );
-        let _ = std::fs::remove_file(identity_path);
-        (artifact, signer)
-    }
-
-    fn daemon_test_artifact_evidence_record(
-        root: &Path,
-        evidence_id: &sinomo_core::Id,
-        content_hash: &str,
-        evidence_refs: Vec<String>,
-    ) -> sinomo_registry::ArtifactEvidenceRecord {
-        let evidence_path = root.join("artifact-evidence").join(evidence_id.as_str());
-        sinomo_registry::ArtifactEvidenceRecord {
-            evidence_id: evidence_id.clone(),
-            evidence_kind: "daemon-test-release".to_string(),
-            evidence_path: evidence_path.display().to_string(),
-            content_hash: content_hash.to_string(),
-            content_manifest_path: None,
-            attestation_path: None,
-            evidence_refs,
-            verification: sinomo_registry::ArtifactEvidenceIntegrityReport {
-                evidence_id: evidence_id.clone(),
-                evidence_kind: "daemon-test-release".to_string(),
-                evidence_path: evidence_path.display().to_string(),
-                declared_content_hash: Some(content_hash.to_string()),
-                recomputed_content_hash: Some(content_hash.to_string()),
-                content_manifest_path: None,
-                attestation_path: None,
-                checks: vec![sinomo_registry::ArtifactEvidenceIntegrityCheck {
-                    name: "daemon-test-integrity".to_string(),
-                    passed: true,
-                    detail: "daemon test fixture is pre-verified".to_string(),
-                }],
-                verified_at: OffsetDateTime::now_utc(),
-            },
-            registered_at: OffsetDateTime::now_utc(),
-        }
     }
 
     fn module_shadow_decision_event(

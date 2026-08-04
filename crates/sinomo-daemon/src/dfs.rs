@@ -5,7 +5,6 @@ use crate::client::{
 use crate::control::DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL;
 use crate::{DaemonDataOwnerLock, DaemonError, DaemonPaths, DaemonRunOptions};
 use sinomo_core::ClusterNodeAvailability;
-#[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::kv::{
     KvEntry, KvError, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse, KvVersion,
@@ -2092,19 +2091,14 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         else {
             return Ok(None);
         };
-        let (lane, _) = daemon_dfs_message_lane(
+        let content_store = daemon_dfs_message_content_store(
             data_dir,
             &cluster_paths,
             &peer_snapshot,
             &self.runtime,
-            DaemonDfsMessageLaneKind::ContentRead,
-            false,
         )
         .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))?;
-        let lane = lane
-            .lock()
-            .map_err(|_| DfsDataPlaneHostError::new("DFS content service lane is poisoned"))?;
-        Ok(Some(Arc::new(lane.service.content().clone())))
+        Ok(Some(Arc::new(content_store)))
     }
 
     fn run_smoke<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, sinomo_dfs::DfsSmokeReport> {
@@ -2436,8 +2430,8 @@ pub(crate) fn daemon_dfs_node_transport_on_runtime(
     data_dir: &SinomoDataDir,
     runtime: &tokio::runtime::Handle,
 ) -> DfsNodeTransport {
-    let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(data_dir, runtime);
-    let async_peer_transport = daemon_dfs_async_peer_transport(data_dir, runtime);
+    let (peer_transport, async_peer_transport) =
+        daemon_dfs_peer_transports_on_runtime(data_dir, runtime);
     DfsNodeTransport::with_peer_transports_for_nodes(
         local_node_id,
         peer_node_ids,
@@ -2448,13 +2442,7 @@ pub(crate) fn daemon_dfs_node_transport_on_runtime(
 }
 
 #[derive(Clone, Debug)]
-struct DaemonDfsBlockingPeerTransport {
-    paths: DaemonPaths,
-    runtime: tokio::runtime::Handle,
-}
-
-#[derive(Clone, Debug)]
-struct DaemonDfsAsyncPeerTransport {
+struct DaemonDfsPeerTransport {
     paths: DaemonPaths,
     runtime: tokio::runtime::Handle,
 }
@@ -2491,7 +2479,7 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsUnavailablePeerTransport {
     }
 }
 
-impl DfsPeerTransport for DaemonDfsBlockingPeerTransport {
+impl DfsPeerTransport for DaemonDfsPeerTransport {
     fn call_object_rpc(
         &self,
         target_node_id: &NodeId,
@@ -2510,7 +2498,7 @@ impl DfsPeerTransport for DaemonDfsBlockingPeerTransport {
     }
 }
 
-impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsAsyncPeerTransport {
+impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsPeerTransport {
     fn call_object_rpc_async<'a>(
         &'a self,
         target_node_id: &'a NodeId,
@@ -2535,24 +2523,20 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsAsyncPeerTransport {
     }
 }
 
-pub(crate) fn daemon_dfs_blocking_peer_transport_on_runtime(
+pub(crate) fn daemon_dfs_peer_transports_on_runtime(
     data_dir: &SinomoDataDir,
     runtime: &tokio::runtime::Handle,
-) -> Arc<dyn DfsPeerTransport> {
-    Arc::new(DaemonDfsBlockingPeerTransport {
+) -> (
+    Arc<dyn DfsPeerTransport>,
+    Arc<dyn sinomo_dfs::AsyncDfsPeerTransport>,
+) {
+    let transport = Arc::new(DaemonDfsPeerTransport {
         paths: DaemonPaths::new(data_dir),
         runtime: runtime.clone(),
-    })
-}
-
-pub(crate) fn daemon_dfs_async_peer_transport(
-    data_dir: &SinomoDataDir,
-    runtime: &tokio::runtime::Handle,
-) -> Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> {
-    Arc::new(DaemonDfsAsyncPeerTransport {
-        paths: DaemonPaths::new(data_dir),
-        runtime: runtime.clone(),
-    })
+    });
+    let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
+    let async_peer_transport: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = transport;
+    (peer_transport, async_peer_transport)
 }
 
 #[cfg(test)]
@@ -5118,28 +5102,6 @@ fn open_daemon_dfs_message_service_lane_with_content(
     resident_metadata_scope: Option<DaemonDfsResidentMetadataScope>,
     cross_shard_namespace_locks: DfsCrossShardNamespaceLockRegistry,
 ) -> Result<Arc<DaemonDfsMessageServiceLaneHandle>, sinomo_dfs::DfsError> {
-    open_daemon_dfs_message_metadata_lane_with_content(
-        data_dir,
-        cluster_paths,
-        local_node_id,
-        peer_node_ids,
-        runtime,
-        content,
-        resident_metadata_scope,
-        cross_shard_namespace_locks,
-    )
-}
-
-fn open_daemon_dfs_message_metadata_lane_with_content(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    local_node_id: &sinomo_core::node::NodeId,
-    peer_node_ids: Vec<NodeId>,
-    runtime: &tokio::runtime::Handle,
-    content: sinomo_dfs::LocalContentStore,
-    resident_metadata_scope: Option<DaemonDfsResidentMetadataScope>,
-    cross_shard_namespace_locks: DfsCrossShardNamespaceLockRegistry,
-) -> Result<Arc<DaemonDfsMessageServiceLaneHandle>, sinomo_dfs::DfsError> {
     let metadata_backend = if resident_metadata_scope.is_none() {
         Some(sinomo_dfs::open_cluster_aware_dfs_metadata_backend(
             data_dir,
@@ -5151,12 +5113,14 @@ fn open_daemon_dfs_message_metadata_lane_with_content(
     #[cfg(test)]
     record_daemon_dfs_test_message_service_lane_open(data_dir);
     let detached_send_runtime = daemon_dfs_detached_send_runtime(data_dir, cluster_paths)?;
+    let (peer_transport, async_peer_transport) =
+        daemon_dfs_peer_transports_on_runtime(data_dir, runtime);
     let transport =
         DfsNodeServedMessageTransport::new_with_peer_transports_for_nodes_and_detached_state(
             local_node_id.clone(),
             peer_node_ids.clone(),
-            daemon_dfs_blocking_peer_transport_on_runtime(data_dir, runtime),
-            daemon_dfs_async_peer_transport(data_dir, runtime),
+            peer_transport,
+            async_peer_transport,
             sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
             detached_send_runtime.state.clone(),
         );
@@ -5205,12 +5169,14 @@ fn open_daemon_dfs_message_content_read_lane_with_content(
     content: sinomo_dfs::LocalContentStore,
 ) -> Result<Arc<DaemonDfsMessageServiceLaneHandle>, sinomo_dfs::DfsError> {
     let detached_send_runtime = daemon_dfs_detached_send_runtime(data_dir, cluster_paths)?;
+    let (peer_transport, async_peer_transport) =
+        daemon_dfs_peer_transports_on_runtime(data_dir, runtime);
     let transport =
         DfsNodeServedMessageTransport::new_with_peer_transports_for_nodes_and_detached_state(
             local_node_id.clone(),
             peer_node_ids.clone(),
-            daemon_dfs_blocking_peer_transport_on_runtime(data_dir, runtime),
-            daemon_dfs_async_peer_transport(data_dir, runtime),
+            peer_transport,
+            async_peer_transport,
             sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
             detached_send_runtime.state.clone(),
         );
@@ -5269,12 +5235,14 @@ fn prepare_daemon_dfs_commit_promotion_recovery(
     let peer_node_ids = sinomo_dfs::cluster_dfs_peer_node_ids(&cluster_state);
     let open_recovery_service = || {
         let content = sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+        let (peer_transport, async_peer_transport) =
+            daemon_dfs_peer_transports_on_runtime(data_dir, runtime);
         let transport =
             DfsNodeServedMessageTransport::new_with_peer_transports_for_nodes_and_detached_state(
                 cluster_state.local_node_id.clone(),
                 peer_node_ids.clone(),
-                daemon_dfs_blocking_peer_transport_on_runtime(data_dir, runtime),
-                daemon_dfs_async_peer_transport(data_dir, runtime),
+                peer_transport,
+                async_peer_transport,
                 sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
                 detached_send_runtime.state.clone(),
             );
@@ -5793,16 +5761,18 @@ fn daemon_dfs_message_content_store(
     peer_snapshot: &DaemonDfsMessagePeerSnapshot,
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_dfs::LocalContentStore, sinomo_dfs::DfsError> {
-    let (lane, _) = daemon_dfs_message_lane(
+    let mut cache = daemon_dfs_message_service_cache()
+        .lock()
+        .map_err(|_| daemon_dfs_cache_lock_error())?;
+    let entry = daemon_dfs_message_cache_entry(
+        &mut cache,
         data_dir,
         cluster_paths,
         peer_snapshot,
         runtime,
-        DaemonDfsMessageLaneKind::ContentRead,
         false,
     )?;
-    let lane = lane.lock().map_err(|_| daemon_dfs_cache_lock_error())?;
-    Ok(lane.service.content().clone())
+    Ok(entry.content_store.clone())
 }
 
 fn process_daemon_dfs_message_command_on_runtime(
@@ -8247,7 +8217,8 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     if let Some(stats) = crate::process_idle_stats() {
         stats.incr_disk_reads_dfs_metadata();
     }
-    let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, runtime);
+    let (peer_transport, async_peer_transport) =
+        daemon_dfs_peer_transports_on_runtime(&data_dir, runtime);
     let cluster_state = sinomo_dfs::refresh_cluster_dfs_maintenance_state_with_peer_transport(
         runtime,
         &cluster_paths,
@@ -8281,7 +8252,6 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
         ..
     } = lane;
     let authority_generation_before_maintenance = metadata_authority_generation.generation();
-    let async_peer_transport = daemon_dfs_async_peer_transport(&data_dir, runtime);
     let maintenance_result = match maintenance_kind {
         DaemonDfsMaintenanceKind::Routine => {
             sinomo_dfs::run_cluster_dfs_reactive_maintenance_tick_with_reusable_service(
@@ -9134,8 +9104,8 @@ fn schedule_daemon_dfs_metadata_publish_lane_on_runtime(
             return DfsMetadataPublishScheduleStart::AlreadyRunning;
         }
     };
-    let peer_transport = daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, runtime);
-    let async_peer_transport = daemon_dfs_async_peer_transport(&data_dir, runtime);
+    let (peer_transport, async_peer_transport) =
+        daemon_dfs_peer_transports_on_runtime(&data_dir, runtime);
     let publish_data_dir = data_dir;
     let publish_cluster_paths = cluster_paths;
     let publish_file_system_id = lane.file_system_id.clone();
@@ -9337,10 +9307,11 @@ async fn run_daemon_dfs_smoke_async(
     let smoke_task = tokio::task::spawn_blocking(move || {
         let _data_owner_lock = data_owner_lock;
         let _smoke_guard = smoke_guard;
+        let (peer_transport, _) = daemon_dfs_peer_transports_on_runtime(&data_dir, &runtime);
         sinomo_dfs::run_default_cluster_dfs_smoke_with_peer_transport(
             &data_dir,
             &cluster_paths,
-            daemon_dfs_blocking_peer_transport_on_runtime(&data_dir, &runtime),
+            peer_transport,
             Box::new(DaemonDfsControlPlaneKvClient::new_on_runtime(
                 &cluster_paths,
                 &runtime,
@@ -9427,6 +9398,22 @@ mod tests {
                 .map(|replication| replication.confirmation_id.clone()),
             result: DfsMetadataJournalBatchResult::Applied,
         }
+    }
+
+    #[test]
+    fn daemon_dfs_peer_transport_traits_share_one_adapter() {
+        let root = temp_root("daemon-dfs-shared-peer-transport");
+        let data_dir = SinomoDataDir::new(root.path());
+        let runtime = daemon_test_runtime("daemon-dfs-shared-peer-transport");
+
+        let (peer_transport, async_peer_transport) =
+            daemon_dfs_peer_transports_on_runtime(&data_dir, runtime.handle());
+
+        assert_eq!(
+            Arc::as_ptr(&peer_transport) as *const (),
+            Arc::as_ptr(&async_peer_transport) as *const (),
+            "blocking and async DFS calls must reuse one peer transport adapter"
+        );
     }
 
     // Restart recovery deliberately keeps the permit record private. Tests
@@ -17242,6 +17229,40 @@ mod tests {
         assert!(
             !daemon_dfs_message_supports_exact_service_lane(&distributed_write),
             "distributed-write coordinator and repair state is not shard-owned yet"
+        );
+    }
+
+    #[test]
+    fn daemon_dfs_content_store_lookup_does_not_open_service_lane() {
+        let root = temp_root("daemon_dfs_content_store_lookup");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        let local = NodeId::from_legacy_named("node_dfs_content_store_lookup").expect("local");
+        write_test_cluster_state(&data_root, &local);
+        let runtime = daemon_test_runtime("daemon-dfs-content-store-lookup");
+        let host = DaemonDfsDataPlaneHost::new_on_runtime(paths, runtime.handle());
+
+        assert!(
+            host.shared_content_store(&data_dir)
+                .expect("shared content-store lookup")
+                .is_some()
+        );
+
+        let cache = daemon_dfs_message_service_cache()
+            .lock()
+            .expect("cache lock");
+        let entry = cache.get(&data_dir.root()).expect("cache entry");
+        assert!(entry.content_read_service.is_none());
+        assert!(entry.primary_service.is_none());
+        assert!(entry.exact_shard_services.is_empty());
+        assert!(entry.resident_metadata_backend.is_none());
+        assert!(!entry.resident_metadata_initialized);
+        drop(cache);
+        assert_eq!(
+            daemon_dfs_test_message_service_lane_open_count(&data_dir),
+            0,
+            "content-store lookup must not instantiate a DFS service lane"
         );
     }
 

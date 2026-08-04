@@ -1,6 +1,4 @@
 use sinomo_api::IdleStatsSnapshot;
-#[allow(unused_imports)]
-use sinomo_core::cluster::ClusterKvPathsExt;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};

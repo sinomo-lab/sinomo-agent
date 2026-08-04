@@ -945,13 +945,13 @@ pub enum DfsMetadataMutation {
         operation_id: String,
         status: DfsNamespacePrepareStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        prepare: Option<DfsNamespacePrepareRecord>,
+        prepare: Option<Box<DfsNamespacePrepareRecord>>,
         /// Packed authoritative body selected only by a capability-fenced
         /// shard configuration. Exactly one prepare representation may be
         /// present. Older readers ignore this additive field, observe the
         /// missing canonical body, and fail replay closed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        packed_prepare_v1: Option<DfsPackedNamespacePrepareV1>,
+        packed_prepare_v1: Option<Box<DfsPackedNamespacePrepareV1>>,
         /// Indexed, column-oriented body selected only after every assigned
         /// metadata member advertises packed-v2 decoder support.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1006,7 +1006,7 @@ pub enum DfsMetadataMutation {
         file_system_id: DfsFileSystemId,
         requester_node_id: NodeId,
         request_id: String,
-        request: DfsNamespaceRequestRecord,
+        request: Box<DfsNamespaceRequestRecord>,
     },
     /// Compact canonical response retained after a completed request no longer
     /// needs its operation or recovery diagnostics.
@@ -1014,7 +1014,7 @@ pub enum DfsMetadataMutation {
         file_system_id: DfsFileSystemId,
         requester_node_id: NodeId,
         request_id: String,
-        receipt: DfsNamespaceRequestReceipt,
+        receipt: Box<DfsNamespaceRequestReceipt>,
     },
     RemoveNamespaceRequestReceipt {
         file_system_id: DfsFileSystemId,
@@ -1600,7 +1600,7 @@ impl DfsMetadataMutation {
             file_system_id: request.file_system_id.clone(),
             requester_node_id: request.requester_node_id.clone(),
             request_id: request.request_id.clone(),
-            request: request.clone(),
+            request: Box::new(request.clone()),
         }
     }
 
@@ -1609,7 +1609,7 @@ impl DfsMetadataMutation {
             file_system_id: receipt.file_system_id.clone(),
             requester_node_id: receipt.requester_node_id.clone(),
             request_id: receipt.request_id.clone(),
-            receipt: receipt.clone(),
+            receipt: Box::new(receipt.clone()),
         }
     }
 
@@ -1618,7 +1618,7 @@ impl DfsMetadataMutation {
             file_system_id: prepare.file_system_id.clone(),
             operation_id: prepare.operation_id.clone(),
             status: prepare.status.clone(),
-            prepare: Some(prepare.clone()),
+            prepare: Some(Box::new(prepare.clone())),
             packed_prepare_v1: None,
             packed_prepare_v2: None,
         }
@@ -1632,7 +1632,7 @@ impl DfsMetadataMutation {
             operation_id: prepare.operation_id.clone(),
             status: prepare.status.clone(),
             prepare: None,
-            packed_prepare_v1: Some(DfsPackedNamespacePrepareV1::pack(prepare)?),
+            packed_prepare_v1: Some(Box::new(DfsPackedNamespacePrepareV1::pack(prepare)?)),
             packed_prepare_v2: None,
         })
     }
@@ -1764,40 +1764,23 @@ impl DfsMetadataMutation {
     }
 
     pub(crate) fn commit_namespace_prepare(prepare: &DfsNamespacePrepareRecord) -> Self {
-        let object_ids = prepare
+        let mut object_ids = prepare
             .expected_object_versions
             .iter()
             .map(|expected| expected.object_id.clone())
-            .chain(
-                prepare
-                    .transaction
-                    .objects
-                    .iter()
-                    .map(|object| object.object_id.clone()),
-            )
-            .chain(
-                prepare
-                    .transaction
-                    .versions
-                    .iter()
-                    .map(|version| version.object_id.clone()),
-            )
-            .chain(
-                prepare
-                    .transaction
-                    .advisory_lock_states
-                    .iter()
-                    .map(|state| state.object_id.clone()),
-            )
+            // Receipt validation fences the filesystem but intentionally does
+            // not require every receipt object to have a version expectation.
+            // Keep those independently valid objects in the compact commit's
+            // affected-object set.
             .chain(
                 prepare
                     .content_receipts
                     .iter()
                     .map(|receipt| receipt.receipt.object_id.clone()),
             )
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+            .collect::<Vec<_>>();
+        object_ids.sort();
+        object_ids.dedup();
         Self::CommitNamespacePrepare {
             file_system_id: prepare.file_system_id.clone(),
             operation_id: prepare.operation_id.clone(),
@@ -2852,7 +2835,7 @@ pub struct DfsMetadataTableSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) materialized_through_sequence: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) tables: Option<DfsMetadataTableSnapshotTables>,
+    pub(crate) tables: Option<Box<DfsMetadataTableSnapshotTables>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) ops: Vec<DfsMetadataTableOp>,
     /// Exact semantic identity of the snapshot payload, excluding these proof
@@ -3159,7 +3142,7 @@ pub(crate) enum DfsMetadataTableOp {
         retention: DfsNamespaceReceiptRetentionState,
     },
     PutNamespacePrepare {
-        prepare: DfsNamespacePrepareRecord,
+        prepare: Box<DfsNamespacePrepareRecord>,
     },
     /// Rebuildable materialized-table reference to the authoritative
     /// `PutNamespacePrepare` journal entry at `journal_sequence`.
@@ -3213,16 +3196,36 @@ pub(crate) enum DfsMetadataTableOp {
         retention: DfsNamespaceReceiptRetentionState,
     },
     PutNamespaceRequest {
-        request: DfsNamespaceRequestRecord,
+        request: Box<DfsNamespaceRequestRecord>,
     },
     PutNamespaceRequestReceipt {
-        receipt: DfsNamespaceRequestReceipt,
+        receipt: Box<DfsNamespaceRequestReceipt>,
     },
     RemoveNamespaceRequestReceipt {
         requester_node_id: NodeId,
         request_id: String,
         retention: DfsNamespaceReceiptRetentionState,
     },
+}
+
+impl DfsMetadataTableOp {
+    pub(crate) fn put_namespace_prepare(prepare: DfsNamespacePrepareRecord) -> Self {
+        Self::PutNamespacePrepare {
+            prepare: Box::new(prepare),
+        }
+    }
+
+    pub(crate) fn put_namespace_request(request: DfsNamespaceRequestRecord) -> Self {
+        Self::PutNamespaceRequest {
+            request: Box::new(request),
+        }
+    }
+
+    pub(crate) fn put_namespace_request_receipt(receipt: DfsNamespaceRequestReceipt) -> Self {
+        Self::PutNamespaceRequestReceipt {
+            receipt: Box::new(receipt),
+        }
+    }
 }
 
 impl DfsTombstoneCompactionReport {
@@ -3465,17 +3468,32 @@ mod tests {
     #[test]
     fn metadata_mutation_stack_footprint_stays_bounded() {
         // Journal mutations cross several by-value Result boundaries. Keeping
-        // large packed bodies behind pointers prevents the debug write path
-        // from exhausting the default worker-thread stack.
+        // large namespace bodies behind pointers prevents every small journal
+        // or table operation from reserving space for the largest variant.
         assert!(
-            std::mem::size_of::<DfsMetadataMutation>() <= 12 * 1024,
+            std::mem::size_of::<DfsMetadataMutation>() <= 1024,
             "DfsMetadataMutation grew to {} bytes",
             std::mem::size_of::<DfsMetadataMutation>()
         );
         assert!(
-            std::mem::size_of::<DfsMetadataJournalEntry>() <= 12 * 1024,
+            std::mem::size_of::<DfsMetadataJournalEntry>() <= 4 * 1024,
             "DfsMetadataJournalEntry grew to {} bytes",
             std::mem::size_of::<DfsMetadataJournalEntry>()
+        );
+        assert!(
+            std::mem::size_of::<DfsMetadataTableOp>() <= 1024,
+            "DfsMetadataTableOp grew to {} bytes",
+            std::mem::size_of::<DfsMetadataTableOp>()
+        );
+        assert!(
+            std::mem::size_of::<DfsMetadataTableSnapshot>() <= 256,
+            "DfsMetadataTableSnapshot grew to {} bytes",
+            std::mem::size_of::<DfsMetadataTableSnapshot>()
+        );
+        assert!(
+            std::mem::size_of::<crate::DfsMetadataSnapshotInstallCommand>() <= 512,
+            "DfsMetadataSnapshotInstallCommand grew to {} bytes",
+            std::mem::size_of::<crate::DfsMetadataSnapshotInstallCommand>()
         );
     }
 

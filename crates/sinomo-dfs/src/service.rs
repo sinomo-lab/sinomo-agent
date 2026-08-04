@@ -13,8 +13,6 @@
 //! data-plane routes bind to a [`DfsDataPlaneHost`], so `sinomo-dfs` still owns
 //! the route contract while an embedding process supplies cluster transport.
 
-#[allow(unused_imports)]
-use sinomo_core::cluster::ClusterKvPathsExt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

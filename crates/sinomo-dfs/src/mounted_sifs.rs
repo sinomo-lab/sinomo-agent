@@ -4,7 +4,6 @@
 //! networked DFS service from a local data directory.
 
 use sinomo_core::ClusterBootstrapState;
-#[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_core::local::SinomoDataDir;

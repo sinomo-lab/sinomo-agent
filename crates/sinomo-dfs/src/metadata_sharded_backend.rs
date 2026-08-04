@@ -147,7 +147,7 @@ mod visible_placement_tests {
                         file_system_id,
                         operation_id: prepare.operation_id.clone(),
                         status,
-                        prepare: Some(prepare),
+                        prepare: Some(Box::new(prepare)),
                         packed_prepare_v1: None,
                         packed_prepare_v2: None,
                     },
@@ -725,7 +725,7 @@ struct LocalMetadataShardSlot {
     root: PathBuf,
     open_mode: LocalMetadataShardOpenMode,
     initialization: Mutex<()>,
-    backend: OnceLock<LocalSobjMetadataBackend>,
+    backend: OnceLock<Box<LocalSobjMetadataBackend>>,
 }
 
 /// One resident shard-local backend slot shared by scoped mutation sessions.
@@ -748,7 +748,7 @@ struct ResidentLocalMetadataShardSlot {
 enum ResidentLocalMetadataShardState {
     Unopened,
     Opening,
-    Available(LocalSobjMetadataBackend),
+    Available(Box<LocalSobjMetadataBackend>),
     CheckedOut,
 }
 
@@ -773,11 +773,11 @@ impl ResidentLocalMetadataShardSlot {
         }
     }
 
-    fn open_backend(&self) -> Result<LocalSobjMetadataBackend> {
-        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode)
+    fn open_backend(&self) -> Result<Box<LocalSobjMetadataBackend>> {
+        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode).map(Box::new)
     }
 
-    fn checkout(self: &Arc<Self>) -> Result<LocalSobjMetadataBackend> {
+    fn checkout(self: &Arc<Self>) -> Result<Box<LocalSobjMetadataBackend>> {
         loop {
             let mut state = self.state.lock().map_err(|error| {
                 MetadataBackendError::Serde(format!(
@@ -825,7 +825,7 @@ impl ResidentLocalMetadataShardSlot {
         }
     }
 
-    fn restore(&self, backend: LocalSobjMetadataBackend) {
+    fn restore(&self, backend: Box<LocalSobjMetadataBackend>) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         debug_assert!(matches!(
             *state,
@@ -884,7 +884,7 @@ impl ResidentLocalMetadataShardHandle {
         operation: impl FnOnce(&mut LocalSobjMetadataBackend) -> Result<R>,
     ) -> Result<R> {
         let mut lease = self.checkout()?;
-        operation(&mut *lease)
+        operation(&mut lease)
     }
 
     pub fn is_open(&self) -> bool {
@@ -899,7 +899,7 @@ pub struct ResidentLocalMetadataShardLease {
     file_system_id: DfsFileSystemId,
     shard_id: DfsMetadataShardId,
     slot: Arc<ResidentLocalMetadataShardSlot>,
-    backend: Option<LocalSobjMetadataBackend>,
+    backend: Option<Box<LocalSobjMetadataBackend>>,
 }
 
 impl std::fmt::Debug for ResidentLocalMetadataShardLease {
@@ -1226,8 +1226,8 @@ impl LocalMetadataShardSlot {
         self.open_mode != LocalMetadataShardOpenMode::ReplicaRepair
     }
 
-    fn open_backend(&self) -> Result<LocalSobjMetadataBackend> {
-        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode)
+    fn open_backend(&self) -> Result<Box<LocalSobjMetadataBackend>> {
+        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode).map(Box::new)
     }
 
     fn backend(&self) -> Result<&LocalSobjMetadataBackend> {
@@ -1248,7 +1248,8 @@ impl LocalMetadataShardSlot {
         Ok(self
             .backend
             .get()
-            .expect("metadata shard slot initialized above"))
+            .expect("metadata shard slot initialized above")
+            .as_ref())
     }
 
     fn backend_mut(&mut self) -> Result<&mut LocalSobjMetadataBackend> {
@@ -1261,11 +1262,12 @@ impl LocalMetadataShardSlot {
         Ok(self
             .backend
             .get_mut()
-            .expect("metadata shard slot initialized above"))
+            .expect("metadata shard slot initialized above")
+            .as_mut())
     }
 
     fn opened_backend_mut(&mut self) -> Option<&mut LocalSobjMetadataBackend> {
-        self.backend.get_mut()
+        self.backend.get_mut().map(Box::as_mut)
     }
 }
 
@@ -2713,6 +2715,15 @@ mod lazy_replica_slot_tests {
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             },
         ]
+    }
+
+    #[test]
+    fn resident_shard_lease_moves_only_backend_ownership() {
+        assert!(
+            std::mem::size_of::<ResidentLocalMetadataShardLease>() <= 256,
+            "resident shard lease grew to {} bytes",
+            std::mem::size_of::<ResidentLocalMetadataShardLease>()
+        );
     }
 
     #[test]
@@ -6158,7 +6169,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(DfsMetadataTableSnapshot {
             format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
             materialized_through_sequence: None,
-            tables: Some(tables),
+            tables: Some(Box::new(tables)),
             ops: Vec::new(),
             semantic_state_fingerprint: None,
             prefix_proof: None,

@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-#[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::ClusterPaths;

@@ -22,7 +22,6 @@ use crate::{
 };
 #[cfg(test)]
 use sinomo_core::cluster::ClusterJoinRegistrationResponse;
-#[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::cluster::ClusterLocalDaemonMembershipAsyncObserver;
 use sinomo_core::cluster::{
@@ -1313,14 +1312,6 @@ pub(crate) async fn handle_daemon_cluster_kv_request_async_on_runtime_with_timeo
     .await
 }
 
-pub(crate) async fn handle_daemon_cluster_kv_request_async_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_core::kv::KvTxnRequest,
-    runtime: &tokio::runtime::Handle,
-) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
-    handle_daemon_cluster_kv_request_async_with_forwarding(paths, request, true, runtime).await
-}
-
 pub(crate) async fn handle_daemon_cluster_kv_request_compact_async_on_runtime_with_timeouts(
     paths: &DaemonPaths,
     request: sinomo_core::kv::KvTxnRequest,
@@ -1519,22 +1510,6 @@ pub(crate) async fn handle_daemon_cluster_kv_txn_rpc_request_compact_async_on_ru
     )
     .await
     .map_err(Into::into)
-}
-
-async fn handle_daemon_cluster_kv_request_async_with_forwarding(
-    paths: &DaemonPaths,
-    request: sinomo_core::kv::KvTxnRequest,
-    allow_forwarding: bool,
-    runtime: &tokio::runtime::Handle,
-) -> Result<sinomo_core::kv::ClusterKvTxnCommitResult, DaemonError> {
-    handle_daemon_cluster_kv_request_async_with_forwarding_and_timeouts(
-        paths,
-        request,
-        allow_forwarding,
-        runtime,
-        cluster_control_plane_timeouts(),
-    )
-    .await
 }
 
 async fn handle_daemon_cluster_kv_request_async_with_forwarding_and_timeouts(

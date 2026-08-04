@@ -1618,10 +1618,7 @@ impl OwnedRoutedStreamClient {
         self.owner.closed.load(Ordering::Acquire)
     }
 
-    pub(crate) async fn open(
-        self: &Arc<Self>,
-        _timeout: std::time::Duration,
-    ) -> Result<PeerStream, NetworkError> {
+    pub(crate) fn open(self: &Arc<Self>) -> Result<PeerStream, NetworkError> {
         if self.is_closed() {
             return Err(NetworkError::delivery_failed(
                 "open owned routed logical stream",

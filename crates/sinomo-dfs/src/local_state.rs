@@ -4,14 +4,13 @@
 //! store wrappers, metadata backend openers, and operator inspection entry
 //! points. The networked service loop remains in the root module for now.
 
-#[allow(unused_imports)]
-use sinomo_core::cluster::ClusterKvPathsExt;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
+use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::local::{LocalDataError, SinomoDataDir};
 use sinomo_core::network::ClusterPaths;
 use sinomo_core::node::NodeId;
@@ -111,7 +110,7 @@ impl DfsMetadataInspectionIdentity {
 
 #[derive(Debug)]
 enum CachedDfsMetadataInspectionBackend {
-    Root(LocalSobjMetadataBackend),
+    Root(Box<LocalSobjMetadataBackend>),
     Sharded(LocalShardedMetadataBackend),
 }
 
@@ -120,6 +119,7 @@ impl CachedDfsMetadataInspectionBackend {
         match identity {
             DfsMetadataInspectionIdentity::Root { metadata_root } => {
                 open_root_local_metadata_backend_for_inspection(metadata_root.clone())
+                    .map(Box::new)
                     .map(Self::Root)
                     .map_err(Into::into)
             }
@@ -155,7 +155,7 @@ impl CachedDfsMetadataInspectionBackend {
 
     fn as_metadata_backend(&self) -> &dyn DfsMetadataBackend {
         match self {
-            Self::Root(backend) => backend,
+            Self::Root(backend) => backend.as_ref(),
             Self::Sharded(backend) => backend,
         }
     }

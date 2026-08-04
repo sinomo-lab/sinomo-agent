@@ -683,7 +683,7 @@ pub(crate) async fn open_pooled_routed_stream_with_protection_and_destination_pr
     local_node_id: NodeId,
     peer_node_id: NodeId,
     protection: crate::RoutedSessionProtection,
-    timeout: Duration,
+    _timeout: Duration,
     establish: F,
 ) -> Result<PeerStream, NetworkError>
 where
@@ -703,7 +703,7 @@ where
         reusable_pooled_client(&mut pool, &key)
     };
     if let Some(client) = existing {
-        match client.open(timeout).await {
+        match client.open() {
             Ok(stream) => return Ok(stream),
             Err(_) => {
                 let mut pool = routed_stream_pool().lock().await;
@@ -757,7 +757,7 @@ where
         }
     };
     drop(connect_guard);
-    match client.open(timeout).await {
+    match client.open() {
         Ok(stream) => Ok(stream),
         Err(error) => {
             let mut pool = routed_stream_pool().lock().await;
@@ -1352,13 +1352,9 @@ mod tests {
         let client =
             Arc::new(OwnedRoutedStreamClient::new(client_carrier).expect("owned mux client"));
 
-        let stream = tokio::time::timeout(
-            Duration::from_millis(50),
-            client.open(Duration::from_millis(10)),
-        )
-        .await
-        .expect("logical open must not wait for a remote acknowledgement")
-        .expect("logical stream");
+        let stream = client
+            .open()
+            .expect("logical open must not wait for a remote acknowledgement");
 
         drop(stream);
     }
@@ -1397,10 +1393,7 @@ mod tests {
             Arc::new(OwnedRoutedStreamClient::new(client_carrier).expect("owned mux client"));
 
         for _ in 0..2 {
-            let mut stream = client
-                .open(Duration::from_secs(1))
-                .await
-                .expect("open logical stream");
+            let mut stream = client.open().expect("open logical stream");
             stream.write_all(b"ping").await.expect("write request");
             stream.shutdown().await.expect("finish request");
             let mut response = Vec::new();

@@ -21,9 +21,9 @@ direct_link.rs and transport modules
 
 No payload-size branch selects another carrier. Relayed and direct calls use the
 same object-RPC protocol, and relays forward opaque routed-stream bytes.
-The daemon still accepts the legacy one-call local `SXP1` byte stream as an
-explicit compatibility boundary. Persistent local `SLC1` carriers and every
-routed call use the owned-record path.
+Persistent local `SLC1` carriers and every routed call use the owned-record
+path. Byte-stream adapters remain library compatibility and test boundaries;
+the daemon does not expose a second local RPC protocol.
 
 ## Call and Body Contracts
 

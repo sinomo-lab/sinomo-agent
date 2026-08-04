@@ -1,6 +1,5 @@
 use crate::{DaemonError, DaemonPaths, read_daemon_status};
 use sinomo_core::Id;
-#[allow(unused_imports)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::ClusterPaths;

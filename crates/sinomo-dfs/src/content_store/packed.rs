@@ -799,28 +799,6 @@ impl LocalContentStore {
         Ok(stats_delta)
     }
 
-    #[allow(dead_code)]
-    pub(super) fn remove_packed_blob_index_entry(&self, hash: &str) -> Result<bool> {
-        Ok(self
-            .remove_packed_blob_index_entries(&[hash.to_owned()])?
-            .contains(hash))
-    }
-
-    /// Durably tombstone packed hashes with one lock acquisition and one
-    /// append/sync per affected lane.
-    ///
-    /// Lane zero remains part of every hash's removal set because it owns the
-    /// pre-sharding layout. Holding all affected lane locks in numeric order
-    /// preserves the global packed-index lock order used by batched writes.
-    pub(super) fn remove_packed_blob_index_entries(
-        &self,
-        hashes: &[String],
-    ) -> Result<BTreeSet<String>> {
-        Ok(self
-            .remove_packed_blob_index_entries_impl(hashes, true)?
-            .removed_hashes)
-    }
-
     pub(super) fn remove_packed_blob_index_entries_deferred_checkpoint(
         &self,
         hashes: &[String],
@@ -828,6 +806,10 @@ impl LocalContentStore {
         self.remove_packed_blob_index_entries_impl(hashes, false)
     }
 
+    /// Tombstone packed hashes with one lock acquisition and one append/sync
+    /// per affected lane. Lane zero participates because it owns the legacy
+    /// pre-sharding layout; ordered lane locking preserves the batch-write
+    /// lock order.
     fn remove_packed_blob_index_entries_impl(
         &self,
         hashes: &[String],
@@ -1941,15 +1923,15 @@ mod tests {
             .open_packed_blob_reader(&retained_hash, 0, usize::MAX)
             .expect("open retained packed blob")
             .expect("retained packed reader");
-        assert!(
+        assert_eq!(
             store
-                .remove_packed_blob_index_entry(&removed_hash_a)
-                .expect("tombstone first packed blob")
-        );
-        assert!(
-            store
-                .remove_packed_blob_index_entry(&removed_hash_b)
-                .expect("tombstone second packed blob")
+                .remove_packed_blob_index_entries_impl(
+                    &[removed_hash_a.clone(), removed_hash_b.clone(),],
+                    true
+                )
+                .expect("tombstone packed blobs")
+                .removed_hashes,
+            BTreeSet::from([removed_hash_a.clone(), removed_hash_b.clone()])
         );
 
         let projection = store
@@ -2326,7 +2308,7 @@ mod tests {
             .write_packed_blob(&removed_hash, &removed_bytes)
             .expect("write removable packed blob");
         store
-            .remove_packed_blob_index_entry(&removed_hash)
+            .remove_packed_blob_index_entries_impl(std::slice::from_ref(&removed_hash), true)
             .expect("remove packed index entry");
         let pre_checkpoint_log = fs::read(store.packed_blob_index_log_path_for_lane(LANE))
             .expect("read pre-checkpoint packed log");

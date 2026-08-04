@@ -309,7 +309,6 @@ async fn service_result_from_stream(
 #[cfg(test)]
 pub(crate) async fn call_service_rpc_stream<S>(
     stream: S,
-    context: &RpcPeerContext,
     call: ObjectRpcCall,
     options: ObjectFrameIoOptions,
 ) -> Result<ObjectRpcResult, NetworkError>
@@ -343,13 +342,9 @@ where
         body: ObjectRpcStreamBody::source(body),
         timeline_trace,
     };
-    match call_object_rpc_stream_with_consumption(
-        stream,
-        context,
-        stream_call,
-        options,
-        move |response| service_result_from_stream(route, response, false, timeline_trace),
-    )
+    match call_object_rpc_stream_with_consumption(stream, stream_call, options, move |response| {
+        service_result_from_stream(route, response, false, timeline_trace)
+    })
     .await
     {
         RpcDeliveryOutcome::Completed(result) => Ok(result),
@@ -383,17 +378,9 @@ where
 
 pub async fn call_service_rpc_peer_stream(
     stream: PeerStream,
-    context: &RpcPeerContext,
     call: ObjectRpcCall,
     options: ObjectFrameIoOptions,
 ) -> Result<ObjectRpcResult, NetworkError> {
-    if !stream.has_owned_chunks() {
-        return Err(NetworkError::Io {
-            operation: "dispatch owned stream-native service RPC".to_string(),
-            detail: "peer stream does not expose the canonical owned-chunk transport; use the explicit byte compatibility entrypoint"
-                .to_string(),
-        });
-    }
     let timeline_trace = crate::network_timeline_trace_context_for_request(&call.request);
     let operation_id = call.request.operation_id().map(str::to_string);
     let route = call.request.route.clone();
@@ -424,7 +411,6 @@ pub async fn call_service_rpc_peer_stream(
     let chunks = stream.into_chunk_stream()?;
     match call_object_rpc_chunk_stream_with_consumption(
         chunks,
-        context,
         stream_call,
         options,
         move |response| service_result_from_stream(route, response, true, timeline_trace),
@@ -500,13 +486,6 @@ where
     F: FnOnce(ObjectRpcIncomingRequest, RpcPeerContext) -> Fut,
     Fut: Future<Output = Result<ObjectRpcOutgoingResponse, NetworkError>>,
 {
-    if !stream.has_owned_chunks() {
-        return Err(NetworkError::Io {
-            operation: "serve owned stream-native service RPC".to_string(),
-            detail: "peer stream does not expose the canonical owned-chunk transport; use the explicit byte compatibility entrypoint"
-                .to_string(),
-        });
-    }
     let chunks = stream.into_chunk_stream()?;
     serve_object_rpc_chunk_stream(chunks, context, options, move |incoming, peer| async move {
         let request_id = incoming.request_id.clone();
@@ -566,8 +545,7 @@ mod tests {
         response_bytes: usize,
     ) -> Result<ObjectRpcResult, NetworkError> {
         let (client, server) = tokio::io::duplex(2 * OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES);
-        let client_context = local_context();
-        let server_context = client_context.clone();
+        let server_context = local_context();
         let server_task = tokio::spawn(async move {
             serve_service_rpc_stream(
                 server,
@@ -592,13 +570,7 @@ mod tests {
             vec![7; request_bytes],
         );
         let call = ObjectRpcCall::value(request);
-        let result = call_service_rpc_stream(
-            client,
-            &client_context,
-            call,
-            ObjectFrameIoOptions::default(),
-        )
-        .await?;
+        let result = call_service_rpc_stream(client, call, ObjectFrameIoOptions::default()).await?;
         server_task.await.expect("server task")?;
         Ok(result)
     }
@@ -645,7 +617,7 @@ mod tests {
             let (client, server) = tokio::io::duplex(2 * OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES);
             (Box::new(client), Box::new(server), None)
         };
-        let (client_context, server_context) = authenticated_contexts();
+        let (_, server_context) = authenticated_contexts();
         let expected_source = match &server_context.identity {
             crate::object_rpc_stream::RpcPeerIdentity::Authenticated { peer_node_id, .. } => {
                 peer_node_id.clone()
@@ -697,13 +669,7 @@ mod tests {
         // when the caller explicitly supplies it.
         request.auth = Some(b"origin-auth".to_vec());
         let call = ObjectRpcCall::new(request, crate::ObjectRpcBodySource::bytes(vec![3; bytes]));
-        let result = call_service_rpc_stream(
-            client,
-            &client_context,
-            call,
-            ObjectFrameIoOptions::default(),
-        )
-        .await?;
+        let result = call_service_rpc_stream(client, call, ObjectFrameIoOptions::default()).await?;
         assert_eq!(result.response.body, b"typed-response-head");
         let response = result.body.collect_to_vec(bytes + 1).await?;
         server_task.await.expect("server task")?;
@@ -743,10 +709,8 @@ mod tests {
             tokio::io::duplex(2 * OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES);
         let (proxy_outgoing, server) =
             tokio::io::duplex(2 * OBJECT_RPC_STREAM_RECEIVE_WINDOW_BYTES);
-        let upstream_client_context = local_context();
-        let upstream_proxy_context = upstream_client_context.clone();
-        let downstream_proxy_context = local_context();
-        let downstream_server_context = downstream_proxy_context.clone();
+        let upstream_proxy_context = local_context();
+        let downstream_server_context = local_context();
 
         let server_task = tokio::spawn(async move {
             serve_service_rpc_stream(
@@ -785,7 +749,6 @@ mod tests {
                     let call = ObjectRpcCall::from_forwarded_body(request.request, request.body);
                     let result = call_service_rpc_stream(
                         proxy_outgoing,
-                        &downstream_proxy_context,
                         call,
                         ObjectFrameIoOptions::default(),
                     )
@@ -805,14 +768,9 @@ mod tests {
             ),
             crate::ObjectRpcBodySource::zeroes(request_bytes as u64),
         );
-        let result = call_service_rpc_stream(
-            client,
-            &upstream_client_context,
-            call,
-            ObjectFrameIoOptions::default(),
-        )
-        .await
-        .expect("stream-native proxied attachment call");
+        let result = call_service_rpc_stream(client, call, ObjectFrameIoOptions::default())
+            .await
+            .expect("stream-native proxied attachment call");
         assert_eq!(result.response.body, b"proxied-response-head");
         assert_eq!(result.body.total_bytes(), Some(response_bytes as u64));
         assert_eq!(

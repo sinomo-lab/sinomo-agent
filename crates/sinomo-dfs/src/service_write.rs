@@ -32,7 +32,91 @@ fn stale_write_base_error(
     }
 }
 
+struct PreparedDistributedWrite {
+    object: DfsObjectMetadata,
+    desired_replica_nodes: Vec<NodeId>,
+    policy: DfsReplicationPolicy,
+    touch_parent_on_create: bool,
+    create_predecessor_object_id: Option<DfsObjectId>,
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    fn normalize_distributed_write_replication_plan(
+        &self,
+        object: &DfsObjectMetadata,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+    ) -> Result<(Vec<NodeId>, DfsReplicationPolicy), DfsError> {
+        if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
+            return Err(DfsError::InvalidReplicationPolicy {
+                message:
+                    "replicated-confirmed writes require min_commit_replicas == desired_replicas"
+                        .to_string(),
+            });
+        }
+
+        validate_replication_plan(&desired_replica_nodes, &policy)?;
+        let desired_replica_nodes =
+            self.normalize_desired_replica_nodes(object, desired_replica_nodes, &policy);
+        let policy = if desired_replica_nodes.len() > policy.desired_replicas {
+            let desired_replicas = desired_replica_nodes.len();
+            // A confirmed write waits for every desired replica. If normalization
+            // adds the owner, widen both counts so it cannot silently become an
+            // eventual write.
+            let min_commit_replicas = if object.policy == DfsObjectPolicy::ReplicatedConfirmed {
+                desired_replicas
+            } else {
+                policy.min_commit_replicas.min(desired_replicas)
+            };
+            policy.with_counts(min_commit_replicas, desired_replicas)?
+        } else {
+            policy
+        };
+        validate_replication_plan(&desired_replica_nodes, &policy)?;
+        Ok((desired_replica_nodes, policy))
+    }
+
+    fn prepare_distributed_write(
+        &mut self,
+        object_id: &DfsObjectId,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
+    ) -> Result<PreparedDistributedWrite, DfsError> {
+        let object = self.current_object_for_write(object_id)?;
+        if !matches!(
+            object.policy,
+            DfsObjectPolicy::ReplicatedEventual | DfsObjectPolicy::ReplicatedConfirmed
+        ) {
+            return Err(DfsError::UnsupportedPolicy {
+                policy: object.policy,
+            });
+        }
+        let (desired_replica_nodes, policy) = self.normalize_distributed_write_replication_plan(
+            &object,
+            desired_replica_nodes,
+            policy,
+        )?;
+
+        let transient_create = self.transient_metadata_object_ids.contains(object_id);
+        let touch_parent_on_create = touch_parent_on_create && transient_create;
+        let create_predecessor_object_id = transient_create
+            .then(|| {
+                self.transient_metadata_predecessor_object_ids
+                    .get(object_id)
+                    .cloned()
+            })
+            .flatten();
+
+        Ok(PreparedDistributedWrite {
+            object,
+            desired_replica_nodes,
+            policy,
+            touch_parent_on_create,
+            create_predecessor_object_id,
+        })
+    }
+
     fn record_durable_write_intent_work(
         &mut self,
         intent: &DistributedWriteIntent,
@@ -388,35 +472,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if expected_base_version != object.version {
             return Ok(None);
         }
-        if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
-            return Err(DfsError::InvalidReplicationPolicy {
-                message:
-                    "replicated-confirmed writes require min_commit_replicas == desired_replicas"
-                        .to_string(),
-            });
-        }
-        validate_replication_plan(&desired_replica_nodes, &policy)?;
-        let desired_replica_nodes =
-            self.normalize_desired_replica_nodes(&object, desired_replica_nodes, &policy);
-        let policy = if desired_replica_nodes.len() > policy.desired_replicas {
-            let desired_replicas = desired_replica_nodes.len();
-            let min_commit_replicas = if object.policy == DfsObjectPolicy::ReplicatedConfirmed {
-                desired_replicas
-            } else {
-                policy.min_commit_replicas.min(desired_replicas)
-            };
-            policy.with_counts(min_commit_replicas, desired_replicas)?
-        } else {
-            policy
-        };
-        validate_replication_plan(&desired_replica_nodes, &policy)?;
-        if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
-            return Err(DfsError::InvalidReplicationPolicy {
-                message:
-                    "replicated-confirmed writes require min_commit_replicas == desired_replicas"
-                        .to_string(),
-            });
-        }
+        let (desired_replica_nodes, policy) = self.normalize_distributed_write_replication_plan(
+            &object,
+            desired_replica_nodes,
+            policy,
+        )?;
         let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
             Some(shard) if shard.primary_node_id != self.node_id => return Ok(None),
             Some(shard) => shard.epoch,
@@ -566,35 +626,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if expected_base_version != object.version {
             return Ok(None);
         }
-        if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
-            return Err(DfsError::InvalidReplicationPolicy {
-                message:
-                    "replicated-confirmed writes require min_commit_replicas == desired_replicas"
-                        .to_string(),
-            });
-        }
-        validate_replication_plan(&desired_replica_nodes, &policy)?;
-        let desired_replica_nodes =
-            self.normalize_desired_replica_nodes(&object, desired_replica_nodes, &policy);
-        let policy = if desired_replica_nodes.len() > policy.desired_replicas {
-            let desired_replicas = desired_replica_nodes.len();
-            let min_commit_replicas = if object.policy == DfsObjectPolicy::ReplicatedConfirmed {
-                desired_replicas
-            } else {
-                policy.min_commit_replicas.min(desired_replicas)
-            };
-            policy.with_counts(min_commit_replicas, desired_replicas)?
-        } else {
-            policy
-        };
-        validate_replication_plan(&desired_replica_nodes, &policy)?;
-        if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
-            return Err(DfsError::InvalidReplicationPolicy {
-                message:
-                    "replicated-confirmed writes require min_commit_replicas == desired_replicas"
-                        .to_string(),
-            });
-        }
+        let (desired_replica_nodes, policy) = self.normalize_distributed_write_replication_plan(
+            &object,
+            desired_replica_nodes,
+            policy,
+        )?;
         let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
             Some(shard) if shard.primary_node_id != self.node_id => return Ok(None),
             Some(shard) => shard.epoch,
@@ -725,19 +761,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if object.policy != DfsObjectPolicy::ReplicatedEventual {
             return Ok(None);
         }
-        validate_replication_plan(&desired_replica_nodes, &policy)?;
-        let desired_replica_nodes =
-            self.normalize_desired_replica_nodes(&object, desired_replica_nodes, &policy);
-        let policy = if desired_replica_nodes.len() > policy.desired_replicas {
-            let desired_replicas = desired_replica_nodes.len();
-            policy.with_counts(
-                policy.min_commit_replicas.min(desired_replicas),
-                desired_replicas,
-            )?
-        } else {
-            policy
-        };
-        validate_replication_plan(&desired_replica_nodes, &policy)?;
+        let (desired_replica_nodes, policy) = self.normalize_distributed_write_replication_plan(
+            &object,
+            desired_replica_nodes,
+            policy,
+        )?;
         if policy.min_commit_replicas != 1
             || desired_replica_nodes.len() != 1
             || desired_replica_nodes[0] != self.node_id
@@ -812,19 +840,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if object.policy != DfsObjectPolicy::ReplicatedEventual {
             return Ok(None);
         }
-        validate_replication_plan(&desired_replica_nodes, &policy)?;
-        let desired_replica_nodes =
-            self.normalize_desired_replica_nodes(&object, desired_replica_nodes, &policy);
-        let policy = if desired_replica_nodes.len() > policy.desired_replicas {
-            let desired_replicas = desired_replica_nodes.len();
-            policy.with_counts(
-                policy.min_commit_replicas.min(desired_replicas),
-                desired_replicas,
-            )?
-        } else {
-            policy
-        };
-        validate_replication_plan(&desired_replica_nodes, &policy)?;
+        let (desired_replica_nodes, policy) = self.normalize_distributed_write_replication_plan(
+            &object,
+            desired_replica_nodes,
+            policy,
+        )?;
         if policy.min_commit_replicas != 1
             || desired_replica_nodes.len() != 1
             || desired_replica_nodes[0] != self.node_id
@@ -952,55 +972,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         touch_parent_on_create: bool,
         foreground_replica_repair: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
-        let object = self.current_object_for_write(&request.object_id)?;
-        let transient_create = self
-            .transient_metadata_object_ids
-            .contains(&request.object_id);
-        let touch_parent_on_create = touch_parent_on_create && transient_create;
-        let create_predecessor_object_id = transient_create
-            .then(|| {
-                self.transient_metadata_predecessor_object_ids
-                    .get(&request.object_id)
-                    .cloned()
-            })
-            .flatten();
-        if !matches!(
-            object.policy,
-            DfsObjectPolicy::ReplicatedEventual | DfsObjectPolicy::ReplicatedConfirmed
-        ) {
-            return Err(DfsError::UnsupportedPolicy {
-                policy: object.policy,
-            });
-        }
-        if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
-            return Err(DfsError::InvalidReplicationPolicy {
-                message:
-                    "replicated-confirmed writes require min_commit_replicas == desired_replicas"
-                        .to_string(),
-            });
-        }
-        validate_replication_plan(&desired_replica_nodes, &policy)?;
-        let desired_replica_nodes =
-            self.normalize_desired_replica_nodes(&object, desired_replica_nodes, &policy);
-        let policy = if desired_replica_nodes.len() > policy.desired_replicas {
-            let desired_replicas = desired_replica_nodes.len();
-            let min_commit_replicas = if object.policy == DfsObjectPolicy::ReplicatedConfirmed {
-                desired_replicas
-            } else {
-                policy.min_commit_replicas.min(desired_replicas)
-            };
-            policy.with_counts(min_commit_replicas, desired_replicas)?
-        } else {
-            policy
-        };
-        validate_replication_plan(&desired_replica_nodes, &policy)?;
-        if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
-            return Err(DfsError::InvalidReplicationPolicy {
-                message:
-                    "replicated-confirmed writes require min_commit_replicas == desired_replicas"
-                        .to_string(),
-            });
-        }
+        let PreparedDistributedWrite {
+            object,
+            desired_replica_nodes,
+            policy,
+            touch_parent_on_create,
+            create_predecessor_object_id,
+        } = self.prepare_distributed_write(
+            &request.object_id,
+            desired_replica_nodes,
+            policy,
+            touch_parent_on_create,
+        )?;
         let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
             Some(shard) if shard.primary_node_id != self.node_id => {
                 return self.route_distributed_write_from_reader_to_metadata_primary(
@@ -1304,36 +1287,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_policy_min = policy.min_commit_replicas;
         let trace_policy_desired = policy.desired_replicas;
         let trace_content_size_bytes = content_size_bytes;
-        let object = self.current_object_for_write(&request.object_id)?;
-        let transient_create = self
-            .transient_metadata_object_ids
-            .contains(&request.object_id);
-        let touch_parent_on_create = touch_parent_on_create && transient_create;
-        let create_predecessor_object_id = transient_create
-            .then(|| {
-                self.transient_metadata_predecessor_object_ids
-                    .get(&request.object_id)
-                    .cloned()
-            })
-            .flatten();
-        if !matches!(
-            object.policy,
-            DfsObjectPolicy::ReplicatedEventual | DfsObjectPolicy::ReplicatedConfirmed
-        ) {
-            return Err(DfsError::UnsupportedPolicy {
-                policy: object.policy,
-            });
-        }
-        if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
-            return Err(DfsError::InvalidReplicationPolicy {
-                message:
-                    "replicated-confirmed writes require min_commit_replicas == desired_replicas"
-                        .to_string(),
-            });
-        }
-        validate_replication_plan(&desired_replica_nodes, &policy)?;
-        let desired_replica_nodes =
-            self.normalize_desired_replica_nodes(&object, desired_replica_nodes, &policy);
+        let PreparedDistributedWrite {
+            object,
+            desired_replica_nodes,
+            policy,
+            touch_parent_on_create,
+            create_predecessor_object_id,
+        } = self.prepare_distributed_write(
+            &request.object_id,
+            desired_replica_nodes,
+            policy,
+            touch_parent_on_create,
+        )?;
         if let Some(invalid_receipt_node_id) = initial_receipt_node_ids
             .iter()
             .find(|node_id| !desired_replica_nodes.contains(node_id))
@@ -1343,25 +1308,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     "routed write for {} cannot record initial receipt for non-replica {}",
                     request.object_id, invalid_receipt_node_id
                 ),
-            });
-        }
-        let policy = if desired_replica_nodes.len() > policy.desired_replicas {
-            let desired_replicas = desired_replica_nodes.len();
-            let min_commit_replicas = if object.policy == DfsObjectPolicy::ReplicatedConfirmed {
-                desired_replicas
-            } else {
-                policy.min_commit_replicas.min(desired_replicas)
-            };
-            policy.with_counts(min_commit_replicas, desired_replicas)?
-        } else {
-            policy
-        };
-        validate_replication_plan(&desired_replica_nodes, &policy)?;
-        if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
-            return Err(DfsError::InvalidReplicationPolicy {
-                message:
-                    "replicated-confirmed writes require min_commit_replicas == desired_replicas"
-                        .to_string(),
             });
         }
         // Creating the in-memory intent is not the visible linearization
@@ -1597,60 +1543,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         detach_remote_primary_request: bool,
         replay_response_journal: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
-        let object = self.current_object_for_write(&request.object_id)?;
-        let transient_create = self
-            .transient_metadata_object_ids
-            .contains(&request.object_id);
-        let touch_parent_on_create = touch_parent_on_create && transient_create;
-        let create_predecessor_object_id = transient_create
-            .then(|| {
-                self.transient_metadata_predecessor_object_ids
-                    .get(&request.object_id)
-                    .cloned()
-            })
-            .flatten();
-        if !matches!(
-            object.policy,
-            DfsObjectPolicy::ReplicatedEventual | DfsObjectPolicy::ReplicatedConfirmed
-        ) {
-            return Err(DfsError::UnsupportedPolicy {
-                policy: object.policy,
-            });
-        }
-        if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
-            return Err(DfsError::InvalidReplicationPolicy {
-                message:
-                    "replicated-confirmed writes require min_commit_replicas == desired_replicas"
-                        .to_string(),
-            });
-        }
-        validate_replication_plan(&desired_replica_nodes, &policy)?;
-        let desired_replica_nodes =
-            self.normalize_desired_replica_nodes(&object, desired_replica_nodes, &policy);
-        let policy = if desired_replica_nodes.len() > policy.desired_replicas {
-            let desired_replicas = desired_replica_nodes.len();
-            // Replicated-confirmed requires every desired replica to confirm before
-            // commit. When normalization widens the replica set (e.g. by injecting
-            // the owner node), the commit threshold must grow with it; otherwise the
-            // write would commit before all desired replicas are durable and silently
-            // degrade to eventual semantics.
-            let min_commit_replicas = if object.policy == DfsObjectPolicy::ReplicatedConfirmed {
-                desired_replicas
-            } else {
-                policy.min_commit_replicas.min(desired_replicas)
-            };
-            policy.with_counts(min_commit_replicas, desired_replicas)?
-        } else {
-            policy
-        };
-        validate_replication_plan(&desired_replica_nodes, &policy)?;
-        if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
-            return Err(DfsError::InvalidReplicationPolicy {
-                message:
-                    "replicated-confirmed writes require min_commit_replicas == desired_replicas"
-                        .to_string(),
-            });
-        }
+        let PreparedDistributedWrite {
+            object,
+            desired_replica_nodes,
+            policy,
+            touch_parent_on_create,
+            create_predecessor_object_id,
+        } = self.prepare_distributed_write(
+            &request.object_id,
+            desired_replica_nodes,
+            policy,
+            touch_parent_on_create,
+        )?;
         let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
             Some(shard) if shard.primary_node_id != self.node_id => {
                 return self.route_distributed_write_to_metadata_primary(

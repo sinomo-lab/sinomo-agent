@@ -3114,9 +3114,7 @@ mod tests {
                 prefix_proof: &mut prefix_proof,
             },
             1,
-            vec![DfsMetadataTableOp::PutNamespacePrepare {
-                prepare: prepare.clone(),
-            }],
+            vec![DfsMetadataTableOp::put_namespace_prepare(prepare.clone())],
             u64::MAX,
         )
         .expect("append prepared body");
@@ -3249,9 +3247,7 @@ mod tests {
             },
             entry.sequence,
             vec![reference],
-            vec![DfsMetadataTableOp::PutNamespacePrepare {
-                prepare: prepare.clone(),
-            }],
+            vec![DfsMetadataTableOp::put_namespace_prepare(prepare.clone())],
             None,
             max_replay_bytes,
         )
@@ -3360,9 +3356,9 @@ mod tests {
                 owner_epoch: second_prepare.owner_epoch,
                 status: second_prepare.status.clone(),
             }],
-            vec![DfsMetadataTableOp::PutNamespacePrepare {
-                prepare: second_prepare.clone(),
-            }],
+            vec![DfsMetadataTableOp::put_namespace_prepare(
+                second_prepare.clone(),
+            )],
             None,
             max_replay_bytes,
         )
@@ -3561,9 +3557,7 @@ mod tests {
             DfsNamespacePrepareStatus::Prepared,
         );
         let mut tables = DfsMetadataTables::default();
-        tables.apply(DfsMetadataTableOp::PutNamespacePrepare {
-            prepare: prepare.clone(),
-        });
+        tables.apply(DfsMetadataTableOp::put_namespace_prepare(prepare.clone()));
 
         let mut wrong_digest = namespace_prepare_commit_op(&prepare);
         let DfsMetadataTableOp::CommitNamespacePrepare {
@@ -3585,7 +3579,7 @@ mod tests {
 
         let mut aborted = prepare.clone();
         aborted.status = DfsNamespacePrepareStatus::Aborted;
-        tables.apply(DfsMetadataTableOp::PutNamespacePrepare { prepare: aborted });
+        tables.apply(DfsMetadataTableOp::put_namespace_prepare(aborted));
         assert!(
             tables
                 .validate_checked(&namespace_prepare_commit_op(&prepare))
@@ -3603,9 +3597,7 @@ mod tests {
             DfsNamespacePrepareStatus::Prepared,
         );
         let mut tables = DfsMetadataTables::default();
-        tables.apply(DfsMetadataTableOp::PutNamespacePrepare {
-            prepare: prepare.clone(),
-        });
+        tables.apply(DfsMetadataTableOp::put_namespace_prepare(prepare.clone()));
         let before = tables.clone();
         let marker = namespace_prepare_commit_op(&prepare);
         let mut rollback = DfsMetadataTableRollback::default();
@@ -3743,7 +3735,7 @@ mod tests {
             },
             1,
             vec![prefix_op, reference],
-            DfsMetadataTableOp::PutNamespacePrepare { prepare },
+            DfsMetadataTableOp::put_namespace_prepare(prepare),
             1,
             u64::MAX,
             rollback,

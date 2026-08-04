@@ -692,7 +692,7 @@ pub(crate) fn metadata_tables_from_table_snapshot(
             Ok(tables)
         }
         METADATA_TABLE_SNAPSHOT_FORMAT_VERSION => Ok(metadata_tables_from_snapshot(
-            snapshot.tables.ok_or_else(|| {
+            *snapshot.tables.ok_or_else(|| {
                 MetadataBackendError::Serde(format!(
                     "{description} version {} is missing structured tables",
                     snapshot.format_version
@@ -1003,9 +1003,9 @@ fn resolve_metadata_table_op_from_journal(
             "metadata table namespace prepare {operation_id} reference {journal_sequence} scope/digest/epoch/status fence mismatch"
         )));
     }
-    Ok(DfsMetadataTableOp::PutNamespacePrepare {
-        prepare: prepare.into_owned(),
-    })
+    Ok(DfsMetadataTableOp::put_namespace_prepare(
+        prepare.into_owned(),
+    ))
 }
 
 pub(crate) fn append_metadata_table_batch(
@@ -1760,7 +1760,7 @@ fn metadata_tables_from_snapshot(snapshot: DfsMetadataTableSnapshotTables) -> Df
         tables.apply(DfsMetadataTableOp::PutNamespaceTransactionReceipt { receipt });
     }
     for prepare in snapshot.namespace_prepares {
-        tables.apply(DfsMetadataTableOp::PutNamespacePrepare { prepare });
+        tables.apply(DfsMetadataTableOp::put_namespace_prepare(prepare));
     }
     for receipt in snapshot.namespace_prepare_receipts {
         tables.apply(DfsMetadataTableOp::PutNamespacePrepareReceipt { receipt });
@@ -1772,10 +1772,10 @@ fn metadata_tables_from_snapshot(snapshot: DfsMetadataTableSnapshotTables) -> Df
         tables.apply(DfsMetadataTableOp::PutNamespaceJobReceipt { receipt });
     }
     for request in snapshot.namespace_requests {
-        tables.apply(DfsMetadataTableOp::PutNamespaceRequest { request });
+        tables.apply(DfsMetadataTableOp::put_namespace_request(request));
     }
     for receipt in snapshot.namespace_request_receipts {
-        tables.apply(DfsMetadataTableOp::PutNamespaceRequestReceipt { receipt });
+        tables.apply(DfsMetadataTableOp::put_namespace_request_receipt(receipt));
     }
     tables
 }
@@ -1953,7 +1953,7 @@ pub(crate) fn metadata_table_snapshot_ops(tables: &DfsMetadataTables) -> Vec<Dfs
             .namespace_prepares
             .values()
             .cloned()
-            .map(|prepare| DfsMetadataTableOp::PutNamespacePrepare { prepare }),
+            .map(DfsMetadataTableOp::put_namespace_prepare),
     );
     ops.extend(
         tables
@@ -1974,7 +1974,7 @@ pub(crate) fn metadata_table_snapshot_ops(tables: &DfsMetadataTables) -> Vec<Dfs
             .namespace_requests
             .values()
             .cloned()
-            .map(|request| DfsMetadataTableOp::PutNamespaceRequest { request }),
+            .map(DfsMetadataTableOp::put_namespace_request),
     );
     ops
 }
