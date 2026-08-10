@@ -11,6 +11,7 @@ use crate::posix_path::{
     hidden_alias_tombstone_path, normalize_posix_path,
     normalize_posix_path_with_trailing_directory, parent_posix_path,
 };
+use crate::protocol::{DfsNamespaceDestinationPrecondition, DfsNamespaceObjectPrecondition};
 use crate::{
     DfsMessageTransport, DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNamespaceTransaction,
     DfsObjectId, DfsObjectKind, DfsObjectMetadata, NetworkedDfsService,
@@ -34,25 +35,140 @@ fn ensure_same_atomic_namespace_shard(
     Ok(())
 }
 
+fn namespace_generation_conflict(
+    path: &str,
+    expected: &DfsNamespaceObjectPrecondition,
+    actual: Option<&DfsObjectMetadata>,
+) -> DfsPosixError {
+    let actual = actual
+        .map(|object| {
+            format!(
+                "{}@{} ({:?})",
+                object.object_id, object.version, object.kind
+            )
+        })
+        .unwrap_or_else(|| "absent".to_string());
+    DfsPosixError::Conflict {
+        path: path.to_string(),
+        reason: format!(
+            "namespace generation changed: expected {}@{}, current {actual}; reconcile operation outcome before retrying",
+            expected.object_id, expected.version
+        ),
+    }
+}
+
+fn conditional_delete_result(path: &str, stat: DfsStat) -> Result<DfsStat> {
+    if stat.kind == DfsObjectKind::Tombstone {
+        return Ok(stat);
+    }
+    Err(DfsPosixError::Conflict {
+        path: path.to_string(),
+        reason: "durable delete was applied previously, but the path now names a live generation; reconcile the stored outcome"
+            .to_string(),
+    })
+}
+
+fn conditional_rename_result(
+    path: &str,
+    expected_source: &DfsNamespaceObjectPrecondition,
+    stat: DfsStat,
+) -> Result<DfsStat> {
+    if stat.object_id == expected_source.object_id && stat.kind != DfsObjectKind::Tombstone {
+        return Ok(stat);
+    }
+    Err(DfsPosixError::Conflict {
+        path: path.to_string(),
+        reason: "durable rename was applied previously, but the destination now names a different generation; reconcile the stored outcome"
+            .to_string(),
+    })
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
-    pub fn posix_unlink(&mut self, path: &str) -> Result<DfsStat> {
-        self.with_posix_commit_operation_deadline(|service| {
-            service.posix_unlink_with_current_deadline(path)
+    fn hardlink_alias_target_requires_cross_shard_coordination(
+        &mut self,
+        alias_path: &str,
+        target_path: &str,
+    ) -> Result<bool> {
+        let Some(shards) = self.refresh_sifs_metadata_shards()? else {
+            return Ok(false);
+        };
+        let alias_shard =
+            self.select_sifs_metadata_shard_for_path_from_snapshot(alias_path, &shards)?;
+        let target_shard =
+            self.select_sifs_metadata_shard_for_path_from_snapshot(target_path, &shards)?;
+        Ok(match (alias_shard, target_shard) {
+            (Some(alias), Some(target)) => alias.shard_id != target.shard_id,
+            _ => false,
         })
     }
 
-    fn posix_unlink_with_current_deadline(&mut self, path: &str) -> Result<DfsStat> {
+    pub fn posix_unlink(&mut self, path: &str) -> Result<DfsStat> {
+        self.with_posix_commit_operation_deadline(|service| {
+            // The CAS protects the namespace entry being removed. Ordinary POSIX lstat
+            // intentionally projects a hardlink alias as its shared target inode, whose
+            // object/version cannot match the alias record checked by the authority.
+            let observed = service.posix_namespace_lstat_distributed(path)?;
+            let operation_id = service.next_request_id();
+            service.posix_unlink_if_generation_with_current_deadline(
+                path,
+                operation_id,
+                DfsNamespaceObjectPrecondition {
+                    object_id: observed.object_id,
+                    version: observed.version,
+                },
+            )
+        })
+    }
+
+    /// Unlink an exact namespace generation under a caller-owned durable
+    /// operation id. A caller retrying after an ambiguous response must reuse
+    /// both the id and the precondition unchanged.
+    pub fn posix_unlink_if_generation(
+        &mut self,
+        path: &str,
+        operation_id: String,
+        expected: DfsNamespaceObjectPrecondition,
+    ) -> Result<DfsStat> {
+        self.with_posix_commit_operation_deadline(|service| {
+            service.posix_unlink_if_generation_with_current_deadline(path, operation_id, expected)
+        })
+    }
+
+    fn posix_unlink_if_generation_with_current_deadline(
+        &mut self,
+        path: &str,
+        operation_id: String,
+        expected: DfsNamespaceObjectPrecondition,
+    ) -> Result<DfsStat> {
         let normalized = normalize_posix_path(path)?;
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
-            self.route_namespace_operation(
+            self.route_namespace_operation_with_request_id(
+                operation_id,
                 primary,
-                DfsNamespaceOperation::Unlink {
+                DfsNamespaceOperation::ConditionalUnlink {
                     path: path.to_string(),
+                    expected,
                 },
             )?;
-            return self.stat_replayed_tombstone_synced(&normalized);
+            return conditional_delete_result(
+                &normalized,
+                self.stat_replayed_tombstone_synced(&normalized)?,
+            );
         }
-        self.posix_unlink_local(path)
+        if self.control_plane.is_some() {
+            self.execute_local_primary_namespace_operation_with_request_id(
+                operation_id,
+                DfsNamespaceOperation::ConditionalUnlink {
+                    path: path.to_string(),
+                    expected,
+                },
+            )?;
+            return conditional_delete_result(
+                &normalized,
+                self.stat_replayed_tombstone(&normalized)?,
+            );
+        }
+        self.posix_unlink_local_if_generation(path, &expected)
     }
 
     pub(crate) fn posix_unlink_local(&mut self, path: &str) -> Result<DfsStat> {
@@ -68,17 +184,62 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(DfsPosixError::NotFound { path });
         }
         if object.kind == DfsObjectKind::Hardlink {
-            if let Some(target_object_id) = object.link_target_object_id.clone()
-                && let Some(mut target) = self.object_by_id(&target_object_id)?
-            {
-                target.changed_at_unix_nanos = now_unix_nanos();
-                target.version = next_version(&target.version);
-                self.add_object_metadata(target)?;
+            let target_object_id = object
+                .link_target_object_id
+                .clone()
+                .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+            let mut target = self
+                .object_by_id(&target_object_id)?
+                .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+            if target.kind == DfsObjectKind::Tombstone || target.kind == DfsObjectKind::Hardlink {
+                return Err(DfsPosixError::NotFound { path });
             }
-            object = self.tombstone_path_object(object);
-            self.add_object_metadata(object.clone())?;
-            self.touch_parent_directory_modified(&path)?;
-            return self.stat_object(&object);
+            let tombstone = self.tombstone_path_object(object.clone());
+            let mut alias_objects = vec![tombstone.clone()];
+            if let Some(parent_path) = parent_posix_path(&path) {
+                alias_objects.push(self.directory_modified_metadata(&parent_path)?);
+            }
+            let alias_transaction = DfsNamespaceTransaction {
+                transaction_id: namespace_transaction_id_for_batch(
+                    "unlink-hardlink-alias",
+                    &object.file_system_id,
+                    &alias_objects,
+                    &[],
+                ),
+                file_system_id: object.file_system_id.clone(),
+                objects: alias_objects,
+                versions: Vec::new(),
+                advisory_lock_states: Vec::new(),
+                created_at: OffsetDateTime::now_utc(),
+            };
+            if self.hardlink_alias_target_requires_cross_shard_coordination(&path, &target.path)? {
+                self.coordinate_cross_primary_hardlink_alias_mutation(
+                    &object,
+                    &path,
+                    alias_transaction,
+                    "unlink",
+                )?;
+                return self.stat_replayed_tombstone(&path);
+            }
+            target.changed_at_unix_nanos =
+                now_unix_nanos().max(target.changed_at_unix_nanos.saturating_add(1));
+            target.version = next_version(&target.version);
+            let mut objects = alias_transaction.objects;
+            objects.push(target);
+            self.apply_namespace_transaction(DfsNamespaceTransaction {
+                transaction_id: namespace_transaction_id_for_batch(
+                    "unlink-hardlink-alias-local",
+                    &object.file_system_id,
+                    &objects,
+                    &[],
+                ),
+                file_system_id: object.file_system_id.clone(),
+                objects,
+                versions: Vec::new(),
+                advisory_lock_states: Vec::new(),
+                created_at: alias_transaction.created_at,
+            })?;
+            return self.stat_object(&tombstone);
         }
         if self.link_count_for_object(&object)? > 1 {
             // Unlinking a canonical record promotes one of its hardlink
@@ -121,24 +282,90 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.stat_object(&object)
     }
 
+    pub(crate) fn posix_unlink_local_if_generation(
+        &mut self,
+        path: &str,
+        expected: &DfsNamespaceObjectPrecondition,
+    ) -> Result<DfsStat> {
+        let resolved = self.resolve_existing_posix_path_distributed(path, false)?;
+        let current = self.lookup_sifs_path(&resolved)?;
+        if current.as_ref().is_none_or(|object| {
+            object.kind == DfsObjectKind::Tombstone
+                || object.object_id != expected.object_id
+                || object.version != expected.version
+        }) {
+            return Err(namespace_generation_conflict(
+                &resolved,
+                expected,
+                current.as_ref(),
+            ));
+        }
+        self.posix_unlink_local(&resolved)
+    }
+
     pub fn posix_rmdir(&mut self, path: &str) -> Result<DfsStat> {
         self.with_posix_commit_operation_deadline(|service| {
-            service.posix_rmdir_with_current_deadline(path)
+            let observed = service.posix_namespace_lstat_distributed(path)?;
+            let operation_id = service.next_request_id();
+            service.posix_rmdir_if_generation_with_current_deadline(
+                path,
+                operation_id,
+                DfsNamespaceObjectPrecondition {
+                    object_id: observed.object_id,
+                    version: observed.version,
+                },
+            )
         })
     }
 
-    fn posix_rmdir_with_current_deadline(&mut self, path: &str) -> Result<DfsStat> {
+    /// Remove an exact directory generation under a caller-owned durable
+    /// operation id.
+    pub fn posix_rmdir_if_generation(
+        &mut self,
+        path: &str,
+        operation_id: String,
+        expected: DfsNamespaceObjectPrecondition,
+    ) -> Result<DfsStat> {
+        self.with_posix_commit_operation_deadline(|service| {
+            service.posix_rmdir_if_generation_with_current_deadline(path, operation_id, expected)
+        })
+    }
+
+    fn posix_rmdir_if_generation_with_current_deadline(
+        &mut self,
+        path: &str,
+        operation_id: String,
+        expected: DfsNamespaceObjectPrecondition,
+    ) -> Result<DfsStat> {
         let normalized = normalize_posix_path(path)?;
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
-            self.route_namespace_operation(
+            self.route_namespace_operation_with_request_id(
+                operation_id,
                 primary,
-                DfsNamespaceOperation::Rmdir {
+                DfsNamespaceOperation::ConditionalRmdir {
                     path: path.to_string(),
+                    expected,
                 },
             )?;
-            return self.stat_replayed_tombstone_synced(&normalized);
+            return conditional_delete_result(
+                &normalized,
+                self.stat_replayed_tombstone_synced(&normalized)?,
+            );
         }
-        self.posix_rmdir_local(path)
+        if self.control_plane.is_some() {
+            self.execute_local_primary_namespace_operation_with_request_id(
+                operation_id,
+                DfsNamespaceOperation::ConditionalRmdir {
+                    path: path.to_string(),
+                    expected,
+                },
+            )?;
+            return conditional_delete_result(
+                &normalized,
+                self.stat_replayed_tombstone(&normalized)?,
+            );
+        }
+        self.posix_rmdir_local_if_generation(path, &expected)
     }
 
     pub(crate) fn posix_rmdir_local(&mut self, path: &str) -> Result<DfsStat> {
@@ -185,6 +412,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.stat_object(&object)
     }
 
+    pub(crate) fn posix_rmdir_local_if_generation(
+        &mut self,
+        path: &str,
+        expected: &DfsNamespaceObjectPrecondition,
+    ) -> Result<DfsStat> {
+        let normalized = normalize_posix_path(path)?;
+        let resolved = self.resolve_posix_path_distributed(&normalized, false)?;
+        let current = self.lookup_sifs_path(&resolved)?;
+        if current.as_ref().is_none_or(|object| {
+            object.kind == DfsObjectKind::Tombstone
+                || object.object_id != expected.object_id
+                || object.version != expected.version
+        }) {
+            return Err(namespace_generation_conflict(
+                &resolved,
+                expected,
+                current.as_ref(),
+            ));
+        }
+        self.posix_rmdir_local(&resolved)
+    }
+
     pub fn posix_rename(&mut self, from: &str, to: &str) -> Result<DfsStat> {
         let normalized_from = normalize_posix_path(from)?;
         let normalized_to = normalize_posix_path(to)?;
@@ -220,6 +469,80 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 self.stat_routed_namespace_result(&normalized_to, true)
             }
+        }
+    }
+
+    /// Rename under exact source and destination generation fences.
+    ///
+    /// The current cross-shard adoption protocol cannot atomically carry a
+    /// destination compare-and-swap, so this API rejects cross-shard moves
+    /// instead of weakening the contract. Same-shard local and routed moves
+    /// are one metadata transaction.
+    pub fn posix_rename_if_generation(
+        &mut self,
+        from: &str,
+        to: &str,
+        operation_id: String,
+        expected_source: DfsNamespaceObjectPrecondition,
+        expected_destination: DfsNamespaceDestinationPrecondition,
+    ) -> Result<DfsStat> {
+        let normalized_from = normalize_posix_path(from)?;
+        let normalized_to = normalize_posix_path(to)?;
+        let mut primaries = self
+            .routed_namespace_primaries_for_paths_fresh([
+                normalized_from.as_str(),
+                normalized_to.as_str(),
+            ])?
+            .into_iter();
+        let from_primary = primaries.next().unwrap_or(None);
+        let to_primary = primaries.next().unwrap_or(None);
+        match (from_primary, to_primary) {
+            (None, None) if self.control_plane.is_some() => {
+                self.execute_local_primary_namespace_operation_with_request_id(
+                    operation_id,
+                    DfsNamespaceOperation::ConditionalRename {
+                        from: from.to_string(),
+                        to: to.to_string(),
+                        expected_source: expected_source.clone(),
+                        expected_destination,
+                    },
+                )?;
+                conditional_rename_result(
+                    &normalized_to,
+                    &expected_source,
+                    self.posix_stat(&normalized_to)?,
+                )
+            }
+            (None, None) => self.posix_rename_local_if_generation(
+                from,
+                to,
+                &expected_source,
+                &expected_destination,
+            ),
+            (Some(source_primary), Some(destination_primary))
+                if source_primary == destination_primary =>
+            {
+                self.route_namespace_operation_with_request_id(
+                    operation_id,
+                    source_primary,
+                    DfsNamespaceOperation::ConditionalRename {
+                        from: from.to_string(),
+                        to: to.to_string(),
+                        expected_source: expected_source.clone(),
+                        expected_destination,
+                    },
+                )?;
+                conditional_rename_result(
+                    &normalized_to,
+                    &expected_source,
+                    self.stat_routed_namespace_result(&normalized_to, true)?,
+                )
+            }
+            _ => Err(DfsPosixError::Conflict {
+                path: format!("{normalized_from} -> {normalized_to}"),
+                reason: "conditional rename crosses metadata shard primaries; the destination CAS cannot be weakened"
+                    .to_string(),
+            }),
         }
     }
 
@@ -364,6 +687,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if source.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path: from });
         }
+        let source_generation = source.clone();
         if to_requires_directory && source.kind != DfsObjectKind::Directory {
             return Err(DfsPosixError::NotDirectory { path: to });
         }
@@ -392,12 +716,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
         let old_source_path = source.path.clone();
         let mut moved_children = Vec::new();
-        let mut hardlink_target_updates = Vec::new();
+        let mut local_hardlink_target_updates = Vec::new();
 
         if let Some(mut destination) = self.lookup_sifs_path(&to)? {
             if destination.kind != DfsObjectKind::Tombstone {
                 let source_target = self.resolve_hardlink_target(&source)?;
-                let mut destination_target = self.resolve_hardlink_target(&destination)?;
+                let destination_target = self.resolve_hardlink_target(&destination)?;
                 if source_target.object_id == destination_target.object_id {
                     return self.posix_stat(&to);
                 }
@@ -416,6 +740,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     _ => {}
                 }
                 let destination_target_changed_at = now_unix_nanos();
+                if destination.kind == DfsObjectKind::Hardlink {
+                    if self.hardlink_alias_target_requires_cross_shard_coordination(
+                        &destination.path,
+                        &destination_target.path,
+                    )? {
+                        return Err(DfsPosixError::InvalidPath {
+                            path: format!(
+                                "replacing hardlink destination {to} whose canonical target {} is on another metadata shard requires a multi-target alias job",
+                                destination_target.path
+                            ),
+                        });
+                    }
+                    let mut updated_target = destination_target.clone();
+                    updated_target.changed_at_unix_nanos = destination_target_changed_at
+                        .max(updated_target.changed_at_unix_nanos.saturating_add(1));
+                    updated_target.version = next_version(&updated_target.version);
+                    local_hardlink_target_updates.push(updated_target);
+                }
                 if !matches!(
                     destination.kind,
                     DfsObjectKind::Hardlink | DfsObjectKind::Directory
@@ -449,28 +791,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     moved_children.push(alias_tombstone);
                     moved_children.push(destination);
                 } else {
-                    if destination.kind == DfsObjectKind::Hardlink {
-                        destination_target.changed_at_unix_nanos = destination_target_changed_at;
-                        destination_target.version = next_version(&destination_target.version);
-                        hardlink_target_updates.push(destination_target);
-                    }
                     moved_children.push(self.tombstone_path_object(destination));
                 }
             }
         }
 
-        if source.kind == DfsObjectKind::Hardlink
-            && let Some(target_object_id) = source.link_target_object_id.as_ref()
-            && let Some(mut source_target) = self.object_by_id(target_object_id)?
+        let source_hardlink_target = if source.kind == DfsObjectKind::Hardlink {
+            Some(self.resolve_hardlink_target(&source)?)
+        } else {
+            None
+        };
+        let source_hardlink_requires_coordination = match source_hardlink_target.as_ref() {
+            Some(target) => self.hardlink_alias_target_requires_cross_shard_coordination(
+                &source.path,
+                &target.path,
+            )?,
+            None => false,
+        };
+        if let Some(target) = source_hardlink_target.as_ref()
+            && !source_hardlink_requires_coordination
         {
-            source_target.changed_at_unix_nanos = now_unix_nanos();
-            source_target.version = next_version(&source_target.version);
-            if !hardlink_target_updates
-                .iter()
-                .any(|object: &DfsObjectMetadata| object.object_id == source_target.object_id)
-            {
-                hardlink_target_updates.push(source_target);
-            }
+            let mut updated_target = target.clone();
+            updated_target.changed_at_unix_nanos =
+                now_unix_nanos().max(updated_target.changed_at_unix_nanos.saturating_add(1));
+            updated_target.version = next_version(&updated_target.version);
+            local_hardlink_target_updates.push(updated_target);
         }
 
         let old_path_tombstone = self.tombstone_path_object_at(
@@ -487,8 +832,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         source.version = next_version(&source.version);
         let mut transaction_objects = vec![old_path_tombstone, source.clone()];
         transaction_objects.extend(moved_children);
-        transaction_objects.extend(hardlink_target_updates);
-        self.apply_namespace_transaction(DfsNamespaceTransaction {
+        transaction_objects.extend(local_hardlink_target_updates);
+        if source_hardlink_requires_coordination {
+            if let Some(parent_path) = parent_posix_path(&from) {
+                transaction_objects.push(self.directory_modified_metadata(&parent_path)?);
+            }
+            if parent_posix_path(&from) != parent_posix_path(&source.path)
+                && let Some(parent_path) = parent_posix_path(&source.path)
+            {
+                transaction_objects.push(self.directory_modified_metadata(&parent_path)?);
+            }
+        }
+        let transaction = DfsNamespaceTransaction {
             transaction_id: namespace_transaction_id_for_path(
                 "rename",
                 &source.object_id,
@@ -499,12 +854,76 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             versions: Vec::new(),
             advisory_lock_states: Vec::new(),
             created_at: time::OffsetDateTime::now_utc(),
-        })?;
+        };
+        if source_hardlink_requires_coordination {
+            self.coordinate_cross_primary_hardlink_alias_mutation(
+                &source_generation,
+                &source.path,
+                transaction,
+                "rename",
+            )?;
+            return self.posix_stat_distributed(&source.path);
+        }
+        self.apply_namespace_transaction(transaction)?;
         self.touch_parent_directory_modified(&from)?;
         if parent_posix_path(&from) != parent_posix_path(&source.path) {
             self.touch_parent_directory_modified(&source.path)?;
         }
         self.stat_object(&source)
+    }
+
+    pub(crate) fn posix_rename_local_if_generation(
+        &mut self,
+        from: &str,
+        to: &str,
+        expected_source: &DfsNamespaceObjectPrecondition,
+        expected_destination: &DfsNamespaceDestinationPrecondition,
+    ) -> Result<DfsStat> {
+        let (from, _) = normalize_posix_path_with_trailing_directory(from)?;
+        let (to, _) = normalize_posix_path_with_trailing_directory(to)?;
+        let from = self.resolve_posix_path_distributed(&from, false)?;
+        let to = self.resolve_posix_path_distributed(&to, false)?;
+        let source = self.lookup_sifs_path(&from)?;
+        if source.as_ref().is_none_or(|object| {
+            object.kind == DfsObjectKind::Tombstone
+                || object.object_id != expected_source.object_id
+                || object.version != expected_source.version
+        }) {
+            return Err(namespace_generation_conflict(
+                &from,
+                expected_source,
+                source.as_ref(),
+            ));
+        }
+        let destination = self.lookup_sifs_path(&to)?;
+        match expected_destination {
+            DfsNamespaceDestinationPrecondition::Absent
+                if destination
+                    .as_ref()
+                    .is_some_and(|object| object.kind != DfsObjectKind::Tombstone) =>
+            {
+                return Err(DfsPosixError::Conflict {
+                    path: to,
+                    reason: "rename destination was created after it was observed absent; reconcile operation outcome before retrying"
+                        .to_string(),
+                });
+            }
+            DfsNamespaceDestinationPrecondition::Exact(expected)
+                if destination.as_ref().is_none_or(|object| {
+                    object.kind == DfsObjectKind::Tombstone
+                        || object.object_id != expected.object_id
+                        || object.version != expected.version
+                }) =>
+            {
+                return Err(namespace_generation_conflict(
+                    &to,
+                    expected,
+                    destination.as_ref(),
+                ));
+            }
+            _ => {}
+        }
+        self.posix_rename_local(&from, &to)
     }
 
     fn unlink_canonical_with_hardlinks(
@@ -578,10 +997,10 @@ mod atomic_namespace_tests {
     use super::*;
     use crate::{
         DfsControlPlaneStore, DfsFileSystemConfig, DfsMetadataMutation, DfsMetadataShardAssignment,
-        DfsMetadataShardConfig, DfsMetadataShardId, DfsNamespaceCommand, DfsNamespaceResult,
-        DfsRoutedCall, DfsRoutedMessage, DfsTransportIdentity, LocalContentStore,
-        LocalSobjMetadataBackend, NetworkedDfsServiceEvent, SharedDfsControlPlaneKvClient,
-        distributed_sifs, open_local_sharded_metadata_backend,
+        DfsMetadataShardConfig, DfsMetadataShardId, DfsNamespaceCommand, DfsNamespacePosixError,
+        DfsNamespaceResult, DfsRoutedCall, DfsRoutedMessage, DfsTransportIdentity,
+        LocalContentStore, LocalSobjMetadataBackend, NetworkedDfsServiceEvent,
+        SharedDfsControlPlaneKvClient, distributed_sifs, open_local_sharded_metadata_backend,
     };
     use sinomo_core::DfsObjectPolicy;
     use sinomo_core::kv::InProcessKvStore;
@@ -798,6 +1217,102 @@ mod atomic_namespace_tests {
     }
 
     #[test]
+    fn conditional_rmdir_never_deletes_a_recreated_generation() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-rmdir-cas-recreate");
+        let owner = NodeId::from_legacy_named("node_rmdir_cas_recreate").expect("node");
+        let network = InProcessNetwork::new();
+        let backend = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            root.path().join("metadata"),
+        )
+        .expect("metadata backend");
+        let mut service = NetworkedDfsService::new(
+            network.add_node(owner),
+            LocalContentStore::new(root.path().join("content")).expect("content store"),
+        )
+        .with_metadata_backend(backend)
+        .expect("metadata-backed service");
+        service
+            .bootstrap_distributed_sifs()
+            .expect("bootstrap distributed sifs");
+
+        let path = "/services/rmdir-cas-recreate";
+        let original = service.posix_mkdir(path).expect("original directory");
+        let expected = DfsNamespaceObjectPrecondition {
+            object_id: original.object_id,
+            version: original.version,
+        };
+        service
+            .posix_rmdir_if_generation(path, "rmdir-cas-operation".to_string(), expected.clone())
+            .expect("conditional rmdir");
+        let recreated = service.posix_mkdir(path).expect("recreated directory");
+
+        let stale = service
+            .posix_rmdir_if_generation(path, "rmdir-cas-operation".to_string(), expected)
+            .expect_err("stale generation must be fenced");
+        assert!(matches!(stale, DfsPosixError::Conflict { .. }));
+        assert_eq!(
+            service
+                .posix_stat(path)
+                .expect("recreated directory remains"),
+            recreated
+        );
+    }
+
+    #[test]
+    fn conditional_rename_never_replaces_a_destination_created_after_observation() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-rename-cas-destination");
+        let owner = NodeId::from_legacy_named("node_rename_cas_destination").expect("node");
+        let network = InProcessNetwork::new();
+        let backend = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            root.path().join("metadata"),
+        )
+        .expect("metadata backend");
+        let mut service = NetworkedDfsService::new(
+            network.add_node(owner),
+            LocalContentStore::new(root.path().join("content")).expect("content store"),
+        )
+        .with_metadata_backend(backend)
+        .expect("metadata-backed service");
+        service
+            .bootstrap_distributed_sifs()
+            .expect("bootstrap distributed sifs");
+
+        let source_path = "/services/rename-cas-source";
+        let destination_path = "/services/rename-cas-destination";
+        let source = service.posix_mkdir(source_path).expect("source");
+        let expected_source = DfsNamespaceObjectPrecondition {
+            object_id: source.object_id.clone(),
+            version: source.version.clone(),
+        };
+        let destination = service
+            .posix_mkdir(destination_path)
+            .expect("concurrent destination");
+
+        let stale = service
+            .posix_rename_if_generation(
+                source_path,
+                destination_path,
+                "rename-cas-operation".to_string(),
+                expected_source,
+                DfsNamespaceDestinationPrecondition::Absent,
+            )
+            .expect_err("new destination must be fenced");
+        assert!(matches!(stale, DfsPosixError::Conflict { .. }));
+        assert_eq!(
+            service.posix_stat(source_path).expect("source remains"),
+            source
+        );
+        assert_eq!(
+            service
+                .posix_stat(destination_path)
+                .expect("destination remains"),
+            destination
+        );
+    }
+
+    #[test]
     fn rmdir_installs_and_restores_the_commit_deadline() {
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-rmdir-deadline");
         let owner = NodeId::from_legacy_named("node_rmdir_deadline").expect("node");
@@ -878,7 +1393,7 @@ mod atomic_namespace_tests {
             .bootstrap_distributed_sifs()
             .expect("bootstrap distributed sifs");
         let path = "/services/routed-rmdir-replay";
-        service.posix_mkdir(path).expect("seed directory");
+        let original = service.posix_mkdir(path).expect("seed directory");
         let command = DfsNamespaceCommand {
             request_id: "dfs_net_req_routed_rmdir_replay".to_string(),
             file_system_id: sifs_file_system_id(),
@@ -886,8 +1401,12 @@ mod atomic_namespace_tests {
             include_metadata_journal_batches: false,
             metadata_journal_after_sequences: Vec::new(),
             authority_shards: Vec::new(),
-            operation: DfsNamespaceOperation::Rmdir {
+            operation: DfsNamespaceOperation::ConditionalRmdir {
                 path: path.to_string(),
+                expected: DfsNamespaceObjectPrecondition {
+                    object_id: original.object_id,
+                    version: original.version,
+                },
             },
         };
 
@@ -902,6 +1421,19 @@ mod atomic_namespace_tests {
                 ..
             }
         ));
+        let local_path = "/services/local-primary-rmdir-replay";
+        let local_original = service.posix_mkdir(local_path).expect("local-primary seed");
+        let local_expected = DfsNamespaceObjectPrecondition {
+            object_id: local_original.object_id,
+            version: local_original.version,
+        };
+        service
+            .posix_rmdir_if_generation(
+                local_path,
+                "local-primary-rmdir-operation".to_string(),
+                local_expected.clone(),
+            )
+            .expect("local-primary conditional rmdir");
         let journal_len = service
             .metadata_backend()
             .expect("metadata backend")
@@ -947,6 +1479,42 @@ mod atomic_namespace_tests {
             Err(DfsPosixError::NotFound { .. })
         ));
 
+        let local_recreated = restarted
+            .posix_mkdir(local_path)
+            .expect("local-primary recreation");
+        let local_replay = restarted
+            .posix_rmdir_if_generation(
+                local_path,
+                "local-primary-rmdir-operation".to_string(),
+                local_expected,
+            )
+            .expect_err("local-primary replay after recreation needs reconciliation");
+        assert!(matches!(local_replay, DfsPosixError::Conflict { .. }));
+        assert_eq!(
+            restarted
+                .posix_stat(local_path)
+                .expect("local-primary recreation remains"),
+            local_recreated
+        );
+
+        let recreated = restarted.posix_mkdir(path).expect("recreate after replay");
+        let replay_after_recreate = restarted
+            .handle_namespace_request(requester.clone(), command.clone())
+            .expect("exact retry after path recreation");
+        assert!(matches!(
+            replay_after_recreate,
+            NetworkedDfsServiceEvent::RemoteNamespaceServed {
+                result: DfsNamespaceResult::Applied,
+                mutates_metadata: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            restarted.posix_stat(path).expect("recreated path remains"),
+            recreated,
+            "a durable replay must return its stored result without consuming a new generation"
+        );
+
         let reused = restarted
             .handle_namespace_request(
                 requester,
@@ -961,7 +1529,11 @@ mod atomic_namespace_tests {
         assert!(matches!(
             reused,
             NetworkedDfsServiceEvent::RemoteNamespaceServed {
-                result: DfsNamespaceResult::Rejected { ref reason, .. },
+                result: DfsNamespaceResult::Rejected {
+                    ref reason,
+                    posix_error: Some(DfsNamespacePosixError::Conflict { .. }),
+                    ..
+                },
                 mutates_metadata: false,
                 ..
             } if reason.contains("already used for a different command")

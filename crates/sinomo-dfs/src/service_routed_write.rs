@@ -13,11 +13,30 @@ use sinomo_core::DfsWriteRequest;
 use sinomo_core::events::EventId;
 use sinomo_core::node::NodeId;
 
+use crate::intent::{
+    stable_distributed_intent_matches_routed_write_command, stable_operation_order_token,
+    stable_write_intent_id, stable_write_intent_record_matches_routed_write_command,
+};
 use crate::metadata_pages::walk_metadata_pages;
 use crate::*;
 
 pub(crate) const DFS_ROUTED_WRITE_LATE_RESPONSE_TTL: Duration = Duration::from_secs(60);
 pub(crate) const DFS_ROUTED_WRITE_LATE_RESPONSE_MAX_REQUESTS: usize = 1024;
+const DFS_WRITE_OPERATION_ID_MAX_BYTES: usize = 256;
+
+pub(crate) fn validate_write_operation_id(operation_id: &str) -> Result<(), DfsError> {
+    if operation_id.is_empty()
+        || operation_id.len() > DFS_WRITE_OPERATION_ID_MAX_BYTES
+        || operation_id.chars().any(char::is_control)
+    {
+        return Err(DfsError::Serialization {
+            message: format!(
+                "write operation id must contain 1..={DFS_WRITE_OPERATION_ID_MAX_BYTES} bytes and no control characters"
+            ),
+        });
+    }
+    Ok(())
+}
 
 /// Compact requester-local identity needed to publish a manifest after an
 /// authoritative routed write commits. The content hash and version arrive in
@@ -37,7 +56,9 @@ fn routed_write_command_content_size_bytes(command: &DfsDistributedWriteCommand)
     }
 }
 
-fn routed_exclusive_create_event_id(command: &DfsDistributedWriteCommand) -> Option<EventId> {
+pub(crate) fn routed_exclusive_create_event_id(
+    command: &DfsDistributedWriteCommand,
+) -> Option<EventId> {
     if !command.exclusive_create {
         return None;
     }
@@ -58,7 +79,372 @@ fn routed_exclusive_create_event_id(command: &DfsDistributedWriteCommand) -> Opt
     ))
 }
 
+fn stable_write_operation_receipt(
+    operation_id: &str,
+    record: &DfsWriteIntentRecord,
+    content_size_bytes: Option<u64>,
+) -> DfsStableWriteOperationReceipt {
+    DfsStableWriteOperationReceipt {
+        operation_id: operation_id.to_string(),
+        intent_id: record.intent_id.clone(),
+        file_system_id: record.file_system_id.clone(),
+        object_id: record.object_id.clone(),
+        target_version: record.target_version.clone(),
+        content_hash: record.content_hash.clone(),
+        content_size_bytes,
+        status: record.status.clone(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_stable_write_operation(
+    operation_id: &str,
+    expected_intent_id: &str,
+    expected_file_system_id: &DfsFileSystemId,
+    expected_object_id: &DfsObjectId,
+    expected_target_version: &DfsVersion,
+    expected_requester_node_id: &NodeId,
+    expected_content_hash: &str,
+    expected_content_size_bytes: u64,
+    record: Option<&DfsWriteIntentRecord>,
+    recorded_content_size_bytes: Option<u64>,
+    history_expired: bool,
+    locally_authoritative: bool,
+) -> DfsStableWriteOperationReconciliation {
+    if let Some(record) = record {
+        if record.intent_id != expected_intent_id
+            || record.file_system_id != *expected_file_system_id
+            || record.object_id != *expected_object_id
+            || record.target_version != *expected_target_version
+            || record.coordinator_node_id != *expected_requester_node_id
+            || record.content_hash.as_deref() != Some(expected_content_hash)
+            || recorded_content_size_bytes.is_some_and(|size| size != expected_content_size_bytes)
+        {
+            return DfsStableWriteOperationReconciliation::Conflict {
+                reason: format!(
+                    "write operation id {operation_id} is bound to a different durable request digest"
+                ),
+            };
+        }
+        let receipt =
+            stable_write_operation_receipt(operation_id, record, recorded_content_size_bytes);
+        return match record.status {
+            DfsWriteIntentStatus::Committed => {
+                DfsStableWriteOperationReconciliation::Applied { receipt }
+            }
+            DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending => {
+                DfsStableWriteOperationReconciliation::AmbiguousOrExpired {
+                    reason: format!(
+                        "write operation {operation_id} has durable non-terminal admission status {:?}",
+                        record.status
+                    ),
+                }
+            }
+            DfsWriteIntentStatus::Rejected
+            | DfsWriteIntentStatus::Conflict
+            | DfsWriteIntentStatus::Aborted => DfsStableWriteOperationReconciliation::Conflict {
+                reason: format!(
+                    "write operation {operation_id} terminated without committing (status {:?})",
+                    record.status
+                ),
+            },
+        };
+    }
+    if history_expired {
+        return DfsStableWriteOperationReconciliation::AmbiguousOrExpired {
+            reason: format!(
+                "write operation {operation_id} has no exact receipt and its durable history expired"
+            ),
+        };
+    }
+    if locally_authoritative {
+        DfsStableWriteOperationReconciliation::NotApplied
+    } else {
+        DfsStableWriteOperationReconciliation::AmbiguousOrExpired {
+            reason: format!(
+                "write operation {operation_id} has no local exact receipt and this node is not the current metadata authority"
+            ),
+        }
+    }
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile_stable_write_operation_locally_for_requester(
+        &mut self,
+        object_id: &DfsObjectId,
+        operation_id: &str,
+        requester_node_id: &NodeId,
+        expected_content_hash: &str,
+        expected_content_size_bytes: u64,
+        locally_authoritative: bool,
+    ) -> Result<DfsStableWriteOperationReconciliation, DfsError> {
+        let file_system_id = sifs_file_system_id();
+        let target_version =
+            crate::intent::stable_write_target_version(requester_node_id, object_id, operation_id);
+        let intent_id = stable_write_intent_id(requester_node_id, object_id, operation_id);
+        let (record, recorded_content_size_bytes, history_expired) =
+            if let Some(backend) = self.metadata_backend.as_ref() {
+                let record = backend.get_intent(object_id, &intent_id)?;
+                let recorded_content_size_bytes = match record.as_ref() {
+                    Some(record) => backend
+                        .get_version(object_id, &record.target_version)?
+                        .and_then(|version| version.size_bytes),
+                    None => None,
+                };
+                let history_expired = record.is_none()
+                    && backend
+                        .intent_receipt_retention_for_object(object_id)?
+                        .operation_history_expired(
+                            object_id,
+                            requester_node_id,
+                            &intent_id,
+                            stable_operation_order_token(operation_id).as_deref(),
+                        );
+                (record, recorded_content_size_bytes, history_expired)
+            } else {
+                (None, None, false)
+            };
+        Ok(classify_stable_write_operation(
+            operation_id,
+            &intent_id,
+            &file_system_id,
+            object_id,
+            &target_version,
+            requester_node_id,
+            expected_content_hash,
+            expected_content_size_bytes,
+            record.as_ref(),
+            recorded_content_size_bytes,
+            history_expired,
+            locally_authoritative,
+        ))
+    }
+
+    fn wait_for_stable_write_reconciliation(
+        &mut self,
+        request_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<DfsStableWriteOperationReconciliation, DfsError> {
+        let started = std::time::Instant::now();
+        loop {
+            self.process_incoming()?;
+            if let Some(result) = self.stable_write_reconciliation_results.remove(request_id) {
+                self.stable_write_reconciliation_targets.remove(request_id);
+                return Ok(result);
+            }
+            if started.elapsed() >= timeout {
+                self.stable_write_reconciliation_targets.remove(request_id);
+                return Ok(DfsStableWriteOperationReconciliation::AmbiguousOrExpired {
+                    reason: format!(
+                        "stable write reconciliation {request_id} timed out before the current authority replied"
+                    ),
+                });
+            }
+            self.check_cancelled("stable write reconciliation")?;
+            let remaining = timeout.saturating_sub(started.elapsed());
+            self.transport
+                .wait_for_incoming(std::time::Duration::from_millis(10).min(remaining))
+                .map_err(DfsError::from_network)?;
+        }
+    }
+
+    /// Inspect durable write-operation evidence without sending or executing a
+    /// write. Replica receipts can prove `Applied`; only the current metadata
+    /// authority may turn a history-complete absence into `NotApplied`.
+    pub fn reconcile_stable_write_operation(
+        &mut self,
+        path: &str,
+        object_id: &DfsObjectId,
+        operation_id: &str,
+        expected_content_hash: &str,
+        expected_content_size_bytes: u64,
+    ) -> Result<DfsStableWriteOperationReconciliation, DfsError> {
+        validate_write_operation_id(operation_id)?;
+        let path = crate::posix_path::normalized_posix_path_key(path).ok_or_else(|| {
+            DfsError::Serialization {
+                message: format!("invalid POSIX path for write reconciliation: {path}"),
+            }
+        })?;
+        let requester_node_id = self.node_id.clone();
+        if self.control_plane.is_none() {
+            return self.reconcile_stable_write_operation_locally_for_requester(
+                object_id,
+                operation_id,
+                &requester_node_id,
+                expected_content_hash,
+                expected_content_size_bytes,
+                self.metadata_backend.is_some(),
+            );
+        }
+        let file_system_id = sifs_file_system_id();
+        self.refresh_control_plane_latest()?;
+        let shards = self
+            .metadata_shard_config_snapshot(&file_system_id)?
+            .unwrap_or_default();
+        let authority_shard =
+            crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                &file_system_id,
+                &shards,
+                &path,
+            )?
+            .ok_or_else(|| DfsError::Distributed {
+                message: format!("stable write reconciliation for {path} has no authority shard"),
+            })?;
+        if authority_shard.primary_node_id == self.node_id {
+            return self.reconcile_stable_write_operation_locally_for_requester(
+                object_id,
+                operation_id,
+                &requester_node_id,
+                expected_content_hash,
+                expected_content_size_bytes,
+                true,
+            );
+        }
+        let request_id = self.next_request_id();
+        let authority_node_id = authority_shard.primary_node_id.clone();
+        self.stable_write_reconciliation_targets
+            .insert(request_id.clone(), authority_node_id.clone());
+        let sent = self.send_dfs_message_if_routable(
+            &authority_node_id,
+            DfsNetworkMessage::StableWriteReconciliationRequest(
+                DfsStableWriteReconciliationRequest {
+                    request_id: request_id.clone(),
+                    operation_id: operation_id.to_string(),
+                    path,
+                    object_id: object_id.clone(),
+                    requesting_node_id: requester_node_id,
+                    expected_content_hash: expected_content_hash.to_string(),
+                    expected_content_size_bytes,
+                    authority_shard,
+                },
+            ),
+        )?;
+        if !sent {
+            self.stable_write_reconciliation_targets.remove(&request_id);
+            return Ok(DfsStableWriteOperationReconciliation::AmbiguousOrExpired {
+                reason: format!(
+                    "stable write reconciliation authority {authority_node_id} is unroutable"
+                ),
+            });
+        }
+        self.wait_for_stable_write_reconciliation(&request_id, std::time::Duration::from_secs(5))
+    }
+
+    /// Read-only stable-create reconciliation convenience. The object identity
+    /// and target version are derived exactly as they were for the exclusive
+    /// create, so the caller does not need a response that may have been lost.
+    pub fn reconcile_stable_create_file_operation(
+        &mut self,
+        path: &str,
+        operation_id: &str,
+        expected_content_hash: &str,
+        expected_content_size_bytes: u64,
+    ) -> Result<DfsStableWriteOperationReconciliation, DfsError> {
+        validate_write_operation_id(operation_id)?;
+        let normalized = crate::posix_path::normalized_posix_path_key(path).ok_or_else(|| {
+            DfsError::Serialization {
+                message: format!("invalid POSIX path for create reconciliation: {path}"),
+            }
+        })?;
+        let object_id =
+            crate::intent::stable_create_object_id(&self.node_id, &normalized, operation_id);
+        self.reconcile_stable_write_operation(
+            &normalized,
+            &object_id,
+            operation_id,
+            expected_content_hash,
+            expected_content_size_bytes,
+        )
+    }
+
+    pub(crate) fn handle_stable_write_reconciliation_request(
+        &mut self,
+        source_node_id: NodeId,
+        request: DfsStableWriteReconciliationRequest,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let reconciliation = if source_node_id != request.requesting_node_id {
+            DfsStableWriteOperationReconciliation::Conflict {
+                reason: "stable write reconciliation source does not match requester identity"
+                    .to_string(),
+            }
+        } else {
+            self.refresh_control_plane_latest()?;
+            let shards = self
+                .metadata_shard_config_snapshot(&request.authority_shard.file_system_id)?
+                .unwrap_or_default();
+            let current = crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                &request.authority_shard.file_system_id,
+                &shards,
+                &request.path,
+            )?;
+            if current.as_ref() != Some(&request.authority_shard)
+                || request.authority_shard.primary_node_id != self.node_id
+            {
+                DfsStableWriteOperationReconciliation::AmbiguousOrExpired {
+                    reason: "stable write reconciliation authority moved after dispatch"
+                        .to_string(),
+                }
+            } else {
+                self.reconcile_stable_write_operation_locally_for_requester(
+                    &request.object_id,
+                    &request.operation_id,
+                    &request.requesting_node_id,
+                    &request.expected_content_hash,
+                    request.expected_content_size_bytes,
+                    true,
+                )?
+            }
+        };
+        self.send_dfs_message_if_routable(
+            &source_node_id,
+            DfsNetworkMessage::StableWriteReconciliationResponse(
+                DfsStableWriteReconciliationResponse {
+                    request_id: request.request_id.clone(),
+                    reconciliation,
+                },
+            ),
+        )?;
+        Ok(NetworkedDfsServiceEvent::StableReconciliationServed {
+            request_id: request.request_id,
+            requester_node_id: source_node_id,
+            kind: "write".to_string(),
+        })
+    }
+
+    pub(crate) fn handle_stable_write_reconciliation_response(
+        &mut self,
+        authority_node_id: NodeId,
+        response: DfsStableWriteReconciliationResponse,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let Some(expected_authority) = self
+            .stable_write_reconciliation_targets
+            .get(&response.request_id)
+        else {
+            return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
+                request_id: response.request_id,
+                source_node_id: authority_node_id,
+                reason: "untracked stable write reconciliation response".to_string(),
+            });
+        };
+        if expected_authority != &authority_node_id {
+            return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
+                request_id: response.request_id,
+                source_node_id: authority_node_id,
+                reason: format!(
+                    "stable write reconciliation response did not come from authority {expected_authority}"
+                ),
+            });
+        }
+        self.stable_write_reconciliation_results
+            .insert(response.request_id.clone(), response.reconciliation);
+        Ok(NetworkedDfsServiceEvent::StableReconciliationCompleted {
+            request_id: response.request_id,
+            authority_node_id,
+            kind: "write".to_string(),
+        })
+    }
+
     fn validate_routed_write_command_authority(
         &mut self,
         command: &DfsDistributedWriteCommand,
@@ -135,36 +521,167 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if requester_node_id != &command.request.requesting_node_id {
             return Ok(None);
         }
-        if let Some(expected_event_id) = routed_exclusive_create_event_id(command) {
+        validate_write_operation_id(&command.request_id)?;
+        let (
+            exclusive_create_is_still_visible,
+            exclusive_create_pending_generation_is_visible,
+            exclusive_create_payload_mismatch_path,
+        ) = if let Some(expected_event_id) = routed_exclusive_create_event_id(command) {
             let object = command
                 .object_metadata
                 .as_ref()
                 .expect("exclusive-create replay identity requires object metadata");
             let path_key = crate::posix_path::normalized_posix_path_key(&object.path)
                 .unwrap_or_else(|| object.path.clone());
-            // A successful exclusive create is replayable only while the exact
-            // object remains visible at the path carried by the request.
+            // A committed exclusive create is replayable only while the exact
+            // target generation remains visible at the path carried by the
+            // request. While its durable intent is still collecting receipts,
+            // the transient namespace object intentionally retains its base
+            // version; its derived event id still proves that it belongs to
+            // this exact request and may safely replay the Pending outcome.
             // Resolve that path through its authoritative shard instead of
             // looking up a brand-new object id with no shard index. The latter
             // falls back across every shard and makes cold creates pay for
             // unrelated journal refreshes before their normal path check.
-            let exact_create_is_still_visible = self
-                .authoritative_metadata_object_for_path(&command.request.file_system_id, &path_key)?
-                .is_some_and(|visible| {
-                    visible.object_id == command.request.object_id
-                        && visible.kind != DfsObjectKind::Tombstone
-                        && visible.version == command.request.target_version
-                        && visible.last_modified_by_event_id.as_ref() == Some(&expected_event_id)
+            let visible = self.authoritative_metadata_object_for_path(
+                &command.request.file_system_id,
+                &path_key,
+            )?;
+            let same_object = visible.as_ref().is_some_and(|visible| {
+                visible.object_id == command.request.object_id
+                    && visible.kind != DfsObjectKind::Tombstone
+            });
+            let same_request = same_object
+                && visible.as_ref().is_some_and(|visible| {
+                    visible.last_modified_by_event_id.as_ref() == Some(&expected_event_id)
                 });
-            if !exact_create_is_still_visible {
-                return Ok(None);
-            }
-        }
+            let same_generation = same_object
+                && visible
+                    .as_ref()
+                    .is_some_and(|visible| visible.version == command.request.target_version);
+            let exact = same_generation && same_request;
+            let mismatch_path = (same_generation && !exact)
+                .then(|| visible.expect("same generation has a visible object").path);
+            (Some(exact), Some(same_request), mismatch_path)
+        } else {
+            (None, None, None)
+        };
         let expected_content_hash = routed_write_command_content_hash(command);
         let Some(expected_content_size_bytes) = routed_write_command_content_size_bytes(command)
         else {
             return Ok(None);
         };
+        let stable_intent_id = stable_write_intent_id(
+            requester_node_id,
+            &command.request.object_id,
+            &command.request_id,
+        );
+        if let Some(intent) = self.coordinator.intent(&stable_intent_id).cloned() {
+            if !stable_distributed_intent_matches_routed_write_command(
+                &intent,
+                requester_node_id,
+                command,
+            ) || !self.routed_write_intent_matches_content_identity(
+                &intent,
+                &expected_content_hash,
+                expected_content_size_bytes,
+            )? {
+                return Err(DfsError::WriteOperationIdConflict {
+                    operation_id: command.request_id.clone(),
+                    object_id: command.request.object_id.clone(),
+                });
+            }
+            if let Some(path) = exclusive_create_payload_mismatch_path.clone() {
+                return Err(DfsError::AlreadyExists { path });
+            }
+            if exclusive_create_is_still_visible == Some(false)
+                && (matches!(intent.state, DfsWriteIntentState::Committed)
+                    || exclusive_create_pending_generation_is_visible != Some(true))
+            {
+                return Err(DfsError::WriteReconciliationRequired {
+                    operation_id: command.request_id.clone(),
+                    object_id: command.request.object_id.clone(),
+                    reason: "the exclusive-create result is no longer the visible path generation"
+                        .to_string(),
+                });
+            }
+            return self.replayed_routed_write_outcome_for_intent(&intent);
+        }
+
+        let stable_record = if let Some(backend) = self.metadata_backend.as_ref() {
+            backend.get_intent(&command.request.object_id, &stable_intent_id)?
+        } else {
+            None
+        };
+        if let Some(record) = stable_record {
+            let size_matches = match self.metadata_backend.as_ref() {
+                Some(backend) => backend
+                    .get_version(&record.object_id, &record.target_version)?
+                    .is_none_or(|version| {
+                        version
+                            .size_bytes
+                            .is_none_or(|size| size == expected_content_size_bytes)
+                    }),
+                None => true,
+            };
+            if !stable_write_intent_record_matches_routed_write_command(
+                &record,
+                requester_node_id,
+                command,
+                &expected_content_hash,
+            ) || !size_matches
+            {
+                return Err(DfsError::WriteOperationIdConflict {
+                    operation_id: command.request_id.clone(),
+                    object_id: command.request.object_id.clone(),
+                });
+            }
+            if let Some(path) = exclusive_create_payload_mismatch_path {
+                return Err(DfsError::AlreadyExists { path });
+            }
+            if exclusive_create_is_still_visible == Some(false)
+                && (matches!(record.status, DfsWriteIntentStatus::Committed)
+                    || exclusive_create_pending_generation_is_visible != Some(true))
+            {
+                return Err(DfsError::WriteReconciliationRequired {
+                    operation_id: command.request_id.clone(),
+                    object_id: command.request.object_id.clone(),
+                    reason: "the exclusive-create result is no longer the visible path generation"
+                        .to_string(),
+                });
+            }
+            self.restore_pending_write_for_intent_if_missing(&record.intent_id, &record.object_id)?;
+            self.restore_backend_receipt_pages_for_intent(&record, true)?;
+            if matches!(record.status, DfsWriteIntentStatus::Committed) {
+                self.restore_visible_committed_object_location_receipts(&record)?;
+            }
+            let Some(intent) = self.coordinator.intent(&record.intent_id).cloned() else {
+                return Ok(None);
+            };
+            return self.replayed_routed_write_outcome_for_intent(&intent);
+        }
+        if let Some(backend) = self.metadata_backend.as_ref()
+            && backend
+                .intent_receipt_retention_for_object(&command.request.object_id)?
+                .operation_history_expired(
+                    &command.request.object_id,
+                    requester_node_id,
+                    &stable_intent_id,
+                    stable_operation_order_token(&command.request_id).as_deref(),
+                )
+        {
+            return Err(DfsError::WriteReconciliationRequired {
+                operation_id: command.request_id.clone(),
+                object_id: command.request.object_id.clone(),
+                reason: "durable write-operation history expired or is unknown".to_string(),
+            });
+        }
+
+        // Rolling-upgrade fallback for intents created before routed request
+        // ids became the durable intent identity.
+        if exclusive_create_is_still_visible == Some(false) {
+            return Ok(None);
+        }
         if let Some(intent) = self
             .coordinator
             .claimed_intent_for_target(
@@ -358,10 +875,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 reason: error.to_string(),
                 current_primary_node_id,
             }
-        } else if let Some(outcome) =
-            self.replayed_routed_write_outcome_if_known(&requester_node_id, &command)?
+        } else if let Some(replayed_result) =
+            match self.replayed_routed_write_outcome_if_known(&requester_node_id, &command) {
+                Ok(Some(outcome)) => Some(DfsDistributedWriteResult::Outcome { outcome }),
+                Ok(None) => None,
+                Err(
+                    error @ (DfsError::WriteOperationIdConflict { .. }
+                    | DfsError::AlreadyExists { .. }),
+                ) => Some(DfsDistributedWriteResult::Rejected {
+                    reason: error.to_string(),
+                    current_primary_node_id: None,
+                }),
+                Err(DfsError::WriteReconciliationRequired {
+                    operation_id,
+                    reason,
+                    ..
+                }) => Some(DfsDistributedWriteResult::ReconciliationRequired {
+                    operation_id,
+                    reason,
+                }),
+                Err(error) => return Err(error),
+            }
         {
-            DfsDistributedWriteResult::Outcome { outcome }
+            replayed_result
         } else {
             let authority_validation = self
                 .rebase_routed_path_write_if_current(&mut command)
@@ -441,7 +977,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     if let Some((content_hash, content_size_bytes)) = manifest {
                         if command.requester_blob_pre_staged {
-                            self.write_distributed_eventual_from_remote_manifest_with_base_and_parent_touch(
+                            self.write_distributed_eventual_from_remote_manifest_with_base_and_parent_touch_and_operation_id(
                                 command.request,
                                 command.expected_base_version,
                                 content_hash,
@@ -451,9 +987,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 created_object_path.is_some(),
                                 command.exclusive_create,
                                 write_foreground_replica_repair,
+                                request_id.clone(),
                             )
                         } else if let Some(blob) = preingested_blob.take() {
-                            self.write_distributed_eventual_from_quarantined_blob_with_base_and_parent_touch(
+                            self.write_distributed_eventual_from_quarantined_blob_with_base_and_parent_touch_and_operation_id(
                                 command.request,
                                 command.expected_base_version,
                                 blob,
@@ -462,9 +999,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 created_object_path.is_some(),
                                 command.exclusive_create,
                                 write_foreground_replica_repair,
+                                request_id.clone(),
                             )
                         } else {
-                            self.write_distributed_eventual_from_ingested_manifest_with_base_and_parent_touch(
+                            self.write_distributed_eventual_from_ingested_manifest_with_base_and_parent_touch_and_operation_id(
                                 command.request,
                                 command.expected_base_version,
                                 content_hash,
@@ -474,6 +1012,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 created_object_path.is_some(),
                                 command.exclusive_create,
                                 write_foreground_replica_repair,
+                                request_id.clone(),
                             )
                         }
                     } else if !command.requester_blob_pre_staged {
@@ -486,7 +1025,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             command.request.target_version.as_str(),
                             &command.bytes,
                         )?;
-                        self.write_distributed_eventual_from_ingested_manifest_with_base_and_parent_touch(
+                        self.write_distributed_eventual_from_ingested_manifest_with_base_and_parent_touch_and_operation_id(
                             command.request,
                             command.expected_base_version,
                             manifest.content_hash,
@@ -496,9 +1035,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             created_object_path.is_some(),
                             command.exclusive_create,
                             write_foreground_replica_repair,
+                            request_id.clone(),
                         )
                     } else {
-                        self.write_distributed_eventual_with_base_and_parent_touch_and_repair_mode(
+                        self.write_distributed_eventual_with_base_and_parent_touch_and_repair_mode_and_operation_id(
                             command.request,
                             command.expected_base_version,
                             command.bytes,
@@ -509,6 +1049,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             write_foreground_replica_repair,
                             false,
                             true,
+                            Some(request_id.clone()),
                         )
                     }
                 })
@@ -1315,6 +1856,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsDistributedWriteResult::Outcome { outcome } => {
                 self.complete_pending_routed_write(&canonical_request_id, Ok(outcome.clone()));
             }
+            DfsDistributedWriteResult::ReconciliationRequired {
+                operation_id,
+                reason,
+            } => {
+                self.complete_pending_routed_write(
+                    &canonical_request_id,
+                    Err(DfsError::WriteReconciliationRequired {
+                        operation_id: operation_id.clone(),
+                        object_id: response.object_id.clone(),
+                        reason: reason.clone(),
+                    }),
+                );
+            }
             DfsDistributedWriteResult::Rejected { reason, .. } => {
                 let remote_intent_id = self
                     .pending_routed_writes
@@ -1663,5 +2217,165 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.deferred_routed_create_parent_touches.remove(&path);
             self.touch_routed_create_parent_directory(&path);
         }
+    }
+}
+
+#[cfg(test)]
+mod stable_reconciliation_tests {
+    use super::*;
+    use time::OffsetDateTime;
+
+    fn node(value: &str) -> NodeId {
+        NodeId::from_legacy_named(value).expect("node id")
+    }
+
+    fn object(value: &str) -> DfsObjectId {
+        DfsObjectId::from_legacy_named(value).expect("object id")
+    }
+
+    fn committed_record(
+        requester: &NodeId,
+        object_id: &DfsObjectId,
+        operation_id: &str,
+        content_hash: &str,
+    ) -> DfsWriteIntentRecord {
+        DfsWriteIntentRecord {
+            intent_id: stable_write_intent_id(requester, object_id, operation_id),
+            file_system_id: sifs_file_system_id(),
+            object_id: object_id.clone(),
+            base_version: None,
+            target_version: crate::intent::stable_write_target_version(
+                requester,
+                object_id,
+                operation_id,
+            ),
+            coordinator_node_id: requester.clone(),
+            operation_id: None,
+            operation_order_token: None,
+            owner_epoch: 7,
+            desired_replica_node_ids: vec![requester.clone()],
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            status: DfsWriteIntentStatus::Committed,
+            content_hash: Some(content_hash.to_string()),
+            object_metadata: None,
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+        }
+    }
+
+    fn classify(
+        operation_id: &str,
+        requester: &NodeId,
+        object_id: &DfsObjectId,
+        expected_hash: &str,
+        record: Option<&DfsWriteIntentRecord>,
+        history_expired: bool,
+        locally_authoritative: bool,
+    ) -> DfsStableWriteOperationReconciliation {
+        classify_stable_write_operation(
+            operation_id,
+            &stable_write_intent_id(requester, object_id, operation_id),
+            &sifs_file_system_id(),
+            object_id,
+            &crate::intent::stable_write_target_version(requester, object_id, operation_id),
+            requester,
+            expected_hash,
+            12,
+            record,
+            Some(12),
+            history_expired,
+            locally_authoritative,
+        )
+    }
+
+    #[test]
+    fn committed_exact_receipt_reconciles_applied_without_resend() {
+        let requester = node("stable-reconcile-node");
+        let object_id = object("stable-reconcile-object");
+        let operation_id = "stable-write-17";
+        let record = committed_record(&requester, &object_id, operation_id, "blake3:expected");
+
+        let reconciled = classify(
+            operation_id,
+            &requester,
+            &object_id,
+            "blake3:expected",
+            Some(&record),
+            false,
+            false,
+        );
+        let DfsStableWriteOperationReconciliation::Applied { receipt } = reconciled else {
+            panic!("exact committed receipt must classify as applied");
+        };
+        assert_eq!(receipt.intent_id, record.intent_id);
+        assert_eq!(receipt.target_version, record.target_version);
+        assert_eq!(receipt.content_hash.as_deref(), Some("blake3:expected"));
+    }
+
+    #[test]
+    fn same_write_id_with_different_content_reconciles_conflict() {
+        let requester = node("stable-reconcile-digest-node");
+        let object_id = object("stable-reconcile-digest-object");
+        let operation_id = "stable-write-digest";
+        let record = committed_record(&requester, &object_id, operation_id, "blake3:original");
+
+        assert!(matches!(
+            classify(
+                operation_id,
+                &requester,
+                &object_id,
+                "blake3:different",
+                Some(&record),
+                false,
+                true,
+            ),
+            DfsStableWriteOperationReconciliation::Conflict { .. }
+        ));
+    }
+
+    #[test]
+    fn only_authoritative_history_complete_absence_is_not_applied() {
+        let requester = node("stable-reconcile-absence-node");
+        let object_id = object("stable-reconcile-absence-object");
+        let operation_id = "stable-write-absence";
+
+        assert_eq!(
+            classify(
+                operation_id,
+                &requester,
+                &object_id,
+                "blake3:expected",
+                None,
+                false,
+                true,
+            ),
+            DfsStableWriteOperationReconciliation::NotApplied
+        );
+        assert!(matches!(
+            classify(
+                operation_id,
+                &requester,
+                &object_id,
+                "blake3:expected",
+                None,
+                false,
+                false,
+            ),
+            DfsStableWriteOperationReconciliation::AmbiguousOrExpired { .. }
+        ));
+        assert!(matches!(
+            classify(
+                operation_id,
+                &requester,
+                &object_id,
+                "blake3:expected",
+                None,
+                true,
+                true,
+            ),
+            DfsStableWriteOperationReconciliation::AmbiguousOrExpired { .. }
+        ));
     }
 }

@@ -83,6 +83,7 @@ pub(crate) fn visible_commit_record_from_parts(
         committed_object: normalized_object_metadata(committed_object),
         visible_version: normalized_version_record(visible_version),
         required_replica_node_ids: normalized_node_location_list(required_replica_node_ids),
+        operation_id: None,
         created_at,
     }
 }
@@ -292,6 +293,7 @@ mod tests {
             visible_version: version_record(&committed_object, vec![node("node_a")]),
             required_replica_node_ids: vec![node("node_a")],
             committed_object,
+            operation_id: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
         }
     }

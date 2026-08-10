@@ -14,7 +14,7 @@ use crate::posix_model::{
 use crate::posix_path::{join_posix_path, normalize_posix_path, posix_path_is_at_or_under_prefix};
 use crate::{
     DfsDirectoryPageCursor, DfsMessageTransport, DfsObjectId, DfsObjectKind, DfsReadData,
-    NetworkedDfsReadOutcome, NetworkedDfsService,
+    NetworkedDfsReadOutcome, NetworkedDfsService, sifs_file_system_id,
 };
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -184,6 +184,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn posix_stat(&self, path: &str) -> Result<DfsStat> {
         self.with_metadata_lookup_cache(|service| {
+            let requested = normalize_posix_path(path)?;
+            service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
             let path = service.resolve_existing_posix_path(path, true)?;
             service.stat_resolved_posix_path(&path)
         })
@@ -191,7 +193,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn posix_stat_distributed(&mut self, path: &str) -> Result<DfsStat> {
         self.check_cancelled("distributed stat")?;
+        let requested = normalize_posix_path(path)?;
+        self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
         let path = self.resolve_existing_posix_path_distributed(path, true)?;
+        self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
         let shard_snapshot = self.refresh_sifs_metadata_shards()?;
         let object = self
             .lookup_sifs_path_direct_distributed_synced_from_snapshot(
@@ -207,12 +212,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn posix_lstat(&self, path: &str) -> Result<DfsStat> {
         self.with_metadata_lookup_cache(|service| {
+            let requested = normalize_posix_path(path)?;
+            service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
             let path = service.resolve_existing_posix_path(path, false)?;
             service.stat_resolved_posix_path(&path)
         })
     }
 
     fn stat_resolved_posix_path(&self, path: &str) -> Result<DfsStat> {
+        self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), path)?;
         let object = self
             .lookup_sifs_path(path)?
             .ok_or_else(|| DfsPosixError::NotFound {
@@ -227,7 +235,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_lstat_distributed(&mut self, path: &str) -> Result<DfsStat> {
+        let requested = normalize_posix_path(path)?;
+        self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
         let (path, object) = self.lookup_sifs_path_distributed_synced(path, false)?;
+        self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
         let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path });
@@ -243,7 +254,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// all link records before performing a follow operation.
     pub fn posix_namespace_lstat(&self, path: &str) -> Result<DfsStat> {
         self.with_metadata_lookup_cache(|service| {
+            let requested = normalize_posix_path(path)?;
+            service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
             let path = service.resolve_existing_posix_path(path, false)?;
+            service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
             let object = service
                 .lookup_sifs_path(&path)?
                 .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
@@ -255,7 +269,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_namespace_lstat_distributed(&mut self, path: &str) -> Result<DfsStat> {
+        let requested = normalize_posix_path(path)?;
+        self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
         let (path, object) = self.lookup_sifs_path_distributed_synced(path, false)?;
+        self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
         let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path });

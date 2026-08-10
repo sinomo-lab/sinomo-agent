@@ -2270,6 +2270,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             base_version: Some(object.version.clone()),
             target_version: object.version.clone(),
             requesting_node_id: self.node_id.clone(),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch,
             desired_replica_nodes: desired_replica_node_ids.to_vec(),
             policy: replication_policy,

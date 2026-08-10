@@ -463,6 +463,8 @@ mod tests {
             base_version: None,
             target_version: object.version.clone(),
             coordinator_node_id,
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 1,
             desired_replica_node_ids: Vec::new(),
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),

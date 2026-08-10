@@ -12,7 +12,8 @@ use super::{
 };
 use crate::metadata_pages::{try_walk_metadata_pages, walk_metadata_pages};
 use crate::namespace::{
-    initial_version, namespace_transaction_id_for_path, next_version, object_id_for_path,
+    initial_version, namespace_transaction_id_for_batch, namespace_transaction_id_for_path,
+    next_version, object_id_for_path,
 };
 use crate::posix_model::{DfsPosixError, Result};
 use crate::posix_path::{
@@ -22,13 +23,71 @@ use crate::posix_path::{
 use crate::{
     DfsDirectoryPageCursor, DfsError, DfsFileSystemId, DfsMessageTransport,
     DfsMetadataVersionPinRecord, DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobOrigin,
-    DfsNamespaceJobRecord, DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNamespaceTransaction,
-    DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsObjectVersionRecord,
-    DfsPosixCoordinationResult, DfsReplicaReceiptRecord, DfsWriteIntentReceipt,
-    DfsWriteIntentReceiptRetentionState, DfsWriteIntentState, DfsWriteIntentStatus,
-    NetworkedDfsService, object_version_record, sifs_file_system_id,
+    DfsNamespaceJobRecord, DfsNamespaceJobStatus, DfsNamespaceObjectPrecondition,
+    DfsNamespaceOperation, DfsNamespaceTransaction, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
+    DfsObjectVersionRecord, DfsPosixCoordinationResult, DfsReplicaReceiptRecord,
+    DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState, DfsWriteIntentState,
+    DfsWriteIntentStatus, NetworkedDfsService, object_version_record, sifs_file_system_id,
 };
 use sinomo_core::node::NodeId;
+
+#[cfg(test)]
+type HardlinkAliasAfterCommitTestHook = Box<dyn FnOnce() -> Result<()> + Send>;
+
+#[cfg(test)]
+static HARDLINK_ALIAS_AFTER_COMMIT_TEST_HOOK: std::sync::Mutex<
+    Option<(String, HardlinkAliasAfterCommitTestHook)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) struct HardlinkAliasAfterCommitTestHookGuard;
+
+#[cfg(test)]
+impl Drop for HardlinkAliasAfterCommitTestHookGuard {
+    fn drop(&mut self) {
+        HARDLINK_ALIAS_AFTER_COMMIT_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_hardlink_alias_after_commit_test_hook(
+    source_path: impl Into<String>,
+    hook: impl FnOnce() -> Result<()> + Send + 'static,
+) -> HardlinkAliasAfterCommitTestHookGuard {
+    let previous = HARDLINK_ALIAS_AFTER_COMMIT_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .replace((source_path.into(), Box::new(hook)));
+    assert!(
+        previous.is_none(),
+        "hardlink-alias after-commit test hook is already installed"
+    );
+    HardlinkAliasAfterCommitTestHookGuard
+}
+
+#[cfg(test)]
+fn run_hardlink_alias_after_commit_test_hook(source_path: &str) -> Result<()> {
+    let hook = {
+        let mut slot = HARDLINK_ALIAS_AFTER_COMMIT_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|(expected_path, _)| expected_path == source_path)
+        {
+            slot.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    };
+    match hook {
+        Some(hook) => hook(),
+        None => Ok(()),
+    }
+}
 
 pub(crate) fn cross_shard_object_version_record(
     object: &DfsObjectMetadata,
@@ -45,6 +104,45 @@ pub(crate) fn cross_shard_object_version_record(
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    fn hidden_alias_tombstone_path_on_destination_shard(
+        &mut self,
+        destination_path: &str,
+        alias_object_id: &DfsObjectId,
+    ) -> Result<String> {
+        let Some(shards) = self.refresh_sifs_metadata_shards()? else {
+            return Ok(crate::posix_path::hidden_alias_tombstone_path(
+                alias_object_id,
+            ));
+        };
+        let destination = self
+            .select_sifs_metadata_shard_for_path_from_snapshot(destination_path, &shards)?
+            .ok_or_else(|| {
+                DfsPosixError::Dfs(DfsError::Metadata {
+                    message: format!(
+                        "destination {destination_path} has no metadata shard for hardlink promotion"
+                    ),
+                })
+            })?;
+        for nonce in 0..64u8 {
+            let candidate = format!(
+                "{destination_path}.sinomo-hardlink-tombstone-{}-{nonce}",
+                alias_object_id.as_str()
+            );
+            if self
+                .select_sifs_metadata_shard_for_path_from_snapshot(&candidate, &shards)?
+                .is_some_and(|shard| shard.shard_id == destination.shard_id)
+            {
+                return Ok(candidate);
+            }
+        }
+        Err(DfsPosixError::Dfs(DfsError::Metadata {
+            message: format!(
+                "could not place hidden alias tombstone for {alias_object_id} on destination shard {}",
+                destination.shard_id
+            ),
+        }))
+    }
+
     /// Coordinates a rename whose destination lives in a metadata shard owned
     /// by another primary. The move is a durable two-step saga: the
     /// destination primary atomically adopts the object record (with its
@@ -932,6 +1030,453 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.drive_cross_shard_namespace_job(job)
     }
 
+    fn hardlink_alias_job_phase_operation_id(job: &DfsNamespaceJobRecord, phase: &str) -> String {
+        let identity = format!("{}\0{}", job.job_id, phase);
+        let digest = blake3::hash(identity.as_bytes()).to_hex();
+        let order_token = job.origin.as_ref().and_then(|origin| {
+            crate::intent::stable_operation_order_token(&origin.operation_id)
+                .or_else(|| crate::intent::stable_operation_order_token(&origin.request_id))
+        });
+        match order_token {
+            Some(order_token) => format!("hlj_{}_{}", &digest.as_str()[..24], order_token),
+            None => format!("hlj_{}", &digest.as_str()[..32]),
+        }
+    }
+
+    /// Coordinate one exact alias-shard transaction with the canonical target
+    /// authority. Both alias paths and the canonical path remain hidden behind
+    /// durable Busy fences until the two visible generations have committed.
+    pub(crate) fn coordinate_cross_primary_hardlink_alias_mutation(
+        &mut self,
+        alias: &DfsObjectMetadata,
+        result_path: &str,
+        transaction: DfsNamespaceTransaction,
+        reason: &str,
+    ) -> Result<()> {
+        let source_path = normalize_posix_path(&alias.path)?;
+        let result_path = normalize_posix_path(result_path)?;
+        let job_id = namespace_job_id(
+            "hardlink-alias-mutation-cross-primary",
+            &alias.file_system_id,
+            &format!("{reason}:{source_path}->{result_path}"),
+            &alias.object_id,
+            &alias.version,
+        );
+        let active_request = self.active_durable_namespace_request.clone().ok_or_else(|| {
+            DfsPosixError::Dfs(DfsError::Distributed {
+                message: format!(
+                    "cross-primary hardlink alias mutation for {source_path} has no durable outer namespace admission"
+                ),
+            })
+        })?;
+        // Unlike a single-shard namespace prepare, this job cannot fuse the
+        // outer terminal receipt into its first visible transaction: the
+        // canonical target generation still has to commit on another
+        // authority. Persist Pending admission before either durable fence so
+        // a process crash always leaves enough command identity to resume and
+        // eventually complete the exact caller operation.
+        self.metadata_backend
+            .as_mut()
+            .ok_or_else(|| {
+                DfsPosixError::Dfs(DfsError::Metadata {
+                    message: format!(
+                        "cross-primary hardlink alias mutation for {source_path} requires a durable metadata backend"
+                    ),
+                })
+            })?
+            .put_namespace_request_on_shard(
+                &active_request.authority_shard_id,
+                &active_request,
+            )?;
+        if let Some(job) = self.namespace_job(&job_id)? {
+            return self.drive_cross_shard_namespace_job(job);
+        }
+        let target_object_id =
+            alias
+                .link_target_object_id
+                .as_ref()
+                .ok_or_else(|| DfsPosixError::NotFound {
+                    path: source_path.clone(),
+                })?;
+        let target = self.object_by_id(target_object_id)?.ok_or_else(|| {
+            DfsPosixError::Dfs(DfsError::Distributed {
+                message: format!(
+                    "hardlink alias {source_path} cannot locate canonical target {target_object_id}"
+                ),
+            })
+        })?;
+        if target.kind == DfsObjectKind::Tombstone
+            || target.kind == DfsObjectKind::Hardlink
+            || target.object_id != *target_object_id
+        {
+            return Err(DfsPosixError::Conflict {
+                path: source_path,
+                reason: format!(
+                    "canonical hardlink target generation changed; expected object {target_object_id}"
+                ),
+            });
+        }
+        let target_path = normalize_posix_path(&target.path)?;
+        let target_primary = self.routed_namespace_primary_for_path(&target_path)?;
+        if target_primary.is_none() {
+            return Err(DfsPosixError::Dfs(DfsError::Distributed {
+                message: format!(
+                    "hardlink alias coordinator for {source_path} was invoked without a foreign canonical authority at {target_path}"
+                ),
+            }));
+        }
+        let file_system_id = alias.file_system_id.clone();
+        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &source_path)?;
+        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &result_path)?;
+
+        let expected_target = DfsNamespaceObjectPrecondition {
+            object_id: target.object_id.clone(),
+            version: target.version.clone(),
+        };
+        let mut committed_target = target.clone();
+        committed_target.changed_at_unix_nanos =
+            now_unix_nanos().max(target.changed_at_unix_nanos.saturating_add(1));
+        committed_target.version = next_version(&target.version);
+        let now = time::OffsetDateTime::now_utc();
+        let origin = Some(DfsNamespaceJobOrigin::from_request(&active_request));
+        let fence_job_id = namespace_job_id(
+            "hardlink-target-fence",
+            &target.file_system_id,
+            &format!("{job_id}:{source_path}->{target_path}"),
+            &target.object_id,
+            &target.version,
+        );
+        let fence = DfsNamespaceJobRecord {
+            job_id: fence_job_id.clone(),
+            file_system_id: target.file_system_id.clone(),
+            origin: origin.clone(),
+            kind: DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary,
+            status: DfsNamespaceJobStatus::Running,
+            root_path: target_path,
+            target_path: None,
+            pending_frames: vec![DfsNamespaceJobFrame::HardlinkTargetFenceReservation {
+                source_path: source_path.clone(),
+                expected_target: expected_target.clone(),
+                committed_target: committed_target.clone(),
+            }],
+            processed_object_count: 0,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+            failure_reason: None,
+        };
+        let job = DfsNamespaceJobRecord {
+            job_id,
+            file_system_id,
+            origin,
+            kind: DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries,
+            status: DfsNamespaceJobStatus::Running,
+            root_path: source_path.clone(),
+            target_path: Some(result_path),
+            pending_frames: vec![
+                DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceCommit {
+                    fence_job_id,
+                    source_path: source_path.clone(),
+                    expected_target,
+                    committed_target,
+                },
+                DfsNamespaceJobFrame::CrossShardHardlinkAliasCommit { transaction },
+                DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceInstall {
+                    fence: Box::new(fence),
+                    source_path,
+                },
+            ],
+            processed_object_count: 0,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+            failure_reason: None,
+        };
+        self.persist_namespace_job(&job)?;
+        self.drive_cross_shard_namespace_job(job)
+    }
+
+    fn commit_hardlink_alias_transaction(
+        &mut self,
+        job: &DfsNamespaceJobRecord,
+        transaction: DfsNamespaceTransaction,
+    ) -> Result<()> {
+        let origin = job.origin.as_ref().ok_or_else(|| {
+            DfsPosixError::Dfs(DfsError::Metadata {
+                message: format!(
+                    "cross-primary hardlink alias job {} has no durable caller provenance",
+                    job.job_id
+                ),
+            })
+        })?;
+        let previous_active_request = self.active_durable_namespace_request.take();
+        if previous_active_request
+            .as_ref()
+            .is_some_and(|request| !origin.matches_request(request))
+        {
+            self.active_durable_namespace_request = previous_active_request;
+            return Err(DfsPosixError::Dfs(DfsError::Busy {
+                path: job.root_path.clone(),
+            }));
+        }
+        // Keep the exact caller operation in the visible journal/feed, but do
+        // not attach a Completed request record to this intermediate alias
+        // generation. The outer request becomes terminal only after the
+        // canonical target frame commits and the complete job returns.
+        let outcome = self
+            .apply_namespace_transaction_with_feed_provenance_only(transaction, &origin.request_id);
+        self.active_durable_namespace_request = previous_active_request;
+        outcome
+    }
+
+    fn apply_namespace_transaction_with_feed_provenance_only(
+        &mut self,
+        transaction: DfsNamespaceTransaction,
+        operation_id: &str,
+    ) -> Result<()> {
+        let previous_prepare_recorded = self.active_durable_namespace_prepare_recorded;
+        self.active_durable_namespace_prepare_recorded = false;
+        let active_request = self.active_durable_namespace_request.take();
+        let outcome =
+            self.apply_namespace_transaction_with_journal_operation_id(transaction, operation_id);
+        self.active_durable_namespace_request = active_request;
+        self.active_durable_namespace_prepare_recorded = previous_prepare_recorded;
+        outcome.map_err(DfsPosixError::from)
+    }
+
+    fn install_hardlink_target_fence(
+        &mut self,
+        source_job: &DfsNamespaceJobRecord,
+        fence: &DfsNamespaceJobRecord,
+        source_path: &str,
+    ) -> Result<()> {
+        let operation = DfsNamespaceOperation::InstallHardlinkTargetFence {
+            fence: Box::new(fence.clone()),
+            source_path: source_path.to_string(),
+        };
+        match self.routed_namespace_primary_for_path(&fence.root_path)? {
+            Some(primary) => self.route_namespace_operation_with_request_id(
+                Self::hardlink_alias_job_phase_operation_id(source_job, "install-target-fence"),
+                primary,
+                operation,
+            ),
+            None => self.install_hardlink_target_fence_local(fence, source_path),
+        }
+    }
+
+    fn commit_hardlink_target_fence(
+        &mut self,
+        source_job: &DfsNamespaceJobRecord,
+        fence_job_id: &str,
+        source_path: &str,
+        expected_target: &DfsNamespaceObjectPrecondition,
+        committed_target: &DfsObjectMetadata,
+    ) -> Result<()> {
+        let operation = DfsNamespaceOperation::CommitHardlinkTargetFence {
+            fence_job_id: fence_job_id.to_string(),
+            source_path: source_path.to_string(),
+            target_path: committed_target.path.clone(),
+            expected_target: expected_target.clone(),
+            committed_target: committed_target.clone(),
+        };
+        match self.routed_namespace_primary_for_path(&committed_target.path)? {
+            Some(primary) => self.route_namespace_operation_with_request_id(
+                Self::hardlink_alias_job_phase_operation_id(source_job, "commit-target-fence"),
+                primary,
+                operation,
+            ),
+            None => self.commit_hardlink_target_fence_local(
+                fence_job_id,
+                source_path,
+                &committed_target.path,
+                expected_target,
+                committed_target,
+            ),
+        }
+    }
+
+    pub(crate) fn install_hardlink_target_fence_local(
+        &mut self,
+        fence: &DfsNamespaceJobRecord,
+        source_path: &str,
+    ) -> Result<()> {
+        let target_path = normalize_posix_path(&fence.root_path)?;
+        if fence.kind != DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary
+            || fence.status != DfsNamespaceJobStatus::Running
+            || fence.root_path != target_path
+            || fence.target_path.is_some()
+        {
+            return Err(DfsPosixError::Dfs(DfsError::Distributed {
+                message: format!("invalid hardlink target fence {}", fence.job_id),
+            }));
+        }
+        let Some(DfsNamespaceJobFrame::HardlinkTargetFenceReservation {
+            source_path: reserved_source_path,
+            expected_target,
+            committed_target,
+        }) = fence.pending_frames.as_slice().first()
+        else {
+            return Err(DfsPosixError::Dfs(DfsError::Distributed {
+                message: format!(
+                    "hardlink target fence {} has no exact reservation",
+                    fence.job_id
+                ),
+            }));
+        };
+        if fence.pending_frames.len() != 1
+            || normalize_posix_path(reserved_source_path)? != normalize_posix_path(source_path)?
+            || normalize_posix_path(&committed_target.path)? != target_path
+            || committed_target.object_id != expected_target.object_id
+        {
+            return Err(DfsPosixError::Dfs(DfsError::Distributed {
+                message: format!(
+                    "hardlink target fence {} reservation does not match its command",
+                    fence.job_id
+                ),
+            }));
+        }
+        if let Some(existing) = self.namespace_job(&fence.job_id)? {
+            if existing == *fence {
+                self.apply_cross_shard_namespace_job_guard(&existing)?;
+                return Ok(());
+            }
+            if existing.status == DfsNamespaceJobStatus::Completed
+                && existing.job_id == fence.job_id
+                && existing.file_system_id == fence.file_system_id
+                && existing.root_path == fence.root_path
+                && existing.origin == fence.origin
+                && existing.pending_frames == fence.pending_frames
+                && existing.created_at == fence.created_at
+            {
+                let current = self.lookup_sifs_path(&target_path)?;
+                if current.as_ref() == Some(committed_target) {
+                    return Ok(());
+                }
+            }
+            return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                message: format!(
+                    "hardlink target fence {} conflicts with an existing durable record",
+                    fence.job_id
+                ),
+            }));
+        }
+        let current = self.lookup_sifs_path(&target_path)?;
+        if current.as_ref() == Some(committed_target) {
+            // The target-side terminal job/receipt may have been compacted
+            // after the exact pre-minted generation committed. Full metadata
+            // equality is an immutable completion proof for the source frame.
+            return Ok(());
+        }
+        if current.as_ref().is_none_or(|target| {
+            target.kind == DfsObjectKind::Tombstone
+                || target.kind == DfsObjectKind::Hardlink
+                || target.object_id != expected_target.object_id
+                || target.version != expected_target.version
+        }) {
+            return Err(DfsPosixError::Conflict {
+                path: target_path,
+                reason: format!(
+                    "canonical hardlink target generation changed before fence installation; expected {}@{}",
+                    expected_target.object_id, expected_target.version
+                ),
+            });
+        }
+        self.persist_namespace_job(fence)
+    }
+
+    pub(crate) fn commit_hardlink_target_fence_local(
+        &mut self,
+        fence_job_id: &str,
+        source_path: &str,
+        target_path: &str,
+        expected_target: &DfsNamespaceObjectPrecondition,
+        committed_target: &DfsObjectMetadata,
+    ) -> Result<()> {
+        let target_path = normalize_posix_path(target_path)?;
+        let fence = self.namespace_job(fence_job_id)?;
+        if fence.is_none()
+            && self.lookup_sifs_path(&target_path)?.as_ref() == Some(committed_target)
+        {
+            return Ok(());
+        }
+        let mut fence = fence.ok_or_else(|| {
+            DfsPosixError::Dfs(DfsError::Metadata {
+                message: format!("hardlink target fence {fence_job_id} is missing"),
+            })
+        })?;
+        let reservation_matches = matches!(
+            fence.pending_frames.as_slice(),
+            [DfsNamespaceJobFrame::HardlinkTargetFenceReservation {
+                source_path: reserved_source_path,
+                expected_target: reserved_expected,
+                committed_target: reserved_committed,
+            }] if normalize_posix_path(reserved_source_path).ok().as_deref()
+                    == normalize_posix_path(source_path).ok().as_deref()
+                && reserved_expected == expected_target
+                && reserved_committed == committed_target
+        );
+        if fence.kind != DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary
+            || fence.root_path != target_path
+            || !reservation_matches
+        {
+            return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                message: format!("hardlink target fence {fence_job_id} does not match its commit"),
+            }));
+        }
+        let current = self.lookup_sifs_path(&target_path)?;
+        if current.as_ref() != Some(committed_target) {
+            if current.as_ref().is_none_or(|target| {
+                target.kind == DfsObjectKind::Tombstone
+                    || target.kind == DfsObjectKind::Hardlink
+                    || target.object_id != expected_target.object_id
+                    || target.version != expected_target.version
+            }) {
+                return Err(DfsPosixError::Dfs(DfsError::Metadata {
+                    message: format!(
+                        "canonical hardlink target changed while fence {fence_job_id} was held"
+                    ),
+                }));
+            }
+            let journal_operation_id = fence
+                .origin
+                .as_ref()
+                .ok_or_else(|| {
+                    DfsPosixError::Dfs(DfsError::Metadata {
+                        message: format!(
+                            "hardlink target fence {fence_job_id} has no durable caller provenance"
+                        ),
+                    })
+                })?
+                .request_id
+                .clone();
+            self.apply_namespace_transaction_with_feed_provenance_only(
+                DfsNamespaceTransaction {
+                    transaction_id: namespace_transaction_id_for_batch(
+                        "hardlink-target-fence-commit",
+                        &committed_target.file_system_id,
+                        std::slice::from_ref(committed_target),
+                        &[],
+                    ),
+                    file_system_id: committed_target.file_system_id.clone(),
+                    objects: vec![committed_target.clone()],
+                    versions: Vec::new(),
+                    advisory_lock_states: Vec::new(),
+                    created_at: fence.created_at,
+                },
+                &journal_operation_id,
+            )?;
+        }
+        if fence.status != DfsNamespaceJobStatus::Completed {
+            let now = time::OffsetDateTime::now_utc();
+            fence.status = DfsNamespaceJobStatus::Completed;
+            fence.processed_object_count = 1;
+            fence.updated_at = now;
+            fence.completed_at = Some(now);
+            self.persist_namespace_job(&fence)?;
+        }
+        Ok(())
+    }
+
     /// Drives a cross-shard saga job to completion: the foreign adoption is
     /// idempotent and may be re-sent after restarts or timeouts; the local
     /// completion is idempotent against current state. Structured rejections
@@ -998,6 +1543,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Ok(job);
             }
             steps = steps.saturating_add(1);
+            let hardlink_alias_coordination_frame = matches!(
+                &frame,
+                DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceInstall { .. }
+                    | DfsNamespaceJobFrame::CrossShardHardlinkAliasCommit { .. }
+                    | DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceCommit { .. }
+            );
+            #[cfg(test)]
+            let hardlink_alias_commit_frame = matches!(
+                &frame,
+                DfsNamespaceJobFrame::CrossShardHardlinkAliasCommit { .. }
+            );
             let outcome = match frame.clone() {
                 DfsNamespaceJobFrame::CrossShardAdopt {
                     moved_object,
@@ -1047,6 +1603,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsNamespaceJobFrame::CrossShardHardlinkComplete { target_object_id } => {
                     self.complete_cross_shard_hardlink_locally(&target_object_id)
                 }
+                DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceInstall {
+                    fence,
+                    source_path,
+                } => self.install_hardlink_target_fence(&job, &fence, &source_path),
+                DfsNamespaceJobFrame::CrossShardHardlinkAliasCommit { transaction } => {
+                    self.commit_hardlink_alias_transaction(&job, transaction)
+                }
+                DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceCommit {
+                    fence_job_id,
+                    source_path,
+                    expected_target,
+                    committed_target,
+                } => self.commit_hardlink_target_fence(
+                    &job,
+                    &fence_job_id,
+                    &source_path,
+                    &expected_target,
+                    &committed_target,
+                ),
+                DfsNamespaceJobFrame::HardlinkTargetFenceReservation { .. } => {
+                    Err(DfsPosixError::Dfs(DfsError::Metadata {
+                        message: format!(
+                            "target-side hardlink fence {} cannot be run as a source saga",
+                            job.job_id
+                        ),
+                    }))
+                }
                 other => Err(DfsPosixError::InvalidPath {
                     path: format!("{}: unexpected frame {other:?}", job.job_id),
                 }),
@@ -1056,10 +1639,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     job.processed_object_count = job.processed_object_count.saturating_add(1);
                     job.updated_at = time::OffsetDateTime::now_utc();
                     self.persist_namespace_job(&job)?;
+                    #[cfg(test)]
+                    if hardlink_alias_commit_frame {
+                        run_hardlink_alias_after_commit_test_hook(&job.root_path)?;
+                    }
                 }
                 Err(error @ (DfsPosixError::Dfs(_) | DfsPosixError::Metadata(_))) => {
                     // Transport or internal failure: the saga stays running
                     // (and the path stays locked) so maintenance resumes it.
+                    job.pending_frames.push(frame);
+                    job.updated_at = time::OffsetDateTime::now_utc();
+                    self.persist_namespace_job(&job)?;
+                    return Err(error);
+                }
+                Err(error) if hardlink_alias_coordination_frame => {
+                    // Once a target fence may exist, failure is forward-only:
+                    // retain both durable reservations and let exact retry or
+                    // authority recovery settle the same generation.
                     job.pending_frames.push(frame);
                     job.updated_at = time::OffsetDateTime::now_utc();
                     self.persist_namespace_job(&job)?;
@@ -1291,7 +1887,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         }
                     }
                 }
-                transaction_objects.push(self.tombstone_path_object(destination));
+                let destination_tombstone = if destination.kind == DfsObjectKind::Hardlink
+                    && destination.link_target_object_id.as_ref() == Some(&object.object_id)
+                {
+                    // Promotion replaces the alias at this path with its
+                    // canonical record. Park the alias under a hidden
+                    // tombstone key so it cannot remain a second live link at
+                    // the newly canonical path.
+                    let hidden_path = self.hidden_alias_tombstone_path_on_destination_shard(
+                        &path,
+                        &destination.object_id,
+                    )?;
+                    self.tombstone_path_object_at(destination.clone(), hidden_path)
+                } else {
+                    self.tombstone_path_object(destination)
+                };
+                transaction_objects.push(destination_tombstone);
             }
         }
         let rebound_advisory_lock_state = advisory_lock_state
@@ -1511,6 +2122,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         self.drive_cross_shard_namespace_job(job)?;
         Ok(true)
+    }
+
+    /// Resume, or prove terminal completion of, the exact hardlink-alias job
+    /// owned by the active durable outer request. This check runs before CAS
+    /// validation because a crash can leave the alias transaction visible
+    /// while the outer request is still Pending.
+    pub(crate) fn resume_or_replay_hardlink_alias_mutation_for_active_request(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        root_path: &str,
+        target_path: &str,
+    ) -> Result<bool> {
+        let kinds = [DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries];
+        if self.resume_running_cross_shard_namespace_job_for_paths(
+            file_system_id,
+            root_path,
+            target_path,
+            &kinds,
+        )? {
+            return Ok(true);
+        }
+        let Some(request) = self.active_durable_namespace_request.clone() else {
+            return Ok(false);
+        };
+        self.completed_cross_shard_namespace_job_for_paths_since(
+            file_system_id,
+            root_path,
+            target_path,
+            &kinds,
+            request.created_at,
+            &DfsNamespaceJobOrigin::from_request(&request),
+        )
     }
 
     fn running_cross_shard_namespace_job_for_paths(

@@ -1782,11 +1782,40 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         required_replica_node_ids: &[NodeId],
     ) -> Result<DfsMetadataJournalEntry>;
 
+    /// Publish a visible version while retaining the exact caller-owned
+    /// operation identity in the durable journal. Backends predating this
+    /// additive API remain source-compatible and conservatively omit the
+    /// provenance; production DFS backends override it.
+    fn commit_visible_version_with_operation_id(
+        &mut self,
+        expected_version: &DfsVersion,
+        committed_object: &DfsObjectMetadata,
+        visible_version: &DfsObjectVersionRecord,
+        required_replica_node_ids: &[NodeId],
+        _operation_id: Option<&str>,
+    ) -> Result<DfsMetadataJournalEntry> {
+        self.commit_visible_version(
+            expected_version,
+            committed_object,
+            visible_version,
+            required_replica_node_ids,
+        )
+    }
+
     /// Atomically apply a namespace transaction and journal the mutation.
     fn apply_namespace_transaction(
         &mut self,
         transaction: &DfsNamespaceTransaction,
     ) -> Result<DfsMetadataJournalEntry>;
+
+    /// Apply a namespace transaction with exact stable-write provenance.
+    fn apply_namespace_transaction_with_operation_id(
+        &mut self,
+        transaction: &DfsNamespaceTransaction,
+        _operation_id: Option<&str>,
+    ) -> Result<DfsMetadataJournalEntry> {
+        self.apply_namespace_transaction(transaction)
+    }
 
     /// Durably reserve one shard-local namespace transaction without making
     /// any of its object or path changes visible.

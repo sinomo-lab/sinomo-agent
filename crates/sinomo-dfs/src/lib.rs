@@ -57,6 +57,7 @@ mod model;
 mod module_surface;
 mod mounted_sifs;
 mod namespace;
+mod namespace_change_feed;
 mod node_transport;
 mod operator;
 mod performance_metrics;
@@ -436,6 +437,12 @@ pub use namespace::{
 pub(crate) use namespace::{
     metadata_path, namespace_transaction_id_for_batch, namespace_transaction_id_for_object,
 };
+pub use namespace_change_feed::{
+    DfsNamespaceChangeBatch, DfsNamespaceChangeCursor, DfsNamespaceChangeEvent,
+    DfsNamespaceChangeProvenance, DfsNamespaceRescanReason,
+    dfs_namespace_change_shards_for_subtree, poll_dfs_namespace_changes,
+    project_dfs_namespace_change_batch,
+};
 #[cfg(test)]
 pub(crate) use node_transport::{
     AsyncDfsDirectReadSender, AsyncDfsMessageSender, DfsDirectReadSender,
@@ -497,11 +504,17 @@ pub use protocol::{
     DfsMessageResponse, DfsMetadataAuthorityOperation, DfsMetadataAuthorityProbe,
     DfsMetadataDurableReplication, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
     DfsMetadataJournalBatchResult, DfsMetadataPrefixProbe, DfsMetadataSnapshotInstallCommand,
-    DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult, DfsNamespaceCommand,
-    DfsNamespaceOperation, DfsNamespacePosixError, DfsNamespaceResponse, DfsNamespaceResult,
-    DfsNamespaceShardCursor, DfsNetworkMessage, DfsPosixCoordinationResult, DfsReadData,
-    DfsReadRangeData, DfsReadRequest, DfsReadResponse, DfsReadResult, DfsRepairReplicaCommand,
-    DfsRepairReplicaResponse, DfsRoutedMessage, DfsStageBlobCommand, DfsStageBlobResponse,
+    DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult,
+    DfsNamespaceChangePollRequest, DfsNamespaceChangePollResponse, DfsNamespaceCommand,
+    DfsNamespaceDestinationPrecondition, DfsNamespaceObjectPrecondition, DfsNamespaceOperation,
+    DfsNamespacePosixError, DfsNamespaceResponse, DfsNamespaceResult, DfsNamespaceShardCursor,
+    DfsNetworkMessage, DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData, DfsReadRequest,
+    DfsReadResponse, DfsReadResult, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
+    DfsRoutedMessage, DfsStableNamespaceOperationReceipt,
+    DfsStableNamespaceOperationReconciliation, DfsStableNamespaceReconciliationRequest,
+    DfsStableNamespaceReconciliationResponse, DfsStableWriteOperationReceipt,
+    DfsStableWriteOperationReconciliation, DfsStableWriteReconciliationRequest,
+    DfsStableWriteReconciliationResponse, DfsStageBlobCommand, DfsStageBlobResponse,
     DfsStagePatchCommand, DfsWriteCommand, DfsWriteResponse, DfsWriteResult,
 };
 pub use renewable_lease::{

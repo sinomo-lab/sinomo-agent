@@ -4,6 +4,7 @@ use crate::{
 };
 use sinomo_core::DfsObjectPolicy;
 use sinomo_core::kv::KvError;
+use sinomo_core::network::NetworkDeliveryState;
 use sinomo_core::node::NodeId;
 use thiserror::Error;
 
@@ -27,12 +28,35 @@ pub enum DfsError {
     },
     #[error("network error: {message}")]
     Network { message: String },
+    /// A request failed at a transport boundary which can classify whether
+    /// the peer may already have applied it. Mutation callers must preserve
+    /// `PossiblyApplied` instead of treating it like a safe fresh retry.
+    #[error("network delivery {delivery_state:?}: {message}")]
+    NetworkDelivery {
+        message: String,
+        delivery_state: NetworkDeliveryState,
+    },
     #[error("serialization error: {message}")]
     Serialization { message: String },
     #[error("content store error: {message}")]
     ContentStore { message: String },
     #[error("distributed DFS error: {message}")]
     Distributed { message: String },
+    #[error(
+        "DFS write operation {operation_id} for object {object_id} was already bound to a different payload"
+    )]
+    WriteOperationIdConflict {
+        operation_id: String,
+        object_id: DfsObjectId,
+    },
+    #[error(
+        "DFS write operation {operation_id} for object {object_id} requires authoritative reconciliation: {reason}"
+    )]
+    WriteReconciliationRequired {
+        operation_id: String,
+        object_id: DfsObjectId,
+        reason: String,
+    },
     /// A metadata-shard reconfiguration has been durably recorded but cannot
     /// become active until the retiring authority and every required target
     /// have produced the exact handoff evidence.
@@ -111,8 +135,13 @@ pub enum DfsError {
 
 impl DfsError {
     pub(crate) fn from_network(error: sinomo_core::network::NetworkError) -> Self {
-        Self::Network {
-            message: error.to_string(),
+        let message = error.to_string();
+        match error.delivery_state() {
+            Some(delivery_state) => Self::NetworkDelivery {
+                message,
+                delivery_state,
+            },
+            None => Self::Network { message },
         }
     }
 }
@@ -225,5 +254,43 @@ impl From<KvError> for DfsError {
         Self::Distributed {
             message: error.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_core::network::NetworkError;
+
+    #[test]
+    fn network_conversion_preserves_possibly_applied_delivery_state() {
+        let error = DfsError::from_network(NetworkError::delivery_failed(
+            "stable DFS write",
+            NetworkDeliveryState::PossiblyApplied,
+            "response stream closed",
+        ));
+        assert!(matches!(
+            error,
+            DfsError::NetworkDelivery {
+                delivery_state: NetworkDeliveryState::PossiblyApplied,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn network_conversion_preserves_definitely_not_sent_delivery_state() {
+        let error = DfsError::from_network(NetworkError::delivery_failed(
+            "stable DFS write",
+            NetworkDeliveryState::DefinitelyNotSent,
+            "route unavailable",
+        ));
+        assert!(matches!(
+            error,
+            DfsError::NetworkDelivery {
+                delivery_state: NetworkDeliveryState::DefinitelyNotSent,
+                ..
+            }
+        ));
     }
 }

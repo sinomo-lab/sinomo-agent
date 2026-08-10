@@ -743,8 +743,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         transaction: DfsNamespaceTransaction,
     ) -> Result<(), DfsError> {
-        self.apply_namespace_transaction_with_selected_shard(transaction, None, Vec::new(), None)
-            .map_err(NamespaceTransactionApplyError::into_dfs_error)
+        self.apply_namespace_transaction_with_selected_shard(
+            transaction,
+            None,
+            Vec::new(),
+            None,
+            None,
+        )
+        .map_err(NamespaceTransactionApplyError::into_dfs_error)
+    }
+
+    pub(crate) fn apply_namespace_transaction_with_journal_operation_id(
+        &mut self,
+        transaction: DfsNamespaceTransaction,
+        operation_id: &str,
+    ) -> Result<(), DfsError> {
+        self.apply_namespace_transaction_with_selected_shard(
+            transaction,
+            None,
+            Vec::new(),
+            None,
+            Some(operation_id.to_string()),
+        )
+        .map_err(NamespaceTransactionApplyError::into_dfs_error)
     }
 
     fn validate_local_eventual_batch_commit(
@@ -1253,6 +1274,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             selected_shard,
             receipts,
             prepare_expectations,
+            None,
         )
         .map_err(NamespaceTransactionApplyError::into_posix_error)?;
         Ok(true)
@@ -1271,6 +1293,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         selected_shard: Option<DfsMetadataShardConfig>,
         content_receipts: Vec<DfsReplicaReceiptRecord>,
         prepare_expectations: Option<NamespacePrepareExpectationBundle>,
+        journal_operation_id: Option<String>,
     ) -> Result<(), NamespaceTransactionApplyError> {
         self.clear_metadata_lookup_cache();
         let trace_started = Instant::now();
@@ -1554,7 +1577,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .as_ref()
                         .map(|completion| &completion.operation_id)
                 });
-            let operation_id = if let Some(completed_operation_id) = completed_operation_id {
+            let operation_id = if let Some(journal_operation_id) = journal_operation_id.as_ref() {
+                crate::metadata_records::namespace_prepare_operation_id_with_journal_provenance(
+                    journal_operation_id,
+                    &transaction.transaction_id,
+                )
+            } else if let Some(completed_operation_id) = completed_operation_id {
                 format!(
                     "namespace-request:{}:{}",
                     completed_operation_id, transaction.transaction_id
@@ -1664,7 +1692,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .find(|object| object.object_id == receipt.receipt.object_id);
                 backend.put_receipt_for_object(object, receipt)?;
             }
-            backend.apply_namespace_transaction(&transaction)?;
+            backend.apply_namespace_transaction_with_operation_id(
+                &transaction,
+                journal_operation_id.as_deref(),
+            )?;
         }
         trace_backend_apply_ms = backend_apply_started.elapsed().as_millis();
         let (tombstones, live_objects): (Vec<_>, Vec<_>) = transaction

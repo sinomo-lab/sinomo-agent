@@ -3,11 +3,12 @@ use crate::{
     DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest, DfsFileSystemId,
     DfsMetadataJournalBatch, DfsMetadataJournalFrameRecord, DfsMetadataPrefixProof,
     DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataTableSnapshot,
-    DfsMetadataVersionPinRecord, DfsNamespaceJobRecord, DfsNamespaceTransaction, DfsObjectId,
-    DfsObjectMetadata, DfsObjectVersionRecord, DfsPosixCreateAttrs,
-    DfsPosixDirectorySyncCertificate, DfsPosixDirectorySyncTarget, DfsPosixFileSyncCertificate,
-    DfsPosixFileSyncTarget, DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsVersion,
-    DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord,
+    DfsMetadataVersionPinRecord, DfsNamespaceChangeBatch, DfsNamespaceChangeCursor,
+    DfsNamespaceJobRecord, DfsNamespaceTransaction, DfsObjectId, DfsObjectMetadata,
+    DfsObjectVersionRecord, DfsPosixCreateAttrs, DfsPosixDirectorySyncCertificate,
+    DfsPosixDirectorySyncTarget, DfsPosixFileSyncCertificate, DfsPosixFileSyncTarget,
+    DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsVersion, DfsWriteIntentReceipt,
+    DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord, DfsWriteIntentStatus,
     NetworkedDfsWriteOutcome,
 };
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,117 @@ fn default_true() -> bool {
 
 fn default_advisory_lock_timeout_millis() -> u64 {
     45_000
+}
+
+/// Exact durable evidence retained for one caller-owned data-write operation.
+///
+/// This is deliberately smaller than the original write response. Repair jobs
+/// are transient scheduling output; the fields below are the authoritative
+/// identity needed to prove which object generation and content the operation
+/// committed (or why its durable admission terminated without committing).
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsStableWriteOperationReceipt {
+    pub operation_id: String,
+    pub intent_id: String,
+    pub file_system_id: DfsFileSystemId,
+    pub object_id: DfsObjectId,
+    pub target_version: DfsVersion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_size_bytes: Option<u64>,
+    pub status: DfsWriteIntentStatus,
+}
+
+/// Read-only classification of a stable data-write operation id.
+///
+/// `NotApplied` is returned only when the current metadata authority can prove
+/// that no durable admission or expired-history marker exists. Callers may
+/// submit the original operation only in that state. Every other non-terminal
+/// or non-authoritative observation fails closed.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum DfsStableWriteOperationReconciliation {
+    Applied {
+        receipt: DfsStableWriteOperationReceipt,
+    },
+    NotApplied,
+    AmbiguousOrExpired {
+        reason: String,
+    },
+    Conflict {
+        reason: String,
+    },
+}
+
+/// Exact durable response retained for one caller-owned namespace mutation.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsStableNamespaceOperationReceipt {
+    pub operation_id: String,
+    pub file_system_id: DfsFileSystemId,
+    pub requesting_node_id: NodeId,
+    pub authority_shard_id: DfsMetadataShardId,
+    pub command_digest: String,
+    pub result: DfsNamespaceResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posix_coordination_result: Option<DfsPosixCoordinationResult>,
+}
+
+/// Read-only classification of a stable namespace mutation id.
+///
+/// An `Applied` result is the exact terminal response bound to the command
+/// digest. `NotApplied` requires an authoritative, history-complete absence;
+/// pending prepares, replica-only absence, and evicted history are never
+/// treated as permission to resend.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum DfsStableNamespaceOperationReconciliation {
+    Applied {
+        receipt: DfsStableNamespaceOperationReceipt,
+    },
+    NotApplied,
+    AmbiguousOrExpired {
+        reason: String,
+    },
+    Conflict {
+        reason: String,
+    },
+}
+
+/// Read-only authority-routed query for one stable data-write outcome.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsStableWriteReconciliationRequest {
+    pub request_id: String,
+    pub operation_id: String,
+    pub path: String,
+    pub object_id: DfsObjectId,
+    pub requesting_node_id: NodeId,
+    pub expected_content_hash: String,
+    pub expected_content_size_bytes: u64,
+    pub authority_shard: DfsMetadataShardConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsStableWriteReconciliationResponse {
+    pub request_id: String,
+    pub reconciliation: DfsStableWriteOperationReconciliation,
+}
+
+/// Read-only authority-routed query for one stable namespace outcome.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsStableNamespaceReconciliationRequest {
+    pub request_id: String,
+    pub operation_id: String,
+    pub requesting_node_id: NodeId,
+    pub operation: Box<DfsNamespaceOperation>,
+    pub authority_shards: Vec<DfsMetadataShardConfig>,
+    pub dispatch_authority_shard: DfsMetadataShardConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsStableNamespaceReconciliationResponse {
+    pub request_id: String,
+    pub reconciliation: DfsStableNamespaceOperationReconciliation,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -207,6 +319,14 @@ pub enum DfsDistributedWriteResult {
     Outcome {
         outcome: NetworkedDfsWriteOutcome,
     },
+    /// The authority can prove that this operation's compact receipt was
+    /// evicted, but can no longer prove its exact outcome. Retrying as a fresh
+    /// mutation would risk applying the write twice, so callers must reconcile
+    /// the authoritative object generation first.
+    ReconciliationRequired {
+        operation_id: String,
+        reason: String,
+    },
     Rejected {
         reason: String,
         /// Set when the addressed node is not the current metadata-shard
@@ -280,9 +400,54 @@ pub struct DfsLocalEventualBatchWriteProof {
     pub receipt: DfsReplicaReceiptRecord,
 }
 
+/// Exact namespace generation a conditional mutation is authorized to
+/// consume. Both fields are required: object ids fence delete/recreate races,
+/// while versions fence in-place changes to the same durable object.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceObjectPrecondition {
+    pub object_id: DfsObjectId,
+    pub version: DfsVersion,
+}
+
+/// Required destination state for a conditional rename.
+///
+/// `Absent` accepts either no record or the namespace's durable tombstone.
+/// `Exact` authorizes replacement of precisely one live generation. A
+/// destination created or changed after the caller's observation therefore
+/// cannot be overwritten by a delayed or replayed rename.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsNamespaceDestinationPrecondition {
+    Absent,
+    Exact(DfsNamespaceObjectPrecondition),
+}
+
+/// One shard-local semantic change poll carried over the existing namespace
+/// authority route.
+///
+/// A subtree caller sends one request per current intersecting shard. The
+/// cursor itself fences filesystem, shard, authority epoch, and journal
+/// sequence; the enclosing namespace command carries the matching complete
+/// authority configuration used to select the primary.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceChangePollRequest {
+    pub root_path: String,
+    pub cursor: DfsNamespaceChangeCursor,
+}
+
+/// One independently ordered shard batch. No cross-shard ordering is implied.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceChangePollResponse {
+    pub batch: DfsNamespaceChangeBatch,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsNamespaceOperation {
+    /// Read-only semantic namespace journal projection for exactly one shard.
+    PollNamespaceChanges {
+        request: DfsNamespaceChangePollRequest,
+    },
     Mkdir {
         path: String,
     },
@@ -304,12 +469,32 @@ pub enum DfsNamespaceOperation {
     Rmdir {
         path: String,
     },
+    /// Remove a directory only while the exact observed generation remains
+    /// visible. This is the production mutation form for retrying a durable
+    /// caller operation id after an ambiguous response.
+    ConditionalRmdir {
+        path: String,
+        expected: DfsNamespaceObjectPrecondition,
+    },
     Unlink {
         path: String,
+    },
+    /// Unlink only the exact observed generation.
+    ConditionalUnlink {
+        path: String,
+        expected: DfsNamespaceObjectPrecondition,
     },
     Rename {
         from: String,
         to: String,
+    },
+    /// Rename only the exact source generation and only when the destination
+    /// still has the caller-observed state.
+    ConditionalRename {
+        from: String,
+        to: String,
+        expected_source: DfsNamespaceObjectPrecondition,
+        expected_destination: DfsNamespaceDestinationPrecondition,
     },
     RenameSingleNamespaceAtomic {
         from: String,
@@ -330,6 +515,22 @@ pub enum DfsNamespaceOperation {
     Hardlink {
         existing_path: String,
         link_path: String,
+    },
+    /// Install a durable target-authority fence before a foreign alias
+    /// authority exposes its namespace generation change.
+    InstallHardlinkTargetFence {
+        fence: Box<DfsNamespaceJobRecord>,
+        source_path: String,
+    },
+    /// Commit the exact pre-minted canonical generation and release the
+    /// matching target-authority fence. This operation is idempotent across a
+    /// crash after the object transaction but before fence completion.
+    CommitHardlinkTargetFence {
+        fence_job_id: String,
+        source_path: String,
+        target_path: String,
+        expected_target: DfsNamespaceObjectPrecondition,
+        committed_target: DfsObjectMetadata,
     },
     SetMode {
         path: String,
@@ -511,12 +712,18 @@ impl DfsNamespaceOperation {
     /// shards remain independently authoritative for their own journal lanes.
     pub(crate) fn routing_path(&self) -> Option<&str> {
         match self {
+            // A subtree root does not identify one feed authority: nested
+            // prefix and hash shards may intersect it. Routed feed code must
+            // dispatch by the cursor's exact shard configuration.
+            DfsNamespaceOperation::PollNamespaceChanges { .. } => None,
             DfsNamespaceOperation::Mkdir { path }
             | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
             | DfsNamespaceOperation::MkdirAtNoLinks { path, .. }
             | DfsNamespaceOperation::MkdirAll { path }
             | DfsNamespaceOperation::Rmdir { path }
+            | DfsNamespaceOperation::ConditionalRmdir { path, .. }
             | DfsNamespaceOperation::Unlink { path }
+            | DfsNamespaceOperation::ConditionalUnlink { path, .. }
             | DfsNamespaceOperation::SetMode { path, .. }
             | DfsNamespaceOperation::SetOwner { path, .. }
             | DfsNamespaceOperation::SetSymlinkOwner { path, .. }
@@ -530,11 +737,16 @@ impl DfsNamespaceOperation {
             | DfsNamespaceOperation::FileSync { path, .. }
             | DfsNamespaceOperation::DirectorySync { path, .. }
             | DfsNamespaceOperation::ResumeNamespaceJobBounded { path, .. }
-            | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { path, .. } => {
-                Some(path.as_str())
+            | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { path, .. }
+            | DfsNamespaceOperation::CommitHardlinkTargetFence {
+                target_path: path, ..
+            } => Some(path.as_str()),
+            DfsNamespaceOperation::InstallHardlinkTargetFence { fence, .. } => {
+                Some(fence.root_path.as_str())
             }
             DfsNamespaceOperation::LookupPaths { paths } => paths.first().map(String::as_str),
             DfsNamespaceOperation::Rename { from, .. }
+            | DfsNamespaceOperation::ConditionalRename { from, .. }
             | DfsNamespaceOperation::RenameSingleNamespaceAtomic { from, .. }
             | DfsNamespaceOperation::RenameDirectoryBounded { from, .. } => Some(from.as_str()),
             DfsNamespaceOperation::Hardlink { existing_path, .. } => Some(existing_path.as_str()),
@@ -551,18 +763,24 @@ impl DfsNamespaceOperation {
         }
     }
 
-    /// The normalized paths whose metadata shards this operation may mutate
-    /// (the targets themselves; parents share a prefix shard with their
-    /// children except at shard-boundary anchors, which the handler also
-    /// derives from these paths).
+    /// The namespace paths this operation observes or may mutate (the targets
+    /// themselves; parents share a prefix shard with their children except at
+    /// shard-boundary anchors, which the handler also derives from these
+    /// paths). Feed routing must still use its cursor shard, not this subtree
+    /// root.
     pub fn involved_paths(&self) -> Vec<&str> {
         match self {
+            DfsNamespaceOperation::PollNamespaceChanges { request } => {
+                vec![request.root_path.as_str()]
+            }
             DfsNamespaceOperation::Mkdir { path }
             | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
             | DfsNamespaceOperation::MkdirAtNoLinks { path, .. }
             | DfsNamespaceOperation::MkdirAll { path }
             | DfsNamespaceOperation::Rmdir { path }
+            | DfsNamespaceOperation::ConditionalRmdir { path, .. }
             | DfsNamespaceOperation::Unlink { path }
+            | DfsNamespaceOperation::ConditionalUnlink { path, .. }
             | DfsNamespaceOperation::SetMode { path, .. }
             | DfsNamespaceOperation::SetOwner { path, .. }
             | DfsNamespaceOperation::SetSymlinkOwner { path, .. }
@@ -572,11 +790,18 @@ impl DfsNamespaceOperation {
             | DfsNamespaceOperation::SyncPath { path }
             | DfsNamespaceOperation::LookupPath { path }
             | DfsNamespaceOperation::ReconcilePlacement { path, .. }
-            | DfsNamespaceOperation::ResumeNamespaceJobBounded { path, .. } => vec![path],
+            | DfsNamespaceOperation::ResumeNamespaceJobBounded { path, .. }
+            | DfsNamespaceOperation::CommitHardlinkTargetFence {
+                target_path: path, ..
+            } => vec![path],
+            DfsNamespaceOperation::InstallHardlinkTargetFence { fence, .. } => {
+                vec![fence.root_path.as_str()]
+            }
             DfsNamespaceOperation::LookupPaths { paths } => {
                 paths.iter().map(String::as_str).collect()
             }
             DfsNamespaceOperation::Rename { from, to }
+            | DfsNamespaceOperation::ConditionalRename { from, to, .. }
             | DfsNamespaceOperation::RenameSingleNamespaceAtomic { from, to, .. }
             | DfsNamespaceOperation::RenameDirectoryBounded { from, to, .. } => {
                 vec![from, to]
@@ -716,10 +941,10 @@ pub struct DfsNamespaceResponse {
     /// which the receiver retains the conservative legacy limit heuristic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_journal_has_more: Option<bool>,
-    /// Typed result for POSIX coordination operations. Keeping this separate
-    /// from `result` preserves the existing namespace success/error contract
-    /// while allowing lock and durability certificates to cross the same
-    /// metadata-primary RPC path.
+    /// Typed result for namespace reads and POSIX coordination operations.
+    /// Keeping this separate from `result` preserves the existing namespace
+    /// success/error contract while allowing semantic feed batches, locks, and
+    /// durability certificates to cross the same metadata-primary RPC path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub posix_coordination_result: Option<DfsPosixCoordinationResult>,
 }
@@ -727,6 +952,7 @@ pub struct DfsNamespaceResponse {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsPosixCoordinationResult {
+    NamespaceChanges(DfsNamespaceChangePollResponse),
     NamespaceJob(DfsNamespaceJobRecord),
     AdvisoryLock(DfsAdvisoryLockOutcome),
     /// Capability acknowledgement for a lock-bearing cross-shard adoption.
@@ -1238,8 +1464,12 @@ pub enum DfsNetworkMessage {
     /// accidentally executing it as an overwrite-capable write.
     ExclusiveCreateRequest(DfsDistributedWriteCommand),
     DistributedWriteResponse(DfsDistributedWriteResponse),
+    StableWriteReconciliationRequest(DfsStableWriteReconciliationRequest),
+    StableWriteReconciliationResponse(DfsStableWriteReconciliationResponse),
     NamespaceRequest(DfsNamespaceCommand),
     NamespaceResponse(DfsNamespaceResponse),
+    StableNamespaceReconciliationRequest(DfsStableNamespaceReconciliationRequest),
+    StableNamespaceReconciliationResponse(DfsStableNamespaceReconciliationResponse),
     StageBlob(DfsStageBlobCommand),
     StagePatch(DfsStagePatchCommand),
     StageBlobResponse(DfsStageBlobResponse),

@@ -1128,6 +1128,8 @@ pub fn dfs_events_should_publish_metadata(events: &[NetworkedDfsServiceEvent]) -
         // they never append the requester's metadata-shard journal.
         NetworkedDfsServiceEvent::RemoteWriteCompleted { .. }
         | NetworkedDfsServiceEvent::RemoteNamespaceCompleted { .. }
+        | NetworkedDfsServiceEvent::StableReconciliationServed { .. }
+        | NetworkedDfsServiceEvent::StableReconciliationCompleted { .. }
         | NetworkedDfsServiceEvent::RemoteResponseDiscarded { .. } => false,
         NetworkedDfsServiceEvent::RemoteNamespaceServed {
             result,
@@ -10629,6 +10631,7 @@ mod cursor_update_tests {
                 file_system_id: transaction.file_system_id.clone(),
                 transaction_id: transaction.transaction_id.clone(),
                 object_count: transaction.objects.len(),
+                operation_id: None,
                 transaction: Some(transaction),
             },
         };
@@ -11909,6 +11912,8 @@ mod cursor_update_tests {
             base_version: Some(object.version.clone()),
             target_version: late_version.version.clone(),
             coordinator_node_id: local.clone(),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 1,
             desired_replica_node_ids: vec![local.clone()],
             policy: crate::DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -12117,6 +12122,8 @@ mod cursor_update_tests {
                     base_version: None,
                     target_version: version.clone(),
                     coordinator_node_id: local.clone(),
+                    operation_id: None,
+                    operation_order_token: None,
                     owner_epoch: 1,
                     desired_replica_node_ids: vec![local.clone()],
                     policy: crate::DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -13222,6 +13229,8 @@ mod cursor_update_tests {
             base_version: Some(old_version.clone()),
             target_version: live_version.clone(),
             coordinator_node_id: source_node_id.clone(),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 7,
             desired_replica_node_ids: vec![source_node_id.clone(), promoted_node_id.clone()],
             policy: crate::DfsReplicationPolicy::confirmed(2).expect("replication policy"),

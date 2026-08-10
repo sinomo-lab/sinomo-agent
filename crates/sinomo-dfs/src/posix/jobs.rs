@@ -30,6 +30,8 @@ pub(super) fn namespace_job_kind_is_cross_shard(kind: &DfsNamespaceJobKind) -> b
         kind,
         DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
             | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
+            | DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
+            | DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary
             | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
     )
 }
@@ -94,9 +96,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
             | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
+            | DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
             | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries => {
                 self.run_cross_shard_namespace_job(job, max_steps)
             }
+            // This target-side reservation is released only by the
+            // authenticated source coordinator after its alias generation is
+            // durable. Background maintenance must not expose it early.
+            DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary => Ok(job),
         }
     }
 
@@ -511,6 +518,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 | DfsNamespaceJobFrame::CrossShardComplete { .. }
                 | DfsNamespaceJobFrame::CrossShardHardlinkAdopt { .. }
                 | DfsNamespaceJobFrame::CrossShardHardlinkComplete { .. }
+                | DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceInstall { .. }
+                | DfsNamespaceJobFrame::CrossShardHardlinkAliasCommit { .. }
+                | DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceCommit { .. }
+                | DfsNamespaceJobFrame::HardlinkTargetFenceReservation { .. }
                 | DfsNamespaceJobFrame::CrossShardDirStart { .. }
                 | DfsNamespaceJobFrame::CrossShardDirScan { .. }
                 | DfsNamespaceJobFrame::CrossShardDirFinish { .. } => {
@@ -852,6 +863,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 | DfsNamespaceJobFrame::CrossShardComplete { .. }
                 | DfsNamespaceJobFrame::CrossShardHardlinkAdopt { .. }
                 | DfsNamespaceJobFrame::CrossShardHardlinkComplete { .. }
+                | DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceInstall { .. }
+                | DfsNamespaceJobFrame::CrossShardHardlinkAliasCommit { .. }
+                | DfsNamespaceJobFrame::CrossShardHardlinkTargetFenceCommit { .. }
+                | DfsNamespaceJobFrame::HardlinkTargetFenceReservation { .. }
                 | DfsNamespaceJobFrame::CrossShardDirStart { .. }
                 | DfsNamespaceJobFrame::CrossShardDirScan { .. }
                 | DfsNamespaceJobFrame::CrossShardDirFinish { .. } => {

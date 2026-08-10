@@ -35,6 +35,19 @@ enum RoutedNamespaceNetworkRecovery {
     Unchanged,
 }
 
+fn namespace_operation_uses_stable_admission(operation: &DfsNamespaceOperation) -> bool {
+    matches!(
+        operation,
+        DfsNamespaceOperation::Mkdir { .. }
+            | DfsNamespaceOperation::MkdirWithAttrs { .. }
+            | DfsNamespaceOperation::MkdirAtNoLinks { .. }
+            | DfsNamespaceOperation::MkdirAll { .. }
+            | DfsNamespaceOperation::ConditionalUnlink { .. }
+            | DfsNamespaceOperation::ConditionalRmdir { .. }
+            | DfsNamespaceOperation::ConditionalRename { .. }
+    )
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// The metadata-shard primary to route a namespace mutation to, or `None`
     /// when this node is itself the namespace authority for the path (or no
@@ -482,8 +495,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
     ) -> Result<()> {
-        self.route_namespace_operation_with_result(primary_node_id, operation)
-            .map(drop)
+        let operation_id = self.next_request_id();
+        self.route_namespace_operation_with_request_id(operation_id, primary_node_id, operation)
     }
 
     pub(crate) fn route_namespace_operation_with_result(
@@ -491,11 +504,40 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
     ) -> Result<Option<DfsPosixCoordinationResult>> {
+        let operation_id = self.next_request_id();
+        self.route_namespace_operation_with_request_id_and_result(
+            operation_id,
+            primary_node_id,
+            operation,
+        )
+    }
+
+    pub(crate) fn route_namespace_operation_with_request_id(
+        &mut self,
+        operation_id: String,
+        primary_node_id: NodeId,
+        operation: DfsNamespaceOperation,
+    ) -> Result<()> {
+        self.route_namespace_operation_with_request_id_and_result(
+            operation_id,
+            primary_node_id,
+            operation,
+        )
+        .map(drop)
+    }
+
+    fn route_namespace_operation_with_request_id_and_result(
+        &mut self,
+        operation_id: String,
+        primary_node_id: NodeId,
+        operation: DfsNamespaceOperation,
+    ) -> Result<Option<DfsPosixCoordinationResult>> {
         let file_system_id = sifs_file_system_id();
         let mut primary = primary_node_id;
         for _ in 0..POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT {
             let routed = match self
-                .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
+                .route_namespace_operation_to_metadata_primary_with_request_id_and_options(
+                    operation_id.clone(),
                     file_system_id.clone(),
                     primary.clone(),
                     operation.clone(),
@@ -505,10 +547,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ) {
                 Ok(result) => result,
                 Err(error @ DfsError::Network { .. }) => {
-                    match self.refresh_routed_namespace_primary_after_network_error(
-                        &operation,
-                        &mut primary,
-                    )? {
+                    let recovery = if namespace_operation_uses_stable_admission(&operation) {
+                        self.refresh_routed_stable_namespace_primary_after_network_error(
+                            &operation_id,
+                            &operation,
+                            &mut primary,
+                        )?
+                    } else {
+                        self.refresh_routed_namespace_primary_after_network_error(
+                            &operation,
+                            &mut primary,
+                        )?
+                    };
+                    match recovery {
                         RoutedNamespaceNetworkRecovery::Completed => {
                             validate_cross_shard_adoption_receipt(&operation, None)?;
                             validate_cross_shard_adoption_source_pin_set(
@@ -545,6 +596,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 } => match current_primary_node_id {
                     Some(current) if current == self.node_id => {
                         // Authority moved to this node; execute locally.
+                        if namespace_operation_uses_stable_admission(&operation) {
+                            self.execute_local_primary_namespace_operation_with_request_id(
+                                operation_id.clone(),
+                                operation.clone(),
+                            )?;
+                            return Ok(None);
+                        }
                         return self.execute_posix_coordination_operation_local(&operation);
                     }
                     Some(current) if current != primary => {
@@ -557,6 +615,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             )
                             .map_err(DfsPosixError::Dfs)?;
                         if primary == self.node_id {
+                            if namespace_operation_uses_stable_admission(&operation) {
+                                self.execute_local_primary_namespace_operation_with_request_id(
+                                    operation_id.clone(),
+                                    operation.clone(),
+                                )?;
+                                return Ok(None);
+                            }
                             return self.execute_posix_coordination_operation_local(&operation);
                         }
                     }
@@ -569,6 +634,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "routed namespace operation exceeded {POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT} authority redirects"
             ),
         }))
+    }
+
+    /// Refresh a caller-owned stable namespace operation after a transport
+    /// failure without losing its request identity when authority has moved
+    /// onto this node. The ordinary recovery helper predates durable local
+    /// admission and executes directly; doing that here would turn response
+    /// loss plus an authority move into an untracked second mutation attempt.
+    fn refresh_routed_stable_namespace_primary_after_network_error(
+        &mut self,
+        operation_id: &str,
+        operation: &DfsNamespaceOperation,
+        primary: &mut NodeId,
+    ) -> Result<RoutedNamespaceNetworkRecovery> {
+        debug_assert!(namespace_operation_uses_stable_admission(operation));
+        let Some(path) = operation.routing_path() else {
+            return Ok(RoutedNamespaceNetworkRecovery::Unchanged);
+        };
+        let Some(shard) = self.select_sifs_metadata_shard_for_path_fresh(path)? else {
+            return Ok(RoutedNamespaceNetworkRecovery::Unchanged);
+        };
+        if shard.primary_node_id == self.node_id {
+            self.execute_local_primary_namespace_operation_with_request_id(
+                operation_id.to_string(),
+                operation.clone(),
+            )?;
+            return Ok(RoutedNamespaceNetworkRecovery::Completed);
+        }
+        if shard.primary_node_id != *primary {
+            *primary = shard.primary_node_id;
+            return Ok(RoutedNamespaceNetworkRecovery::Retry);
+        }
+        Ok(RoutedNamespaceNetworkRecovery::Unchanged)
     }
 
     pub(super) fn route_namespace_job_operation(
@@ -723,7 +820,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation: &DfsNamespaceOperation,
     ) -> Result<()> {
         match operation {
-            DfsNamespaceOperation::Rename { from, to } => {
+            DfsNamespaceOperation::Unlink { path }
+            | DfsNamespaceOperation::ConditionalUnlink { path, .. } => {
+                if self.resume_or_replay_hardlink_alias_mutation_for_active_request(
+                    &sifs_file_system_id(),
+                    path,
+                    path,
+                )? {
+                    return Ok(());
+                }
+            }
+            DfsNamespaceOperation::Rename { from, to }
+            | DfsNamespaceOperation::ConditionalRename { from, to, .. } => {
+                if self.resume_or_replay_hardlink_alias_mutation_for_active_request(
+                    &sifs_file_system_id(),
+                    from,
+                    to,
+                )? {
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+        match operation {
+            DfsNamespaceOperation::Rename { from, to }
+            | DfsNamespaceOperation::ConditionalRename { from, to, .. } => {
                 if self.resume_running_cross_shard_namespace_job_for_paths(
                     &sifs_file_system_id(),
                     from,
@@ -748,6 +869,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )? {
                     return Ok(());
                 }
+            }
+            _ => {}
+        }
+        // These authenticated phase commands are the only operations allowed
+        // through the exact target fence they own. Ordinary lookup and
+        // mutation traffic still reaches the guard below and returns Busy.
+        match operation {
+            DfsNamespaceOperation::InstallHardlinkTargetFence { fence, source_path } => {
+                return self.install_hardlink_target_fence_local(fence, source_path);
+            }
+            DfsNamespaceOperation::CommitHardlinkTargetFence {
+                fence_job_id,
+                source_path,
+                target_path,
+                expected_target,
+                committed_target,
+            } => {
+                return self.commit_hardlink_target_fence_local(
+                    fence_job_id,
+                    source_path,
+                    target_path,
+                    expected_target,
+                    committed_target,
+                );
             }
             _ => {}
         }
@@ -777,10 +922,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map(drop),
             DfsNamespaceOperation::MkdirAll { path } => self.posix_mkdir_all_local(path),
             DfsNamespaceOperation::Rmdir { path } => self.posix_rmdir_local(path).map(drop),
+            DfsNamespaceOperation::ConditionalRmdir { path, expected } => self
+                .posix_rmdir_local_if_generation(path, expected)
+                .map(drop),
             DfsNamespaceOperation::Unlink { path } => self.posix_unlink_local(path).map(drop),
+            DfsNamespaceOperation::ConditionalUnlink { path, expected } => self
+                .posix_unlink_local_if_generation(path, expected)
+                .map(drop),
             DfsNamespaceOperation::Rename { from, to } => {
                 self.posix_rename_local(from, to).map(drop)
             }
+            DfsNamespaceOperation::ConditionalRename {
+                from,
+                to,
+                expected_source,
+                expected_destination,
+            } => self
+                .posix_rename_local_if_generation(from, to, expected_source, expected_destination)
+                .map(drop),
             DfsNamespaceOperation::RenameSingleNamespaceAtomic {
                 from,
                 to,
@@ -799,6 +958,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             } => self
                 .posix_hardlink_local(existing_path, link_path)
                 .map(drop),
+            DfsNamespaceOperation::InstallHardlinkTargetFence { .. }
+            | DfsNamespaceOperation::CommitHardlinkTargetFence { .. } => {
+                unreachable!("hardlink target fence phases return before generic path guards")
+            }
             DfsNamespaceOperation::SetMode { path, mode } => {
                 self.posix_set_mode_local(path, *mode).map(drop)
             }
@@ -864,7 +1027,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     desired_replica_node_ids,
                 )
                 .map_err(DfsPosixError::from),
-            DfsNamespaceOperation::AdvisoryLock { .. }
+            DfsNamespaceOperation::PollNamespaceChanges { .. }
+            | DfsNamespaceOperation::AdvisoryLock { .. }
             | DfsNamespaceOperation::FileSync { .. }
             | DfsNamespaceOperation::DirectorySync { .. }
             | DfsNamespaceOperation::RenameDirectoryBounded { .. }

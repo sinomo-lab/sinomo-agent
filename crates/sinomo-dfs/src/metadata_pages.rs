@@ -1081,6 +1081,8 @@ mod tests {
             base_version: None,
             target_version,
             coordinator_node_id: node("node_writer"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 0,
             desired_replica_node_ids: Vec::new(),
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),

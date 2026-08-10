@@ -219,8 +219,14 @@ fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'stati
         DfsNetworkMessage::DistributedWriteRequest(_)
         | DfsNetworkMessage::ExclusiveCreateRequest(_) => DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
         DfsNetworkMessage::DistributedWriteResponse(_) => DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE,
+        DfsNetworkMessage::StableWriteReconciliationRequest(_) => DFS_DATA_READ_ROUTE,
+        DfsNetworkMessage::StableWriteReconciliationResponse(_) => DFS_DATA_READ_RESPONSE_ROUTE,
         DfsNetworkMessage::NamespaceRequest(_) => DFS_DATA_NAMESPACE_ROUTE,
         DfsNetworkMessage::NamespaceResponse(_) => DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
+        DfsNetworkMessage::StableNamespaceReconciliationRequest(_) => DFS_DATA_NAMESPACE_ROUTE,
+        DfsNetworkMessage::StableNamespaceReconciliationResponse(_) => {
+            DFS_DATA_NAMESPACE_RESPONSE_ROUTE
+        }
         DfsNetworkMessage::StageBlob(_) => DFS_DATA_STAGE_BLOB_ROUTE,
         DfsNetworkMessage::StagePatch(_) => DFS_DATA_STAGE_PATCH_ROUTE,
         DfsNetworkMessage::StageBlobResponse(_) => DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
@@ -345,11 +351,19 @@ fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessag
     match message {
         DfsNetworkMessage::ReadRequest(_)
         | DfsNetworkMessage::BulkReadRequest(_)
+        | DfsNetworkMessage::StableWriteReconciliationRequest(_)
         | DfsNetworkMessage::ContentRootCatalogPageRequest(_) => DfsMessageExecutionScope::ReadOnly,
+        DfsNetworkMessage::StableNamespaceReconciliationRequest(request) => {
+            authority_shard_execution_scope(
+                Some(&request.dispatch_authority_shard),
+                Some(&request.dispatch_authority_shard.file_system_id),
+            )
+        }
         DfsNetworkMessage::NamespaceRequest(command)
             if matches!(
                 command.operation,
-                DfsNamespaceOperation::LookupPath { .. }
+                DfsNamespaceOperation::PollNamespaceChanges { .. }
+                    | DfsNamespaceOperation::LookupPath { .. }
                     | DfsNamespaceOperation::LookupPaths { .. }
             ) =>
         {
@@ -402,7 +416,9 @@ fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessag
         | DfsNetworkMessage::WriteRequest(_)
         | DfsNetworkMessage::WriteResponse(_)
         | DfsNetworkMessage::DistributedWriteResponse(_)
+        | DfsNetworkMessage::StableWriteReconciliationResponse(_)
         | DfsNetworkMessage::NamespaceResponse(_)
+        | DfsNetworkMessage::StableNamespaceReconciliationResponse(_)
         | DfsNetworkMessage::StageBlobResponse(_)
         | DfsNetworkMessage::CommitVersionResponse(_)
         | DfsNetworkMessage::RepairReplicaResponse(_)
@@ -427,9 +443,12 @@ fn dfs_network_message_is_read_only_request(message: &DfsNetworkMessage) -> bool
         DfsNetworkMessage::ReadRequest(_)
             | DfsNetworkMessage::BulkReadRequest(_)
             | DfsNetworkMessage::ContentRootCatalogPageRequest(_)
+            | DfsNetworkMessage::StableWriteReconciliationRequest(_)
+            | DfsNetworkMessage::StableNamespaceReconciliationRequest(_)
             | DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
                 operation: DfsNamespaceOperation::LookupPath { .. }
-                    | DfsNamespaceOperation::LookupPaths { .. },
+                    | DfsNamespaceOperation::LookupPaths { .. }
+                    | DfsNamespaceOperation::PollNamespaceChanges { .. },
                 ..
             })
     )
@@ -444,6 +463,8 @@ pub(crate) fn dfs_network_message_response_retry_safe(message: &DfsNetworkMessag
         message,
         DfsNetworkMessage::DistributedWriteRequest(_)
             | DfsNetworkMessage::DistributedWriteResponse(_)
+            | DfsNetworkMessage::StableWriteReconciliationRequest(_)
+            | DfsNetworkMessage::StableNamespaceReconciliationRequest(_)
             | DfsNetworkMessage::CommitVersion(_)
             | DfsNetworkMessage::RepairReplica(_)
             | DfsNetworkMessage::ContentRootCatalogPageRequest(_)
@@ -647,10 +668,10 @@ mod tests {
     use crate::{
         DfsContentRootCatalogPageRequest, DfsContentRootCatalogShardIdentity,
         DfsDistributedWriteCommand, DfsMetadataJournalBatch, DfsMetadataShardAssignment,
-        DfsMetadataTableSnapshot, DfsNamespaceCommand, DfsNamespaceOperation,
-        DfsNamespacePosixError, DfsNamespaceResponse, DfsNamespaceResult, DfsObjectId,
-        DfsReadRequest, DfsReplicationPolicy, DfsStageBlobCommand, DfsVersion,
-        dfs_content_root_catalog_topology_digest,
+        DfsMetadataTableSnapshot, DfsNamespaceChangeCursor, DfsNamespaceChangePollRequest,
+        DfsNamespaceCommand, DfsNamespaceOperation, DfsNamespacePosixError, DfsNamespaceResponse,
+        DfsNamespaceResult, DfsObjectId, DfsReadRequest, DfsReplicationPolicy, DfsStageBlobCommand,
+        DfsVersion, dfs_content_root_catalog_topology_digest,
     };
     use sinomo_core::node::NodeId;
     use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
@@ -902,6 +923,44 @@ mod tests {
             dfs_message_execution_scope(&lookup_command(Vec::new())),
             DfsMessageExecutionScope::ReadOnly,
             "an unstamped lookup must retain the conservative read classification"
+        );
+        let poll_command = |authority_shards| {
+            message_command(DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                request_id: "scope-stamped-namespace-poll".to_string(),
+                file_system_id: file_system_id.clone(),
+                requesting_node_id: node_id("scope-source"),
+                include_metadata_journal_batches: false,
+                metadata_journal_after_sequences: Vec::new(),
+                authority_shards,
+                operation: DfsNamespaceOperation::PollNamespaceChanges {
+                    request: DfsNamespaceChangePollRequest {
+                        // The subtree root intentionally does not identify the
+                        // services cursor's dispatch shard.
+                        root_path: "/".to_string(),
+                        cursor: DfsNamespaceChangeCursor::from_shard_config(&shard, 11),
+                    },
+                },
+            }))
+        };
+        let stamped_poll = poll_command(vec![shard.clone()]);
+        assert!(dfs_message_is_read_only_request(&stamped_poll));
+        assert_eq!(
+            dfs_message_execution_scope(&stamped_poll),
+            DfsMessageExecutionScope::ExactShard {
+                file_system_id: file_system_id.clone(),
+                shard_id: DfsMetadataShardId::new("services"),
+            }
+        );
+        let encoded = dfs_message_rpc_request(&stamped_poll).expect("encode namespace poll");
+        assert_eq!(encoded.route, DFS_DATA_NAMESPACE_ROUTE);
+        assert_eq!(
+            decode_dfs_message_rpc_request(&encoded).expect("decode namespace poll"),
+            stamped_poll
+        );
+        assert_eq!(
+            dfs_message_execution_scope(&poll_command(Vec::new())),
+            DfsMessageExecutionScope::ReadOnly,
+            "an unstamped feed poll must never gain an exact shard from its cursor alone"
         );
         assert!(matches!(
             dfs_message_execution_scope(&namespace_command(vec![

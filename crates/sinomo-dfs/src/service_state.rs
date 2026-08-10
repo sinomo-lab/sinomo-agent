@@ -19,8 +19,9 @@ use crate::{
     DfsMetadataShardId, DfsMetadataStore, DfsNamespaceRequestRecord, DfsNamespaceResult,
     DfsObjectId, DfsObjectMetadata, DfsOutboundAttachment, DfsPendingNamespaceRequestPageCursor,
     DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData, DfsReadResult,
-    DfsRepairAttemptRecord, DfsVersion, DistributedEventualCoordinator, DistributedRepairJob,
-    LocalContentStore, ObjectVersionReader, ResidentLocalMetadataShardLease,
+    DfsRepairAttemptRecord, DfsStableNamespaceOperationReconciliation,
+    DfsStableWriteOperationReconciliation, DfsVersion, DistributedEventualCoordinator,
+    DistributedRepairJob, LocalContentStore, ObjectVersionReader, ResidentLocalMetadataShardLease,
     ResidentLocalShardedMetadataBackendLease,
 };
 
@@ -168,7 +169,23 @@ pub(crate) const DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES: usize = 64;
 struct DfsCrossShardNamespaceJobLock {
     shard_id: Option<DfsMetadataShardId>,
     file_system_id: DfsFileSystemId,
-    path: String,
+    paths: Vec<String>,
+}
+
+pub(crate) trait IntoCrossShardNamespaceLockPaths {
+    fn into_lock_paths(self) -> Vec<String>;
+}
+
+impl IntoCrossShardNamespaceLockPaths for String {
+    fn into_lock_paths(self) -> Vec<String> {
+        vec![self]
+    }
+}
+
+impl IntoCrossShardNamespaceLockPaths for Vec<String> {
+    fn into_lock_paths(self) -> Vec<String> {
+        self
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -180,10 +197,12 @@ pub struct DfsCrossShardNamespaceLockRegistry {
 }
 
 impl DfsCrossShardNamespaceLockRegistry {
-    pub(crate) fn replace_jobs(
+    pub(crate) fn replace_jobs<P>(
         &self,
-        locks: impl IntoIterator<Item = (Option<DfsMetadataShardId>, String, DfsFileSystemId, String)>,
-    ) {
+        locks: impl IntoIterator<Item = (Option<DfsMetadataShardId>, String, DfsFileSystemId, P)>,
+    ) where
+        P: IntoCrossShardNamespaceLockPaths,
+    {
         let mut current = self
             .locks_by_job
             .lock()
@@ -192,48 +211,52 @@ impl DfsCrossShardNamespaceLockRegistry {
         current.extend(
             locks
                 .into_iter()
-                .map(|(shard_id, job_id, file_system_id, path)| {
+                .map(|(shard_id, job_id, file_system_id, paths)| {
                     (
                         job_id,
                         DfsCrossShardNamespaceJobLock {
                             shard_id,
                             file_system_id,
-                            path,
+                            paths: paths.into_lock_paths(),
                         },
                     )
                 }),
         );
     }
 
-    pub(crate) fn replace_shard_jobs(
+    pub(crate) fn replace_shard_jobs<P>(
         &self,
         shard_id: &DfsMetadataShardId,
-        locks: impl IntoIterator<Item = (String, DfsFileSystemId, String)>,
-    ) {
+        locks: impl IntoIterator<Item = (String, DfsFileSystemId, P)>,
+    ) where
+        P: IntoCrossShardNamespaceLockPaths,
+    {
         let mut current = self
             .locks_by_job
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         current.retain(|_, lock| lock.shard_id.as_ref() != Some(shard_id));
-        current.extend(locks.into_iter().map(|(job_id, file_system_id, path)| {
+        current.extend(locks.into_iter().map(|(job_id, file_system_id, paths)| {
             (
                 job_id,
                 DfsCrossShardNamespaceJobLock {
                     shard_id: Some(shard_id.clone()),
                     file_system_id,
-                    path,
+                    paths: paths.into_lock_paths(),
                 },
             )
         }));
     }
 
-    pub(crate) fn upsert_job(
+    pub(crate) fn upsert_job<P>(
         &self,
         shard_id: Option<DfsMetadataShardId>,
         job_id: String,
         file_system_id: DfsFileSystemId,
-        path: String,
-    ) {
+        paths: P,
+    ) where
+        P: IntoCrossShardNamespaceLockPaths,
+    {
         self.locks_by_job
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -242,7 +265,7 @@ impl DfsCrossShardNamespaceLockRegistry {
                 DfsCrossShardNamespaceJobLock {
                     shard_id,
                     file_system_id,
-                    path,
+                    paths: paths.into_lock_paths(),
                 },
             );
     }
@@ -268,7 +291,11 @@ impl DfsCrossShardNamespaceLockRegistry {
             .unwrap_or_else(|error| error.into_inner());
         current
             .values()
-            .map(|lock| (&lock.file_system_id, lock.path.as_str()))
+            .flat_map(|lock| {
+                lock.paths
+                    .iter()
+                    .map(|path| (&lock.file_system_id, path.as_str()))
+            })
             .collect::<BTreeSet<_>>()
             .len()
     }
@@ -280,8 +307,13 @@ impl DfsCrossShardNamespaceLockRegistry {
             .values()
             .any(|lock| {
                 lock.file_system_id == *file_system_id
-                    && (crate::posix_path::posix_path_is_at_or_under_prefix(path, &lock.path)
-                        || crate::posix_path::posix_path_is_at_or_under_prefix(&lock.path, path))
+                    && lock.paths.iter().any(|locked_path| {
+                        crate::posix_path::posix_path_is_at_or_under_prefix(path, locked_path)
+                            || crate::posix_path::posix_path_is_at_or_under_prefix(
+                                locked_path,
+                                path,
+                            )
+                    })
             })
     }
 
@@ -450,6 +482,12 @@ pub struct NetworkedDfsService<T> {
     pub(crate) deferred_routed_create_parent_touches: BTreeSet<String>,
     pub(crate) deferred_untracked_routed_write_responses: BTreeMap<String, DfsObjectId>,
     pub(crate) pending_routed_namespace_ops: BTreeMap<String, PendingRoutedNamespaceOp>,
+    pub(crate) stable_write_reconciliation_results:
+        BTreeMap<String, DfsStableWriteOperationReconciliation>,
+    pub(crate) stable_write_reconciliation_targets: BTreeMap<String, NodeId>,
+    pub(crate) stable_namespace_reconciliation_results:
+        BTreeMap<String, DfsStableNamespaceOperationReconciliation>,
+    pub(crate) stable_namespace_reconciliation_targets: BTreeMap<String, NodeId>,
     pub(crate) active_namespace_operation_context: Option<DfsNamespaceOperationContext>,
     /// In-memory round-robin cursor for bounded pending-request maintenance.
     /// Durable request status remains the recovery source of truth.
@@ -980,6 +1018,16 @@ pub enum NetworkedDfsServiceEvent {
         request_id: String,
         primary_node_id: NodeId,
         result: DfsNamespaceResult,
+    },
+    StableReconciliationServed {
+        request_id: String,
+        requester_node_id: NodeId,
+        kind: String,
+    },
+    StableReconciliationCompleted {
+        request_id: String,
+        authority_node_id: NodeId,
+        kind: String,
     },
     /// A routed-operation response arrived for a request this node no longer
     /// tracks (settled, timed out, or retried elsewhere) or did not match the

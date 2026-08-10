@@ -21,6 +21,7 @@ use crate::metadata_records::{
 };
 use crate::metadata_tables::DfsMetadataTables;
 use crate::metadata_visible_commit::visible_commit_should_recover;
+use crate::protocol::DfsNamespaceDestinationPrecondition;
 use crate::{DfsFileSystemId, DfsNamespaceOperation, DfsObjectId, DfsVersion};
 
 /// Stable identity of one immutable metadata version protected from GC.
@@ -1508,12 +1509,20 @@ fn legacy_namespace_job_matches_operation(
                 && existing_path == root_path
                 && target_path == Some(link_path.as_str())
         }
+        DfsNamespaceOperation::Unlink { path }
+        | DfsNamespaceOperation::ConditionalUnlink { path, .. } => {
+            kind == &crate::DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
+                && path == root_path
+                && target_path == Some(path.as_str())
+        }
         DfsNamespaceOperation::Rename { from, to }
+        | DfsNamespaceOperation::ConditionalRename { from, to, .. }
         | DfsNamespaceOperation::RenameDirectoryBounded { from, to, .. } => {
             matches!(
                 kind,
                 crate::DfsNamespaceJobKind::RenameDirectory
                     | crate::DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
+                    | crate::DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
                     | crate::DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
             ) && from == root_path
                 && target_path == Some(to.as_str())
@@ -1656,6 +1665,29 @@ fn protect_namespace_operation_versions(
     operation: &DfsNamespaceOperation,
 ) {
     match operation {
+        DfsNamespaceOperation::ConditionalUnlink { expected, .. }
+        | DfsNamespaceOperation::ConditionalRmdir { expected, .. } => {
+            protected.insert(DfsMetadataVersionIdentity::new(
+                expected.object_id.clone(),
+                expected.version.clone(),
+            ));
+        }
+        DfsNamespaceOperation::ConditionalRename {
+            expected_source,
+            expected_destination,
+            ..
+        } => {
+            protected.insert(DfsMetadataVersionIdentity::new(
+                expected_source.object_id.clone(),
+                expected_source.version.clone(),
+            ));
+            if let DfsNamespaceDestinationPrecondition::Exact(expected) = expected_destination {
+                protected.insert(DfsMetadataVersionIdentity::new(
+                    expected.object_id.clone(),
+                    expected.version.clone(),
+                ));
+            }
+        }
         DfsNamespaceOperation::MkdirAtNoLinks {
             expected_parent_object_id,
             expected_parent_version,
@@ -1964,14 +1996,21 @@ fn push_retention_stats<T: Serialize>(
 fn intent_receipt_retention_record_count(
     retention: &crate::metadata_records::DfsWriteIntentReceiptRetentionState,
 ) -> u64 {
-    retention
+    let generated_floor_count = retention
         .max_evicted_counter_by_object_and_coordinator
         .values()
         .map(|floors| usize_to_u64_saturating(floors.len()))
-        .fold(
-            usize_to_u64_saturating(retention.opaque_intent_history_evicted_object_ids.len()),
-            u64::saturating_add,
-        )
+        .fold(0_u64, u64::saturating_add);
+    let exact_opaque_id_count = retention
+        .evicted_opaque_intent_ids_by_object
+        .values()
+        .map(|intent_ids| usize_to_u64_saturating(intent_ids.len()))
+        .fold(0_u64, u64::saturating_add);
+    generated_floor_count
+        .saturating_add(exact_opaque_id_count)
+        .saturating_add(usize_to_u64_saturating(
+            retention.opaque_intent_history_evicted_object_ids.len(),
+        ))
 }
 
 fn namespace_receipt_retention_record_count(
@@ -2205,6 +2244,15 @@ mod tests {
                 object_id("obj_stats_opaque_first"),
                 object_id("obj_stats_opaque_second"),
             ]);
+        tables
+            .intent_receipt_retention
+            .evicted_opaque_intent_ids_by_object
+            .entry(first_object.clone())
+            .or_default()
+            .extend([
+                "dfs_write_op_stats_first".to_string(),
+                "dfs_write_op_stats_second".to_string(),
+            ]);
 
         use crate::metadata_records::DfsNamespaceReceiptOrderKey;
         tables.namespace_receipt_retention.transaction_floor = Some(DfsNamespaceReceiptOrderKey {
@@ -2267,8 +2315,8 @@ mod tests {
         };
         let intent_retention = table("intent-receipt-retention");
         assert_eq!(
-            intent_retention.record_count, 5,
-            "each nested object/coordinator floor and opaque object is one retained entry"
+            intent_retention.record_count, 7,
+            "each nested object/coordinator floor, exact opaque id, and legacy opaque object is one retained entry"
         );
         assert_eq!(
             intent_retention.estimated_serialized_bytes,
@@ -2294,7 +2342,7 @@ mod tests {
             Some(offset_datetime_nanos(timestamp(4)))
         );
         assert!(stats.collection_authorized);
-        assert_eq!(stats.total_record_count, 12);
+        assert_eq!(stats.total_record_count, 14);
     }
 
     #[test]
@@ -2499,6 +2547,8 @@ mod tests {
             base_version: Some(intent_base.clone()),
             target_version: intent_target.clone(),
             coordinator_node_id: node("node_coordinator"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 1,
             desired_replica_node_ids: vec![node("node_owner")],
             policy: DfsReplicationPolicy::new(1, 1).expect("replication policy"),
@@ -2553,6 +2603,8 @@ mod tests {
             base_version: None,
             target_version: target_version.clone(),
             coordinator_node_id: node("node_coordinator"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 1,
             desired_replica_node_ids: vec![node("node_owner")],
             policy: DfsReplicationPolicy::new(1, 1).expect("replication policy"),

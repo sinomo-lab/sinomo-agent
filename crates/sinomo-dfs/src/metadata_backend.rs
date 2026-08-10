@@ -7339,6 +7339,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 file_system_id: transaction.file_system_id.clone(),
                 transaction_id: transaction.transaction_id.clone(),
                 object_count: transaction.objects.len(),
+                operation_id: None,
                 transaction: Some(transaction),
             },
             table_ops,
@@ -8758,6 +8759,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             file_system_id: transaction.file_system_id.clone(),
             transaction_id: transaction.transaction_id.clone(),
             object_count: transaction.objects.len(),
+            operation_id: committed_intent.operation_id.clone(),
             transaction: Some(transaction),
         });
         mutations.push(DfsMetadataMutation::put_intent(committed_intent));
@@ -9321,6 +9323,23 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         visible_version: &DfsObjectVersionRecord,
         required_replica_node_ids: &[NodeId],
     ) -> Result<DfsMetadataJournalEntry> {
+        self.commit_visible_version_with_operation_id(
+            expected_version,
+            committed_object,
+            visible_version,
+            required_replica_node_ids,
+            None,
+        )
+    }
+
+    fn commit_visible_version_with_operation_id(
+        &mut self,
+        expected_version: &DfsVersion,
+        committed_object: &DfsObjectMetadata,
+        visible_version: &DfsObjectVersionRecord,
+        required_replica_node_ids: &[NodeId],
+        operation_id: Option<&str>,
+    ) -> Result<DfsMetadataJournalEntry> {
         let _lock = self.begin_metadata_write()?;
         let current = self
             .get_object(&committed_object.object_id)?
@@ -9349,13 +9368,14 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             }
         }
 
-        let commit_record = visible_commit_record_from_parts(
+        let mut commit_record = visible_commit_record_from_parts(
             expected_version,
             committed_object,
             visible_version,
             required_replica_node_ids,
             OffsetDateTime::now_utc(),
         );
+        commit_record.operation_id = operation_id.map(str::to_owned);
         let table_ops = visible_commit_table_ops(&self.tables, &commit_record);
         self.write_journal_entry_and_apply_table_ops_unlocked(
             DfsMetadataMutation::commit_visible_version(&commit_record),
@@ -9366,6 +9386,14 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
     fn apply_namespace_transaction(
         &mut self,
         transaction: &DfsNamespaceTransaction,
+    ) -> Result<DfsMetadataJournalEntry> {
+        self.apply_namespace_transaction_with_operation_id(transaction, None)
+    }
+
+    fn apply_namespace_transaction_with_operation_id(
+        &mut self,
+        transaction: &DfsNamespaceTransaction,
+        operation_id: Option<&str>,
     ) -> Result<DfsMetadataJournalEntry> {
         let _lock = self.begin_metadata_write()?;
         if self.get_file_system(&transaction.file_system_id)?.is_none() {
@@ -9430,6 +9458,7 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 file_system_id: transaction.file_system_id.clone(),
                 transaction_id: transaction.transaction_id.clone(),
                 object_count: transaction.objects.len(),
+                operation_id: operation_id.map(str::to_owned),
                 transaction: Some(transaction),
             })?;
         let mut table_ops = Vec::new();
@@ -14913,6 +14942,8 @@ mod tests {
             base_version: Some(current.version.clone()),
             target_version: version("version_intent_rebind_2"),
             coordinator_node_id: node("node_requester"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 7,
             desired_replica_node_ids: vec![node("node_owner"), node("node_replica")],
             policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
@@ -15668,6 +15699,8 @@ mod tests {
             base_version: Some(object.version.clone()),
             target_version: version("version_2"),
             coordinator_node_id: node("node_owner"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 0,
             desired_replica_node_ids: vec![node("node_owner"), node("node_replica")],
             policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
@@ -15735,6 +15768,8 @@ mod tests {
             base_version: Some(source_object.version.clone()),
             target_version: version("version_2"),
             coordinator_node_id: node("node_owner"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 1,
             desired_replica_node_ids: vec![node("node_owner")],
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -16692,6 +16727,8 @@ mod tests {
             base_version: Some(version("version_sharded_snapshot_base")),
             target_version: version("version_sharded_snapshot_target"),
             coordinator_node_id: node("node_owner"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 1,
             desired_replica_node_ids: vec![node("node_owner")],
             policy: DfsReplicationPolicy::new(1, 1).expect("replication policy"),
@@ -16964,6 +17001,8 @@ mod tests {
                 base_version: Some(version("version_0")),
                 target_version: version(&format!("version_{}", index + 1)),
                 coordinator_node_id: node("node_owner"),
+                operation_id: None,
+                operation_order_token: None,
                 owner_epoch: 1,
                 desired_replica_node_ids: vec![node("node_owner")],
                 policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -17016,6 +17055,8 @@ mod tests {
                 base_version: Some(version("version_0")),
                 target_version: target_version.clone(),
                 coordinator_node_id: node("node_owner"),
+                operation_id: None,
+                operation_order_token: None,
                 owner_epoch: 1,
                 desired_replica_node_ids: vec![node("node_owner")],
                 policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -17078,6 +17119,8 @@ mod tests {
             base_version: None,
             target_version: version("version_transient_2"),
             coordinator_node_id: node("node_owner"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 1,
             desired_replica_node_ids: vec![node("node_owner")],
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -17120,6 +17163,8 @@ mod tests {
             base_version: Some(moved_object.version.clone()),
             target_version: version("version_stale_source_2"),
             coordinator_node_id: node("node_owner"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 1,
             desired_replica_node_ids: vec![node("node_owner")],
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -17261,6 +17306,8 @@ mod tests {
             base_version: None,
             target_version: target_version.clone(),
             coordinator_node_id: node("node_owner"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 1,
             desired_replica_node_ids: vec![node("node_owner")],
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -17315,6 +17362,8 @@ mod tests {
             base_version: None,
             target_version: misrouted_version.clone(),
             coordinator_node_id: node("node_owner"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 1,
             desired_replica_node_ids: vec![node("node_owner")],
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -17937,6 +17986,8 @@ mod tests {
             base_version: Some(object.version.clone()),
             target_version: version("version_2"),
             coordinator_node_id: node("node_owner"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 1,
             desired_replica_node_ids: vec![node("node_owner")],
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -18469,6 +18520,8 @@ mod tests {
             base_version: None,
             target_version: child.version.clone(),
             coordinator_node_id: node("node_owner"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 1,
             desired_replica_node_ids: child.current_locations.clone(),
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -18661,6 +18714,8 @@ mod tests {
             base_version: Some(object.version.clone()),
             target_version: committed.version.clone(),
             coordinator_node_id: node("node_owner"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 1,
             desired_replica_node_ids: committed.current_locations.clone(),
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -18986,6 +19041,7 @@ mod tests {
                     file_system_id: durable_transaction.file_system_id.clone(),
                     transaction_id: durable_transaction.transaction_id.clone(),
                     object_count: durable_transaction.objects.len(),
+                    operation_id: None,
                     transaction: Some(durable_transaction.clone()),
                 })
                 .expect("durable namespace transaction append");
@@ -22501,6 +22557,8 @@ mod tests {
                 base_version: Some(version("version_0")),
                 target_version: version(&format!("version_{}", index + 1)),
                 coordinator_node_id: node("node_owner"),
+                operation_id: None,
+                operation_order_token: None,
                 owner_epoch: 1,
                 desired_replica_node_ids: vec![node("node_owner")],
                 policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -22589,6 +22647,8 @@ mod tests {
                 base_version: Some(version("version_0")),
                 target_version,
                 coordinator_node_id: node("node_owner"),
+                operation_id: None,
+                operation_order_token: None,
                 owner_epoch: 1,
                 desired_replica_node_ids: vec![node("node_owner")],
                 policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -23733,6 +23793,8 @@ mod tests {
             base_version: Some(version("version_1")),
             target_version: version("version_2"),
             coordinator_node_id: node("node_owner"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 0,
             desired_replica_node_ids: vec![node("node_owner"), node("node_replica")],
             policy: DfsReplicationPolicy::new(1, 2).expect("policy"),
@@ -25932,6 +25994,8 @@ mod tests {
             base_version: Some(file.version.clone()),
             target_version: version("version_1"),
             coordinator_node_id: node("node_owner"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 1,
             desired_replica_node_ids: vec![node("node_owner"), node("node_remote")],
             policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
@@ -28348,6 +28412,8 @@ mod tests {
             base_version: Some(version("version_intent_gc_base")),
             target_version: version("version_intent_gc_target"),
             coordinator_node_id: coordinator_node_id.clone(),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 7,
             desired_replica_node_ids: vec![node("node_owner")],
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),

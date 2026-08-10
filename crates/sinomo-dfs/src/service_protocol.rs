@@ -243,11 +243,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNetworkMessage::DistributedWriteResponse(response) => {
                 events.push(self.handle_distributed_write_response(source_node_id, response)?);
             }
+            DfsNetworkMessage::StableWriteReconciliationRequest(request) => {
+                events.push(
+                    self.handle_stable_write_reconciliation_request(source_node_id, request)?,
+                );
+            }
+            DfsNetworkMessage::StableWriteReconciliationResponse(response) => {
+                events.push(
+                    self.handle_stable_write_reconciliation_response(source_node_id, response)?,
+                );
+            }
             DfsNetworkMessage::NamespaceRequest(command) => {
                 events.push(self.handle_namespace_request(source_node_id, command)?);
             }
             DfsNetworkMessage::NamespaceResponse(response) => {
                 events.push(self.handle_namespace_response(source_node_id, response)?);
+            }
+            DfsNetworkMessage::StableNamespaceReconciliationRequest(request) => {
+                events.push(
+                    self.handle_stable_namespace_reconciliation_request(source_node_id, request)?,
+                );
+            }
+            DfsNetworkMessage::StableNamespaceReconciliationResponse(response) => {
+                events.push(
+                    self.handle_stable_namespace_reconciliation_response(source_node_id, response)?,
+                );
             }
             DfsNetworkMessage::MetadataJournalBatch(command) => {
                 events.push(self.handle_metadata_journal_batch(source_node_id, command)?);

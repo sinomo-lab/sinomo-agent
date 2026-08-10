@@ -1322,29 +1322,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 objects.push(parent.clone());
                 versions.push(object_version_record(parent, parent.content_size_bytes));
             }
-            backend.apply_namespace_transaction(&DfsNamespaceTransaction {
-                transaction_id: namespace_transaction_id_for_object(
-                    "create-visible",
-                    &pending.object_id,
-                    &pending.version,
-                ),
-                file_system_id: committed_object.file_system_id.clone(),
-                objects,
-                versions,
-                advisory_lock_states: Vec::new(),
-                created_at: OffsetDateTime::now_utc(),
-            })?;
+            backend.apply_namespace_transaction_with_operation_id(
+                &DfsNamespaceTransaction {
+                    transaction_id: namespace_transaction_id_for_object(
+                        "create-visible",
+                        &pending.object_id,
+                        &pending.version,
+                    ),
+                    file_system_id: committed_object.file_system_id.clone(),
+                    objects,
+                    versions,
+                    advisory_lock_states: Vec::new(),
+                    created_at: OffsetDateTime::now_utc(),
+                },
+                intent.operation_id.as_deref(),
+            )?;
             if let Some(parent) = parent_touch {
                 self.metadata.add_object(parent)?;
                 self.clear_metadata_lookup_cache();
             }
             return Ok(());
         }
-        backend.commit_visible_version(
+        backend.commit_visible_version_with_operation_id(
             &expected_object.version,
             &committed_object,
             &visible_version,
             &required_replica_node_ids,
+            intent.operation_id.as_deref(),
         )?;
         Ok(())
     }
@@ -2178,6 +2182,8 @@ mod atomic_create_parent_touch_tests {
             base_version: None,
             target_version: DfsVersion::from_legacy_named("version_2").expect("version"),
             requesting_node_id: node("node_create_path_fence"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 1,
             desired_replica_nodes: vec![node("node_create_path_fence")],
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),

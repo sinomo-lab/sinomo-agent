@@ -16,6 +16,7 @@ use sinomo_core::network::NetworkError;
 use sinomo_core::node::NodeId;
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 
+use crate::intent::{stable_operation_order_token, stable_write_intent_id};
 use crate::transfer::{PendingNetworkedWrite, PendingNetworkedWritePatch};
 use crate::*;
 
@@ -279,19 +280,85 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         touch_parent_on_create: bool,
         foreground_replica_repair: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        self.write_distributed_eventual_from_reader_with_candidates_and_parent_touch_and_operation_id(
+            request,
+            reader,
+            candidate_nodes,
+            policy,
+            touch_parent_on_create,
+            foreground_replica_repair,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_distributed_eventual_from_reader_with_candidates_and_parent_touch_and_operation_id<
+        R: Read,
+    >(
+        &mut self,
+        request: DfsWriteRequest,
+        reader: R,
+        candidate_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
+        foreground_replica_repair: bool,
+        operation_id: Option<String>,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let plan =
             self.plan_distributed_eventual_replicas(&request, candidate_nodes, policy.clone())?;
-        self.write_distributed_eventual_from_reader_and_parent_touch(
+        self.write_distributed_eventual_from_reader_and_parent_touch_and_operation_id(
             request,
             reader,
             plan.desired_replica_nodes,
             policy,
             touch_parent_on_create,
             foreground_replica_repair,
+            operation_id,
         )
     }
 
+    /// Capture a caller reader once into immutable DFS content, then execute
+    /// an exact-base and optionally exclusive stable write from that manifest.
+    /// Routed retries reopen the captured manifest and never re-read the
+    /// caller's mutable source.
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_distributed_eventual_from_reader_with_candidates_and_base_and_parent_touch_and_operation_id_and_mode<
+        R: Read,
+    >(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        reader: R,
+        candidate_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
+        exclusive_create: bool,
+        foreground_replica_repair: bool,
+        operation_id: String,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        crate::service_routed_write::validate_write_operation_id(&operation_id)?;
+        let manifest = self.content.put_object_version_from_reader(
+            request.object_id.as_str(),
+            request.target_version.as_str(),
+            reader,
+        )?;
+        self.write_distributed_eventual_from_local_manifest_with_candidates_and_parent_touch_and_operation_id_and_mode(
+            request,
+            expected_base_version,
+            manifest.content_hash,
+            manifest.size_bytes,
+            candidate_nodes,
+            policy,
+            touch_parent_on_create,
+            exclusive_create,
+            foreground_replica_repair,
+            false,
+            true,
+            Some(operation_id),
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn write_distributed_eventual_from_local_manifest_with_candidates_and_parent_touch(
         &mut self,
         request: DfsWriteRequest,
@@ -305,38 +372,118 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         detach_request: bool,
         replay_response_journal: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        self.write_distributed_eventual_from_local_manifest_with_candidates_and_parent_touch_and_operation_id(
+            request,
+            expected_base_version,
+            content_hash,
+            content_size_bytes,
+            candidate_nodes,
+            policy,
+            touch_parent_on_create,
+            foreground_replica_repair,
+            detach_request,
+            replay_response_journal,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_distributed_eventual_from_local_manifest_with_candidates_and_parent_touch_and_operation_id(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        content_hash: String,
+        content_size_bytes: u64,
+        candidate_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
+        foreground_replica_repair: bool,
+        detach_request: bool,
+        replay_response_journal: bool,
+        operation_id: Option<String>,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        self.write_distributed_eventual_from_local_manifest_with_candidates_and_parent_touch_and_operation_id_and_mode(
+            request,
+            expected_base_version,
+            content_hash,
+            content_size_bytes,
+            candidate_nodes,
+            policy,
+            touch_parent_on_create,
+            false,
+            foreground_replica_repair,
+            detach_request,
+            replay_response_journal,
+            operation_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_distributed_eventual_from_local_manifest_with_candidates_and_parent_touch_and_operation_id_and_mode(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        content_hash: String,
+        content_size_bytes: u64,
+        candidate_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
+        exclusive_create: bool,
+        foreground_replica_repair: bool,
+        detach_request: bool,
+        replay_response_journal: bool,
+        operation_id: Option<String>,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let plan =
             self.plan_distributed_eventual_replicas(&request, candidate_nodes, policy.clone())?;
         let object = self.current_object_for_write(&request.object_id)?;
         if let Some(shard) = self.select_metadata_shard_for_object(&object)? {
             if shard.primary_node_id != self.node_id {
-                return self.route_distributed_manifest_write_to_metadata_primary(
+                return self
+                    .route_distributed_manifest_write_to_metadata_primary_with_operation_id_and_mode(
+                        request,
+                        expected_base_version,
+                        content_hash,
+                        content_size_bytes,
+                        plan.desired_replica_nodes,
+                        policy,
+                        object,
+                        shard,
+                        touch_parent_on_create,
+                        exclusive_create,
+                        foreground_replica_repair,
+                        detach_request,
+                        replay_response_journal,
+                        operation_id,
+                    );
+            }
+        }
+        match operation_id {
+            Some(operation_id) => self
+                .write_distributed_eventual_from_remote_manifest_with_base_and_parent_touch_and_operation_id(
                     request,
                     expected_base_version,
                     content_hash,
                     content_size_bytes,
                     plan.desired_replica_nodes,
                     policy,
-                    object,
-                    shard,
                     touch_parent_on_create,
+                    exclusive_create,
                     foreground_replica_repair,
-                    detach_request,
-                    replay_response_journal,
-                );
-            }
+                    operation_id,
+                ),
+            None => self.write_distributed_eventual_from_remote_manifest_with_base_and_parent_touch(
+                request,
+                expected_base_version,
+                content_hash,
+                content_size_bytes,
+                plan.desired_replica_nodes,
+                policy,
+                touch_parent_on_create,
+                exclusive_create,
+                foreground_replica_repair,
+            ),
         }
-        self.write_distributed_eventual_from_remote_manifest_with_base_and_parent_touch(
-            request,
-            expected_base_version,
-            content_hash,
-            content_size_bytes,
-            plan.desired_replica_nodes,
-            policy,
-            touch_parent_on_create,
-            false,
-            foreground_replica_repair,
-        )
     }
 
     pub fn write_replicated_confirmed(
@@ -425,8 +572,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         touch_parent_on_create: bool,
         foreground_replica_repair: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        self.write_distributed_eventual_from_reader_and_parent_touch_and_operation_id(
+            request,
+            reader,
+            desired_replica_nodes,
+            policy,
+            touch_parent_on_create,
+            foreground_replica_repair,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_distributed_eventual_from_reader_and_parent_touch_and_operation_id<
+        R: Read,
+    >(
+        &mut self,
+        request: DfsWriteRequest,
+        reader: R,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
+        foreground_replica_repair: bool,
+        operation_id: Option<String>,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let object = self.current_object_for_write(&request.object_id)?;
-        self.write_distributed_eventual_from_reader_with_base_and_parent_touch(
+        self.write_distributed_eventual_from_reader_with_base_and_parent_touch_and_operation_id(
             request,
             Some(object.version),
             reader,
@@ -434,6 +605,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             policy,
             touch_parent_on_create,
             foreground_replica_repair,
+            operation_id,
         )
     }
 
@@ -972,6 +1144,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         touch_parent_on_create: bool,
         foreground_replica_repair: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        self.write_distributed_eventual_from_reader_with_base_and_parent_touch_and_operation_id(
+            request,
+            expected_base_version,
+            reader,
+            desired_replica_nodes,
+            policy,
+            touch_parent_on_create,
+            foreground_replica_repair,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_distributed_eventual_from_reader_with_base_and_parent_touch_and_operation_id<
+        R: Read,
+    >(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        reader: R,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
+        foreground_replica_repair: bool,
+        operation_id: Option<String>,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        if let Some(operation_id) = operation_id.as_deref() {
+            crate::service_routed_write::validate_write_operation_id(operation_id)?;
+        }
         let PreparedDistributedWrite {
             object,
             desired_replica_nodes,
@@ -986,17 +1187,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )?;
         let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
             Some(shard) if shard.primary_node_id != self.node_id => {
-                return self.route_distributed_write_from_reader_to_metadata_primary(
-                    request,
-                    expected_base_version,
-                    reader,
-                    desired_replica_nodes,
-                    policy,
-                    object,
-                    shard,
-                    touch_parent_on_create,
-                    foreground_replica_repair,
-                );
+                return self
+                    .route_distributed_write_from_reader_to_metadata_primary_with_operation_id(
+                        request,
+                        expected_base_version,
+                        reader,
+                        desired_replica_nodes,
+                        policy,
+                        object,
+                        shard,
+                        touch_parent_on_create,
+                        foreground_replica_repair,
+                        operation_id,
+                    );
             }
             Some(shard) => shard.epoch,
             None if self.control_plane.is_none() => 0,
@@ -1006,6 +1209,48 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ));
             }
         };
+
+        // A stable operation captures its reader exactly once before replay
+        // admission. The finalized manifest is immutable, so transport retry
+        // and durable-outcome lookup never touch the caller's mutable source
+        // again.
+        let mut reader = Some(reader);
+        let captured_manifest = if operation_id.is_some() {
+            Some(self.content.put_object_version_from_reader(
+                request.object_id.as_str(),
+                request.target_version.as_str(),
+                reader.take().expect("stable reader captured once"),
+            )?)
+        } else {
+            None
+        };
+        if let (Some(operation_id), Some(manifest)) =
+            (operation_id.as_deref(), captured_manifest.as_ref())
+        {
+            let replay_command = DfsDistributedWriteCommand {
+                request_id: operation_id.to_string(),
+                request: request.clone(),
+                expected_base_version: expected_base_version.clone(),
+                metadata_journal_after_sequence: None,
+                bytes: Vec::new(),
+                content_hash: Some(manifest.content_hash.clone()),
+                content_size_bytes: Some(manifest.size_bytes),
+                requester_blob_pre_staged: true,
+                desired_replica_nodes: desired_replica_nodes.clone(),
+                policy: policy.clone(),
+                object_metadata: Some(object.clone()),
+                authority_shard: None,
+                touch_parent_on_create,
+                foreground_replica_repair,
+                exclusive_create: false,
+            };
+            let requester_node_id = request.requesting_node_id.clone();
+            if let Some(outcome) =
+                self.replayed_routed_write_outcome_if_known(&requester_node_id, &replay_command)?
+            {
+                return Ok(outcome);
+            }
+        }
 
         if expected_base_version
             .as_ref()
@@ -1040,13 +1285,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(error.into());
         }
 
-        let manifest = self.content.put_object_version_from_reader(
-            request.object_id.as_str(),
-            request.target_version.as_str(),
-            reader,
-        )?;
+        let manifest = match captured_manifest {
+            Some(manifest) => manifest,
+            None => self.content.put_object_version_from_reader(
+                request.object_id.as_str(),
+                request.target_version.as_str(),
+                reader.expect("legacy reader remains available until content ingest"),
+            )?,
+        };
 
-        if self.control_plane.is_none()
+        if operation_id.is_none()
+            && self.control_plane.is_none()
             && !touch_parent_on_create
             && object.policy == DfsObjectPolicy::ReplicatedEventual
             && policy.min_commit_replicas == 1
@@ -1089,18 +1338,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
 
-        let intent = match self.coordinator.create_intent_at_epoch_with_parent_touch(
-            request.file_system_id.clone(),
-            request.object_id.clone(),
-            expected_base_version.clone(),
-            request.target_version.clone(),
-            request.requesting_node_id.clone(),
-            owner_epoch,
-            desired_replica_nodes.clone(),
-            policy,
-            touch_parent_on_create,
-            create_predecessor_object_id,
-        ) {
+        let explicit_intent_id = operation_id.as_deref().map(|operation_id| {
+            stable_write_intent_id(
+                &request.requesting_node_id,
+                &request.object_id,
+                operation_id,
+            )
+        });
+        let intent = match self
+            .coordinator
+            .create_intent_at_epoch_with_parent_touch_and_id(
+                request.file_system_id.clone(),
+                request.object_id.clone(),
+                expected_base_version.clone(),
+                request.target_version.clone(),
+                request.requesting_node_id.clone(),
+                owner_epoch,
+                desired_replica_nodes.clone(),
+                policy,
+                touch_parent_on_create,
+                create_predecessor_object_id,
+                explicit_intent_id,
+                operation_id.clone(),
+                operation_id
+                    .as_deref()
+                    .and_then(stable_operation_order_token),
+            ) {
             Ok(intent) => intent,
             Err(error)
                 if object.policy == DfsObjectPolicy::ReplicatedEventual
@@ -1196,10 +1459,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             exclusive_create,
             foreground_replica_repair,
             vec![requester_node_id],
+            None,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_distributed_eventual_from_remote_manifest_with_base_and_parent_touch_and_operation_id(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        content_hash: String,
+        content_size_bytes: u64,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
+        exclusive_create: bool,
+        foreground_replica_repair: bool,
+        operation_id: String,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        let requester_node_id = request.requesting_node_id.clone();
+        self.write_distributed_eventual_from_manifest_with_initial_receipts(
+            request,
+            expected_base_version,
+            content_hash,
+            content_size_bytes,
+            None,
+            desired_replica_nodes,
+            policy,
+            touch_parent_on_create,
+            exclusive_create,
+            foreground_replica_repair,
+            vec![requester_node_id],
+            Some(operation_id),
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn write_distributed_eventual_from_quarantined_blob_with_base_and_parent_touch(
         &mut self,
         request: DfsWriteRequest,
@@ -1229,10 +1524,46 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             exclusive_create,
             foreground_replica_repair,
             initial_receipt_node_ids,
+            None,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_distributed_eventual_from_quarantined_blob_with_base_and_parent_touch_and_operation_id(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        blob: ContentStoreQuarantinedBlob,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
+        exclusive_create: bool,
+        foreground_replica_repair: bool,
+        operation_id: String,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        let content_hash = blob.content_hash.clone();
+        let content_size_bytes = blob.size_bytes;
+        let initial_receipt_node_ids = desired_replica_nodes
+            .contains(&self.node_id)
+            .then(|| vec![self.node_id.clone()])
+            .unwrap_or_default();
+        self.write_distributed_eventual_from_manifest_with_initial_receipts(
+            request,
+            expected_base_version,
+            content_hash,
+            content_size_bytes,
+            Some(blob),
+            desired_replica_nodes,
+            policy,
+            touch_parent_on_create,
+            exclusive_create,
+            foreground_replica_repair,
+            initial_receipt_node_ids,
+            Some(operation_id),
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn write_distributed_eventual_from_ingested_manifest_with_base_and_parent_touch(
         &mut self,
         request: DfsWriteRequest,
@@ -1261,6 +1592,41 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             exclusive_create,
             foreground_replica_repair,
             initial_receipt_node_ids,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_distributed_eventual_from_ingested_manifest_with_base_and_parent_touch_and_operation_id(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        content_hash: String,
+        content_size_bytes: u64,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
+        exclusive_create: bool,
+        foreground_replica_repair: bool,
+        operation_id: String,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        let initial_receipt_node_ids = desired_replica_nodes
+            .contains(&self.node_id)
+            .then(|| vec![self.node_id.clone()])
+            .unwrap_or_default();
+        self.write_distributed_eventual_from_manifest_with_initial_receipts(
+            request,
+            expected_base_version,
+            content_hash,
+            content_size_bytes,
+            None,
+            desired_replica_nodes,
+            policy,
+            touch_parent_on_create,
+            exclusive_create,
+            foreground_replica_repair,
+            initial_receipt_node_ids,
+            Some(operation_id),
         )
     }
 
@@ -1275,10 +1641,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
         touch_parent_on_create: bool,
-        _exclusive_create: bool,
+        exclusive_create: bool,
         foreground_replica_repair: bool,
         initial_receipt_node_ids: Vec<NodeId>,
+        operation_id: Option<String>,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        if let Some(operation_id) = operation_id.as_deref() {
+            crate::service_routed_write::validate_write_operation_id(operation_id)?;
+        }
         let trace_started = Instant::now();
         let trace_object_id = request.object_id.clone();
         let trace_version = request.target_version.clone();
@@ -1288,7 +1658,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_policy_desired = policy.desired_replicas;
         let trace_content_size_bytes = content_size_bytes;
         let PreparedDistributedWrite {
-            object,
+            mut object,
             desired_replica_nodes,
             policy,
             touch_parent_on_create,
@@ -1317,6 +1687,48 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // shard assignment. A second barrier here only adds a WAN round trip (most
         // visibly for first publication of a newly created file).
         let owner_epoch = self.local_metadata_owner_epoch_hint_for_object(&object)?;
+
+        if let Some(operation_id) = operation_id.as_deref() {
+            let mut replay_command = DfsDistributedWriteCommand {
+                request_id: operation_id.to_string(),
+                request: request.clone(),
+                expected_base_version: expected_base_version.clone(),
+                metadata_journal_after_sequence: None,
+                bytes: Vec::new(),
+                content_hash: Some(content_hash.clone()),
+                content_size_bytes: Some(content_size_bytes),
+                requester_blob_pre_staged: true,
+                desired_replica_nodes: desired_replica_nodes.clone(),
+                policy: policy.clone(),
+                object_metadata: Some(object.clone()),
+                authority_shard: None,
+                touch_parent_on_create,
+                foreground_replica_repair,
+                exclusive_create,
+            };
+            if exclusive_create {
+                let event_id =
+                    crate::service_routed_write::routed_exclusive_create_event_id(&replay_command)
+                        .ok_or_else(|| DfsError::Serialization {
+                            message: "stable exclusive create is missing object metadata"
+                                .to_string(),
+                        })?;
+                object.last_modified_by_event_id = Some(event_id);
+                replay_command.object_metadata = Some(object.clone());
+                if self
+                    .transient_metadata_object_ids
+                    .contains(&object.object_id)
+                {
+                    self.add_transient_object_metadata(object.clone())?;
+                }
+            }
+            let requester_node_id = request.requesting_node_id.clone();
+            if let Some(outcome) =
+                self.replayed_routed_write_outcome_if_known(&requester_node_id, &replay_command)?
+            {
+                return Ok(outcome);
+            }
+        }
 
         if expected_base_version
             .as_ref()
@@ -1360,18 +1772,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
 
         let create_intent_started = Instant::now();
-        let intent = match self.coordinator.create_intent_at_epoch_with_parent_touch(
-            request.file_system_id.clone(),
-            request.object_id.clone(),
-            expected_base_version.clone(),
-            request.target_version.clone(),
-            request.requesting_node_id.clone(),
-            owner_epoch,
-            desired_replica_nodes.clone(),
-            policy,
-            touch_parent_on_create,
-            create_predecessor_object_id,
-        ) {
+        let explicit_intent_id = operation_id.as_deref().map(|operation_id| {
+            stable_write_intent_id(
+                &request.requesting_node_id,
+                &request.object_id,
+                operation_id,
+            )
+        });
+        let intent = match self
+            .coordinator
+            .create_intent_at_epoch_with_parent_touch_and_id(
+                request.file_system_id.clone(),
+                request.object_id.clone(),
+                expected_base_version.clone(),
+                request.target_version.clone(),
+                request.requesting_node_id.clone(),
+                owner_epoch,
+                desired_replica_nodes.clone(),
+                policy,
+                touch_parent_on_create,
+                create_predecessor_object_id,
+                explicit_intent_id,
+                operation_id.clone(),
+                operation_id
+                    .as_deref()
+                    .and_then(stable_operation_order_token),
+            ) {
             Ok(intent) => intent,
             Err(error)
                 if object.policy == DfsObjectPolicy::ReplicatedEventual
@@ -1543,8 +1969,41 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         detach_remote_primary_request: bool,
         replay_response_journal: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        self.write_distributed_eventual_with_base_and_parent_touch_and_repair_mode_and_operation_id(
+            request,
+            expected_base_version,
+            bytes,
+            desired_replica_nodes,
+            policy,
+            touch_parent_on_create,
+            exclusive_create,
+            foreground_replica_repair,
+            detach_remote_primary_request,
+            replay_response_journal,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_distributed_eventual_with_base_and_parent_touch_and_repair_mode_and_operation_id(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        bytes: Vec<u8>,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
+        exclusive_create: bool,
+        foreground_replica_repair: bool,
+        detach_remote_primary_request: bool,
+        replay_response_journal: bool,
+        operation_id: Option<String>,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        if let Some(operation_id) = operation_id.as_deref() {
+            crate::service_routed_write::validate_write_operation_id(operation_id)?;
+        }
         let PreparedDistributedWrite {
-            object,
+            mut object,
             desired_replica_nodes,
             policy,
             touch_parent_on_create,
@@ -1557,7 +2016,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )?;
         let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
             Some(shard) if shard.primary_node_id != self.node_id => {
-                return self.route_distributed_write_to_metadata_primary(
+                return self.route_distributed_write_to_metadata_primary_with_operation_id(
                     request,
                     expected_base_version,
                     bytes,
@@ -1570,6 +2029,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     foreground_replica_repair,
                     detach_remote_primary_request,
                     replay_response_journal,
+                    operation_id,
                 );
             }
             Some(shard) => shard.epoch,
@@ -1580,6 +2040,48 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ));
             }
         };
+
+        if let Some(operation_id) = operation_id.as_deref() {
+            let mut replay_command = DfsDistributedWriteCommand {
+                request_id: operation_id.to_string(),
+                request: request.clone(),
+                expected_base_version: expected_base_version.clone(),
+                metadata_journal_after_sequence: None,
+                bytes: Vec::new(),
+                content_hash: Some(content_hash(&bytes)),
+                content_size_bytes: Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+                requester_blob_pre_staged: false,
+                desired_replica_nodes: desired_replica_nodes.clone(),
+                policy: policy.clone(),
+                object_metadata: Some(object.clone()),
+                authority_shard: None,
+                touch_parent_on_create,
+                foreground_replica_repair,
+                exclusive_create,
+            };
+            if exclusive_create {
+                let event_id =
+                    crate::service_routed_write::routed_exclusive_create_event_id(&replay_command)
+                        .ok_or_else(|| DfsError::Serialization {
+                            message: "stable exclusive create is missing object metadata"
+                                .to_string(),
+                        })?;
+                object.last_modified_by_event_id = Some(event_id);
+                replay_command.object_metadata = Some(object.clone());
+                if self
+                    .transient_metadata_object_ids
+                    .contains(&object.object_id)
+                {
+                    self.add_transient_object_metadata(object.clone())?;
+                }
+            }
+            let requester_node_id = request.requesting_node_id.clone();
+            if let Some(outcome) =
+                self.replayed_routed_write_outcome_if_known(&requester_node_id, &replay_command)?
+            {
+                return Ok(outcome);
+            }
+        }
 
         if expected_base_version
             .as_ref()
@@ -1614,7 +2116,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(error.into());
         }
 
-        if self.control_plane.is_none()
+        if operation_id.is_none()
+            && self.control_plane.is_none()
             && !touch_parent_on_create
             && object.policy == DfsObjectPolicy::ReplicatedEventual
             && policy.min_commit_replicas == 1
@@ -1677,18 +2180,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )?;
         let content_elapsed = content_started.elapsed();
         let create_intent_started = Instant::now();
-        let intent = match self.coordinator.create_intent_at_epoch_with_parent_touch(
-            request.file_system_id.clone(),
-            request.object_id.clone(),
-            expected_base_version.clone(),
-            request.target_version.clone(),
-            request.requesting_node_id.clone(),
-            owner_epoch,
-            desired_replica_nodes.clone(),
-            policy,
-            touch_parent_on_create,
-            create_predecessor_object_id,
-        ) {
+        let explicit_intent_id = operation_id.as_deref().map(|operation_id| {
+            stable_write_intent_id(
+                &request.requesting_node_id,
+                &request.object_id,
+                operation_id,
+            )
+        });
+        let intent = match self
+            .coordinator
+            .create_intent_at_epoch_with_parent_touch_and_id(
+                request.file_system_id.clone(),
+                request.object_id.clone(),
+                expected_base_version.clone(),
+                request.target_version.clone(),
+                request.requesting_node_id.clone(),
+                owner_epoch,
+                desired_replica_nodes.clone(),
+                policy,
+                touch_parent_on_create,
+                create_predecessor_object_id,
+                explicit_intent_id,
+                operation_id.clone(),
+                operation_id
+                    .as_deref()
+                    .and_then(stable_operation_order_token),
+            ) {
             Ok(intent) => intent,
             Err(error)
                 if object.policy == DfsObjectPolicy::ReplicatedEventual
@@ -1815,6 +2332,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn route_distributed_write_to_metadata_primary(
         &mut self,
         request: DfsWriteRequest,
@@ -1830,7 +2348,47 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         detach_request: bool,
         replay_response_journal: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
-        let request_id = self.next_request_id();
+        self.route_distributed_write_to_metadata_primary_with_operation_id(
+            request,
+            expected_base_version,
+            bytes,
+            desired_replica_nodes,
+            policy,
+            object,
+            shard,
+            touch_parent_on_create,
+            exclusive_create,
+            foreground_replica_repair,
+            detach_request,
+            replay_response_journal,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn route_distributed_write_to_metadata_primary_with_operation_id(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        bytes: Vec<u8>,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        object: DfsObjectMetadata,
+        shard: DfsMetadataShardConfig,
+        touch_parent_on_create: bool,
+        exclusive_create: bool,
+        foreground_replica_repair: bool,
+        detach_request: bool,
+        replay_response_journal: bool,
+        operation_id: Option<String>,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        let request_id = match operation_id {
+            Some(operation_id) => {
+                crate::service_routed_write::validate_write_operation_id(&operation_id)?;
+                operation_id
+            }
+            None => self.next_request_id(),
+        };
         let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
         let metadata_journal_after_sequence = if !detach_request && replay_response_journal {
             self.local_metadata_journal_after_sequence_for_shard(&shard_id)?
@@ -1903,7 +2461,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn route_distributed_manifest_write_to_metadata_primary(
         &mut self,
         request: DfsWriteRequest,
@@ -1919,7 +2477,83 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         detach_request: bool,
         replay_response_journal: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
-        let request_id = self.next_request_id();
+        self.route_distributed_manifest_write_to_metadata_primary_with_operation_id(
+            request,
+            expected_base_version,
+            content_hash,
+            content_size_bytes,
+            desired_replica_nodes,
+            policy,
+            object,
+            shard,
+            touch_parent_on_create,
+            foreground_replica_repair,
+            detach_request,
+            replay_response_journal,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn route_distributed_manifest_write_to_metadata_primary_with_operation_id(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        content_hash: String,
+        content_size_bytes: u64,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        object: DfsObjectMetadata,
+        shard: DfsMetadataShardConfig,
+        touch_parent_on_create: bool,
+        foreground_replica_repair: bool,
+        detach_request: bool,
+        replay_response_journal: bool,
+        operation_id: Option<String>,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        self.route_distributed_manifest_write_to_metadata_primary_with_operation_id_and_mode(
+            request,
+            expected_base_version,
+            content_hash,
+            content_size_bytes,
+            desired_replica_nodes,
+            policy,
+            object,
+            shard,
+            touch_parent_on_create,
+            false,
+            foreground_replica_repair,
+            detach_request,
+            replay_response_journal,
+            operation_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn route_distributed_manifest_write_to_metadata_primary_with_operation_id_and_mode(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        content_hash: String,
+        content_size_bytes: u64,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        object: DfsObjectMetadata,
+        shard: DfsMetadataShardConfig,
+        touch_parent_on_create: bool,
+        exclusive_create: bool,
+        foreground_replica_repair: bool,
+        detach_request: bool,
+        replay_response_journal: bool,
+        operation_id: Option<String>,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        let request_id = match operation_id {
+            Some(operation_id) => {
+                crate::service_routed_write::validate_write_operation_id(&operation_id)?;
+                operation_id
+            }
+            None => self.next_request_id(),
+        };
         let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
         let metadata_journal_after_sequence = if !detach_request && replay_response_journal {
             self.local_metadata_journal_after_sequence_for_shard(&shard_id)?
@@ -1942,9 +2576,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             authority_shard: Some(shard.clone()),
             touch_parent_on_create,
             foreground_replica_repair,
-            exclusive_create: false,
+            exclusive_create,
         };
-        let message = DfsNetworkMessage::DistributedWriteRequest(command.clone());
+        let message = if exclusive_create {
+            DfsNetworkMessage::ExclusiveCreateRequest(command.clone())
+        } else {
+            DfsNetworkMessage::DistributedWriteRequest(command.clone())
+        };
         let sent = if detach_request {
             self.send_dfs_message_if_routable_detached(&primary_node_id, message)?
         } else {
@@ -1965,6 +2603,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         ))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn route_distributed_write_from_reader_to_metadata_primary<R: Read>(
         &mut self,
         request: DfsWriteRequest,
@@ -1976,6 +2615,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shard: DfsMetadataShardConfig,
         touch_parent_on_create: bool,
         foreground_replica_repair: bool,
+    ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        self.route_distributed_write_from_reader_to_metadata_primary_with_operation_id(
+            request,
+            expected_base_version,
+            reader,
+            desired_replica_nodes,
+            policy,
+            object,
+            shard,
+            touch_parent_on_create,
+            foreground_replica_repair,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn route_distributed_write_from_reader_to_metadata_primary_with_operation_id<
+        R: Read,
+    >(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: Option<DfsVersion>,
+        reader: R,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        object: DfsObjectMetadata,
+        shard: DfsMetadataShardConfig,
+        touch_parent_on_create: bool,
+        foreground_replica_repair: bool,
+        operation_id: Option<String>,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         if !desired_replica_nodes.contains(&request.requesting_node_id) {
             return Err(DfsError::Distributed {
@@ -1992,6 +2661,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_desired_count = desired_replica_nodes.len();
         let trace_policy_min = policy.min_commit_replicas;
         let trace_policy_desired = policy.desired_replicas;
+        let request_id = match operation_id {
+            Some(operation_id) => {
+                crate::service_routed_write::validate_write_operation_id(&operation_id)?;
+                operation_id
+            }
+            None => self.next_request_id(),
+        };
         let capture_started = Instant::now();
         let manifest = self.content.put_object_version_from_reader(
             request.object_id.as_str(),
@@ -1999,7 +2675,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             reader,
         )?;
         let capture_elapsed = capture_started.elapsed();
-        let request_id = self.next_request_id();
         let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
         let metadata_sequence_started = Instant::now();
         let metadata_journal_after_sequence =

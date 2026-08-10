@@ -9,7 +9,9 @@
 mod attrs;
 mod cross_shard;
 #[cfg(test)]
-pub(crate) use cross_shard::cross_shard_object_version_record;
+pub(crate) use cross_shard::{
+    cross_shard_object_version_record, install_hardlink_alias_after_commit_test_hook,
+};
 mod jobs;
 mod links;
 pub(crate) mod locks;
@@ -64,6 +66,7 @@ pub(crate) fn reset_posix_bulk_parent_touch_constructions() {
 }
 
 use crate::dfs_now_unix_nanos as now_unix_nanos;
+use crate::intent::{stable_create_object_id, stable_write_target_version};
 use crate::metadata_records::object_version_record;
 use crate::namespace::{
     initial_version, namespace_transaction_id_for_batch, namespace_transaction_id_for_object,
@@ -582,6 +585,47 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.posix_mkdir_local(path)
     }
 
+    /// Create one directory under a caller-owned durable operation identity.
+    ///
+    /// Clustered local-primary execution and routed execution both enter the
+    /// same durable namespace admission table before touching the directory.
+    /// An exact retry therefore replays the canonical response, while reuse of
+    /// the id for another path or operation is rejected as a digest conflict.
+    pub fn posix_mkdir_with_operation_id(
+        &mut self,
+        path: &str,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        crate::service_routed_namespace::validate_namespace_operation_id(operation_id)?;
+        let normalized = normalize_posix_path(path)?;
+        let operation = DfsNamespaceOperation::Mkdir {
+            path: path.to_string(),
+        };
+        if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
+            self.route_namespace_operation_with_request_id(
+                operation_id.to_string(),
+                primary,
+                operation,
+            )?;
+            return self.stat_routed_namespace_result(&normalized, false);
+        }
+        if self.control_plane.is_some() {
+            self.execute_local_primary_namespace_operation_with_request_id(
+                operation_id.to_string(),
+                operation,
+            )?;
+            return self.stat_object(&self.lookup_sifs_path(&normalized)?.ok_or_else(|| {
+                DfsPosixError::NotFound {
+                    path: normalized.clone(),
+                }
+            })?);
+        }
+        Err(DfsPosixError::Dfs(DfsError::Distributed {
+            message: "stable mkdir requires a committed control-plane shard view for durable request admission"
+                .to_string(),
+        }))
+    }
+
     pub fn posix_mkdir_with_create_attrs(
         &mut self,
         path: &str,
@@ -599,6 +643,46 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return self.stat_routed_namespace_result(&normalized, false);
         }
         self.posix_mkdir_local_with_create_attrs(path, attrs)
+    }
+
+    /// Create one attributed directory under a caller-owned durable operation
+    /// identity. The path, attributes, requester, and operation kind are bound
+    /// into the durable command digest before the destination-absent mutation.
+    pub fn posix_mkdir_with_create_attrs_and_operation_id(
+        &mut self,
+        path: &str,
+        attrs: DfsPosixCreateAttrs,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        crate::service_routed_namespace::validate_namespace_operation_id(operation_id)?;
+        let normalized = normalize_posix_path(path)?;
+        let operation = DfsNamespaceOperation::MkdirWithAttrs {
+            path: path.to_string(),
+            attrs,
+        };
+        if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
+            self.route_namespace_operation_with_request_id(
+                operation_id.to_string(),
+                primary,
+                operation,
+            )?;
+            return self.stat_routed_namespace_result(&normalized, false);
+        }
+        if self.control_plane.is_some() {
+            self.execute_local_primary_namespace_operation_with_request_id(
+                operation_id.to_string(),
+                operation,
+            )?;
+            return self.stat_object(&self.lookup_sifs_path(&normalized)?.ok_or_else(|| {
+                DfsPosixError::NotFound {
+                    path: normalized.clone(),
+                }
+            })?);
+        }
+        Err(DfsPosixError::Dfs(DfsError::Distributed {
+            message: "stable mkdir requires a committed control-plane shard view for durable request admission"
+                .to_string(),
+        }))
     }
 
     pub(crate) fn posix_inherit_create_attrs_from_parent_local(
@@ -1165,6 +1249,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    /// Write or create a file under a caller-owned idempotency key.
+    ///
+    /// Reusing `operation_id` with the same payload replays the exact durable
+    /// outcome across response loss and service restart. Reusing it for a
+    /// different payload is rejected.
+    pub fn posix_write_file_with_operation_id(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_bytes_checked_parent_with_operation_id(
+            path,
+            bytes,
+            options,
+            true,
+            true,
+            true,
+            None,
+            false,
+            false,
+            Some(operation_id.to_string()),
+        )
+    }
+
     /// Replace an existing file only while its stable identity and visible
     /// version still match the caller's snapshot.
     ///
@@ -1192,6 +1302,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             false,
             Some((expected_object_id, expected_version)),
             true,
+        )
+    }
+
+    /// Compare-and-replace with a durable caller-owned operation identity.
+    pub fn posix_replace_file_if_version_with_operation_id(
+        &mut self,
+        path: &str,
+        expected_object_id: &DfsObjectId,
+        expected_version: &DfsVersion,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        crate::service_routed_write::validate_write_operation_id(operation_id)?;
+        self.posix_write_file_bytes_checked_parent_once_with_operation_id(
+            path,
+            bytes,
+            options,
+            true,
+            false,
+            true,
+            None,
+            false,
+            false,
+            Some((expected_object_id, expected_version)),
+            true,
+            Some(operation_id),
         )
     }
 
@@ -1240,6 +1377,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    /// Exclusively create an empty file under a durable operation identity.
+    pub fn posix_create_file_with_attrs_and_operation_id(
+        &mut self,
+        path: &str,
+        options: DfsWriteOptions,
+        attrs: DfsPosixCreateAttrs,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_bytes_checked_parent_with_operation_id(
+            path,
+            &[],
+            options,
+            true,
+            true,
+            true,
+            Some(attrs),
+            true,
+            false,
+            Some(operation_id.to_string()),
+        )
+    }
+
     /// Create a new regular file with content and final POSIX attributes in
     /// one exclusive namespace operation.
     ///
@@ -1267,6 +1426,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    /// Exclusively create a content-bearing file under a durable operation
+    /// identity.
+    pub fn posix_create_file_with_contents_and_attrs_and_operation_id(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+        attrs: DfsPosixCreateAttrs,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_bytes_checked_parent_with_operation_id(
+            path,
+            bytes,
+            options,
+            true,
+            true,
+            true,
+            Some(attrs),
+            true,
+            false,
+            Some(operation_id.to_string()),
+        )
+    }
+
     /// Create a new regular file with content, inheriting the ordinary
     /// filesystem create attributes. Existing paths are rejected atomically.
     pub fn posix_create_file(
@@ -1277,6 +1460,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsStat> {
         self.posix_write_file_bytes_checked_parent(
             path, bytes, options, true, true, true, None, true, false,
+        )
+    }
+
+    /// Exclusively create a file under a durable operation identity.
+    pub fn posix_create_file_with_operation_id(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_bytes_checked_parent_with_operation_id(
+            path,
+            bytes,
+            options,
+            true,
+            true,
+            true,
+            None,
+            true,
+            false,
+            Some(operation_id.to_string()),
         )
     }
 
@@ -2557,6 +2762,75 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.posix_write_file_from_reader_checked_parent(path, reader, options, true, true, None)
     }
 
+    /// Reader-backed write under a durable caller-owned operation identity.
+    /// The reader is captured once into immutable content before any routed
+    /// retry can occur.
+    pub fn posix_write_file_from_reader_with_operation_id<R: Read>(
+        &mut self,
+        path: &str,
+        reader: R,
+        options: DfsWriteOptions,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_from_reader_checked_parent_with_operation_id(
+            path,
+            reader,
+            options,
+            true,
+            true,
+            None,
+            Some(operation_id.to_string()),
+        )
+    }
+
+    /// Exclusively create a file from a reader under a durable caller-owned
+    /// operation identity. The reader is captured once; response recovery and
+    /// authority redirects reuse immutable DFS content.
+    pub fn posix_create_file_from_reader_with_operation_id<R: Read>(
+        &mut self,
+        path: &str,
+        reader: R,
+        options: DfsWriteOptions,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_from_reader_checked_parent_with_operation_id_and_mode(
+            path,
+            reader,
+            options,
+            true,
+            true,
+            None,
+            true,
+            None,
+            Some(operation_id.to_string()),
+        )
+    }
+
+    /// Replace an exact object/version snapshot from a reader under a durable
+    /// operation identity. A recreated path or stale visible version is a
+    /// conflict and is never refreshed into a blind overwrite.
+    pub fn posix_replace_file_if_version_from_reader_with_operation_id<R: Read>(
+        &mut self,
+        path: &str,
+        expected_object_id: &DfsObjectId,
+        expected_version: &DfsVersion,
+        reader: R,
+        options: DfsWriteOptions,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_from_reader_checked_parent_with_operation_id_and_mode(
+            path,
+            reader,
+            options,
+            true,
+            false,
+            None,
+            false,
+            Some((expected_object_id, expected_version)),
+            Some(operation_id.to_string()),
+        )
+    }
+
     pub fn posix_write_file_from_reader_with_create_attrs<R: Read>(
         &mut self,
         path: &str,
@@ -2574,6 +2848,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    pub fn posix_write_file_from_reader_with_create_attrs_and_operation_id<R: Read>(
+        &mut self,
+        path: &str,
+        reader: R,
+        options: DfsWriteOptions,
+        attrs: DfsPosixCreateAttrs,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_from_reader_checked_parent_with_operation_id(
+            path,
+            reader,
+            options,
+            true,
+            true,
+            Some(attrs),
+            Some(operation_id.to_string()),
+        )
+    }
+
     fn posix_write_file_bytes_checked_parent(
         &mut self,
         path: &str,
@@ -2586,6 +2879,37 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         exclusive_create: bool,
         follow_final_for_exclusive_create: bool,
     ) -> Result<DfsStat> {
+        self.posix_write_file_bytes_checked_parent_with_operation_id(
+            path,
+            bytes,
+            options,
+            check_parent,
+            touch_parent_on_create,
+            replay_response_journal,
+            create_attrs,
+            exclusive_create,
+            follow_final_for_exclusive_create,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn posix_write_file_bytes_checked_parent_with_operation_id(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+        check_parent: bool,
+        touch_parent_on_create: bool,
+        replay_response_journal: bool,
+        create_attrs: Option<DfsPosixCreateAttrs>,
+        exclusive_create: bool,
+        follow_final_for_exclusive_create: bool,
+        operation_id: Option<String>,
+    ) -> Result<DfsStat> {
+        if let Some(operation_id) = operation_id.as_deref() {
+            crate::service_routed_write::validate_write_operation_id(operation_id)?;
+        }
         let started_at = Instant::now();
         let requested_deadline = started_at + POSIX_WAIT_FOR_COMMIT_TIMEOUT;
         let observed_previous_deadline = self.transport.operation_deadline();
@@ -2601,7 +2925,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let result = (|| {
             loop {
-                match self.posix_write_file_bytes_checked_parent_once(
+                match self.posix_write_file_bytes_checked_parent_once_with_operation_id(
                     path,
                     bytes,
                     options.clone(),
@@ -2613,6 +2937,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     follow_final_for_exclusive_create,
                     None,
                     true,
+                    operation_id.as_deref(),
                 ) {
                     Ok(stat) => return Ok(stat),
                     Err(error)
@@ -2653,6 +2978,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         expected_existing: Option<(&DfsObjectId, &DfsVersion)>,
         resolve_links: bool,
     ) -> Result<DfsStat> {
+        self.posix_write_file_bytes_checked_parent_once_with_operation_id(
+            path,
+            bytes,
+            options,
+            check_parent,
+            touch_parent_on_create,
+            replay_response_journal,
+            create_attrs,
+            exclusive_create,
+            follow_final_for_exclusive_create,
+            expected_existing,
+            resolve_links,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn posix_write_file_bytes_checked_parent_once_with_operation_id(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+        check_parent: bool,
+        touch_parent_on_create: bool,
+        replay_response_journal: bool,
+        create_attrs: Option<DfsPosixCreateAttrs>,
+        exclusive_create: bool,
+        follow_final_for_exclusive_create: bool,
+        expected_existing: Option<(&DfsObjectId, &DfsVersion)>,
+        resolve_links: bool,
+        operation_id: Option<&str>,
+    ) -> Result<DfsStat> {
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
         let path = if resolve_links {
             self.resolve_posix_path_distributed(
@@ -2680,6 +3037,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_bytes = bytes.len();
         let mut transient_create = false;
         let mut object = match self.lookup_sifs_path(&path)? {
+            Some(object)
+                if exclusive_create
+                    && object.kind != DfsObjectKind::Tombstone
+                    && operation_id.is_some_and(|operation_id| {
+                        object.version
+                            == stable_write_target_version(
+                                &self.node_id,
+                                &object.object_id,
+                                operation_id,
+                            )
+                    }) =>
+            {
+                // Exact exclusive-create retry after a lost response. The
+                // durable operation admission below proves payload identity;
+                // a different operation still takes the ordinary EEXIST arm.
+                object
+            }
             Some(object) if exclusive_create && object.kind != DfsObjectKind::Tombstone => {
                 return Err(DfsPosixError::AlreadyExists { path });
             }
@@ -2709,6 +3083,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let attrs = create_attrs.unwrap_or_else(DfsPosixCreateAttrs::file_default);
                 let attrs = self.posix_create_attrs_for_object_authority(&object, attrs, false)?;
                 apply_posix_create_attrs(&mut object, attrs);
+                if let Some(operation_id) = operation_id {
+                    object.object_id = stable_create_object_id(&self.node_id, &path, operation_id);
+                }
                 self.add_transient_object_metadata(object.clone())?;
                 transient_create = true;
                 object
@@ -2723,12 +3100,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let attrs = create_attrs.unwrap_or_else(DfsPosixCreateAttrs::file_default);
                 let attrs = self.posix_create_attrs_for_object_authority(&object, attrs, false)?;
                 apply_posix_create_attrs(&mut object, attrs);
+                if let Some(operation_id) = operation_id.as_deref() {
+                    object.object_id = stable_create_object_id(&self.node_id, &path, operation_id);
+                }
                 self.add_transient_object_metadata(object.clone())?;
                 transient_create = true;
                 object
             }
         };
         self.apply_managed_policy_to_new_object(&mut object, options.replica_candidates.len())?;
+        let target_version = operation_id
+            .map(|operation_id| {
+                stable_write_target_version(&self.node_id, &object.object_id, operation_id)
+            })
+            .unwrap_or_else(|| next_version(&object.version));
         if let Some((expected_object_id, expected_version)) = expected_existing {
             if &object.object_id != expected_object_id {
                 return Err(DfsPosixError::Conflict {
@@ -2739,7 +3124,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     ),
                 });
             }
-            if &object.version != expected_version {
+            if &object.version != expected_version && object.version != target_version {
                 return Err(DfsPosixError::Conflict {
                     path,
                     reason: format!(
@@ -2749,7 +3134,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
         }
-        let target_version = next_version(&object.version);
         let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
         let committed_locations = candidates.clone();
         let remote_metadata_primary = match self.select_metadata_shard_for_object(&object) {
@@ -2794,7 +3178,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             requesting_node_id: self.node_id.clone(),
         };
         let outcome = if streamed_remote_primary_write {
-            self.write_distributed_eventual_with_base_and_parent_touch_and_repair_mode(
+            self.write_distributed_eventual_with_base_and_parent_touch_and_repair_mode_and_operation_id(
                 request,
                 Some(object.version.clone()),
                 bytes.to_vec(),
@@ -2805,12 +3189,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 options.foreground_replica_repair,
                 detach_request,
                 replay_response_journal,
+                operation_id.map(ToOwned::to_owned),
             )
         } else {
             let manifest = manifest
                 .as_ref()
                 .expect("local metadata-primary write published a blob-only manifest");
-            self.write_distributed_eventual_from_local_manifest_with_candidates_and_parent_touch(
+            self.write_distributed_eventual_from_local_manifest_with_candidates_and_parent_touch_and_operation_id(
                 request,
                 Some(object.version.clone()),
                 manifest.content_hash.clone(),
@@ -2821,6 +3206,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 options.foreground_replica_repair,
                 detach_request,
                 replay_response_journal,
+                operation_id.map(ToOwned::to_owned),
             )
         };
         let outcome = match outcome {
@@ -3028,8 +3414,59 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         touch_parent_on_create: bool,
         create_attrs: Option<DfsPosixCreateAttrs>,
     ) -> Result<DfsStat> {
+        self.posix_write_file_from_reader_checked_parent_with_operation_id(
+            path,
+            reader,
+            options,
+            check_parent,
+            touch_parent_on_create,
+            create_attrs,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn posix_write_file_from_reader_checked_parent_with_operation_id<R: Read>(
+        &mut self,
+        path: &str,
+        reader: R,
+        options: DfsWriteOptions,
+        check_parent: bool,
+        touch_parent_on_create: bool,
+        create_attrs: Option<DfsPosixCreateAttrs>,
+        operation_id: Option<String>,
+    ) -> Result<DfsStat> {
+        self.posix_write_file_from_reader_checked_parent_with_operation_id_and_mode(
+            path,
+            reader,
+            options,
+            check_parent,
+            touch_parent_on_create,
+            create_attrs,
+            false,
+            None,
+            operation_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn posix_write_file_from_reader_checked_parent_with_operation_id_and_mode<R: Read>(
+        &mut self,
+        path: &str,
+        reader: R,
+        options: DfsWriteOptions,
+        check_parent: bool,
+        touch_parent_on_create: bool,
+        create_attrs: Option<DfsPosixCreateAttrs>,
+        exclusive_create: bool,
+        expected_existing: Option<(&DfsObjectId, &DfsVersion)>,
+        operation_id: Option<String>,
+    ) -> Result<DfsStat> {
+        if let Some(operation_id) = operation_id.as_deref() {
+            crate::service_routed_write::validate_write_operation_id(operation_id)?;
+        }
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
-        let path = self.resolve_posix_path_distributed(&path, true)?;
+        let path = self.resolve_posix_path_distributed(&path, !exclusive_create)?;
         if requires_directory {
             return match self.ensure_resolved_path_is_directory(&path) {
                 Ok(()) => Err(DfsPosixError::IsDirectory { path }),
@@ -3045,11 +3482,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let mut transient_create = false;
         let mut object = match self.lookup_sifs_path(&path)? {
+            Some(object)
+                if exclusive_create
+                    && object.kind != DfsObjectKind::Tombstone
+                    && operation_id.as_deref().is_some_and(|operation_id| {
+                        object.version
+                            == stable_write_target_version(
+                                &self.node_id,
+                                &object.object_id,
+                                operation_id,
+                            )
+                    }) =>
+            {
+                object
+            }
+            Some(object) if exclusive_create && object.kind != DfsObjectKind::Tombstone => {
+                return Err(DfsPosixError::AlreadyExists { path });
+            }
             Some(object) if object.kind == DfsObjectKind::Directory => {
                 return Err(DfsPosixError::IsDirectory { path });
             }
             Some(object) if object.kind == DfsObjectKind::Hardlink => {
                 self.resolve_hardlink_target(&object)?
+            }
+            Some(object)
+                if object.kind == DfsObjectKind::Tombstone && expected_existing.is_some() =>
+            {
+                return Err(DfsPosixError::NotFound { path });
             }
             Some(object) if object.kind == DfsObjectKind::Tombstone => {
                 let mut object =
@@ -3057,40 +3516,96 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let attrs = create_attrs.unwrap_or_else(DfsPosixCreateAttrs::file_default);
                 let attrs = self.posix_create_attrs_for_object_authority(&object, attrs, false)?;
                 apply_posix_create_attrs(&mut object, attrs);
+                if let Some(operation_id) = operation_id.as_deref() {
+                    object.object_id = stable_create_object_id(&self.node_id, &path, operation_id);
+                }
                 self.add_transient_object_metadata(object.clone())?;
                 transient_create = true;
                 object
             }
             Some(object) => object,
+            None if expected_existing.is_some() => {
+                return Err(DfsPosixError::NotFound { path });
+            }
             None => {
                 let mut object =
                     new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
                 let attrs = create_attrs.unwrap_or_else(DfsPosixCreateAttrs::file_default);
                 let attrs = self.posix_create_attrs_for_object_authority(&object, attrs, false)?;
                 apply_posix_create_attrs(&mut object, attrs);
+                if let Some(operation_id) = operation_id.as_deref() {
+                    object.object_id = stable_create_object_id(&self.node_id, &path, operation_id);
+                }
                 self.add_transient_object_metadata(object.clone())?;
                 transient_create = true;
                 object
             }
         };
         self.apply_managed_policy_to_new_object(&mut object, options.replica_candidates.len())?;
-        let target_version = next_version(&object.version);
+        let target_version = operation_id
+            .as_deref()
+            .map(|operation_id| {
+                stable_write_target_version(&self.node_id, &object.object_id, operation_id)
+            })
+            .unwrap_or_else(|| next_version(&object.version));
         let target_version_for_stat = target_version.clone();
+        if let Some((expected_object_id, expected_version)) = expected_existing {
+            if &object.object_id != expected_object_id {
+                return Err(DfsPosixError::Conflict {
+                    path,
+                    reason: format!(
+                        "file identity changed: expected {expected_object_id}, found {}",
+                        object.object_id
+                    ),
+                });
+            }
+            if &object.version != expected_version && object.version != target_version {
+                return Err(DfsPosixError::Conflict {
+                    path,
+                    reason: format!(
+                        "file changed since it was opened: expected version {expected_version}, found {}",
+                        object.version
+                    ),
+                });
+            }
+        }
         let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
         let committed_locations = candidates.clone();
-        let outcome = self.write_distributed_eventual_from_reader_with_candidates_and_parent_touch(
-            DfsWriteRequest {
-                file_system_id: object.file_system_id.clone(),
-                object_id: object.object_id.clone(),
-                target_version,
-                requesting_node_id: self.node_id.clone(),
-            },
-            reader,
-            candidates,
-            options.policy,
-            touch_parent_on_create,
-            options.foreground_replica_repair,
-        );
+        let request = DfsWriteRequest {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            target_version,
+            requesting_node_id: self.node_id.clone(),
+        };
+        let outcome = if exclusive_create || expected_existing.is_some() {
+            let operation_id = operation_id.ok_or_else(|| {
+                DfsPosixError::Dfs(DfsError::Serialization {
+                    message: "reader-backed exclusive/CAS write requires an operation id"
+                        .to_string(),
+                })
+            })?;
+            self.write_distributed_eventual_from_reader_with_candidates_and_base_and_parent_touch_and_operation_id_and_mode(
+                request,
+                Some(object.version.clone()),
+                reader,
+                candidates,
+                options.policy,
+                touch_parent_on_create,
+                exclusive_create,
+                options.foreground_replica_repair,
+                operation_id,
+            )
+        } else {
+            self.write_distributed_eventual_from_reader_with_candidates_and_parent_touch_and_operation_id(
+                request,
+                reader,
+                candidates,
+                options.policy,
+                touch_parent_on_create,
+                options.foreground_replica_repair,
+                operation_id,
+            )
+        };
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {

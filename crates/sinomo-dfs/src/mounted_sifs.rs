@@ -18,11 +18,11 @@ use std::time::Duration;
 
 use crate::node_transport::collect_dfs_incoming_body_sync;
 use crate::{
-    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsError, DfsNodeAdvertisement, DfsNodeId,
-    DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
-    DfsPeerTransportFuture, DfsPosixError, NetworkedDfsService, cluster_dfs_peer_node_ids,
-    content_services_prefix, fallback_dfs_node_id,
-    open_cluster_dfs_service_with_peer_transports_for_nodes_lazy,
+    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsError, DfsNamespaceChangeBatch,
+    DfsNamespaceChangeCursor, DfsNodeAdvertisement, DfsNodeId, DfsNodeTransport,
+    DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture,
+    DfsPosixError, NetworkedDfsService, cluster_dfs_peer_node_ids, content_services_prefix,
+    fallback_dfs_node_id, open_cluster_dfs_service_with_peer_transports_for_nodes_lazy,
 };
 
 pub type MountedSifsService = NetworkedDfsService<DfsNodeTransport>;
@@ -87,6 +87,20 @@ impl NetworkedDfsService<DfsNodeTransport> {
             transport: self.transport.fork_read_only_request(),
             cancellation: self.cancellation.clone(),
         }
+    }
+
+    /// Poll mounted SIFS namespace changes as independent shard-local batches.
+    ///
+    /// This is a named mounted-service seam for platform modules; it preserves
+    /// the generic service contract that the returned vector has no implied
+    /// ordering across shards.
+    pub fn poll_mounted_namespace_changes_for_subtree(
+        &mut self,
+        file_system_id: crate::DfsFileSystemId,
+        root_path: &str,
+        cursors: &[DfsNamespaceChangeCursor],
+    ) -> Result<Vec<DfsNamespaceChangeBatch>, DfsError> {
+        self.poll_namespace_changes_for_subtree(file_system_id, root_path, cursors)
     }
 }
 

@@ -74,8 +74,20 @@ pub(crate) fn dfs_network_message_trace_label(message: &DfsNetworkMessage) -> &'
         DfsNetworkMessage::DistributedWriteRequest(_) => "distributed-write-request",
         DfsNetworkMessage::ExclusiveCreateRequest(_) => "exclusive-create-request",
         DfsNetworkMessage::DistributedWriteResponse(_) => "distributed-write-response",
+        DfsNetworkMessage::StableWriteReconciliationRequest(_) => {
+            "stable-write-reconciliation-request"
+        }
+        DfsNetworkMessage::StableWriteReconciliationResponse(_) => {
+            "stable-write-reconciliation-response"
+        }
         DfsNetworkMessage::NamespaceRequest(_) => "namespace-request",
         DfsNetworkMessage::NamespaceResponse(_) => "namespace-response",
+        DfsNetworkMessage::StableNamespaceReconciliationRequest(_) => {
+            "stable-namespace-reconciliation-request"
+        }
+        DfsNetworkMessage::StableNamespaceReconciliationResponse(_) => {
+            "stable-namespace-reconciliation-response"
+        }
         DfsNetworkMessage::StageBlob(_) => "stage-blob",
         DfsNetworkMessage::StagePatch(_) => "stage-patch",
         DfsNetworkMessage::StageBlobResponse(_) => "stage-blob-response",
@@ -102,19 +114,25 @@ pub(crate) fn dfs_namespace_operation_trace_label(
     operation: &DfsNamespaceOperation,
 ) -> &'static str {
     match operation {
+        DfsNamespaceOperation::PollNamespaceChanges { .. } => "poll-namespace-changes",
         DfsNamespaceOperation::Mkdir { .. } => "mkdir",
         DfsNamespaceOperation::MkdirWithAttrs { .. } => "mkdir-with-attrs",
         DfsNamespaceOperation::MkdirAtNoLinks { .. } => "mkdir-at-no-links",
         DfsNamespaceOperation::MkdirAll { .. } => "mkdir-all",
         DfsNamespaceOperation::Rmdir { .. } => "rmdir",
+        DfsNamespaceOperation::ConditionalRmdir { .. } => "conditional-rmdir",
         DfsNamespaceOperation::Unlink { .. } => "unlink",
+        DfsNamespaceOperation::ConditionalUnlink { .. } => "conditional-unlink",
         DfsNamespaceOperation::Rename { .. } => "rename",
+        DfsNamespaceOperation::ConditionalRename { .. } => "conditional-rename",
         DfsNamespaceOperation::RenameSingleNamespaceAtomic { .. } => {
             "rename-single-namespace-atomic"
         }
         DfsNamespaceOperation::RenameDirectoryBounded { .. } => "rename-directory-bounded",
         DfsNamespaceOperation::ResumeNamespaceJobBounded { .. } => "resume-namespace-job-bounded",
         DfsNamespaceOperation::Hardlink { .. } => "hardlink",
+        DfsNamespaceOperation::InstallHardlinkTargetFence { .. } => "install-hardlink-target-fence",
+        DfsNamespaceOperation::CommitHardlinkTargetFence { .. } => "commit-hardlink-target-fence",
         DfsNamespaceOperation::SetMode { .. } => "set-mode",
         DfsNamespaceOperation::SetOwner { .. } => "set-owner",
         DfsNamespaceOperation::SetSymlinkOwner { .. } => "set-symlink-owner",
@@ -146,6 +164,7 @@ pub(crate) fn dfs_distributed_write_result_trace_label(
 ) -> &'static str {
     match result {
         DfsDistributedWriteResult::Rejected { .. } => "rejected",
+        DfsDistributedWriteResult::ReconciliationRequired { .. } => "reconciliation-required",
         DfsDistributedWriteResult::Outcome { outcome } => match outcome {
             NetworkedDfsWriteOutcome::Pending { .. } => "pending",
             NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } => {

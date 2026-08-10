@@ -22,9 +22,9 @@ use crate::metadata_prepare_codec::{
     validate_namespace_prepare_file_system_scope,
 };
 use crate::{
-    DfsConflictReadView, DfsError, DfsFileSystem, DfsFileSystemId, DfsNamespaceOperation,
-    DfsNamespaceResult, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsPosixCoordinationResult,
-    DfsReplicationPolicy, DfsVersion, normalize_current_locations,
+    DfsConflictReadView, DfsError, DfsFileSystem, DfsFileSystemId, DfsNamespaceObjectPrecondition,
+    DfsNamespaceOperation, DfsNamespaceResult, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
+    DfsPosixCoordinationResult, DfsReplicationPolicy, DfsVersion, normalize_current_locations,
 };
 
 #[cfg(test)]
@@ -336,6 +336,10 @@ pub struct DfsWriteIntentRecord {
     pub base_version: Option<DfsVersion>,
     pub target_version: DfsVersion,
     pub coordinator_node_id: NodeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_order_token: Option<String>,
     #[serde(default)]
     pub owner_epoch: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -375,6 +379,10 @@ pub struct DfsWriteIntentReceipt {
     pub base_version: Option<DfsVersion>,
     pub target_version: DfsVersion,
     pub coordinator_node_id: NodeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_order_token: Option<String>,
     #[serde(default)]
     pub owner_epoch: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -413,6 +421,8 @@ impl DfsWriteIntentReceipt {
             base_version: intent.base_version.clone(),
             target_version: intent.target_version.clone(),
             coordinator_node_id: intent.coordinator_node_id.clone(),
+            operation_id: intent.operation_id.clone(),
+            operation_order_token: intent.operation_order_token.clone(),
             owner_epoch: intent.owner_epoch,
             desired_replica_node_ids: intent.desired_replica_node_ids.clone(),
             policy: intent.policy.clone(),
@@ -434,6 +444,8 @@ impl DfsWriteIntentReceipt {
             base_version: self.base_version.clone(),
             target_version: self.target_version.clone(),
             coordinator_node_id: self.coordinator_node_id.clone(),
+            operation_id: self.operation_id.clone(),
+            operation_order_token: self.operation_order_token.clone(),
             owner_epoch: self.owner_epoch,
             desired_replica_node_ids: self.desired_replica_node_ids.clone(),
             policy: self.policy.clone(),
@@ -464,18 +476,42 @@ impl DfsWriteIntentReceipt {
 pub struct DfsWriteIntentReceiptRetentionState {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub max_evicted_counter_by_object_and_coordinator: BTreeMap<DfsObjectId, BTreeMap<NodeId, u64>>,
+    /// High-water marks for current caller-owned stable operation ids. ULIDs
+    /// retain lexical time order, so one object/coordinator floor replaces an
+    /// unbounded set of exact derived intent ids.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub max_evicted_operation_order_token_by_object_and_coordinator:
+        BTreeMap<DfsObjectId, BTreeMap<NodeId, String>>,
+    /// Exact opaque intent ids evicted by current writers.
+    ///
+    /// Rolling-upgrade compatibility for exact opaque ids retained by older
+    /// nodes. New nodes never add to this map. Conservative merges promote an
+    /// oversized legacy set to the per-object opaque marker below.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub evicted_opaque_intent_ids_by_object: BTreeMap<DfsObjectId, BTreeSet<String>>,
+    /// Conservative rolling-upgrade marker written by older nodes. Once set,
+    /// the exact opaque ids which were evicted are unknowable, so all opaque
+    /// retries for that object remain reconciliation-required.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub opaque_intent_history_evicted_object_ids: BTreeSet<DfsObjectId>,
 }
 
 impl DfsWriteIntentReceiptRetentionState {
+    const LEGACY_EXACT_OPAQUE_IDS_PER_OBJECT_MAX: usize = 128;
+
     pub(crate) fn is_empty(&self) -> bool {
         self == &Self::default()
     }
 
     pub(crate) fn eviction_delta(receipt: &DfsWriteIntentReceipt) -> Self {
         let mut state = Self::default();
-        if let Some(counter) = write_intent_id_counter(&receipt.intent_id) {
+        if let Some(token) = receipt.operation_order_token.as_ref() {
+            state
+                .max_evicted_operation_order_token_by_object_and_coordinator
+                .entry(receipt.object_id.clone())
+                .or_default()
+                .insert(receipt.coordinator_node_id.clone(), token.clone());
+        } else if let Some(counter) = write_intent_id_counter(&receipt.intent_id) {
             state
                 .max_evicted_counter_by_object_and_coordinator
                 .entry(receipt.object_id.clone())
@@ -500,21 +536,89 @@ impl DfsWriteIntentReceiptRetentionState {
                 *current = (*current).max(floor);
             }
         }
+        for (object_id, floors) in other.max_evicted_operation_order_token_by_object_and_coordinator
+        {
+            let current_floors = self
+                .max_evicted_operation_order_token_by_object_and_coordinator
+                .entry(object_id)
+                .or_default();
+            for (node_id, floor) in floors {
+                let current = current_floors.entry(node_id).or_default();
+                if floor > *current {
+                    *current = floor;
+                }
+            }
+        }
+        for (object_id, intent_ids) in other.evicted_opaque_intent_ids_by_object {
+            if self
+                .opaque_intent_history_evicted_object_ids
+                .contains(&object_id)
+            {
+                continue;
+            }
+            let retained = self
+                .evicted_opaque_intent_ids_by_object
+                .entry(object_id.clone())
+                .or_default();
+            retained.extend(intent_ids);
+            if retained.len() > Self::LEGACY_EXACT_OPAQUE_IDS_PER_OBJECT_MAX {
+                self.evicted_opaque_intent_ids_by_object.remove(&object_id);
+                self.opaque_intent_history_evicted_object_ids
+                    .insert(object_id);
+            }
+        }
         self.opaque_intent_history_evicted_object_ids
             .extend(other.opaque_intent_history_evicted_object_ids);
+        for object_id in &self.opaque_intent_history_evicted_object_ids {
+            self.evicted_opaque_intent_ids_by_object.remove(object_id);
+        }
     }
 
     pub(crate) fn history_expired(&self, intent: &DfsWriteIntentRecord) -> bool {
+        if let Some(token) = intent.operation_order_token.as_ref() {
+            return self
+                .max_evicted_operation_order_token_by_object_and_coordinator
+                .get(&intent.object_id)
+                .and_then(|floors| floors.get(&intent.coordinator_node_id))
+                .is_some_and(|floor| token.as_str() <= floor.as_str());
+        }
         match write_intent_id_counter(&intent.intent_id) {
             Some(counter) => self
                 .max_evicted_counter_by_object_and_coordinator
                 .get(&intent.object_id)
                 .and_then(|floors| floors.get(&intent.coordinator_node_id))
                 .is_some_and(|floor| counter <= *floor),
-            None => self
-                .opaque_intent_history_evicted_object_ids
-                .contains(&intent.object_id),
+            None => {
+                self.opaque_intent_history_evicted_object_ids
+                    .contains(&intent.object_id)
+                    || self
+                        .evicted_opaque_intent_ids_by_object
+                        .get(&intent.object_id)
+                        .is_some_and(|intent_ids| intent_ids.contains(&intent.intent_id))
+            }
         }
+    }
+
+    pub(crate) fn operation_history_expired(
+        &self,
+        object_id: &DfsObjectId,
+        coordinator_node_id: &NodeId,
+        intent_id: &str,
+        operation_order_token: Option<&str>,
+    ) -> bool {
+        if let Some(token) = operation_order_token {
+            return self
+                .max_evicted_operation_order_token_by_object_and_coordinator
+                .get(object_id)
+                .and_then(|floors| floors.get(coordinator_node_id))
+                .is_some_and(|floor| token <= floor.as_str());
+        }
+        self.opaque_intent_history_evicted_object_ids
+            .contains(object_id)
+            || self
+                .evicted_opaque_intent_ids_by_object
+                .get(object_id)
+                .is_some_and(|intent_ids| intent_ids.contains(intent_id))
     }
 
     pub(crate) fn for_object(&self, object_id: &DfsObjectId) -> Self {
@@ -527,6 +631,14 @@ impl DfsWriteIntentReceiptRetentionState {
                 .max_evicted_counter_by_object_and_coordinator
                 .insert(object_id.clone(), floors.clone());
         }
+        if let Some(floors) = self
+            .max_evicted_operation_order_token_by_object_and_coordinator
+            .get(object_id)
+        {
+            state
+                .max_evicted_operation_order_token_by_object_and_coordinator
+                .insert(object_id.clone(), floors.clone());
+        }
         if self
             .opaque_intent_history_evicted_object_ids
             .contains(object_id)
@@ -534,6 +646,11 @@ impl DfsWriteIntentReceiptRetentionState {
             state
                 .opaque_intent_history_evicted_object_ids
                 .insert(object_id.clone());
+        }
+        if let Some(intent_ids) = self.evicted_opaque_intent_ids_by_object.get(object_id) {
+            state
+                .evicted_opaque_intent_ids_by_object
+                .insert(object_id.clone(), intent_ids.clone());
         }
         state
     }
@@ -897,6 +1014,8 @@ pub enum DfsMetadataMutation {
         previous_version: DfsVersion,
         committed_version: DfsVersion,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         committed_object: Option<DfsObjectMetadata>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         visible_version: Option<DfsObjectVersionRecord>,
@@ -925,6 +1044,8 @@ pub enum DfsMetadataMutation {
         file_system_id: DfsFileSystemId,
         transaction_id: String,
         object_count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transaction: Option<DfsNamespaceTransaction>,
     },
@@ -1815,6 +1936,7 @@ impl DfsMetadataMutation {
             object_id: commit.committed_object.object_id.clone(),
             previous_version: commit.expected_version.clone(),
             committed_version: commit.committed_object.version.clone(),
+            operation_id: commit.operation_id.clone(),
             committed_object: Some(commit.committed_object.clone()),
             visible_version: Some(commit.visible_version.clone()),
             required_replica_node_ids: commit.required_replica_node_ids.clone(),
@@ -1951,6 +2073,44 @@ pub enum DfsNamespacePrepareStatus {
     Prepared,
     Committed,
     Aborted,
+}
+
+const NAMESPACE_PREPARE_JOURNAL_PROVENANCE_PREFIX: &str = "namespace-journal-provenance-v1:";
+
+/// Build a prepare key that remains unique per transaction while carrying a
+/// reversible caller-owned operation id for semantic journal projection.
+///
+/// The prepare key is internal metadata identity, so it cannot be replaced by
+/// the caller id directly: one distributed operation may commit one prepare
+/// on each of several shards. Length framing keeps arbitrary non-control UTF-8
+/// operation ids unambiguous without changing the durable prepare schema.
+pub(crate) fn namespace_prepare_operation_id_with_journal_provenance(
+    journal_operation_id: &str,
+    transaction_id: &str,
+) -> String {
+    let transaction_digest = blake3::hash(transaction_id.as_bytes()).to_hex();
+    format!(
+        "{NAMESPACE_PREPARE_JOURNAL_PROVENANCE_PREFIX}{}:{journal_operation_id}:{}",
+        journal_operation_id.len(),
+        &transaction_digest.as_str()[..24],
+    )
+}
+
+/// Recover caller-owned feed provenance from an internal prepare key created
+/// by [`namespace_prepare_operation_id_with_journal_provenance`].
+pub(crate) fn namespace_prepare_journal_operation_id(operation_id: &str) -> Option<&str> {
+    let framed = operation_id.strip_prefix(NAMESPACE_PREPARE_JOURNAL_PROVENANCE_PREFIX)?;
+    let (length, framed) = framed.split_once(':')?;
+    let length = length.parse::<usize>().ok()?;
+    if length == 0 || framed.len() <= length || !framed.is_char_boundary(length) {
+        return None;
+    }
+    let (journal_operation_id, suffix) = framed.split_at(length);
+    let digest = suffix.strip_prefix(':')?;
+    if digest.len() != 24 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(journal_operation_id)
 }
 
 /// Durable, hidden namespace transaction prepared on one metadata shard.
@@ -2737,6 +2897,12 @@ pub enum DfsNamespaceJobKind {
     RenameDirectory,
     RenameObjectAcrossShardPrimaries,
     HardlinkAcrossShardPrimaries,
+    /// Source-side coordinator for removing or moving a hardlink alias whose
+    /// canonical inode is owned by another metadata authority.
+    HardlinkAliasMutationAcrossShardPrimaries,
+    /// Target-side durable read/write fence held while the alias authority
+    /// commits its exact namespace generation.
+    HardlinkTargetFenceAcrossShardPrimary,
     RenameDirectoryAcrossShardPrimaries,
 }
 
@@ -2746,6 +2912,8 @@ impl DfsNamespaceJobKind {
             self,
             Self::RenameObjectAcrossShardPrimaries
                 | Self::HardlinkAcrossShardPrimaries
+                | Self::HardlinkAliasMutationAcrossShardPrimaries
+                | Self::HardlinkTargetFenceAcrossShardPrimary
                 | Self::RenameDirectoryAcrossShardPrimaries
         )
     }
@@ -2810,6 +2978,33 @@ pub enum DfsNamespaceJobFrame {
     CrossShardHardlinkComplete {
         target_object_id: DfsObjectId,
     },
+    /// Install the target authority's durable fence before exposing any alias
+    /// mutation. The exact target generations are carried by the fence job.
+    CrossShardHardlinkTargetFenceInstall {
+        fence: Box<DfsNamespaceJobRecord>,
+        source_path: String,
+    },
+    /// Commit the exact alias-shard transaction while both authorities reject
+    /// reads and mutations for the affected paths.
+    CrossShardHardlinkAliasCommit {
+        transaction: DfsNamespaceTransaction,
+    },
+    /// Commit the pre-minted canonical generation and release its durable
+    /// fence. Retrying this frame is exact and idempotent.
+    CrossShardHardlinkTargetFenceCommit {
+        fence_job_id: String,
+        source_path: String,
+        expected_target: DfsNamespaceObjectPrecondition,
+        committed_target: DfsObjectMetadata,
+    },
+    /// Marker retained inside a target-side fence job. Maintenance must never
+    /// execute it independently; only the authenticated source coordinator can
+    /// commit or release this reservation.
+    HardlinkTargetFenceReservation {
+        source_path: String,
+        expected_target: DfsNamespaceObjectPrecondition,
+        committed_target: DfsObjectMetadata,
+    },
     /// Cross-shard-primary directory rename: move the root directory record
     /// (destination primary adopts it, source primary tombstones the old
     /// path and evicts the record).
@@ -2840,6 +3035,8 @@ pub(crate) struct DfsVisibleVersionCommitRecord {
     pub(crate) committed_object: DfsObjectMetadata,
     pub(crate) visible_version: DfsObjectVersionRecord,
     pub(crate) required_replica_node_ids: Vec<NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) operation_id: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub(crate) created_at: OffsetDateTime,
 }
@@ -3580,6 +3777,34 @@ mod tests {
         assert!(!wrong_prefix.is_well_formed());
     }
 
+    #[test]
+    fn namespace_prepare_key_round_trips_exact_journal_operation_provenance() {
+        let caller_operation_id = "cf:client-ümlaut_01k00000000000000000000000";
+        let first = namespace_prepare_operation_id_with_journal_provenance(
+            caller_operation_id,
+            "transaction-one",
+        );
+        let same = namespace_prepare_operation_id_with_journal_provenance(
+            caller_operation_id,
+            "transaction-one",
+        );
+        let other = namespace_prepare_operation_id_with_journal_provenance(
+            caller_operation_id,
+            "transaction-two",
+        );
+
+        assert_eq!(first, same);
+        assert_ne!(first, other);
+        assert_eq!(
+            namespace_prepare_journal_operation_id(&first),
+            Some(caller_operation_id)
+        );
+        assert_eq!(
+            namespace_prepare_journal_operation_id("namespace-journal-provenance-v1:5:short"),
+            None
+        );
+    }
+
     fn node(value: &str) -> NodeId {
         NodeId::from_legacy_named(value).expect("valid node id")
     }
@@ -3620,6 +3845,144 @@ mod tests {
             created_by_event_id: None,
             last_modified_by_event_id: None,
         }
+    }
+
+    #[test]
+    fn opaque_write_operation_eviction_fails_closed_without_poisoning_sortable_operations() {
+        let object_id = object_id();
+        let receipt = DfsWriteIntentReceipt {
+            intent_id: "dfs_write_op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            file_system_id: file_system_id(),
+            object_id: object_id.clone(),
+            base_version: Some(version("version_receipt_base")),
+            target_version: version("version_receipt_target"),
+            coordinator_node_id: node("node_receipt_writer"),
+            operation_id: None,
+            operation_order_token: None,
+            owner_epoch: 3,
+            desired_replica_node_ids: vec![node("node_receipt_writer")],
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            status: DfsWriteIntentStatus::Committed,
+            content_hash: Some("blake3:receipt".to_string()),
+            touch_parent_on_create: false,
+            create_predecessor_object_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            terminal_at: OffsetDateTime::UNIX_EPOCH,
+            retained_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let state = DfsWriteIntentReceiptRetentionState::eviction_delta(&receipt);
+        assert!(state.operation_history_expired(
+            &object_id,
+            &receipt.coordinator_node_id,
+            &receipt.intent_id,
+            None,
+        ));
+        assert!(state.operation_history_expired(
+            &object_id,
+            &receipt.coordinator_node_id,
+            "dfs_write_op_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            None,
+        ));
+        assert!(
+            !state.operation_history_expired(
+                &object_id,
+                &receipt.coordinator_node_id,
+                "dfs_write_op_01j00000000000000000000000",
+                Some("01j00000000000000000000000"),
+            ),
+            "legacy opaque eviction must not poison new sortable operation ids"
+        );
+        assert!(
+            state
+                .max_evicted_counter_by_object_and_coordinator
+                .is_empty(),
+            "stable operation ids must not pollute the generated counter floor"
+        );
+        assert_eq!(
+            serde_json::from_slice::<DfsWriteIntentReceiptRetentionState>(
+                &serde_json::to_vec(&state).expect("encode retention")
+            )
+            .expect("decode retention"),
+            state
+        );
+
+        let legacy: DfsWriteIntentReceiptRetentionState =
+            serde_json::from_value(serde_json::json!({
+                "opaque_intent_history_evicted_object_ids": [object_id.clone()]
+            }))
+            .expect("decode rolling-upgrade retention");
+        assert!(legacy.operation_history_expired(
+            &object_id,
+            &node("node_receipt_writer"),
+            "dfs_write_op_any_unknown_legacy_id",
+            None,
+        ));
+        assert!(!legacy.operation_history_expired(
+            &object_id,
+            &node("node_receipt_writer"),
+            "dfs_write_op_01j00000000000000000000000",
+            Some("01j00000000000000000000000"),
+        ));
+    }
+
+    #[test]
+    fn sortable_write_receipt_high_churn_reopens_as_one_bounded_floor() {
+        let object_id = object_id();
+        let coordinator = node("node_sortable_receipt_writer");
+        let mut state = DfsWriteIntentReceiptRetentionState::default();
+        for index in 0..4096_u64 {
+            let token = format!("00000000000000000000{index:06}");
+            let receipt = DfsWriteIntentReceipt {
+                intent_id: format!("dfs_write_op_{token}"),
+                file_system_id: file_system_id(),
+                object_id: object_id.clone(),
+                base_version: None,
+                target_version: version("version_sortable_receipt_target"),
+                coordinator_node_id: coordinator.clone(),
+                operation_id: Some(format!("cf_{token}")),
+                operation_order_token: Some(token),
+                owner_epoch: 1,
+                desired_replica_node_ids: vec![coordinator.clone()],
+                policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+                status: DfsWriteIntentStatus::Committed,
+                content_hash: Some("blake3:sortable-receipt".to_string()),
+                touch_parent_on_create: false,
+                create_predecessor_object_id: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                terminal_at: OffsetDateTime::UNIX_EPOCH,
+                retained_at: OffsetDateTime::UNIX_EPOCH,
+            };
+            state.merge_conservative(DfsWriteIntentReceiptRetentionState::eviction_delta(
+                &receipt,
+            ));
+        }
+        assert!(state.evicted_opaque_intent_ids_by_object.is_empty());
+        assert!(state.opaque_intent_history_evicted_object_ids.is_empty());
+        assert_eq!(
+            state
+                .max_evicted_operation_order_token_by_object_and_coordinator
+                .get(&object_id)
+                .map(BTreeMap::len),
+            Some(1),
+        );
+
+        let reopened: DfsWriteIntentReceiptRetentionState =
+            serde_json::from_slice(&serde_json::to_vec(&state).expect("persist sortable floor"))
+                .expect("reopen sortable floor");
+        let floor = format!("00000000000000000000{:06}", 4095);
+        assert!(reopened.operation_history_expired(
+            &object_id,
+            &coordinator,
+            &format!("dfs_write_op_{floor}"),
+            Some(&floor),
+        ));
+        let next = format!("00000000000000000000{:06}", 4096);
+        assert!(!reopened.operation_history_expired(
+            &object_id,
+            &coordinator,
+            &format!("dfs_write_op_{next}"),
+            Some(&next),
+        ));
     }
 
     fn version_record(object: &DfsObjectMetadata) -> DfsObjectVersionRecord {
@@ -3731,6 +4094,8 @@ mod tests {
             base_version: None,
             target_version: object.version.clone(),
             coordinator_node_id: node("node_owner"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 0,
             desired_replica_node_ids: vec![node("node_replica")],
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -3794,6 +4159,8 @@ mod tests {
             base_version: None,
             target_version: object.version.clone(),
             coordinator_node_id: node("node_owner"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 0,
             desired_replica_node_ids: vec![node("node_replica")],
             policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
@@ -4046,6 +4413,7 @@ mod tests {
             committed_object: committed_object.clone(),
             visible_version: visible_version.clone(),
             required_replica_node_ids: vec![node("node_replica")],
+            operation_id: Some("stable-visible-op".to_string()),
             created_at: OffsetDateTime::UNIX_EPOCH,
         };
 
@@ -4056,6 +4424,7 @@ mod tests {
                 object_id: committed_object.object_id,
                 previous_version: commit.expected_version,
                 committed_version: committed_object.version,
+                operation_id: Some("stable-visible-op".to_string()),
                 committed_object: Some(commit.committed_object),
                 visible_version: Some(visible_version),
                 required_replica_node_ids: commit.required_replica_node_ids,
@@ -4086,6 +4455,7 @@ mod tests {
             file_system_id: transaction.file_system_id.clone(),
             transaction_id: transaction.transaction_id.clone(),
             object_count: transaction.objects.len(),
+            operation_id: None,
             transaction: Some(transaction),
         };
         let expected = mutation
@@ -4123,6 +4493,7 @@ mod tests {
             file_system_id: file_system_id(),
             transaction_id: "transaction_empty_namespace".to_string(),
             object_count: 0,
+            operation_id: None,
             transaction: Some(DfsNamespaceTransaction {
                 transaction_id: "transaction_empty_namespace".to_string(),
                 file_system_id: file_system_id(),

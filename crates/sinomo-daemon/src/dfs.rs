@@ -386,24 +386,16 @@ impl DaemonDfsMetadataAuthorityGeneration {
     /// Matching only `(filesystem, shard id)` is insufficient: an epoch,
     /// primary, replica set, assignment, or sibling shard can change while
     /// retaining the same id. Decode the complete filesystem topology and
-    /// prove every lookup path still selects the exact stamped configuration
-    /// before the daemon may borrow an independently admitted shard lane.
-    fn namespace_lookup_stamp_state(
+    /// prove the read still selects the exact stamped configuration before the
+    /// daemon may borrow an independently admitted shard lane. Namespace-feed
+    /// polls bind directly to their cursor shard because a subtree root may be
+    /// owned by a different (less specific) assignment.
+    fn namespace_read_stamp_state(
         self: &Arc<Self>,
         command: &sinomo_dfs::DfsNamespaceCommand,
     ) -> Result<(u64, bool), sinomo_dfs::DfsError> {
         let [stamped] = command.authority_shards.as_slice() else {
             return Ok((self.generation(), false));
-        };
-        let paths = match &command.operation {
-            sinomo_dfs::DfsNamespaceOperation::LookupPath { path } => vec![path.as_str()],
-            sinomo_dfs::DfsNamespaceOperation::LookupPaths { paths } if !paths.is_empty() => {
-                paths.iter().map(String::as_str).collect()
-            }
-            sinomo_dfs::DfsNamespaceOperation::LookupPaths { .. } => {
-                return Ok((self.generation(), false));
-            }
-            _ => return Ok((self.generation(), false)),
         };
         if stamped.file_system_id != command.file_system_id || stamped.shard_id.trim().is_empty() {
             return Ok((self.generation(), false));
@@ -431,14 +423,38 @@ impl DaemonDfsMetadataAuthorityGeneration {
             }
             None => &[],
         };
-        let stamp_matches = paths.into_iter().all(|path| {
-            sinomo_dfs::select_metadata_shard_config_for_path_strict_default_sifs_split(
-                &command.file_system_id,
-                &shards,
-                path,
-            )
-            .is_ok_and(|selected| selected.as_ref() == Some(stamped))
-        });
+        let stamp_matches = match &command.operation {
+            sinomo_dfs::DfsNamespaceOperation::LookupPath { path } => {
+                sinomo_dfs::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                    &command.file_system_id,
+                    shards,
+                    path,
+                )
+                .is_ok_and(|selected| selected.as_ref() == Some(stamped))
+            }
+            sinomo_dfs::DfsNamespaceOperation::LookupPaths { paths } if !paths.is_empty() => {
+                paths.iter().all(|path| {
+                    sinomo_dfs::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                        &command.file_system_id,
+                        shards,
+                        path,
+                    )
+                    .is_ok_and(|selected| selected.as_ref() == Some(stamped))
+                })
+            }
+            sinomo_dfs::DfsNamespaceOperation::PollNamespaceChanges { request } => {
+                request.cursor.file_system_id == command.file_system_id
+                    && request.cursor.shard_id.0 == stamped.shard_id
+                    && request.cursor.authority_epoch == stamped.epoch
+                    && sinomo_dfs::dfs_namespace_change_shards_for_subtree(
+                        &command.file_system_id,
+                        &request.root_path,
+                        shards,
+                    )
+                    .is_ok_and(|selected| selected.iter().any(|shard| shard == stamped))
+            }
+            _ => false,
+        };
         // `observe` updates both projection and generation while retaining
         // this mutex, so the returned generation identifies the exact decoded
         // topology above.
@@ -7224,7 +7240,7 @@ fn daemon_dfs_message_cache_exact_admission_is_current(
 /// compatibility service. That cold path may initialize the one resident
 /// generation, but it must not create and hydrate a new exact-shard service
 /// merely because an unvalidated wire stamp names a shard id.
-fn daemon_dfs_message_cache_exact_lookup_admission_is_current(
+fn daemon_dfs_message_cache_exact_namespace_read_admission_is_current(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     peer_snapshot: &DaemonDfsMessagePeerSnapshot,
@@ -7244,7 +7260,7 @@ fn daemon_dfs_message_cache_exact_lookup_admission_is_current(
         Some(runtime),
     )?;
     let (observed_generation, stamp_matches) =
-        metadata_authority_generation.namespace_lookup_stamp_state(command)?;
+        metadata_authority_generation.namespace_read_stamp_state(command)?;
     if !stamp_matches {
         return Ok(false);
     }
@@ -8245,11 +8261,12 @@ async fn handle_daemon_dfs_message_async(
     let scheduler = daemon_dfs_mutation_scheduler(&data_dir)?;
     let exact_service_lane_candidate = daemon_dfs_message_supports_exact_service_lane(&command)
         && DaemonDfsMutationLaneKey::from_scope(&execution_scope).is_some();
-    let exact_lookup_command = match &command.routed_message.message {
+    let exact_namespace_read_command = match &command.routed_message.message {
         sinomo_dfs::DfsNetworkMessage::NamespaceRequest(namespace)
             if matches!(
                 namespace.operation,
-                sinomo_dfs::DfsNamespaceOperation::LookupPath { .. }
+                sinomo_dfs::DfsNamespaceOperation::PollNamespaceChanges { .. }
+                    | sinomo_dfs::DfsNamespaceOperation::LookupPath { .. }
                     | sinomo_dfs::DfsNamespaceOperation::LookupPaths { .. }
             ) =>
         {
@@ -8257,8 +8274,21 @@ async fn handle_daemon_dfs_message_async(
         }
         _ => None,
     };
+    let namespace_change_poll = exact_namespace_read_command.is_some_and(|namespace| {
+        matches!(
+            namespace.operation,
+            sinomo_dfs::DfsNamespaceOperation::PollNamespaceChanges { .. }
+        )
+    });
     let read_only_exact_service_lane_candidate =
-        exact_service_lane_candidate && exact_lookup_command.is_some();
+        exact_service_lane_candidate && exact_namespace_read_command.is_some();
+    if namespace_change_poll && !exact_service_lane_candidate {
+        return Err(sinomo_dfs::DfsError::Metadata {
+            message: "namespace change poll requires one complete exact-shard authority stamp"
+                .to_string(),
+        }
+        .into());
+    }
     let admission_scope = if uses_content_read_lane {
         DfsMessageExecutionScope::ReadOnly
     } else if exact_service_lane_candidate {
@@ -8273,8 +8303,8 @@ async fn handle_daemon_dfs_message_async(
     let admission_started = Instant::now();
     let mut admission = admit_daemon_dfs_foreground_message(&scheduler, &admission_scope).await?;
     let mut exact_service_lane = if exact_service_lane_candidate && admission.is_exact() {
-        if let Some(namespace) = exact_lookup_command {
-            daemon_dfs_message_cache_exact_lookup_admission_is_current(
+        if let Some(namespace) = exact_namespace_read_command {
+            daemon_dfs_message_cache_exact_namespace_read_admission_is_current(
                 &data_dir,
                 &cluster_paths,
                 &peer_snapshot,
@@ -8297,6 +8327,14 @@ async fn handle_daemon_dfs_message_async(
         false
     };
     if exact_service_lane_candidate && !exact_service_lane {
+        if namespace_change_poll {
+            drop(admission);
+            return Err(sinomo_dfs::DfsError::Metadata {
+                message: "namespace change poll authority is stale, foreign, or not already resident; refusing to cold-open metadata"
+                    .to_string(),
+            }
+            .into());
+        }
         if !admission.is_global() {
             drop(admission);
             admission = admit_daemon_dfs_foreground_message(
@@ -16164,6 +16202,8 @@ mod tests {
             base_version: None,
             target_version,
             coordinator_node_id,
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 1,
             policy: DfsReplicationPolicy::new(min_commit_replicas, desired_replica_node_ids.len())
                 .expect("replication policy"),
@@ -20333,6 +20373,27 @@ mod tests {
             dfs_message_execution_scope(&read_only),
             DfsMessageExecutionScope::ExactShard { .. }
         ));
+        let namespace_poll = namespace_command(
+            DfsNamespaceOperation::PollNamespaceChanges {
+                request: sinomo_dfs::DfsNamespaceChangePollRequest {
+                    root_path: "/".to_string(),
+                    cursor: sinomo_dfs::DfsNamespaceChangeCursor::from_shard_config(&services, 0),
+                },
+            },
+            vec![services.clone()],
+        );
+        assert!(daemon_dfs_message_supports_exact_service_lane(
+            &namespace_poll
+        ));
+        assert!(dfs_message_is_read_only_request(&namespace_poll));
+        assert_eq!(
+            dfs_message_execution_scope(&namespace_poll),
+            DfsMessageExecutionScope::ExactShard {
+                file_system_id: file_system_id.clone(),
+                shard_id: DfsMetadataShardId::new("services"),
+            },
+            "namespace polling must dispatch by cursor shard, not subtree root"
+        );
 
         let cross_shard = namespace_command(
             DfsNamespaceOperation::Rename {
@@ -20409,6 +20470,18 @@ mod tests {
             namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
+        let users_shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "users".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: vec![remote.clone()],
+            epoch: 9,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/users".to_string(),
+            },
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
         append_cluster_raft_command(
             &cluster_paths,
             &local,
@@ -20450,6 +20523,20 @@ mod tests {
                 unreachable!("lookup helper returns namespace request")
             };
             namespace.authority_shards = vec![stamp];
+            routed
+        };
+        let stamped_poll = |frame_id: u64, stamp: DfsMetadataShardConfig| {
+            let mut routed = test_dfs_lookup_routed_message(&remote, &local, frame_id, "/");
+            let DfsNetworkMessage::NamespaceRequest(namespace) = &mut routed.message else {
+                unreachable!("lookup helper returns namespace request")
+            };
+            namespace.authority_shards = vec![stamp.clone()];
+            namespace.operation = DfsNamespaceOperation::PollNamespaceChanges {
+                request: sinomo_dfs::DfsNamespaceChangePollRequest {
+                    root_path: "/".to_string(),
+                    cursor: sinomo_dfs::DfsNamespaceChangeCursor::from_shard_config(&stamp, 0),
+                },
+            };
             routed
         };
         let runtime = daemon_test_runtime("daemon-dfs-stamped-lookup-lane-safety");
@@ -20533,7 +20620,7 @@ mod tests {
             unreachable!("current probe is a namespace request")
         };
         assert!(
-            daemon_dfs_message_cache_exact_lookup_admission_is_current(
+            daemon_dfs_message_cache_exact_namespace_read_admission_is_current(
                 &data_dir,
                 &cluster_paths,
                 &peer_snapshot,
@@ -20557,7 +20644,7 @@ mod tests {
             unreachable!("stale probe is a namespace request")
         };
         assert!(
-            !daemon_dfs_message_cache_exact_lookup_admission_is_current(
+            !daemon_dfs_message_cache_exact_namespace_read_admission_is_current(
                 &data_dir,
                 &cluster_paths,
                 &peer_snapshot,
@@ -20748,6 +20835,64 @@ mod tests {
             0,
             "repeated warm namespace reads must reuse the seeded retained prefix without another Raft ReadIndex",
         );
+
+        let (lane_opens_before_cold_poll, exact_lanes_before_cold_poll) = {
+            let cache = daemon_dfs_message_service_cache()
+                .lock()
+                .expect("message cache");
+            let entry = cache.get(&data_dir.root()).expect("cache entry");
+            (
+                daemon_dfs_test_message_service_lane_open_count(&data_dir),
+                entry.exact_shard_services.len(),
+            )
+        };
+        append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system.file_system_id, &users_shard.shard_id),
+                    &users_shard,
+                    None,
+                )
+                .expect("new users shard config"),
+            ),
+        )
+        .expect("commit new cold users shard");
+        let cold_poll_error = runtime
+            .block_on(handle_daemon_dfs_message_async(
+                &paths,
+                test_dfs_message_command(
+                    "dfs_namespace_poll_cold_nonresident",
+                    stamped_poll(50, users_shard),
+                ),
+                None,
+                None,
+                runtime.handle(),
+            ))
+            .expect_err("new nonresident namespace poll must fail closed");
+        assert!(
+            cold_poll_error
+                .to_string()
+                .contains("refusing to cold-open"),
+            "unexpected cold poll error: {cold_poll_error}"
+        );
+        assert_eq!(
+            daemon_dfs_test_message_service_lane_open_count(&data_dir),
+            lane_opens_before_cold_poll,
+            "a cold namespace poll must fail before opening any service/backend lane"
+        );
+        let cache = daemon_dfs_message_service_cache()
+            .lock()
+            .expect("message cache");
+        let entry = cache.get(&data_dir.root()).expect("cache entry");
+        assert_eq!(
+            entry.exact_shard_services.len(),
+            exact_lanes_before_cold_poll,
+            "a cold namespace poll must not construct an exact shard service"
+        );
+        drop(cache);
+
         let repair_queue =
             LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(&data_dir))
                 .view()

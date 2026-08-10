@@ -189,7 +189,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .and_then(|backend| backend.resident_exact_shard_id())
             .cloned();
         let Some(backend) = self.metadata_backend.as_ref() else {
-            self.cross_shard_namespace_locks.replace_jobs([]);
+            self.cross_shard_namespace_locks
+                .replace_jobs(std::iter::empty::<(
+                    Option<DfsMetadataShardId>,
+                    String,
+                    DfsFileSystemId,
+                    Vec<String>,
+                )>());
             return Ok(true);
         };
         let mut locks = Vec::new();
@@ -202,6 +208,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         job.kind,
                         DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
                             | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
+                            | DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
+                            | DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary
                             | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
                     )
                 {
@@ -210,11 +218,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         None => backend
                             .metadata_shard_id_for_path(&job.file_system_id, &job.root_path)?,
                     };
+                    let mut paths = vec![job.root_path.clone()];
+                    if matches!(
+                        job.kind,
+                        DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
+                    ) && let Some(target_path) = job.target_path.as_ref()
+                        && target_path != &job.root_path
+                    {
+                        paths.push(target_path.clone());
+                    }
                     locks.push((
                         shard_id,
                         job.job_id.clone(),
                         job.file_system_id.clone(),
-                        job.root_path.clone(),
+                        paths,
                     ));
                 }
             }
@@ -233,7 +250,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &exact_shard_id,
                 locks
                     .into_iter()
-                    .map(|(_, job_id, file_system_id, path)| (job_id, file_system_id, path)),
+                    .map(|(_, job_id, file_system_id, paths)| (job_id, file_system_id, paths)),
             );
         } else {
             self.cross_shard_namespace_locks.replace_jobs(locks);
@@ -249,6 +266,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             job.kind,
             DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
                 | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
+                | DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
+                | DfsNamespaceJobKind::HardlinkTargetFenceAcrossShardPrimary
                 | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
         ) {
             return Ok(());
@@ -262,11 +281,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 })
                 .transpose()?
                 .flatten();
+            let mut paths = vec![job.root_path.clone()];
+            if matches!(
+                job.kind,
+                DfsNamespaceJobKind::HardlinkAliasMutationAcrossShardPrimaries
+            ) && let Some(target_path) = job.target_path.as_ref()
+                && target_path != &job.root_path
+            {
+                paths.push(target_path.clone());
+            }
             self.cross_shard_namespace_locks.upsert_job(
                 shard_id,
                 job.job_id.clone(),
                 job.file_system_id.clone(),
-                job.root_path.clone(),
+                paths,
             );
         } else {
             self.cross_shard_namespace_locks.remove_job(&job.job_id);

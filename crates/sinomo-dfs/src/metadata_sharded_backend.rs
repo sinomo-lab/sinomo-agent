@@ -5856,13 +5856,33 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         visible_version: &DfsObjectVersionRecord,
         required_replica_node_ids: &[NodeId],
     ) -> Result<DfsMetadataJournalEntry> {
-        let shard_id = self.require_shard_id_for_object(&committed_object.object_id)?;
-        let entry = self.shard_backend_mut(&shard_id)?.commit_visible_version(
+        self.commit_visible_version_with_operation_id(
             expected_version,
             committed_object,
             visible_version,
             required_replica_node_ids,
-        )?;
+            None,
+        )
+    }
+
+    fn commit_visible_version_with_operation_id(
+        &mut self,
+        expected_version: &DfsVersion,
+        committed_object: &DfsObjectMetadata,
+        visible_version: &DfsObjectVersionRecord,
+        required_replica_node_ids: &[NodeId],
+        operation_id: Option<&str>,
+    ) -> Result<DfsMetadataJournalEntry> {
+        let shard_id = self.require_shard_id_for_object(&committed_object.object_id)?;
+        let entry = self
+            .shard_backend_mut(&shard_id)?
+            .commit_visible_version_with_operation_id(
+                expected_version,
+                committed_object,
+                visible_version,
+                required_replica_node_ids,
+                operation_id,
+            )?;
         self.write_content_commit_object_shard_index(
             &normalized_object_metadata(committed_object),
             &shard_id,
@@ -5873,6 +5893,14 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     fn apply_namespace_transaction(
         &mut self,
         transaction: &DfsNamespaceTransaction,
+    ) -> Result<DfsMetadataJournalEntry> {
+        self.apply_namespace_transaction_with_operation_id(transaction, None)
+    }
+
+    fn apply_namespace_transaction_with_operation_id(
+        &mut self,
+        transaction: &DfsNamespaceTransaction,
+        operation_id: Option<&str>,
     ) -> Result<DfsMetadataJournalEntry> {
         let mut objects_by_shard = BTreeMap::<DfsMetadataShardId, Vec<DfsObjectMetadata>>::new();
         let mut versions_by_shard =
@@ -5991,7 +6019,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             };
             let entry = self
                 .shard_backend_mut(&shard_id)?
-                .apply_namespace_transaction(&shard_transaction)?;
+                .apply_namespace_transaction_with_operation_id(&shard_transaction, operation_id)?;
             self.write_transaction_object_shard_indexes(&shard_transaction.objects, &shard_id)?;
             last_entry = Some(entry);
         }

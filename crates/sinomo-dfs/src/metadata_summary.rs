@@ -374,6 +374,8 @@ mod tests {
             base_version: None,
             target_version: object.version.clone(),
             coordinator_node_id: node("node_owner"),
+            operation_id: None,
+            operation_order_token: None,
             owner_epoch: 0,
             desired_replica_node_ids: vec![node("node_owner"), node("node_replica")],
             policy: crate::DfsReplicationPolicy::confirmed(2).expect("valid policy"),

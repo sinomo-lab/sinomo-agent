@@ -115,6 +115,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             | DfsNamespaceOperation::AdoptObjectAtPath { source_path, .. }
             | DfsNamespaceOperation::FinalizeObjectFamilyAdoption { source_path, .. }
             | DfsNamespaceOperation::VerifyObjectFamilyAdoption { source_path, .. }
+            | DfsNamespaceOperation::InstallHardlinkTargetFence { source_path, .. }
+            | DfsNamespaceOperation::CommitHardlinkTargetFence { source_path, .. }
             | DfsNamespaceOperation::AdoptHardlinkAlias { source_path, .. } => source_path,
             _ => return Ok(None),
         };

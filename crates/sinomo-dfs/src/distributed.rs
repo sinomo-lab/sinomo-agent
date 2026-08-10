@@ -444,6 +444,14 @@ pub struct DistributedWriteIntent {
     pub base_version: Option<DfsVersion>,
     pub target_version: DfsVersion,
     pub requesting_node_id: NodeId,
+    /// Exact caller-owned stable identity retained through durable replay and
+    /// projected namespace-change provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    /// Monotonic caller-owned operation token used to compact stable-write
+    /// receipts without retaining every exact operation id forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_order_token: Option<String>,
     #[serde(default)]
     pub owner_epoch: u64,
     pub desired_replica_nodes: Vec<NodeId>,
@@ -593,6 +601,47 @@ impl DistributedEventualCoordinator {
         touch_parent_on_create: bool,
         create_predecessor_object_id: Option<DfsObjectId>,
     ) -> Result<DistributedWriteIntent, DfsDistributedError> {
+        self.create_intent_at_epoch_with_parent_touch_and_id(
+            file_system_id,
+            object_id,
+            base_version,
+            target_version,
+            requesting_node_id,
+            owner_epoch,
+            desired_replica_nodes,
+            policy,
+            touch_parent_on_create,
+            create_predecessor_object_id,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Create an intent with an optional caller-derived durable identity.
+    ///
+    /// Routed and explicitly idempotent local writes pass a stable id. Legacy
+    /// in-process callers retain the monotonic generated-id path. Replay is
+    /// admitted before this method; seeing the same explicit id here is thus a
+    /// concurrent/identity conflict, never permission to replace an indexed
+    /// intent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_intent_at_epoch_with_parent_touch_and_id(
+        &mut self,
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        base_version: Option<DfsVersion>,
+        target_version: DfsVersion,
+        requesting_node_id: NodeId,
+        owner_epoch: u64,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        touch_parent_on_create: bool,
+        create_predecessor_object_id: Option<DfsObjectId>,
+        explicit_intent_id: Option<String>,
+        operation_id: Option<String>,
+        operation_order_token: Option<String>,
+    ) -> Result<DistributedWriteIntent, DfsDistributedError> {
         self.validate_new_intent(
             &file_system_id,
             &object_id,
@@ -602,7 +651,18 @@ impl DistributedEventualCoordinator {
             &policy,
         )?;
 
-        let intent_id = self.next_intent_id(&requesting_node_id, &object_id, &target_version);
+        let intent_id = match explicit_intent_id {
+            Some(intent_id) => {
+                if self.intents.contains_key(&intent_id) {
+                    return Err(DfsDistributedError::DuplicateIntent {
+                        object_id: object_id.clone(),
+                        target_version: target_version.clone(),
+                    });
+                }
+                intent_id
+            }
+            None => self.next_intent_id(&requesting_node_id, &object_id, &target_version),
+        };
         let intent = DistributedWriteIntent {
             intent_id: intent_id.clone(),
             file_system_id,
@@ -610,6 +670,8 @@ impl DistributedEventualCoordinator {
             base_version,
             target_version,
             requesting_node_id,
+            operation_id,
+            operation_order_token,
             owner_epoch,
             desired_replica_nodes,
             policy,
