@@ -2012,7 +2012,6 @@ fn run_mount_supervisor(
             });
             match start_result {
                 Ok(mount) => {
-                    start_retry.clear();
                     active = Some(mount);
                 }
                 Err(error) => {
@@ -2041,6 +2040,9 @@ fn run_mount_supervisor(
             let mut status = mount.status(daemon_pid, restart_count);
             status.configured_mount_point = config.mount_point.clone();
             status.resolved_mount_point = Some(mount_point.display().to_string());
+            if mount_runtime_confirms_start(&status) {
+                start_retry.clear();
+            }
             publish_status(
                 &store,
                 data_dir,
@@ -2227,6 +2229,24 @@ fn status_persistence_key(status: &SifsMountRuntimeStatus) -> SifsMountRuntimeSt
     status.worker_health_generation = 0;
     status.last_worker_heartbeat_at = None;
     status
+}
+
+fn mount_runtime_confirms_start(status: &SifsMountRuntimeStatus) -> bool {
+    if status.last_error.is_some() {
+        return false;
+    }
+    match status.platform {
+        SifsMountPlatform::UnixFuse => status.phase == SifsMountRuntimePhase::Mounted,
+        SifsMountPlatform::WindowsCloudFiles => {
+            status.phase == SifsMountRuntimePhase::Connected
+                && status.provider_registered
+                && status.provider_connected
+                && status.worker_alive
+                && status.worker_ready
+                && status.worker_health_generation > 0
+        }
+        SifsMountPlatform::Unsupported => false,
+    }
 }
 
 fn status_for_config(
@@ -2737,6 +2757,30 @@ struct ActiveMount {
 }
 
 #[cfg(any(windows, test))]
+fn poll_cloud_files_completion(
+    finished: &mpsc::Receiver<Result<(), String>>,
+    worker_finished: bool,
+) -> Option<Result<(), String>> {
+    match finished.try_recv() {
+        Ok(result) => Some(result),
+        Err(mpsc::TryRecvError::Empty) => None,
+        Err(mpsc::TryRecvError::Disconnected) => Some(Err(if worker_finished {
+            "Cloud Files provider worker exited without a terminal result".to_string()
+        } else {
+            "Cloud Files provider result channel disconnected before the worker stopped".to_string()
+        })),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn cloud_files_completion_error(result: Option<&Result<(), String>>) -> Option<String> {
+    result.map(|result| match result {
+        Ok(()) => "Cloud Files provider exited while the mount remained enabled".to_string(),
+        Err(error) => error.clone(),
+    })
+}
+
+#[cfg(any(windows, test))]
 fn cloud_files_attention_summary(
     summary: sinomo_runtime::dfs_cloud_files_api::CloudFilesSyncAttentionSummary,
 ) -> SifsMountAttentionSummary {
@@ -2817,10 +2861,12 @@ impl ActiveMount {
             }
             self.lifecycle = Some(event);
         }
-        if self.finished_result.is_none()
-            && let Ok(result) = self.finished.try_recv()
-        {
-            self.finished_result = Some(result);
+        if self.finished_result.is_none() {
+            let worker_finished = self
+                .thread
+                .as_ref()
+                .is_none_or(|thread| thread.is_finished());
+            self.finished_result = poll_cloud_files_completion(&self.finished, worker_finished);
         }
     }
 
@@ -2900,14 +2946,8 @@ impl ActiveMount {
                 .collect();
             status.attention_overflow = event.local_change_sync.attention_overflow;
         }
-        status.last_error = last_error.or_else(|| {
-            self.finished_result.as_ref().map(|result| match result {
-                Ok(()) => {
-                    "Cloud Files provider exited while the mount remained enabled".to_string()
-                }
-                Err(error) => error.clone(),
-            })
-        });
+        status.last_error =
+            last_error.or_else(|| cloud_files_completion_error(self.finished_result.as_ref()));
         if status.last_error.is_none() {
             status.last_error = self
                 .lifecycle
@@ -4036,6 +4076,83 @@ mod tests {
         changed.root_path = "/changed".to_string();
         assert!(retry.permits_attempt(&changed, now));
         assert!(retry.last_error().is_none());
+    }
+
+    #[test]
+    fn post_spawn_provider_failure_keeps_backing_off_until_runtime_is_healthy() {
+        let now = Instant::now();
+        let mut config = SifsMountConfig::default();
+        config.enabled = true;
+        let mut retry = MountStartRetry::default();
+
+        retry.record_failure(&config, "first provider failure", now);
+        let second_attempt_at = now + MOUNT_START_RETRY_INITIAL;
+        assert!(retry.permits_attempt(&config, second_attempt_at));
+
+        let mut loading = status_for_config(
+            &config,
+            None,
+            31,
+            1,
+            SifsMountRuntimePhase::Starting,
+            "loading the Windows Cloud Files provider",
+        );
+        loading.platform = SifsMountPlatform::WindowsCloudFiles;
+        assert!(!mount_runtime_confirms_start(&loading));
+        assert_eq!(retry.delay, MOUNT_START_RETRY_INITIAL);
+
+        retry.record_failure(&config, "post-spawn provider failure", second_attempt_at);
+        assert_eq!(retry.delay, MOUNT_START_RETRY_INITIAL * 2);
+        assert!(!retry.permits_attempt(&config, second_attempt_at + MOUNT_START_RETRY_INITIAL));
+
+        let mut connected = status_for_config(
+            &config,
+            None,
+            31,
+            2,
+            SifsMountRuntimePhase::Connected,
+            "Cloud Files hydration callbacks connected",
+        );
+        connected.platform = SifsMountPlatform::WindowsCloudFiles;
+        connected.provider_registered = true;
+        connected.provider_connected = true;
+        connected.worker_alive = true;
+        connected.worker_ready = true;
+        connected.worker_health_generation = 1;
+        assert!(mount_runtime_confirms_start(&connected));
+        retry.clear();
+        assert!(retry.permits_attempt(&config, second_attempt_at));
+    }
+
+    #[test]
+    fn disconnected_cloud_files_completion_is_a_terminal_error() {
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        drop(finished_tx);
+
+        let result = poll_cloud_files_completion(&finished_rx, true)
+            .expect("disconnected completion must be terminal");
+        let error = cloud_files_completion_error(Some(&result))
+            .expect("terminal completion must carry a status error");
+        assert_eq!(
+            error,
+            "Cloud Files provider worker exited without a terminal result"
+        );
+
+        let mut status = status_for_config(
+            &SifsMountConfig::default(),
+            None,
+            37,
+            0,
+            SifsMountRuntimePhase::Starting,
+            "loading the Windows Cloud Files provider",
+        );
+        status.platform = SifsMountPlatform::WindowsCloudFiles;
+        status.last_error = Some(error);
+        if status.last_error.is_some() {
+            status.phase = SifsMountRuntimePhase::Error;
+        }
+        assert_eq!(status.phase, SifsMountRuntimePhase::Error);
+        assert!(!mount_runtime_confirms_start(&status));
     }
 
     #[test]

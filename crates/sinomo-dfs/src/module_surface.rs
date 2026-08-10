@@ -113,7 +113,7 @@ pub fn register_storage_paths(
     ] {
         layout.register_escape_path("sinomo-dfs", StorageRing::R1, relative_path, reason)?;
     }
-    Ok(())
+    layout.register_binary("sinomo-dfs", StorageRing::R1, "dfs/host-mount.lock")
 }
 
 pub fn dfs_module_id() -> sinomo_module::ModuleId {
@@ -229,7 +229,7 @@ mod tests {
     use super::*;
     use crate::{DFS_DATA_READ_ROUTE, DFS_OBJECT_RPC_ROUTES};
     use sinomo_core::ModuleKind;
-    use sinomo_core::storage::StorageLayout;
+    use sinomo_core::storage::{StorageLayout, StoragePathOwner};
     use sinomo_module::{ModuleBackendRegistration, NativeRustBackendRegistration};
 
     #[test]
@@ -321,6 +321,7 @@ mod tests {
             "dfs/content/manifest-absence-observations/ab/abcdef.sobj",
             "dfs/content/orphan-observations/ab/abcdef.sobj",
             "dfs/content/stats.sobj",
+            "dfs/host-mount.lock",
             "dfs/anti-entropy-cursors/sifs.sobj",
             "dfs/metadata/services/records/tables/materialized.slog",
             "dfs/metadata/users/journal/segments/00000000000000000001.slog",
@@ -331,5 +332,10 @@ mod tests {
                 "storage contract should cover {path}"
             );
         }
+        assert!(matches!(
+            layout.owner_for("dfs/host-mount.lock"),
+            Some(StoragePathOwner::File(contract))
+                if contract.module == SINOMO_DFS_MODULE_OWNER
+        ));
     }
 }
