@@ -2443,6 +2443,48 @@ struct ResidentMetadataCursorStatusProjection {
     replay_cursors: BTreeMap<DfsMetadataShardId, u64>,
 }
 
+/// A narrow, cloneable writer for the resident replica-cursor projection.
+///
+/// Prepared publication releases its resident shard lease before peer I/O.
+/// Keeping only this projection writer lets the post-ACK path publish the
+/// committed cursor without reopening or checking out the metadata backend.
+#[derive(Clone, Debug)]
+pub(crate) struct ResidentMetadataReplicationCursorProjectionObserver {
+    projection: Arc<Mutex<ResidentMetadataCursorStatusProjection>>,
+}
+
+impl ResidentMetadataReplicationCursorProjectionObserver {
+    pub(crate) fn observe(
+        &self,
+        target_node_id: &NodeId,
+        shard_id: &DfsMetadataShardId,
+        sequence: u64,
+    ) {
+        observe_resident_metadata_replication_cursor_projection(
+            &self.projection,
+            target_node_id,
+            shard_id,
+            sequence,
+        );
+    }
+}
+
+fn observe_resident_metadata_replication_cursor_projection(
+    projection: &Mutex<ResidentMetadataCursorStatusProjection>,
+    target_node_id: &NodeId,
+    shard_id: &DfsMetadataShardId,
+    sequence: u64,
+) {
+    let mut projection = projection.lock().unwrap_or_else(|error| error.into_inner());
+    if projection.initialized {
+        let current = projection
+            .replication_cursors
+            .entry((target_node_id.clone(), shard_id.clone()))
+            .or_default();
+        *current = (*current).max(sequence);
+    }
+}
+
 impl LocalSobjMetadataBackend {
     /// Open or initialize one durable metadata shard under `root`.
     ///
@@ -5220,17 +5262,63 @@ impl LocalSobjMetadataBackend {
         shard_id: &DfsMetadataShardId,
         sequence: u64,
     ) {
+        observe_resident_metadata_replication_cursor_projection(
+            &self.resident_cursor_status_projection,
+            target_node_id,
+            shard_id,
+            sequence,
+        );
+    }
+
+    pub(crate) fn resident_metadata_replication_cursor_projection_observer(
+        &self,
+    ) -> ResidentMetadataReplicationCursorProjectionObserver {
+        ResidentMetadataReplicationCursorProjectionObserver {
+            projection: Arc::clone(&self.resident_cursor_status_projection),
+        }
+    }
+
+    /// Reconcile the resident replication-cursor projection to one current
+    /// shard topology generation.
+    ///
+    /// Global membership handoff is the only path which changes the replica
+    /// set of an already resident slot. Read the newly configured targets'
+    /// durable sidecars once at that boundary, then keep ordinary bounded
+    /// status and lease return entirely projection-backed.
+    pub(crate) fn reconcile_resident_metadata_replication_cursor_status_projection(
+        &self,
+        target_node_ids: &[NodeId],
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<()> {
+        let target_node_ids = target_node_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let mut durable_cursors = Vec::with_capacity(target_node_ids.len());
+        for target_node_id in &target_node_ids {
+            durable_cursors.push((
+                target_node_id.clone(),
+                metadata_cursor::metadata_replication_cursor(&self.root, target_node_id, shard_id)?,
+            ));
+        }
+
         let mut projection = self
             .resident_cursor_status_projection
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if projection.initialized {
+        if !projection.initialized {
+            return Ok(());
+        }
+        projection
+            .replication_cursors
+            .retain(|(target_node_id, projected_shard_id), _| {
+                projected_shard_id != shard_id || target_node_ids.contains(target_node_id)
+            });
+        for (target_node_id, durable_sequence) in durable_cursors {
             let current = projection
                 .replication_cursors
-                .entry((target_node_id.clone(), shard_id.clone()))
+                .entry((target_node_id, shard_id.clone()))
                 .or_default();
-            *current = (*current).max(sequence);
+            *current = (*current).max(durable_sequence);
         }
+        Ok(())
     }
 
     fn observe_resident_metadata_replay_cursor(

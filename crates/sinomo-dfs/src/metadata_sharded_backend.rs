@@ -29,7 +29,9 @@ use crate::metadata_api::{
     DfsMetadataShardWriteFreeze, DfsNamespaceRequestAdmissionSnapshot,
     DfsNormalizedNamespacePrepare, DfsObjectLocationUpdate,
 };
-use crate::metadata_backend::LocalSobjMetadataBackend;
+use crate::metadata_backend::{
+    LocalSobjMetadataBackend, ResidentMetadataReplicationCursorProjectionObserver,
+};
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_hardlink::sort_hardlinks_by_path;
 use crate::metadata_history_gc::{
@@ -928,8 +930,10 @@ struct ResidentLocalMetadataShardSlot {
     async_available: tokio::sync::Notify,
     /// Last complete shard-local operator projection. It stays readable while
     /// the backend itself is checked out by a long mutation, so status never
-    /// queues behind data-plane ownership.
-    status_snapshot: RwLock<Option<ResidentLocalMetadataShardStatusSnapshot>>,
+    /// queues behind data-plane ownership. Its topology is mutable because a
+    /// global membership-handoff lease can rebind the resident router while
+    /// retaining this exact shard backend instance.
+    operator_status: RwLock<ResidentLocalMetadataShardOperatorStatus>,
 }
 
 #[derive(Debug)]
@@ -945,6 +949,77 @@ struct ResidentLocalMetadataShardStatusSnapshot {
     summary: DfsMetadataSummary,
     shard_status: DfsMetadataShardStatus,
     incomplete_reasons: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ResidentLocalMetadataShardOperatorStatus {
+    config: DfsMetadataShardConfig,
+    snapshot: Option<ResidentLocalMetadataShardStatusSnapshot>,
+}
+
+/// Post-commit bridge from an async replica ACK into bounded resident status.
+///
+/// It owns neither the shard backend nor its mutation lease. The durable
+/// cursor remains authoritative; this observer advances only the monotonic
+/// in-memory projection and the matching last-complete operator image.
+#[derive(Clone, Debug)]
+pub(crate) struct ResidentMetadataReplicationCursorStatusObserver {
+    shard_id: DfsMetadataShardId,
+    slot: Arc<ResidentLocalMetadataShardSlot>,
+    projection: ResidentMetadataReplicationCursorProjectionObserver,
+}
+
+impl ResidentMetadataReplicationCursorStatusObserver {
+    pub(crate) fn observe(
+        &self,
+        target_node_id: &NodeId,
+        shard_id: &DfsMetadataShardId,
+        sequence: u64,
+    ) {
+        if shard_id != &self.shard_id {
+            debug_assert_eq!(shard_id, &self.shard_id);
+            return;
+        }
+
+        // Lease restore takes these locks in the same order. That prevents a
+        // restore which sampled the old projection from overwriting this
+        // newer post-ACK status image.
+        let mut operator_status = self
+            .slot
+            .operator_status
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if !operator_status
+            .config
+            .replica_node_ids
+            .contains(target_node_id)
+        {
+            // The durable ACK remains authoritative on disk, but a retained
+            // predecessor plan cannot repopulate the current generation's
+            // in-memory projection or bounded status with a removed target.
+            return;
+        }
+        self.projection.observe(target_node_id, shard_id, sequence);
+        let Some(snapshot) = operator_status.snapshot.as_mut() else {
+            return;
+        };
+        let journal_last_sequence = snapshot.shard_status.journal_last_sequence;
+        let Some(replica) = snapshot
+            .shard_status
+            .replica_lag
+            .iter_mut()
+            .find(|replica| replica.target_node_id == *target_node_id)
+        else {
+            // A retained plan may finish while a newer resident topology no
+            // longer projects this target. The old plan still owns its
+            // durable cursor ACK, but it must not invent a status row outside
+            // the slot's retained replica set.
+            return;
+        };
+        replica.replicated_through_sequence = replica.replicated_through_sequence.max(sequence);
+        replica.lag_entries =
+            journal_last_sequence.saturating_sub(replica.replicated_through_sequence);
+    }
 }
 
 /// One bounded operator image from a resident sharded metadata generation.
@@ -1005,7 +1080,7 @@ impl ResidentLocalMetadataShardSlot {
             .as_deref()
             .map(|backend| initialize_resident_metadata_shard_status_snapshot(&config, backend));
         Self {
-            config,
+            config: config.clone(),
             root,
             open_mode,
             state: Mutex::new(match backend {
@@ -1014,7 +1089,10 @@ impl ResidentLocalMetadataShardSlot {
             }),
             available: Condvar::new(),
             async_available: tokio::sync::Notify::new(),
-            status_snapshot: RwLock::new(status_snapshot),
+            operator_status: RwLock::new(ResidentLocalMetadataShardOperatorStatus {
+                config,
+                snapshot: status_snapshot,
+            }),
         }
     }
 
@@ -1037,14 +1115,16 @@ impl ResidentLocalMetadataShardSlot {
                 let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
                 match opened {
                     Ok(backend) => {
-                        let snapshot = initialize_resident_metadata_shard_status_snapshot(
-                            &self.config,
-                            &backend,
-                        );
-                        *self
-                            .status_snapshot
+                        let mut operator_status = self
+                            .operator_status
                             .write()
-                            .unwrap_or_else(|error| error.into_inner()) = Some(snapshot);
+                            .unwrap_or_else(|error| error.into_inner());
+                        let status_config = operator_status.config.clone();
+                        operator_status.snapshot =
+                            Some(initialize_resident_metadata_shard_status_snapshot(
+                                &status_config,
+                                &backend,
+                            ));
                         *state = ResidentLocalMetadataShardState::CheckedOut;
                         Ok(Some(backend))
                     }
@@ -1123,18 +1203,43 @@ impl ResidentLocalMetadataShardSlot {
     }
 
     fn restore(&self, backend: Box<LocalSobjMetadataBackend>) {
-        let refreshed = resident_metadata_shard_status_snapshot_from_projection(
-            &self.config,
-            &backend,
-            Vec::new(),
-        );
+        self.restore_with_status_config(backend, None);
+    }
+
+    fn restore_with_status_config(
+        &self,
+        backend: Box<LocalSobjMetadataBackend>,
+        status_config: Option<&DfsMetadataShardConfig>,
+    ) {
+        let mut operator_status = self
+            .operator_status
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut incomplete_reasons = Vec::new();
+        if let Some(status_config) = status_config
+            && operator_status.config != *status_config
         {
-            let mut snapshot = self
-                .status_snapshot
-                .write()
-                .unwrap_or_else(|error| error.into_inner());
-            *snapshot = Some(refreshed);
+            if operator_status.config.replica_node_ids != status_config.replica_node_ids
+                && let Err(error) = backend
+                    .reconcile_resident_metadata_replication_cursor_status_projection(
+                        &status_config.replica_node_ids,
+                        &DfsMetadataShardId::new(status_config.shard_id.clone()),
+                    )
+            {
+                incomplete_reasons.push(format!(
+                    "metadata shard {} cursor projection could not be rebound: {error}",
+                    status_config.shard_id
+                ));
+            }
+            operator_status.config = status_config.clone();
         }
+        let refreshed = resident_metadata_shard_status_snapshot_from_projection(
+            &operator_status.config,
+            &backend,
+            incomplete_reasons,
+        );
+        operator_status.snapshot = Some(refreshed);
+        drop(operator_status);
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         debug_assert!(matches!(
             *state,
@@ -1173,9 +1278,10 @@ impl ResidentLocalMetadataShardSlot {
     }
 
     fn last_status_snapshot(&self) -> Result<ResidentLocalMetadataShardStatusSnapshot> {
-        self.status_snapshot
+        self.operator_status
             .read()
             .unwrap_or_else(|error| error.into_inner())
+            .snapshot
             .clone()
             .ok_or_else(|| MetadataBackendError::StatusUnavailable {
                 reason: format!(
@@ -1389,6 +1495,20 @@ impl ResidentLocalMetadataShardLease {
     pub fn shard_root(&self) -> &Path {
         &self.slot.root
     }
+
+    pub(crate) fn metadata_replication_cursor_status_observer(
+        &self,
+    ) -> ResidentMetadataReplicationCursorStatusObserver {
+        ResidentMetadataReplicationCursorStatusObserver {
+            shard_id: self.shard_id.clone(),
+            slot: Arc::clone(&self.slot),
+            projection: self
+                .backend
+                .as_ref()
+                .expect("resident metadata shard lease retains backend until drop")
+                .resident_metadata_replication_cursor_projection_observer(),
+        }
+    }
 }
 
 impl Deref for ResidentLocalMetadataShardLease {
@@ -1487,13 +1607,18 @@ impl ResidentLocalShardedMetadataBackend {
     /// counters and marks the image incomplete until migration retires the
     /// fallbacks. Status itself must remain bounded and available.
     pub fn bounded_status_snapshot(&self) -> Result<DfsResidentMetadataStatusSnapshot> {
-        let (local_node_id, shard_configs, fallback_count) = self.with_router(|router| {
-            (
-                router.local_node_id.clone(),
-                router.shard_configs.clone(),
-                router.fallback_routing_indexes.len(),
-            )
+        // Retain the router generation while collecting every slot image.
+        // Global handoff restore holds the same lock while rebinding slot
+        // status, so an operator snapshot cannot pair predecessor topology
+        // with successor lag rows (or vice versa).
+        let router = self.inner.router.lock().map_err(|error| {
+            MetadataBackendError::Serde(format!(
+                "resident DFS metadata router lock failed: {error}"
+            ))
         })?;
+        let local_node_id = router.local_node_id.clone();
+        let shard_configs = router.shard_configs.clone();
+        let fallback_count = router.fallback_routing_indexes.len();
         let mut summary = DfsMetadataSummary::default();
         let mut primary_summary = DfsMetadataSummary::default();
         let mut file_system_ids = BTreeSet::new();
@@ -1562,6 +1687,7 @@ impl ResidentLocalShardedMetadataBackend {
             snapshot.shard_status.epoch = Some(config.epoch);
             metadata_shards.push(snapshot.shard_status);
         }
+        drop(router);
         summary.file_system_count = file_system_ids.len();
         primary_summary.file_system_count = primary_file_system_ids.len();
         if fallback_count > 0 {
@@ -1765,33 +1891,35 @@ impl Drop for ResidentLocalShardedMetadataBackendLease {
             fallback_routing_indexes,
             shards,
         } = backend;
-        {
-            let mut router = self
-                .resident
-                .inner
-                .router
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            *router = ResidentLocalShardedMetadataRouterState {
-                root,
-                local_node_id,
-                shard_configs,
-                routing_indexes,
-                fallback_routing_indexes,
-            };
-        }
+        let mut router = self
+            .resident
+            .inner
+            .router
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         for (shard_id, slot) in shards {
             let backend = slot
                 .backend
                 .into_inner()
                 .expect("global resident lease returns every checked-out shard backend");
-            self.resident
+            let resident_slot = self
+                .resident
                 .inner
                 .shards
                 .get(&shard_id)
-                .expect("global resident lease returns known shard")
-                .restore(backend);
+                .expect("global resident lease returns known shard");
+            let status_config = shard_configs
+                .get(&shard_id.0)
+                .unwrap_or(&resident_slot.config);
+            resident_slot.restore_with_status_config(backend, Some(status_config));
         }
+        *router = ResidentLocalShardedMetadataRouterState {
+            root,
+            local_node_id,
+            shard_configs,
+            routing_indexes,
+            fallback_routing_indexes,
+        };
     }
 }
 
@@ -3563,10 +3691,10 @@ mod lazy_replica_slot_tests {
             .expect("resident primary slot");
         *slot.state.lock().unwrap_or_else(|error| error.into_inner()) =
             ResidentLocalMetadataShardState::Unopened;
-        *slot
-            .status_snapshot
+        slot.operator_status
             .write()
-            .unwrap_or_else(|error| error.into_inner()) = None;
+            .unwrap_or_else(|error| error.into_inner())
+            .snapshot = None;
         crate::metadata_backend::reset_metadata_backend_open_calls();
 
         let snapshot = resident
