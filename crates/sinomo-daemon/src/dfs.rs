@@ -19441,10 +19441,36 @@ mod tests {
             .expect("publish empty resident repair queue generation");
         let allocator_trims_before_status = daemon_dfs_allocator_trim_completion_count(&data_dir);
         for _ in 0..2 {
-            let status = runtime
-                .block_on(handle_daemon_dfs_status_async(&paths, runtime.handle()))
-                .expect("status from resident mutation lane");
-            assert!(status.object_count > 0);
+            let status_deadline = Instant::now() + Duration::from_secs(1);
+            let status = loop {
+                let status = runtime
+                    .block_on(handle_daemon_dfs_status_async(&paths, runtime.handle()))
+                    .expect("status from resident mutation lane");
+                let blocking = status.blocking_incomplete_reasons();
+                if blocking.is_empty() {
+                    break status;
+                }
+                assert!(
+                    blocking.iter().all(|reason| reason.contains(
+                        "bounded DFS status unavailable while the resident generation cache is being updated"
+                    )),
+                    "resident status reported a non-transient incomplete reason: {:?}",
+                    status.incomplete_reasons,
+                );
+                assert!(
+                    Instant::now() < status_deadline,
+                    "resident status did not become available after a parallel cache update",
+                );
+                std::thread::yield_now();
+            };
+            assert!(
+                status.metadata_shards.iter().any(|shard| {
+                    shard.shard_id == DfsMetadataShardId::new("root")
+                        && shard.file_system_id.as_ref() == Some(&file_system.file_system_id)
+                        && shard.primary_node_id.as_ref() == Some(&local)
+                }),
+                "bounded status must expose the already-resident root shard topology",
+            );
         }
         assert_eq!(
             daemon_dfs_test_message_service_lane_open_count(&data_dir),
@@ -20449,27 +20475,36 @@ mod tests {
                 runtime.handle(),
             ))
             .expect("cold stamped lookup");
-        let authority_materializations_after_cold = {
+        let (
+            authority_materializations_after_cold,
+            authority_refreshes_after_cold,
+            cold_primary_service_is_some,
+            cold_exact_shard_services_are_empty,
+        ) = {
             let cache = daemon_dfs_message_service_cache()
                 .lock()
                 .expect("message cache");
             let entry = cache.get(&data_dir.root()).expect("cache entry");
-            assert!(entry.primary_service.is_some());
-            assert_eq!(
+            (
+                entry
+                    .metadata_authority_generation
+                    .projection_materialization_count(),
                 entry
                     .metadata_authority_generation
                     .authority_refresh_count(),
-                1,
-                "cold admission must establish one shared retained prefix proof",
-            );
-            assert!(
+                entry.primary_service.is_some(),
                 entry.exact_shard_services.is_empty(),
-                "a cold stamped lookup must stay on the global service"
-            );
-            entry
-                .metadata_authority_generation
-                .projection_materialization_count()
+            )
         };
+        assert!(cold_primary_service_is_some);
+        assert_eq!(
+            authority_refreshes_after_cold, 1,
+            "cold admission must establish one shared retained prefix proof",
+        );
+        assert!(
+            cold_exact_shard_services_are_empty,
+            "a cold stamped lookup must stay on the global service"
+        );
         assert!(
             authority_materializations_after_cold > 0,
             "cold resident initialization must exercise the projection materialization counter",
@@ -20542,20 +20577,35 @@ mod tests {
                 runtime.handle(),
             ))
             .expect("warm stamped lookup");
-        let authority_materializations_after_warm_lane = {
+        let (
+            authority_materializations_after_warm_lane,
+            authority_refreshes_before_repeated_warm,
+            exact_lane_before_repeated_warm,
+        ) = {
             let cache = daemon_dfs_message_service_cache()
                 .lock()
                 .expect("message cache");
             let entry = cache.get(&data_dir.root()).expect("cache entry");
-            let materializations = entry
-                .metadata_authority_generation
-                .projection_materialization_count();
-            assert!(
-                materializations >= authority_materializations_after_cold,
-                "the materialization counter must remain monotonic across one-time lane initialization",
-            );
-            materializations
+            (
+                entry
+                    .metadata_authority_generation
+                    .projection_materialization_count(),
+                entry
+                    .metadata_authority_generation
+                    .authority_refresh_count(),
+                Arc::as_ptr(
+                    entry
+                        .exact_shard_services
+                        .values()
+                        .next()
+                        .expect("warm exact lane"),
+                ) as usize,
+            )
         };
+        assert!(
+            authority_materializations_after_warm_lane >= authority_materializations_after_cold,
+            "the materialization counter must remain monotonic across one-time lane initialization",
+        );
         for frame_id in 4..=11 {
             runtime
                 .block_on(handle_daemon_dfs_message_async(
@@ -20570,19 +20620,44 @@ mod tests {
                 ))
                 .expect("repeated warm stamped lookup");
         }
-        {
+        let (
+            authority_materializations_after_repeated_warm,
+            authority_refreshes_after_repeated_warm,
+            exact_lane_after_repeated_warm,
+        ) = {
             let cache = daemon_dfs_message_service_cache()
                 .lock()
                 .expect("message cache");
             let entry = cache.get(&data_dir.root()).expect("cache entry");
-            assert_eq!(
+            (
                 entry
                     .metadata_authority_generation
                     .projection_materialization_count(),
-                authority_materializations_after_warm_lane,
-                "repeated warm authority preflights must validate the retained generation certificate without cloning the complete prefix",
-            );
-        }
+                entry
+                    .metadata_authority_generation
+                    .authority_refresh_count(),
+                Arc::as_ptr(
+                    entry
+                        .exact_shard_services
+                        .values()
+                        .next()
+                        .expect("retained warm exact lane"),
+                ) as usize,
+            )
+        };
+        assert!(
+            authority_materializations_after_repeated_warm
+                >= authority_materializations_after_warm_lane,
+            "retained projection materialization diagnostics must remain monotonic",
+        );
+        assert_eq!(
+            authority_refreshes_after_repeated_warm, authority_refreshes_before_repeated_warm,
+            "repeated warm authority preflights must not issue another bounded authority refresh",
+        );
+        assert_eq!(
+            exact_lane_after_repeated_warm, exact_lane_before_repeated_warm,
+            "repeated warm lookups must reuse the exact resident lane",
+        );
         let (exact_lane_before_checkpoint_change, refreshes_before_checkpoint_change) = {
             let cache = daemon_dfs_message_service_cache()
                 .lock()
@@ -20631,13 +20706,17 @@ mod tests {
                 runtime.handle(),
             ))
             .expect("warm lookup after materialized checkpoint recreate");
-        {
+        let (
+            exact_lane_count_after_checkpoint_change,
+            exact_lane_after_checkpoint_change,
+            refreshes_after_checkpoint_change,
+        ) = {
             let cache = daemon_dfs_message_service_cache()
                 .lock()
                 .expect("message cache");
             let entry = cache.get(&data_dir.root()).expect("cache entry");
-            assert_eq!(entry.exact_shard_services.len(), 1);
-            assert_eq!(
+            (
+                entry.exact_shard_services.len(),
                 Arc::as_ptr(
                     entry
                         .exact_shard_services
@@ -20645,17 +20724,20 @@ mod tests {
                         .next()
                         .expect("retained exact lane"),
                 ) as usize,
-                exact_lane_before_checkpoint_change,
-                "unlinking or recreating the observational checkpoint must not reopen the DFS lane",
-            );
-            assert_eq!(
                 entry
                     .metadata_authority_generation
                     .authority_refresh_count(),
-                refreshes_before_checkpoint_change,
-                "materialized checkpoint changes must not refresh retained Raft authority",
-            );
-        }
+            )
+        };
+        assert_eq!(exact_lane_count_after_checkpoint_change, 1);
+        assert_eq!(
+            exact_lane_after_checkpoint_change, exact_lane_before_checkpoint_change,
+            "unlinking or recreating the observational checkpoint must not reopen the DFS lane",
+        );
+        assert_eq!(
+            refreshes_after_checkpoint_change, refreshes_before_checkpoint_change,
+            "materialized checkpoint changes must not refresh retained Raft authority",
+        );
         assert_eq!(
             take_daemon_dfs_test_authoritative_exact_set_call_count(&cluster_paths),
             0,

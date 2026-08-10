@@ -11045,25 +11045,29 @@ mod tests {
         let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
 
         for attempt in 1..=3 {
-            let timed_out = runtime.block_on(async {
-                tokio::time::timeout(
-                    Duration::from_millis(25),
-                    maintenance.retry_main_local_raft_resident_initialization(&daemon_paths),
-                )
-                .await
+            runtime.block_on(async {
+                let initializer =
+                    maintenance.retry_main_local_raft_resident_initialization(&daemon_paths);
+                tokio::pin!(initializer);
+                let registration_deadline = tokio::time::sleep(Duration::from_secs(1));
+                tokio::pin!(registration_deadline);
+                loop {
+                    if sinomo_core::kv::cluster_kv_raft_operation_queue_depth_for_test(&kv_paths)
+                        == 1
+                    {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = &mut initializer => {
+                            panic!("initializer attempt {attempt} completed before registering its retained operation waiter")
+                        }
+                        _ = &mut registration_deadline => {
+                            panic!("initializer attempt {attempt} did not register its retained operation waiter")
+                        }
+                        _ = tokio::task::yield_now() => {}
+                    }
+                }
             });
-            assert!(
-                timed_out.is_err(),
-                "initializer attempt {attempt} must remain blocked by the operation guard"
-            );
-            let queue_deadline = Instant::now() + Duration::from_secs(1);
-            while sinomo_core::kv::cluster_kv_raft_operation_queue_depth_for_test(&kv_paths) != 1 {
-                assert!(
-                    Instant::now() < queue_deadline,
-                    "initializer did not register exactly one operation waiter"
-                );
-                std::thread::yield_now();
-            }
             assert!(matches!(
                 &maintenance.local_raft_resident_initialization,
                 LocalRaftResidentInitialization::InFlight(_)
@@ -11165,27 +11169,30 @@ mod tests {
         let options = DaemonRunOptions::default();
 
         for attempt in 1..=3 {
-            let timed_out = runtime.block_on(async {
-                tokio::time::timeout(
-                    Duration::from_millis(25),
-                    maintenance.tick_async(&daemon_paths, &options, runtime.handle().clone()),
-                )
-                .await
+            runtime.block_on(async {
+                let tick =
+                    maintenance.tick_async(&daemon_paths, &options, runtime.handle().clone());
+                tokio::pin!(tick);
+                let registration_deadline = tokio::time::sleep(Duration::from_secs(1));
+                tokio::pin!(registration_deadline);
+                loop {
+                    if sinomo_core::kv::cluster_kv_raft_operation_queue_depth_for_test(&kv_paths)
+                        == 1
+                    {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = &mut tick => {
+                            panic!("production-shaped tick attempt {attempt} completed before registering its retained operation waiter")
+                        }
+                        _ = &mut registration_deadline => {
+                            panic!("production-shaped tick attempt {attempt} did not register its retained operation waiter")
+                        }
+                        _ = tokio::task::yield_now() => {}
+                    }
+                }
             });
-            assert!(
-                timed_out.is_err(),
-                "production-shaped tick attempt {attempt} must await the retained initializer"
-            );
             maintenance.record_active_tick_plan_failure(Instant::now());
-
-            let queue_deadline = Instant::now() + Duration::from_secs(1);
-            while sinomo_core::kv::cluster_kv_raft_operation_queue_depth_for_test(&kv_paths) != 1 {
-                assert!(
-                    Instant::now() < queue_deadline,
-                    "timed-out tick did not retain exactly one operation waiter"
-                );
-                std::thread::yield_now();
-            }
             assert_eq!(
                 sinomo_core::kv::cluster_kv_raft_operation_queue_depth_for_test(&kv_paths),
                 1,
