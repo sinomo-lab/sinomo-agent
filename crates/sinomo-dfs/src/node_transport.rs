@@ -431,6 +431,22 @@ pub fn dfs_routed_call_rpc_call(
         routed_message: message,
     };
     let rpc_call = match attachment {
+        Some(attachment) if attachment.descriptor.total_size_bytes == 0 => {
+            // The object-RPC transport deliberately represents a zero-length
+            // body as `None`, not as a semantic attachment. Bind the empty
+            // payload into the typed DFS message before encoding so receivers
+            // take the ordinary value path rather than trying to decode an
+            // attachment wrapper whose body cannot exist on the wire.
+            let command = crate::body_rpc::attach_dfs_message_request_attachment(
+                crate::DfsAttachmentMessageCommand {
+                    command,
+                    attachment: attachment.descriptor,
+                },
+                Vec::new(),
+            )?;
+            let rpc_call = dfs_message_rpc_call(&command)?;
+            return Ok((command, rpc_call));
+        }
         Some(attachment) => {
             let request = dfs_message_rpc_request(&command)?;
             let request = crate::body_rpc::encode_dfs_attachment_message_rpc_request(
@@ -3993,6 +4009,50 @@ mod tests {
                 .expect("attachment body"),
             attachment_bytes
         );
+
+        let empty_hash = crate::content_hash(&[]);
+        let empty_repair_request_id = "empty-repair-request";
+        let empty_repair_message = DfsRoutedMessage {
+            source_node_id: source,
+            target_node_id: target,
+            frame_id: 8,
+            message_id: 8,
+            message: DfsNetworkMessage::RepairReplica(crate::DfsRepairReplicaCommand {
+                request_id: empty_repair_request_id.to_string(),
+                intent_id: "empty-repair-intent".to_string(),
+                file_system_id: sifs_file_system_id(),
+                object_id: DfsObjectId::from_legacy_named("empty-repair-object")
+                    .expect("object id"),
+                expected_base_version: None,
+                version: DfsVersion::from_legacy_named("empty-repair-version").expect("version"),
+                content_hash: empty_hash.clone(),
+                bytes: Vec::new(),
+                object_metadata: None,
+                authority_shard: None,
+            }),
+        };
+        let (empty_repair_command, empty_repair_call) =
+            dfs_routed_call_rpc_call(DfsRoutedCall::with_attachment(
+                empty_repair_message,
+                DfsOutboundAttachment::from_bytes(Vec::new(), empty_hash.clone()),
+            ))
+            .expect("zero-byte repair RPC call");
+        assert!(
+            empty_repair_call.has_streamed_value_body(),
+            "a zero-byte semantic payload must use the ordinary typed value path"
+        );
+        let empty_repair_request = materialize_dfs_value_call_sync(empty_repair_call, usize::MAX)
+            .expect("materialize zero-byte repair value call");
+        let decoded = empty_repair_request
+            .decode_body::<DfsMessageCommand>()
+            .expect("zero-byte repair must decode as an ordinary DFS command");
+        assert_eq!(decoded, empty_repair_command);
+        let DfsNetworkMessage::RepairReplica(repair) = decoded.routed_message.message else {
+            panic!("expected zero-byte repair message");
+        };
+        assert_eq!(repair.request_id, empty_repair_request_id);
+        assert_eq!(repair.content_hash, empty_hash);
+        assert!(repair.bytes.is_empty());
     }
 
     fn stage_attachment_rpc_response(
