@@ -2,10 +2,10 @@ use crate::internal::*;
 
 pub(crate) const MAX_WAL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = durable_file::DEFAULT_OBJECT_FILE_MAX_READ_BYTES;
-// A quorum command retains this lock while it replicates over the network. A
-// concurrent local maintenance/read path must tolerate that normal WAN-sized
-// critical section, but the wait remains below the outer control-plane timeout
-// so genuine lock leaks still fail in bounded time.
+// Normal quorum transport owns neither the resident node nor this file lock.
+// Five seconds is a bounded leak/contention detector for exceptional cold or
+// recovery owners, not expected WAN tolerance; routine holders should release
+// in local storage time.
 pub(crate) const RAFT_NODE_LOCK_WAIT: Duration = Duration::from_secs(5);
 pub(crate) const RAFT_NODE_LOCK_RETRY_INITIAL: Duration = Duration::from_millis(2);
 pub(crate) const RAFT_NODE_LOCK_RETRY_MAX: Duration = Duration::from_millis(40);
@@ -107,8 +107,69 @@ pub(crate) struct MaterializedSnapshotCacheEntry {
 pub(crate) struct RaftViewCacheEntry {
     pub(crate) node_id: NodeId,
     pub(crate) identity: RaftViewIdentity,
-    pub(crate) snapshot: Arc<KvSnapshot>,
+    /// Immutable indexed state moved out of the operation-scoped durable
+    /// opener.  Retaining the restored store, rather than converting it to an
+    /// owned `KvSnapshot`, avoids a second O(total keyspace) walk before a
+    /// point or prefix read can use the view.
+    pub(crate) view: Arc<RaftLocalReadView>,
     pub(crate) last_used: u64,
+    /// Conservative heap estimate derived from the durable files that produced
+    /// this view. Keeping it with the entry makes eviction O(tiny cache size)
+    /// without walking the full in-memory KV store again.
+    pub(crate) estimated_bytes: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct RaftLocalReadView {
+    pub(crate) store: InProcessKvStore,
+    pub(crate) observed_term: u64,
+    pub(crate) applied_index: u64,
+    pub(crate) known_leader: Option<NodeId>,
+    #[cfg(test)]
+    snapshot_materializations: AtomicU64,
+}
+
+impl RaftLocalReadView {
+    pub(crate) fn new(
+        store: InProcessKvStore,
+        observed_term: u64,
+        applied_index: u64,
+        known_leader: Option<NodeId>,
+    ) -> Self {
+        Self {
+            store,
+            observed_term,
+            applied_index,
+            known_leader,
+            #[cfg(test)]
+            snapshot_materializations: AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_snapshot_for_test(snapshot: &KvSnapshot) -> Result<Self, KvError> {
+        Ok(Self::new(
+            InProcessKvStore::restore(snapshot.clone())?,
+            0,
+            0,
+            None,
+        ))
+    }
+
+    pub(crate) fn revision(&self) -> KvRevision {
+        self.store.revision()
+    }
+
+    pub(crate) fn try_snapshot(&self) -> Result<KvSnapshot, KvError> {
+        #[cfg(test)]
+        self.snapshot_materializations.fetch_add(1, Ordering::Relaxed);
+        self.store.try_snapshot().map(KvSnapshot::canonicalized)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_materializations_for_test(&self) -> u64 {
+        self.snapshot_materializations.load(Ordering::Relaxed)
+    }
 }
 
 pub(crate) struct HardStateCacheEntry {
@@ -171,6 +232,14 @@ pub(crate) struct RaftViewIdentity {
 /// against unbounded growth under pathological path churn. Read caches evict the
 /// oldest entry so a noisy set of roots cannot repeatedly cold-start hot roots.
 pub(crate) const FILE_CACHE_CAPACITY: usize = 4096;
+/// Unlike the parsed object caches, every immutable Raft view owns a complete
+/// indexed KV store. Keep both a deliberately small root count and a global
+/// conservative byte budget so path churn cannot retain hundreds of full
+/// stores.
+pub(crate) const RAFT_VIEW_CACHE_CAPACITY: usize = 8;
+pub(crate) const RAFT_VIEW_CACHE_MAX_ESTIMATED_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const RAFT_VIEW_CACHE_DURABLE_EXPANSION_FACTOR: u64 = 8;
+pub(crate) const RAFT_VIEW_CACHE_MIN_ESTIMATED_BYTES: u64 = 64 * 1024;
 
 pub(crate) fn path_exists(path: &Path) -> Result<bool, KvError> {
     #[cfg(test)]
@@ -329,20 +398,47 @@ pub(crate) fn evict_materialized_snapshot_cache_entry_if_needed(
     }
 }
 
-pub(crate) fn evict_raft_view_cache_entry_if_needed(
+pub(crate) fn raft_view_cache_estimated_bytes(identity: RaftViewIdentity) -> u64 {
+    let durable_bytes = [identity.hard_state, identity.wal, identity.snapshot]
+        .into_iter()
+        .flatten()
+        .fold(0_u64, |total, file| total.saturating_add(file.len));
+    durable_bytes
+        .saturating_mul(RAFT_VIEW_CACHE_DURABLE_EXPANSION_FACTOR)
+        .max(RAFT_VIEW_CACHE_MIN_ESTIMATED_BYTES)
+}
+
+fn evict_raft_view_cache_entries_for_insert(
     guard: &mut HashMap<PathBuf, RaftViewCacheEntry>,
     protected: &Path,
-) {
-    if guard.contains_key(protected) || guard.len() < FILE_CACHE_CAPACITY {
-        return;
+    incoming_bytes: u64,
+) -> bool {
+    // A replacement's old identity is no longer usable. Remove it before
+    // calculating the budget so its bytes cannot evict an unrelated hot view.
+    guard.remove(protected);
+    if incoming_bytes > RAFT_VIEW_CACHE_MAX_ESTIMATED_BYTES {
+        return false;
     }
-    let eviction_candidate = guard
-        .iter()
-        .filter(|(path, _)| path.as_path() != protected)
-        .min_by_key(|(_, entry)| entry.last_used)
-        .map(|(path, _)| path.clone());
-    if let Some(path) = eviction_candidate {
+
+    loop {
+        let retained_bytes = guard.values().fold(0_u64, |total, entry| {
+            total.saturating_add(entry.estimated_bytes)
+        });
+        if guard.len() < RAFT_VIEW_CACHE_CAPACITY
+            && retained_bytes.saturating_add(incoming_bytes)
+                <= RAFT_VIEW_CACHE_MAX_ESTIMATED_BYTES
+        {
+            return true;
+        }
+        let eviction_candidate = guard
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(path, _)| path.clone());
+        let Some(path) = eviction_candidate else {
+            return false;
+        };
         guard.remove(&path);
+        metrics::counter!("sinomo.kv.raft.read_view_cache_evictions").increment(1);
     }
 }
 
@@ -470,36 +566,55 @@ pub(crate) fn cache_lookup_raft_view(
     paths: &KvWalPaths,
     node_id: &NodeId,
     identity: RaftViewIdentity,
-) -> Option<Arc<KvSnapshot>> {
+) -> Option<Arc<RaftLocalReadView>> {
+    if crate::raft::process_local_raft_access_is_denied(&paths.root) {
+        return None;
+    }
     let mut guard = raft_view_cache().lock().ok()?;
     let entry = guard.get_mut(&paths.root)?;
     if entry.node_id != *node_id || entry.identity != identity {
         return None;
     }
     entry.last_used = kv_read_cache_tick();
-    let snapshot = entry.snapshot.clone();
+    let view = entry.view.clone();
     drop(guard);
     // Re-stat after cloning the cached view so a concurrent append/rewrite cannot
     // slip between the first identity read and the return. If the files change
     // after this check, the read linearizes before that change.
-    (raft_view_identity(paths) == Some(identity)).then_some(snapshot)
+    (raft_view_identity(paths) == Some(identity)).then_some(view)
 }
 
 pub(crate) fn cache_store_raft_view(
     paths: &KvWalPaths,
     node_id: NodeId,
     identity: RaftViewIdentity,
-    snapshot: Arc<KvSnapshot>,
+    view: Arc<RaftLocalReadView>,
 ) {
+    if crate::raft::process_local_raft_access_is_denied(&paths.root) {
+        return;
+    }
     if let Ok(mut guard) = raft_view_cache().lock() {
-        evict_raft_view_cache_entry_if_needed(&mut guard, &paths.root);
+        let estimated_bytes = raft_view_cache_estimated_bytes(identity);
+        if !evict_raft_view_cache_entries_for_insert(
+            &mut guard,
+            &paths.root,
+            estimated_bytes,
+        ) {
+            metrics::counter!(
+                "sinomo.kv.raft.read_view_cache_admission",
+                "outcome" => "oversize"
+            )
+            .increment(1);
+            return;
+        }
         guard.insert(
             paths.root.clone(),
             RaftViewCacheEntry {
                 node_id,
                 identity,
-                snapshot,
+                view,
                 last_used: kv_read_cache_tick(),
+                estimated_bytes,
             },
         );
     }
@@ -513,6 +628,15 @@ pub(crate) fn evict_cached_raft_view(paths: &KvWalPaths) {
     if let Ok(mut guard) = raft_view_cache().lock() {
         guard.remove(&paths.root);
     }
+}
+
+pub(crate) fn evict_cached_raft_views_under_root(root: &Path) -> Result<(), KvError> {
+    let mut guard = raft_view_cache().lock().map_err(|error| KvError::Io {
+        path: root.display().to_string(),
+        detail: format!("immutable Raft view cache poisoned: {error}"),
+    })?;
+    guard.retain(|path, _| !path.starts_with(root));
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default)]

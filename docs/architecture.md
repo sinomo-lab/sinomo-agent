@@ -118,6 +118,13 @@ recovery, and changed member or endpoint sources own publication. There is no
 generic KV maintenance sweep, and observational status, health, app, or CLI
 reads do not schedule control-plane work.
 
+The daemon's resident applied Raft state is the canonical KV view. Its shared
+materialized file is a derived observational checkpoint that may lag any
+ordinary commit and cannot authorize DFS topology, placement, or destructive
+work. Correctness-sensitive clients request bounded ReadIndex projections from
+the daemon and reuse the resulting exact-key or prefix scope within that
+validated generation; they do not cold-replay the daemon-owned Raft node.
+
 Cluster discovery finds possible routes; it never grants authority. Membership
 and signed identity establish trust. A node without cluster state is in a
 bootstrap or recovery condition and may perform only local setup, credentials,

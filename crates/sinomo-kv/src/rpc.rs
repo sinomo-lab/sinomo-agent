@@ -132,6 +132,31 @@ pub fn decode_cluster_kv_txn_rpc_body(body: &[u8]) -> Result<ClusterKvTxnRpcResp
 pub struct ClusterKvAuthoritativeSnapshotRequest;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvEntryRequest {
+    pub key: String,
+}
+
+/// Requests an ordered, bounded set of exact keys from one authoritative
+/// committed view. Duplicate keys are retained so callers receive exactly one
+/// result per requested position.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvAuthoritativeEntriesRequest {
+    pub keys: Vec<String>,
+}
+
+/// Wire representation for an ordered exact-key-set response. SOBJ arrays are
+/// homogeneous, so a `Vec<Option<KvEntry>>` cannot directly mix present and
+/// missing values. Present entries are dense and `missing` marks absent output
+/// positions; an empty bitmap means every requested key was present.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvAuthoritativeEntriesResponse {
+    pub entries: Vec<KvEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<u64>,
+    pub authority: KvAuthorityProof,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterKvAuthoritativeRangePrefixRequest {
     pub prefix: String,
 }
@@ -197,6 +222,334 @@ pub fn validate_cluster_kv_authoritative_snapshot_read(
         });
     }
     Ok(())
+}
+
+pub fn cluster_kv_authoritative_entry_rpc_payload(
+    key: impl Into<String>,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(&ClusterKvEntryRequest { key: key.into() })?,
+    })
+}
+
+pub fn decode_cluster_kv_authoritative_entry_rpc_request_body(
+    body: &[u8],
+) -> Result<ClusterKvEntryRequest, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+pub fn cluster_kv_authoritative_entry_response_rpc_payload(
+    response: &KvAuthoritativeRead<Option<KvEntry>>,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    validate_cluster_kv_authoritative_entry_read(response)?;
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(response)?,
+    })
+}
+
+pub fn decode_cluster_kv_authoritative_entry_rpc_body(
+    body: &[u8],
+) -> Result<KvAuthoritativeRead<Option<KvEntry>>, KvError> {
+    let response = decode_cluster_kv_rpc_body(body)?;
+    validate_cluster_kv_authoritative_entry_read(&response)?;
+    Ok(response)
+}
+
+pub fn validate_cluster_kv_authoritative_entry_read(
+    response: &KvAuthoritativeRead<Option<KvEntry>>,
+) -> Result<(), KvError> {
+    validate_cluster_kv_current_term_authority_proof(&response.authority)?;
+    if let Some(entry) = &response.value
+        && (entry.create_revision > entry.modify_revision
+            || entry.modify_revision > response.authority.revision)
+    {
+        return Err(KvError::AuthorityUnavailable {
+            detail: format!(
+                "authoritative entry {:?} has revisions {}..{} outside proof revision {}",
+                entry.key,
+                entry.create_revision.0,
+                entry.modify_revision.0,
+                response.authority.revision.0,
+            ),
+        });
+    }
+    Ok(())
+}
+
+pub fn cluster_kv_authoritative_entries_rpc_payload(
+    keys: &[String],
+) -> Result<ClusterKvRpcPayload, KvError> {
+    validate_cluster_kv_authoritative_entries_request_keys(keys)?;
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(&ClusterKvAuthoritativeEntriesRequest {
+            keys: keys.to_vec(),
+        })?,
+    })
+}
+
+pub fn decode_cluster_kv_authoritative_entries_rpc_request_body(
+    body: &[u8],
+) -> Result<ClusterKvAuthoritativeEntriesRequest, KvError> {
+    let request: ClusterKvAuthoritativeEntriesRequest = decode_cluster_kv_rpc_body(body)?;
+    validate_cluster_kv_authoritative_entries_request_keys(&request.keys)?;
+    Ok(request)
+}
+
+pub fn cluster_kv_authoritative_entries_response_rpc_payload(
+    keys: &[String],
+    response: &KvAuthoritativeRead<Vec<Option<KvEntry>>>,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    let response = pack_cluster_kv_authoritative_entries_response(keys, response)?;
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(&response)?,
+    })
+}
+
+pub fn decode_cluster_kv_authoritative_entries_rpc_body(
+    body: &[u8],
+    expected_keys: &[String],
+) -> Result<KvAuthoritativeRead<Vec<Option<KvEntry>>>, KvError> {
+    let response = decode_cluster_kv_rpc_body(body)?;
+    unpack_cluster_kv_authoritative_entries_response(expected_keys, response)
+}
+
+pub fn pack_cluster_kv_authoritative_entries_response(
+    keys: &[String],
+    response: &KvAuthoritativeRead<Vec<Option<KvEntry>>>,
+) -> Result<ClusterKvAuthoritativeEntriesResponse, KvError> {
+    validate_cluster_kv_authoritative_entries_read(keys, response)?;
+    let mut entries = Vec::new();
+    entries
+        .try_reserve(response.value.len())
+        .map_err(|_| KvError::ResourceExhausted {
+            operation: "pack authoritative exact-key response entries".to_string(),
+            requested_bytes: response
+                .value
+                .len()
+                .saturating_mul(std::mem::size_of::<KvEntry>()),
+        })?;
+    let has_missing = response.value.iter().any(Option::is_none);
+    let mut missing = Vec::new();
+    if has_missing {
+        let word_count = response.value.len().div_ceil(u64::BITS as usize);
+        missing
+            .try_reserve(word_count)
+            .map_err(|_| KvError::ResourceExhausted {
+                operation: "pack authoritative exact-key response missing bitmap".to_string(),
+                requested_bytes: word_count.saturating_mul(std::mem::size_of::<u64>()),
+            })?;
+        missing.resize(word_count, 0);
+    }
+    for (index, value) in response.value.iter().enumerate() {
+        if let Some(entry) = value {
+            entries.push(try_clone_kv_entry(
+                entry,
+                "pack authoritative exact-key response entry",
+            )?);
+        } else if has_missing {
+            missing[index / u64::BITS as usize] |= 1_u64 << (index % u64::BITS as usize);
+        }
+    }
+    Ok(ClusterKvAuthoritativeEntriesResponse {
+        entries,
+        missing,
+        authority: response.authority,
+    })
+}
+
+pub fn unpack_cluster_kv_authoritative_entries_response(
+    keys: &[String],
+    response: ClusterKvAuthoritativeEntriesResponse,
+) -> Result<KvAuthoritativeRead<Vec<Option<KvEntry>>>, KvError> {
+    validate_cluster_kv_authoritative_entries_request_keys(keys)?;
+    let expected_words = keys.len().div_ceil(u64::BITS as usize);
+    if !response.missing.is_empty() && response.missing.len() != expected_words {
+        return Err(KvError::AuthorityUnavailable {
+            detail: format!(
+                "authoritative exact-key response has {} missing-bitmap words, expected {expected_words}",
+                response.missing.len(),
+            ),
+        });
+    }
+    if let Some(last) = response.missing.last() {
+        let used_bits = keys.len() % u64::BITS as usize;
+        if used_bits != 0 && (*last >> used_bits) != 0 {
+            return Err(KvError::AuthorityUnavailable {
+                detail: "authoritative exact-key response sets missing bits outside the request"
+                    .to_string(),
+            });
+        }
+    }
+    let missing_count = (0..keys.len())
+        .filter(|index| {
+            !response.missing.is_empty()
+                && response.missing[*index / u64::BITS as usize]
+                    & (1_u64 << (*index % u64::BITS as usize))
+                    != 0
+        })
+        .count();
+    let expected_entries = keys.len().saturating_sub(missing_count);
+    if response.entries.len() != expected_entries {
+        return Err(KvError::AuthorityUnavailable {
+            detail: format!(
+                "authoritative exact-key response has {} dense entries, expected {expected_entries}",
+                response.entries.len(),
+            ),
+        });
+    }
+
+    let mut dense = response.entries.into_iter();
+    let mut values = Vec::new();
+    values
+        .try_reserve(keys.len())
+        .map_err(|_| KvError::ResourceExhausted {
+            operation: "unpack authoritative exact-key response".to_string(),
+            requested_bytes: keys
+                .len()
+                .saturating_mul(std::mem::size_of::<Option<KvEntry>>()),
+        })?;
+    for index in 0..keys.len() {
+        let is_missing = !response.missing.is_empty()
+            && response.missing[index / u64::BITS as usize]
+                & (1_u64 << (index % u64::BITS as usize))
+                != 0;
+        values.push(if is_missing { None } else { dense.next() });
+    }
+    let read = KvAuthoritativeRead {
+        value: values,
+        authority: response.authority,
+    };
+    validate_cluster_kv_authoritative_entries_read(keys, &read)?;
+    Ok(read)
+}
+
+pub fn validate_cluster_kv_authoritative_entries_request_keys(
+    keys: &[String],
+) -> Result<(), KvError> {
+    if keys.is_empty() {
+        return Err(KvError::Serialization {
+            detail: "authoritative exact-key request must contain at least one key".to_string(),
+        });
+    }
+    if keys.len() > CLUSTER_KV_AUTHORITATIVE_ENTRIES_MAX_KEYS {
+        return Err(KvError::ResourceExhausted {
+            operation: "authoritative exact-key request cardinality".to_string(),
+            requested_bytes: keys.len(),
+        });
+    }
+    let key_bytes = keys
+        .iter()
+        .fold(0_usize, |total, key| total.saturating_add(key.len()));
+    if key_bytes > CLUSTER_KV_AUTHORITATIVE_ENTRIES_MAX_PAYLOAD_BYTES {
+        return Err(KvError::ResourceExhausted {
+            operation: "authoritative exact-key request payload".to_string(),
+            requested_bytes: key_bytes,
+        });
+    }
+    Ok(())
+}
+
+pub fn validate_cluster_kv_authoritative_entries_read(
+    keys: &[String],
+    response: &KvAuthoritativeRead<Vec<Option<KvEntry>>>,
+) -> Result<(), KvError> {
+    validate_cluster_kv_authoritative_entries_request_keys(keys)?;
+    validate_cluster_kv_current_term_authority_proof(&response.authority)?;
+    if response.value.len() != keys.len() {
+        return Err(KvError::AuthorityUnavailable {
+            detail: format!(
+                "authoritative exact-key response has {} entries for {} requested keys",
+                response.value.len(),
+                keys.len(),
+            ),
+        });
+    }
+
+    let mut payload_bytes = 0_usize;
+    let mut duplicate_values = BTreeMap::<&str, &Option<KvEntry>>::new();
+    for (key, value) in keys.iter().zip(&response.value) {
+        if let Some(entry) = value {
+            if entry.key != *key {
+                return Err(KvError::AuthorityUnavailable {
+                    detail: format!(
+                        "authoritative exact-key response returned {:?} for requested key {:?}",
+                        entry.key, key,
+                    ),
+                });
+            }
+            validate_kv_value_len(entry.value.len())?;
+            payload_bytes = payload_bytes.saturating_add(kv_entry_payload_bytes(entry));
+            if entry.create_revision > entry.modify_revision
+                || entry.modify_revision > response.authority.revision
+            {
+                return Err(KvError::AuthorityUnavailable {
+                    detail: format!(
+                        "authoritative entry {:?} has revisions {}..{} outside proof revision {}",
+                        entry.key,
+                        entry.create_revision.0,
+                        entry.modify_revision.0,
+                        response.authority.revision.0,
+                    ),
+                });
+            }
+        }
+        if let Some(previous) = duplicate_values.insert(key.as_str(), value)
+            && previous != value
+        {
+            return Err(KvError::AuthorityUnavailable {
+                detail: format!(
+                    "authoritative exact-key response returned inconsistent values for duplicate key {key:?}"
+                ),
+            });
+        }
+    }
+    if payload_bytes > CLUSTER_KV_AUTHORITATIVE_ENTRIES_MAX_PAYLOAD_BYTES {
+        return Err(KvError::ResourceExhausted {
+            operation: "authoritative exact-key response payload".to_string(),
+            requested_bytes: payload_bytes,
+        });
+    }
+    Ok(())
+}
+
+/// Compatibility/test projection from an already-materialized authoritative
+/// snapshot. The production exact-key route projects directly from resident
+/// indexed Raft storage after one ReadIndex and must not call this helper.
+pub fn project_cluster_kv_authoritative_entries(
+    read: &KvAuthoritativeRead<KvSnapshot>,
+    keys: &[String],
+) -> Result<KvAuthoritativeRead<Vec<Option<KvEntry>>>, KvError> {
+    validate_cluster_kv_authoritative_snapshot_read(read)?;
+    validate_cluster_kv_authoritative_entries_request_keys(keys)?;
+    let mut values = Vec::new();
+    values
+        .try_reserve(keys.len())
+        .map_err(|_| KvError::ResourceExhausted {
+            operation: "project authoritative exact-key response".to_string(),
+            requested_bytes: keys.len().saturating_mul(std::mem::size_of::<Option<KvEntry>>()),
+        })?;
+    for key in keys {
+        values.push(
+            read.value
+                .get(key)
+                .map(|entry| try_clone_kv_entry(entry, "project authoritative exact-key response"))
+                .transpose()?,
+        );
+    }
+    let response = KvAuthoritativeRead {
+        value: values,
+        authority: read.authority,
+    };
+    validate_cluster_kv_authoritative_entries_read(keys, &response)?;
+    Ok(response)
 }
 
 pub fn cluster_kv_authoritative_range_prefix_rpc_payload(
@@ -389,6 +742,38 @@ pub fn validate_cluster_kv_request_outcome_read(
     Ok(())
 }
 
+pub fn cluster_kv_local_entry_rpc_payload(
+    key: impl Into<String>,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_LOCAL_ENTRY_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(&ClusterKvEntryRequest { key: key.into() })?,
+    })
+}
+
+pub fn decode_cluster_kv_local_entry_rpc_request_body(
+    body: &[u8],
+) -> Result<ClusterKvEntryRequest, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+pub fn cluster_kv_local_entry_response_rpc_payload(
+    entry: &KvLocalRead<Option<KvEntry>>,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_LOCAL_ENTRY_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(entry)?,
+    })
+}
+
+pub fn decode_cluster_kv_local_entry_rpc_body(
+    body: &[u8],
+) -> Result<KvLocalRead<Option<KvEntry>>, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
 pub fn cluster_kv_local_range_prefix_rpc_payload(
     prefix: &str,
 ) -> Result<ClusterKvRpcPayload, KvError> {
@@ -487,6 +872,18 @@ pub struct ClusterRaftAppendRequest {
     pub append: RaftAppendEntriesRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<RaftSnapshot>,
+    /// Marks the empty AppendEntries heartbeat used only to establish a
+    /// linearizable ReadIndex proof.
+    ///
+    /// Ordinary heartbeats and replication requests deliberately leave this
+    /// false. Receivers may then answer a marked same-term probe from their
+    /// exact resident Raft view without entering the durable mutation queues.
+    #[serde(default, skip_serializing_if = "cluster_raft_read_index_probe_is_false")]
+    pub read_index_probe: bool,
+}
+
+fn cluster_raft_read_index_probe_is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

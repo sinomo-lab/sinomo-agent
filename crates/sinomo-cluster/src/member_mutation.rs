@@ -39,7 +39,7 @@ use sinomo_kv::{
     ClusterKvRaftConfigChange, ClusterKvRaftConfigChangeEvidence, ClusterKvRaftConfigChangeKind,
     ClusterKvRaftConfigChangePhase, ClusterKvRaftConfigRecord, ClusterKvTxnCommitResult,
     InProcessKvStore, KvAuthoritativeRead, KvAuthorityProof, KvCommand, KvCompare, KvOp,
-    KvSnapshot, KvTxn, KvTxnRequest,
+    KvRevision, KvSnapshot, KvTxn, KvTxnRequest,
 };
 use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterPaths;
@@ -287,6 +287,82 @@ pub fn sync_cluster_state_to_local_kv_unchecked(
         return Ok(initial_snapshot);
     }
     append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+}
+
+/// Seeds the first committed KV generation of a newly-created single-voter
+/// cluster.
+///
+/// [`ClusterBootstrapState::initialized_locally`] describes the first cluster
+/// generation, so its `kv_revision` floor is one while the durable store is
+/// still at revision zero. Ordinary authoritative reads must not weaken their
+/// monotonic revision floor for that one transition. This
+/// explicit bootstrap seam instead proves that the local node is the sole
+/// voter and leader and that no KV generation exists before using the local
+/// bootstrap writer.
+pub fn bootstrap_single_voter_cluster_state_to_local_kv(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<KvSnapshot, NetworkError> {
+    let voters = sinomo_kv::cluster_kv_raft_voter_ids(state).map_err(kv_err)?;
+    if state.term != 1
+        || state.kv_revision != KvRevision::ZERO.next().0
+        || voters.as_slice() != std::slice::from_ref(&state.local_node_id)
+    {
+        return Err(NetworkError::InvalidClusterCommand {
+            detail: "single-voter KV bootstrap requires initial term/revision and the local node as the sole voter"
+                .to_string(),
+        });
+    }
+
+    let node = open_cluster_raft_kv_node(paths, &state.local_node_id)?;
+    let hard_state = node.hard_state();
+    if hard_state.current_term != state.term
+        || hard_state.leader_id.as_ref() != Some(&state.local_node_id)
+    {
+        return Err(NetworkError::ClusterReadOnly {
+            detail:
+                "single-voter KV bootstrap requires durable local leadership in the initial term"
+                    .to_string(),
+        });
+    }
+    let initial = node.store().try_snapshot().map_err(kv_err)?;
+    if initial.revision != KvRevision::ZERO
+        || initial.compacted_revision != KvRevision::ZERO
+        || !initial.entries.is_empty()
+        || !initial.leases.is_empty()
+        || !initial.events.is_empty()
+        || !initial.committed_requests.is_empty()
+        || !initial.expired_requests.is_empty()
+    {
+        return Err(NetworkError::InvalidClusterCommand {
+            detail: format!(
+                "single-voter KV bootstrap requires an empty revision-zero store, found revision {}",
+                initial.revision.0
+            ),
+        });
+    }
+    drop(node);
+
+    let seeded = sync_cluster_state_to_local_kv_unchecked(paths, state)?;
+    let expected_config = ClusterKvRaftConfigRecord::from(state);
+    let seeded_config = seeded
+        .get(&sinomo_kv::cluster_kv_raft_config_key())
+        .ok_or_else(|| NetworkError::ClusterReadOnly {
+            detail: "single-voter KV bootstrap did not commit a Raft configuration".to_string(),
+        })?
+        .decode()
+        .map_err(kv_err)?;
+    if seeded.revision.0 < state.kv_revision
+        || !sinomo_kv::cluster_kv_raft_config_record_stable_eq(&seeded_config, &expected_config)
+    {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "single-voter KV bootstrap committed generation {} below required floor {}",
+                seeded.revision.0, state.kv_revision
+            ),
+        });
+    }
+    Ok(seeded)
 }
 
 #[cfg(any(test, feature = "test-support"))]

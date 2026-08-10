@@ -173,9 +173,12 @@ seed an identity-validated immutable view from one cold restore, but it never
 retains the writer lock. Commits return their bounded event/final-key delta;
 full Raft snapshots are created only at the log/event compaction threshold or
 when a compatibility/export caller explicitly requests one. The shared
-main/shadow projection remains synchronous for Critical and unclassified
-keyspaces; Operational and Telemetry projections converge from committed
-deltas and periodic checkpoints.
+main/shadow materialized file is a derived observational checkpoint and may lag
+ordinary commits in every keyspace; it never grants authority. Process-local
+observers consume committed deltas, while correctness-sensitive readers use the
+resident applied Raft index or a bounded daemon ReadIndex projection. Checkpoint
+publication happens only after Raft, commit-sequence, and resident-state locks
+have been released, so filesystem I/O cannot hold the authority path.
 
 Public reads use one of two explicit consistency contracts:
 
@@ -199,6 +202,12 @@ Concurrent reads may share one confirmation only when their root, leader,
 term, commit position, exact configuration entry, and voter set are identical.
 Each caller retains its own deadline and independently revalidates that fence
 against the resident applied state before returning data.
+
+DFS clients retain only the exact keys and prefixes they have validated through
+the daemon. Metadata-backend construction and repeated operations reuse those
+scope certificates; they do not reopen or replay the daemon-owned Raft node, and
+they never treat a stale or missing materialized checkpoint as an authoritative
+absence.
 
 Leader preference is a routing optimization, not a third consistency level. A
 reachable leader without current quorum evidence does not prove freshness.

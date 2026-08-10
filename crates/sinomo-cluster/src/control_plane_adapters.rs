@@ -89,9 +89,7 @@ pub(crate) use crate::raft_quorum::{
 #[cfg(test)]
 pub(crate) use crate::raft_replication::replicate_cluster_raft_to_endpoint_with_local_host;
 #[cfg(test)]
-pub(crate) use crate::raft_rpc::{
-    handle_cluster_raft_append_request, handle_cluster_raft_vote_request,
-};
+pub(crate) use crate::raft_rpc::handle_cluster_raft_append_request;
 use crate::state_authority_reachability::{
     ClusterStateAuthorityReachabilityHost, cluster_has_local_quorum_with_host,
 };
@@ -389,12 +387,10 @@ where
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
     ) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError> {
-        read_cluster_kv_authoritative_snapshot_with_host(
-            paths,
-            state,
-            self.timeouts.kv_txn_quorum_options(true),
-            self,
-        )
+        let options = self.timeouts.kv_txn_quorum_options(true);
+        self.with_active_cluster_paths(paths, |driver| {
+            read_cluster_kv_authoritative_snapshot_with_host(paths, state, options, driver)
+        })
     }
 
     fn commit_cluster_kv_txn_with_quorum(
@@ -404,7 +400,11 @@ where
         request: KvTxnRequest,
     ) -> Result<sinomo_kv::ClusterKvTxnCommitResult, NetworkError> {
         let options = self.timeouts.kv_txn_quorum_options(true);
-        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, request, options, self)
+        self.with_active_cluster_paths(paths, |driver| {
+            commit_cluster_kv_txn_with_quorum_response_with_host(
+                paths, state, request, options, driver,
+            )
+        })
     }
 
     fn prove_cluster_raft_member_caught_up(
@@ -415,8 +415,9 @@ where
         required_log_index: u64,
         now: time::OffsetDateTime,
     ) -> Result<sinomo_kv::ClusterKvRaftCatchUpProof, NetworkError> {
-        let response =
-            catch_up_cluster_raft_member_with_control_plane_driver(paths, state, node_id, self)?;
+        let response = self.with_active_cluster_paths(paths, |driver| {
+            catch_up_cluster_raft_member_with_control_plane_driver(paths, state, node_id, driver)
+        })?;
         if !response.accepted || response.append.match_index < required_log_index {
             return Err(NetworkError::ClusterReadOnly {
                 detail: format!(

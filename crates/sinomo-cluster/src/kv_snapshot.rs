@@ -8,10 +8,6 @@ use sinomo_base::ClusterBootstrapState;
 use sinomo_kv::{InProcessKvStore, KvAuthoritativeRead, KvSnapshot};
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
-use sinomo_network::{
-    ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector,
-    cluster_node_blocks_leader_preference,
-};
 use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_node::NodeId;
 use std::time::{Duration, Instant};
@@ -147,12 +143,14 @@ pub fn refresh_current_cluster_kv_store_with_outcome(
     host: &mut impl ClusterKvSnapshotRefreshHost,
 ) -> Result<ClusterKvSnapshotRefreshOutcome, NetworkError> {
     let local_snapshot = read_cluster_kv_snapshot(paths).ok();
-    let mut targets = ClusterEndpointSelector::new(paths, state).select_internal_unique_node_ids(
-        ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
-    );
+    // Snapshot refresh is itself the mechanism that makes a cold KV
+    // projection available. Selecting targets through the KV-backed cluster
+    // directory first is circular: it can synchronously hydrate that same
+    // full snapshot/WAL merely to discover the voter IDs already present in
+    // the caller's committed membership fence.
+    let mut targets = sinomo_kv::cluster_kv_raft_voter_ids(state).map_err(kv_err)?;
     targets.retain(|node_id| node_id != &state.local_node_id);
     if let Ok(Some(leader_id)) = host.known_kv_state_authority_id(paths, state)
-        && !cluster_node_blocks_leader_preference(paths, state, &leader_id)
         && let Some(position) = targets.iter().position(|node_id| node_id == &leader_id)
     {
         let leader = targets.remove(position);
@@ -263,7 +261,63 @@ mod tests {
     use sinomo_kv::KvRevision;
     use sinomo_node::{ClusterId, DAEMON_MAIN_RUN_CAPABILITY};
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use time::OffsetDateTime;
+
+    struct PanickingSnapshotRefreshDirectory;
+
+    impl sinomo_network::ClusterDirectory for PanickingSnapshotRefreshDirectory {
+        fn members(&self) -> Result<Vec<ClusterMemberRecord>, NetworkError> {
+            panic!("snapshot refresh must not read the dynamic cluster directory")
+        }
+
+        fn endpoints(&self) -> Result<Vec<sinomo_base::ClusterEndpointRecord>, NetworkError> {
+            panic!("snapshot refresh must not read the dynamic cluster directory")
+        }
+
+        fn node_statuses(
+            &self,
+        ) -> Result<BTreeMap<NodeId, sinomo_base::ClusterNodeStatusRecord>, NetworkError> {
+            panic!("snapshot refresh must not read the dynamic cluster directory")
+        }
+
+        fn connectivity_records(
+            &self,
+        ) -> Result<Vec<sinomo_network::ClusterConnectivityRecord>, NetworkError> {
+            panic!("snapshot refresh must not read the dynamic cluster directory")
+        }
+
+        fn version(&self) -> Result<sinomo_network::DirectoryVersion, NetworkError> {
+            panic!("snapshot refresh must not read the dynamic cluster directory")
+        }
+    }
+
+    struct SnapshotRefreshDirectoryActivation(Arc<AtomicBool>);
+
+    impl Drop for SnapshotRefreshDirectoryActivation {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+
+    fn install_panicking_snapshot_refresh_directory() -> SnapshotRefreshDirectoryActivation {
+        let active = Arc::new(AtomicBool::new(true));
+        let owner_thread = std::thread::current().id();
+        let provider_active = Arc::clone(&active);
+        sinomo_network::set_cluster_directory_provider(Arc::new(move |_| {
+            let directory: Arc<dyn sinomo_network::ClusterDirectory> = if provider_active
+                .load(Ordering::Acquire)
+                && std::thread::current().id() == owner_thread
+            {
+                Arc::new(PanickingSnapshotRefreshDirectory)
+            } else {
+                Arc::new(sinomo_network::EmptyClusterDirectory)
+            };
+            directory
+        }));
+        SnapshotRefreshDirectoryActivation(active)
+    }
 
     struct RecordingSnapshotRefreshHost {
         known_authority: NodeId,
@@ -403,10 +457,8 @@ mod tests {
             state.members.push(member);
         }
 
-        let mut targets = ClusterEndpointSelector::new(&paths, &state)
-            .select_internal_unique_node_ids(
-                ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
-            );
+        let mut targets =
+            sinomo_kv::cluster_kv_raft_voter_ids(&state).expect("projected voter targets");
         targets.retain(|node_id| node_id != &state.local_node_id);
         assert_eq!(targets.len(), 3, "test requires three remote authorities");
         (root, paths, state, targets)
@@ -426,6 +478,7 @@ mod tests {
 
     #[test]
     fn snapshot_refresh_bounds_stalled_preferred_authority_and_uses_reachable_fallback() {
+        let _directory_activation = install_panicking_snapshot_refresh_directory();
         let (_root, paths, state, targets) = snapshot_refresh_test_state();
         let preferred = targets[2].clone();
         let fallback = targets[0].clone();

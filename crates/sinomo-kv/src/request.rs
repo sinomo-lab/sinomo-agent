@@ -43,6 +43,12 @@ struct StoredRequestAttempt {
     encoded_bytes: usize,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ClusterKvRequestAttemptSubmissionReceipt {
+    command_digest: KvCommandDigest,
+    updated_at: OffsetDateTime,
+}
+
 #[derive(Clone, Debug, Default)]
 struct MaterializedRequestAttemptLedger {
     attempts: HashMap<KvRequestId, StoredRequestAttempt>,
@@ -163,6 +169,47 @@ impl MaterializedRequestAttemptLedger {
         if encoded_bytes > MAX_CLUSTER_KV_REQUEST_ATTEMPT_BYTES {
             // Preserve the established outcome for an individually oversized
             // attempt without appending its multi-megabyte diagnostic detail.
+            return Ok(Some(PreparedRequestAttemptMutation::Expire(
+                record.request_id,
+            )));
+        }
+        Ok(Some(PreparedRequestAttemptMutation::Upsert {
+            record,
+            encoded_bytes,
+        }))
+    }
+
+    fn prepare_rejection_after_exact_submission(
+        &self,
+        record: KvRequestAttemptRecord,
+        submission: &ClusterKvRequestAttemptSubmissionReceipt,
+    ) -> Result<Option<PreparedRequestAttemptMutation>, KvError> {
+        if self.expired.contains(&record.request_id) {
+            return Err(KvError::RequestExpired {
+                request_id: record.request_id,
+            });
+        }
+        let Some(existing) = self.attempts.get(&record.request_id) else {
+            return Ok(None);
+        };
+        if existing.record.command_digest != record.command_digest
+            || existing.record.command_digest != submission.command_digest
+        {
+            return Err(KvError::RequestIdConflict {
+                request_id: record.request_id,
+            });
+        }
+        // Only the caller that durably created this exact Submitted record may
+        // close it as a definite pre-append rejection. A retry that merely
+        // observed an older Submitted/Unknown record must preserve ambiguity,
+        // and a concurrent newer outcome must never be overwritten.
+        if existing.record.updated_at != submission.updated_at
+            || !matches!(existing.record.state, KvRequestAttemptState::Submitted)
+        {
+            return Ok(None);
+        }
+        let encoded_bytes = encode_kv_value(&record)?.len();
+        if encoded_bytes > MAX_CLUSTER_KV_REQUEST_ATTEMPT_BYTES {
             return Ok(Some(PreparedRequestAttemptMutation::Expire(
                 record.request_id,
             )));
@@ -345,11 +392,32 @@ pub(crate) fn write_cached_request_attempt_checkpoint_for_test(
     write_object_file(&paths.request_attempts, &checkpoint)
 }
 
-fn lock_request_attempt_ledger(paths: &ClusterKvPaths) -> Result<File, KvError> {
+fn request_attempt_deadline_busy(paths: &ClusterKvPaths) -> KvError {
+    KvError::Busy {
+        path: paths.request_attempts_lock.display().to_string(),
+    }
+}
+
+fn ensure_request_attempt_deadline(
+    paths: &ClusterKvPaths,
+    operation_deadline: Option<Instant>,
+) -> Result<(), KvError> {
+    if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(request_attempt_deadline_busy(paths));
+    }
+    Ok(())
+}
+
+fn lock_request_attempt_ledger_before(
+    paths: &ClusterKvPaths,
+    operation_deadline: Option<Instant>,
+) -> Result<File, KvError> {
+    ensure_request_attempt_deadline(paths, operation_deadline)?;
     fs::create_dir_all(&paths.root).map_err(|source| KvError::Io {
         path: paths.root.display().to_string(),
         detail: source.to_string(),
     })?;
+    ensure_request_attempt_deadline(paths, operation_deadline)?;
     let lock = OpenOptions::new()
         .create(true)
         .read(true)
@@ -360,12 +428,58 @@ fn lock_request_attempt_ledger(paths: &ClusterKvPaths) -> Result<File, KvError> 
             path: paths.request_attempts_lock.display().to_string(),
             detail: source.to_string(),
         })?;
-    lock_node_exclusive(
-        &lock,
-        &paths.request_attempts_lock,
-        CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT,
-    )?;
+    let wait = operation_deadline.map_or(CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT, |deadline| {
+        deadline.saturating_duration_since(Instant::now())
+    });
+    lock_node_exclusive(&lock, &paths.request_attempts_lock, wait)?;
+    // A lock release racing the timeout must not admit an already-expired
+    // reconciliation operation. Dropping `lock` here releases the flock.
+    ensure_request_attempt_deadline(paths, operation_deadline)?;
     Ok(lock)
+}
+
+fn lock_request_attempt_ledger(paths: &ClusterKvPaths) -> Result<File, KvError> {
+    lock_request_attempt_ledger_before(paths, None)
+}
+
+#[cfg(test)]
+pub(crate) fn lock_cluster_kv_request_attempt_ledger_for_test(
+    paths: &ClusterKvPaths,
+) -> Result<File, KvError> {
+    lock_request_attempt_ledger(paths)
+}
+
+fn lock_request_attempt_cache_before(
+    paths: &ClusterKvPaths,
+    operation_deadline: Instant,
+) -> Result<std::sync::MutexGuard<'static, HashMap<PathBuf, RequestAttemptLedgerCacheEntry>>, KvError>
+{
+    let mut attempts = 0_u32;
+    loop {
+        ensure_request_attempt_deadline(paths, Some(operation_deadline))?;
+        match REQUEST_ATTEMPT_LEDGER_CACHE.try_lock() {
+            Ok(cache) => {
+                ensure_request_attempt_deadline(paths, Some(operation_deadline))?;
+                return Ok(cache);
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let cache = poisoned.into_inner();
+                ensure_request_attempt_deadline(paths, Some(operation_deadline))?;
+                return Ok(cache);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let now = Instant::now();
+                if now >= operation_deadline {
+                    return Err(request_attempt_deadline_busy(paths));
+                }
+                thread::sleep(
+                    raft_node_lock_retry_delay(attempts)
+                        .min(operation_deadline.saturating_duration_since(now)),
+                );
+                attempts = attempts.saturating_add(1);
+            }
+        }
+    }
 }
 
 fn evict_request_attempt_cache_entry_if_needed(
@@ -387,9 +501,12 @@ fn evict_request_attempt_cache_entry_if_needed(
 
 fn load_request_attempt_ledger(
     paths: &ClusterKvPaths,
+    operation_deadline: Option<Instant>,
 ) -> Result<RequestAttemptLedgerCacheEntry, KvError> {
+    ensure_request_attempt_deadline(paths, operation_deadline)?;
     let checkpoint =
         read_optional_object::<KvRequestAttemptLedger>(&paths.request_attempts)?.unwrap_or_default();
+    ensure_request_attempt_deadline(paths, operation_deadline)?;
     let mut ledger = MaterializedRequestAttemptLedger::from_checkpoint(checkpoint)?;
     let mut log_records = 0_usize;
     let mut log_bytes = 0_u64;
@@ -415,6 +532,7 @@ fn load_request_attempt_ledger(
                 })?;
             let mut physical_records = 0_usize;
             loop {
+                ensure_request_attempt_deadline(paths, operation_deadline)?;
                 let record_start = file.stream_position().map_err(|source| KvError::Io {
                     path: paths.request_attempts_log.display().to_string(),
                     detail: source.to_string(),
@@ -474,7 +592,9 @@ fn load_request_attempt_ledger(
                 repair_log = true;
             }
             if repair_log {
+                ensure_request_attempt_deadline(paths, operation_deadline)?;
                 write_object_file(&paths.request_attempts, &ledger.checkpoint())?;
+                ensure_request_attempt_deadline(paths, operation_deadline)?;
                 durable_file::truncate_open_file_and_sync(
                     &mut file,
                     &paths.request_attempts_log,
@@ -508,7 +628,9 @@ fn load_request_attempt_ledger(
 fn request_attempt_cache_entry<'a>(
     paths: &ClusterKvPaths,
     cache: &'a mut HashMap<PathBuf, RequestAttemptLedgerCacheEntry>,
+    operation_deadline: Option<Instant>,
 ) -> Result<&'a mut RequestAttemptLedgerCacheEntry, KvError> {
+    ensure_request_attempt_deadline(paths, operation_deadline)?;
     let key = paths.request_attempts.clone();
     let checkpoint_identity = file_identity(&paths.request_attempts);
     let log_identity = file_identity(&paths.request_attempts_log);
@@ -516,13 +638,15 @@ fn request_attempt_cache_entry<'a>(
         entry.checkpoint_identity == checkpoint_identity && entry.log_identity == log_identity
     });
     if !cache_is_current {
-        let entry = load_request_attempt_ledger(paths)?;
+        let entry = load_request_attempt_ledger(paths, operation_deadline)?;
+        ensure_request_attempt_deadline(paths, operation_deadline)?;
         evict_request_attempt_cache_entry_if_needed(cache, &key);
         cache.insert(key.clone(), entry);
     }
     let entry = cache
         .get_mut(&key)
         .expect("request-attempt cache entry inserted above");
+    ensure_request_attempt_deadline(paths, operation_deadline)?;
     entry.last_used = kv_read_cache_tick();
     Ok(entry)
 }
@@ -576,22 +700,43 @@ fn checkpoint_request_attempt_ledger(
     Ok(())
 }
 
-pub fn record_cluster_kv_request_attempt(
+fn record_cluster_kv_request_attempt_with_deadline(
     paths: &ClusterKvPaths,
     record: KvRequestAttemptRecord,
-) -> Result<(), KvError> {
-    let _lock = lock_request_attempt_ledger(paths)?;
-    let mut cache = REQUEST_ATTEMPT_LEDGER_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let entry = request_attempt_cache_entry(paths, &mut cache)?;
+    operation_deadline: Option<Instant>,
+    expected_submission: Option<&ClusterKvRequestAttemptSubmissionReceipt>,
+) -> Result<bool, KvError> {
+    let _lock = lock_request_attempt_ledger_before(paths, operation_deadline)?;
+    let mut cache = match operation_deadline {
+        Some(deadline) => lock_request_attempt_cache_before(paths, deadline)?,
+        None => REQUEST_ATTEMPT_LEDGER_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    };
+    let entry = request_attempt_cache_entry(paths, &mut cache, operation_deadline)?;
     if request_attempt_log_should_checkpoint(entry) {
+        // Checkpoint publication and its sequence-fenced log truncation form
+        // one crash-safe durability step. Admit that step only while the
+        // caller still owns time, then let it finish atomically rather than
+        // abandoning a published checkpoint half way through cleanup.
+        ensure_request_attempt_deadline(paths, operation_deadline)?;
         checkpoint_request_attempt_ledger(paths, entry)?;
+        ensure_request_attempt_deadline(paths, operation_deadline)?;
     }
 
-    let Some(mutation) = entry.ledger.prepare(record)? else {
-        return Ok(());
+    let mutation = match expected_submission {
+        Some(submission) => entry
+            .ledger
+            .prepare_rejection_after_exact_submission(record, submission)?,
+        None => entry.ledger.prepare(record)?,
     };
+    let Some(mutation) = mutation else {
+        return Ok(false);
+    };
+    // Encoding/preparation is bounded by the retained attempt-record limit,
+    // but it can still consume the tail of a short request deadline. The log
+    // append below is the linearization point, so refuse it after expiry.
+    ensure_request_attempt_deadline(paths, operation_deadline)?;
     let sequence =
         entry
             .ledger
@@ -610,10 +755,85 @@ pub fn record_cluster_kv_request_attempt(
     entry.log_bytes = entry.log_bytes.saturating_add(written);
     entry.log_identity = file_identity(&paths.request_attempts_log);
 
-    if request_attempt_log_should_checkpoint(entry) {
+    // Deadline-bound mutation paths have already made their record durable.
+    // Do not turn optional compaction into post-linearization deadline work;
+    // the next writer (or crash recovery) checkpoints this bounded log before
+    // admitting another record. Legacy maintenance callers retain the eager
+    // compaction behavior.
+    if operation_deadline.is_none() && request_attempt_log_should_checkpoint(entry) {
         checkpoint_request_attempt_ledger(paths, entry)?;
     }
-    Ok(())
+    Ok(true)
+}
+
+pub fn record_cluster_kv_request_attempt(
+    paths: &ClusterKvPaths,
+    record: KvRequestAttemptRecord,
+) -> Result<(), KvError> {
+    record_cluster_kv_request_attempt_with_deadline(paths, record, None, None).map(|_| ())
+}
+
+/// Records one request-attempt transition without waiting past the owning
+/// mutation's absolute deadline for the ledger flock, cache, checkpoint, or
+/// append admission. Once the length-prefixed record append is admitted, its
+/// data sync completes and the function reports that durable outcome even if
+/// the clock crosses the deadline during the sync itself.
+pub fn record_cluster_kv_request_attempt_before(
+    paths: &ClusterKvPaths,
+    record: KvRequestAttemptRecord,
+    operation_deadline: Instant,
+) -> Result<(), KvError> {
+    record_cluster_kv_request_attempt_with_deadline(
+        paths,
+        record,
+        Some(operation_deadline),
+        None,
+    )
+    .map(|_| ())
+}
+
+pub(crate) fn mark_cluster_kv_request_submitted_with_receipt(
+    paths: &ClusterKvPaths,
+    request: &KvCommandRequest,
+    operation_deadline: Option<Instant>,
+) -> Result<Option<ClusterKvRequestAttemptSubmissionReceipt>, KvError> {
+    let receipt = ClusterKvRequestAttemptSubmissionReceipt {
+        command_digest: request.digest()?,
+        updated_at: OffsetDateTime::now_utc(),
+    };
+    let recorded = record_cluster_kv_request_attempt_with_deadline(
+        paths,
+        KvRequestAttemptRecord {
+            request_id: request.request_id.clone(),
+            command_digest: receipt.command_digest,
+            state: KvRequestAttemptState::Submitted,
+            updated_at: receipt.updated_at,
+        },
+        operation_deadline,
+        None,
+    )?;
+    Ok(recorded.then_some(receipt))
+}
+
+pub(crate) fn mark_cluster_kv_request_rejected_after_exact_submission(
+    paths: &ClusterKvPaths,
+    request: &KvCommandRequest,
+    submission: &ClusterKvRequestAttemptSubmissionReceipt,
+    reason: impl Into<String>,
+) -> Result<bool, KvError> {
+    record_cluster_kv_request_attempt_with_deadline(
+        paths,
+        KvRequestAttemptRecord {
+            request_id: request.request_id.clone(),
+            command_digest: request.digest()?,
+            state: KvRequestAttemptState::RejectedBeforeCommit {
+                reason: reason.into(),
+            },
+            updated_at: OffsetDateTime::now_utc(),
+        },
+        None,
+        Some(submission),
+    )
 }
 
 pub fn mark_cluster_kv_request_submitted(
@@ -628,6 +848,23 @@ pub fn mark_cluster_kv_request_submitted(
             state: KvRequestAttemptState::Submitted,
             updated_at: OffsetDateTime::now_utc(),
         },
+    )
+}
+
+pub fn mark_cluster_kv_request_submitted_before(
+    paths: &ClusterKvPaths,
+    request: &KvCommandRequest,
+    operation_deadline: Instant,
+) -> Result<(), KvError> {
+    record_cluster_kv_request_attempt_before(
+        paths,
+        KvRequestAttemptRecord {
+            request_id: request.request_id.clone(),
+            command_digest: request.digest()?,
+            state: KvRequestAttemptState::Submitted,
+            updated_at: OffsetDateTime::now_utc(),
+        },
+        operation_deadline,
     )
 }
 
@@ -649,6 +886,26 @@ pub fn mark_cluster_kv_request_rejected_before_commit(
     )
 }
 
+pub fn mark_cluster_kv_request_rejected_before_commit_before(
+    paths: &ClusterKvPaths,
+    request: &KvCommandRequest,
+    reason: impl Into<String>,
+    operation_deadline: Instant,
+) -> Result<(), KvError> {
+    record_cluster_kv_request_attempt_before(
+        paths,
+        KvRequestAttemptRecord {
+            request_id: request.request_id.clone(),
+            command_digest: request.digest()?,
+            state: KvRequestAttemptState::RejectedBeforeCommit {
+                reason: reason.into(),
+            },
+            updated_at: OffsetDateTime::now_utc(),
+        },
+        operation_deadline,
+    )
+}
+
 pub fn mark_cluster_kv_request_unknown(
     paths: &ClusterKvPaths,
     request: &KvCommandRequest,
@@ -667,6 +924,26 @@ pub fn mark_cluster_kv_request_unknown(
     )
 }
 
+pub fn mark_cluster_kv_request_unknown_before(
+    paths: &ClusterKvPaths,
+    request: &KvCommandRequest,
+    detail: impl Into<String>,
+    operation_deadline: Instant,
+) -> Result<(), KvError> {
+    record_cluster_kv_request_attempt_before(
+        paths,
+        KvRequestAttemptRecord {
+            request_id: request.request_id.clone(),
+            command_digest: request.digest()?,
+            state: KvRequestAttemptState::Unknown {
+                detail: detail.into(),
+            },
+            updated_at: OffsetDateTime::now_utc(),
+        },
+        operation_deadline,
+    )
+}
+
 pub fn read_cluster_kv_request_attempt(
     paths: &ClusterKvPaths,
     request_id: &KvRequestId,
@@ -675,9 +952,26 @@ pub fn read_cluster_kv_request_attempt(
     let mut cache = REQUEST_ATTEMPT_LEDGER_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    Ok(request_attempt_cache_entry(paths, &mut cache)?
+    Ok(request_attempt_cache_entry(paths, &mut cache, None)?
         .ledger
         .outcome(request_id))
+}
+
+/// Deadline-aware local request-attempt lookup for end-to-end authoritative
+/// operations. Unlike the legacy local maintenance API, this lookup cannot
+/// inherit the 30-second ledger-lock budget after its network budget is spent.
+pub fn read_cluster_kv_request_attempt_before(
+    paths: &ClusterKvPaths,
+    request_id: &KvRequestId,
+    operation_deadline: Instant,
+) -> Result<Option<KvRequestOutcome>, KvError> {
+    let _lock = lock_request_attempt_ledger_before(paths, Some(operation_deadline))?;
+    let mut cache = lock_request_attempt_cache_before(paths, operation_deadline)?;
+    let outcome = request_attempt_cache_entry(paths, &mut cache, Some(operation_deadline))?
+        .ledger
+        .outcome(request_id);
+    ensure_request_attempt_deadline(paths, Some(operation_deadline))?;
+    Ok(outcome)
 }
 
 pub fn resolve_cluster_kv_request_outcome(

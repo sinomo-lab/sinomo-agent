@@ -4,6 +4,11 @@ use crate::kv_snapshot_observer::{
     notify_cluster_kv_committed_delta_observers, notify_cluster_kv_committed_snapshot_observers,
 };
 use crate::local_state_store::read_cluster_state_without_kv;
+#[cfg(test)]
+use crate::raft_quorum::{
+    ClusterRaftBlockingCancellationPolicy, ClusterRaftBlockingDeadlinePolicy,
+    run_cluster_raft_supervised_blocking,
+};
 #[allow(unused_imports)]
 use sinomo_kv::KvError;
 use sinomo_network::ClusterPaths;
@@ -19,8 +24,7 @@ use sinomo_kv::{
     ClusterKvCommittedDelta, ClusterKvCommittedKeyState, ClusterKvRaftCommitResult,
     ClusterRaftAppendRequest, DurableRaftKvNode, InProcessKvStore, KvCommand, KvCommandRequest,
     KvCommittedRequestRecord, KvEntry, KvEvent, KvLocalCache, KvLogEntry, KvOp, KvRevision,
-    KvSnapshot, KvTxnResponse, RaftAppendEntriesRequest, RaftAppendEntriesResponse,
-    RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot,
+    KvSnapshot, KvTxnResponse, RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftSnapshot,
 };
 use sinomo_node::NodeId;
 use std::collections::{BTreeMap, HashMap};
@@ -532,6 +536,14 @@ pub(crate) fn read_cluster_kv_current_or_cached_snapshot_arc_if_present(
 pub fn read_cluster_kv_latest_observed_snapshot_arc_if_present(
     paths: &ClusterPaths,
 ) -> Result<Option<Arc<KvSnapshot>>, NetworkError> {
+    // Shadow daemons install a one-way local-Raft ownership denial for this
+    // root. Their routing/authentication read model is the materialized or
+    // imported projection only; trying the current voter first would either
+    // seize the main voter's node lock or repeatedly fail before reaching the
+    // safe cache.
+    if sinomo_kv::process_local_raft_access_is_denied(&paths.kv_paths().raft) {
+        return read_cluster_kv_cached_snapshot_if_present(paths);
+    }
     let current = match read_cluster_kv_current_snapshot_arc(paths) {
         Ok(snapshot) => Some(snapshot),
         Err(NetworkError::ClusterOrphan) => None,
@@ -646,6 +658,18 @@ pub(crate) fn read_cluster_kv_cached_snapshot_if_present(
     Ok(snapshot)
 }
 
+/// Peeks only at the process-hot materialized snapshot.
+///
+/// Forwarding calls this after a compact response or fanout notification. A
+/// cache miss must stay a miss: opening the Raft node or decoding the complete
+/// materialized file here would move unbounded local hydration into the
+/// caller's end-to-end network deadline.
+pub(crate) fn read_cluster_kv_cached_snapshot_if_hot(
+    paths: &ClusterPaths,
+) -> Result<Option<Arc<KvSnapshot>>, NetworkError> {
+    sinomo_kv::read_cluster_kv_cached_snapshot_arc_if_hot(&paths.kv_paths()).map_err(kv_err)
+}
+
 fn cluster_kv_local_cache(paths: &ClusterPaths) -> KvLocalCache {
     paths.kv_paths().local_cache()
 }
@@ -748,20 +772,60 @@ pub(crate) fn locked_kv_state_authority_id(
         .map_err(kv_err)
 }
 
+#[cfg(test)]
 pub(crate) async fn locked_kv_state_authority_id_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
+    deadline: Instant,
 ) -> Result<Option<NodeId>, NetworkError> {
+    fn deadline_elapsed(paths: &ClusterPaths) -> NetworkError {
+        NetworkError::ClusterReadOnly {
+            detail: format!(
+                "cluster KV state-authority lookup did not complete before its admission deadline at {}",
+                paths.root.display()
+            ),
+        }
+    }
+
+    if Instant::now() >= deadline {
+        return Err(deadline_elapsed(paths));
+    }
     let paths = paths.clone();
     let state = state.clone();
-    runtime
-        .spawn_blocking(move || locked_kv_state_authority_id(&paths, &state))
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster kv state authority".to_string(),
-            detail: format!("known state authority task failed: {source}"),
-        })?
+    let task_paths = paths.clone();
+    let timeout_error = deadline_elapsed(&paths);
+    run_cluster_raft_supervised_blocking(
+        runtime,
+        Some((
+            deadline,
+            timeout_error,
+            ClusterRaftBlockingDeadlinePolicy::DeadlineBounded,
+        )),
+        ClusterRaftBlockingCancellationPolicy::CancelQueued,
+        "state_authority_lookup",
+        "resident authority lookup",
+        "cluster KV state authority",
+        move || {
+            // A task can remain in Tokio's blocking queue after its async caller's
+            // deadline. Refuse operation-lock admission when that happens.
+            if Instant::now() >= deadline {
+                return Err(deadline_elapsed(&task_paths));
+            }
+            let authority_id = task_paths
+                .kv_paths()
+                .locked_known_raft_voter_leader_id_before(&state, deadline)
+                .map_err(kv_err)?;
+            // The timed Raft lock checks after acquisition. Check once more after
+            // the hard-state read so a delayed disk lookup cannot publish a result
+            // outside the caller's budget.
+            if Instant::now() >= deadline {
+                return Err(deadline_elapsed(&task_paths));
+            }
+            Ok(authority_id)
+        },
+    )
+    .await
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -839,15 +903,66 @@ pub fn append_cluster_raft_command_with_response(
     node_id: &NodeId,
     command: KvCommand,
 ) -> Result<(KvSnapshot, Option<KvTxnResponse>), NetworkError> {
-    let (snapshot, txn_response, wrote) = paths
+    let (result, wrote) = paths
         .kv_paths()
-        .append_kv_command_with_response_and_publish_report(
+        .raft_store()
+        .append_command_with_response_and_publish_report(
             node_id,
             command,
             sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
         )
         .map_err(kv_err)?;
-    observe_cluster_kv_snapshot_write(paths, wrote, Some(&snapshot));
+    let ClusterKvRaftCommitResult {
+        snapshot,
+        txn_response,
+        events,
+        committed_request,
+    } = result;
+    let published_delta = !events.is_empty();
+    if published_delta {
+        let mut keys = Vec::new();
+        sinomo_network::try_reserve_vec(
+            &mut keys,
+            events.len(),
+            "collect local committed cluster KV delta keys",
+        )?;
+        for event in &events {
+            keys.push(event.key.as_str());
+        }
+        keys.sort_unstable();
+        keys.dedup();
+
+        let mut final_key_states = Vec::new();
+        sinomo_network::try_reserve_vec(
+            &mut final_key_states,
+            keys.len(),
+            "collect local committed cluster KV final key states",
+        )?;
+        for key in keys {
+            final_key_states.push(ClusterKvCommittedKeyState {
+                key: key.to_string(),
+                entry: snapshot.get(key).cloned(),
+            });
+        }
+        observe_cluster_kv_committed_delta(
+            paths,
+            committed_request.revision,
+            snapshot.compacted_revision,
+            events,
+            final_key_states,
+            true,
+        );
+    }
+    // A committed delta already invalidated only the read models touched by
+    // its exact event keys. The snapshot notification remains useful to
+    // compatibility observers, but must not conservatively invalidate those
+    // models a second time.
+    observe_cluster_kv_snapshot_write_with_invalidation(
+        paths,
+        wrote,
+        Some(&snapshot),
+        !published_delta,
+    );
     Ok((snapshot, txn_response))
 }
 
@@ -896,17 +1011,6 @@ pub fn apply_cluster_raft_append(
         );
     }
     Ok(outcome.response)
-}
-
-pub(crate) fn locked_apply_cluster_raft_vote(
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-    vote: RaftRequestVoteRequest,
-) -> Result<RaftRequestVoteResponse, NetworkError> {
-    paths
-        .kv_paths()
-        .locked_apply_raft_vote(node_id, vote)
-        .map_err(kv_err)
 }
 
 pub(crate) struct LocalClusterRaftPostCommitObservations {
@@ -962,6 +1066,43 @@ pub struct LocalClusterRaftCommandStorage {
     inner: sinomo_kv::ClusterKvRaftLocalCommandStorage<fn(&str) -> bool>,
 }
 
+pub(crate) enum LocalClusterRaftReadIndexAdmission {
+    Admitted(sinomo_kv::ClusterKvRaftReadIndexState),
+    Busy,
+}
+
+/// The bounded value projection performed after a ReadIndex or compact barrier
+/// has established current-term quorum authority.
+///
+/// Mutable command storage implements this for compatibility full snapshots.
+/// Point, exact-set, request-outcome, and bounded-prefix reads use the borrowed
+/// resident implementation so concurrent readers do not re-enter the exclusive
+/// Raft operation queue.
+pub(crate) trait LocalClusterRaftReadProjection {
+    fn read_index_state(&mut self) -> Result<sinomo_kv::ClusterKvRaftReadIndexState, NetworkError>;
+    fn read_index_snapshot(&mut self) -> Result<KvSnapshot, NetworkError>;
+    fn read_index_entry(&mut self, key: &str) -> Result<Option<KvEntry>, NetworkError>;
+    fn pending_current_term_barrier(&mut self) -> Result<Option<KvLogEntry>, NetworkError>;
+    fn build_raft_read_index_heartbeat(
+        &mut self,
+        node_id: &NodeId,
+        state: &ClusterBootstrapState,
+        commit_index: u64,
+    ) -> Result<ClusterRaftAppendRequest, NetworkError>;
+    fn read_index_entries(&mut self, keys: &[String])
+    -> Result<Vec<Option<KvEntry>>, NetworkError>;
+    fn read_index_request_outcome(
+        &mut self,
+        request_id: &sinomo_kv::KvRequestId,
+    ) -> Result<Option<sinomo_kv::KvRequestOutcome>, NetworkError>;
+    fn read_index_prefix_limited_by_payload_bytes(
+        &mut self,
+        prefix: &str,
+        max_entries: usize,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<KvEntry>, NetworkError>;
+}
+
 impl LocalClusterRaftCommandStorage {
     pub fn new(paths: &ClusterPaths, local_node_id: NodeId) -> Self {
         Self {
@@ -969,6 +1110,53 @@ impl LocalClusterRaftCommandStorage {
             inner: paths.kv_paths().local_raft_command_storage(
                 local_node_id,
                 sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot,
+            ),
+        }
+    }
+
+    pub(crate) fn new_with_operation_deadline(
+        paths: &ClusterPaths,
+        local_node_id: NodeId,
+        operation_deadline: Instant,
+    ) -> Self {
+        Self {
+            paths: paths.clone(),
+            inner: sinomo_kv::ClusterKvRaftLocalCommandStorage::new_with_operation_deadline(
+                paths.kv_paths().raft_store(),
+                local_node_id,
+                sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot as fn(&str) -> bool,
+                operation_deadline,
+            ),
+        }
+    }
+
+    pub(crate) fn new_read_index_with_operation_deadline(
+        paths: &ClusterPaths,
+        local_node_id: NodeId,
+        operation_deadline: Instant,
+    ) -> Self {
+        Self {
+            paths: paths.clone(),
+            inner:
+                sinomo_kv::ClusterKvRaftLocalCommandStorage::new_read_index_with_operation_deadline(
+                    paths.kv_paths().raft_store(),
+                    local_node_id,
+                    sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot as fn(&str) -> bool,
+                    operation_deadline,
+                ),
+        }
+    }
+
+    pub(crate) fn new_read_index_with_immediate_operation_admission(
+        paths: &ClusterPaths,
+        local_node_id: NodeId,
+    ) -> Self {
+        Self {
+            paths: paths.clone(),
+            inner: sinomo_kv::ClusterKvRaftLocalCommandStorage::new_read_index_with_immediate_operation_admission(
+                paths.kv_paths().raft_store(),
+                local_node_id,
+                sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot as fn(&str) -> bool,
             ),
         }
     }
@@ -996,12 +1184,35 @@ impl LocalClusterRaftCommandStorage {
         self.inner.read_index_state().map_err(kv_err)
     }
 
+    pub(crate) fn try_admit_read_index_state(
+        &mut self,
+    ) -> Result<LocalClusterRaftReadIndexAdmission, NetworkError> {
+        match self.inner.read_index_state() {
+            Ok(state) => Ok(LocalClusterRaftReadIndexAdmission::Admitted(state)),
+            Err(sinomo_kv::KvError::Busy { .. }) => Ok(LocalClusterRaftReadIndexAdmission::Busy),
+            Err(error) => Err(kv_err(error)),
+        }
+    }
+
+    pub(crate) fn pending_current_term_barrier(
+        &mut self,
+    ) -> Result<Option<KvLogEntry>, NetworkError> {
+        self.inner.pending_current_term_barrier().map_err(kv_err)
+    }
+
     pub(crate) fn read_index_snapshot(&mut self) -> Result<KvSnapshot, NetworkError> {
         self.inner.read_index_snapshot().map_err(kv_err)
     }
 
     pub(crate) fn read_index_entry(&mut self, key: &str) -> Result<Option<KvEntry>, NetworkError> {
         self.inner.read_index_entry(key).map_err(kv_err)
+    }
+
+    pub(crate) fn read_index_entries(
+        &mut self,
+        keys: &[String],
+    ) -> Result<Vec<Option<KvEntry>>, NetworkError> {
+        self.inner.read_index_entries(keys).map_err(kv_err)
     }
 
     pub(crate) fn read_index_request_outcome(
@@ -1028,6 +1239,10 @@ impl LocalClusterRaftCommandStorage {
         self.inner.release_session_after_commit();
     }
 
+    pub(crate) fn release_session_for_quorum(&mut self) {
+        self.inner.release_session_for_quorum();
+    }
+
     pub(crate) fn build_raft_append_request(
         &mut self,
         state: &ClusterBootstrapState,
@@ -1035,6 +1250,16 @@ impl LocalClusterRaftCommandStorage {
     ) -> Result<ClusterRaftAppendRequest, NetworkError> {
         self.inner
             .build_cluster_raft_append_request_from_next_index(state, next_index)
+            .map_err(kv_err)
+    }
+
+    pub(crate) fn build_raft_read_index_heartbeat(
+        &mut self,
+        state: &ClusterBootstrapState,
+        commit_index: u64,
+    ) -> Result<ClusterRaftAppendRequest, NetworkError> {
+        self.inner
+            .build_cluster_raft_read_index_heartbeat(state, commit_index)
             .map_err(kv_err)
     }
 
@@ -1095,17 +1320,6 @@ impl LocalClusterRaftCommandStorage {
         self.inner.record_unknown(request, detail).map_err(kv_err)
     }
 
-    pub(crate) fn discard_uncommitted_tail_and_clear_leader(
-        &mut self,
-    ) -> Result<KvSnapshot, NetworkError> {
-        let snapshot = self
-            .inner
-            .discard_uncommitted_tail_and_clear_leader()
-            .map_err(kv_err)?;
-        self.observe_last_snapshot_publish(&snapshot);
-        Ok(snapshot)
-    }
-
     pub(crate) fn discard_uncommitted_tail_and_clear_leader_compact(
         &mut self,
     ) -> Result<(), NetworkError> {
@@ -1114,8 +1328,31 @@ impl LocalClusterRaftCommandStorage {
             .map_err(kv_err)
     }
 
+    pub(crate) fn step_down_preserving_pending_entry(&mut self) -> Result<(), NetworkError> {
+        self.inner
+            .step_down_preserving_pending_entry()
+            .map_err(kv_err)
+    }
+
+    #[cfg(test)]
     pub(crate) fn observe_term(&mut self, term: u64) -> Result<(), NetworkError> {
         self.inner.observe_term(term).map_err(kv_err)
+    }
+
+    pub(crate) fn publish_pending_higher_term(
+        &self,
+        state: &ClusterBootstrapState,
+        term: u64,
+    ) -> Result<(), NetworkError> {
+        crate::raft_quorum::publish_cluster_raft_higher_term_reactively(
+            &self.paths,
+            &state.local_node_id,
+            term,
+        )
+    }
+
+    pub(crate) fn observe_pending_higher_term(&mut self, term: u64) -> Result<(), NetworkError> {
+        self.inner.observe_pending_higher_term(term).map_err(kv_err)
     }
 
     pub(crate) fn commit_index_with_events(
@@ -1139,18 +1376,28 @@ impl LocalClusterRaftCommandStorage {
         commit: Option<&sinomo_kv::ClusterKvRaftCompactCommitResult>,
     ) -> Result<LocalClusterRaftPostCommitObservations, NetworkError> {
         let snapshot_publish_wrote = self.inner.take_last_snapshot_publish_wrote();
-        let snapshot_write = match (snapshot_publish_wrote, commit) {
-            (Some(wrote), Some(commit)) => commit
-                .checkpoint_snapshot
-                .as_ref()
-                .map(|snapshot| (wrote, snapshot.clone())),
-            (Some(true), None) => Some((
-                true,
-                sinomo_kv::read_cluster_kv_cached_snapshot(&self.paths.kv_paths())
-                    .map_err(kv_err)?,
-            )),
-            _ => None,
-        };
+        let snapshot_write =
+            if let Some(snapshot) = commit.and_then(|commit| commit.checkpoint_snapshot.as_ref()) {
+                // The quorum driver releases the resident node, Raft operation
+                // guard, and proposal sequence before collecting observations.
+                // Keep this O(total-state) materialized write on that post-commit
+                // side of the boundary. Its internal generation comparison makes
+                // reordered publications monotonic.
+                let wrote = self
+                    .paths
+                    .kv_paths()
+                    .write_raft_snapshot_if_changed(snapshot)
+                    .map_err(kv_err)?;
+                Some((wrote, snapshot.clone()))
+            } else if snapshot_publish_wrote == Some(true) {
+                Some((
+                    true,
+                    sinomo_kv::read_cluster_kv_cached_snapshot(&self.paths.kv_paths())
+                        .map_err(kv_err)?,
+                ))
+            } else {
+                None
+            };
         let delta = commit.map(|commit| ClusterKvCommittedDelta {
             revision: commit.committed_request.revision,
             compacted_revision: commit.compacted_revision,
@@ -1166,6 +1413,129 @@ impl LocalClusterRaftCommandStorage {
             delta,
             watcher_events,
         })
+    }
+}
+
+impl LocalClusterRaftReadProjection for LocalClusterRaftCommandStorage {
+    fn read_index_state(&mut self) -> Result<sinomo_kv::ClusterKvRaftReadIndexState, NetworkError> {
+        LocalClusterRaftCommandStorage::read_index_state(self)
+    }
+
+    fn read_index_snapshot(&mut self) -> Result<KvSnapshot, NetworkError> {
+        LocalClusterRaftCommandStorage::read_index_snapshot(self)
+    }
+
+    fn read_index_entry(&mut self, key: &str) -> Result<Option<KvEntry>, NetworkError> {
+        LocalClusterRaftCommandStorage::read_index_entry(self, key)
+    }
+
+    fn pending_current_term_barrier(&mut self) -> Result<Option<KvLogEntry>, NetworkError> {
+        LocalClusterRaftCommandStorage::pending_current_term_barrier(self)
+    }
+
+    fn build_raft_read_index_heartbeat(
+        &mut self,
+        _node_id: &NodeId,
+        state: &ClusterBootstrapState,
+        commit_index: u64,
+    ) -> Result<ClusterRaftAppendRequest, NetworkError> {
+        LocalClusterRaftCommandStorage::build_raft_read_index_heartbeat(self, state, commit_index)
+    }
+
+    fn read_index_entries(
+        &mut self,
+        keys: &[String],
+    ) -> Result<Vec<Option<KvEntry>>, NetworkError> {
+        LocalClusterRaftCommandStorage::read_index_entries(self, keys)
+    }
+
+    fn read_index_request_outcome(
+        &mut self,
+        request_id: &sinomo_kv::KvRequestId,
+    ) -> Result<Option<sinomo_kv::KvRequestOutcome>, NetworkError> {
+        LocalClusterRaftCommandStorage::read_index_request_outcome(self, request_id)
+    }
+
+    fn read_index_prefix_limited_by_payload_bytes(
+        &mut self,
+        prefix: &str,
+        max_entries: usize,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<KvEntry>, NetworkError> {
+        LocalClusterRaftCommandStorage::read_index_prefix_limited_by_payload_bytes(
+            self,
+            prefix,
+            max_entries,
+            max_payload_bytes,
+        )
+    }
+}
+
+impl LocalClusterRaftReadProjection for sinomo_kv::ClusterKvRaftResidentReadProjection<'_> {
+    fn read_index_state(&mut self) -> Result<sinomo_kv::ClusterKvRaftReadIndexState, NetworkError> {
+        Ok(sinomo_kv::ClusterKvRaftResidentReadProjection::read_index_state(self))
+    }
+
+    fn read_index_snapshot(&mut self) -> Result<KvSnapshot, NetworkError> {
+        sinomo_kv::ClusterKvRaftResidentReadProjection::read_index_snapshot(self).map_err(kv_err)
+    }
+
+    fn read_index_entry(&mut self, key: &str) -> Result<Option<KvEntry>, NetworkError> {
+        sinomo_kv::ClusterKvRaftResidentReadProjection::read_index_entry(self, key).map_err(kv_err)
+    }
+
+    fn pending_current_term_barrier(&mut self) -> Result<Option<KvLogEntry>, NetworkError> {
+        sinomo_kv::ClusterKvRaftResidentReadProjection::pending_current_term_barrier(self)
+            .map_err(kv_err)
+    }
+
+    fn build_raft_read_index_heartbeat(
+        &mut self,
+        node_id: &NodeId,
+        state: &ClusterBootstrapState,
+        commit_index: u64,
+    ) -> Result<ClusterRaftAppendRequest, NetworkError> {
+        sinomo_kv::ClusterKvRaftResidentReadProjection::build_read_index_heartbeat(
+            self,
+            node_id,
+            state,
+            commit_index,
+        )
+        .map_err(kv_err)
+    }
+
+    fn read_index_entries(
+        &mut self,
+        keys: &[String],
+    ) -> Result<Vec<Option<KvEntry>>, NetworkError> {
+        sinomo_kv::ClusterKvRaftResidentReadProjection::read_index_entries(self, keys)
+            .map_err(kv_err)
+    }
+
+    fn read_index_request_outcome(
+        &mut self,
+        request_id: &sinomo_kv::KvRequestId,
+    ) -> Result<Option<sinomo_kv::KvRequestOutcome>, NetworkError> {
+        Ok(
+            sinomo_kv::ClusterKvRaftResidentReadProjection::read_index_request_outcome(
+                self, request_id,
+            ),
+        )
+    }
+
+    fn read_index_prefix_limited_by_payload_bytes(
+        &mut self,
+        prefix: &str,
+        max_entries: usize,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<KvEntry>, NetworkError> {
+        sinomo_kv::ClusterKvRaftResidentReadProjection::read_index_prefix_limited_by_payload_bytes(
+            self,
+            prefix,
+            max_entries,
+            max_payload_bytes,
+        )
+        .map_err(kv_err)
     }
 }
 
@@ -1197,6 +1567,10 @@ impl sinomo_kv::ClusterKvRaftCommandStorage for LocalClusterRaftCommandStorage {
         self.append_uncommitted(request)
     }
 
+    fn release_cluster_raft_command_session_for_quorum(&mut self) {
+        self.release_session_for_quorum();
+    }
+
     fn record_cluster_raft_request_rejected_before_commit(
         &mut self,
         request: &KvCommandRequest,
@@ -1219,12 +1593,19 @@ impl sinomo_kv::ClusterKvRaftCommandStorage for LocalClusterRaftCommandStorage {
         self.discard_uncommitted_tail_and_clear_leader_compact()
     }
 
+    fn step_down_preserving_cluster_raft_pending_entry(&mut self) -> Result<(), NetworkError> {
+        self.step_down_preserving_pending_entry()
+    }
+
     fn observe_cluster_raft_term(
         &mut self,
         _state: &ClusterBootstrapState,
         term: u64,
     ) -> Result<(), NetworkError> {
-        self.observe_term(term)
+        // Quorum rejection has already raised the process-local higher-term
+        // floor. Use the sole exclusive closer so the synchronous commit path
+        // cannot return before that observation reaches durable hard state.
+        self.observe_pending_higher_term(term)
     }
 
     fn commit_cluster_raft_index_with_events(
@@ -1289,6 +1670,162 @@ pub fn kv_err(error: sinomo_kv::KvError) -> sinomo_network::NetworkError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn denied_local_raft_latest_observed_reads_materialized_projection_only() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-shadow-kv-projection-only");
+        let data_dir = sinomo_local::SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let kv_paths = paths.kv_paths();
+        let snapshot = InProcessKvStore::new()
+            .try_snapshot()
+            .expect("empty materialized snapshot");
+        kv_paths
+            .write_raft_snapshot_if_changed(&snapshot)
+            .expect("write materialized projection");
+        assert!(
+            !kv_paths.raft.exists(),
+            "projection write must not create Raft storage"
+        );
+
+        sinomo_kv::deny_process_local_raft_access_for_root(kv_paths.raft.clone())
+            .expect("install shadow role denial");
+        let observed = read_cluster_kv_latest_observed_snapshot_arc_if_present(&paths)
+            .expect("projection-only latest-observed read")
+            .expect("materialized projection");
+        assert_eq!(observed.as_ref(), &snapshot);
+        assert!(
+            !kv_paths.raft.exists(),
+            "projection-only shadow read must not create or open a local Raft root"
+        );
+        assert!(sinomo_kv::clear_process_local_raft_access_denial_for_test(
+            &kv_paths.raft
+        ));
+    }
+
+    #[test]
+    fn async_authority_lookup_drops_expired_pool_and_operation_waiters() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-kv-authority-deadline");
+        let data_dir = sinomo_local::SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let node_id =
+            NodeId::from_legacy_named("node_kv_authority_deadline").expect("local node id");
+        let state = ClusterBootstrapState::initialized_locally(
+            sinomo_node::ClusterId::from_legacy_named("cluster_kv_authority_deadline")
+                .expect("cluster id"),
+            "KV authority deadline",
+            node_id,
+            "local",
+            "public-key",
+            OffsetDateTime::now_utc(),
+        );
+        let kv_paths = paths.kv_paths();
+        let operation_guard = sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&kv_paths)
+            .expect("hold Raft operation lock");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        // First prove a lookup still waiting in Tokio's blocking queue cannot
+        // begin operation-lock admission after its caller has timed out.
+        let (blocker_started_tx, blocker_started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::sync_channel(0);
+        let blocker = runtime.spawn_blocking(move || {
+            blocker_started_tx.send(()).expect("report blocker start");
+            release_blocker_rx.recv().expect("release blocking worker");
+        });
+        blocker_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocking worker occupied");
+        let queued_started = Instant::now();
+        let queued_result = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                locked_kv_state_authority_id_async(
+                    runtime.handle(),
+                    &paths,
+                    &state,
+                    queued_started + Duration::from_secs(5),
+                ),
+            )
+            .await
+        });
+        assert!(
+            queued_result.is_err(),
+            "the caller must be able to cancel a queued lookup"
+        );
+        assert!(
+            queued_started.elapsed() < Duration::from_millis(500),
+            "blocking-pool saturation must not extend the 50ms lookup into a multi-second wait"
+        );
+        assert_eq!(
+            sinomo_kv::cluster_kv_raft_operation_queue_depth_for_test(&kv_paths),
+            0,
+            "a lookup still queued in the blocking pool must not register an operation waiter"
+        );
+        release_blocker_tx.send(()).expect("release blocker");
+        runtime.block_on(blocker).expect("blocking worker joined");
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            sinomo_kv::cluster_kv_raft_operation_queue_depth_for_test(&kv_paths),
+            0,
+            "the expired blocking task must not enter the operation queue when a worker frees"
+        );
+
+        // Then prove a lookup that did start and reached the operation lock
+        // removes its timed waiter instead of acquiring after the guard drops.
+        let waiting_paths = paths.clone();
+        let waiting_state = state.clone();
+        let waiting_runtime = runtime.handle().clone();
+        let waiting = runtime.spawn(async move {
+            locked_kv_state_authority_id_async(
+                &waiting_runtime,
+                &waiting_paths,
+                &waiting_state,
+                Instant::now() + Duration::from_millis(50),
+            )
+            .await
+        });
+        let queue_deadline = Instant::now() + Duration::from_secs(1);
+        while sinomo_kv::cluster_kv_raft_operation_queue_depth_for_test(&kv_paths) != 1 {
+            assert!(
+                Instant::now() < queue_deadline,
+                "authority lookup did not enter the operation queue"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            runtime
+                .block_on(waiting)
+                .expect("authority lookup task joined")
+                .is_err(),
+            "operation-lock lookup must expire"
+        );
+        assert_eq!(
+            sinomo_kv::cluster_kv_raft_operation_queue_depth_for_test(&kv_paths),
+            0,
+            "expired operation waiter must be removed before the caller resumes"
+        );
+
+        drop(operation_guard);
+        let fresh_started = Instant::now();
+        let fresh = runtime.block_on(locked_kv_state_authority_id_async(
+            runtime.handle(),
+            &paths,
+            &state,
+            Instant::now() + Duration::from_millis(500),
+        ));
+        assert!(fresh.is_ok(), "fresh lookup after release must succeed");
+        assert!(
+            fresh_started.elapsed() < Duration::from_millis(250),
+            "fresh lookup was delayed by expired authority work"
+        );
+    }
+
     fn test_event(key: &str) -> KvEvent {
         KvEvent {
             revision: KvRevision(1),
@@ -1313,6 +1850,127 @@ mod tests {
             .get(&paths.root)
             .copied()
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn local_append_publishes_exact_committed_delta_to_retained_observer() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-local-append-delta");
+        let data_dir = sinomo_local::SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let node_id = NodeId::from_legacy_named("node_local_append_delta").expect("node");
+        let live_key = "/dfs/filesystems/test/live";
+        let deleted_key = "/dfs/filesystems/test/deleted";
+
+        append_cluster_raft_command(
+            &paths,
+            &node_id,
+            KvCommand::Txn(sinomo_kv::KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    KvOp::Put {
+                        key: live_key.to_string(),
+                        value: b"old".to_vec(),
+                        lease_id: None,
+                    },
+                    KvOp::Put {
+                        key: deleted_key.to_string(),
+                        value: b"remove-me".to_vec(),
+                        lease_id: None,
+                    },
+                ],
+                failure: Vec::new(),
+            }),
+        )
+        .expect("seed local values");
+
+        let observed = Arc::new(Mutex::new(Vec::<ClusterKvCommittedDelta>::new()));
+        let observed_for_callback = Arc::clone(&observed);
+        let _subscription = crate::subscribe_cluster_kv_committed_deltas(&paths, move |delta| {
+            observed_for_callback
+                .lock()
+                .expect("observed delta lock")
+                .push(delta.clone());
+        });
+
+        let snapshot = append_cluster_raft_command(
+            &paths,
+            &node_id,
+            KvCommand::Txn(sinomo_kv::KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    KvOp::Put {
+                        key: live_key.to_string(),
+                        value: b"intermediate".to_vec(),
+                        lease_id: None,
+                    },
+                    KvOp::Put {
+                        key: live_key.to_string(),
+                        value: b"new".to_vec(),
+                        lease_id: None,
+                    },
+                    KvOp::Delete {
+                        key: deleted_key.to_string(),
+                    },
+                ],
+                failure: Vec::new(),
+            }),
+        )
+        .expect("commit observed local mutation");
+
+        {
+            let observed = observed.lock().expect("observed deltas");
+            assert_eq!(observed.len(), 1, "local append must notify immediately");
+            let delta = &observed[0];
+            assert_eq!(delta.revision, snapshot.revision);
+            assert_eq!(delta.compacted_revision, snapshot.compacted_revision);
+            assert_eq!(delta.events.len(), 3);
+            assert_eq!(
+                delta.events[0].revision.next(),
+                delta.events[1].revision,
+                "multi-op local transactions must retain their contiguous event revisions"
+            );
+            assert_eq!(delta.events[1].revision.next(), delta.events[2].revision);
+            assert_eq!(delta.events[2].revision, snapshot.revision);
+            assert_eq!(
+                delta
+                    .final_key_states
+                    .iter()
+                    .map(|state| state.key.as_str())
+                    .collect::<Vec<_>>(),
+                vec![deleted_key, live_key],
+                "final states must be deduplicated and deterministically ordered"
+            );
+            assert!(delta.final_key_states[0].entry.is_none());
+            let live = delta.final_key_states[1]
+                .entry
+                .as_ref()
+                .expect("updated live entry");
+            assert_eq!(live.value, b"new");
+            assert_eq!(
+                live.modify_revision,
+                delta
+                    .events
+                    .iter()
+                    .rfind(|event| event.key == live_key)
+                    .expect("live-key event")
+                    .revision
+            );
+        }
+
+        append_cluster_raft_command(
+            &paths,
+            &node_id,
+            KvCommand::Op(KvOp::Delete {
+                key: "/dfs/filesystems/test/missing".to_string(),
+            }),
+        )
+        .expect("commit no-effect local mutation");
+        assert_eq!(
+            observed.lock().expect("observed deltas").len(),
+            1,
+            "a committed request with no events must not publish a false delta"
+        );
     }
 
     #[test]

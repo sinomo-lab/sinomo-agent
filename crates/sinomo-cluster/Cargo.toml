@@ -13,7 +13,7 @@ ring = "r0"
 
 [features]
 # Exposes crate internals for sibling-crate integration tests.
-test-support = []
+test-support = ["sinomo-kv/test-support"]
 
 [dependencies]
 arc-swap.workspace = true

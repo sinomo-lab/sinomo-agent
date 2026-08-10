@@ -40,6 +40,7 @@ impl SinomoTestError {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SinomoTestRequirement {
     ClusterRuntime,
+    ClusterKvSnapshot,
     LiveNetwork,
     ProviderAccount { provider: String },
     RuntimeCapability { capability: String },
@@ -61,6 +62,7 @@ impl SinomoTestRequirement {
     pub fn label(&self) -> String {
         match self {
             Self::ClusterRuntime => "cluster-runtime".to_string(),
+            Self::ClusterKvSnapshot => "cluster-kv-snapshot".to_string(),
             Self::LiveNetwork => "live-network".to_string(),
             Self::ProviderAccount { provider } => format!("provider-account:{provider}"),
             Self::RuntimeCapability { capability } => {
@@ -147,8 +149,15 @@ impl SinomoTestCase {
                         "requires live network/model access; pass --live",
                     ));
                 }
-                SinomoTestRequirement::ClusterRuntime if context.cluster_snapshot.is_none() => {
-                    let detail = "requires cluster runtime and cluster KV snapshot";
+                SinomoTestRequirement::ClusterRuntime if !context.cluster_runtime_available => {
+                    let detail = "requires cluster runtime";
+                    if context.require_cluster {
+                        return Some(SinomoTestOutcome::failed(detail));
+                    }
+                    return Some(SinomoTestOutcome::skipped(detail));
+                }
+                SinomoTestRequirement::ClusterKvSnapshot if context.cluster_snapshot.is_none() => {
+                    let detail = "requires an authoritative cluster KV snapshot";
                     if context.require_cluster {
                         return Some(SinomoTestOutcome::failed(detail));
                     }
@@ -279,6 +288,7 @@ pub struct SinomoTestContext {
     parameters: BTreeMap<String, String>,
     live: bool,
     require_cluster: bool,
+    cluster_runtime_available: bool,
     cluster_snapshot: Option<SinomoTestClusterSnapshotEvidence>,
     runtime_capabilities: BTreeSet<String>,
     diagnostics: serde_json::Map<String, serde_json::Value>,
@@ -291,6 +301,7 @@ impl SinomoTestContext {
             parameters: BTreeMap::new(),
             live: false,
             require_cluster: false,
+            cluster_runtime_available: false,
             cluster_snapshot: None,
             runtime_capabilities: BTreeSet::new(),
             diagnostics: Default::default(),
@@ -322,11 +333,17 @@ impl SinomoTestContext {
         self
     }
 
+    pub fn with_cluster_runtime_available(mut self, available: bool) -> Self {
+        self.cluster_runtime_available = available;
+        self
+    }
+
     pub fn with_cluster_snapshot(
         mut self,
         snapshot: sinomo_core::kv::KvSnapshot,
         source: impl Into<PathBuf>,
     ) -> Self {
+        self.cluster_runtime_available = true;
         self.cluster_snapshot = Some(SinomoTestClusterSnapshotEvidence::Unverified {
             snapshot: Arc::new(snapshot),
             source: source.into(),
@@ -344,6 +361,7 @@ impl SinomoTestContext {
         source: impl Into<PathBuf>,
     ) -> Result<Self, sinomo_core::kv::KvError> {
         sinomo_core::kv::validate_cluster_kv_authoritative_snapshot_read(&read)?;
+        self.cluster_runtime_available = true;
         self.cluster_snapshot = Some(SinomoTestClusterSnapshotEvidence::Authoritative(
             SinomoTestAuthoritativeClusterSnapshot {
                 snapshot: Arc::new(read.value),
@@ -679,6 +697,64 @@ mod tests {
         let report = case.run(&mut context);
 
         assert_eq!(report.status, SinomoTestStatus::Skipped);
+    }
+
+    #[test]
+    fn cluster_runtime_requirement_does_not_require_a_full_kv_snapshot() {
+        fn run(context: &mut SinomoTestContext) -> SinomoTestResult {
+            assert!(context.cluster_snapshot().is_none());
+            Ok(SinomoTestOutcome::passed("cluster runtime available"))
+        }
+        let case = SinomoTestCase::new(
+            "sample.cluster-runtime",
+            "cluster runtime",
+            ["cluster"],
+            [SinomoTestRequirement::ClusterRuntime],
+            run,
+        );
+        let mut context = SinomoTestContext::new("/tmp/sinomo-test")
+            .with_require_cluster(true)
+            .with_cluster_runtime_available(true);
+
+        let report = case.run(&mut context);
+
+        assert_eq!(report.status, SinomoTestStatus::Passed);
+    }
+
+    #[test]
+    fn cluster_kv_snapshot_requirement_is_explicit() {
+        use sinomo_core::kv::{KvRevision, KvSnapshot};
+
+        fn run(_: &mut SinomoTestContext) -> SinomoTestResult {
+            Ok(SinomoTestOutcome::passed("snapshot available"))
+        }
+        let case = SinomoTestCase::new(
+            "sample.cluster-kv-snapshot",
+            "cluster KV snapshot",
+            ["cluster"],
+            [SinomoTestRequirement::ClusterKvSnapshot],
+            run,
+        );
+        let mut missing =
+            SinomoTestContext::new("/tmp/sinomo-test").with_cluster_runtime_available(true);
+        let mut available = SinomoTestContext::new("/tmp/sinomo-test").with_cluster_snapshot(
+            KvSnapshot {
+                revision: KvRevision::ZERO,
+                compacted_revision: KvRevision::ZERO,
+                entries: Vec::new(),
+                leases: Vec::new(),
+                events: Vec::new(),
+                committed_requests: Vec::new(),
+                expired_requests: Vec::new(),
+            },
+            "cluster/kv-snapshot.sobj",
+        );
+
+        let skipped = case.run(&mut missing);
+        let passed = case.run(&mut available);
+
+        assert_eq!(skipped.status, SinomoTestStatus::Skipped);
+        assert_eq!(passed.status, SinomoTestStatus::Passed);
     }
 
     #[test]

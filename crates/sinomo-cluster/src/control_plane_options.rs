@@ -5,8 +5,23 @@ use crate::kv_snapshot::ClusterKvSnapshotRefreshOptions;
 use crate::state_authority_reachability::ClusterStateAuthorityReachabilityOptions;
 use sinomo_base::{ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterTransportKind};
 use sinomo_kv::{ClusterKvRaftLeaderElectionOptions, ClusterRaftAppendRequest};
-use sinomo_network::DEFAULT_NETWORK_TIMEOUT;
+use sinomo_network::{
+    ClusterObjectRpcOptions, DEFAULT_NETWORK_TIMEOUT, DestinationProcessAffinity,
+};
 use std::time::Duration;
+
+/// Pins a node-targeted cluster-service RPC to the target's main daemon.
+///
+/// Main and shadow endpoints intentionally share a node identity, while
+/// consensus, KV authority, and membership services are registered only by
+/// the main daemon. Keep this policy at the cluster/network bridge so callers
+/// preserve their operation-specific deadlines and transport settings without
+/// relying on endpoint latency to select the process that owns the route.
+pub fn main_daemon_cluster_rpc_options(
+    options: ClusterObjectRpcOptions,
+) -> ClusterObjectRpcOptions {
+    options.with_destination_process_affinity(DestinationProcessAffinity::MainDaemon)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClusterRaftAppendReplicationOptions {

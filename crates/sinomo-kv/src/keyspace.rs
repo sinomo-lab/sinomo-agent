@@ -1,5 +1,11 @@
 use crate::internal::*;
 
+/// Dedicated keyspace for the quorum-commit performance probe. The probe
+/// measures the ordinary quorum/WAL hot path, so its disposable values do not
+/// require an eagerly materialized cross-process snapshot after every commit.
+pub const CLUSTER_KV_QUORUM_COMMIT_BENCHMARK_PREFIX: &str =
+    "/cluster/benchmarks/quorum-commit/";
+
 /// Availability/projection class for a cluster KV key.
 ///
 /// This does not weaken write semantics: every class still requires a
@@ -41,6 +47,7 @@ pub fn cluster_kv_keyspace_class(key: &str) -> ClusterKvKeyspaceClass {
         || key.starts_with("/cluster/health/")
         || key.starts_with("/cluster/health-probes/")
         || key.starts_with("/cluster/module-rollouts/nodes/")
+        || key.starts_with(CLUSTER_KV_QUORUM_COMMIT_BENCHMARK_PREFIX)
     {
         return ClusterKvKeyspaceClass::Telemetry;
     }
@@ -70,4 +77,43 @@ pub fn cluster_kv_default_read_authority_for_key(key: &str) -> KvReadAuthority {
 
 pub fn cluster_kv_key_may_defer_materialized_projection(key: &str) -> bool {
     cluster_kv_keyspace_class(key).may_defer_materialized_projection()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quorum_commit_benchmark_subtree_is_telemetry_and_deferrable() {
+        let key = format!(
+            "{CLUSTER_KV_QUORUM_COMMIT_BENCHMARK_PREFIX}node-a/123-456/measured/0000/0000"
+        );
+
+        assert_eq!(
+            cluster_kv_keyspace_class(&key),
+            ClusterKvKeyspaceClass::Telemetry
+        );
+        assert_eq!(
+            cluster_kv_default_read_authority_for_key(&key),
+            KvReadAuthority::Local
+        );
+        assert!(cluster_kv_key_may_defer_materialized_projection(&key));
+    }
+
+    #[test]
+    fn quorum_commit_benchmark_classification_does_not_widen_to_neighboring_keys() {
+        for key in [
+            "/cluster/benchmarks/quorum-commit",
+            "/cluster/benchmarks/quorum-commit-other/run",
+            "/cluster/benchmarks/range-read/run",
+            "/cluster/benchmarks/unknown/run",
+        ] {
+            assert_eq!(
+                cluster_kv_keyspace_class(key),
+                ClusterKvKeyspaceClass::Critical,
+                "neighboring or unknown key {key} must fail closed"
+            );
+            assert!(!cluster_kv_key_may_defer_materialized_projection(key));
+        }
+    }
 }

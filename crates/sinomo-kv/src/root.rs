@@ -37,7 +37,10 @@ pub const MAX_COMMITTED_KV_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EXPIRED_KV_REQUEST_TOMBSTONES: usize = 4096;
 pub const CLUSTER_KV_RPC_CATEGORY: &str = "cluster.kv";
 pub const CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE: &str = "/cluster/kv/local/snapshot";
+pub const CLUSTER_KV_LOCAL_ENTRY_ROUTE: &str = "/cluster/kv/local/entry";
 pub const CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE: &str = "/cluster/kv/authoritative/snapshot";
+pub const CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE: &str = "/cluster/kv/authoritative/entry";
+pub const CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE: &str = "/cluster/kv/authoritative/entries";
 pub const CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE: &str =
     "/cluster/kv/authoritative/range-prefix";
 pub const CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE: &str =
@@ -64,7 +67,10 @@ pub const CLUSTER_KV_LOCAL_READ_WATCH_ROUTES: &[&str] = &[
 ];
 pub const CLUSTER_KV_RPC_ROUTES: &[&str] = &[
     CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE,
+    CLUSTER_KV_LOCAL_ENTRY_ROUTE,
     CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE,
+    CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE,
+    CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE,
     CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE,
     CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE,
     CLUSTER_KV_TXN_ROUTE,
@@ -78,8 +84,17 @@ pub const CLUSTER_KV_RPC_ROUTES: &[&str] = &[
 pub const CLUSTER_RAFT_RPC_ROUTES: &[&str] = &[CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_VOTE_ROUTE];
 pub const CLUSTER_KV_RPC_ROUTE_METADATA: &[(&str, &str)] = &[
     (CLUSTER_KV_LOCAL_SNAPSHOT_ROUTE, CLUSTER_KV_RPC_CATEGORY),
+    (CLUSTER_KV_LOCAL_ENTRY_ROUTE, CLUSTER_KV_RPC_CATEGORY),
     (
         CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE,
+        CLUSTER_KV_RPC_CATEGORY,
+    ),
+    (
+        CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE,
+        CLUSTER_KV_RPC_CATEGORY,
+    ),
+    (
+        CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE,
         CLUSTER_KV_RPC_CATEGORY,
     ),
     (
@@ -138,7 +153,25 @@ pub const CLUSTER_KV_RPC_ROUTE_POLICIES: &[ClusterKvRpcRoutePolicy] = &[
         required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
     },
     ClusterKvRpcRoutePolicy {
+        route: CLUSTER_KV_LOCAL_ENTRY_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        auth: ClusterKvRouteAuth::LocalOrClusterMember,
+        required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
+    },
+    ClusterKvRpcRoutePolicy {
         route: CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        auth: ClusterKvRouteAuth::LocalOrClusterMember,
+        required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
+    },
+    ClusterKvRpcRoutePolicy {
+        route: CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        auth: ClusterKvRouteAuth::LocalOrClusterMember,
+        required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
+    },
+    ClusterKvRpcRoutePolicy {
+        route: CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE,
         category: CLUSTER_KV_RPC_CATEGORY,
         auth: ClusterKvRouteAuth::LocalOrClusterMember,
         required_capabilities: &[CLUSTER_KV_READ_CAPABILITY],
@@ -235,6 +268,8 @@ pub const MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES: usize = MAX_KV_COMMAND_PAYLO
 pub const MAX_CLUSTER_KV_WATCH_DRAIN_WAIT: Duration = Duration::from_secs(30);
 pub const CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES: usize = 4096;
 pub const CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES: usize = MAX_KV_COMMAND_PAYLOAD_BYTES;
+pub const CLUSTER_KV_AUTHORITATIVE_ENTRIES_MAX_KEYS: usize = CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
+pub const CLUSTER_KV_AUTHORITATIVE_ENTRIES_MAX_PAYLOAD_BYTES: usize = MAX_KV_COMMAND_PAYLOAD_BYTES;
 pub const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 64;
 pub const CLUSTER_KV_DEFERRED_MATERIALIZED_MAX_REVISION_LAG: u64 = 64;
 pub const CLUSTER_KV_DEFERRED_MATERIALIZED_MIN_INTERVAL: Duration = Duration::from_secs(300);
@@ -290,15 +325,17 @@ pub use config_change::{
     apply_cluster_kv_raft_config_change, begin_cluster_kv_raft_config_change,
     clear_cluster_kv_raft_peer_progress, cluster_kv_raft_config_change_key,
     cluster_kv_raft_peer_progress_next_index_hint,
+    cluster_kv_raft_peer_progress_next_index_hint_async,
     cluster_kv_raft_peer_progress_next_index_hint_from_records,
-    cluster_kv_raft_peer_progress_next_index_hint_async, finish_cluster_kv_raft_config_change,
-    read_cluster_kv_raft_peer_progress, record_cluster_kv_raft_catch_up_proof,
-    record_cluster_kv_raft_peer_progress, record_cluster_kv_raft_peer_progress_batch,
+    finish_cluster_kv_raft_config_change, read_cluster_kv_raft_peer_progress,
+    record_cluster_kv_raft_catch_up_proof, record_cluster_kv_raft_peer_progress,
+    record_cluster_kv_raft_peer_progress_batch,
 };
 pub use in_process::{InProcessKvStore, InProcessRaftKvCluster};
 pub use keyspace::{
-    ClusterKvKeyspaceClass, cluster_kv_default_read_authority_for_key,
-    cluster_kv_key_may_defer_materialized_projection, cluster_kv_keyspace_class,
+    CLUSTER_KV_QUORUM_COMMIT_BENCHMARK_PREFIX, ClusterKvKeyspaceClass,
+    cluster_kv_default_read_authority_for_key, cluster_kv_key_may_defer_materialized_projection,
+    cluster_kv_keyspace_class,
 };
 pub type InProcessKvCluster = InProcessRaftKvCluster;
 pub use model::{
@@ -311,6 +348,8 @@ pub use model::{
     KvSnapshot, KvTxn, KvTxnRequest, KvTxnResponse, KvVersion, KvWatch, LeaseId, WatchId,
     decode_kv_value, encode_kv_value, kv_command_digest, push_bounded_txn_success_op,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use paths::cluster_kv_commit_sequence_admission_depth_for_test;
 pub use paths::{
     CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT, ClusterKvPaths, lock_cluster_kv_commit_sequence,
     register_storage_paths,
@@ -321,21 +360,22 @@ pub use raft::{
     ClusterKvRaftAppendReplicationOptions, ClusterKvRaftAppendReplicationOutcome,
     ClusterKvRaftAppendRequest, ClusterKvRaftCommandStorage, ClusterKvRaftCommitResult,
     ClusterKvRaftCompactCommitResult, ClusterKvRaftCompactionPolicy, ClusterKvRaftConfigRecord,
-    ClusterKvRaftLeaderElectionAsyncHost,
-    ClusterKvRaftLeaderElectionHost, ClusterKvRaftLeaderElectionOptions,
-    ClusterKvRaftLocalCommandStorage, ClusterKvRaftLocalVoteMetadata,
-    ClusterKvRaftObservedAppend, ClusterKvRaftOperationGuard, ClusterKvRaftQuorumCommitAsyncHost,
-    ClusterKvRaftQuorumCommitHost, ClusterKvRaftQuorumCompactCommitResult,
-    ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult, ClusterKvRaftQuorumFuture,
-    ClusterKvRaftReadIndexState,
-    ClusterKvRaftStore, ClusterKvRaftTargetReplicationAttempt,
+    ClusterKvRaftLeaderElectionAsyncHost, ClusterKvRaftLeaderElectionHost,
+    ClusterKvRaftLeaderElectionOptions, ClusterKvRaftLocalCommandStorage,
+    ClusterKvRaftLeaderFence, ClusterKvRaftLocalVoteMetadata, ClusterKvRaftObservedAppend,
+    ClusterKvRaftOperationGuard,
+    ClusterKvRaftQuorumCommitAsyncHost, ClusterKvRaftQuorumCommitHost,
+    ClusterKvRaftQuorumCommitOptions, ClusterKvRaftQuorumCommitResult,
+    ClusterKvRaftQuorumCompactCommitResult, ClusterKvRaftQuorumFuture,
+    ClusterKvRaftReadIndexProbeMetadata, ClusterKvRaftReadIndexProbeOutcome,
+    ClusterKvRaftReadIndexState, ClusterKvRaftStore, ClusterKvRaftTargetReplicationAttempt,
     ClusterKvRaftTargetReplicationAttempts, ClusterKvRaftTargetReplicationStatus,
-    ClusterKvRaftUncommittedAppend, ClusterKvTxnCommitResult, ClusterKvTxnCompactCommitResult,
+    ClusterKvRaftUncommittedAppend, ClusterKvRaftVoteDisposition, ClusterKvTxnCommitResult,
+    ClusterKvTxnCompactCommitResult,
     ClusterKvTxnQuorumAsyncHost, ClusterKvTxnQuorumDriverOptions, ClusterKvTxnQuorumHost,
-    DurableRaftKvNode, KvLogEntry,
-    RaftAppendEntriesApplyOutcome, RaftAppendEntriesCompactApplyOutcome,
-    RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftHardState, RaftRequestVoteRequest,
-    RaftRequestVoteResponse, RaftSnapshot,
+    DurableRaftKvNode, KvLogEntry, RaftAppendEntriesApplyOutcome,
+    RaftAppendEntriesCompactApplyOutcome, RaftAppendEntriesRequest, RaftAppendEntriesResponse,
+    RaftHardState, RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot,
     cluster_kv_member_has_raft_vote, cluster_kv_raft_candidate_is_authorized_voter,
     cluster_kv_raft_config_key, cluster_kv_raft_config_member_role,
     cluster_kv_raft_config_record_stable_eq, cluster_kv_raft_local_is_voter,
@@ -346,52 +386,76 @@ pub use raft::{
     commit_cluster_kv_raft_command_compact_with_quorum,
     commit_cluster_kv_raft_command_compact_with_quorum_async,
     commit_cluster_kv_raft_command_with_quorum, commit_cluster_kv_raft_command_with_quorum_async,
-    commit_cluster_kv_txn_with_quorum_async_with_host, commit_cluster_kv_txn_with_quorum_with_host,
     commit_cluster_kv_txn_compact_with_quorum_async_with_host,
+    commit_cluster_kv_txn_with_quorum_async_with_host, commit_cluster_kv_txn_with_quorum_with_host,
     compact_cluster_kv_raft_node_if_needed, default_cluster_kv_raft_compaction_policy,
+    deny_process_local_raft_access_for_root,
     elect_cluster_kv_raft_leader_async_with_host, elect_cluster_kv_raft_leader_with_host,
     lock_cluster_kv_raft_operation_for_paths, lock_cluster_kv_raft_operation_for_root,
     lock_cluster_kv_raft_operation_for_wal_paths,
+    process_local_raft_access_is_denied,
     read_cluster_kv_authoritative_snapshot_async_with_host,
     read_cluster_kv_authoritative_snapshot_with_host,
     replicate_cluster_kv_raft_to_target_async_with_host,
     replicate_cluster_kv_raft_to_target_with_host, validate_cluster_kv_raft_config_transition,
+    with_cluster_kv_resident_read_projection, ClusterKvRaftResidentReadProjection,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use raft::{
+    ResidentRaftNodeRegistryPin, clear_process_local_raft_access_denial_for_test,
+    cluster_kv_raft_operation_queue_depth_for_test,
+    evict_resident_raft_node_for_test, pin_resident_raft_node_registry_for_test,
+};
+#[cfg(test)]
+pub(crate) use request::lock_cluster_kv_request_attempt_ledger_for_test;
 pub use request::{
     MAX_CLUSTER_KV_REQUEST_ATTEMPT_BYTES, MAX_CLUSTER_KV_REQUEST_ATTEMPT_TOMBSTONES,
     MAX_CLUSTER_KV_REQUEST_ATTEMPTS, mark_cluster_kv_request_rejected_before_commit,
-    mark_cluster_kv_request_submitted, mark_cluster_kv_request_unknown,
-    read_cluster_kv_request_attempt, record_cluster_kv_request_attempt,
-    resolve_cluster_kv_request_outcome,
+    mark_cluster_kv_request_rejected_before_commit_before, mark_cluster_kv_request_submitted,
+    mark_cluster_kv_request_submitted_before, mark_cluster_kv_request_unknown,
+    mark_cluster_kv_request_unknown_before, read_cluster_kv_request_attempt,
+    read_cluster_kv_request_attempt_before, record_cluster_kv_request_attempt,
+    record_cluster_kv_request_attempt_before, resolve_cluster_kv_request_outcome,
 };
 pub use rpc::{
+    ClusterKvAuthoritativeEntriesRequest, ClusterKvAuthoritativeEntriesResponse,
     ClusterKvAuthoritativeRangePrefixRequest, ClusterKvAuthoritativeSnapshotRequest,
-    ClusterKvAuthoritativeWatchStartRequest, ClusterKvLocalReadWatchHost,
+    ClusterKvAuthoritativeWatchStartRequest, ClusterKvEntryRequest, ClusterKvLocalReadWatchHost,
     ClusterKvLocalReadWatchRequest, ClusterKvReplicationRequest, ClusterKvReplicationResponse,
     ClusterKvRequestOutcomeRequest, ClusterKvRpcPayload, ClusterKvStateAuthorityVoteRequest,
     ClusterKvStateAuthorityVoteResponse, ClusterKvTxnRpcResponse, ClusterKvWatchEventsRequest,
     ClusterKvWatchEventsResponse, ClusterRaftAppendRequest, ClusterRaftAppendResponse,
     ClusterRaftVoteRequest, ClusterRaftVoteResponse,
+    cluster_kv_authoritative_entries_response_rpc_payload,
+    cluster_kv_authoritative_entries_rpc_payload,
+    cluster_kv_authoritative_entry_response_rpc_payload,
+    cluster_kv_authoritative_entry_rpc_payload,
     cluster_kv_authoritative_range_prefix_response_rpc_payload,
     cluster_kv_authoritative_range_prefix_rpc_payload,
     cluster_kv_authoritative_snapshot_response_rpc_payload,
     cluster_kv_authoritative_snapshot_rpc_payload,
     cluster_kv_authoritative_watch_start_response_rpc_payload,
-    cluster_kv_authoritative_watch_start_rpc_payload,
-    cluster_kv_local_range_prefix_response_rpc_payload, cluster_kv_local_range_prefix_rpc_payload,
-    cluster_kv_local_snapshot_response_rpc_payload, cluster_kv_local_snapshot_rpc_payload,
-    cluster_kv_local_watch_cancel_rpc_payload, cluster_kv_local_watch_drain_rpc_payload,
-    cluster_kv_request_outcome_response_rpc_payload, cluster_kv_request_outcome_rpc_payload,
-    cluster_kv_txn_response_rpc_payload, cluster_kv_txn_rpc_payload,
-    cluster_kv_watch_events_noop_response, cluster_kv_watch_events_response_rpc_payload,
-    cluster_kv_watch_events_rpc_payload, cluster_raft_append_response_rpc_payload,
-    cluster_raft_append_rpc_payload, cluster_raft_vote_response_rpc_payload,
-    cluster_raft_vote_rpc_payload, decode_cluster_kv_authoritative_range_prefix_rpc_body,
+    cluster_kv_authoritative_watch_start_rpc_payload, cluster_kv_local_entry_response_rpc_payload,
+    cluster_kv_local_entry_rpc_payload, cluster_kv_local_range_prefix_response_rpc_payload,
+    cluster_kv_local_range_prefix_rpc_payload, cluster_kv_local_snapshot_response_rpc_payload,
+    cluster_kv_local_snapshot_rpc_payload, cluster_kv_local_watch_cancel_rpc_payload,
+    cluster_kv_local_watch_drain_rpc_payload, cluster_kv_request_outcome_response_rpc_payload,
+    cluster_kv_request_outcome_rpc_payload, cluster_kv_txn_response_rpc_payload,
+    cluster_kv_txn_rpc_payload, cluster_kv_watch_events_noop_response,
+    cluster_kv_watch_events_response_rpc_payload, cluster_kv_watch_events_rpc_payload,
+    cluster_raft_append_response_rpc_payload, cluster_raft_append_rpc_payload,
+    cluster_raft_vote_response_rpc_payload, cluster_raft_vote_rpc_payload,
+    decode_cluster_kv_authoritative_entries_rpc_body,
+    decode_cluster_kv_authoritative_entries_rpc_request_body,
+    decode_cluster_kv_authoritative_entry_rpc_body,
+    decode_cluster_kv_authoritative_entry_rpc_request_body,
+    decode_cluster_kv_authoritative_range_prefix_rpc_body,
     decode_cluster_kv_authoritative_range_prefix_rpc_request_body,
     decode_cluster_kv_authoritative_snapshot_rpc_body,
     decode_cluster_kv_authoritative_snapshot_rpc_request_body,
     decode_cluster_kv_authoritative_watch_start_rpc_body,
     decode_cluster_kv_authoritative_watch_start_rpc_request_body,
+    decode_cluster_kv_local_entry_rpc_body, decode_cluster_kv_local_entry_rpc_request_body,
     decode_cluster_kv_local_range_prefix_rpc_body, decode_cluster_kv_local_snapshot_rpc_body,
     decode_cluster_kv_local_snapshot_rpc_request_body,
     decode_cluster_kv_local_watch_cancel_rpc_body, decode_cluster_kv_local_watch_drain_rpc_body,
@@ -402,20 +466,30 @@ pub use rpc::{
     decode_cluster_raft_append_rpc_response_body, decode_cluster_raft_vote_rpc_request_body,
     decode_cluster_raft_vote_rpc_response_body, handle_cluster_kv_local_read_watch_request,
     handle_cluster_kv_local_read_watch_rpc_payload, handle_cluster_kv_request_outcome_rpc_payload,
-    handle_cluster_kv_watch_events,
-    handle_cluster_raft_rpc_payload, project_cluster_kv_authoritative_range_prefix,
-    validate_cluster_kv_authoritative_snapshot_read,
+    handle_cluster_kv_watch_events, handle_cluster_raft_rpc_payload,
+    pack_cluster_kv_authoritative_entries_response, project_cluster_kv_authoritative_entries,
+    project_cluster_kv_authoritative_range_prefix,
+    unpack_cluster_kv_authoritative_entries_response,
+    validate_cluster_kv_authoritative_entries_read,
+    validate_cluster_kv_authoritative_entries_request_keys,
+    validate_cluster_kv_authoritative_entry_read, validate_cluster_kv_authoritative_snapshot_read,
     validate_cluster_kv_authoritative_watch_start_response,
     validate_cluster_kv_current_term_authority_proof, validate_cluster_kv_request_outcome_read,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use snapshot::evict_cluster_kv_cached_snapshot_arc_for_test;
 pub use snapshot::{
     KvLocalCache, KvMaterializedCache, compact_kv_snapshot_event_history, kv_snapshot_durable_eq,
-    read_cluster_kv_cached_snapshot, read_cluster_kv_current_snapshot_arc_for_node,
-    read_cluster_kv_current_snapshot_for_node, read_cluster_kv_entry,
-    read_cluster_kv_local_entry, read_cluster_kv_local_event_history,
-    read_cluster_kv_local_prefix, read_cluster_kv_local_snapshot, read_cluster_kv_prefix_entries,
-    read_cluster_kv_prefix_entries_limited,
-    read_cluster_kv_prefix_entries_limited_by_payload_bytes, read_cluster_kv_store_for_node,
+    read_cluster_kv_cached_entries_consistently, read_cluster_kv_cached_snapshot,
+    read_cluster_kv_cached_snapshot_arc_if_hot, read_cluster_kv_current_snapshot_arc_for_node,
+    read_cluster_kv_current_snapshot_for_node, read_cluster_kv_entry, read_cluster_kv_local_entry,
+    read_cluster_kv_local_entry_with_deadline, read_cluster_kv_local_event_history,
+    read_cluster_kv_local_prefix, read_cluster_kv_local_prefix_with_deadline,
+    read_cluster_kv_local_snapshot, read_cluster_kv_local_snapshot_with_deadline,
+    read_cluster_kv_prefix_entries, read_cluster_kv_prefix_entries_limited,
+    read_cluster_kv_prefix_entries_limited_by_payload_bytes, read_cluster_kv_resident_local_entries,
+    read_cluster_kv_resident_local_entry, read_cluster_kv_resident_local_prefix,
+    read_cluster_kv_store_for_node,
     write_cluster_kv_materialized_snapshot_if_changed, write_cluster_kv_snapshot,
     write_cluster_kv_snapshot_if_changed, write_imported_cluster_kv_snapshot_if_changed,
 };

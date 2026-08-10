@@ -7,7 +7,10 @@ use crate::kv_local_store::ClusterKvPathsExt;
 use crate::kv_local_store::kv_err;
 use crate::local_state_store::read_cluster_state;
 use crate::prelude::*;
-use crate::raft_quorum::ClusterKvQuorumAsyncHost;
+use crate::raft_quorum::{
+    ClusterKvQuorumAsyncHost, ClusterRaftBlockingCancellationPolicy,
+    run_cluster_raft_supervised_blocking,
+};
 use sinomo_kv::ClusterKvRaftAppendReplicationOutcome;
 #[allow(unused_imports)]
 use sinomo_kv::{
@@ -17,7 +20,6 @@ use sinomo_kv::{
 use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
-use sinomo_network::{ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -31,6 +33,23 @@ pub struct ClusterRaftCommittedFanoutReport {
     pub replicated_nodes: Vec<NodeId>,
     pub peer_progress_hints: Vec<sinomo_kv::ClusterKvRaftPeerProgress>,
     pub watch_event_batches_sent: usize,
+}
+
+fn committed_raft_fanout_target_node_ids(state: &ClusterBootstrapState) -> Vec<NodeId> {
+    state
+        .members
+        .iter()
+        .filter(|member| {
+            member.node_id != state.local_node_id
+                && member.state.is_authorized()
+                && member.capabilities.iter().any(|capability| {
+                    capability.as_str() == sinomo_node::DAEMON_MAIN_RUN_CAPABILITY
+                })
+        })
+        .map(|member| member.node_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 pub trait ClusterKvCommittedFanoutAsyncHost {
@@ -142,7 +161,7 @@ where
 
 #[cfg(any(test, feature = "test-support"))]
 pub async fn fan_out_committed_cluster_raft_command_async_with_host(
-    runtime: &tokio::runtime::Handle,
+    _runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     events: &[KvEvent],
@@ -151,15 +170,8 @@ pub async fn fan_out_committed_cluster_raft_command_async_with_host(
 ) -> Result<ClusterRaftCommittedFanoutReport, NetworkError> {
     let mut report = ClusterRaftCommittedFanoutReport::default();
     let mut replicated_nodes = BTreeSet::new();
-    for target_node_id in ClusterEndpointSelector::select_internal_unique_node_ids_async(
-        runtime,
-        paths,
-        state,
-        ClusterEndpointInternalSelectionPurpose::RaftMemberReplication,
-    )
-    .await?
-    {
-        if target_node_id == state.local_node_id || replicated_nodes.contains(&target_node_id) {
+    for target_node_id in committed_raft_fanout_target_node_ids(state) {
+        if replicated_nodes.contains(&target_node_id) {
             continue;
         }
         report.attempted_nodes += 1;
@@ -356,28 +368,30 @@ async fn persist_fanout_peer_progress_hints(
         return;
     }
     let kv_paths = paths.kv_paths();
-    match runtime
-        .spawn_blocking(move || {
-            sinomo_kv::record_cluster_kv_raft_peer_progress_batch(&kv_paths, hints)
-        })
-        .await
+    match run_cluster_raft_supervised_blocking(
+        runtime,
+        None,
+        ClusterRaftBlockingCancellationPolicy::CompleteAlways,
+        "committed-fanout",
+        "peer-progress-persistence",
+        "persist committed Raft fanout peer progress",
+        move || {
+            sinomo_kv::record_cluster_kv_raft_peer_progress_batch(&kv_paths, hints).map_err(kv_err)
+        },
+    )
+    .await
     {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(
-            target: "sinomo.cluster.raft_fanout",
-            %error,
-            "committed Raft fanout could not persist peer progress hints"
-        ),
+        Ok(()) => {}
         Err(error) => tracing::warn!(
             target: "sinomo.cluster.raft_fanout",
             %error,
-            "committed Raft fanout peer progress task failed"
+            "committed Raft fanout could not persist peer progress hints"
         ),
     }
 }
 
 async fn fan_out_committed_cluster_raft_command_async_with_factory<H, F>(
-    runtime: &tokio::runtime::Handle,
+    _runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     events: &[KvEvent],
@@ -388,17 +402,14 @@ where
     H: ClusterRaftCommittedFanoutAsyncHost + Send + 'static,
     F: FnMut() -> H,
 {
-    let targets = ClusterEndpointSelector::select_internal_unique_node_ids_async(
-        runtime,
-        paths,
-        state,
-        ClusterEndpointInternalSelectionPurpose::RaftMemberReplication,
-    )
-    .await?;
+    // The committed member snapshot is already the authority for this wave.
+    // Do not re-enter KV/status endpoint selection after every commit: an
+    // offline hint is exactly when reactive catch-up must still be attempted.
+    let targets = committed_raft_fanout_target_node_ids(state);
     let mut tasks = tokio::task::JoinSet::new();
     let mut scheduled = BTreeSet::new();
     for target_node_id in targets {
-        if target_node_id == state.local_node_id || !scheduled.insert(target_node_id.clone()) {
+        if !scheduled.insert(target_node_id.clone()) {
             continue;
         }
         let mut host = host_factory();
@@ -489,8 +500,14 @@ async fn read_latest_cluster_raft_fanout_inputs_async(
     paths: &ClusterPaths,
 ) -> Option<(ClusterBootstrapState, Vec<KvEvent>)> {
     let paths = paths.clone();
-    runtime
-        .spawn_blocking(move || {
+    run_cluster_raft_supervised_blocking(
+        runtime,
+        None,
+        ClusterRaftBlockingCancellationPolicy::CancelQueued,
+        "committed-fanout",
+        "refresh-inputs",
+        "read committed Raft fanout inputs",
+        move || {
             let latest_state = read_cluster_state(&paths)?;
             let latest_events = sinomo_kv::read_cluster_kv_local_event_history(
                 &paths.kv_paths(),
@@ -499,10 +516,10 @@ async fn read_latest_cluster_raft_fanout_inputs_async(
             .map(|read| read.value.events)
             .unwrap_or_default();
             Ok::<_, NetworkError>((latest_state, latest_events))
-        })
-        .await
-        .ok()
-        .and_then(Result::ok)
+        },
+    )
+    .await
+    .ok()
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -660,4 +677,104 @@ pub async fn replicate_cluster_kv_to_node_async_with_host(
         &mut append_host,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn committed_fanout_targets_every_authorized_main_daemon_member() {
+        let now = time::OffsetDateTime::now_utc();
+        let local = NodeId::from_legacy_named("fanout_exact_local").expect("local");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            sinomo_base::Id::from_legacy_named("fanout_exact_cluster").expect("cluster"),
+            "fanout exact targets",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let main_capability =
+            sinomo_base::CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY.to_string())
+                .expect("main daemon capability");
+        state.members[0].capabilities = vec![main_capability.clone()];
+
+        let mut add_member = |name: &str,
+                              role: ClusterMemberRole,
+                              member_state: ClusterMemberState,
+                              main_daemon: bool|
+         -> NodeId {
+            let node_id = NodeId::from_legacy_named(name).expect("member node");
+            let mut member = state.members[0].clone();
+            member.node_id = node_id.clone();
+            member.display_name = name.to_string();
+            member.node_public_key = format!("pk-{name}");
+            member.role = role;
+            member.state = member_state;
+            member.capabilities = main_daemon
+                .then(|| vec![main_capability.clone()])
+                .unwrap_or_default();
+            state.members.push(member);
+            node_id
+        };
+
+        let voter = add_member(
+            "fanout_exact_voter",
+            ClusterMemberRole::Voter,
+            ClusterMemberState::Voter,
+            true,
+        );
+        let learner = add_member(
+            "fanout_exact_learner",
+            ClusterMemberRole::Learner,
+            ClusterMemberState::Learner,
+            true,
+        );
+        let non_voting = add_member(
+            "fanout_exact_nonvoting",
+            ClusterMemberRole::NonVoting,
+            ClusterMemberState::NonVoting,
+            true,
+        );
+        let offline = add_member(
+            "fanout_exact_offline",
+            ClusterMemberRole::Voter,
+            ClusterMemberState::Offline,
+            true,
+        );
+        let pending = add_member(
+            "fanout_exact_pending",
+            ClusterMemberRole::Learner,
+            ClusterMemberState::Pending,
+            true,
+        );
+        let removed = add_member(
+            "fanout_exact_removed",
+            ClusterMemberRole::NonVoting,
+            ClusterMemberState::Removed,
+            true,
+        );
+        let no_main = add_member(
+            "fanout_exact_no_main",
+            ClusterMemberRole::Voter,
+            ClusterMemberState::Voter,
+            false,
+        );
+        let duplicate = state
+            .members
+            .iter()
+            .find(|member| member.node_id == voter)
+            .expect("voter member")
+            .clone();
+        state.members.push(duplicate);
+
+        let mut expected = vec![voter, learner, non_voting, offline];
+        expected.sort();
+        assert_eq!(committed_raft_fanout_target_node_ids(&state), expected);
+        assert!(!expected.contains(&local));
+        assert!(!expected.contains(&pending));
+        assert!(!expected.contains(&removed));
+        assert!(!expected.contains(&no_main));
+    }
 }

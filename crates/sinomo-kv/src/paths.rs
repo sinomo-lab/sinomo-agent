@@ -99,13 +99,12 @@ impl Drop for CommitSequenceAdmissionTurn {
     }
 }
 
-/// Locks the cluster raft commit sequence (append → replicate → commit) against
-/// concurrent committers from other tasks and other processes sharing this data
-/// dir. The quorum commit is a multi-step protocol over separately-locked store
-/// operations; without this outer lock two concurrent committers race: each
-/// append opens the WAL discarding the other's uncommitted entry, so the first
-/// committer's commit step no longer finds its entry (`missing committed raft
-/// entry`) and the publishers livelock retrying against each other.
+/// Locks one cluster-Raft proposal or finalization phase against concurrent
+/// committers from other tasks and other processes sharing this data dir. The
+/// quorum driver holds it for replay/leader-check/append, releases it across
+/// transport, and reacquires it for exact-entry revalidation/apply. This keeps
+/// local log order deterministic without turning a slow voter into a WAN-sized
+/// critical section.
 ///
 /// The returned file holds an exclusive advisory lock released on drop.
 pub fn lock_cluster_kv_commit_sequence(
@@ -142,6 +141,24 @@ pub fn lock_cluster_kv_commit_sequence(
     )?;
     Ok(lock)
 }
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
+pub fn cluster_kv_commit_sequence_admission_depth_for_test(paths: &ClusterKvPaths) -> usize {
+    let lock_path = paths.raft.join("commit-sequence.lock");
+    let gates = COMMIT_SEQUENCE_ADMISSION_GATES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(gate) = gates.get(&lock_path).and_then(std::sync::Weak::upgrade) else {
+        return 0;
+    };
+    let state = gate
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    usize::try_from(state.next_ticket.saturating_sub(state.serving_ticket)).unwrap_or(usize::MAX)
+}
+
 pub fn register_storage_paths(
     layout: &mut sinomo_storage::StorageLayout,
 ) -> Result<(), sinomo_storage::StorageContractError> {
@@ -347,6 +364,13 @@ impl ClusterKvPaths {
             .map(|snapshot| snapshot.revision)
     }
 
+    /// Publishes a local applied-Raft projection with monotonic generation
+    /// comparison. Quorum hosts call this only after releasing Raft storage so
+    /// materialized-file serialization and fsync cannot block resident reads.
+    pub fn write_raft_snapshot_if_changed(&self, snapshot: &KvSnapshot) -> Result<bool, KvError> {
+        self.local_cache().write_raft_snapshot_if_changed(snapshot)
+    }
+
     pub fn imported_snapshot_advances_current_for_node(
         &self,
         node_id: &NodeId,
@@ -437,6 +461,15 @@ impl ClusterKvPaths {
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, KvError> {
         self.raft_store().locked_known_voter_leader_id(state)
+    }
+
+    pub fn locked_known_raft_voter_leader_id_before(
+        &self,
+        state: &ClusterBootstrapState,
+        deadline: Instant,
+    ) -> Result<Option<NodeId>, KvError> {
+        self.raft_store()
+            .locked_known_voter_leader_id_before(state, deadline)
     }
 
     pub fn locked_raft_local_is_leader(
@@ -727,9 +760,7 @@ mod tests {
         let timed_out = {
             let gate = Arc::clone(&gate);
             let path = path.clone();
-            thread::spawn(move || {
-                gate.acquire(&path, Instant::now() + Duration::from_millis(20))
-            })
+            thread::spawn(move || gate.acquire(&path, Instant::now() + Duration::from_millis(20)))
         };
         wait_for_issued_ticket(&gate, 2);
         assert!(matches!(
@@ -739,9 +770,7 @@ mod tests {
 
         let next = {
             let gate = Arc::clone(&gate);
-            thread::spawn(move || {
-                gate.acquire(&path, Instant::now() + Duration::from_secs(1))
-            })
+            thread::spawn(move || gate.acquire(&path, Instant::now() + Duration::from_secs(1)))
         };
         wait_for_issued_ticket(&gate, 3);
         drop(first);

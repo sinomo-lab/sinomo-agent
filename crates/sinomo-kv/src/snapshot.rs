@@ -1,7 +1,189 @@
 use crate::internal::*;
 
+#[cfg(test)]
+#[derive(Clone)]
+struct ClusterKvColdReadPause {
+    after_open: bool,
+    before_handoff: bool,
+    claimed: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+static CLUSTER_KV_COLD_READ_PAUSES: LazyLock<Mutex<HashMap<PathBuf, ClusterKvColdReadPause>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn install_cluster_kv_cold_read_pause_for_test(
+    root: PathBuf,
+    claimed: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
+) {
+    CLUSTER_KV_COLD_READ_PAUSES
+        .lock()
+        .expect("cluster KV cold-read pause")
+        .insert(
+            root.clone(),
+            ClusterKvColdReadPause {
+                after_open: false,
+                before_handoff: false,
+                claimed,
+                resume,
+            },
+        );
+}
+
+#[cfg(test)]
+pub(crate) fn install_cluster_kv_cold_read_after_open_pause_for_test(
+    root: PathBuf,
+    opened: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
+) {
+    CLUSTER_KV_COLD_READ_PAUSES
+        .lock()
+        .expect("cluster KV cold-read pause")
+        .insert(
+            root.clone(),
+            ClusterKvColdReadPause {
+                after_open: true,
+                before_handoff: false,
+                claimed: opened,
+                resume,
+            },
+        );
+}
+
+#[cfg(test)]
+pub(crate) fn install_cluster_kv_cold_read_before_handoff_pause_for_test(
+    root: PathBuf,
+    observed: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
+) {
+    CLUSTER_KV_COLD_READ_PAUSES
+        .lock()
+        .expect("cluster KV cold-read pause")
+        .insert(
+            root,
+            ClusterKvColdReadPause {
+                after_open: false,
+                before_handoff: true,
+                claimed: observed,
+                resume,
+            },
+        );
+}
+
+#[cfg(test)]
+pub(crate) fn clear_cluster_kv_cold_read_pause_for_test(root: &Path) {
+    CLUSTER_KV_COLD_READ_PAUSES
+        .lock()
+        .expect("cluster KV cold-read pause")
+        .remove(root);
+}
+
+#[cfg(test)]
+fn pause_cluster_kv_cold_read_for_test(root: &Path, after_open: bool) {
+    let pause = CLUSTER_KV_COLD_READ_PAUSES.lock().ok().and_then(|pauses| {
+        pauses
+            .get(root)
+            .filter(|pause| !pause.before_handoff && pause.after_open == after_open)
+            .cloned()
+    });
+    if let Some(pause) = pause {
+        pause.claimed.wait();
+        pause.resume.wait();
+    }
+}
+
+#[cfg(not(test))]
+fn pause_cluster_kv_cold_read_for_test(_root: &Path, _after_open: bool) {}
+
+#[cfg(test)]
+fn pause_cluster_kv_cold_read_before_handoff_for_test(root: &Path) {
+    let pause = CLUSTER_KV_COLD_READ_PAUSES.lock().ok().and_then(|pauses| {
+        pauses
+            .get(root)
+            .filter(|pause| pause.before_handoff)
+            .cloned()
+    });
+    if let Some(pause) = pause {
+        pause.claimed.wait();
+        pause.resume.wait();
+    }
+}
+
+#[cfg(not(test))]
+fn pause_cluster_kv_cold_read_before_handoff_for_test(_root: &Path) {}
+
 pub fn read_cluster_kv_cached_snapshot(paths: &ClusterKvPaths) -> Result<KvSnapshot, KvError> {
     paths.local_cache().cached_snapshot()
+}
+
+/// Returns the already-decoded materialized snapshot only when it is resident
+/// in this process and still matches the durable file identity.
+///
+/// This is an admission probe for latency-bounded callers. It performs only the
+/// identity stat and process-cache lookup: a miss never reads or decodes the
+/// materialized file, opens the resident Raft node, or restores snapshot/WAL
+/// state.
+pub fn read_cluster_kv_cached_snapshot_arc_if_hot(
+    paths: &ClusterKvPaths,
+) -> Result<Option<Arc<KvSnapshot>>, KvError> {
+    paths.local_cache().cached_snapshot_arc_if_hot()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn evict_cluster_kv_cached_snapshot_arc_for_test(paths: &ClusterKvPaths) {
+    if let Ok(mut cache) = materialized_snapshot_cache().lock() {
+        cache.remove(&paths.snapshot);
+    }
+}
+
+/// Reads a small set of exact keys from one immutable materialized snapshot.
+///
+/// Opening the materialized snapshot independently for each key can straddle
+/// an atomic snapshot replacement and return values from different revisions.
+/// Keep the shared snapshot alive until every requested entry has been
+/// projected so callers receive one coherent local view without cloning the
+/// complete keyspace.
+pub fn read_cluster_kv_cached_entries_consistently(
+    paths: &ClusterKvPaths,
+    keys: &[String],
+) -> Result<Vec<Option<KvEntry>>, KvError> {
+    let Some(snapshot) = paths.local_cache().cached_snapshot_arc_if_present()? else {
+        let mut missing = Vec::new();
+        missing
+            .try_reserve(keys.len())
+            .map_err(|_| KvError::ResourceExhausted {
+                operation: "read coherent materialized cluster KV entries".to_string(),
+                requested_bytes: keys
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Option<KvEntry>>()),
+            })?;
+        missing.resize_with(keys.len(), || None);
+        return Ok(missing);
+    };
+
+    let mut entries = Vec::new();
+    entries
+        .try_reserve(keys.len())
+        .map_err(|_| KvError::ResourceExhausted {
+            operation: "read coherent materialized cluster KV entries".to_string(),
+            requested_bytes: keys
+                .len()
+                .saturating_mul(std::mem::size_of::<Option<KvEntry>>()),
+        })?;
+    for key in keys {
+        entries.push(
+            snapshot
+                .get(key)
+                .map(|entry| {
+                    try_clone_kv_entry(entry, "read coherent materialized cluster KV entry")
+                })
+                .transpose()?,
+        );
+    }
+    Ok(entries)
 }
 
 pub fn read_cluster_kv_current_snapshot_for_node(
@@ -30,73 +212,95 @@ pub fn read_cluster_kv_store_for_node(
 }
 
 enum ClusterKvLocalImmutableSnapshot {
-    Snapshot(KvLocalRead<Arc<KvSnapshot>>),
+    View(KvLocalRead<Arc<RaftLocalReadView>>),
     RetryResident,
 }
 
-fn cluster_kv_local_read_metadata_for_revision(
-    wal_paths: &KvWalPaths,
-    node_id: &NodeId,
-    revision: KvRevision,
-) -> (u64, u64, Option<NodeId>) {
-    match resident_raft_local_read_metadata(wal_paths, node_id) {
-        Some((resident_revision, observed_term, applied_index, known_leader))
-            if resident_revision == revision =>
-        {
-            (observed_term, applied_index, known_leader)
-        }
-        _ => (0, 0, None),
-    }
-}
-
 /// Reads or seeds the immutable local Raft-view cache without ever checking a
-/// node into the resident writer slot. The cold loader consumes the restored
-/// store into its snapshot, so seeding does not construct a second full
-/// BTreeMap/event copy alongside the decoded node.
-fn read_cluster_kv_local_immutable_snapshot(
-    paths: &ClusterKvPaths,
+/// node into the resident writer slot. The first unbounded read after process
+/// start still performs recovery work proportional to the durable snapshot and
+/// retained WAL; moving that restored indexed store into this bounded cache
+/// amortizes the cost across subsequent point and prefix reads and avoids a
+/// second O(total keyspace) snapshot conversion. Deadline-aware authority reads
+/// may join an existing recovery but never become its uninterruptible owner.
+fn read_cluster_kv_local_immutable_view_from_cache(
+    cache: &KvMaterializedCache,
     node_id: &NodeId,
     wal_paths: &KvWalPaths,
+    deadline: Option<Instant>,
 ) -> Result<ClusterKvLocalImmutableSnapshot, KvError> {
+    // A shadow-role denial applies to voter-derived hot projections as well as
+    // file opens. Never serve a view seeded before the one-way process role
+    // boundary was installed.
+    crate::raft::require_process_local_raft_access(&wal_paths.root)?;
     for _ in 0..3 {
         let (_, identity) = raft_view_identity_for_read(wal_paths)?;
         if let Some(identity) = identity
-            && let Some(snapshot) = cache_lookup_raft_view(wal_paths, node_id, identity)
+            && let Some(view) = cache_lookup_raft_view(wal_paths, node_id, identity)
         {
-            let (observed_term, applied_index, known_leader) =
-                cluster_kv_local_read_metadata_for_revision(wal_paths, node_id, snapshot.revision);
-            return Ok(ClusterKvLocalImmutableSnapshot::Snapshot(KvLocalRead {
-                revision: snapshot.revision,
-                observed_term,
-                applied_index,
-                known_leader,
-                value: snapshot,
+            return Ok(ClusterKvLocalImmutableSnapshot::View(KvLocalRead {
+                revision: view.revision(),
+                observed_term: view.observed_term,
+                applied_index: view.applied_index,
+                known_leader: view.known_leader.clone(),
+                value: view,
             }));
         }
 
-        let loader = match begin_resident_raft_cold_read(wal_paths)? {
+        let loader = match begin_resident_raft_cold_read(wal_paths, deadline)? {
             ResidentRaftColdReadStart::Load(loader) => loader,
             ResidentRaftColdReadStart::RetryImmutableCache => continue,
             ResidentRaftColdReadStart::RetryResident => {
                 return Ok(ClusterKvLocalImmutableSnapshot::RetryResident);
             }
         };
-        let cache = paths.local_cache();
+        pause_cluster_kv_cold_read_for_test(&wal_paths.root, false);
+        if loader.preempt_requested() {
+            loader.yield_before_open();
+            return Ok(ClusterKvLocalImmutableSnapshot::RetryResident);
+        }
         let node = DurableRaftKvNode::try_open_with_materialized_cache(
             node_id.clone(),
             wal_paths.clone(),
-            &cache.materialized,
+            cache,
         )?;
+        pause_cluster_kv_cold_read_for_test(&wal_paths.root, true);
+        let (loader, node) = if loader.preempt_requested() {
+            pause_cluster_kv_cold_read_before_handoff_for_test(&wal_paths.root);
+            match loader.try_yield_restored_node(node) {
+                Ok(()) => return Ok(ClusterKvLocalImmutableSnapshot::RetryResident),
+                Err(loader_and_node) => loader_and_node,
+            }
+        } else {
+            (loader, node)
+        };
         let identity = raft_view_identity(wal_paths).ok_or_else(|| KvError::Io {
             path: wal_paths.root.display().to_string(),
             detail: "durable Raft identity unavailable after local read replay".to_string(),
         })?;
-        let revision = node.store().revision();
-        let observed_term = node.hard_state().current_term;
-        let applied_index = node.applied_index();
-        let known_leader = node.hard_state().leader_id.clone();
-        let snapshot = Arc::new(node.try_into_snapshot()?.canonicalized());
-        cache_store_raft_view(wal_paths, node_id.clone(), identity, snapshot.clone());
+        let view = node.try_into_local_read_view()?;
+        let revision = view.revision();
+        let observed_term = view.observed_term;
+        let applied_index = view.applied_index;
+        let known_leader = view.known_leader.clone();
+        let raft_config_entry = view.store.get(&cluster_kv_raft_config_key()).cloned();
+        cache_store_raft_view(wal_paths, node_id.clone(), identity, view.clone());
+        let view = match cache_lookup_raft_view(wal_paths, node_id, identity) {
+            Some(cached) => cached,
+            // An oversized indexed store is deliberately not retained in the
+            // process-wide cache. It may still serve this one caller after the
+            // same post-flock identity fence used by a cached view.
+            None if raft_view_identity(wal_paths) == Some(identity) => view,
+            None => {
+                // Another process changed the durable view after the operation-
+                // scoped reader released its flock. Never return the unfenced
+                // parse; retry against the new identity while this load owns the
+                // in-process singleflight.
+                return Err(KvError::Busy {
+                    path: wal_paths.root.display().to_string(),
+                });
+            }
+        };
         loader.complete(
             node_id.clone(),
             identity,
@@ -104,9 +308,10 @@ fn read_cluster_kv_local_immutable_snapshot(
             observed_term,
             applied_index,
             known_leader.clone(),
+            raft_config_entry,
         );
-        return Ok(ClusterKvLocalImmutableSnapshot::Snapshot(KvLocalRead {
-            value: snapshot,
+        return Ok(ClusterKvLocalImmutableSnapshot::View(KvLocalRead {
+            value: view,
             revision,
             observed_term,
             applied_index,
@@ -116,6 +321,21 @@ fn read_cluster_kv_local_immutable_snapshot(
     Err(KvError::Busy {
         path: wal_paths.root.display().to_string(),
     })
+}
+
+fn read_cluster_kv_local_immutable_snapshot(
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+    wal_paths: &KvWalPaths,
+    deadline: Option<Instant>,
+) -> Result<ClusterKvLocalImmutableSnapshot, KvError> {
+    let cache = paths.local_cache();
+    read_cluster_kv_local_immutable_view_from_cache(
+        &cache.materialized,
+        node_id,
+        wal_paths,
+        deadline,
+    )
 }
 
 fn cluster_kv_local_materialized_fallback(
@@ -146,9 +366,10 @@ fn cluster_kv_local_materialized_fallback(
 ///
 /// The returned metadata is observational only: neither the known leader nor
 /// the observed term establishes freshness.
-pub fn read_cluster_kv_local_snapshot(
+fn read_cluster_kv_local_snapshot_inner(
     paths: &ClusterKvPaths,
     node_id: &NodeId,
+    deadline: Option<Instant>,
 ) -> Result<KvLocalRead<KvSnapshot>, KvError> {
     let started = Instant::now();
     let result = (|| {
@@ -156,13 +377,13 @@ pub fn read_cluster_kv_local_snapshot(
         if let Some(read) = read_resident_raft_local_snapshot(&wal_paths, node_id) {
             return read;
         }
-        match read_cluster_kv_local_immutable_snapshot(paths, node_id, &wal_paths) {
-            Ok(ClusterKvLocalImmutableSnapshot::Snapshot(read)) => Ok(KvLocalRead {
+        match read_cluster_kv_local_immutable_snapshot(paths, node_id, &wal_paths, deadline) {
+            Ok(ClusterKvLocalImmutableSnapshot::View(read)) => Ok(KvLocalRead {
                 revision: read.revision,
                 observed_term: read.observed_term,
                 applied_index: read.applied_index,
                 known_leader: read.known_leader,
-                value: (*read.value).clone(),
+                value: read.value.try_snapshot()?,
             }),
             Ok(ClusterKvLocalImmutableSnapshot::RetryResident) => {
                 if let Some(read) = read_resident_raft_local_snapshot(&wal_paths, node_id) {
@@ -204,10 +425,29 @@ pub fn read_cluster_kv_local_snapshot(
     result
 }
 
-pub fn read_cluster_kv_local_entry(
+pub fn read_cluster_kv_local_snapshot(
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+) -> Result<KvLocalRead<KvSnapshot>, KvError> {
+    read_cluster_kv_local_snapshot_inner(paths, node_id, None)
+}
+
+/// Deadline-aware form used when the caller already owns an end-to-end
+/// authority budget. Only joining an in-process cold restore observes this
+/// deadline; the restore owner performs the actual local I/O synchronously.
+pub fn read_cluster_kv_local_snapshot_with_deadline(
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+    deadline: Instant,
+) -> Result<KvLocalRead<KvSnapshot>, KvError> {
+    read_cluster_kv_local_snapshot_inner(paths, node_id, Some(deadline))
+}
+
+fn read_cluster_kv_local_entry_inner(
     paths: &ClusterKvPaths,
     node_id: &NodeId,
     key: &str,
+    deadline: Option<Instant>,
 ) -> Result<KvLocalRead<Option<KvEntry>>, KvError> {
     let started = Instant::now();
     let wal_paths = paths.raft_wal_paths(node_id);
@@ -215,9 +455,10 @@ pub fn read_cluster_kv_local_entry(
         Some(result) => ("resident_raft_entry", result),
         None => (
             "immutable_or_materialized_entry",
-            (|| match read_cluster_kv_local_immutable_snapshot(paths, node_id, &wal_paths) {
-                Ok(ClusterKvLocalImmutableSnapshot::Snapshot(read)) => Ok(KvLocalRead {
-                    value: read.value.get(key).cloned(),
+            (|| match read_cluster_kv_local_immutable_snapshot(paths, node_id, &wal_paths, deadline)
+            {
+                Ok(ClusterKvLocalImmutableSnapshot::View(read)) => Ok(KvLocalRead {
+                    value: read.value.store.get(key).cloned(),
                     revision: read.revision,
                     observed_term: read.observed_term,
                     applied_index: read.applied_index,
@@ -264,10 +505,79 @@ pub fn read_cluster_kv_local_entry(
     result
 }
 
-pub fn read_cluster_kv_local_prefix(
+pub fn read_cluster_kv_local_entry(
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+    key: &str,
+) -> Result<KvLocalRead<Option<KvEntry>>, KvError> {
+    read_cluster_kv_local_entry_inner(paths, node_id, key, None)
+}
+
+pub fn read_cluster_kv_local_entry_with_deadline(
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+    key: &str,
+    deadline: Instant,
+) -> Result<KvLocalRead<Option<KvEntry>>, KvError> {
+    read_cluster_kv_local_entry_inner(paths, node_id, key, Some(deadline))
+}
+
+/// Reads one exact key only when the canonical resident Raft node is idle.
+///
+/// Unlike [`read_cluster_kv_local_entry`], this readiness-oriented path never
+/// opens or replays durable state and never materializes a full snapshot. A
+/// cold or currently checked-out resident is reported as `Busy` so callers can
+/// retry after the operation that owns the resident node makes it available.
+pub fn read_cluster_kv_resident_local_entry(
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+    key: &str,
+) -> Result<KvLocalRead<Option<KvEntry>>, KvError> {
+    let started = Instant::now();
+    let wal_paths = paths.raft_wal_paths(node_id);
+    let result = read_resident_raft_local_entry(&wal_paths, node_id, key).unwrap_or_else(|| {
+        Err(KvError::Busy {
+            path: wal_paths.root.display().to_string(),
+        })
+    });
+    record_kv_read(
+        "local",
+        "resident_raft_entry_strict",
+        if result.is_ok() { "ok" } else { "busy" },
+        started,
+    );
+    result
+}
+
+/// Reads an ordered, bounded exact-key set from one canonical resident Raft
+/// view. The result cannot straddle applied revisions and never opens/replays
+/// durable state or falls back to a materialized snapshot.
+pub fn read_cluster_kv_resident_local_entries(
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+    keys: &[String],
+) -> Result<KvLocalRead<Vec<Option<KvEntry>>>, KvError> {
+    let started = Instant::now();
+    let wal_paths = paths.raft_wal_paths(node_id);
+    let result = read_resident_raft_local_entries(&wal_paths, node_id, keys).unwrap_or_else(|| {
+        Err(KvError::Busy {
+            path: wal_paths.root.display().to_string(),
+        })
+    });
+    record_kv_read(
+        "local",
+        "resident_raft_exact_set_strict",
+        if result.is_ok() { "ok" } else { "busy" },
+        started,
+    );
+    result
+}
+
+fn read_cluster_kv_local_prefix_inner(
     paths: &ClusterKvPaths,
     node_id: &NodeId,
     prefix: &str,
+    deadline: Option<Instant>,
 ) -> Result<KvLocalRead<Vec<KvEntry>>, KvError> {
     let started = Instant::now();
     let wal_paths = paths.raft_wal_paths(node_id);
@@ -275,9 +585,10 @@ pub fn read_cluster_kv_local_prefix(
         Some(result) => ("resident_raft_prefix", result),
         None => (
             "immutable_or_materialized_prefix",
-            (|| match read_cluster_kv_local_immutable_snapshot(paths, node_id, &wal_paths) {
-                Ok(ClusterKvLocalImmutableSnapshot::Snapshot(read)) => Ok(KvLocalRead {
-                    value: read.value.try_range_prefix(prefix)?,
+            (|| match read_cluster_kv_local_immutable_snapshot(paths, node_id, &wal_paths, deadline)
+            {
+                Ok(ClusterKvLocalImmutableSnapshot::View(read)) => Ok(KvLocalRead {
+                    value: read.value.store.range_prefix(prefix)?,
                     revision: read.revision,
                     observed_term: read.observed_term,
                     applied_index: read.applied_index,
@@ -325,6 +636,61 @@ pub fn read_cluster_kv_local_prefix(
     result
 }
 
+pub fn read_cluster_kv_local_prefix(
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+    prefix: &str,
+) -> Result<KvLocalRead<Vec<KvEntry>>, KvError> {
+    read_cluster_kv_local_prefix_inner(paths, node_id, prefix, None)
+}
+
+/// Reads one prefix only from the canonical resident Raft node.
+///
+/// This is the prefix counterpart to [`read_cluster_kv_resident_local_entry`].
+/// It never opens durable state and, critically, never falls back to the
+/// observational materialized snapshot. The result is only the canonical
+/// locally applied view; it is not current-term quorum authority. Observers
+/// should fail fast on `Busy`. Destructive work and routing decisions must use
+/// a ReadIndex-backed authority proof or fail closed. A successful result is
+/// complete within the standard prefix cardinality and payload bounds;
+/// oversized prefixes fail with `RangeLimit`/`RangePayloadLimit`.
+pub fn read_cluster_kv_resident_local_prefix(
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+    prefix: &str,
+) -> Result<KvLocalRead<Vec<KvEntry>>, KvError> {
+    let started = Instant::now();
+    let wal_paths = paths.raft_wal_paths(node_id);
+    let result = read_resident_raft_local_prefix_limited_by_payload_bytes(
+        &wal_paths,
+        node_id,
+        prefix,
+        CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+        CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+    )
+    .unwrap_or_else(|| {
+            Err(KvError::Busy {
+                path: wal_paths.root.display().to_string(),
+            })
+        });
+    record_kv_read(
+        "local",
+        "resident_raft_prefix_strict",
+        if result.is_ok() { "ok" } else { "busy" },
+        started,
+    );
+    result
+}
+
+pub fn read_cluster_kv_local_prefix_with_deadline(
+    paths: &ClusterKvPaths,
+    node_id: &NodeId,
+    prefix: &str,
+    deadline: Instant,
+) -> Result<KvLocalRead<Vec<KvEntry>>, KvError> {
+    read_cluster_kv_local_prefix_inner(paths, node_id, prefix, Some(deadline))
+}
+
 pub fn read_cluster_kv_local_event_history(
     paths: &ClusterKvPaths,
     node_id: &NodeId,
@@ -333,11 +699,18 @@ pub fn read_cluster_kv_local_event_history(
     let wal_paths = paths.raft_wal_paths(node_id);
     let result = match read_resident_raft_local_event_history(&wal_paths, node_id) {
         Some(result) => result,
-        None => match read_cluster_kv_local_immutable_snapshot(paths, node_id, &wal_paths) {
-            Ok(ClusterKvLocalImmutableSnapshot::Snapshot(read)) => Ok(KvLocalRead {
+        None => match read_cluster_kv_local_immutable_snapshot(paths, node_id, &wal_paths, None) {
+            Ok(ClusterKvLocalImmutableSnapshot::View(read)) => Ok(KvLocalRead {
                 value: ClusterKvEventReadView {
-                    compacted_revision: read.value.compacted_revision,
-                    events: read.value.events.clone(),
+                    compacted_revision: read.value.store.compacted_revision(),
+                    events: read
+                        .value
+                        .store
+                        .retained_events()
+                        .map(|event| {
+                            try_clone_kv_event(event, "clone immutable cluster KV event history")
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
                 },
                 revision: read.revision,
                 observed_term: read.observed_term,
@@ -606,6 +979,10 @@ impl KvSnapshot {
 
         let mut payload_bytes = 0_usize;
         for entry in &self.entries {
+            // Snapshots written by an older binary are an independent ingress
+            // path. Refuse a leased membership key here so lease expiry can
+            // never silently erase the authoritative voter configuration.
+            validate_cluster_kv_raft_config_is_unleased(&entry.key, entry.lease_id)?;
             validate_kv_value_len(entry.value.len())?;
             payload_bytes = checked_snapshot_payload_bytes(
                 payload_bytes,
@@ -859,7 +1236,6 @@ impl KvMaterializedCache {
     pub fn exists(&self) -> bool {
         self.path.exists()
     }
-
     pub fn read_snapshot_arc(&self) -> Result<Arc<KvSnapshot>, KvError> {
         let identity = file_identity(&self.path);
         if let Some(identity) = identity
@@ -898,6 +1274,13 @@ impl KvMaterializedCache {
             cache_store_snapshot(&self.path, identity, snapshot.clone());
         }
         Ok(Some(snapshot))
+    }
+
+    pub fn read_snapshot_arc_if_hot(&self) -> Result<Option<Arc<KvSnapshot>>, KvError> {
+        let Some(Some(identity)) = optional_file_identity_for_read(&self.path)? else {
+            return Ok(None);
+        };
+        Ok(cache_lookup_snapshot(&self.path, identity))
     }
 
     /// Reads the file while the materialized-cache write lock is held. The full
@@ -975,53 +1358,72 @@ impl KvMaterializedCache {
                 return Ok(Arc::new(snapshot));
             }
             if let Some(identity) = identity
-                && let Some(snapshot) = cache_lookup_raft_view(&paths, &node_id, identity)
+                && let Some(view) = cache_lookup_raft_view(&paths, &node_id, identity)
             {
+                let snapshot = Arc::new(view.try_snapshot()?);
+                if refresh_materialized {
+                    self.write_raft_snapshot_if_changed(&snapshot)?;
+                }
                 record_kv_read("local", "raft_view_cache", "ok", started);
                 return Ok(snapshot);
             }
-            let node = match DurableRaftKvNode::try_open_with_materialized_cache(
-                node_id.clone(),
-                paths,
-                self,
-            ) {
-                Ok(node) => node,
-                Err(error @ KvError::Busy { .. }) => {
-                    let fallback = match self.read_snapshot_arc_if_present() {
-                        Ok(Some(snapshot)) => Ok(snapshot),
-                        Ok(None) => Err(error),
-                        Err(error) => Err(error),
-                    };
-                    record_kv_read(
-                        "local",
-                        "materialized_busy_fallback",
-                        if fallback.is_ok() { "ok" } else { "error" },
-                        started,
-                    );
-                    return fallback;
-                }
-                Err(error) => {
-                    record_kv_read("local", "durable_raft_open", "error", started);
-                    return Err(error);
-                }
-            };
-            let raft_paths = node.paths.clone();
-            let snapshot = match node.try_into_snapshot() {
-                Ok(snapshot) => snapshot.canonicalized(),
-                Err(error) => {
-                    record_kv_read("local", "durable_raft_open", "error", started);
-                    return Err(error);
-                }
-            };
-            if refresh_materialized
-                && let Err(error) = self.write_raft_snapshot_if_changed(&snapshot)
+            // The non-refresh contract is explicitly observational and already
+            // falls back to the materialized view when a resident writer owns
+            // the flock. If the identity-fenced resident slot proves that exact
+            // condition, avoid spending the full local-read lock window only to
+            // reach the same fallback. Refresh callers keep the existing wait
+            // and durable-open attempt because they may need the current view.
+            if !refresh_materialized
+                && resident_raft_writer_is_checked_out(&paths, &node_id)
+                && let Ok(Some(snapshot)) = self.read_snapshot_arc_if_present()
             {
-                record_kv_read("local", "durable_raft_open", "error", started);
-                return Err(error);
+                record_kv_read(
+                    "local",
+                    "materialized_resident_busy_fallback",
+                    "ok",
+                    started,
+                );
+                return Ok(snapshot);
             }
-            let snapshot = Arc::new(snapshot);
-            if let Some(identity) = raft_view_identity(&raft_paths) {
-                cache_store_raft_view(&raft_paths, node_id.clone(), identity, snapshot.clone());
+            let view =
+                match read_cluster_kv_local_immutable_view_from_cache(self, &node_id, &paths, None)
+                {
+                    Ok(ClusterKvLocalImmutableSnapshot::View(read)) => read.value,
+                    Ok(ClusterKvLocalImmutableSnapshot::RetryResident) => {
+                        if let Some(read) = read_resident_raft_local_snapshot(&paths, &node_id) {
+                            let snapshot = Arc::new(read?.value.canonicalized());
+                            if refresh_materialized {
+                                self.write_raft_snapshot_if_changed(&snapshot)?;
+                            }
+                            return Ok(snapshot);
+                        }
+                        let error = KvError::Busy {
+                            path: paths.root.display().to_string(),
+                        };
+                        let fallback = self.read_snapshot_arc_if_present()?.ok_or(error);
+                        record_kv_read(
+                            "local",
+                            "materialized_busy_fallback",
+                            if fallback.is_ok() { "ok" } else { "error" },
+                            started,
+                        );
+                        return fallback;
+                    }
+                    Err(error @ KvError::Busy { .. }) => {
+                        let fallback = self.read_snapshot_arc_if_present()?.ok_or(error);
+                        record_kv_read(
+                            "local",
+                            "materialized_busy_fallback",
+                            if fallback.is_ok() { "ok" } else { "error" },
+                            started,
+                        );
+                        return fallback;
+                    }
+                    Err(error) => return Err(error),
+                };
+            let snapshot = Arc::new(view.try_snapshot()?);
+            if refresh_materialized {
+                self.write_raft_snapshot_if_changed(&snapshot)?;
             }
             record_kv_read("local", "durable_raft_open", "ok", started);
             return Ok(snapshot);
@@ -1318,10 +1720,29 @@ impl KvLocalCache {
         if let Some(read) = read_resident_raft_local_entry(&wal_paths, &node_id, key) {
             return read.map(|read| read.value);
         }
-        let snapshot = self
-            .materialized
-            .read_snapshot_with_raft_view(node_id, wal_paths)?;
-        Ok(snapshot.get(key).cloned())
+        if !raft_view_identity_for_read(&wal_paths)?.0 {
+            return Ok(self.materialized.read_snapshot_arc()?.get(key).cloned());
+        }
+        match read_cluster_kv_local_immutable_view_from_cache(
+            &self.materialized,
+            &node_id,
+            &wal_paths,
+            None,
+        ) {
+            Ok(ClusterKvLocalImmutableSnapshot::View(read)) => {
+                Ok(read.value.store.get(key).cloned())
+            }
+            Ok(ClusterKvLocalImmutableSnapshot::RetryResident) => {
+                if let Some(read) = read_resident_raft_local_entry(&wal_paths, &node_id, key) {
+                    return read.map(|read| read.value);
+                }
+                Ok(self.materialized.read_snapshot_arc()?.get(key).cloned())
+            }
+            Err(KvError::Busy { .. }) => {
+                Ok(self.materialized.read_snapshot_arc()?.get(key).cloned())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn current_get_serde<T: DeserializeOwned>(
@@ -1343,10 +1764,35 @@ impl KvLocalCache {
         if let Some(read) = read_resident_raft_local_prefix(&wal_paths, &node_id, prefix) {
             return read.map(|read| read.value);
         }
-        let snapshot = self
-            .materialized
-            .read_snapshot_with_raft_view(node_id, wal_paths)?;
-        snapshot.try_range_prefix(prefix)
+        if !raft_view_identity_for_read(&wal_paths)?.0 {
+            return self
+                .materialized
+                .read_snapshot_arc()?
+                .try_range_prefix(prefix);
+        }
+        match read_cluster_kv_local_immutable_view_from_cache(
+            &self.materialized,
+            &node_id,
+            &wal_paths,
+            None,
+        ) {
+            Ok(ClusterKvLocalImmutableSnapshot::View(read)) => {
+                read.value.store.range_prefix(prefix)
+            }
+            Ok(ClusterKvLocalImmutableSnapshot::RetryResident) => {
+                if let Some(read) = read_resident_raft_local_prefix(&wal_paths, &node_id, prefix) {
+                    return read.map(|read| read.value);
+                }
+                self.materialized
+                    .read_snapshot_arc()?
+                    .try_range_prefix(prefix)
+            }
+            Err(KvError::Busy { .. }) => self
+                .materialized
+                .read_snapshot_arc()?
+                .try_range_prefix(prefix),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn current_range_prefix_limited(
@@ -1365,10 +1811,41 @@ impl KvLocalCache {
         ) {
             return read.map(|read| read.value);
         }
-        let snapshot = self
-            .materialized
-            .read_snapshot_with_raft_view(node_id, wal_paths)?;
-        snapshot.range_prefix_limited(prefix, max_entries)
+        if !raft_view_identity_for_read(&wal_paths)?.0 {
+            return self
+                .materialized
+                .read_snapshot_arc()?
+                .range_prefix_limited(prefix, max_entries);
+        }
+        match read_cluster_kv_local_immutable_view_from_cache(
+            &self.materialized,
+            &node_id,
+            &wal_paths,
+            None,
+        ) {
+            Ok(ClusterKvLocalImmutableSnapshot::View(read)) => {
+                read.value.store.range_prefix_limited(prefix, max_entries)
+            }
+            Ok(ClusterKvLocalImmutableSnapshot::RetryResident) => {
+                if let Some(read) = read_resident_raft_local_prefix_limited_by_payload_bytes(
+                    &wal_paths,
+                    &node_id,
+                    prefix,
+                    max_entries,
+                    usize::MAX,
+                ) {
+                    return read.map(|read| read.value);
+                }
+                self.materialized
+                    .read_snapshot_arc()?
+                    .range_prefix_limited(prefix, max_entries)
+            }
+            Err(KvError::Busy { .. }) => self
+                .materialized
+                .read_snapshot_arc()?
+                .range_prefix_limited(prefix, max_entries),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn current_range_prefix_limited_by_payload_bytes(
@@ -1388,10 +1865,42 @@ impl KvLocalCache {
         ) {
             return read.map(|read| read.value);
         }
-        let snapshot = self
-            .materialized
-            .read_snapshot_with_raft_view(node_id, wal_paths)?;
-        snapshot.range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)
+        if !raft_view_identity_for_read(&wal_paths)?.0 {
+            return self
+                .materialized
+                .read_snapshot_arc()?
+                .range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes);
+        }
+        match read_cluster_kv_local_immutable_view_from_cache(
+            &self.materialized,
+            &node_id,
+            &wal_paths,
+            None,
+        ) {
+            Ok(ClusterKvLocalImmutableSnapshot::View(read)) => read
+                .value
+                .store
+                .range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes),
+            Ok(ClusterKvLocalImmutableSnapshot::RetryResident) => {
+                if let Some(read) = read_resident_raft_local_prefix_limited_by_payload_bytes(
+                    &wal_paths,
+                    &node_id,
+                    prefix,
+                    max_entries,
+                    max_payload_bytes,
+                ) {
+                    return read.map(|read| read.value);
+                }
+                self.materialized
+                    .read_snapshot_arc()?
+                    .range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)
+            }
+            Err(KvError::Busy { .. }) => self
+                .materialized
+                .read_snapshot_arc()?
+                .range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn current_range_prefix_serde<T: DeserializeOwned>(
@@ -1468,6 +1977,10 @@ impl KvLocalCache {
 
     pub fn cached_snapshot_arc_if_present(&self) -> Result<Option<Arc<KvSnapshot>>, KvError> {
         self.materialized.read_snapshot_arc_if_present()
+    }
+
+    pub fn cached_snapshot_arc_if_hot(&self) -> Result<Option<Arc<KvSnapshot>>, KvError> {
+        self.materialized.read_snapshot_arc_if_hot()
     }
 
     pub fn write_snapshot(&self, snapshot: &KvSnapshot) -> Result<(), KvError> {

@@ -1,4 +1,6 @@
-use crate::control_plane_options::DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT;
+use crate::control_plane_options::{
+    DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT, main_daemon_cluster_rpc_options,
+};
 #[allow(unused_imports)]
 use crate::kv_local_store::kv_err;
 #[cfg(any(test, feature = "test-support"))]
@@ -44,8 +46,11 @@ impl MembershipForwardDeadline {
     }
 
     fn rpc_options_at(&self, now: TokioInstant) -> Option<ClusterObjectRpcOptions> {
-        self.remaining_at(now)
-            .map(|remaining| ClusterObjectRpcOptions::default().with_overall_timeout(remaining))
+        self.remaining_at(now).map(|remaining| {
+            main_daemon_cluster_rpc_options(
+                ClusterObjectRpcOptions::default().with_overall_timeout(remaining),
+            )
+        })
     }
 
     fn timeout_error(
@@ -551,11 +556,15 @@ mod tests {
 
         assert_eq!(
             deadline.rpc_options_at(started_at),
-            Some(ClusterObjectRpcOptions::default().with_overall_timeout(Duration::from_secs(15)))
+            Some(main_daemon_cluster_rpc_options(
+                ClusterObjectRpcOptions::default().with_overall_timeout(Duration::from_secs(15))
+            ))
         );
         assert_eq!(
             deadline.rpc_options_at(started_at + Duration::from_secs(6)),
-            Some(ClusterObjectRpcOptions::default().with_overall_timeout(Duration::from_secs(9)))
+            Some(main_daemon_cluster_rpc_options(
+                ClusterObjectRpcOptions::default().with_overall_timeout(Duration::from_secs(9))
+            ))
         );
         assert_eq!(
             deadline.rpc_options_at(started_at + timeout),

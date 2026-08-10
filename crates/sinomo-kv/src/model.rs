@@ -1224,6 +1224,16 @@ pub enum KvError {
     RequestIdConflict { request_id: KvRequestId },
     #[error("KV request id {request_id} expired from idempotency retention")]
     RequestExpired { request_id: KvRequestId },
+    #[error(
+        "KV request {request_id} is durably committed at term {term}, log index {log_index}, revision {revision:?}, but its complete read view is unavailable: {detail}"
+    )]
+    CommittedViewUnavailable {
+        request_id: KvRequestId,
+        term: u64,
+        log_index: u64,
+        revision: KvRevision,
+        detail: String,
+    },
     #[error("cluster KV authority unavailable: {detail}")]
     AuthorityUnavailable { detail: String },
 }

@@ -63,7 +63,7 @@ pub use control_plane_options::{
     DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_MAX_ATTEMPTS,
     DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
     DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_CAMPAIGN_JITTER_MAX,
-    DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
+    DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT, main_daemon_cluster_rpc_options,
 };
 pub use control_routes::{
     CLUSTER_CONTROL_ADMIN_CAPABILITY, CLUSTER_CONTROL_INIT_ROUTE, CLUSTER_CONTROL_INVITE_ROUTE,
@@ -169,6 +169,7 @@ pub use kv_txn_quorum::{
     handle_cluster_kv_txn_request_async_with_host,
     handle_cluster_kv_txn_request_compact_async_with_host,
     handle_forwarded_cluster_kv_txn_rpc_request_compact_async_with_host,
+    read_cluster_kv_authoritative_entries_async_with_host,
     read_cluster_kv_authoritative_entry_async_with_host,
     read_cluster_kv_authoritative_range_prefix_async_with_host,
     read_cluster_kv_authoritative_snapshot_async_with_host,
@@ -194,6 +195,7 @@ pub use member_mutation::{
     ClusterMemberRemoval, ClusterNodeNameUpdate, ClusterNodeRoleUpdate,
     ClusterRaftConfigReconciliationReport, ClusterStateAuthorityUpdate,
     MAX_CLUSTER_RAFT_CONFIG_RECONCILIATIONS_PER_PASS, add_cluster_raft_learner_async_with_host,
+    bootstrap_single_voter_cluster_state_to_local_kv,
     cleanup_legacy_shadow_daemon_members_with_host, cluster_state_sync_txn,
     reconcile_cluster_raft_config_changes_bounded_with_host,
     reconcile_cluster_raft_config_changes_with_host, remove_cluster_members_with_host,
@@ -458,10 +460,7 @@ pub use raft_replication::{
     replicate_cluster_raft_to_endpoint_with_local_host,
 };
 #[cfg(any(test, feature = "test-support"))]
-pub use raft_rpc::{
-    handle_cluster_raft_append_request, handle_cluster_raft_rpc_request,
-    handle_cluster_raft_vote_request,
-};
+pub use raft_rpc::{handle_cluster_raft_append_request, handle_cluster_raft_rpc_request};
 #[cfg(any(test, feature = "test-support"))]
 pub use status_publish::{
     cluster_network_info_publish_matches_with_host, cluster_node_status_publish_matches_with_host,

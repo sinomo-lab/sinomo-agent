@@ -41,9 +41,8 @@ use sinomo_cluster::{
     forward_cluster_membership_rpc_to_state_authority_with_host,
     handle_cluster_invite_publish_request_with_host, handle_cluster_kv_txn_request_with_host,
     handle_cluster_member_publish_request_with_host, handle_cluster_raft_append_request,
-    handle_cluster_raft_rpc_request, handle_cluster_raft_vote_request,
-    locked_set_cluster_raft_leader, open_cluster_raft_kv_node, open_cluster_raft_kv_node_async,
-    prepare_cluster_join_registration_response,
+    handle_cluster_raft_rpc_request, locked_set_cluster_raft_leader, open_cluster_raft_kv_node,
+    open_cluster_raft_kv_node_async, prepare_cluster_join_registration_response,
     prepare_cluster_join_registration_state_with_local_daemon_members,
     read_cluster_endpoints_from_kv, read_cluster_kv_current_snapshot,
     read_cluster_kv_prefix_entries, read_cluster_kv_prefix_entries_limited,
@@ -7577,6 +7576,71 @@ fn cluster_raft_handler_test_state(
     (state, local_node_id, peer_node_id)
 }
 
+fn seed_marked_read_index_receiver(
+    paths: &ClusterPaths,
+    cluster_name: &str,
+    local_name: &str,
+    peer_name: &str,
+) -> (
+    ClusterBootstrapState,
+    NodeId,
+    NodeId,
+    ClusterRaftAppendRequest,
+    ClusterAuthenticatedPeer,
+    sinomo_kv::ResidentRaftNodeRegistryPin,
+) {
+    let (state, local_node_id, peer_node_id) =
+        cluster_raft_handler_test_state(cluster_name, local_name, peer_name);
+    write_cluster_state(paths, &state).expect("write receiver state");
+    let mut leader_state = state.clone();
+    leader_state.local_node_id = peer_node_id.clone();
+    let authenticated_peer = ClusterAuthenticatedPeer {
+        node_id: peer_node_id.to_string(),
+        public_key: "peer-public-key".to_string(),
+    };
+    let resident_pin = sinomo_kv::pin_resident_raft_node_registry_for_test(
+        &paths.kv_paths().raft_wal_paths(&local_node_id),
+    )
+    .expect("pin receiver resident registry slot");
+    let heartbeat = ClusterRaftAppendRequest {
+        state: leader_state.clone(),
+        snapshot: None,
+        read_index_probe: false,
+        append: RaftAppendEntriesRequest {
+            term: 1,
+            leader_id: peer_node_id.clone(),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 0,
+        },
+    };
+    let response = handle_cluster_raft_append_request(paths, heartbeat, &authenticated_peer)
+        .expect("seed follower resident state");
+    assert!(response.accepted);
+    let probe = ClusterRaftAppendRequest {
+        state: leader_state,
+        snapshot: None,
+        read_index_probe: true,
+        append: RaftAppendEntriesRequest {
+            term: 1,
+            leader_id: peer_node_id.clone(),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 0,
+        },
+    };
+    (
+        state,
+        local_node_id,
+        peer_node_id,
+        probe,
+        authenticated_peer,
+        resident_pin,
+    )
+}
+
 #[test]
 fn cluster_raft_append_handler_applies_authorized_heartbeat() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-raft-append-handler-authorized");
@@ -7597,6 +7661,7 @@ fn cluster_raft_append_handler_applies_authorized_heartbeat() {
         ClusterRaftAppendRequest {
             state: leader_state,
             snapshot: None,
+            read_index_probe: false,
             append: RaftAppendEntriesRequest {
                 term: 1,
                 leader_id: leader_node_id.clone(),
@@ -7615,6 +7680,512 @@ fn cluster_raft_append_handler_applies_authorized_heartbeat() {
 
     assert!(response.accepted);
     assert!(response.append.success);
+}
+
+#[test]
+fn marked_read_index_probe_bypasses_blocking_pool_and_durable_queues() {
+    let root = sinomo_testdir::TestDir::new("sinomo-raft-read-index-fast-receiver");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    paths.ensure().expect("cluster paths");
+    let (_state, local_node_id, _peer_node_id, probe, peer, resident_pin) =
+        seed_marked_read_index_receiver(
+            &paths,
+            "cluster_read_index_fast_receiver",
+            "node_read_index_fast_receiver_local",
+            "node_read_index_fast_receiver_peer",
+        );
+    let operation_guard = sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths())
+        .expect("hold durable operation queue");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (blocking_started_tx, blocking_started_rx) = std::sync::mpsc::channel();
+    let (release_blocking_tx, release_blocking_rx) = std::sync::mpsc::channel();
+    let blocker = runtime.spawn_blocking(move || {
+        blocking_started_tx.send(()).expect("report blocker");
+        release_blocking_rx.recv().expect("release blocker");
+    });
+    blocking_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("blocking worker saturated");
+
+    let started = Instant::now();
+    let response = runtime
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(150),
+                handle_cluster_raft_append_request_async(
+                    runtime.handle(),
+                    &paths,
+                    probe.clone(),
+                    &peer,
+                ),
+            )
+            .await
+        })
+        .expect("hot marked probe must not wait for the blocking pool")
+        .expect("hot marked probe response");
+    assert!(response.accepted);
+    assert!(response.append.success);
+    assert!(
+        started.elapsed() < Duration::from_millis(150),
+        "resident ReadIndex receiver took {:?}",
+        started.elapsed()
+    );
+
+    assert!(
+        sinomo_kv::evict_resident_raft_node_for_test(
+            &paths.kv_paths().raft_wal_paths(&local_node_id)
+        ),
+        "seeded resident node must be evicted for the cold-probe regression"
+    );
+    drop(resident_pin);
+    let cold_started = Instant::now();
+    let cold = runtime
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(150),
+                handle_cluster_raft_append_request_async(
+                    runtime.handle(),
+                    &paths,
+                    probe.clone(),
+                    &peer,
+                ),
+            )
+            .await
+        })
+        .expect("cold same-term marked probe must reject without durable admission")
+        .expect("cold same-term marked probe response");
+    assert!(!cold.accepted);
+    assert!(!cold.append.success);
+    assert!(cold.detail.contains("resident state is unavailable"));
+    assert!(
+        cold_started.elapsed() < Duration::from_millis(150),
+        "cold same-term ReadIndex receiver took {:?}",
+        cold_started.elapsed()
+    );
+    assert_eq!(
+        sinomo_kv::cluster_kv_raft_operation_queue_depth_for_test(&paths.kv_paths()),
+        0,
+        "marked probe must not enter the durable operation queue"
+    );
+    release_blocking_tx.send(()).expect("release blocker");
+    runtime.block_on(blocker).expect("join blocker");
+    drop(operation_guard);
+
+    let resident_pin = sinomo_kv::pin_resident_raft_node_registry_for_test(
+        &paths.kv_paths().raft_wal_paths(&local_node_id),
+    )
+    .expect("repin receiver resident registry slot after explicit eviction");
+    drop(
+        open_cluster_raft_kv_node(&paths, &local_node_id)
+            .expect("restore resident node after cold-probe rejection"),
+    );
+
+    let checked_out = open_cluster_raft_kv_node(&paths, &local_node_id)
+        .expect("hold the resident node checked out");
+    let response = runtime
+        .block_on(handle_cluster_raft_append_request_async(
+            runtime.handle(),
+            &paths,
+            probe.clone(),
+            &peer,
+        ))
+        .expect("busy marked probe returns a healthy RPC envelope");
+    assert!(!response.accepted);
+    assert!(!response.append.success);
+    assert_eq!(response.append.match_index, 0);
+    assert!(response.detail.contains("busy"));
+    assert_eq!(
+        sinomo_kv::cluster_kv_raft_operation_queue_depth_for_test(&paths.kv_paths()),
+        0
+    );
+    drop(checked_out);
+
+    let retry = runtime
+        .block_on(handle_cluster_raft_append_request_async(
+            runtime.handle(),
+            &paths,
+            probe,
+            &peer,
+        ))
+        .expect("retry after resident release");
+    assert!(retry.accepted);
+    assert!(retry.append.success);
+    drop(resident_pin);
+}
+
+#[test]
+fn cancelled_queued_marked_probe_persists_term_without_late_request_apply() {
+    let root = sinomo_testdir::TestDir::new("sinomo-raft-read-index-queued-cancel");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    paths.ensure().expect("cluster paths");
+    let (_state, local_node_id, _peer_node_id, mut probe, peer, _resident_pin) =
+        seed_marked_read_index_receiver(
+            &paths,
+            "cluster_read_index_queued_cancel",
+            "node_read_index_queued_cancel_local",
+            "node_read_index_queued_cancel_peer",
+        );
+    // A higher term deliberately requires the durable fallback even if the
+    // fixture's resident slot remains hot.
+    probe.append.term = 2;
+    let operation_guard = sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths())
+        .expect("hold durable operation queue");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (blocking_started_tx, blocking_started_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_blocking_tx, release_blocking_rx) = std::sync::mpsc::sync_channel(0);
+    let blocker = runtime.spawn_blocking(move || {
+        blocking_started_tx.send(()).expect("report blocker");
+        release_blocking_rx.recv().expect("release blocker");
+    });
+    blocking_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("blocking worker saturated");
+
+    let elapsed = runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            handle_cluster_raft_append_request_async(
+                runtime.handle(),
+                &paths,
+                probe.clone(),
+                &peer,
+            ),
+        )
+        .await
+    });
+    assert!(elapsed.is_err(), "durable fallback must remain queued");
+    assert_eq!(
+        paths
+            .kv_paths()
+            .raft_store()
+            .pending_higher_term(&local_node_id)
+            .expect("published higher-term floor"),
+        Some(2),
+        "an authenticated higher term must fence authority before blocking-pool admission"
+    );
+    release_blocking_tx.send(()).expect("release blocker");
+    runtime.block_on(blocker).expect("join blocker");
+    std::thread::sleep(Duration::from_millis(30));
+    assert!(
+        sinomo_kv::cluster_kv_raft_operation_queue_depth_for_test(&paths.kv_paths()) <= 1,
+        "the mandatory term observer may be the only operation queued; the cancelled request must not wake later"
+    );
+    drop(operation_guard);
+
+    let wal_paths = cluster_raft_wal_paths(&paths, &local_node_id);
+    let persistence_deadline = Instant::now() + Duration::from_secs(1);
+    let hard_state = loop {
+        let hard_state = wal_paths
+            .read_persisted_hard_state()
+            .expect("read independently persisted higher term");
+        if hard_state.current_term >= 2 {
+            break hard_state;
+        }
+        assert!(
+            Instant::now() < persistence_deadline,
+            "authenticated higher term was not persisted after local admission cleared"
+        );
+        std::thread::yield_now();
+    };
+    assert_eq!(hard_state.current_term, 2);
+    assert_eq!(
+        hard_state.leader_id, None,
+        "caller cancellation must prevent the queued AppendEntries request itself from applying"
+    );
+    assert_eq!(
+        paths
+            .kv_paths()
+            .raft_store()
+            .pending_higher_term(&local_node_id)
+            .expect("cleared higher-term floor"),
+        None
+    );
+    let response = runtime
+        .block_on(handle_cluster_raft_append_request_async(
+            runtime.handle(),
+            &paths,
+            probe,
+            &peer,
+        ))
+        .expect("fresh higher-term fallback");
+    assert_eq!(response.append.term, 2);
+}
+
+#[test]
+fn idle_marked_read_index_probe_performs_no_durable_writes() {
+    let root = sinomo_testdir::TestDir::new("sinomo-raft-read-index-no-writes");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    paths.ensure().expect("cluster paths");
+    let (_state, local_node_id, _peer_node_id, probe, peer, _resident_pin) =
+        seed_marked_read_index_receiver(
+            &paths,
+            "cluster_read_index_no_writes",
+            "node_read_index_no_writes_local",
+            "node_read_index_no_writes_peer",
+        );
+    let wal_paths = cluster_raft_wal_paths(&paths, &local_node_id);
+    let durable_paths = [
+        wal_paths.hard_state.clone(),
+        wal_paths.wal.clone(),
+        wal_paths.snapshot.clone(),
+        paths.kv_paths().snapshot.clone(),
+    ];
+    let before = durable_paths
+        .iter()
+        .map(|path| std::fs::read(path).ok())
+        .collect::<Vec<_>>();
+
+    let response = handle_cluster_raft_append_request(&paths, probe, &peer)
+        .expect("idle marked ReadIndex probe");
+    assert!(response.accepted);
+    let after = durable_paths
+        .iter()
+        .map(|path| std::fs::read(path).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        after, before,
+        "marked probe must not touch WAL, hard state, Raft snapshot, or materialized state"
+    );
+}
+
+#[test]
+fn higher_term_marked_probe_uses_durable_append_path() {
+    let root = sinomo_testdir::TestDir::new("sinomo-raft-read-index-higher-term");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    paths.ensure().expect("cluster paths");
+    let (_state, local_node_id, _peer_node_id, mut probe, peer, _resident_pin) =
+        seed_marked_read_index_receiver(
+            &paths,
+            "cluster_read_index_higher_term",
+            "node_read_index_higher_term_local",
+            "node_read_index_higher_term_peer",
+        );
+    probe.append.term = 2;
+    let operation_guard = sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths())
+        .expect("hold durable operation queue");
+    let request_paths = paths.clone();
+    let (response_tx, response_rx) = std::sync::mpsc::channel();
+    let request_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(handle_cluster_raft_append_request_async(
+            runtime.handle(),
+            &request_paths,
+            probe,
+            &peer,
+        ));
+        response_tx.send(result).expect("send response");
+    });
+    let queue_deadline = Instant::now() + Duration::from_secs(1);
+    while sinomo_kv::cluster_kv_raft_operation_queue_depth_for_test(&paths.kv_paths()) != 1 {
+        assert!(
+            Instant::now() < queue_deadline,
+            "higher-term marked probe never entered durable handling"
+        );
+        std::thread::yield_now();
+    }
+    assert!(matches!(
+        response_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    drop(operation_guard);
+    let response = response_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("durable response")
+        .expect("higher-term append");
+    request_thread.join().expect("join request");
+    assert!(response.accepted);
+    assert_eq!(response.append.term, 2);
+    let node = open_cluster_raft_kv_node(&paths, &local_node_id).expect("inspect hard state");
+    assert_eq!(node.hard_state().current_term, 2);
+}
+
+#[test]
+fn marked_probe_authorization_uses_exact_committed_raft_config() {
+    let root = sinomo_testdir::TestDir::new("sinomo-raft-read-index-exact-config");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    paths.ensure().expect("cluster paths");
+    let (state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_read_index_exact_config",
+        "node_read_index_exact_config_local",
+        "node_read_index_exact_config_peer",
+    );
+    write_cluster_state(&paths, &state).expect("write bootstrap state");
+    let config = ClusterKvRaftConfigRecord {
+        cluster_id: state.cluster_id.clone(),
+        term: 1,
+        kv_revision: 1,
+        voters: vec![local_node_id.clone()],
+        learners: Vec::new(),
+        non_voting: Vec::new(),
+        updated_at: OffsetDateTime::now_utc(),
+    };
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(sinomo_kv::cluster_kv_raft_config_key(), &config, None)
+        .expect("encode committed config");
+    {
+        let mut node = open_cluster_raft_kv_node(&paths, &local_node_id).expect("open follower");
+        node.apply_append_entries_with_optional_snapshot(
+            Some(RaftSnapshot {
+                last_included_index: 1,
+                last_included_term: 1,
+                kv: store.snapshot().expect("config snapshot"),
+            }),
+            RaftAppendEntriesRequest {
+                term: 1,
+                leader_id: peer_node_id.clone(),
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: Vec::new(),
+                leader_commit: 1,
+            },
+        )
+        .expect("install exact config with retained peer leader");
+    }
+    let mut peer_state = state.clone();
+    peer_state.local_node_id = peer_node_id.clone();
+    let response = handle_cluster_raft_append_request(
+        &paths,
+        ClusterRaftAppendRequest {
+            state: peer_state,
+            snapshot: None,
+            read_index_probe: true,
+            append: RaftAppendEntriesRequest {
+                term: 1,
+                leader_id: peer_node_id.clone(),
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: Vec::new(),
+                leader_commit: 1,
+            },
+        },
+        &ClusterAuthenticatedPeer {
+            node_id: peer_node_id.to_string(),
+            public_key: "peer-public-key".to_string(),
+        },
+    )
+    .expect("marked probe rejection");
+    assert!(!response.accepted);
+    assert!(response.detail.contains("unauthorized"));
+    assert!(
+        state
+            .members
+            .iter()
+            .any(|member| member.node_id == peer_node_id),
+        "fixture bootstrap state must still contain the stale peer voter"
+    );
+}
+
+#[test]
+fn malformed_marked_read_index_probe_is_rejected_before_durable_handling() {
+    let root = sinomo_testdir::TestDir::new("sinomo-raft-read-index-malformed");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    paths.ensure().expect("cluster paths");
+    let (_state, _local_node_id, _peer_node_id, probe, peer, _resident_pin) =
+        seed_marked_read_index_receiver(
+            &paths,
+            "cluster_read_index_malformed",
+            "node_read_index_malformed_local",
+            "node_read_index_malformed_peer",
+        );
+    let mut with_snapshot = probe.clone();
+    with_snapshot.snapshot = Some(RaftSnapshot {
+        last_included_index: 0,
+        last_included_term: 0,
+        kv: InProcessKvStore::new().snapshot().expect("empty snapshot"),
+    });
+    assert!(matches!(
+        handle_cluster_raft_append_request(&paths, with_snapshot, &peer),
+        Err(NetworkError::InvalidClusterCommand { .. })
+    ));
+
+    let mut with_entry = probe.clone();
+    with_entry.append.entries.push(sinomo_kv::KvLogEntry {
+        index: 1,
+        term: 1,
+        request_id: sinomo_kv::KvRequestId::generate(),
+        command: KvCommand::Barrier,
+        revision: KvRevision::ZERO,
+    });
+    assert!(matches!(
+        handle_cluster_raft_append_request(&paths, with_entry, &peer),
+        Err(NetworkError::InvalidClusterCommand { .. })
+    ));
+
+    let mut with_unanchored_commit = probe;
+    with_unanchored_commit.append.leader_commit = 1;
+    assert!(matches!(
+        handle_cluster_raft_append_request(&paths, with_unanchored_commit, &peer),
+        Err(NetworkError::InvalidClusterCommand { .. })
+    ));
+    assert_eq!(
+        sinomo_kv::cluster_kv_raft_operation_queue_depth_for_test(&paths.kv_paths()),
+        0
+    );
+}
+
+#[test]
+fn ordinary_empty_heartbeat_retains_durable_operation_ordering() {
+    let root = sinomo_testdir::TestDir::new("sinomo-raft-normal-heartbeat-durable");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    paths.ensure().expect("cluster paths");
+    let (_state, _local_node_id, _peer_node_id, mut heartbeat, peer, _resident_pin) =
+        seed_marked_read_index_receiver(
+            &paths,
+            "cluster_normal_heartbeat_durable",
+            "node_normal_heartbeat_durable_local",
+            "node_normal_heartbeat_durable_peer",
+        );
+    heartbeat.read_index_probe = false;
+    let operation_guard = sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths())
+        .expect("hold operation queue");
+    let request_paths = paths.clone();
+    let (response_tx, response_rx) = std::sync::mpsc::channel();
+    let request_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(handle_cluster_raft_append_request_async(
+            runtime.handle(),
+            &request_paths,
+            heartbeat,
+            &peer,
+        ));
+        response_tx.send(result).expect("send response");
+    });
+    let queue_deadline = Instant::now() + Duration::from_secs(1);
+    while sinomo_kv::cluster_kv_raft_operation_queue_depth_for_test(&paths.kv_paths()) != 1 {
+        assert!(
+            Instant::now() < queue_deadline,
+            "ordinary heartbeat bypassed durable ordering"
+        );
+        std::thread::yield_now();
+    }
+    assert!(matches!(
+        response_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    drop(operation_guard);
+    let response = response_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("heartbeat response")
+        .expect("ordinary heartbeat");
+    request_thread.join().expect("join request");
+    assert!(response.accepted);
 }
 
 #[test]
@@ -7648,6 +8219,7 @@ fn cluster_raft_append_handler_rejects_unauthorized_leader() {
                     .snapshot()
                     .expect("unauthorized snapshot"),
             }),
+            read_index_probe: false,
             append: RaftAppendEntriesRequest {
                 term: 1,
                 leader_id: leader_node_id.clone(),
@@ -7698,6 +8270,7 @@ fn cluster_raft_rpc_dispatch_decodes_and_encodes_append_and_vote() {
         sinomo_kv::cluster_raft_append_rpc_payload(&ClusterRaftAppendRequest {
             state: peer_state.clone(),
             snapshot: None,
+            read_index_probe: false,
             append: RaftAppendEntriesRequest {
                 term: 1,
                 leader_id: peer_node_id.clone(),
@@ -7768,26 +8341,200 @@ fn cluster_raft_vote_handler_grants_authorized_candidate() {
     let mut candidate_state = state.clone();
     candidate_state.local_node_id = candidate_node_id.clone();
 
-    let response = handle_cluster_raft_vote_request(
-        &paths,
-        ClusterRaftVoteRequest {
-            state: candidate_state,
-            vote: RaftRequestVoteRequest {
-                term: 1,
-                candidate_id: candidate_node_id.clone(),
-                last_log_index: 0,
-                last_log_term: 0,
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let response = runtime
+        .block_on(handle_cluster_raft_vote_request_async(
+            runtime.handle(),
+            &paths,
+            ClusterRaftVoteRequest {
+                state: candidate_state,
+                vote: RaftRequestVoteRequest {
+                    term: 1,
+                    candidate_id: candidate_node_id.clone(),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                },
             },
-        },
-        &ClusterAuthenticatedPeer {
-            node_id: candidate_node_id.to_string(),
-            public_key: "peer-public-key".to_string(),
-        },
-    )
-    .expect("raft vote");
+            &ClusterAuthenticatedPeer {
+                node_id: candidate_node_id.to_string(),
+                public_key: "peer-public-key".to_string(),
+            },
+        ))
+        .expect("raft vote");
 
     assert!(response.accepted);
     assert!(response.vote.vote_granted);
+}
+
+#[test]
+fn cluster_raft_vote_handler_rejects_stale_local_voter_from_exact_resident_config() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-vote-exact-config");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    paths.ensure().expect("cluster paths");
+    let (state, local_node_id, candidate_node_id) = cluster_raft_handler_test_state(
+        "cluster_raft_vote_exact_config",
+        "node_raft_vote_exact_config_local",
+        "node_raft_vote_exact_config_candidate",
+    );
+    write_cluster_state(&paths, &state).expect("write stale bootstrap state");
+    let config = ClusterKvRaftConfigRecord {
+        cluster_id: state.cluster_id.clone(),
+        term: 1,
+        kv_revision: 1,
+        voters: vec![local_node_id.clone()],
+        learners: Vec::new(),
+        non_voting: vec![candidate_node_id.clone()],
+        updated_at: OffsetDateTime::now_utc(),
+    };
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(sinomo_kv::cluster_kv_raft_config_key(), &config, None)
+        .expect("encode committed config");
+    {
+        let mut node = open_cluster_raft_kv_node(&paths, &local_node_id).expect("open follower");
+        node.apply_append_entries_with_optional_snapshot(
+            Some(RaftSnapshot {
+                last_included_index: 1,
+                last_included_term: 1,
+                kv: store.snapshot().expect("config snapshot"),
+            }),
+            RaftAppendEntriesRequest {
+                term: 1,
+                leader_id: candidate_node_id.clone(),
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: Vec::new(),
+                leader_commit: 1,
+            },
+        )
+        .expect("install exact config");
+    }
+    let mut candidate_state = state.clone();
+    candidate_state.local_node_id = candidate_node_id.clone();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let response = runtime
+        .block_on(handle_cluster_raft_vote_request_async(
+            runtime.handle(),
+            &paths,
+            ClusterRaftVoteRequest {
+                state: candidate_state,
+                vote: RaftRequestVoteRequest {
+                    term: 2,
+                    candidate_id: candidate_node_id.clone(),
+                    last_log_index: 1,
+                    last_log_term: 1,
+                },
+            },
+            &ClusterAuthenticatedPeer {
+                node_id: candidate_node_id.to_string(),
+                public_key: "peer-public-key".to_string(),
+            },
+        ))
+        .expect("exact-config vote rejection must not race the higher-term closer");
+
+    assert!(!response.accepted);
+    assert!(!response.vote.vote_granted);
+    assert!(response.detail.contains("unauthorized or mismatched"));
+    assert_eq!(
+        response
+            .state
+            .members
+            .iter()
+            .find(|member| member.node_id == candidate_node_id)
+            .expect("candidate projection")
+            .role,
+        ClusterMemberRole::NonVoting
+    );
+}
+
+#[test]
+fn cancelled_admitted_vote_finishes_durability_before_a_subsequent_vote() {
+    let root = sinomo_testdir::TestDir::new("sinomo-raft-vote-admitted-cancel");
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+    paths.ensure().expect("cluster paths");
+    let (state, local_node_id, candidate_node_id) = cluster_raft_handler_test_state(
+        "cluster_raft_vote_admitted_cancel",
+        "node_raft_vote_admitted_cancel_local",
+        "node_raft_vote_admitted_cancel_candidate",
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    let mut candidate_state = state.clone();
+    candidate_state.local_node_id = candidate_node_id.clone();
+    let request = ClusterRaftVoteRequest {
+        state: candidate_state,
+        vote: RaftRequestVoteRequest {
+            term: 2,
+            candidate_id: candidate_node_id.clone(),
+            last_log_index: 0,
+            last_log_term: 0,
+        },
+    };
+    let peer = ClusterAuthenticatedPeer {
+        node_id: candidate_node_id.to_string(),
+        public_key: "peer-public-key".to_string(),
+    };
+    let operation_guard = sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths())
+        .expect("hold durable operation lock");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let request_paths = paths.clone();
+    let cancelled_request = request.clone();
+    let cancelled_peer = peer.clone();
+    let vote = runtime.spawn(async move {
+        handle_cluster_raft_vote_request_async(
+            &tokio::runtime::Handle::current(),
+            &request_paths,
+            cancelled_request,
+            &cancelled_peer,
+        )
+        .await
+    });
+    let admission_deadline = Instant::now() + Duration::from_secs(1);
+    while sinomo_kv::cluster_kv_raft_operation_queue_depth_for_test(&paths.kv_paths()) != 1 {
+        assert!(
+            Instant::now() < admission_deadline,
+            "vote blocking work never won admission"
+        );
+        std::thread::yield_now();
+    }
+    vote.abort();
+    runtime.block_on(async {
+        let _ = vote.await;
+    });
+    drop(operation_guard);
+
+    // The canceled caller no longer owns a result receiver, but the admitted
+    // worker remains supervised and serializes the next vote behind its exact
+    // durable term/voted-for update.
+    let response = runtime
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                handle_cluster_raft_vote_request_async(runtime.handle(), &paths, request, &peer),
+            )
+            .await
+        })
+        .expect("subsequent vote must not hang behind canceled admitted work")
+        .expect("subsequent vote response");
+    assert!(response.accepted);
+    assert!(response.vote.vote_granted);
+    let node = open_cluster_raft_kv_node(&paths, &local_node_id).expect("inspect durable vote");
+    assert_eq!(node.hard_state().current_term, 2);
+    assert_eq!(
+        node.hard_state().voted_for.as_ref(),
+        Some(&candidate_node_id)
+    );
 }
 
 #[test]
@@ -8168,6 +8915,24 @@ impl ClusterRaftVoteTransportHost for RecordingLeaderElectionHost {
             },
         })
     }
+
+    fn send_raft_votes(
+        &mut self,
+        state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+        request: &ClusterRaftVoteRequest,
+        timeout: Duration,
+        required_grants: usize,
+    ) -> Result<Vec<(NodeId, Result<ClusterRaftVoteResponse, NetworkError>)>, NetworkError> {
+        Ok(targets
+            .into_iter()
+            .take(required_grants)
+            .map(|target| {
+                let response = self.send_raft_vote(state, &target, request, timeout);
+                (target, response)
+            })
+            .collect())
+    }
 }
 
 struct BlockingLeaderElectionHost {
@@ -8200,6 +8965,24 @@ impl ClusterRaftVoteTransportHost for BlockingLeaderElectionHost {
                 vote_granted: true,
             },
         })
+    }
+
+    fn send_raft_votes(
+        &mut self,
+        state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+        request: &ClusterRaftVoteRequest,
+        timeout: Duration,
+        required_grants: usize,
+    ) -> Result<Vec<(NodeId, Result<ClusterRaftVoteResponse, NetworkError>)>, NetworkError> {
+        Ok(targets
+            .into_iter()
+            .take(required_grants)
+            .map(|target| {
+                let response = self.send_raft_vote(state, &target, request, timeout);
+                (target, response)
+            })
+            .collect())
     }
 }
 
@@ -8234,6 +9017,24 @@ impl ClusterRaftVoteTransportHost for NodeSensitiveLeaderElectionHost {
                 vote_granted: true,
             },
         })
+    }
+
+    fn send_raft_votes(
+        &mut self,
+        state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+        request: &ClusterRaftVoteRequest,
+        timeout: Duration,
+        required_grants: usize,
+    ) -> Result<Vec<(NodeId, Result<ClusterRaftVoteResponse, NetworkError>)>, NetworkError> {
+        Ok(targets
+            .into_iter()
+            .map(|target| {
+                let response = self.send_raft_vote(state, &target, request, timeout);
+                (target, response)
+            })
+            .take(required_grants)
+            .collect())
     }
 }
 
@@ -10519,7 +11320,8 @@ fn intermittent_three_node_cluster_preserves_local_reads_and_converges_after_quo
     }
 
     for peer_paths in [&peer_one_paths, &peer_two_paths] {
-        let peer_snapshot = read_cluster_kv_snapshot(peer_paths).expect("caught-up peer snapshot");
+        let peer_snapshot =
+            read_cluster_kv_current_snapshot(peer_paths).expect("caught-up peer Raft view");
         assert_eq!(peer_snapshot.revision, committed.snapshot.revision);
         assert_eq!(peer_snapshot.entries, committed.snapshot.entries);
         assert!(peer_snapshot.get("/intermittent/converged").is_some());
@@ -10584,6 +11386,141 @@ fn cluster_raft_quorum_commit_observes_higher_rejected_append_term() {
     let node = open_cluster_raft_kv_node(&paths, &local_node_id).expect("open raft");
     assert_eq!(node.hard_state().current_term, observed_term);
     assert_eq!(node.hard_state().leader_id, None);
+}
+
+#[test]
+fn blocked_quorum_transport_does_not_monopolize_local_raft_storage() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-blocked-quorum-storage");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_raft_blocked_quorum_storage",
+        "node_raft_blocked_quorum_local",
+        "node_raft_blocked_quorum_peer",
+    );
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == peer_node_id)
+        .expect("peer member")
+        .endpoints
+        .push(daemon_lan_endpoint(
+            &peer_node_id,
+            "10.0.0.184:21353".to_string(),
+            10,
+        ));
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("seed committed raft config");
+
+    let (send_started_tx, send_started_rx) = std::sync::mpsc::channel();
+    let (release_send_tx, release_send_rx) = std::sync::mpsc::channel();
+    let commit_paths = paths.clone();
+    let commit = std::thread::spawn(move || {
+        commit_cluster_raft_command_with_local_storage_and_transport(
+            &commit_paths,
+            &mut state,
+            KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+                key: "/quorum/blocked-transport".to_string(),
+                value: b"committed".to_vec(),
+                lease_id: None,
+            })),
+            ClusterKvRaftQuorumCommitOptions {
+                timeout: Duration::from_secs(3),
+            },
+            ClusterControlPlaneTimeouts::default_daemon_transport(),
+            move |_endpoint, request, _timeout| {
+                send_started_tx.send(()).expect("report blocked send");
+                release_send_rx.recv().expect("release blocked send");
+                Ok(ClusterRaftAppendResponse {
+                    accepted: true,
+                    detail: "accepted after release".to_string(),
+                    state: request.state.clone(),
+                    append: sinomo_kv::RaftAppendEntriesResponse {
+                        term: request.append.term,
+                        success: true,
+                        match_index: request
+                            .append
+                            .prev_log_index
+                            .saturating_add(request.append.entries.len() as u64),
+                    },
+                })
+            },
+            |_, _, _, _, _| {},
+            |_, _, _, _| {},
+            || {},
+        )
+    });
+
+    send_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("quorum transport started");
+    let diagnostic_paths = paths.clone();
+    let (diagnostic_tx, diagnostic_rx) = std::sync::mpsc::channel();
+    let diagnostic = std::thread::spawn(move || {
+        let result = diagnostic_paths
+            .kv_paths()
+            .raft_store()
+            .locked_last_log_index(&local_node_id)
+            .map_err(kv_err);
+        diagnostic_tx.send(result).expect("report diagnostic read");
+    });
+    let diagnostic_before_release = diagnostic_rx.recv_timeout(Duration::from_millis(500));
+    release_send_tx.send(()).expect("release quorum transport");
+
+    let last_log_index = diagnostic_before_release
+        .expect("local Raft diagnostic must not wait for quorum transport")
+        .expect("local Raft diagnostic succeeds");
+    assert!(last_log_index > 0);
+    commit
+        .join()
+        .expect("join quorum commit")
+        .expect("quorum commit succeeds");
+    diagnostic.join().expect("join diagnostic read");
+}
+
+#[test]
+fn nonleader_quorum_retry_releases_local_raft_storage_for_reads() {
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-nonleader-storage-release");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, local_node_id, _peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_raft_nonleader_storage_release",
+        "node_raft_nonleader_storage_local",
+        "node_raft_nonleader_storage_peer",
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("seed committed raft config");
+    let local_member = state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == local_node_id)
+        .expect("local member");
+    local_member.role = ClusterMemberRole::NonVoting;
+    local_member.state = ClusterMemberState::NonVoting;
+
+    for attempt in 0..2 {
+        let error = commit_cluster_raft_command_with_local_storage_and_transport(
+            &paths,
+            &mut state,
+            KvCommandRequest::generated(KvCommand::Barrier),
+            ClusterKvRaftQuorumCommitOptions {
+                timeout: Duration::from_secs(1),
+            },
+            ClusterControlPlaneTimeouts::default_daemon_transport(),
+            |_, _, _| panic!("nonleader must not send a Raft append"),
+            |_, _, _, _, _| {},
+            |_, _, _, _| {},
+            || {},
+        )
+        .expect_err("non-voter cannot commit locally");
+        assert!(matches!(error, NetworkError::ClusterReadOnly { .. }));
+
+        let node = open_cluster_raft_kv_node(&paths, &local_node_id)
+            .unwrap_or_else(|error| panic!("read after nonleader attempt {attempt}: {error}"));
+        assert_eq!(node.hard_state().commit_index, node.applied_index());
+    }
 }
 
 #[test]
@@ -10761,6 +11698,238 @@ fn cluster_raft_leader_election_driver_sets_leader_after_remote_voter_grants() {
     assert!(
         host.sent_votes[0].2 > Duration::from_secs(4),
         "node-targeted election should use the routed node budget, not a one-endpoint foreground slice"
+    );
+}
+
+#[test]
+fn cluster_raft_leader_election_fences_config_advanced_during_remote_vote() {
+    struct ConfigAdvancingElectionHost {
+        paths: ClusterPaths,
+        config_advances: usize,
+    }
+
+    impl ClusterRaftVoteTransportHost for ConfigAdvancingElectionHost {
+        fn send_raft_vote(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            _target_node_id: &NodeId,
+            request: &ClusterRaftVoteRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterRaftVoteResponse, NetworkError> {
+            Ok(ClusterRaftVoteResponse {
+                accepted: true,
+                detail: "granted".to_string(),
+                state: request.state.clone(),
+                vote: sinomo_kv::RaftRequestVoteResponse {
+                    term: request.vote.term,
+                    vote_granted: true,
+                },
+            })
+        }
+
+        fn send_raft_votes(
+            &mut self,
+            state: &ClusterBootstrapState,
+            targets: Vec<NodeId>,
+            request: &ClusterRaftVoteRequest,
+            timeout: Duration,
+            required_grants: usize,
+        ) -> Result<Vec<(NodeId, Result<ClusterRaftVoteResponse, NetworkError>)>, NetworkError>
+        {
+            // The durable self-vote has completed and released the campaign
+            // lock before transport starts. Advance the exact committed
+            // configuration entry in that gap; final leader publication must
+            // reject the stale election fence even though the voter grants.
+            sync_cluster_state_to_local_raft_unchecked(&self.paths, state)?;
+            // The unchecked fixture sync bootstraps a local leader so it can
+            // commit the config record. Clear that test-only side effect; the
+            // election under test is the only path allowed to publish a
+            // leader after the remote vote.
+            self.paths
+                .kv_paths()
+                .raft_store()
+                .locked_clear_leader_compact(&state.local_node_id)
+                .expect("clear fixture-sync leader");
+            self.config_advances += 1;
+            Ok(targets
+                .into_iter()
+                .take(required_grants)
+                .map(|target| {
+                    let response = self.send_raft_vote(state, &target, request, timeout);
+                    (target, response)
+                })
+                .collect())
+        }
+    }
+
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-election-config-fence");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, local_node_id, peer_node_id) = cluster_raft_handler_test_state(
+        "cluster_raft_election_config_fence",
+        "node_raft_election_config_fence_local",
+        "node_raft_election_config_fence_peer",
+    );
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == peer_node_id)
+        .expect("peer member")
+        .endpoints
+        .push(daemon_lan_endpoint(
+            &peer_node_id,
+            "10.0.0.183:21353".to_string(),
+            10,
+        ));
+    write_cluster_state(&paths, &state).expect("write state");
+    let mut host = ConfigAdvancingElectionHost {
+        paths: paths.clone(),
+        config_advances: 0,
+    };
+
+    let error = elect_cluster_raft_leader_with_host(
+        &paths,
+        &state,
+        ClusterRaftLeaderElectionOptions {
+            kv: ClusterKvRaftLeaderElectionOptions {
+                max_attempts: sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS,
+            },
+            timeout: Duration::from_secs(5),
+            campaign_jitter_max: Duration::ZERO,
+            tcp_command_timeout: Duration::from_secs(5),
+            iroh_command_timeout: Duration::from_secs(3),
+            tcp_foreground_attempt_timeout: Duration::from_secs(1),
+            public_foreground_attempt_timeout: Duration::from_secs(4),
+            iroh_foreground_attempt_timeout: Duration::from_millis(1500),
+        },
+        &mut host,
+    )
+    .expect_err("an advanced committed configuration must fence leader publication");
+
+    assert!(matches!(
+        error,
+        NetworkError::ClusterReadOnly { detail }
+            if detail.contains("configuration changed during leader election")
+    ));
+    assert_eq!(host.config_advances, 1);
+    assert_eq!(
+        paths
+            .kv_paths()
+            .known_raft_voter_leader_id(&state)
+            .expect("known state authority"),
+        None,
+        "the stale campaign must not publish local leadership"
+    );
+    let node = open_cluster_raft_kv_node(&paths, &local_node_id).expect("open local raft node");
+    assert_eq!(node.hard_state().leader_id, None);
+}
+
+#[test]
+fn cluster_raft_leader_election_batch_does_not_wait_for_slow_first_voter() {
+    #[derive(Default)]
+    struct SlowFirstElectionBatchHost {
+        batch_targets: Vec<NodeId>,
+    }
+
+    impl ClusterRaftVoteTransportHost for SlowFirstElectionBatchHost {
+        fn send_raft_vote(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            _target_node_id: &NodeId,
+            _request: &ClusterRaftVoteRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterRaftVoteResponse, NetworkError> {
+            panic!("the election regressed to serial per-voter dispatch")
+        }
+
+        fn send_raft_votes(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            targets: Vec<NodeId>,
+            request: &ClusterRaftVoteRequest,
+            _timeout: Duration,
+            required_grants: usize,
+        ) -> Result<Vec<(NodeId, Result<ClusterRaftVoteResponse, NetworkError>)>, NetworkError>
+        {
+            assert_eq!(required_grants, 1);
+            assert_eq!(targets.len(), 2);
+            self.batch_targets = targets.clone();
+            // Model the first RPC as still pending. The concurrently completed
+            // second voter is sufficient for quorum and must be consumable
+            // without waiting for the first target in selection order.
+            let fast_voter = targets.last().expect("second voter").clone();
+            Ok(vec![(
+                fast_voter,
+                Ok(ClusterRaftVoteResponse {
+                    accepted: true,
+                    detail: "fast concurrent grant".to_string(),
+                    state: request.state.clone(),
+                    vote: sinomo_kv::RaftRequestVoteResponse {
+                        term: request.vote.term,
+                        vote_granted: true,
+                    },
+                }),
+            )])
+        }
+    }
+
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-election-slow-first");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, local_node_id, first_peer_id) = cluster_raft_handler_test_state(
+        "cluster_raft_election_slow_first",
+        "node_raft_election_slow_first_local",
+        "node_raft_election_slow_first_peer_one",
+    );
+    state.members[1].endpoints.push(daemon_lan_endpoint(
+        &first_peer_id,
+        "10.0.0.193:21353".to_string(),
+        10,
+    ));
+    let second_peer_id =
+        NodeId::from_legacy_named("node_raft_election_slow_first_peer_two").expect("second peer");
+    let mut second_peer = state.members[1].clone();
+    second_peer.node_id = second_peer_id.clone();
+    second_peer.display_name = "second peer".to_string();
+    second_peer.node_public_key = "second-peer-public-key".to_string();
+    second_peer.endpoints = vec![daemon_lan_endpoint(
+        &second_peer_id,
+        "10.0.0.194:21353".to_string(),
+        10,
+    )];
+    state.members.push(second_peer);
+    write_cluster_state(&paths, &state).expect("write state");
+    let mut host = SlowFirstElectionBatchHost::default();
+
+    let elected = elect_cluster_raft_leader_with_host(
+        &paths,
+        &state,
+        ClusterRaftLeaderElectionOptions {
+            kv: ClusterKvRaftLeaderElectionOptions {
+                max_attempts: sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS,
+            },
+            timeout: Duration::from_secs(5),
+            campaign_jitter_max: Duration::ZERO,
+            tcp_command_timeout: Duration::from_secs(5),
+            iroh_command_timeout: Duration::from_secs(3),
+            tcp_foreground_attempt_timeout: Duration::from_secs(1),
+            public_foreground_attempt_timeout: Duration::from_secs(4),
+            iroh_foreground_attempt_timeout: Duration::from_millis(1500),
+        },
+        &mut host,
+    )
+    .expect("elect from the fast concurrent voter");
+
+    assert!(elected);
+    assert_eq!(host.batch_targets.len(), 2);
+    assert_eq!(
+        paths
+            .kv_paths()
+            .known_raft_voter_leader_id(&state)
+            .expect("known state authority"),
+        Some(local_node_id)
     );
 }
 
@@ -10953,7 +12122,7 @@ fn cluster_raft_leader_election_replaces_unchanged_remote_leader() {
 }
 
 #[test]
-fn cluster_raft_leader_election_serializes_queued_local_campaigns() {
+fn cluster_raft_leader_election_coalesces_rounds_without_holding_commit_lock_across_rpc() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-raft-election-sequence");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -11005,6 +12174,12 @@ fn cluster_raft_leader_election_serializes_queued_local_campaigns() {
     first_started_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("first campaign reached remote vote");
+    assert!(
+        sinomo_kv::evict_resident_raft_node_for_test(
+            &paths.kv_paths().raft_wal_paths(&local_node_id)
+        ),
+        "the first campaign should have released resident Raft storage before its vote RPC"
+    );
 
     let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
     let second_paths = paths.clone();
@@ -11019,15 +12194,23 @@ fn cluster_raft_leader_election_serializes_queued_local_campaigns() {
         elect_cluster_raft_leader_with_host(&second_paths, &second_state, options, &mut host)
     });
 
-    let second_overlapped = second_started_rx
-        .recv_timeout(Duration::from_millis(150))
-        .is_ok();
+    assert!(
+        second_started_rx
+            .recv_timeout(Duration::from_millis(150))
+            .is_err(),
+        "a second local election must coalesce behind the in-flight round"
+    );
+    let commit_lock =
+        sinomo_kv::lock_cluster_kv_commit_sequence(&paths.kv_paths(), Duration::from_millis(150))
+            .expect("vote RPC must not retain the global commit-sequence lock");
+    drop(commit_lock);
     release_first_tx.send(()).expect("release first campaign");
     assert!(
         first
             .join()
             .expect("join first campaign")
-            .expect("first campaign")
+            .expect("first campaign"),
+        "the admitted campaign should publish leadership"
     );
     assert!(
         second
@@ -11035,11 +12218,11 @@ fn cluster_raft_leader_election_serializes_queued_local_campaigns() {
             .expect("join second campaign")
             .expect("second campaign")
     );
-    assert!(
-        !second_overlapped,
-        "a queued local campaign must not overlap the active election"
+    assert_eq!(
+        vote_calls.load(Ordering::SeqCst),
+        1,
+        "the queued caller must reuse the durable predecessor outcome without another self-vote"
     );
-    assert_eq!(vote_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         paths
             .kv_paths()
@@ -11047,6 +12230,293 @@ fn cluster_raft_leader_election_serializes_queued_local_campaigns() {
             .expect("known state authority"),
         Some(local_node_id)
     );
+}
+
+#[test]
+fn simultaneous_reachable_candidates_with_third_voter_unavailable_stabilize_one_leader() {
+    #[derive(Clone)]
+    struct RoutedElectionHost {
+        reachable_paths: Arc<BTreeMap<NodeId, ClusterPaths>>,
+        vote_calls: Arc<AtomicUsize>,
+        first_round_split: Arc<Barrier>,
+        preferred_retry_candidate: NodeId,
+        preferred_retry_completed: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl ClusterRaftVoteTransportHost for RoutedElectionHost {
+        fn send_raft_vote(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            target_node_id: &NodeId,
+            request: &ClusterRaftVoteRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterRaftVoteResponse, NetworkError> {
+            self.vote_calls.fetch_add(1, Ordering::SeqCst);
+            let target_paths =
+                self.reachable_paths
+                    .get(target_node_id)
+                    .ok_or_else(|| NetworkError::Io {
+                        operation: "test cluster raft vote".to_string(),
+                        detail: format!("voter {target_node_id} is unavailable"),
+                    })?;
+            let candidate = request
+                .state
+                .members
+                .iter()
+                .find(|member| member.node_id == request.vote.candidate_id)
+                .expect("candidate member");
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("vote RPC runtime");
+            runtime.block_on(handle_cluster_raft_vote_request_async(
+                runtime.handle(),
+                target_paths,
+                request.clone(),
+                &ClusterAuthenticatedPeer {
+                    node_id: candidate.node_id.to_string(),
+                    public_key: candidate.node_public_key.clone(),
+                },
+            ))
+        }
+
+        fn send_raft_votes(
+            &mut self,
+            state: &ClusterBootstrapState,
+            targets: Vec<NodeId>,
+            request: &ClusterRaftVoteRequest,
+            timeout: Duration,
+            _required_grants: usize,
+        ) -> Result<Vec<(NodeId, Result<ClusterRaftVoteResponse, NetworkError>)>, NetworkError>
+        {
+            let first_round_term = 1 + sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP;
+            let first_round = request.vote.term == first_round_term;
+            if first_round {
+                // Make the first generation a deterministic split vote: both
+                // candidates must have persisted their self-vote before either
+                // delivers RequestVote to the other.
+                self.first_round_split.wait();
+            }
+            let outcomes = targets
+                .into_iter()
+                .map(|target| {
+                    let response = self.send_raft_vote(state, &target, request, timeout);
+                    (target, response)
+                })
+                .collect::<Vec<_>>();
+            if first_round && request.vote.candidate_id != self.preferred_retry_candidate {
+                // Do not depend on the process being scheduled within its
+                // ranked wall-clock slot. Hold the lower-priority candidate in
+                // its completed first round until the preferred retry has
+                // delivered a higher-term vote. Its retry must then observe
+                // that external durable advancement and stand down.
+                let (completed, changed) = &*self.preferred_retry_completed;
+                let mut completed = completed.lock().expect("retry completion lock");
+                while !*completed {
+                    completed = changed.wait(completed).expect("retry completion wait");
+                }
+            } else if !first_round && request.vote.candidate_id == self.preferred_retry_candidate {
+                let (completed, changed) = &*self.preferred_retry_completed;
+                *completed.lock().expect("retry completion lock") = true;
+                changed.notify_all();
+            }
+            Ok(outcomes)
+        }
+    }
+
+    let root_a = sinomo_testdir::TestDir::new("sinomo-raft-election-stable-candidate-a");
+    let root_b = sinomo_testdir::TestDir::new("sinomo-raft-election-stable-candidate-b");
+    let paths_a = ClusterPaths::new(&SinomoDataDir::new(&root_a));
+    let paths_b = ClusterPaths::new(&SinomoDataDir::new(&root_b));
+    paths_a.ensure().expect("candidate a paths");
+    paths_b.ensure().expect("candidate b paths");
+    let (mut state_a, node_a, node_b) = cluster_raft_handler_test_state(
+        "cluster_raft_simultaneous_candidates",
+        "node_raft_simultaneous_candidate_a",
+        "node_raft_simultaneous_candidate_b",
+    );
+    let node_c =
+        NodeId::from_legacy_named("node_raft_simultaneous_unavailable_c").expect("third voter");
+    let mut member_c = state_a.members[1].clone();
+    member_c.node_id = node_c.clone();
+    member_c.display_name = "unavailable voter".to_string();
+    member_c.node_public_key = "unavailable-voter-public-key".to_string();
+    member_c.endpoints.clear();
+    state_a.members.push(member_c);
+    let mut state_b = state_a.clone();
+    state_b.local_node_id = node_b.clone();
+    write_cluster_state(&paths_a, &state_a).expect("candidate a state");
+    write_cluster_state(&paths_b, &state_b).expect("candidate b state");
+
+    let reachable_paths = Arc::new(BTreeMap::from([
+        (node_a.clone(), paths_a.clone()),
+        (node_b.clone(), paths_b.clone()),
+    ]));
+    let vote_calls = Arc::new(AtomicUsize::new(0));
+    let first_round_split = Arc::new(Barrier::new(2));
+    let preferred_retry_candidate = [node_a.clone(), node_b.clone()]
+        .into_iter()
+        .max()
+        .expect("reachable retry candidate");
+    let preferred_retry_completed = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let start = Arc::new(Barrier::new(3));
+    let options = ClusterRaftLeaderElectionOptions {
+        kv: ClusterKvRaftLeaderElectionOptions {
+            max_attempts: sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS,
+        },
+        timeout: Duration::from_secs(8),
+        // Three one-second ranked slots leave ample separation in the retry
+        // generation after the deliberately forced split vote, without
+        // changing any production timeout or stack setting.
+        campaign_jitter_max: Duration::from_secs(3),
+        tcp_command_timeout: Duration::from_secs(5),
+        iroh_command_timeout: Duration::from_secs(3),
+        tcp_foreground_attempt_timeout: Duration::from_secs(1),
+        public_foreground_attempt_timeout: Duration::from_secs(4),
+        iroh_foreground_attempt_timeout: Duration::from_millis(1500),
+    };
+
+    let thread_a = {
+        let paths = paths_a.clone();
+        let state = state_a.clone();
+        let start = Arc::clone(&start);
+        let mut host = RoutedElectionHost {
+            reachable_paths: Arc::clone(&reachable_paths),
+            vote_calls: Arc::clone(&vote_calls),
+            first_round_split: Arc::clone(&first_round_split),
+            preferred_retry_candidate: preferred_retry_candidate.clone(),
+            preferred_retry_completed: Arc::clone(&preferred_retry_completed),
+        };
+        std::thread::spawn(move || {
+            start.wait();
+            elect_cluster_raft_leader_with_host(&paths, &state, options, &mut host)
+        })
+    };
+    let thread_b = {
+        let paths = paths_b.clone();
+        let state = state_b.clone();
+        let start = Arc::clone(&start);
+        let mut host = RoutedElectionHost {
+            reachable_paths: Arc::clone(&reachable_paths),
+            vote_calls: Arc::clone(&vote_calls),
+            first_round_split: Arc::clone(&first_round_split),
+            preferred_retry_candidate: preferred_retry_candidate.clone(),
+            preferred_retry_completed: Arc::clone(&preferred_retry_completed),
+        };
+        std::thread::spawn(move || {
+            start.wait();
+            elect_cluster_raft_leader_with_host(&paths, &state, options, &mut host)
+        })
+    };
+    start.wait();
+    let outcome_a = thread_a.join().expect("candidate a thread");
+    let outcome_b = thread_b.join().expect("candidate b thread");
+    let outcome_a = outcome_a.expect("candidate a election");
+    let outcome_b = outcome_b.expect("candidate b election");
+    assert_eq!(
+        [outcome_a, outcome_b]
+            .into_iter()
+            .filter(|elected| *elected)
+            .count(),
+        1,
+        "the preferred retry must win while the externally advanced candidate suppresses its stale campaign"
+    );
+
+    let hard_state_a = open_cluster_raft_kv_node(&paths_a, &node_a)
+        .expect("candidate a raft")
+        .hard_state()
+        .clone();
+    let hard_state_b = open_cluster_raft_kv_node(&paths_b, &node_b)
+        .expect("candidate b raft")
+        .hard_state()
+        .clone();
+    assert_eq!(hard_state_a.current_term, hard_state_b.current_term);
+    assert!(
+        hard_state_a.current_term >= 1 + sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP
+            && hard_state_a.current_term
+                <= 1 + 2 * sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP,
+        "two reachable simultaneous candidates should converge in at most two bounded rounds"
+    );
+    let local_leaders = [
+        hard_state_a.leader_id.as_ref() == Some(&node_a),
+        hard_state_b.leader_id.as_ref() == Some(&node_b),
+    ];
+    assert_eq!(
+        local_leaders
+            .into_iter()
+            .filter(|is_leader| *is_leader)
+            .count(),
+        1,
+        "exactly one candidate must retain leadership after the crossed votes"
+    );
+    let winner = if local_leaders[0] {
+        node_a.clone()
+    } else {
+        node_b.clone()
+    };
+    let (loser_paths, loser_id) = if winner == node_a {
+        (&paths_b, &node_b)
+    } else {
+        (&paths_a, &node_a)
+    };
+    assert!(
+        apply_cluster_raft_append(
+            loser_paths,
+            loser_id,
+            None,
+            RaftAppendEntriesRequest {
+                term: hard_state_a.current_term,
+                leader_id: winner.clone(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
+            },
+        )
+        .expect("winning heartbeat")
+        .success
+    );
+
+    let stable_term = hard_state_a.current_term;
+    let mut no_vote_host_a = RecordingLeaderElectionHost::default();
+    let mut no_vote_host_b = RecordingLeaderElectionHost::default();
+    let stable_options = ClusterRaftLeaderElectionOptions {
+        campaign_jitter_max: Duration::ZERO,
+        ..options
+    };
+    let stable_a = elect_cluster_raft_leader_with_host(
+        &paths_a,
+        &state_a,
+        stable_options,
+        &mut no_vote_host_a,
+    )
+    .expect("stable candidate a observation");
+    let stable_b = elect_cluster_raft_leader_with_host(
+        &paths_b,
+        &state_b,
+        stable_options,
+        &mut no_vote_host_b,
+    )
+    .expect("stable candidate b observation");
+    assert_eq!(stable_a, winner == node_a);
+    assert_eq!(stable_b, winner == node_b);
+    assert!(no_vote_host_a.sent_votes.is_empty());
+    assert!(no_vote_host_b.sent_votes.is_empty());
+    assert_eq!(
+        open_cluster_raft_kv_node(&paths_a, &node_a)
+            .expect("stable candidate a raft")
+            .hard_state()
+            .current_term,
+        stable_term
+    );
+    assert_eq!(
+        open_cluster_raft_kv_node(&paths_b, &node_b)
+            .expect("stable candidate b raft")
+            .hard_state()
+            .current_term,
+        stable_term
+    );
+    assert!(vote_calls.load(Ordering::SeqCst) >= 2);
 }
 
 #[test]
@@ -11566,6 +13036,7 @@ fn cluster_raft_append_request_only_fans_out_watch_events_missing_from_snapshot(
         state: state.clone(),
         append,
         snapshot: None,
+        read_index_probe: false,
     };
 
     assert!(
@@ -19998,6 +21469,7 @@ fn async_cluster_raft_append_replication_retries_from_rejected_match_index() {
                 Ok(ClusterRaftAppendRequest {
                     state,
                     snapshot,
+                    read_index_probe: false,
                     append: RaftAppendEntriesRequest {
                         term: 1,
                         leader_id,

@@ -14,6 +14,16 @@ use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse};
 use std::time::Duration;
 
 pub trait ClusterControlPlaneTransport {
+    /// Installs the cluster root used by routed operations for the duration of
+    /// one driver call, returning the previous scope for nested restoration.
+    /// Transports that do not need filesystem-backed routing may ignore it.
+    fn replace_active_cluster_paths(
+        &mut self,
+        _paths: Option<ClusterPaths>,
+    ) -> Option<ClusterPaths> {
+        None
+    }
+
     fn send_kv_replication(
         &mut self,
         endpoint: &ClusterEndpointRecord,
@@ -47,6 +57,31 @@ pub trait ClusterControlPlaneTransport {
         decode_cluster_raft_append_response(&response)
     }
 
+    /// Concurrent synchronous ReadIndex heartbeat fanout. Ordinary transport
+    /// implementations that do not serve authoritative reads fail closed here
+    /// instead of silently serializing voters under one operation deadline.
+    fn send_kv_read_index_probes(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+        _request: &ClusterKvReplicationRequest,
+        _timeout: Duration,
+        _required_acks: usize,
+    ) -> Result<Vec<(NodeId, Result<ClusterKvReplicationResponse, NetworkError>)>, NetworkError>
+    {
+        Ok(targets
+            .into_iter()
+            .map(|target| {
+                (
+                    target,
+                    Err(NetworkError::ClusterReadOnly {
+                        detail: "synchronous ReadIndex batch transport is unavailable".to_string(),
+                    }),
+                )
+            })
+            .collect())
+    }
+
     fn request_kv_state_authority_vote_from_node(
         &mut self,
         state: &ClusterBootstrapState,
@@ -64,6 +99,37 @@ pub trait ClusterControlPlaneTransport {
         );
         let response = self.call_node_object_rpc(state, target_node_id, &rpc_request, timeout)?;
         decode_cluster_raft_vote_response(&response)
+    }
+
+    /// Concurrent synchronous election fanout. Hosts that participate in
+    /// elections must override this; failing closed avoids silently restoring
+    /// a voter-by-voter WAN critical path.
+    fn request_kv_state_authority_votes_from_nodes(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+        _request: &ClusterKvStateAuthorityVoteRequest,
+        _timeout: Duration,
+        _required_grants: usize,
+    ) -> Result<
+        Vec<(
+            NodeId,
+            Result<ClusterKvStateAuthorityVoteResponse, NetworkError>,
+        )>,
+        NetworkError,
+    > {
+        Ok(targets
+            .into_iter()
+            .map(|target| {
+                (
+                    target,
+                    Err(NetworkError::ClusterReadOnly {
+                        detail: "synchronous Raft election batch transport is unavailable"
+                            .to_string(),
+                    }),
+                )
+            })
+            .collect())
     }
 
     fn probe_cluster_state_authority(
@@ -246,6 +312,24 @@ impl<T> ClusterControlPlaneDriver<T> {
 
     pub fn into_transport(self) -> T {
         self.transport
+    }
+}
+
+impl<T> ClusterControlPlaneDriver<T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    pub(crate) fn with_active_cluster_paths<R>(
+        &mut self,
+        paths: &ClusterPaths,
+        operation: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous = self
+            .transport
+            .replace_active_cluster_paths(Some(paths.clone()));
+        let result = operation(self);
+        self.transport.replace_active_cluster_paths(previous);
+        result
     }
 }
 

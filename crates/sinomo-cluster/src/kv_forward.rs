@@ -1,8 +1,5 @@
 #[allow(unused_imports)]
-use crate::kv_local_store::{
-    ClusterKvPathsExt, kv_err, locked_kv_state_authority_id_async,
-    read_cluster_kv_latest_observed_snapshot_arc_if_present,
-};
+use crate::kv_local_store::{ClusterKvPathsExt, kv_err, read_cluster_kv_cached_snapshot_if_hot};
 use sinomo_base::ClusterBootstrapState;
 use sinomo_kv::{
     ClusterKvRequestOutcomeRead, ClusterKvRequestOutcomeRequest, ClusterKvTxnCommitResult,
@@ -11,20 +8,26 @@ use sinomo_kv::{
     KvTxnRequest,
 };
 use sinomo_network::ClusterPaths;
-use sinomo_network::{
-    ClusterEndpointInternalSelectionPurpose, ClusterEndpointSelector,
-    cluster_node_blocks_leader_preference, cluster_node_blocks_leader_preference_async,
-};
 use sinomo_network::{ClusterObjectRpcAsyncHost, ClusterObjectRpcClient, ClusterObjectRpcOptions};
-use sinomo_network::{NetworkDeliveryState, NetworkError};
+use sinomo_network::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
 use sinomo_network::{ObjectRpcCall, ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_node::NodeId;
+use std::future::Future;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
-const FORWARDED_CLUSTER_KV_NON_LEADER_DETAIL: &str =
+use crate::control_plane_options::main_daemon_cluster_rpc_options;
+
+pub(crate) const FORWARDED_CLUSTER_KV_NON_LEADER_DETAIL: &str =
     "forwarded cluster KV transaction reached a non-leader voter";
-const FORWARDED_CLUSTER_KV_READ_NON_LEADER_DETAIL: &str =
+pub(crate) const FORWARDED_CLUSTER_KV_READ_NON_LEADER_DETAIL: &str =
     "forwarded authoritative cluster KV read reached a non-leader voter";
+pub(crate) const FORWARDED_CLUSTER_KV_EXACT_READ_NON_LEADER_DETAIL: &str =
+    "forwarded authoritative exact-key-set read reached a non-leader voter";
+pub(crate) const FORWARDED_CLUSTER_KV_POINT_READ_NON_LEADER_DETAIL: &str =
+    "forwarded authoritative point read reached a non-leader voter";
+pub(crate) const FORWARDED_CLUSTER_KV_PREFIX_READ_NON_LEADER_DETAIL: &str =
+    "forwarded authoritative prefix read reached a non-leader voter";
 // The leader dispatches committed fanout before returning the compact
 // transaction response. Give that operation-owned replication a short,
 // notification-driven opportunity to materialize the exact commit locally
@@ -37,8 +40,15 @@ fn verified_cluster_non_leader_error(target_node_id: &NodeId, error: NetworkErro
     let NetworkError::ClusterReadOnly { detail } = error else {
         return error;
     };
-    if detail.contains(FORWARDED_CLUSTER_KV_NON_LEADER_DETAIL)
-        || detail.contains(FORWARDED_CLUSTER_KV_READ_NON_LEADER_DETAIL)
+    if [
+        FORWARDED_CLUSTER_KV_NON_LEADER_DETAIL,
+        FORWARDED_CLUSTER_KV_READ_NON_LEADER_DETAIL,
+        FORWARDED_CLUSTER_KV_EXACT_READ_NON_LEADER_DETAIL,
+        FORWARDED_CLUSTER_KV_POINT_READ_NON_LEADER_DETAIL,
+        FORWARDED_CLUSTER_KV_PREFIX_READ_NON_LEADER_DETAIL,
+    ]
+    .into_iter()
+    .any(|marker| detail.contains(marker))
     {
         NetworkError::VerifiedClusterNonLeader {
             node_id: target_node_id.clone(),
@@ -47,6 +57,21 @@ fn verified_cluster_non_leader_error(target_node_id: &NodeId, error: NetworkErro
     } else {
         NetworkError::ClusterReadOnly { detail }
     }
+}
+
+/// Preserve the authenticated target identity when the routed client rejects
+/// an RPC error response before the caller can decode its typed body.
+///
+/// `ClusterObjectRpcClient::call_target` validates `response.error_detail()`
+/// itself, so an authenticated non-leader rejection normally exits from this
+/// await rather than from the later `decode_body` await. Both boundaries must
+/// feed the same classifier or a stale durable leader cannot be invalidated.
+pub(crate) async fn await_authenticated_cluster_kv_target<T>(
+    target_node_id: &NodeId,
+    call: impl Future<Output = Result<T, NetworkError>>,
+) -> Result<T, NetworkError> {
+    call.await
+        .map_err(|error| verified_cluster_non_leader_error(target_node_id, error))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,6 +100,295 @@ impl ClusterKvTxnForwardOptions {
     }
 }
 
+fn cluster_kv_forward_deadline(timeout: Duration) -> Instant {
+    let started = Instant::now();
+    started.checked_add(timeout).unwrap_or(started)
+}
+
+fn cluster_kv_forward_attempt_deadline(overall_deadline: Instant, timeout: Duration) -> Instant {
+    Instant::now()
+        .checked_add(timeout)
+        .map(|deadline| deadline.min(overall_deadline))
+        .unwrap_or(overall_deadline)
+}
+
+fn forwarded_cluster_kv_txn_timeout(timeout: Duration) -> NetworkError {
+    NetworkError::timeout(
+        "materialize forwarded cluster KV transaction",
+        NetworkTimeoutPhase::Overall,
+        timeout,
+        NetworkDeliveryState::PossiblyApplied,
+    )
+}
+
+fn forwarded_cluster_kv_txn_remaining(
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<Duration, NetworkError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(forwarded_cluster_kv_txn_timeout(timeout))
+    } else {
+        Ok(remaining)
+    }
+}
+
+struct AbortForwardBlockingTaskOnDrop<T> {
+    task: tokio::task::JoinHandle<T>,
+}
+
+const FORWARD_BLOCKING_QUEUED: u8 = 0;
+const FORWARD_BLOCKING_ADMITTED: u8 = 1;
+const FORWARD_BLOCKING_CANCELLED: u8 = 2;
+const FORWARD_BLOCKING_COMPLETE: u8 = 3;
+
+impl<T> Drop for AbortForwardBlockingTaskOnDrop<T> {
+    fn drop(&mut self) {
+        // `spawn_blocking` can cancel queued work even though an already-running
+        // blocking closure cannot be interrupted. The closures admitted here do
+        // only a hot-cache lookup or one deadline-bounded notifier wait; they
+        // never start durable hydration. Full snapshot cloning uses the
+        // explicitly admitted-and-awaited helper below.
+        self.task.abort();
+    }
+}
+
+async fn run_forward_blocking_before_deadline<T, F>(
+    deadline: Instant,
+    timeout: Duration,
+    work: F,
+) -> Result<T, NetworkError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, NetworkError> + Send + 'static,
+{
+    forwarded_cluster_kv_txn_remaining(deadline, timeout)?;
+    let admission = std::sync::Arc::new(AtomicU8::new(FORWARD_BLOCKING_QUEUED));
+    let task_admission = std::sync::Arc::clone(&admission);
+    let mut task = AbortForwardBlockingTaskOnDrop {
+        task: tokio::task::spawn_blocking(move || {
+            if task_admission
+                .compare_exchange(
+                    FORWARD_BLOCKING_QUEUED,
+                    FORWARD_BLOCKING_ADMITTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return Err(forwarded_cluster_kv_txn_timeout(timeout));
+            }
+            let result = (|| {
+                forwarded_cluster_kv_txn_remaining(deadline, timeout)?;
+                let value = work()?;
+                forwarded_cluster_kv_txn_remaining(deadline, timeout)?;
+                Ok(value)
+            })();
+            task_admission.store(FORWARD_BLOCKING_COMPLETE, Ordering::Release);
+            result
+        }),
+    };
+    let remaining = forwarded_cluster_kv_txn_remaining(deadline, timeout)?;
+    match tokio::time::timeout(remaining, &mut task.task).await {
+        Ok(result) => result.map_err(|source| NetworkError::Io {
+            operation: "materialize forwarded cluster KV transaction".to_string(),
+            detail: format!("forwarded materialization task failed: {source}"),
+        })?,
+        Err(_) => {
+            if admission
+                .compare_exchange(
+                    FORWARD_BLOCKING_QUEUED,
+                    FORWARD_BLOCKING_CANCELLED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                task.task.abort();
+                return Err(forwarded_cluster_kv_txn_timeout(timeout));
+            }
+            // The blocking closure won admission at the timeout edge. It is
+            // deadline-cooperative, so await its terminal deadline result
+            // instead of detaching it behind the completed caller.
+            (&mut task.task).await.map_err(|source| NetworkError::Io {
+                operation: "materialize forwarded cluster KV transaction".to_string(),
+                detail: format!("forwarded materialization task failed: {source}"),
+            })?
+        }
+    }
+}
+
+/// Runs an inherently complete, O(total snapshot) materialization without
+/// letting an outer timeout detach it. A queued closure is cancelled exactly
+/// at the deadline; once the closure wins admission, the caller awaits the
+/// coherent owned snapshot just like the authoritative full-snapshot path.
+async fn run_forward_admitted_snapshot_materialization<T, F>(
+    deadline: Instant,
+    timeout: Duration,
+    work: F,
+) -> Result<T, NetworkError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, NetworkError> + Send + 'static,
+{
+    forwarded_cluster_kv_txn_remaining(deadline, timeout)?;
+    let admission = std::sync::Arc::new(AtomicU8::new(FORWARD_BLOCKING_QUEUED));
+    let task_admission = std::sync::Arc::clone(&admission);
+    let mut task = AbortForwardBlockingTaskOnDrop {
+        task: tokio::task::spawn_blocking(move || {
+            if task_admission
+                .compare_exchange(
+                    FORWARD_BLOCKING_QUEUED,
+                    FORWARD_BLOCKING_ADMITTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return Err(forwarded_cluster_kv_txn_timeout(timeout));
+            }
+            forwarded_cluster_kv_txn_remaining(deadline, timeout)?;
+            let result = work();
+            task_admission.store(FORWARD_BLOCKING_COMPLETE, Ordering::Release);
+            result
+        }),
+    };
+    let remaining = forwarded_cluster_kv_txn_remaining(deadline, timeout)?;
+    match tokio::time::timeout(remaining, &mut task.task).await {
+        Ok(result) => result.map_err(|source| NetworkError::Io {
+            operation: "materialize forwarded cluster KV snapshot".to_string(),
+            detail: format!("forwarded snapshot materialization task failed: {source}"),
+        })?,
+        Err(_) => {
+            if admission
+                .compare_exchange(
+                    FORWARD_BLOCKING_QUEUED,
+                    FORWARD_BLOCKING_CANCELLED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                task.task.abort();
+                return Err(forwarded_cluster_kv_txn_timeout(timeout));
+            }
+            // `abort` cannot cancel an admitted `spawn_blocking` closure. Wait
+            // for its coherent full-snapshot result rather than returning a
+            // timeout while the O(N) clone continues in the background.
+            (&mut task.task).await.map_err(|source| NetworkError::Io {
+                operation: "materialize forwarded cluster KV snapshot".to_string(),
+                detail: format!("forwarded snapshot materialization task failed: {source}"),
+            })?
+        }
+    }
+}
+
+fn cluster_kv_forward_remaining(
+    deadline: Instant,
+    timeout: Duration,
+    operation: &'static str,
+) -> Result<Duration, NetworkError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(NetworkError::timeout(
+            operation,
+            NetworkTimeoutPhase::Overall,
+            timeout,
+            NetworkDeliveryState::DefinitelyNotSent,
+        ))
+    } else {
+        Ok(remaining)
+    }
+}
+
+async fn decode_forwarded_cluster_kv_authority_before<T, F>(
+    target_node_id: &NodeId,
+    operation: &'static str,
+    deadline: Instant,
+    timeout: Duration,
+    call: F,
+) -> Result<T, NetworkError>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+    F: Future<Output = Result<sinomo_network::ObjectRpcResult, NetworkError>>,
+{
+    let remaining = cluster_kv_forward_remaining(deadline, timeout, operation)?;
+    let rpc = async {
+        await_authenticated_cluster_kv_target(target_node_id, call)
+            .await?
+            .decode_body::<T>()
+            .await
+            .map_err(|error| verified_cluster_non_leader_error(target_node_id, error))
+    };
+    tokio::time::timeout(remaining, rpc).await.map_err(|_| {
+        NetworkError::timeout(
+            operation,
+            NetworkTimeoutPhase::Overall,
+            timeout,
+            NetworkDeliveryState::PossiblyApplied,
+        )
+    })?
+}
+
+fn projected_remote_cluster_kv_voters(
+    state: &ClusterBootstrapState,
+) -> Result<Vec<NodeId>, NetworkError> {
+    let mut targets = sinomo_kv::cluster_kv_raft_voter_ids(state).map_err(kv_err)?;
+    targets.retain(|target| target != &state.local_node_id);
+    Ok(targets)
+}
+
+/// Select forwarding candidates and inspect the durable leader hint under one
+/// caller-owned deadline. In particular, the blocking leader lookup must not
+/// acquire the Raft operation lock after this future has timed out.
+async fn cluster_kv_forward_authority_targets_before_deadline(
+    _runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    deadline: Instant,
+    timeout: Duration,
+    operation: &'static str,
+) -> Result<Option<(Vec<NodeId>, Option<NodeId>)>, NetworkError> {
+    cluster_kv_forward_remaining(deadline, timeout, operation)?;
+    // `state` is the caller's already-projected committed membership fence.
+    // Re-entering the process-wide endpoint selector here would read the
+    // current cluster directory again, mixing generations and potentially
+    // hydrating a cold full KV snapshot before a point read can even be sent.
+    // The fenced routed client below owns endpoint selection from this exact
+    // membership view, so this layer needs only the exact remote voter IDs.
+    let mut targets = projected_remote_cluster_kv_voters(state)?;
+    cluster_kv_forward_remaining(deadline, timeout, operation)?;
+    if targets.is_empty() {
+        return Ok(None);
+    }
+
+    // A leader hint is advisory. Never enqueue behind the process-wide Raft
+    // operation gate merely to reorder exact voter targets: on contention the
+    // zero-budget lookup returns `Busy` and forwarding immediately tries the
+    // committed voter set in its canonical order.
+    let known_authority_lookup = paths
+        .kv_paths()
+        .raft_store()
+        .try_locked_known_voter_leader_id(state);
+    let known_authority_id = known_authority_lookup.ok().flatten();
+    cluster_kv_forward_remaining(deadline, timeout, operation)?;
+
+    let preferred_authority_id = match known_authority_id {
+        Some(authority_id) if authority_id == state.local_node_id => return Ok(None),
+        Some(authority_id) if targets.contains(&authority_id) => {
+            prefer_known_state_authority_node(&mut targets, &authority_id);
+            Some(authority_id)
+        }
+        // A missing hint says nothing about which exact voter currently leads.
+        // This is expected after restart and while catching up. Probe the
+        // committed remote voters before starting a disruptive election; every
+        // authority route validates current-term leadership before serving.
+        _ => None,
+    };
+
+    Ok(Some((targets, preferred_authority_id)))
+}
+
 pub trait ClusterKvTxnForwardHost {
     fn known_kv_state_authority_id(
         &mut self,
@@ -98,9 +412,8 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
     options: ClusterKvTxnForwardOptions,
     host: &mut impl ClusterKvTxnForwardHost,
 ) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
-    let mut targets = ClusterEndpointSelector::new(paths, state).select_internal_unique_node_ids(
-        ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
-    );
+    let deadline = cluster_kv_forward_deadline(options.timeout);
+    let mut targets = projected_remote_cluster_kv_voters(state)?;
     if targets.is_empty() {
         return Ok(None);
     }
@@ -109,23 +422,18 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
         .ok()
         .flatten();
     let preferred_authority_id = match known_authority_id {
-        Some(authority_id)
-            if !cluster_node_blocks_leader_preference(paths, state, &authority_id) =>
-        {
-            if authority_id == state.local_node_id {
-                return Ok(None);
-            }
+        Some(authority_id) if authority_id == state.local_node_id => return Ok(None),
+        Some(authority_id) if targets.contains(&authority_id) => {
             prefer_known_state_authority_node(&mut targets, &authority_id);
             Some(authority_id)
         }
-        _ if sinomo_kv::cluster_kv_raft_local_is_voter(state) => {
-            return Ok(None);
-        }
+        // A missing hint is not evidence that this voter should campaign.
+        // Exact remote voters independently validate current-term leadership.
         _ => None,
     };
 
     let mut failures = Vec::new();
-    let deadline = Instant::now() + options.timeout;
+    let mut rejected_preferred_authority = None;
     for (index, target) in targets.iter().enumerate() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -137,31 +445,41 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
             ));
             break;
         }
+        let attempt_timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
+        let attempt_deadline = cluster_kv_forward_attempt_deadline(deadline, attempt_timeout);
         match forward_cluster_kv_txn_to_state_authority_node_with_host(
             paths,
             state,
             target,
             request,
-            options.routed_node_attempt_timeout(remaining, targets.len() - index),
+            attempt_timeout,
+            attempt_deadline,
             host,
         ) {
             Ok(response) => return Ok(Some(response)),
             Err(error) => {
                 failures.push(format!("node {target} failed: {error}"));
-                if verified_non_leader_rejects_preferred_authority(
+                record_verified_non_leader_rejected_preferred_authority(
                     &error,
                     preferred_authority_id.as_ref(),
                     target,
-                ) || !cluster_kv_forward_error_allows_next_authority(&error, target)
-                {
+                );
+                retain_verified_non_leader_rejected_preferred_authority(
+                    &mut rejected_preferred_authority,
+                    &error,
+                    preferred_authority_id.as_ref(),
+                    target,
+                );
+                if !cluster_kv_forward_error_allows_next_authority(&error, target) {
                     return Err(error);
                 }
             }
         }
     }
 
-    Err(NetworkError::ClusterReadOnly {
-        detail: format!(
+    Err(cluster_kv_forward_terminal_error(
+        rejected_preferred_authority,
+        format!(
             "could not forward cluster KV transaction to any known state authority{}",
             if failures.is_empty() {
                 String::new()
@@ -169,7 +487,7 @@ pub fn forward_cluster_kv_txn_to_state_authority_with_host(
                 format!(": {}", failures.join("; "))
             }
         ),
-    })
+    ))
 }
 
 pub fn forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
@@ -178,9 +496,7 @@ pub fn forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
     options: ClusterKvTxnForwardOptions,
     host: &mut impl ClusterKvTxnForwardHost,
 ) -> Result<Option<KvAuthoritativeRead<KvSnapshot>>, NetworkError> {
-    let mut targets = ClusterEndpointSelector::new(paths, state).select_internal_unique_node_ids(
-        ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
-    );
+    let mut targets = projected_remote_cluster_kv_voters(state)?;
     if targets.is_empty() {
         return Ok(None);
     }
@@ -189,21 +505,19 @@ pub fn forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
         .ok()
         .flatten()
     {
-        Some(authority_id)
-            if !cluster_node_blocks_leader_preference(paths, state, &authority_id) =>
-        {
-            if authority_id == state.local_node_id {
-                return Ok(None);
-            }
+        Some(authority_id) if authority_id == state.local_node_id => return Ok(None),
+        Some(authority_id) if targets.contains(&authority_id) => {
             prefer_known_state_authority_node(&mut targets, &authority_id);
             Some(authority_id)
         }
-        _ if sinomo_kv::cluster_kv_raft_local_is_voter(state) => return Ok(None),
+        // A missing hint is not evidence that this voter should campaign.
+        // Exact remote voters independently validate current-term leadership.
         _ => None,
     };
 
     let deadline = Instant::now() + options.timeout;
     let mut failures = Vec::new();
+    let mut rejected_preferred_authority = None;
     for (index, target) in targets.iter().enumerate() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -216,19 +530,28 @@ pub fn forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
             ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
                 .with_response_retry_safe();
         let timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
-        match host.call_node_object_rpc(state, target, &request, timeout) {
+        match host
+            .call_node_object_rpc(state, target, &request, timeout)
+            .map_err(|error| verified_cluster_non_leader_error(target, error))
+        {
             Ok(response) => {
                 if let Err(error) = response
                     .error_detail()
                     .map_err(|error| verified_cluster_non_leader_error(target, error))
                 {
                     failures.push(format!("node {target} failed: {error}"));
-                    if verified_non_leader_rejects_preferred_authority(
+                    record_verified_non_leader_rejected_preferred_authority(
                         &error,
                         preferred_authority_id.as_ref(),
                         target,
-                    ) || !cluster_kv_forward_error_allows_next_authority(&error, target)
-                    {
+                    );
+                    retain_verified_non_leader_rejected_preferred_authority(
+                        &mut rejected_preferred_authority,
+                        &error,
+                        preferred_authority_id.as_ref(),
+                        target,
+                    );
+                    if !cluster_kv_forward_error_allows_next_authority(&error, target) {
                         return Err(error);
                     }
                     continue;
@@ -236,13 +559,30 @@ pub fn forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
                 let read =
                     sinomo_kv::decode_cluster_kv_authoritative_snapshot_rpc_body(&response.body)
                         .map_err(kv_err)?;
-                return Ok(Some(read));
+                return validate_forwarded_authoritative_snapshot_read(read, state).map(Some);
             }
-            Err(error) => failures.push(format!("node {target} failed: {error}")),
+            Err(error) => {
+                failures.push(format!("node {target} failed: {error}"));
+                record_verified_non_leader_rejected_preferred_authority(
+                    &error,
+                    preferred_authority_id.as_ref(),
+                    target,
+                );
+                retain_verified_non_leader_rejected_preferred_authority(
+                    &mut rejected_preferred_authority,
+                    &error,
+                    preferred_authority_id.as_ref(),
+                    target,
+                );
+                if !cluster_kv_forward_error_allows_next_authority(&error, target) {
+                    return Err(error);
+                }
+            }
         }
     }
-    Err(NetworkError::ClusterReadOnly {
-        detail: format!(
+    Err(cluster_kv_forward_terminal_error(
+        rejected_preferred_authority,
+        format!(
             "could not establish an authoritative cluster KV read{}",
             if failures.is_empty() {
                 String::new()
@@ -250,7 +590,7 @@ pub fn forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
                 format!(": {}", failures.join("; "))
             }
         ),
-    })
+    ))
 }
 
 fn forward_cluster_kv_txn_to_state_authority_node_with_host(
@@ -259,9 +599,9 @@ fn forward_cluster_kv_txn_to_state_authority_node_with_host(
     target_node_id: &NodeId,
     request: &KvTxnRequest,
     timeout: Duration,
+    deadline: Instant,
     host: &mut impl ClusterKvTxnForwardHost,
 ) -> Result<ClusterKvTxnCommitResult, NetworkError> {
-    let deadline = Instant::now() + timeout;
     let kv_paths = paths.kv_paths();
     let mut observed_generation = sinomo_kv::cluster_kv_watch_generation(&kv_paths);
     let txn_payload = sinomo_kv::cluster_kv_txn_rpc_payload(request).map_err(kv_err)?;
@@ -270,27 +610,24 @@ fn forward_cluster_kv_txn_to_state_authority_node_with_host(
         txn_payload.category,
         txn_payload.body,
     );
-    let txn_response = host.call_node_object_rpc(state, target_node_id, &txn_request, timeout)?;
+    let rpc_timeout = forwarded_cluster_kv_txn_remaining(deadline, timeout)?;
+    let txn_response = host
+        .call_node_object_rpc(state, target_node_id, &txn_request, rpc_timeout)
+        .map_err(|error| verified_cluster_non_leader_error(target_node_id, error))?;
     txn_response
         .error_detail()
         .map_err(|error| verified_cluster_non_leader_error(target_node_id, error))?;
     let response = sinomo_kv::decode_cluster_kv_txn_rpc_body(&txn_response.body).map_err(kv_err)?;
-    let local_snapshot = read_cluster_kv_latest_observed_snapshot_arc_if_present(paths)
-        .ok()
-        .flatten()
-        .map(|snapshot| (*snapshot).clone());
-    if let Some(result) =
-        try_materialize_forwarded_cluster_kv_txn_response(request, &response, local_snapshot)?
-    {
+    if let Some(result) = try_materialize_forwarded_cluster_kv_txn_response_from_hot_local_cache(
+        paths, request, &response, deadline, timeout,
+    )? {
         return Ok(result);
     }
 
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .unwrap_or_default();
+    let remaining = forwarded_cluster_kv_txn_remaining(deadline, timeout)?;
     let fanout_wait = remaining.min(FORWARDED_CLUSTER_KV_FANOUT_GRACE);
     if !fanout_wait.is_zero() {
-        let fanout_deadline = Instant::now() + fanout_wait;
+        let fanout_deadline = cluster_kv_forward_attempt_deadline(deadline, fanout_wait);
         loop {
             let wait = fanout_deadline.saturating_duration_since(Instant::now());
             if wait.is_zero()
@@ -303,15 +640,11 @@ fn forward_cluster_kv_txn_to_state_authority_node_with_host(
                 break;
             }
             observed_generation = sinomo_kv::cluster_kv_watch_generation(&kv_paths);
-            let local_snapshot = read_cluster_kv_latest_observed_snapshot_arc_if_present(paths)
-                .ok()
-                .flatten()
-                .map(|snapshot| (*snapshot).clone());
-            if let Some(result) = try_materialize_forwarded_cluster_kv_txn_response(
-                request,
-                &response,
-                local_snapshot,
-            )? {
+            if let Some(result) =
+                try_materialize_forwarded_cluster_kv_txn_response_from_hot_local_cache(
+                    paths, request, &response, deadline, timeout,
+                )?
+            {
                 metrics::counter!(
                     "sinomo.kv.forward.materialization",
                     "source" => "committed_fanout"
@@ -327,12 +660,13 @@ fn forward_cluster_kv_txn_to_state_authority_node_with_host(
         "source" => "authoritative_snapshot"
     )
     .increment(1);
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .unwrap_or_default();
+    let remaining = forwarded_cluster_kv_txn_remaining(deadline, timeout)?;
     let snapshot =
         fetch_cluster_kv_snapshot_from_node_with_host(state, target_node_id, remaining, host)?;
-    materialize_forwarded_cluster_kv_txn_response_from_snapshot(request, response, snapshot)
+    let result =
+        materialize_forwarded_cluster_kv_txn_response_from_snapshot(request, response, snapshot)?;
+    forwarded_cluster_kv_txn_remaining(deadline, timeout)?;
+    Ok(result)
 }
 
 pub async fn forward_cluster_kv_txn_to_state_authority_async_with_host<H>(
@@ -346,44 +680,23 @@ pub async fn forward_cluster_kv_txn_to_state_authority_async_with_host<H>(
 where
     H: ClusterObjectRpcAsyncHost + Send,
 {
-    let mut targets = ClusterEndpointSelector::select_internal_unique_node_ids_async(
-        runtime,
-        paths,
-        state,
-        ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
-    )
-    .await?;
-    if targets.is_empty() {
+    let deadline = cluster_kv_forward_deadline(options.timeout);
+    let Some((targets, preferred_authority_id)) =
+        cluster_kv_forward_authority_targets_before_deadline(
+            runtime,
+            paths,
+            state,
+            deadline,
+            options.timeout,
+            "forward cluster KV transaction",
+        )
+        .await?
+    else {
         return Ok(None);
-    }
-    let known_authority_id = locked_kv_state_authority_id_async(runtime, paths, state)
-        .await
-        .ok()
-        .flatten();
-    let preferred_authority_id = match known_authority_id {
-        Some(authority_id)
-            if !cluster_node_blocks_leader_preference_async(
-                runtime,
-                paths,
-                state,
-                &authority_id,
-            )
-            .await? =>
-        {
-            if authority_id == state.local_node_id {
-                return Ok(None);
-            }
-            prefer_known_state_authority_node(&mut targets, &authority_id);
-            Some(authority_id)
-        }
-        _ if sinomo_kv::cluster_kv_raft_local_is_voter(state) => {
-            return Ok(None);
-        }
-        _ => None,
     };
 
     let mut failures = Vec::new();
-    let deadline = Instant::now() + options.timeout;
+    let mut rejected_preferred_authority = None;
     for (index, target) in targets.iter().enumerate() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -395,12 +708,15 @@ where
             ));
             break;
         }
+        let attempt_timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
+        let attempt_deadline = cluster_kv_forward_attempt_deadline(deadline, attempt_timeout);
         match forward_cluster_kv_txn_to_state_authority_node_async_with_host(
             paths,
             state,
             target,
             request,
-            options.routed_node_attempt_timeout(remaining, targets.len() - index),
+            attempt_timeout,
+            attempt_deadline,
             host,
         )
         .await
@@ -408,20 +724,27 @@ where
             Ok(response) => return Ok(Some(response)),
             Err(error) => {
                 failures.push(format!("node {target} failed: {error}"));
-                if verified_non_leader_rejects_preferred_authority(
+                record_verified_non_leader_rejected_preferred_authority(
                     &error,
                     preferred_authority_id.as_ref(),
                     target,
-                ) || !cluster_kv_forward_error_allows_next_authority(&error, target)
-                {
+                );
+                retain_verified_non_leader_rejected_preferred_authority(
+                    &mut rejected_preferred_authority,
+                    &error,
+                    preferred_authority_id.as_ref(),
+                    target,
+                );
+                if !cluster_kv_forward_error_allows_next_authority(&error, target) {
                     return Err(error);
                 }
             }
         }
     }
 
-    Err(NetworkError::ClusterReadOnly {
-        detail: format!(
+    Err(cluster_kv_forward_terminal_error(
+        rejected_preferred_authority,
+        format!(
             "could not forward cluster KV transaction to any known state authority{}",
             if failures.is_empty() {
                 String::new()
@@ -429,7 +752,7 @@ where
                 format!(": {}", failures.join("; "))
             }
         ),
-    })
+    ))
 }
 
 async fn forward_cluster_kv_txn_compact_to_node_async_with_host<H>(
@@ -443,9 +766,11 @@ async fn forward_cluster_kv_txn_compact_to_node_async_with_host<H>(
 where
     H: ClusterObjectRpcAsyncHost + Send,
 {
-    let mut client = ClusterObjectRpcClient::routed(host, paths);
-    let response = client
-        .call_target(
+    let mut client =
+        ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(host, paths, state)?;
+    let response = await_authenticated_cluster_kv_target(
+        target_node_id,
+        client.call_target(
             state,
             target_node_id,
             ObjectRpcCall::encode_borrowed_value(
@@ -453,12 +778,15 @@ where
                 sinomo_kv::CLUSTER_KV_RPC_CATEGORY,
                 request,
             )?,
-            ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
-        )
-        .await?
-        .decode_body::<ClusterKvTxnRpcResponse>()
-        .await
-        .map_err(|error| verified_cluster_non_leader_error(target_node_id, error))?;
+            main_daemon_cluster_rpc_options(
+                ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
+            ),
+        ),
+    )
+    .await?
+    .decode_body::<ClusterKvTxnRpcResponse>()
+    .await
+    .map_err(|error| verified_cluster_non_leader_error(target_node_id, error))?;
     if response.request_id != request.request_id {
         return Err(forwarded_cluster_kv_request_id_mismatch(
             request,
@@ -489,41 +817,22 @@ pub async fn forward_cluster_kv_txn_compact_to_state_authority_async_with_host<H
 where
     H: ClusterObjectRpcAsyncHost + Send,
 {
-    let mut targets = ClusterEndpointSelector::select_internal_unique_node_ids_async(
-        runtime,
-        paths,
-        state,
-        ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
-    )
-    .await?;
-    if targets.is_empty() {
+    let deadline = cluster_kv_forward_deadline(options.timeout);
+    let Some((targets, preferred_authority_id)) =
+        cluster_kv_forward_authority_targets_before_deadline(
+            runtime,
+            paths,
+            state,
+            deadline,
+            options.timeout,
+            "forward compact cluster KV transaction",
+        )
+        .await?
+    else {
         return Ok(None);
-    }
-    let preferred_authority_id = match locked_kv_state_authority_id_async(runtime, paths, state)
-        .await
-        .ok()
-        .flatten()
-    {
-        Some(authority_id)
-            if !cluster_node_blocks_leader_preference_async(
-                runtime,
-                paths,
-                state,
-                &authority_id,
-            )
-            .await? =>
-        {
-            if authority_id == state.local_node_id {
-                return Ok(None);
-            }
-            prefer_known_state_authority_node(&mut targets, &authority_id);
-            Some(authority_id)
-        }
-        _ if sinomo_kv::cluster_kv_raft_local_is_voter(state) => return Ok(None),
-        _ => None,
     };
-    let deadline = Instant::now() + options.timeout;
     let mut failures = Vec::new();
+    let mut rejected_preferred_authority = None;
     for (index, target) in targets.iter().enumerate() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -542,19 +851,26 @@ where
             Ok(response) => return Ok(Some(response)),
             Err(error) => {
                 failures.push(format!("node {target} failed: {error}"));
-                if verified_non_leader_rejects_preferred_authority(
+                record_verified_non_leader_rejected_preferred_authority(
                     &error,
                     preferred_authority_id.as_ref(),
                     target,
-                ) || !cluster_kv_forward_error_allows_next_authority(&error, target)
-                {
+                );
+                retain_verified_non_leader_rejected_preferred_authority(
+                    &mut rejected_preferred_authority,
+                    &error,
+                    preferred_authority_id.as_ref(),
+                    target,
+                );
+                if !cluster_kv_forward_error_allows_next_authority(&error, target) {
                     return Err(error);
                 }
             }
         }
     }
-    Err(NetworkError::ClusterReadOnly {
-        detail: format!(
+    Err(cluster_kv_forward_terminal_error(
+        rejected_preferred_authority,
+        format!(
             "could not forward compact cluster KV transaction to any known state authority{}",
             if failures.is_empty() {
                 String::new()
@@ -562,7 +878,7 @@ where
                 format!(": {}", failures.join("; "))
             }
         ),
-    })
+    ))
 }
 
 pub async fn forward_cluster_kv_authoritative_snapshot_to_state_authority_async_with_host<H>(
@@ -575,42 +891,22 @@ pub async fn forward_cluster_kv_authoritative_snapshot_to_state_authority_async_
 where
     H: ClusterObjectRpcAsyncHost + Send,
 {
-    let mut targets = ClusterEndpointSelector::select_internal_unique_node_ids_async(
-        runtime,
-        paths,
-        state,
-        ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
-    )
-    .await?;
-    if targets.is_empty() {
+    let deadline = cluster_kv_forward_deadline(options.timeout);
+    let Some((targets, preferred_authority_id)) =
+        cluster_kv_forward_authority_targets_before_deadline(
+            runtime,
+            paths,
+            state,
+            deadline,
+            options.timeout,
+            "forward authoritative cluster KV snapshot",
+        )
+        .await?
+    else {
         return Ok(None);
-    }
-    let preferred_authority_id = match locked_kv_state_authority_id_async(runtime, paths, state)
-        .await
-        .ok()
-        .flatten()
-    {
-        Some(authority_id)
-            if !cluster_node_blocks_leader_preference_async(
-                runtime,
-                paths,
-                state,
-                &authority_id,
-            )
-            .await? =>
-        {
-            if authority_id == state.local_node_id {
-                return Ok(None);
-            }
-            prefer_known_state_authority_node(&mut targets, &authority_id);
-            Some(authority_id)
-        }
-        _ if sinomo_kv::cluster_kv_raft_local_is_voter(state) => return Ok(None),
-        _ => None,
     };
-
-    let deadline = Instant::now() + options.timeout;
     let mut failures = Vec::new();
+    let mut rejected_preferred_authority = None;
     for (index, target) in targets.iter().enumerate() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -625,45 +921,50 @@ where
         )?;
         call.request = call.request.with_response_retry_safe();
         let timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
-        let mut client = ClusterObjectRpcClient::routed(host, paths);
-        match client
-            .call_target(
+        let attempt_deadline = cluster_kv_forward_attempt_deadline(deadline, timeout);
+        let mut client =
+            ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(host, paths, state)?;
+        match decode_forwarded_cluster_kv_authority_before::<KvAuthoritativeRead<KvSnapshot>, _>(
+            target,
+            "forward authoritative cluster KV snapshot",
+            attempt_deadline,
+            timeout,
+            client.call_target(
                 state,
                 target,
                 call,
-                ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
-            )
-            .await
+                main_daemon_cluster_rpc_options(
+                    ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
+                ),
+            ),
+        )
+        .await
         {
-            Ok(result) => {
-                let read = match result
-                    .decode_body::<KvAuthoritativeRead<KvSnapshot>>()
-                    .await
-                {
-                    Ok(read) => read,
-                    Err(error) => {
-                        let error = verified_cluster_non_leader_error(target, error);
-                        failures.push(format!("node {target} failed: {error}"));
-                        if verified_non_leader_rejects_preferred_authority(
-                            &error,
-                            preferred_authority_id.as_ref(),
-                            target,
-                        ) || !cluster_kv_forward_error_allows_next_authority(&error, target)
-                        {
-                            return Err(error);
-                        }
-                        continue;
-                    }
-                };
-                sinomo_kv::validate_cluster_kv_authoritative_snapshot_read(&read)
-                    .map_err(kv_err)?;
-                return Ok(Some(read));
+            Ok(read) => {
+                return validate_forwarded_authoritative_snapshot_read(read, state).map(Some);
             }
-            Err(error) => failures.push(format!("node {target} failed: {error}")),
+            Err(error) => {
+                failures.push(format!("node {target} failed: {error}"));
+                record_verified_non_leader_rejected_preferred_authority(
+                    &error,
+                    preferred_authority_id.as_ref(),
+                    target,
+                );
+                retain_verified_non_leader_rejected_preferred_authority(
+                    &mut rejected_preferred_authority,
+                    &error,
+                    preferred_authority_id.as_ref(),
+                    target,
+                );
+                if !cluster_kv_forward_error_allows_next_authority(&error, target) {
+                    return Err(error);
+                }
+            }
         }
     }
-    Err(NetworkError::ClusterReadOnly {
-        detail: format!(
+    Err(cluster_kv_forward_terminal_error(
+        rejected_preferred_authority,
+        format!(
             "could not establish an authoritative cluster KV read{}",
             if failures.is_empty() {
                 String::new()
@@ -671,7 +972,7 @@ where
                 format!(": {}", failures.join("; "))
             }
         ),
-    })
+    ))
 }
 
 /// Forwards a request-outcome lookup to the selected state authority without
@@ -689,42 +990,22 @@ pub async fn forward_cluster_kv_request_outcome_to_state_authority_async_with_ho
 where
     H: ClusterObjectRpcAsyncHost + Send,
 {
-    let mut targets = ClusterEndpointSelector::select_internal_unique_node_ids_async(
-        runtime,
-        paths,
-        state,
-        ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
-    )
-    .await?;
-    if targets.is_empty() {
+    let deadline = cluster_kv_forward_deadline(options.timeout);
+    let Some((targets, preferred_authority_id)) =
+        cluster_kv_forward_authority_targets_before_deadline(
+            runtime,
+            paths,
+            state,
+            deadline,
+            options.timeout,
+            "forward authoritative cluster KV request outcome",
+        )
+        .await?
+    else {
         return Ok(None);
-    }
-    let preferred_authority_id = match locked_kv_state_authority_id_async(runtime, paths, state)
-        .await
-        .ok()
-        .flatten()
-    {
-        Some(authority_id)
-            if !cluster_node_blocks_leader_preference_async(
-                runtime,
-                paths,
-                state,
-                &authority_id,
-            )
-            .await? =>
-        {
-            if authority_id == state.local_node_id {
-                return Ok(None);
-            }
-            prefer_known_state_authority_node(&mut targets, &authority_id);
-            Some(authority_id)
-        }
-        _ if sinomo_kv::cluster_kv_raft_local_is_voter(state) => return Ok(None),
-        _ => None,
     };
-
-    let deadline = Instant::now() + options.timeout;
     let mut failures = Vec::new();
+    let mut rejected_preferred_authority = None;
     for (index, target) in targets.iter().enumerate() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -732,40 +1013,50 @@ where
         }
         let call = cluster_kv_request_outcome_forward_call(request_id)?;
         let timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
-        let mut client = ClusterObjectRpcClient::routed(host, paths);
-        match client
-            .call_target(
+        let attempt_deadline = cluster_kv_forward_attempt_deadline(deadline, timeout);
+        let mut client =
+            ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(host, paths, state)?;
+        match decode_forwarded_cluster_kv_authority_before::<ClusterKvRequestOutcomeRead, _>(
+            target,
+            "forward authoritative cluster KV request outcome",
+            attempt_deadline,
+            timeout,
+            client.call_target(
                 state,
                 target,
                 call,
-                ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
-            )
-            .await
+                main_daemon_cluster_rpc_options(
+                    ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
+                ),
+            ),
+        )
+        .await
         {
-            Ok(result) => {
-                let read = match result.decode_body::<ClusterKvRequestOutcomeRead>().await {
-                    Ok(read) => read,
-                    Err(error) => {
-                        let error = verified_cluster_non_leader_error(target, error);
-                        failures.push(format!("node {target} failed: {error}"));
-                        if verified_non_leader_rejects_preferred_authority(
-                            &error,
-                            preferred_authority_id.as_ref(),
-                            target,
-                        ) || !cluster_kv_forward_error_allows_next_authority(&error, target)
-                        {
-                            return Err(error);
-                        }
-                        continue;
-                    }
-                };
+            Ok(read) => {
                 return validate_forwarded_request_outcome_read(read, state, request_id).map(Some);
             }
-            Err(error) => failures.push(format!("node {target} failed: {error}")),
+            Err(error) => {
+                failures.push(format!("node {target} failed: {error}"));
+                record_verified_non_leader_rejected_preferred_authority(
+                    &error,
+                    preferred_authority_id.as_ref(),
+                    target,
+                );
+                retain_verified_non_leader_rejected_preferred_authority(
+                    &mut rejected_preferred_authority,
+                    &error,
+                    preferred_authority_id.as_ref(),
+                    target,
+                );
+                if !cluster_kv_forward_error_allows_next_authority(&error, target) {
+                    return Err(error);
+                }
+            }
         }
     }
-    Err(NetworkError::ClusterReadOnly {
-        detail: format!(
+    Err(cluster_kv_forward_terminal_error(
+        rejected_preferred_authority,
+        format!(
             "could not establish an authoritative cluster KV request outcome{}",
             if failures.is_empty() {
                 String::new()
@@ -773,7 +1064,7 @@ where
                 format!(": {}", failures.join("; "))
             }
         ),
-    })
+    ))
 }
 
 fn cluster_kv_request_outcome_forward_call(
@@ -788,6 +1079,78 @@ fn cluster_kv_request_outcome_forward_call(
     )?;
     call.request = call.request.with_response_retry_safe();
     Ok(call)
+}
+
+/// Reject a forwarded proof that predates either scalar authority floor the
+/// caller already observed. A higher term cannot compensate for an older
+/// committed KV generation, and a higher revision cannot compensate for an
+/// older term.
+pub(crate) fn validate_forwarded_cluster_kv_authority_floor(
+    authority: &KvAuthorityProof,
+    state: &ClusterBootstrapState,
+    proof_kind: &'static str,
+) -> Result<(), NetworkError> {
+    if authority.term < state.term {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "{proof_kind} term {} is older than locally observed term {}",
+                authority.term, state.term
+            ),
+        });
+    }
+    if authority.revision.0 < state.kv_revision {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "{proof_kind} revision {} is older than locally observed revision {}",
+                authority.revision.0, state.kv_revision
+            ),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_forwarded_authoritative_snapshot_read(
+    read: KvAuthoritativeRead<KvSnapshot>,
+    state: &ClusterBootstrapState,
+) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError> {
+    sinomo_kv::validate_cluster_kv_authoritative_snapshot_read(&read).map_err(kv_err)?;
+    let voter_count = sinomo_kv::cluster_kv_raft_voter_ids(state)
+        .map_err(kv_err)?
+        .len();
+    let expected_quorum = sinomo_kv::cluster_kv_raft_quorum_size(voter_count);
+    let KvAuthorityBasis::CurrentTermQuorum {
+        voter_acks,
+        required_quorum,
+    } = read.authority.basis
+    else {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: "authoritative snapshot read was not current-term quorum confirmed".to_string(),
+        });
+    };
+    if required_quorum != expected_quorum
+        || voter_acks < required_quorum
+        || voter_acks > voter_count
+    {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "authoritative snapshot proof reported {voter_acks} voter acknowledgements and quorum {required_quorum}, but committed membership has {voter_count} voters and requires {expected_quorum}"
+            ),
+        });
+    }
+    validate_forwarded_cluster_kv_authority_floor(
+        &read.authority,
+        state,
+        "authoritative snapshot proof",
+    )?;
+    if read.authority.revision != read.value.revision {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "authoritative proof revision {} does not match returned snapshot revision {}",
+                read.authority.revision.0, read.value.revision.0
+            ),
+        });
+    }
+    Ok(read)
 }
 
 fn validate_forwarded_request_outcome_read(
@@ -820,14 +1183,11 @@ fn validate_forwarded_request_outcome_read(
             ),
         });
     }
-    if read.authority.term < state.term {
-        return Err(NetworkError::ClusterReadOnly {
-            detail: format!(
-                "authoritative request-outcome proof term {} is older than locally observed term {}",
-                read.authority.term, state.term
-            ),
-        });
-    }
+    validate_forwarded_cluster_kv_authority_floor(
+        &read.authority,
+        state,
+        "authoritative request-outcome proof",
+    )?;
     if let KvRequestOutcome::Committed(record) = &read.outcome
         && &record.request_id != request_id
     {
@@ -838,6 +1198,311 @@ fn validate_forwarded_request_outcome_read(
             ),
         });
     }
+    Ok(read)
+}
+
+/// Forwards one authoritative point read directly to the selected state
+/// authority. Point reads must use the exact-entry route: implementing them as
+/// prefix reads makes unrelated keys that share the requested key string count
+/// against the bounded prefix cardinality and payload limits.
+pub async fn forward_cluster_kv_authoritative_entry_to_state_authority_async_with_host<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    key: &str,
+    options: ClusterKvTxnForwardOptions,
+    host: &mut H,
+) -> Result<Option<KvAuthoritativeRead<Option<KvEntry>>>, NetworkError>
+where
+    H: ClusterObjectRpcAsyncHost + Send,
+{
+    let deadline = cluster_kv_forward_deadline(options.timeout);
+    let Some((targets, preferred_authority_id)) =
+        cluster_kv_forward_authority_targets_before_deadline(
+            runtime,
+            paths,
+            state,
+            deadline,
+            options.timeout,
+            "forward authoritative cluster KV point read",
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut failures = Vec::new();
+    let mut rejected_preferred_authority = None;
+    for (index, target) in targets.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let call = cluster_kv_authoritative_entry_forward_call(key)?;
+        let timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
+        let attempt_deadline = cluster_kv_forward_attempt_deadline(deadline, timeout);
+        let mut client =
+            ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(host, paths, state)?;
+        match decode_forwarded_cluster_kv_authority_before::<
+            KvAuthoritativeRead<Option<KvEntry>>,
+            _,
+        >(
+            target,
+            "forward authoritative cluster KV point read",
+            attempt_deadline,
+            timeout,
+            client.call_target(
+                state,
+                target,
+                call,
+                main_daemon_cluster_rpc_options(
+                    ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
+                ),
+            ),
+        )
+        .await
+        {
+            Ok(read) => {
+                return validate_forwarded_authoritative_entry_read(read, state, key).map(Some);
+            }
+            Err(error) => {
+                failures.push(format!("node {target} failed: {error}"));
+                record_verified_non_leader_rejected_preferred_authority(
+                    &error,
+                    preferred_authority_id.as_ref(),
+                    target,
+                );
+                retain_verified_non_leader_rejected_preferred_authority(
+                    &mut rejected_preferred_authority,
+                    &error,
+                    preferred_authority_id.as_ref(),
+                    target,
+                );
+                if !cluster_kv_forward_error_allows_next_authority(&error, target) {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    Err(cluster_kv_forward_terminal_error(
+        rejected_preferred_authority,
+        format!(
+            "could not establish an authoritative cluster KV point read{}",
+            if failures.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", failures.join("; "))
+            }
+        ),
+    ))
+}
+
+fn cluster_kv_authoritative_entry_forward_call(key: &str) -> Result<ObjectRpcCall, NetworkError> {
+    let mut call = ObjectRpcCall::encode_value(
+        sinomo_kv::CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE,
+        sinomo_kv::CLUSTER_KV_RPC_CATEGORY,
+        sinomo_kv::ClusterKvEntryRequest {
+            key: key.to_string(),
+        },
+    )?;
+    call.request = call.request.with_response_retry_safe();
+    Ok(call)
+}
+
+fn validate_forwarded_authoritative_entry_read(
+    read: KvAuthoritativeRead<Option<KvEntry>>,
+    state: &ClusterBootstrapState,
+    key: &str,
+) -> Result<KvAuthoritativeRead<Option<KvEntry>>, NetworkError> {
+    sinomo_kv::validate_cluster_kv_authoritative_entry_read(&read).map_err(kv_err)?;
+    let voter_count = sinomo_kv::cluster_kv_raft_voter_ids(state)
+        .map_err(kv_err)?
+        .len();
+    let expected_quorum = sinomo_kv::cluster_kv_raft_quorum_size(voter_count);
+    let KvAuthorityBasis::CurrentTermQuorum {
+        voter_acks,
+        required_quorum,
+    } = read.authority.basis
+    else {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: "authoritative point read was not current-term quorum confirmed".to_string(),
+        });
+    };
+    if required_quorum != expected_quorum
+        || voter_acks < required_quorum
+        || voter_acks > voter_count
+    {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "authoritative point proof reported {voter_acks} voter acknowledgements and quorum {required_quorum}, but committed membership has {voter_count} voters and requires {expected_quorum}"
+            ),
+        });
+    }
+    validate_forwarded_cluster_kv_authority_floor(
+        &read.authority,
+        state,
+        "authoritative point proof",
+    )?;
+    if let Some(entry) = read.value.as_ref()
+        && entry.key != key
+    {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "authoritative point response returned key {:?} for requested key {:?}",
+                entry.key, key
+            ),
+        });
+    }
+    Ok(read)
+}
+
+/// Forwards an ordered exact-key set as one authoritative operation. The
+/// authority performs one ReadIndex and returns exactly one slot per requested
+/// key, so unrelated writes cannot make a multi-key read straddle revisions.
+pub async fn forward_cluster_kv_authoritative_entries_to_state_authority_async_with_host<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    keys: &[String],
+    options: ClusterKvTxnForwardOptions,
+    host: &mut H,
+) -> Result<Option<KvAuthoritativeRead<Vec<Option<KvEntry>>>>, NetworkError>
+where
+    H: ClusterObjectRpcAsyncHost + Send,
+{
+    let deadline = cluster_kv_forward_deadline(options.timeout);
+    sinomo_kv::validate_cluster_kv_authoritative_entries_request_keys(keys).map_err(kv_err)?;
+    let Some((targets, preferred_authority_id)) =
+        cluster_kv_forward_authority_targets_before_deadline(
+            runtime,
+            paths,
+            state,
+            deadline,
+            options.timeout,
+            "forward authoritative cluster KV exact-key-set read",
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut failures = Vec::new();
+    let mut rejected_preferred_authority = None;
+    for (index, target) in targets.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let call = cluster_kv_authoritative_entries_forward_call(keys)?;
+        let timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
+        let attempt_deadline = cluster_kv_forward_attempt_deadline(deadline, timeout);
+        let mut client =
+            ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(host, paths, state)?;
+        match decode_forwarded_cluster_kv_authority_before::<
+            sinomo_kv::ClusterKvAuthoritativeEntriesResponse,
+            _,
+        >(
+            target,
+            "forward authoritative cluster KV exact-key-set read",
+            attempt_deadline,
+            timeout,
+            client.call_target(
+                state,
+                target,
+                call,
+                main_daemon_cluster_rpc_options(
+                    ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
+                ),
+            ),
+        )
+        .await
+        {
+            Ok(response) => {
+                let read =
+                    sinomo_kv::unpack_cluster_kv_authoritative_entries_response(keys, response)
+                        .map_err(kv_err)?;
+                return validate_forwarded_authoritative_entries_read(read, state, keys).map(Some);
+            }
+            Err(error) => {
+                failures.push(format!("node {target} failed: {error}"));
+                record_verified_non_leader_rejected_preferred_authority(
+                    &error,
+                    preferred_authority_id.as_ref(),
+                    target,
+                );
+                retain_verified_non_leader_rejected_preferred_authority(
+                    &mut rejected_preferred_authority,
+                    &error,
+                    preferred_authority_id.as_ref(),
+                    target,
+                );
+                if !cluster_kv_forward_error_allows_next_authority(&error, target) {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    Err(cluster_kv_forward_terminal_error(
+        rejected_preferred_authority,
+        format!(
+            "could not establish an authoritative cluster KV exact-key-set read{}",
+            if failures.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", failures.join("; "))
+            }
+        ),
+    ))
+}
+
+fn cluster_kv_authoritative_entries_forward_call(
+    keys: &[String],
+) -> Result<ObjectRpcCall, NetworkError> {
+    sinomo_kv::validate_cluster_kv_authoritative_entries_request_keys(keys).map_err(kv_err)?;
+    let mut call = ObjectRpcCall::encode_value(
+        sinomo_kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE,
+        sinomo_kv::CLUSTER_KV_RPC_CATEGORY,
+        sinomo_kv::ClusterKvAuthoritativeEntriesRequest {
+            keys: keys.to_vec(),
+        },
+    )?;
+    call.request = call.request.with_response_retry_safe();
+    Ok(call)
+}
+
+pub(crate) fn validate_forwarded_authoritative_entries_read(
+    read: KvAuthoritativeRead<Vec<Option<KvEntry>>>,
+    state: &ClusterBootstrapState,
+    keys: &[String],
+) -> Result<KvAuthoritativeRead<Vec<Option<KvEntry>>>, NetworkError> {
+    sinomo_kv::validate_cluster_kv_authoritative_entries_read(keys, &read).map_err(kv_err)?;
+    let voter_count = sinomo_kv::cluster_kv_raft_voter_ids(state)
+        .map_err(kv_err)?
+        .len();
+    let expected_quorum = sinomo_kv::cluster_kv_raft_quorum_size(voter_count);
+    let KvAuthorityBasis::CurrentTermQuorum {
+        voter_acks,
+        required_quorum,
+    } = read.authority.basis
+    else {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: "authoritative exact-key-set read was not current-term quorum confirmed"
+                .to_string(),
+        });
+    };
+    if required_quorum != expected_quorum
+        || voter_acks < required_quorum
+        || voter_acks > voter_count
+    {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: format!(
+                "authoritative exact-key-set proof reported {voter_acks} voter acknowledgements and quorum {required_quorum}, but committed membership has {voter_count} voters and requires {expected_quorum}"
+            ),
+        });
+    }
+    validate_forwarded_cluster_kv_authority_floor(
+        &read.authority,
+        state,
+        "authoritative exact-key-set proof",
+    )?;
     Ok(read)
 }
 
@@ -856,42 +1521,22 @@ pub async fn forward_cluster_kv_authoritative_range_prefix_to_state_authority_as
 where
     H: ClusterObjectRpcAsyncHost + Send,
 {
-    let mut targets = ClusterEndpointSelector::select_internal_unique_node_ids_async(
-        runtime,
-        paths,
-        state,
-        ClusterEndpointInternalSelectionPurpose::LiveClusterStateAuthorityCommand,
-    )
-    .await?;
-    if targets.is_empty() {
+    let deadline = cluster_kv_forward_deadline(options.timeout);
+    let Some((targets, preferred_authority_id)) =
+        cluster_kv_forward_authority_targets_before_deadline(
+            runtime,
+            paths,
+            state,
+            deadline,
+            options.timeout,
+            "forward authoritative cluster KV prefix read",
+        )
+        .await?
+    else {
         return Ok(None);
-    }
-    let preferred_authority_id = match locked_kv_state_authority_id_async(runtime, paths, state)
-        .await
-        .ok()
-        .flatten()
-    {
-        Some(authority_id)
-            if !cluster_node_blocks_leader_preference_async(
-                runtime,
-                paths,
-                state,
-                &authority_id,
-            )
-            .await? =>
-        {
-            if authority_id == state.local_node_id {
-                return Ok(None);
-            }
-            prefer_known_state_authority_node(&mut targets, &authority_id);
-            Some(authority_id)
-        }
-        _ if sinomo_kv::cluster_kv_raft_local_is_voter(state) => return Ok(None),
-        _ => None,
     };
-
-    let deadline = Instant::now() + options.timeout;
     let mut failures = Vec::new();
+    let mut rejected_preferred_authority = None;
     for (index, target) in targets.iter().enumerate() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -906,43 +1551,50 @@ where
         )?;
         call.request = call.request.with_response_retry_safe();
         let timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
-        let mut client = ClusterObjectRpcClient::routed(host, paths);
-        match client
-            .call_target(
+        let attempt_deadline = cluster_kv_forward_attempt_deadline(deadline, timeout);
+        let mut client =
+            ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(host, paths, state)?;
+        match decode_forwarded_cluster_kv_authority_before::<KvAuthoritativeRead<Vec<KvEntry>>, _>(
+            target,
+            "forward authoritative cluster KV prefix read",
+            attempt_deadline,
+            timeout,
+            client.call_target(
                 state,
                 target,
                 call,
-                ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
-            )
-            .await
+                main_daemon_cluster_rpc_options(
+                    ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
+                ),
+            ),
+        )
+        .await
         {
-            Ok(result) => {
-                let read = match result
-                    .decode_body::<KvAuthoritativeRead<Vec<KvEntry>>>()
-                    .await
-                {
-                    Ok(read) => read,
-                    Err(error) => {
-                        let error = verified_cluster_non_leader_error(target, error);
-                        failures.push(format!("node {target} failed: {error}"));
-                        if verified_non_leader_rejects_preferred_authority(
-                            &error,
-                            preferred_authority_id.as_ref(),
-                            target,
-                        ) || !cluster_kv_forward_error_allows_next_authority(&error, target)
-                        {
-                            return Err(error);
-                        }
-                        continue;
-                    }
-                };
+            Ok(read) => {
                 return validate_forwarded_authoritative_range_read(read, state, prefix).map(Some);
             }
-            Err(error) => failures.push(format!("node {target} failed: {error}")),
+            Err(error) => {
+                failures.push(format!("node {target} failed: {error}"));
+                record_verified_non_leader_rejected_preferred_authority(
+                    &error,
+                    preferred_authority_id.as_ref(),
+                    target,
+                );
+                retain_verified_non_leader_rejected_preferred_authority(
+                    &mut rejected_preferred_authority,
+                    &error,
+                    preferred_authority_id.as_ref(),
+                    target,
+                );
+                if !cluster_kv_forward_error_allows_next_authority(&error, target) {
+                    return Err(error);
+                }
+            }
         }
     }
-    Err(NetworkError::ClusterReadOnly {
-        detail: format!(
+    Err(cluster_kv_forward_terminal_error(
+        rejected_preferred_authority,
+        format!(
             "could not establish an authoritative cluster KV prefix read{}",
             if failures.is_empty() {
                 String::new()
@@ -950,7 +1602,7 @@ where
                 format!(": {}", failures.join("; "))
             }
         ),
-    })
+    ))
 }
 
 fn validate_forwarded_authoritative_range_read(
@@ -982,14 +1634,11 @@ fn validate_forwarded_authoritative_range_read(
             ),
         });
     }
-    if read.authority.term < state.term {
-        return Err(NetworkError::ClusterReadOnly {
-            detail: format!(
-                "authoritative prefix proof term {} is older than locally observed term {}",
-                read.authority.term, state.term
-            ),
-        });
-    }
+    validate_forwarded_cluster_kv_authority_floor(
+        &read.authority,
+        state,
+        "authoritative prefix proof",
+    )?;
     if read.value.len() > sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES {
         return Err(NetworkError::ClusterReadOnly {
             detail: format!(
@@ -1085,23 +1734,77 @@ fn verified_non_leader_rejects_preferred_authority(
     )
 }
 
+fn record_verified_non_leader_rejected_preferred_authority(
+    error: &NetworkError,
+    preferred_authority_id: Option<&NodeId>,
+    target_node_id: &NodeId,
+) {
+    if verified_non_leader_rejects_preferred_authority(
+        error,
+        preferred_authority_id,
+        target_node_id,
+    ) {
+        // The hint is advisory and can become stale between requests. An
+        // authenticated exact voter rejected it as a non-leader, so continue
+        // within this operation's existing deadline and let the next exact
+        // voter prove current-term leadership.
+        metrics::counter!("sinomo.kv.forward.preferred_authority", "outcome" => "stale")
+            .increment(1);
+    }
+}
+
+fn retain_verified_non_leader_rejected_preferred_authority(
+    retained: &mut Option<NetworkError>,
+    error: &NetworkError,
+    preferred_authority_id: Option<&NodeId>,
+    target_node_id: &NodeId,
+) {
+    if retained.is_none()
+        && verified_non_leader_rejects_preferred_authority(
+            error,
+            preferred_authority_id,
+            target_node_id,
+        )
+    {
+        *retained = Some(error.clone());
+    }
+}
+
+fn cluster_kv_forward_terminal_error(
+    rejected_preferred_authority: Option<NetworkError>,
+    aggregate_detail: String,
+) -> NetworkError {
+    // An authenticated rejection from the exact voter named by the durable
+    // leader hint is stronger than the lossy aggregate assembled after all
+    // safe candidates are exhausted. Preserve that identity so the caller can
+    // compare-and-clear only the matching stale hint, then retry the canonical
+    // voter set. Unsafe or ambiguous failures return from their loop
+    // immediately and can never be replaced here.
+    rejected_preferred_authority.unwrap_or(NetworkError::ClusterReadOnly {
+        detail: aggregate_detail,
+    })
+}
+
 async fn forward_cluster_kv_txn_to_state_authority_node_async_with_host<H>(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
     target_node_id: &NodeId,
     request: &KvTxnRequest,
     timeout: Duration,
+    deadline: Instant,
     host: &mut H,
 ) -> Result<ClusterKvTxnCommitResult, NetworkError>
 where
     H: ClusterObjectRpcAsyncHost + Send,
 {
-    let deadline = Instant::now() + timeout;
     let kv_paths = paths.kv_paths();
     let mut observed_generation = sinomo_kv::cluster_kv_watch_generation(&kv_paths);
-    let mut client = ClusterObjectRpcClient::routed(host, paths);
-    let txn_response = client
-        .call_target(
+    let mut client =
+        ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(host, paths, state)?;
+    let rpc_timeout = forwarded_cluster_kv_txn_remaining(deadline, timeout)?;
+    let txn_response = await_authenticated_cluster_kv_target(
+        target_node_id,
+        client.call_target(
             state,
             target_node_id,
             ObjectRpcCall::encode_borrowed_value(
@@ -1109,9 +1812,12 @@ where
                 sinomo_kv::CLUSTER_KV_RPC_CATEGORY,
                 request,
             )?,
-            ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
-        )
-        .await?;
+            main_daemon_cluster_rpc_options(
+                ClusterObjectRpcOptions::default().with_overall_timeout(rpc_timeout),
+            ),
+        ),
+    )
+    .await?;
     let response = txn_response
         .decode_body::<ClusterKvTxnRpcResponse>()
         .await
@@ -1122,62 +1828,47 @@ where
             &response.request_id,
         ));
     }
-    let local_paths = paths.clone();
-    let local_snapshot = tokio::task::spawn_blocking(move || {
-        read_cluster_kv_latest_observed_snapshot_arc_if_present(&local_paths)
-    })
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .flatten()
-    .map(|snapshot| (*snapshot).clone());
     if let Some(result) =
-        try_materialize_forwarded_cluster_kv_txn_response(request, &response, local_snapshot)?
+        try_materialize_forwarded_cluster_kv_txn_response_from_hot_local_cache_async(
+            paths, request, &response, deadline, timeout,
+        )
+        .await?
     {
         return Ok(result);
     }
 
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .unwrap_or_default();
+    let remaining = forwarded_cluster_kv_txn_remaining(deadline, timeout)?;
     let fanout_wait = remaining.min(FORWARDED_CLUSTER_KV_FANOUT_GRACE);
     if !fanout_wait.is_zero() {
-        let fanout_deadline = Instant::now() + fanout_wait;
+        let fanout_deadline = cluster_kv_forward_attempt_deadline(deadline, fanout_wait);
         loop {
             let wait = fanout_deadline.saturating_duration_since(Instant::now());
             if wait.is_zero() {
                 break;
             }
             let wait_paths = kv_paths.clone();
-            let local_paths = paths.clone();
-            let wait_result = tokio::task::spawn_blocking(move || {
+            let wait_result = run_forward_blocking_before_deadline(deadline, timeout, move || {
+                let wait = fanout_deadline.saturating_duration_since(Instant::now());
                 let changed = sinomo_kv::wait_for_cluster_kv_watch_change(
                     &wait_paths,
                     observed_generation,
                     wait,
                 );
                 let generation = sinomo_kv::cluster_kv_watch_generation(&wait_paths);
-                let snapshot = changed
-                    .then(|| read_cluster_kv_latest_observed_snapshot_arc_if_present(&local_paths));
-                (changed, generation, snapshot)
+                Ok((changed, generation))
             })
-            .await;
-            let Ok((changed, generation, local_snapshot)) = wait_result else {
-                break;
-            };
+            .await?;
+            let (changed, generation) = wait_result;
             if !changed {
                 break;
             }
             observed_generation = generation;
-            let local_snapshot = local_snapshot
-                .and_then(Result::ok)
-                .flatten()
-                .map(|snapshot| (*snapshot).clone());
-            if let Some(result) = try_materialize_forwarded_cluster_kv_txn_response(
-                request,
-                &response,
-                local_snapshot,
-            )? {
+            if let Some(result) =
+                try_materialize_forwarded_cluster_kv_txn_response_from_hot_local_cache_async(
+                    paths, request, &response, deadline, timeout,
+                )
+                .await?
+            {
                 metrics::counter!(
                     "sinomo.kv.forward.materialization",
                     "source" => "committed_fanout"
@@ -1193,18 +1884,23 @@ where
         "source" => "authoritative_snapshot"
     )
     .increment(1);
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .unwrap_or_default();
-    let snapshot = fetch_cluster_kv_snapshot_from_node_async_with_host(
-        paths,
-        state,
-        target_node_id,
+    let remaining = forwarded_cluster_kv_txn_remaining(deadline, timeout)?;
+    let snapshot = tokio::time::timeout(
         remaining,
-        host,
+        fetch_cluster_kv_snapshot_from_node_async_with_host(
+            paths,
+            state,
+            target_node_id,
+            remaining,
+            host,
+        ),
     )
-    .await?;
-    materialize_forwarded_cluster_kv_txn_response_from_snapshot(request, response, snapshot)
+    .await
+    .map_err(|_| forwarded_cluster_kv_txn_timeout(timeout))??;
+    let result =
+        materialize_forwarded_cluster_kv_txn_response_from_snapshot(request, response, snapshot)?;
+    forwarded_cluster_kv_txn_remaining(deadline, timeout)?;
+    Ok(result)
 }
 
 fn forwarded_cluster_kv_request_id_mismatch(
@@ -1217,6 +1913,88 @@ fn forwarded_cluster_kv_request_id_mismatch(
             request.request_id
         ),
     }
+}
+
+fn try_materialize_forwarded_cluster_kv_txn_response_from_hot_snapshot(
+    request: &KvTxnRequest,
+    response: &ClusterKvTxnRpcResponse,
+    snapshot: Option<std::sync::Arc<KvSnapshot>>,
+    deadline: Instant,
+) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
+    if response.request_id != request.request_id {
+        return Err(forwarded_cluster_kv_request_id_mismatch(
+            request,
+            &response.request_id,
+        ));
+    }
+    let Some(snapshot) = snapshot else {
+        return Ok(None);
+    };
+    let matches_authority_revision = matches!(
+        response.authority.basis,
+        KvAuthorityBasis::CurrentTermQuorum { .. }
+    ) && snapshot.revision == response.authority.revision;
+    let contains_exact_commit = snapshot
+        .committed_requests
+        .iter()
+        .any(|record| record.request_id == request.request_id);
+    if !matches_authority_revision && !contains_exact_commit {
+        return Ok(None);
+    }
+    // Returning the legacy full commit result requires an owned snapshot. Once
+    // this O(total retained state) clone is admitted, complete it coherently;
+    // callers that only need the bounded transaction proof use the compact
+    // path and never enter this boundary.
+    let snapshot = snapshot.as_ref().clone();
+    let overrun = Instant::now().saturating_duration_since(deadline);
+    if !overrun.is_zero() {
+        metrics::counter!(
+            "sinomo.kv.forward.materialization_deadline_overrun",
+            "source" => "hot_snapshot_clone"
+        )
+        .increment(1);
+        metrics::histogram!(
+            "sinomo.kv.forward.materialization_deadline_overrun.us",
+            "source" => "hot_snapshot_clone"
+        )
+        .record(overrun.as_micros().min(u128::from(u64::MAX)) as f64);
+    }
+    try_materialize_forwarded_cluster_kv_txn_response(request, response, Some(snapshot))
+}
+
+fn try_materialize_forwarded_cluster_kv_txn_response_from_hot_local_cache(
+    paths: &ClusterPaths,
+    request: &KvTxnRequest,
+    response: &ClusterKvTxnRpcResponse,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
+    forwarded_cluster_kv_txn_remaining(deadline, timeout)?;
+    // This is deliberately a cache-only peek. Any miss falls through to the
+    // notifier/fetch path instead of opening Raft or decoding a snapshot file.
+    let snapshot = read_cluster_kv_cached_snapshot_if_hot(paths).ok().flatten();
+    let result = try_materialize_forwarded_cluster_kv_txn_response_from_hot_snapshot(
+        request, response, snapshot, deadline,
+    )?;
+    Ok(result)
+}
+
+async fn try_materialize_forwarded_cluster_kv_txn_response_from_hot_local_cache_async(
+    paths: &ClusterPaths,
+    request: &KvTxnRequest,
+    response: &ClusterKvTxnRpcResponse,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<Option<ClusterKvTxnCommitResult>, NetworkError> {
+    let paths = paths.clone();
+    let request = request.clone();
+    let response = response.clone();
+    run_forward_admitted_snapshot_materialization(deadline, timeout, move || {
+        try_materialize_forwarded_cluster_kv_txn_response_from_hot_local_cache(
+            &paths, &request, &response, deadline, timeout,
+        )
+    })
+    .await
 }
 
 fn try_materialize_forwarded_cluster_kv_txn_response(
@@ -1305,13 +2083,15 @@ fn fetch_cluster_kv_snapshot_from_node_with_host(
     let request =
         ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
             .with_response_retry_safe();
-    let response = host.call_node_object_rpc(state, target_node_id, &request, timeout)?;
+    let response = host
+        .call_node_object_rpc(state, target_node_id, &request, timeout)
+        .map_err(|error| verified_cluster_non_leader_error(target_node_id, error))?;
     response
         .error_detail()
         .map_err(|error| verified_cluster_non_leader_error(target_node_id, error))?;
-    sinomo_kv::decode_cluster_kv_authoritative_snapshot_rpc_body(&response.body)
-        .map(|read| read.value)
-        .map_err(kv_err)
+    let read = sinomo_kv::decode_cluster_kv_authoritative_snapshot_rpc_body(&response.body)
+        .map_err(kv_err)?;
+    validate_forwarded_authoritative_snapshot_read(read, state).map(|read| read.value)
 }
 
 async fn fetch_cluster_kv_snapshot_from_node_async_with_host<H>(
@@ -1330,20 +2110,24 @@ where
         sinomo_kv::ClusterKvAuthoritativeSnapshotRequest,
     )?;
     call.request = call.request.with_response_retry_safe();
-    let mut client = ClusterObjectRpcClient::routed(host, paths);
-    let read = client
-        .call_target(
+    let mut client =
+        ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(host, paths, state)?;
+    let read = decode_forwarded_cluster_kv_authority_before::<KvAuthoritativeRead<KvSnapshot>, _>(
+        target_node_id,
+        "fetch authoritative cluster KV snapshot",
+        cluster_kv_forward_deadline(timeout),
+        timeout,
+        client.call_target(
             state,
             target_node_id,
             call,
-            ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
-        )
-        .await?
-        .decode_body::<KvAuthoritativeRead<KvSnapshot>>()
-        .await
-        .map_err(|error| verified_cluster_non_leader_error(target_node_id, error))?;
-    sinomo_kv::validate_cluster_kv_authoritative_snapshot_read(&read).map_err(kv_err)?;
-    Ok(read.value)
+            main_daemon_cluster_rpc_options(
+                ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
+            ),
+        ),
+    )
+    .await?;
+    validate_forwarded_authoritative_snapshot_read(read, state).map(|read| read.value)
 }
 
 #[cfg(test)]
@@ -1355,24 +2139,87 @@ mod tests {
         KvTxnResponse, KvVersion,
     };
     use sinomo_node::{ClusterId, DAEMON_MAIN_RUN_CAPABILITY};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use time::OffsetDateTime;
+
+    struct CountingDynamicRouteDirectory {
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl CountingDynamicRouteDirectory {
+        fn record(&self) {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl sinomo_network::ClusterDirectory for CountingDynamicRouteDirectory {
+        fn members(&self) -> Result<Vec<ClusterMemberRecord>, NetworkError> {
+            self.record();
+            Ok(Vec::new())
+        }
+
+        fn endpoints(&self) -> Result<Vec<sinomo_base::ClusterEndpointRecord>, NetworkError> {
+            self.record();
+            Ok(Vec::new())
+        }
+
+        fn node_statuses(
+            &self,
+        ) -> Result<BTreeMap<NodeId, sinomo_base::ClusterNodeStatusRecord>, NetworkError> {
+            self.record();
+            Ok(BTreeMap::new())
+        }
+
+        fn connectivity_records(
+            &self,
+        ) -> Result<Vec<sinomo_network::ClusterConnectivityRecord>, NetworkError> {
+            self.record();
+            Ok(Vec::new())
+        }
+
+        fn version(&self) -> Result<sinomo_network::DirectoryVersion, NetworkError> {
+            self.record();
+            Ok(sinomo_network::DirectoryVersion(1))
+        }
+    }
+
+    struct DynamicRouteProviderActivation(Arc<AtomicBool>);
+
+    impl Drop for DynamicRouteProviderActivation {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+
+    #[derive(Default)]
+    struct FencedForwardDispatchHost;
+
+    impl ClusterObjectRpcAsyncHost for FencedForwardDispatchHost {}
 
     #[test]
     fn authenticated_forwarded_non_leader_response_retains_responder_identity() {
         let target = NodeId::from_legacy_named("verified_non_leader_target").expect("node");
-        let error = verified_cluster_non_leader_error(
-            &target,
-            NetworkError::ClusterReadOnly {
-                detail: format!(
-                    "{FORWARDED_CLUSTER_KV_NON_LEADER_DETAIL}; forwarded requests do not start elections"
-                ),
-            },
-        );
+        for marker in [
+            FORWARDED_CLUSTER_KV_NON_LEADER_DETAIL,
+            FORWARDED_CLUSTER_KV_READ_NON_LEADER_DETAIL,
+            FORWARDED_CLUSTER_KV_EXACT_READ_NON_LEADER_DETAIL,
+            FORWARDED_CLUSTER_KV_POINT_READ_NON_LEADER_DETAIL,
+            FORWARDED_CLUSTER_KV_PREFIX_READ_NON_LEADER_DETAIL,
+        ] {
+            let error = verified_cluster_non_leader_error(
+                &target,
+                NetworkError::ClusterReadOnly {
+                    detail: format!("{marker}; forwarded requests do not start elections"),
+                },
+            );
 
-        assert!(matches!(
-            error,
-            NetworkError::VerifiedClusterNonLeader { node_id, .. } if node_id == target
-        ));
+            assert!(matches!(
+                error,
+                NetworkError::VerifiedClusterNonLeader { node_id, .. } if node_id == target
+            ));
+        }
         assert!(matches!(
             verified_cluster_non_leader_error(
                 &target,
@@ -1381,6 +2228,81 @@ mod tests {
                 },
             ),
             NetworkError::ClusterReadOnly { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn authenticated_non_leader_from_async_call_boundary_retains_target_identity() {
+        let target = NodeId::from_legacy_named("verified_async_non_leader_target").expect("node");
+
+        for detail in [
+            FORWARDED_CLUSTER_KV_NON_LEADER_DETAIL,
+            FORWARDED_CLUSTER_KV_READ_NON_LEADER_DETAIL,
+            FORWARDED_CLUSTER_KV_EXACT_READ_NON_LEADER_DETAIL,
+            FORWARDED_CLUSTER_KV_POINT_READ_NON_LEADER_DETAIL,
+            FORWARDED_CLUSTER_KV_PREFIX_READ_NON_LEADER_DETAIL,
+        ] {
+            let error = await_authenticated_cluster_kv_target(
+                &target,
+                std::future::ready(Err::<(), _>(NetworkError::ClusterReadOnly {
+                    detail: detail.to_string(),
+                })),
+            )
+            .await
+            .expect_err("authenticated non-leader rejection");
+
+            assert!(matches!(
+                error,
+                NetworkError::VerifiedClusterNonLeader { node_id, .. } if node_id == target
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_exact_read_deadline_covers_stalled_streamed_response_body() {
+        let timeout = Duration::from_millis(80);
+        let target = NodeId::from_legacy_named("stalled_exact_read_target").expect("node");
+        let (body_sender, body) = sinomo_network::ObjectRpcIncomingBody::test_channel(Some(16), 1);
+        let response = ObjectRpcResponse::from_encoded_body(
+            sinomo_kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE,
+            Vec::new(),
+        );
+        let result = sinomo_network::ObjectRpcResult::from_forwarded_body(response, body, true)
+            .expect("construct streamed exact-read response");
+        let started = tokio::time::Instant::now();
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .expect("exact-read deadline");
+
+        let error = decode_forwarded_cluster_kv_authority_before::<
+            sinomo_kv::ClusterKvAuthoritativeEntriesResponse,
+            _,
+        >(
+            &target,
+            "forward authoritative cluster KV exact-key-set read",
+            deadline,
+            timeout,
+            async move {
+                tokio::time::sleep(Duration::from_millis(55)).await;
+                Ok(result)
+            },
+        )
+        .await
+        .expect_err("a stalled streamed exact-read body must use the original deadline");
+        // Keep the sending half live through decode so the receiver genuinely
+        // stalls rather than observing an immediately closed channel.
+        drop(body_sender);
+
+        assert_eq!(tokio::time::Instant::now() - started, timeout);
+        assert!(matches!(
+            error,
+            NetworkError::Timeout {
+                ref operation,
+                phase: NetworkTimeoutPhase::Overall,
+                timeout: actual_timeout,
+                delivery_state: NetworkDeliveryState::PossiblyApplied,
+            } if operation == "forward authoritative cluster KV exact-key-set read"
+                && actual_timeout == timeout
         ));
     }
 
@@ -1469,6 +2391,80 @@ mod tests {
     }
 
     #[test]
+    fn every_forwarded_read_family_requires_both_scalar_authority_floors() {
+        let (_root, mut state) = forward_test_state(true);
+        add_second_remote_voter(&mut state);
+        state.term = 4;
+        state.kv_revision = 6;
+        let request_id = KvRequestId::generate();
+        let keys = vec!["/authority/floor".to_string()];
+
+        for (term, revision, expected) in [
+            (4, 5, "revision 5 is older than locally observed revision 6"),
+            (3, 6, "term 3 is older than locally observed term 4"),
+        ] {
+            let authority = KvAuthorityProof {
+                term,
+                commit_index: 7,
+                revision: KvRevision(revision),
+                basis: KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks: 2,
+                    required_quorum: 2,
+                },
+            };
+            let request_error = validate_forwarded_request_outcome_read(
+                ClusterKvRequestOutcomeRead {
+                    authority: authority.clone(),
+                    outcome: KvRequestOutcome::Unknown {
+                        detail: "not retained".to_string(),
+                    },
+                },
+                &state,
+                &request_id,
+            )
+            .expect_err("request-outcome proof below either scalar floor must fail")
+            .to_string();
+            let point_error = validate_forwarded_authoritative_entry_read(
+                KvAuthoritativeRead {
+                    authority: authority.clone(),
+                    value: None,
+                },
+                &state,
+                &keys[0],
+            )
+            .expect_err("point proof below either scalar floor must fail")
+            .to_string();
+            let exact_error = validate_forwarded_authoritative_entries_read(
+                KvAuthoritativeRead {
+                    authority: authority.clone(),
+                    value: vec![None],
+                },
+                &state,
+                &keys,
+            )
+            .expect_err("exact-set proof below either scalar floor must fail")
+            .to_string();
+            let prefix_error = validate_forwarded_authoritative_range_read(
+                KvAuthoritativeRead {
+                    authority,
+                    value: Vec::new(),
+                },
+                &state,
+                "/authority/",
+            )
+            .expect_err("prefix proof below either scalar floor must fail")
+            .to_string();
+
+            for error in [request_error, point_error, exact_error, prefix_error] {
+                assert!(
+                    error.contains(expected),
+                    "forwarded read lost the composed scalar floor: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn kv_forward_does_not_try_another_authority_after_ambiguous_delivery() {
         let rejected_node =
             NodeId::from_legacy_named("node_kv_forward_rejected").expect("rejected node");
@@ -1529,6 +2525,66 @@ mod tests {
             },
             &rejected_node,
         ));
+        assert!(!cluster_kv_forward_error_allows_next_authority(
+            &NetworkError::delivery_failed(
+                "cluster KV transaction",
+                NetworkDeliveryState::PossiblyApplied,
+                "response was lost after delivery",
+            ),
+            &rejected_node,
+        ));
+        assert!(!cluster_kv_forward_error_allows_next_authority(
+            &NetworkError::UnknownRoute {
+                route: sinomo_kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE.to_string(),
+            },
+            &rejected_node,
+        ));
+    }
+
+    #[test]
+    fn safe_terminal_exhaustion_retains_preferred_non_leader_proof_for_every_route_family() {
+        let preferred =
+            NodeId::from_legacy_named("node_kv_forward_preferred").expect("preferred node");
+        let definitely_not_sent = NetworkError::delivery_failed(
+            "cluster KV authority probe",
+            NetworkDeliveryState::DefinitelyNotSent,
+            "connect failed",
+        );
+        assert!(cluster_kv_forward_error_allows_next_authority(
+            &definitely_not_sent,
+            &preferred,
+        ));
+
+        for marker in [
+            FORWARDED_CLUSTER_KV_NON_LEADER_DETAIL,
+            FORWARDED_CLUSTER_KV_READ_NON_LEADER_DETAIL,
+            FORWARDED_CLUSTER_KV_EXACT_READ_NON_LEADER_DETAIL,
+            FORWARDED_CLUSTER_KV_POINT_READ_NON_LEADER_DETAIL,
+            FORWARDED_CLUSTER_KV_PREFIX_READ_NON_LEADER_DETAIL,
+        ] {
+            let rejection = verified_cluster_non_leader_error(
+                &preferred,
+                NetworkError::ClusterReadOnly {
+                    detail: marker.to_string(),
+                },
+            );
+            let mut retained = None;
+            retain_verified_non_leader_rejected_preferred_authority(
+                &mut retained,
+                &rejection,
+                Some(&preferred),
+                &preferred,
+            );
+            let terminal = cluster_kv_forward_terminal_error(
+                retained,
+                format!("safe exhaustion after {definitely_not_sent}"),
+            );
+            assert!(matches!(
+                terminal,
+                NetworkError::VerifiedClusterNonLeader { node_id, .. }
+                    if node_id == preferred
+            ));
+        }
     }
 
     struct CommittedResponseHost {
@@ -1547,12 +2603,13 @@ mod tests {
 
         fn call_node_object_rpc(
             &mut self,
-            _state: &ClusterBootstrapState,
+            state: &ClusterBootstrapState,
             _target_node_id: &NodeId,
             request: &ObjectRpcRequest,
             _timeout: Duration,
         ) -> Result<ObjectRpcResponse, NetworkError> {
             self.calls = self.calls.saturating_add(1);
+            let required_quorum = sinomo_kv::cluster_kv_raft_quorum_size_for_state(state);
             if request.route == sinomo_kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE {
                 let snapshot = KvSnapshot {
                     revision: KvRevision(1),
@@ -1565,12 +2622,12 @@ mod tests {
                 };
                 let response = KvAuthoritativeRead {
                     authority: KvAuthorityProof {
-                        term: 1,
+                        term: state.term,
                         commit_index: 1,
                         revision: snapshot.revision,
                         basis: KvAuthorityBasis::CurrentTermQuorum {
-                            voter_acks: 1,
-                            required_quorum: 1,
+                            voter_acks: required_quorum,
+                            required_quorum,
                         },
                     },
                     value: snapshot,
@@ -1613,12 +2670,12 @@ mod tests {
                             responses: Vec::new(),
                         }),
                         authority: KvAuthorityProof {
-                            term: 1,
+                            term: state.term,
                             commit_index: 1,
                             revision: KvRevision(1),
                             basis: KvAuthorityBasis::CurrentTermQuorum {
-                                voter_acks: 1,
-                                required_quorum: 1,
+                                voter_acks: required_quorum,
+                                required_quorum,
                             },
                         },
                         replayed_committed_request: false,
@@ -1784,6 +2841,39 @@ mod tests {
         }
     }
 
+    struct EarlyNonLeaderHost {
+        known_authority: Option<NodeId>,
+        calls: usize,
+    }
+
+    impl ClusterKvTxnForwardHost for EarlyNonLeaderHost {
+        fn known_kv_state_authority_id(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+        ) -> Result<Option<NodeId>, NetworkError> {
+            Ok(self.known_authority.clone())
+        }
+
+        fn call_node_object_rpc(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            _target_node_id: &NodeId,
+            request: &ObjectRpcRequest,
+            _timeout: Duration,
+        ) -> Result<ObjectRpcResponse, NetworkError> {
+            self.calls = self.calls.saturating_add(1);
+            let detail = if request.route == sinomo_kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE {
+                FORWARDED_CLUSTER_KV_READ_NON_LEADER_DETAIL
+            } else {
+                FORWARDED_CLUSTER_KV_NON_LEADER_DETAIL
+            };
+            Err(NetworkError::ClusterReadOnly {
+                detail: detail.to_string(),
+            })
+        }
+    }
+
     struct RecordingForwardHost {
         known_authority: Option<NodeId>,
         calls: usize,
@@ -1861,6 +2951,38 @@ mod tests {
         (root, state)
     }
 
+    #[tokio::test]
+    async fn busy_operation_gate_falls_through_to_exact_voter_targets_promptly() {
+        let (root, state) = forward_test_state(true);
+        let data_dir = sinomo_local::SinomoDataDir::new(root.path());
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let store = paths.kv_paths().raft_store();
+        let held = store.lock_operation().expect("hold Raft operation gate");
+        let timeout = Duration::from_secs(5);
+        let started = Instant::now();
+
+        let selected = cluster_kv_forward_authority_targets_before_deadline(
+            &tokio::runtime::Handle::current(),
+            &paths,
+            &state,
+            cluster_kv_forward_deadline(timeout),
+            timeout,
+            "test exact voter dispatch",
+        )
+        .await
+        .expect("busy advisory hint falls through")
+        .expect("busy local voter falls through to an exact remote voter target");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "best-effort authority lookup must not consume the five-second request budget"
+        );
+        assert_eq!(selected.0, vec![state.members[1].node_id.clone()]);
+        assert_eq!(selected.1, None);
+        drop(held);
+    }
+
     fn add_second_remote_voter(state: &mut ClusterBootstrapState) -> NodeId {
         let now = OffsetDateTime::now_utc();
         let remote =
@@ -1909,6 +3031,144 @@ mod tests {
             version: KvVersion(1),
             lease_id: None,
         }
+    }
+
+    #[test]
+    fn nonleader_point_and_exact_set_forward_dispatch_bypasses_dynamic_kv_projection() {
+        let (root, mut state) = forward_test_state(false);
+        let data_dir = sinomo_local::SinomoDataDir::new(root.path());
+        data_dir.ensure_root_layout().expect("data root");
+        let identity = sinomo_node::load_or_create_main_node_identity(&data_dir.root())
+            .expect("main node identity");
+        // Routed-session setup validates encoded public keys before asking the
+        // test host to open a stream. One valid fixture key is sufficient: the
+        // host deliberately stops before a transport handshake.
+        for member in &mut state.members {
+            member.node_public_key = identity.public_key.clone();
+        }
+        let remote_node_id = state.members[1].node_id.clone();
+        state.members[1].endpoints[0] =
+            sinomo_network::daemon_lan_endpoint(&remote_node_id, "127.0.0.1:1".to_string(), 0);
+        let shadow_node_id = sinomo_node::shadow_daemon_node_id(&remote_node_id);
+        let mut folded_shadow_endpoint =
+            sinomo_network::daemon_lan_endpoint(&shadow_node_id, "127.0.0.1:2".to_string(), 0);
+        folded_shadow_endpoint.node_id = remote_node_id.clone();
+        state.members[1]
+            .endpoints
+            .push(folded_shadow_endpoint.clone());
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        crate::local_state_store::write_cluster_state(&paths, &state).expect("cluster state");
+        let remote_endpoint = state.members[1]
+            .endpoints
+            .first()
+            .expect("remote route endpoint")
+            .clone();
+        sinomo_network::record_local_cluster_endpoint_command_connectivity(
+            &paths,
+            &state,
+            &remote_endpoint,
+            sinomo_network::ClusterConnectivityState::Healthy,
+            Some(1),
+            false,
+        )
+        .expect("healthy remote route");
+        sinomo_network::record_local_cluster_endpoint_command_connectivity(
+            &paths,
+            &state,
+            &folded_shadow_endpoint,
+            sinomo_network::ClusterConnectivityState::Healthy,
+            Some(0),
+            false,
+        )
+        .expect("faster folded shadow route");
+
+        sinomo_kv::evict_cluster_kv_cached_snapshot_arc_for_test(&paths.kv_paths());
+        crate::kv_local_store::reset_cluster_kv_cached_snapshot_reads_for_test(&paths);
+
+        let dynamic_reads = Arc::new(AtomicUsize::new(0));
+        let provider_active = Arc::new(AtomicBool::new(true));
+        let _provider_activation = DynamicRouteProviderActivation(Arc::clone(&provider_active));
+        let owner_thread = std::thread::current().id();
+        let provider_reads = Arc::clone(&dynamic_reads);
+        sinomo_network::set_cluster_directory_provider(Arc::new(move |_| {
+            let directory: Arc<dyn sinomo_network::ClusterDirectory> = if provider_active
+                .load(Ordering::Acquire)
+                && std::thread::current().id() == owner_thread
+            {
+                Arc::new(CountingDynamicRouteDirectory {
+                    reads: Arc::clone(&provider_reads),
+                })
+            } else {
+                Arc::new(sinomo_network::EmptyClusterDirectory)
+            };
+            directory
+        }));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut point_host = FencedForwardDispatchHost::default();
+        let point = runtime.block_on(
+            forward_cluster_kv_authoritative_entry_to_state_authority_async_with_host(
+                runtime.handle(),
+                &paths,
+                &state,
+                "/sifs/authority",
+                forward_options(),
+                &mut point_host,
+            ),
+        );
+        let point_error = point.expect_err("closed test endpoint must reject the point forward");
+        assert!(
+            point_error.to_string().contains("after 1 attempts"),
+            "point forward must exclude the faster folded shadow endpoint that does not host KV authority: {point_error}"
+        );
+
+        state.members[1].endpoints.truncate(1);
+        state.members[1].endpoints[0] =
+            sinomo_network::daemon_lan_endpoint(&remote_node_id, "127.0.0.1:2".to_string(), 0);
+        crate::local_state_store::write_cluster_state(&paths, &state)
+            .expect("updated exact-set route state");
+        let exact_endpoint = state.members[1].endpoints[0].clone();
+        sinomo_network::record_local_cluster_endpoint_command_connectivity(
+            &paths,
+            &state,
+            &exact_endpoint,
+            sinomo_network::ClusterConnectivityState::Healthy,
+            Some(1),
+            false,
+        )
+        .expect("restore healthy route after deliberate point failure");
+        let mut exact_host = FencedForwardDispatchHost::default();
+        let exact = runtime.block_on(
+            forward_cluster_kv_authoritative_entries_to_state_authority_async_with_host(
+                runtime.handle(),
+                &paths,
+                &state,
+                &["/sifs/authority".to_string(), "/sifs/config".to_string()],
+                forward_options(),
+                &mut exact_host,
+            ),
+        );
+        let exact_error =
+            exact.expect_err("closed test endpoint must reject the exact-set forward");
+        assert!(
+            exact_error.to_string().contains("after 1 attempts"),
+            "exact-set forward must reach one concrete routed transport attempt: {exact_error}"
+        );
+
+        assert_eq!(
+            dynamic_reads.load(Ordering::SeqCst),
+            0,
+            "forward target selection and routing must not read the dynamic KV directory"
+        );
+        assert_eq!(
+            crate::kv_local_store::cluster_kv_cached_snapshot_reads_for_test(&paths),
+            0,
+            "point/exact-set forwarding must not materialize the cached full snapshot"
+        );
     }
 
     fn forwarded_range_read(
@@ -2005,6 +3265,78 @@ mod tests {
     }
 
     #[test]
+    fn follower_point_forward_uses_exact_route_despite_prefix_collision_limit() {
+        let (_root, mut state) = forward_test_state(false);
+        add_second_remote_voter(&mut state);
+        state.term = 4;
+        let key = "/agents";
+        let prefix_colliders = (0..=sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)
+            .map(|index| forwarded_range_entry(&format!("{key}/{index:05}"), 1, 6))
+            .collect();
+        assert!(
+            validate_forwarded_authoritative_range_read(
+                forwarded_range_read(4, 6, 2, 2, prefix_colliders),
+                &state,
+                key,
+            )
+            .is_err(),
+            "the old prefix-based point-forwarding path must exceed its range limit"
+        );
+
+        let exact = KvAuthoritativeRead {
+            authority: KvAuthorityProof {
+                term: 4,
+                commit_index: 7,
+                revision: KvRevision(6),
+                basis: KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks: 2,
+                    required_quorum: 2,
+                },
+            },
+            value: Some(forwarded_range_entry(key, 1, 6)),
+        };
+        let mut wrong_key = exact.clone();
+        wrong_key.value = Some(forwarded_range_entry("/agents/00000", 1, 6));
+        assert!(
+            validate_forwarded_authoritative_entry_read(wrong_key, &state, key).is_err(),
+            "an exact-entry response cannot substitute a prefix-colliding key"
+        );
+        assert_eq!(
+            validate_forwarded_authoritative_entry_read(exact, &state, key)
+                .expect("exact forwarded point read")
+                .value
+                .expect("point entry")
+                .key,
+            key
+        );
+
+        let call = cluster_kv_authoritative_entry_forward_call(key)
+            .expect("build exact-entry forward call");
+        assert_eq!(
+            call.request.route,
+            sinomo_kv::CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE
+        );
+        assert_ne!(
+            call.request.route,
+            sinomo_kv::CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE
+        );
+        assert!(call.request.is_response_retry_safe());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let body = runtime
+            .block_on(call.body.collect_to_vec(64 * 1024))
+            .expect("collect exact-entry forward body");
+        assert_eq!(
+            sinomo_kv::decode_cluster_kv_authoritative_entry_rpc_request_body(&body)
+                .expect("decode exact-entry request")
+                .key,
+            key
+        );
+    }
+
+    #[test]
     fn kv_forward_returns_complete_committed_response_without_second_snapshot_rpc() {
         let (root, state) = forward_test_state(false);
         let data_dir = sinomo_local::SinomoDataDir::new(root.path());
@@ -2036,6 +3368,7 @@ mod tests {
             &target,
             &request,
             Duration::from_secs(1),
+            cluster_kv_forward_deadline(Duration::from_secs(1)),
             &mut host,
         )
         .expect("complete committed response");
@@ -2051,6 +3384,157 @@ mod tests {
                 required_quorum: 1
             }
         ));
+    }
+
+    #[test]
+    fn kv_forward_cold_local_snapshot_skips_hydration_and_fetches_authority() {
+        let (root, state) = forward_test_state(false);
+        let data_dir = sinomo_local::SinomoDataDir::new(root.path());
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        crate::kv_local_store::write_cluster_kv_snapshot(
+            &paths,
+            &KvSnapshot {
+                revision: KvRevision(1),
+                compacted_revision: KvRevision::ZERO,
+                entries: Vec::new(),
+                leases: Vec::new(),
+                events: Vec::new(),
+                committed_requests: Vec::new(),
+                expired_requests: Vec::new(),
+            },
+        )
+        .expect("local replicated snapshot");
+        sinomo_kv::evict_cluster_kv_cached_snapshot_arc_for_test(&paths.kv_paths());
+        assert!(
+            crate::kv_local_store::read_cluster_kv_cached_snapshot_if_hot(&paths)
+                .expect("hot-only snapshot probe")
+                .is_none(),
+            "the fixture must exercise a durable-but-cold local snapshot"
+        );
+
+        let target = state.members[1].node_id.clone();
+        let mut host = CommittedResponseHost {
+            calls: 0,
+            mismatch_request_id: false,
+        };
+        let request = KvTxnRequest::generated(test_txn());
+
+        let result = forward_cluster_kv_txn_to_state_authority_node_with_host(
+            &paths,
+            &state,
+            &target,
+            &request,
+            Duration::from_secs(1),
+            cluster_kv_forward_deadline(Duration::from_secs(1)),
+            &mut host,
+        )
+        .expect("cold local cache falls back to the authority snapshot");
+
+        assert_eq!(
+            host.calls, 2,
+            "a cold local snapshot must remain cold and use the bounded authority fetch"
+        );
+        assert_eq!(result.request_id, request.request_id);
+        assert_eq!(result.snapshot.revision, KvRevision(1));
+    }
+
+    #[test]
+    fn async_forward_deadline_aborts_queued_blocking_materialization() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let blocker_started = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let release_blocker = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let blocking_started = std::sync::Arc::clone(&blocker_started);
+            let blocking_release = std::sync::Arc::clone(&release_blocker);
+            let blocker = tokio::task::spawn_blocking(move || {
+                blocking_started.wait();
+                blocking_release.wait();
+            });
+            blocker_started.wait();
+
+            let ran_after_deadline = std::sync::Arc::new(AtomicBool::new(false));
+            let task_ran = std::sync::Arc::clone(&ran_after_deadline);
+            let timeout = Duration::from_millis(20);
+            let error = run_forward_blocking_before_deadline(
+                cluster_kv_forward_deadline(timeout),
+                timeout,
+                move || {
+                    task_ran.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("queued materialization must obey the forwarding deadline");
+
+            assert_eq!(
+                error.delivery_state(),
+                Some(NetworkDeliveryState::PossiblyApplied)
+            );
+            release_blocker.wait();
+            blocker.await.expect("blocking-pool occupant");
+            tokio::task::yield_now().await;
+            assert!(
+                !ran_after_deadline.load(Ordering::SeqCst),
+                "timed-out queued blocking work must not run later"
+            );
+        });
+    }
+
+    #[test]
+    fn async_forward_deadline_awaits_admitted_snapshot_materialization() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let timeout = Duration::from_millis(20);
+            let materialization = tokio::spawn(async move {
+                run_forward_admitted_snapshot_materialization(
+                    cluster_kv_forward_deadline(timeout),
+                    timeout,
+                    move || {
+                        entered_tx.send(()).map_err(|_| NetworkError::Io {
+                            operation: "test forwarded snapshot admission".to_string(),
+                            detail: "test observer dropped".to_string(),
+                        })?;
+                        release_rx.recv().map_err(|source| NetworkError::Io {
+                            operation: "test forwarded snapshot admission".to_string(),
+                            detail: source.to_string(),
+                        })?;
+                        Ok(7_u8)
+                    },
+                )
+                .await
+            });
+
+            entered_rx.await.expect("snapshot clone admitted");
+            tokio::time::sleep(timeout.saturating_mul(2)).await;
+            assert!(
+                !materialization.is_finished(),
+                "an admitted full-snapshot materialization must not detach at the deadline"
+            );
+            release_tx.send(()).expect("release admitted clone");
+            assert_eq!(
+                materialization
+                    .await
+                    .expect("join materialization")
+                    .expect("admitted materialization result"),
+                7
+            );
+        });
     }
 
     #[test]
@@ -2073,6 +3557,7 @@ mod tests {
             &target,
             &request,
             Duration::from_secs(1),
+            cluster_kv_forward_deadline(Duration::from_secs(1)),
             &mut host,
         )
         .expect("committed fanout materializes the forwarded transaction");
@@ -2105,6 +3590,7 @@ mod tests {
             &target,
             &request,
             Duration::from_secs(1),
+            cluster_kv_forward_deadline(Duration::from_secs(1)),
             &mut host,
         )
         .expect_err("mismatched request ID must fail closed");
@@ -2261,27 +3747,31 @@ mod tests {
     }
 
     #[test]
-    fn voter_without_known_authority_does_not_forward_to_arbitrary_voter() {
-        let (root, state) = forward_test_state(true);
+    fn voter_without_known_authority_probes_exact_voters_before_campaigning() {
+        let (root, mut state) = forward_test_state(true);
+        add_second_remote_voter(&mut state);
+        state.term = 41;
         let data_dir = sinomo_local::SinomoDataDir::new(root.path());
         let paths = ClusterPaths::new(&data_dir);
         paths.ensure().expect("cluster paths");
-        let mut host = RecordingForwardHost {
+        let mut host = NonLeaderThenCommittedHost {
             known_authority: None,
             calls: 0,
         };
+        let term_before_forward = state.term;
 
-        let forwarded = forward_cluster_kv_txn_to_state_authority_with_host(
+        let read = forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
             &paths,
             &state,
-            &KvTxnRequest::generated(test_txn()),
             forward_options(),
             &mut host,
         )
-        .expect("forward decision");
+        .expect("probe exact voters after a verified non-leader rejection")
+        .expect("remote leader authoritative read");
 
-        assert!(forwarded.is_none());
-        assert_eq!(host.calls, 0);
+        assert_eq!(host.calls, 2);
+        assert_eq!(read.value.revision, KvRevision(1));
+        assert_eq!(state.term, term_before_forward);
     }
 
     #[test]
@@ -2341,14 +3831,45 @@ mod tests {
     }
 
     #[test]
-    fn preferred_authority_rejection_returns_before_trying_another_voter() {
+    fn stale_preferred_authority_falls_through_to_new_leader_without_campaigning() {
+        let (root, mut state) = forward_test_state(true);
+        add_second_remote_voter(&mut state);
+        let preferred = state.members[1].node_id.clone();
+        state.term = 57;
+        let data_dir = sinomo_local::SinomoDataDir::new(root.path());
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let request = KvTxnRequest::generated(test_txn());
+        let mut host = NonLeaderThenCommittedHost {
+            known_authority: Some(preferred),
+            calls: 0,
+        };
+        let term_before_forward = state.term;
+
+        let response = forward_cluster_kv_txn_to_state_authority_with_host(
+            &paths,
+            &state,
+            &request,
+            forward_options(),
+            &mut host,
+        )
+        .expect("probe another exact voter after stale preferred hint")
+        .expect("new remote leader committed response");
+
+        assert_eq!(host.calls, 3);
+        assert_eq!(response.request_id, request.request_id);
+        assert_eq!(state.term, term_before_forward);
+    }
+
+    #[test]
+    fn host_level_txn_non_leader_rejections_exhaust_exact_voters() {
         let (root, mut state) = forward_test_state(false);
         add_second_remote_voter(&mut state);
         let preferred = state.members[1].node_id.clone();
         let data_dir = sinomo_local::SinomoDataDir::new(root.path());
         let paths = ClusterPaths::new(&data_dir);
         paths.ensure().expect("cluster paths");
-        let mut host = NonLeaderThenCommittedHost {
+        let mut host = EarlyNonLeaderHost {
             known_authority: Some(preferred.clone()),
             calls: 0,
         };
@@ -2360,9 +3881,9 @@ mod tests {
             forward_options(),
             &mut host,
         )
-        .expect_err("preferred authority rejection must invalidate durable authority first");
+        .expect_err("all exact voters reject the forwarded transaction");
 
-        assert_eq!(host.calls, 1);
+        assert_eq!(host.calls, 2);
         assert!(matches!(
             error,
             NetworkError::VerifiedClusterNonLeader { node_id, .. } if node_id == preferred
@@ -2393,5 +3914,55 @@ mod tests {
         assert_eq!(host.calls, 2);
         assert_eq!(read.value.revision, KvRevision(1));
         assert_eq!(read.authority.revision, KvRevision(1));
+    }
+
+    #[test]
+    fn stale_preferred_authority_snapshot_read_falls_through_to_new_leader() {
+        let (root, mut state) = forward_test_state(true);
+        add_second_remote_voter(&mut state);
+        let preferred = state.members[1].node_id.clone();
+        let data_dir = sinomo_local::SinomoDataDir::new(root.path());
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let mut host = NonLeaderThenCommittedHost {
+            known_authority: Some(preferred),
+            calls: 0,
+        };
+
+        let read = forward_cluster_kv_authoritative_snapshot_to_state_authority_with_host(
+            &paths,
+            &state,
+            forward_options(),
+            &mut host,
+        )
+        .expect("probe another exact voter after stale preferred read hint")
+        .expect("new remote leader authoritative read");
+
+        assert_eq!(host.calls, 2);
+        assert_eq!(read.value.revision, KvRevision(1));
+    }
+
+    #[test]
+    fn host_level_snapshot_fetch_rejection_retains_target_identity() {
+        let (_root, state) = forward_test_state(false);
+        let target = state.members[1].node_id.clone();
+        let mut host = EarlyNonLeaderHost {
+            known_authority: None,
+            calls: 0,
+        };
+
+        let error = fetch_cluster_kv_snapshot_from_node_with_host(
+            &state,
+            &target,
+            Duration::from_secs(1),
+            &mut host,
+        )
+        .expect_err("host-level snapshot fetch rejection must preserve its identity");
+
+        assert_eq!(host.calls, 1);
+        assert!(matches!(
+            error,
+            NetworkError::VerifiedClusterNonLeader { node_id, .. } if node_id == target
+        ));
     }
 }
