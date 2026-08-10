@@ -14,6 +14,7 @@ pub mod cluster;
 pub mod config;
 pub mod evolution;
 pub mod modules;
+pub mod mounts;
 pub mod observe;
 pub mod remote_management;
 pub mod sifs;
@@ -854,7 +855,15 @@ fn start_in_process_daemon(
     let thread = thread::Builder::new()
         .name("sinomo-app-daemon".to_string())
         .spawn(move || {
-            let hooks = vec![agent_runtime_control_service_hook(control_host)];
+            let data_dir = loop_paths
+                .root
+                .parent()
+                .map(SinomoDataDir::new)
+                .expect("embedded daemon paths must have a data directory parent");
+            let hooks = vec![
+                agent_runtime_control_service_hook(control_host),
+                sinomo_cli::sifs_mount_supervisor_service_hook(data_dir, loop_paths.clone()),
+            ];
             if let Err(error) = run_daemon_control_loop_with_services_and_profile(
                 options,
                 loop_paths,

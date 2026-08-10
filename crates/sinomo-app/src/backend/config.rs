@@ -98,6 +98,10 @@ pub fn build_config_store() -> Result<ConfigStore, String> {
         .map_err(|e| format!("rollout config: {e:?}"))?;
     let builder = sinomo_runtime::sandbox::register_config_definitions(builder)
         .map_err(|e| format!("sandbox config: {e:?}"))?;
+    let builder = sinomo_runtime::dfs::dfs_module_registration()
+        .surfaces
+        .register_config_definitions(builder)
+        .map_err(|e| format!("dfs config: {e:?}"))?;
     let builder =
         sinomo_lm::register_config_definitions(builder).map_err(|e| format!("lm config: {e:?}"))?;
     let builder = sinomo_evolution::register_config_definitions(builder)
@@ -263,6 +267,26 @@ mod tests {
             definition.module_id.as_deref(),
             Some(expected_module_id.as_str())
         );
+    }
+
+    #[test]
+    fn app_fallback_registry_includes_sifs_mount_config_and_read_only_status() {
+        let store = build_config_store().expect("config store");
+        let mount = store
+            .registry()
+            .get(sinomo_runtime::dfs::SIFS_MOUNT_CONFIG_KEY)
+            .expect("SIFS mount config definition");
+        assert_eq!(mount.cluster_mode, ConfigClusterMode::LocalOnly);
+        assert!(!mount.read_only);
+        assert!(mount.schema.is_some());
+
+        let status = store
+            .registry()
+            .get(sinomo_runtime::dfs::SIFS_MOUNT_STATUS_CONFIG_KEY)
+            .expect("SIFS mount status definition");
+        assert_eq!(status.cluster_mode, ConfigClusterMode::LocalOnly);
+        assert!(status.read_only);
+        assert!(status.schema.is_some());
     }
 
     #[test]

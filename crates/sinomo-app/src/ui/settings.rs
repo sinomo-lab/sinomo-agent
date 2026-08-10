@@ -14,6 +14,7 @@
 //! snapshot-seed-plus-`on_change` writeback. Async provider device-login status is
 //! rebuilt as ordinary `Label` / `Link` composition when its typed state changes.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -21,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use sinomo_agent::{
@@ -36,20 +37,26 @@ use sinomo_cli::app_api::{
 };
 use sui::{
     Align, Alignment, ArrangeCtx, Checkbox, Command, ConstraintQuery, ConstraintView, Constraints,
-    ContextMenu, ControlSize, DefaultTheme, Event, EventCtx, FieldGroup, FixedPaneSplit, Flex,
-    FlexItem, FlexWrap, FontWeight, FormRow, FormSection, IconButton, IconGlyph, Label, ListItem,
-    ListView, MeasureCtx, MenuItem, NumberInput, PaintCtx, PasswordInput, ProgressBar,
-    RebuildOnChange, Rect, RichText, ScrollState, ScrollView, SectionLabel, Select, SelectionScope,
-    SemanticRegion, SemanticTone, SemanticsCtx, SemanticsRole, Separator, Size, SizedBox, Spinner,
-    Stack, StatusBadge, Surface, SurfaceRole, Switch, SwitchView, TabBar, TextArea, TextCommand,
-    TextDocument, TextInput, ThemeTextToken, Tooltip, TooltipPlacement, TrailingSlotRow,
-    VirtualList, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    containers::Padding as WidgetPadding,
+    ContextMenu, ControlSize, DefaultTheme, Event, EventCtx, EventPhase, FieldGroup,
+    FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight, FormRow, FormSection, IconButton,
+    IconGlyph, Label, ListItem, ListView, MeasureCtx, MenuItem, NumberInput, PaintCtx,
+    PasswordInput, ProgressBar, RebuildOnChange, Rect, RichText, ScrollState, ScrollView,
+    SectionLabel, Select, SelectionScope, SemanticRegion, SemanticTone, SemanticsCtx,
+    SemanticsRole, Separator, Size, SizedBox, Spinner, Stack, StatusBadge, Surface, SurfaceRole,
+    Switch, SwitchView, TabBar, TextArea, TextCommand, TextDocument, TextInput, ThemeTextToken,
+    TimerToken, Tooltip, TooltipPlacement, TrailingSlotRow, VirtualList, Widget, WidgetPod,
+    WidgetPodMutVisitor, WidgetPodVisitor, containers::Padding as WidgetPadding,
 };
 
 use sinomo_runtime::config::{
     ConfigClient, ConfigKey, ConfigSchema, ConfigSchemaField, ConfigSchemaValue, ConfigWriteTarget,
 };
+use sinomo_runtime::dfs::{
+    SifsMountAttentionKind, SifsMountAttentionNextAction, SifsMountAttentionSummary,
+    SifsMountConfig, SifsMountPlatform, SifsMountRuntimePhase, SifsMountWritebackMode,
+};
+#[cfg(test)]
+use sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::node::LocalNodePermissions;
 use sinomo_runtime::vfs::VfsHandle;
@@ -73,6 +80,9 @@ use crate::backend::config::{
     text_verbosity_index,
 };
 use crate::backend::modules::{ModuleConfigSnapshot, ModuleObservedState, module_ids_match};
+use crate::backend::mounts::{
+    SifsMountSettingsSnapshot, validate_connected_cloud_files_status_at, validate_sifs_mount_config,
+};
 use crate::backend::remote_management::{
     EXTERNAL_INTEGRATIONS_ALLOW_COMMAND, EXTERNAL_INTEGRATIONS_DENY_COMMAND,
     REMOTE_MANAGEMENT_ALLOW_COMMAND, REMOTE_MANAGEMENT_DENY_COMMAND,
@@ -88,6 +98,8 @@ use sinomo_runtime::module::ModuleRuntimeConfigSource;
 /// snapshot; past this the section reports itself unavailable instead of wedging the
 /// preload while the distributed file system is unhealthy.
 const SETTINGS_SIFS_LOAD_TIMEOUT: Duration = Duration::from_secs(8);
+const SIFS_MOUNT_LIVE_REFRESH_SECS: f64 = 1.0;
+const SIFS_MOUNT_ATTENTION_DISPLAY_LIMIT: usize = 16;
 
 /// Below this content width the tab collapses to a single drill-down column.
 const WIDE_THRESHOLD: f32 = 700.0;
@@ -103,6 +115,7 @@ const GENERAL_SETTINGS: &[SettingsSection] =
     &[SettingsSection::Appearance, SettingsSection::Connection];
 const INSTALLATION_SETTINGS: &[SettingsSection] = &[
     SettingsSection::Node,
+    SettingsSection::SifsMount,
     SettingsSection::RemoteManagement,
     SettingsSection::Cluster,
 ];
@@ -122,6 +135,7 @@ pub enum SettingsSection {
     Appearance,
     Connection,
     Node,
+    SifsMount,
     RemoteManagement,
     Cluster,
     Providers,
@@ -133,10 +147,11 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 11] = [
+    pub const ALL: [SettingsSection; 12] = [
         SettingsSection::Appearance,
         SettingsSection::Connection,
         SettingsSection::Node,
+        SettingsSection::SifsMount,
         SettingsSection::RemoteManagement,
         SettingsSection::Cluster,
         SettingsSection::Providers,
@@ -152,6 +167,7 @@ impl SettingsSection {
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Connection => "Connectivity",
             SettingsSection::Node => "This device",
+            SettingsSection::SifsMount => "SIFS mount",
             SettingsSection::RemoteManagement => "Remote management",
             SettingsSection::Cluster => "Cluster",
             SettingsSection::Providers => "Providers",
@@ -171,6 +187,9 @@ impl SettingsSection {
             }
             SettingsSection::Node => {
                 "Inspect this installation's runtime identity and local connection."
+            }
+            SettingsSection::SifsMount => {
+                "Expose one SIFS subtree through this device's native filesystem."
             }
             SettingsSection::RemoteManagement => {
                 "Control local host access and the remote-management module on this node."
@@ -204,6 +223,7 @@ impl SettingsSection {
             SettingsSection::Appearance => IconGlyph::Brush,
             SettingsSection::Connection => IconGlyph::Link,
             SettingsSection::Node => IconGlyph::Monitor,
+            SettingsSection::SifsMount => IconGlyph::Storage,
             SettingsSection::RemoteManagement => IconGlyph::Lock,
             SettingsSection::Cluster => IconGlyph::Storage,
             SettingsSection::Providers => IconGlyph::Chat,
@@ -276,6 +296,11 @@ pub struct SettingsState {
     pub module_selected_node_id: Option<String>,
     pub module_action_error: Option<String>,
     pub module_action_status: Option<String>,
+    pub sifs_mount_snapshot: SifsMountSettingsSnapshot,
+    sifs_mount_form: SifsMountForm,
+    pub sifs_mount_action_error: Option<String>,
+    pub sifs_mount_action_status: Option<String>,
+    sifs_mount_ui_revision: u64,
     pub remote_management: RemoteManagementSettingsSnapshot,
     pub remote_management_permission_error: Option<String>,
     pub remote_management_permission_status: Option<String>,
@@ -330,6 +355,53 @@ pub struct SettingsState {
     provider_usage_expanded: Vec<String>,
     provider_storage_detail_expanded: bool,
     provider_remove_confirming: Option<(String, String)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SifsMountForm {
+    enabled: bool,
+    mount_point: String,
+    root_path: String,
+    read_only: bool,
+    allow_other: bool,
+    sync_local_changes: bool,
+}
+
+impl From<&SifsMountConfig> for SifsMountForm {
+    fn from(config: &SifsMountConfig) -> Self {
+        let mut form = Self {
+            enabled: config.enabled,
+            mount_point: config.mount_point.clone(),
+            root_path: config.root_path.clone(),
+            read_only: config.read_only,
+            allow_other: config.allow_other,
+            sync_local_changes: config.sync_local_changes,
+        };
+        match SifsMountPlatform::current() {
+            SifsMountPlatform::UnixFuse => form.sync_local_changes = false,
+            SifsMountPlatform::WindowsCloudFiles => {
+                form.allow_other = false;
+            }
+            SifsMountPlatform::Unsupported => {
+                form.allow_other = false;
+                form.sync_local_changes = false;
+            }
+        }
+        form
+    }
+}
+
+impl SifsMountForm {
+    fn to_config(&self) -> SifsMountConfig {
+        SifsMountConfig {
+            enabled: self.enabled,
+            mount_point: self.mount_point.trim().to_string(),
+            root_path: self.root_path.trim().to_string(),
+            read_only: self.read_only,
+            allow_other: self.allow_other,
+            sync_local_changes: self.sync_local_changes,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -392,6 +464,42 @@ struct SettingsNodeStructure {
     cluster_node_id: Option<String>,
     cluster_summary: Option<String>,
     expanded: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SettingsSifsMountStructure {
+    theme: (AppThemeMode, AppTextScale),
+    snapshot: SifsMountSettingsSnapshot,
+    form_flags: (bool, bool, bool, bool),
+    action_error: Option<String>,
+    action_status: Option<String>,
+    pending: bool,
+    ui_revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SettingsSifsMountEditorStructure {
+    theme: (AppThemeMode, AppTextScale),
+    config: SifsMountConfig,
+    config_error: Option<String>,
+    form_flags: (bool, bool, bool, bool),
+    action_error: Option<String>,
+    action_status: Option<String>,
+    ui_revision: u64,
+}
+
+impl From<&SettingsSifsMountStructure> for SettingsSifsMountEditorStructure {
+    fn from(structure: &SettingsSifsMountStructure) -> Self {
+        Self {
+            theme: structure.theme,
+            config: structure.snapshot.config.clone(),
+            config_error: structure.snapshot.config_error.clone(),
+            form_flags: structure.form_flags,
+            action_error: structure.action_error.clone(),
+            action_status: structure.action_status.clone(),
+            ui_revision: structure.ui_revision,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -539,6 +647,7 @@ struct SettingsStructureSnapshot {
     navigation_previews: Vec<(SettingsSection, String)>,
     connection: SettingsConnectionStructure,
     node: SettingsNodeStructure,
+    sifs_mount: SettingsSifsMountStructure,
     remote_management: SettingsRemoteManagementStructure,
     cluster: SettingsClusterStructure,
     configuration: SettingsConfigurationStructure,
@@ -575,6 +684,7 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
         selected,
         connection,
         node,
+        sifs_mount,
         remote_management,
         cluster,
         configuration,
@@ -739,6 +849,20 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
                 cluster_summary: settings.cluster_summary.clone(),
                 expanded: settings.node_detail_expanded,
             },
+            SettingsSifsMountStructure {
+                theme,
+                snapshot: settings.sifs_mount_snapshot.clone(),
+                form_flags: (
+                    settings.sifs_mount_form.enabled,
+                    settings.sifs_mount_form.read_only,
+                    settings.sifs_mount_form.allow_other,
+                    settings.sifs_mount_form.sync_local_changes,
+                ),
+                action_error: settings.sifs_mount_action_error.clone(),
+                action_status: settings.sifs_mount_action_status.clone(),
+                pending: settings.sifs_mount_pending(),
+                ui_revision: settings.sifs_mount_ui_revision,
+            },
             SettingsRemoteManagementStructure {
                 theme,
                 snapshot: settings.remote_management.clone(),
@@ -786,6 +910,7 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
         navigation_previews,
         connection,
         node,
+        sifs_mount,
         remote_management,
         cluster,
         configuration,
@@ -806,6 +931,7 @@ struct SettingsGenerations {
     providers: u64,
     agents: u64,
     modules: u64,
+    sifs_mount: u64,
     remote_management_permission: u64,
     remote_management: u64,
     skills: u64,
@@ -819,6 +945,7 @@ impl SettingsGenerations {
             SettingsOperationDomain::Providers => self.providers,
             SettingsOperationDomain::Agents => self.agents,
             SettingsOperationDomain::Modules => self.modules,
+            SettingsOperationDomain::SifsMount => self.sifs_mount,
             SettingsOperationDomain::RemoteManagement => self.remote_management,
             SettingsOperationDomain::Skills => self.skills,
             SettingsOperationDomain::Cluster => self.cluster,
@@ -831,6 +958,7 @@ impl SettingsGenerations {
             SettingsOperationDomain::Providers => &mut self.providers,
             SettingsOperationDomain::Agents => &mut self.agents,
             SettingsOperationDomain::Modules => &mut self.modules,
+            SettingsOperationDomain::SifsMount => &mut self.sifs_mount,
             SettingsOperationDomain::RemoteManagement => &mut self.remote_management,
             SettingsOperationDomain::Skills => &mut self.skills,
             SettingsOperationDomain::Cluster => &mut self.cluster,
@@ -845,6 +973,7 @@ enum SettingsOperationDomain {
     Providers,
     Agents,
     Modules,
+    SifsMount,
     RemoteManagement,
     Skills,
     Cluster,
@@ -856,6 +985,7 @@ enum SettingsOperationScope {
     Providers,
     Agents,
     Modules,
+    SifsMount,
     RemoteManagementRefresh,
     RemoteManagementPermission,
     ExternalIntegrationsPermission,
@@ -871,6 +1001,7 @@ impl SettingsOperationScope {
             Self::Providers => SettingsOperationDomain::Providers,
             Self::Agents => SettingsOperationDomain::Agents,
             Self::Modules => SettingsOperationDomain::Modules,
+            Self::SifsMount => SettingsOperationDomain::SifsMount,
             Self::RemoteManagementRefresh
             | Self::RemoteManagementPermission
             | Self::ExternalIntegrationsPermission
@@ -999,6 +1130,12 @@ enum SettingsOperation {
         module_id: String,
         enabled: Option<bool>,
     },
+    RefreshSifsMount {
+        update_feedback: bool,
+    },
+    SaveSifsMount {
+        config: SifsMountConfig,
+    },
     RefreshRemoteManagement,
     SetRemoteManagementPermission {
         enabled: bool,
@@ -1047,6 +1184,7 @@ enum SettingsOperationPayload {
     ProviderHealth(ProviderHealthOperationResult),
     Agents(Result<AgentOperationSuccess, String>),
     Modules(Result<ModuleOperationSuccess, String>),
+    SifsMount(Result<SifsMountOperationSuccess, String>),
     RemoteManagement(Result<RemoteManagementOperationSuccess, String>),
     Skills(Result<SkillOperationSuccess, String>),
     Cluster(Result<ClusterOperationSuccess, String>),
@@ -1061,6 +1199,20 @@ struct ProviderHealthOperationResult {
 struct ConfigOperationSuccess {
     items: Vec<ConfigItem>,
     saved_draft: Option<ConfigSavedDraft>,
+}
+
+struct SifsMountOperationSuccess {
+    snapshot: SifsMountSettingsSnapshot,
+    items: Vec<ConfigItem>,
+    message: Option<String>,
+    update_feedback: bool,
+    effect: SifsMountOperationEffect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SifsMountOperationEffect {
+    Refreshed,
+    Saved,
 }
 
 #[derive(Clone, Debug)]
@@ -1559,6 +1711,8 @@ impl SettingsState {
             .selected_node
             .as_ref()
             .map(|node| node.summary.node_id.clone());
+        let sifs_mount_snapshot = backend.sifs_mount_settings_snapshot();
+        let sifs_mount_form = SifsMountForm::from(&sifs_mount_snapshot.config);
         let remote_management =
             backend.remote_management_settings_snapshot_from_modules(&module_snapshot);
 
@@ -1630,6 +1784,11 @@ impl SettingsState {
             module_selected_node_id,
             module_action_error: None,
             module_action_status: None,
+            sifs_mount_snapshot,
+            sifs_mount_form,
+            sifs_mount_action_error: None,
+            sifs_mount_action_status: None,
+            sifs_mount_ui_revision: 0,
             remote_management,
             remote_management_permission_error: None,
             remote_management_permission_status: None,
@@ -1745,6 +1904,11 @@ impl SettingsState {
             module_selected_node_id: None,
             module_action_error: None,
             module_action_status: None,
+            sifs_mount_snapshot: SifsMountSettingsSnapshot::default(),
+            sifs_mount_form: SifsMountForm::from(&SifsMountConfig::default()),
+            sifs_mount_action_error: None,
+            sifs_mount_action_status: Some("Mount state is loading…".to_string()),
+            sifs_mount_ui_revision: 0,
             remote_management: RemoteManagementSettingsSnapshot::default(),
             remote_management_permission_error: None,
             remote_management_permission_status: None,
@@ -1870,6 +2034,10 @@ impl SettingsState {
                     self.module_action_error = Some(retry_message.to_string());
                     self.module_action_status = None;
                 }
+                SettingsOperationScope::SifsMount => {
+                    self.sifs_mount_action_error = Some(retry_message.to_string());
+                    self.sifs_mount_action_status = None;
+                }
                 SettingsOperationScope::RemoteManagementPermission => {
                     self.remote_management_permission_error = None;
                     self.remote_management_permission_status =
@@ -1924,6 +2092,7 @@ impl SettingsState {
             SettingsOperationDomain::Providers,
             SettingsOperationDomain::Agents,
             SettingsOperationDomain::Modules,
+            SettingsOperationDomain::SifsMount,
             SettingsOperationDomain::RemoteManagement,
             SettingsOperationDomain::Skills,
             SettingsOperationDomain::Cluster,
@@ -1986,6 +2155,20 @@ impl SettingsState {
                 self.module_selected_node_id = loaded.module_selected_node_id;
             }
         }
+        if self.server_generations.sifs_mount == result.server_generations.sifs_mount {
+            self.sifs_mount_snapshot = loaded.sifs_mount_snapshot;
+            if result.draft_generations.sifs_mount == 0
+                && self.draft_generations.sifs_mount == result.draft_generations.sifs_mount
+            {
+                self.sifs_mount_form = loaded.sifs_mount_form;
+            }
+            if self.sifs_mount_action_error.is_none() {
+                self.sifs_mount_action_error = loaded.sifs_mount_action_error;
+            }
+            if self.sifs_mount_action_status.as_deref() == Some("Mount state is loading…") {
+                self.sifs_mount_action_status = loaded.sifs_mount_action_status;
+            }
+        }
         if self.server_generations.remote_management_permission
             == result.server_generations.remote_management_permission
         {
@@ -2035,6 +2218,35 @@ impl SettingsState {
         self.pending_operations
             .keys()
             .any(|scope| scope.domain() == domain)
+    }
+
+    fn sifs_mount_pending(&self) -> bool {
+        self.operation_pending(&SettingsOperationScope::SifsMount)
+    }
+
+    fn sifs_mount_dirty(&self) -> bool {
+        self.sifs_mount_form.to_config() != self.sifs_mount_snapshot.config
+    }
+
+    fn sifs_mount_save_config(&self) -> Result<SifsMountConfig, String> {
+        let config = self.sifs_mount_form.to_config();
+        validate_sifs_mount_config(&config, SifsMountPlatform::current())?;
+        Ok(config)
+    }
+
+    fn reset_sifs_mount_form(&mut self) {
+        self.sifs_mount_form = SifsMountForm::from(&self.sifs_mount_snapshot.config);
+        self.sifs_mount_action_error = None;
+        self.sifs_mount_action_status = None;
+        self.sifs_mount_ui_revision = self.sifs_mount_ui_revision.wrapping_add(1);
+        self.mark_draft_changed(SettingsOperationDomain::SifsMount);
+    }
+
+    fn edit_sifs_mount(&mut self, edit: impl FnOnce(&mut SifsMountForm)) {
+        edit(&mut self.sifs_mount_form);
+        self.sifs_mount_action_error = None;
+        self.sifs_mount_action_status = None;
+        self.mark_draft_changed(SettingsOperationDomain::SifsMount);
     }
 
     fn remote_management_permission_pending(&self) -> bool {
@@ -2221,6 +2433,16 @@ impl SettingsState {
                 self.module_action_error = None;
                 self.module_action_status = Some("Saving module configuration…".to_string());
             }
+            SettingsOperation::RefreshSifsMount { update_feedback } => {
+                if *update_feedback {
+                    self.sifs_mount_action_error = None;
+                    self.sifs_mount_action_status = Some("Refreshing mount state…".to_string());
+                }
+            }
+            SettingsOperation::SaveSifsMount { .. } => {
+                self.sifs_mount_action_error = None;
+                self.sifs_mount_action_status = Some("Saving mount configuration…".to_string());
+            }
             SettingsOperation::RefreshRemoteManagement => {
                 self.remote_management_permission_error = None;
                 self.remote_management_permission_status = None;
@@ -2299,6 +2521,10 @@ impl SettingsState {
             SettingsOperationDomain::Modules => {
                 self.module_action_error = Some(error);
                 self.module_action_status = None;
+            }
+            SettingsOperationDomain::SifsMount => {
+                self.sifs_mount_action_error = Some(error);
+                self.sifs_mount_action_status = None;
             }
             SettingsOperationDomain::RemoteManagement => match scope {
                 SettingsOperationScope::RemoteManagementPermission => {
@@ -2550,6 +2776,29 @@ impl SettingsState {
                     self.module_action_status = success.message;
                 }
                 SettingsOperationPayload::Modules(Err(error)) => {
+                    self.apply_operation_queue_error(&result.scope, error);
+                }
+                SettingsOperationPayload::SifsMount(Ok(success)) => {
+                    self.server_generations
+                        .bump(SettingsOperationDomain::SifsMount);
+                    self.server_generations
+                        .bump(SettingsOperationDomain::Config);
+                    self.sifs_mount_snapshot = success.snapshot;
+                    self.config_items = success.items;
+                    self.config_error = None;
+                    if success.effect == SifsMountOperationEffect::Saved
+                        && self.draft_generations.sifs_mount == result.draft_generation
+                    {
+                        self.sifs_mount_form =
+                            SifsMountForm::from(&self.sifs_mount_snapshot.config);
+                        self.sifs_mount_ui_revision = self.sifs_mount_ui_revision.wrapping_add(1);
+                    }
+                    if success.update_feedback {
+                        self.sifs_mount_action_error = None;
+                        self.sifs_mount_action_status = success.message;
+                    }
+                }
+                SettingsOperationPayload::SifsMount(Err(error)) => {
                     self.apply_operation_queue_error(&result.scope, error);
                 }
                 SettingsOperationPayload::RemoteManagement(Ok(success)) => match success {
@@ -4111,6 +4360,30 @@ fn execute_settings_operation(
             let snapshot = backend.module_config_snapshot(Some(&node_id));
             Ok(module_operation_success(backend, snapshot, Some(message)))
         })()),
+        SettingsOperation::RefreshSifsMount { update_feedback } => {
+            SettingsOperationPayload::SifsMount(sifs_mount_operation_success(
+                backend,
+                None,
+                update_feedback,
+                SifsMountOperationEffect::Refreshed,
+            ))
+        }
+        SettingsOperation::SaveSifsMount { config } => {
+            SettingsOperationPayload::SifsMount((|| {
+                backend.set_local_sifs_mount_config(&config)?;
+                sifs_mount_operation_success(
+                    backend,
+                    Some(if config.enabled {
+                        "Mount configuration saved; the local supervisor is reconciling it"
+                            .to_string()
+                    } else {
+                        "Mount disabled; the local supervisor is reconciling it".to_string()
+                    }),
+                    true,
+                    SifsMountOperationEffect::Saved,
+                )
+            })())
+        }
         SettingsOperation::RefreshRemoteManagement => {
             let module_snapshot = backend.module_config_snapshot(None);
             SettingsOperationPayload::RemoteManagement(Ok(
@@ -4257,6 +4530,25 @@ fn execute_settings_operation(
         })(
         )),
     }
+}
+
+fn sifs_mount_operation_success(
+    backend: &Backend,
+    message: Option<String>,
+    update_feedback: bool,
+    effect: SifsMountOperationEffect,
+) -> Result<SifsMountOperationSuccess, String> {
+    backend
+        .config
+        .catalog(None)
+        .map_err(|error| error.to_string())?;
+    Ok(SifsMountOperationSuccess {
+        snapshot: backend.sifs_mount_settings_snapshot(),
+        items: resolve_items(backend.config.as_ref()),
+        message,
+        update_feedback,
+        effect,
+    })
 }
 
 fn provider_operation_success(
@@ -5213,6 +5505,15 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
             }
         }
         SettingsSection::Node => app_surface_summary(&shared.settings().role),
+        SettingsSection::SifsMount => {
+            let settings = shared.settings();
+            sifs_mount_section_presentation_at(
+                &settings.sifs_mount_snapshot,
+                settings.sifs_mount_action_error.as_deref(),
+                time::OffsetDateTime::now_utc(),
+            )
+            .label
+        }
         SettingsSection::RemoteManagement => {
             let settings = shared.settings();
             let snapshot = &settings.remote_management;
@@ -6361,6 +6662,855 @@ fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
     FormSection::new("Node", body)
         .description("App surface identity and the attached daemon or cluster connection.")
         .theme_when(clone_reader(reader))
+}
+
+fn section_sifs_mount(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source =
+        shared
+            .signals()
+            .settings_structure
+            .select_named("settings SIFS mount structure", |key| {
+                key.0
+                    .as_deref()
+                    .map(|snapshot| SettingsSifsMountEditorStructure::from(&snapshot.sifs_mount))
+            });
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new_observable(source, move |_key| {
+        WidgetPod::new(section_sifs_mount_body(&s, &r))
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SifsMountRuntimePresentationKey {
+    snapshot: SifsMountSettingsSnapshot,
+    presentation: SifsMountPresentation,
+}
+
+fn sifs_mount_runtime_status(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let key_shared = shared.clone();
+    let build_shared = shared.clone();
+    let build_reader = Rc::clone(reader);
+    let status = RebuildOnChange::new(
+        move || {
+            let snapshot = key_shared.settings().sifs_mount_snapshot.clone();
+            let presentation =
+                sifs_mount_presentation_at(&snapshot, time::OffsetDateTime::now_utc());
+            SifsMountRuntimePresentationKey {
+                snapshot,
+                presentation,
+            }
+        },
+        move |key| {
+            WidgetPod::new(build_sifs_mount_runtime_status(
+                &build_shared,
+                &build_reader,
+                &key.snapshot,
+                &key.presentation,
+            ))
+        },
+    );
+    SifsMountLiveRefresh::new(shared.clone(), status)
+}
+
+fn build_sifs_mount_runtime_status(
+    shared: &Shared,
+    reader: &ThemeReader,
+    snapshot: &SifsMountSettingsSnapshot,
+    presentation: &SifsMountPresentation,
+) -> impl Widget + use<> {
+    let status = &snapshot.status;
+    let observed = module_lifecycle_value(
+        shared,
+        reader,
+        presentation.label.clone(),
+        presentation.tone,
+        presentation.detail.clone(),
+    );
+    let refresh = {
+        let s = shared.clone();
+        sui::Button::new("Refresh status")
+            .icon(IconGlyph::Redo)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .enabled_when({
+                let s = s.clone();
+                move || !s.settings().sifs_mount_pending()
+            })
+            .on_press(move || {
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::SifsMount,
+                    SettingsOperation::RefreshSifsMount {
+                        update_feedback: true,
+                    },
+                );
+            })
+    };
+    let mut runtime_rows = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(
+            FormRow::new("Observed state", observed)
+                .stacked()
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(value_row(
+            shared,
+            reader,
+            "Platform adapter",
+            sifs_mount_platform_label(status.platform),
+        ))
+        .with_child(value_row(
+            shared,
+            reader,
+            "Configured location",
+            status.configured_mount_point.clone(),
+        ));
+    if let Some(resolved) = status.resolved_mount_point.as_ref() {
+        runtime_rows = runtime_rows.with_child(copyable_text_row(
+            reader,
+            "sifs-mount-resolved-location",
+            "Resolved location",
+            resolved.clone(),
+        ));
+    }
+    runtime_rows = runtime_rows
+        .with_child(value_row(
+            shared,
+            reader,
+            "Observed SIFS root",
+            status.root_path.clone(),
+        ))
+        .with_child(value_row(
+            shared,
+            reader,
+            "Observed access",
+            if status.read_only {
+                "Read only"
+            } else {
+                "Read and write"
+            },
+        ));
+    if status.platform == SifsMountPlatform::WindowsCloudFiles {
+        runtime_rows = runtime_rows
+            .with_child(value_row(
+                shared,
+                reader,
+                "Writeback",
+                sifs_mount_writeback_mode_label(status.writeback_mode),
+            ))
+            .with_child(value_row(
+                shared,
+                reader,
+                "Cloud connection",
+                format!(
+                    "registered={} · connected={} · worker={} · ready={}",
+                    status.provider_registered,
+                    status.provider_connected,
+                    status.worker_alive,
+                    status.worker_ready
+                ),
+            ))
+            .with_child(value_row(
+                shared,
+                reader,
+                "Writeback queue",
+                format!(
+                    "{} pending · {} retrying · {} failed · {} conflicts",
+                    status.pending_operations,
+                    status.retrying_operations,
+                    status.failed_operations,
+                    status.conflict_count
+                ),
+            ));
+        for (index, attention) in status
+            .attention
+            .iter()
+            .take(SIFS_MOUNT_ATTENTION_DISPLAY_LIMIT)
+            .enumerate()
+        {
+            runtime_rows = runtime_rows.with_child(copyable_area_row(
+                reader,
+                &format!("sifs-mount-attention-{index}"),
+                &format!(
+                    "Attention {} · {}",
+                    index + 1,
+                    sifs_mount_attention_kind_label(attention.kind)
+                ),
+                sifs_mount_attention_detail(attention),
+            ));
+        }
+        let locally_omitted = status
+            .attention
+            .len()
+            .saturating_sub(SIFS_MOUNT_ATTENTION_DISPLAY_LIMIT)
+            as u64;
+        let attention_overflow = status.attention_overflow.saturating_add(locally_omitted);
+        if attention_overflow > 0 {
+            runtime_rows = runtime_rows.with_child(value_row(
+                shared,
+                reader,
+                "Additional attention",
+                format!(
+                    "{attention_overflow} additional issues omitted from this bounded live status; inspect daemon logs and refresh after addressing the shown issues"
+                ),
+            ));
+        }
+        if status.worker_health_generation > 0 {
+            runtime_rows = runtime_rows.with_child(value_row(
+                shared,
+                reader,
+                "Worker heartbeat",
+                status
+                    .last_worker_heartbeat_at
+                    .clone()
+                    .map(|observed| {
+                        format!(
+                            "generation {} · {observed}",
+                            status.worker_health_generation
+                        )
+                    })
+                    .unwrap_or_else(|| format!("generation {}", status.worker_health_generation)),
+            ));
+        }
+        if status.unregister_pending {
+            runtime_rows = runtime_rows.with_child(value_row(
+                shared,
+                reader,
+                "Retired registration",
+                "Cleanup pending; replacement activation remains blocked",
+            ));
+        }
+    }
+    if let Some(pid) = status.daemon_pid {
+        runtime_rows = runtime_rows.with_child(value_row(
+            shared,
+            reader,
+            "Supervisor process",
+            format!("daemon PID {pid}"),
+        ));
+    }
+    if let Some(interface) = status.provider_interface_version.as_ref() {
+        let provider = status
+            .provider_content_hash
+            .as_deref()
+            .map(|hash| format!("{} · {}", interface, short(hash, 16)))
+            .unwrap_or_else(|| interface.clone());
+        runtime_rows =
+            runtime_rows.with_child(value_row(shared, reader, "Provider module", provider));
+    }
+    if let Some(placeholders) = status.placeholders_created {
+        runtime_rows = runtime_rows.with_child(value_row(
+            shared,
+            reader,
+            "Placeholders created",
+            placeholders.to_string(),
+        ));
+    }
+    if status.restart_count > 0 {
+        runtime_rows = runtime_rows.with_child(value_row(
+            shared,
+            reader,
+            "Restarts",
+            status.restart_count.to_string(),
+        ));
+    }
+    if let Some(last_error) = status.last_error.as_ref() {
+        runtime_rows =
+            runtime_rows.with_child(value_row(shared, reader, "Last error", last_error.clone()));
+    }
+    if let Some(action) = presentation.operator_action.as_ref() {
+        runtime_rows = runtime_rows.with_child(value_row(
+            shared,
+            reader,
+            "Safe next action",
+            action.clone(),
+        ));
+    }
+    if !status.updated_at.trim().is_empty() {
+        runtime_rows = runtime_rows.with_child(value_row(
+            shared,
+            reader,
+            "Last observation",
+            status.updated_at.clone(),
+        ));
+    }
+    if let Some(error) = snapshot.status_error.as_ref() {
+        runtime_rows = runtime_rows.with_child(value_row(
+            shared,
+            reader,
+            "Status unavailable",
+            error.clone(),
+        ));
+    }
+    runtime_rows = runtime_rows.with_child(
+        FormRow::new("Actions", Stack::horizontal().with_child(refresh))
+            .inline()
+            .theme_when(clone_reader(reader)),
+    );
+
+    FormSection::new("Runtime status", runtime_rows)
+        .description(
+            "Observed state from the local mount supervisor. Configured does not mean mounted; only fresh observed lifecycle evidence is authoritative.",
+        )
+        .theme_when(clone_reader(reader))
+}
+
+struct SifsMountLiveRefresh {
+    shared: Shared,
+    child: WidgetPod,
+    timer: Cell<Option<(TimerToken, Instant)>>,
+}
+
+impl SifsMountLiveRefresh {
+    fn new<W>(shared: Shared, child: W) -> Self
+    where
+        W: Widget + 'static,
+    {
+        Self {
+            shared,
+            child: WidgetPod::new(child),
+            timer: Cell::new(None),
+        }
+    }
+
+    fn visible(&self) -> bool {
+        self.shared.active_tab() == Tab::Settings
+            && self.shared.settings().selected == Some(SettingsSection::SifsMount)
+    }
+
+    fn schedule(&self, ctx: &mut EventCtx) {
+        if !self.visible() {
+            self.timer.set(None);
+            return;
+        }
+        let now = Instant::now();
+        if self.timer.get().is_some_and(|(_, deadline)| deadline > now) {
+            return;
+        }
+        let token = ctx.schedule_timer_after(SIFS_MOUNT_LIVE_REFRESH_SECS);
+        self.timer.set(Some((
+            token,
+            now + Duration::from_secs_f64(SIFS_MOUNT_LIVE_REFRESH_SECS),
+        )));
+    }
+
+    fn queue_refresh(&self) {
+        let should_refresh = {
+            let settings = self.shared.settings();
+            settings.selected == Some(SettingsSection::SifsMount) && !settings.sifs_mount_pending()
+        };
+        if should_refresh && self.shared.active_tab() == Tab::Settings {
+            queue_settings_operation(
+                &self.shared,
+                SettingsOperationScope::SifsMount,
+                SettingsOperation::RefreshSifsMount {
+                    update_feedback: false,
+                },
+            );
+        }
+    }
+}
+
+impl Widget for SifsMountLiveRefresh {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        if ctx.phase() != EventPhase::Target {
+            return;
+        }
+        if let Event::Wake(sui::WakeEvent::Timer { token, .. }) = event
+            && self
+                .timer
+                .get()
+                .is_some_and(|(current, _)| current == *token)
+        {
+            self.timer.set(None);
+            if self.visible() {
+                self.queue_refresh();
+                ctx.request_measure();
+                ctx.request_arrange();
+                ctx.request_paint();
+                ctx.request_semantics();
+                self.schedule(ctx);
+            }
+            return;
+        }
+        self.schedule(ctx);
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.child.measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.child.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
+
+fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let (snapshot, form) = {
+        let settings = shared.settings();
+        (
+            settings.sifs_mount_snapshot.clone(),
+            settings.sifs_mount_form.clone(),
+        )
+    };
+    let platform = SifsMountPlatform::current();
+    let runtime_status = sifs_mount_runtime_status(shared, reader);
+
+    let enabled = switch_row(reader, "Enabled", form.enabled, {
+        let s = shared.clone();
+        move |enabled| {
+            s.settings_mut()
+                .edit_sifs_mount(|form| form.enabled = enabled);
+        }
+    });
+    let mount_point = text_row(
+        reader,
+        "sifs-mount-location",
+        if platform == SifsMountPlatform::WindowsCloudFiles {
+            "Sync root"
+        } else {
+            "Mount location"
+        },
+        form.mount_point,
+        if platform == SifsMountPlatform::WindowsCloudFiles {
+            r"C:\Users\you\Sinomo"
+        } else {
+            "~/sinomo"
+        },
+        {
+            let s = shared.clone();
+            move |mount_point| {
+                s.settings_mut()
+                    .edit_sifs_mount(|form| form.mount_point = mount_point);
+            }
+        },
+    );
+    let root_path = text_row(
+        reader,
+        "sifs-mount-root-path",
+        "SIFS root",
+        form.root_path,
+        "/",
+        {
+            let s = shared.clone();
+            move |root_path| {
+                s.settings_mut()
+                    .edit_sifs_mount(|form| form.root_path = root_path);
+            }
+        },
+    );
+    let mut config_rows = FieldGroup::new()
+        .spacing(8.0)
+        .with_child(enabled)
+        .with_child(mount_point)
+        .with_child(root_path);
+    match platform {
+        SifsMountPlatform::UnixFuse => {
+            config_rows = config_rows
+                .with_child(switch_row(reader, "Read only", form.read_only, {
+                    let s = shared.clone();
+                    move |read_only| {
+                        s.settings_mut()
+                            .edit_sifs_mount(|form| form.read_only = read_only);
+                    }
+                }))
+                .with_child(switch_row(reader, "Allow other local users", form.allow_other, {
+                    let s = shared.clone();
+                    move |allow_other| {
+                        s.settings_mut()
+                            .edit_sifs_mount(|form| form.allow_other = allow_other);
+                    }
+                }))
+                .with_child(value_row(
+                    shared,
+                    reader,
+                    "FUSE policy",
+                    "Owner-only by default; allow_other also requires user_allow_other in /etc/fuse.conf",
+                ));
+        }
+        SifsMountPlatform::WindowsCloudFiles => {
+            let writeback_enabled = !form.read_only && form.sync_local_changes;
+            config_rows = config_rows
+                .with_child(switch_row(
+                    reader,
+                    "Durable writable cloud sync",
+                    writeback_enabled,
+                    {
+                        let s = shared.clone();
+                        move |enabled| {
+                            s.settings_mut().edit_sifs_mount(|form| {
+                                form.read_only = !enabled;
+                                form.sync_local_changes = enabled;
+                            });
+                        }
+                    },
+                ))
+                .with_child(value_row(
+                    shared,
+                    reader,
+                    "Cloud Files policy",
+                    "Writable activation requires explicit durable sync. Local operations are journaled and version-fenced; conflicts fail closed for review.",
+                ));
+        }
+        SifsMountPlatform::Unsupported => {
+            config_rows = config_rows.with_child(value_row(
+                shared,
+                reader,
+                "Platform",
+                "Host mounts are not supported on this device; enabling is rejected",
+            ));
+        }
+    }
+    if let Some(error) = snapshot.config_error.as_ref() {
+        config_rows = config_rows.with_child(value_row(
+            shared,
+            reader,
+            "Configuration unavailable",
+            error.clone(),
+        ));
+    }
+
+    let save = {
+        let s = shared.clone();
+        sui::Button::new("Save mount configuration")
+            .icon(IconGlyph::Check)
+            .theme_when(clone_reader(reader))
+            .enabled_when({
+                let s = s.clone();
+                move || s.settings().sifs_mount_dirty() && !s.settings().sifs_mount_pending()
+            })
+            .on_press(move || {
+                let config = s.settings().sifs_mount_save_config();
+                match config {
+                    Ok(config) => {
+                        queue_settings_operation(
+                            &s,
+                            SettingsOperationScope::SifsMount,
+                            SettingsOperation::SaveSifsMount { config },
+                        );
+                    }
+                    Err(error) => {
+                        let mut settings = s.settings_mut();
+                        settings.sifs_mount_action_error = Some(error);
+                        settings.sifs_mount_action_status = None;
+                    }
+                }
+            })
+    };
+    let reset = {
+        let s = shared.clone();
+        sui::Button::new("Reset draft")
+            .icon(IconGlyph::Redo)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .enabled_when({
+                let s = s.clone();
+                move || s.settings().sifs_mount_dirty() && !s.settings().sifs_mount_pending()
+            })
+            .on_press(move || s.settings_mut().reset_sifs_mount_form())
+    };
+    config_rows = config_rows
+        .with_child(
+            FormRow::new(
+                "Actions",
+                Flex::horizontal()
+                    .wrap(FlexWrap::Wrap)
+                    .gap(8.0)
+                    .with_child(save)
+                    .with_child(reset),
+            )
+            .inline()
+            .theme_when(clone_reader(reader)),
+        )
+        .with_child(feedback_slot(
+            shared,
+            reader,
+            |settings| settings.sifs_mount_action_error.clone(),
+            |settings| settings.sifs_mount_action_status.clone(),
+        ));
+
+    Stack::vertical()
+        .spacing(14.0)
+        .alignment(Alignment::Stretch)
+        .with_child(
+            runtime_status,
+        )
+        .with_child(
+            FormSection::new("This device", config_rows)
+                .description(format!(
+                    "One node-local {} mount. Saving updates storage.sifs-mount; the main Sinomo process applies it.",
+                    sifs_mount_platform_label(platform)
+                ))
+                .theme_when(clone_reader(reader)),
+        )
+}
+
+fn sifs_mount_platform_label(platform: SifsMountPlatform) -> &'static str {
+    match platform {
+        SifsMountPlatform::UnixFuse => "Unix FUSE",
+        SifsMountPlatform::WindowsCloudFiles => "Windows Cloud Files",
+        SifsMountPlatform::Unsupported => "Unsupported platform",
+    }
+}
+
+fn sifs_mount_phase_label(phase: SifsMountRuntimePhase) -> &'static str {
+    match phase {
+        SifsMountRuntimePhase::Disabled => "Disabled",
+        SifsMountRuntimePhase::WaitingForDaemon => "Waiting for daemon",
+        SifsMountRuntimePhase::Starting => "Starting",
+        SifsMountRuntimePhase::Registered => "Registered",
+        SifsMountRuntimePhase::Mounted => "Mounted",
+        SifsMountRuntimePhase::Connected => "Connected",
+        SifsMountRuntimePhase::Stopping => "Stopping",
+        SifsMountRuntimePhase::Error => "Error",
+    }
+}
+
+fn sifs_mount_writeback_mode_label(mode: SifsMountWritebackMode) -> &'static str {
+    match mode {
+        SifsMountWritebackMode::Disabled => "Disabled",
+        SifsMountWritebackMode::Unsupported => "Unsupported",
+        SifsMountWritebackMode::ReadOnlyEnforcementUnavailable => {
+            "Read-only enforcement unavailable"
+        }
+        SifsMountWritebackMode::Starting => "Starting",
+        SifsMountWritebackMode::Active => "Active",
+        SifsMountWritebackMode::Blocked => "Blocked",
+    }
+}
+
+fn sifs_mount_phase_tone(phase: SifsMountRuntimePhase) -> SemanticTone {
+    match phase {
+        SifsMountRuntimePhase::Mounted | SifsMountRuntimePhase::Connected => SemanticTone::Success,
+        SifsMountRuntimePhase::WaitingForDaemon
+        | SifsMountRuntimePhase::Starting
+        | SifsMountRuntimePhase::Registered
+        | SifsMountRuntimePhase::Stopping => SemanticTone::Warning,
+        SifsMountRuntimePhase::Error => SemanticTone::Danger,
+        SifsMountRuntimePhase::Disabled => SemanticTone::Neutral,
+    }
+}
+
+fn sifs_mount_attention_kind_label(kind: SifsMountAttentionKind) -> &'static str {
+    match kind {
+        SifsMountAttentionKind::LocalOperationConflict => "Local operation conflict",
+        SifsMountAttentionKind::FailedLocalOperation => "Failed local operation",
+        SifsMountAttentionKind::RemoteNamespaceConflict => "Remote namespace conflict",
+        SifsMountAttentionKind::StartupConflict => "Startup conflict",
+        SifsMountAttentionKind::UnsupportedObjectKind => "Unsupported object",
+        SifsMountAttentionKind::StaleOrAmbiguousReconciliation => "Ambiguous reconciliation",
+    }
+}
+
+fn sifs_mount_attention_next_action_label(action: SifsMountAttentionNextAction) -> &'static str {
+    match action {
+        SifsMountAttentionNextAction::ReviewAndResolve => {
+            "Review the local and remote versions, preserve both, and resolve explicitly; Sinomo will not choose a winner."
+        }
+        SifsMountAttentionNextAction::RepairCauseAndRetry => {
+            "Preserve retained local evidence, repair the reported cause, and refresh status to retry."
+        }
+        SifsMountAttentionNextAction::PreserveLocalCopyAndRescan => {
+            "Preserve the local copy, keep the mount enabled, and refresh after an authoritative namespace rescan."
+        }
+        SifsMountAttentionNextAction::ReviewUnsupportedEntry => {
+            "Review the unsupported entry and preserve it outside the sync workflow before making any change."
+        }
+        SifsMountAttentionNextAction::WaitForAuthoritativeReconciliation => {
+            "Keep the mount enabled and wait for authoritative reconciliation; refresh status before taking action."
+        }
+    }
+}
+
+fn sifs_mount_attention_detail(attention: &SifsMountAttentionSummary) -> String {
+    let path = if attention.path.trim().is_empty() {
+        "(mount-wide issue)"
+    } else {
+        attention.path.as_str()
+    };
+    let mut lines = vec![
+        format!("Path: {path}"),
+        format!(
+            "Reason: {} · {}",
+            attention.reason_code,
+            short_one_line(&attention.reason, 512)
+        ),
+    ];
+    if let Some(evidence) = attention.retained_local_evidence.as_ref() {
+        let mut retained = Vec::new();
+        if let Some(operation_id) = evidence.operation_id.as_deref() {
+            retained.push(format!("operation {operation_id}"));
+        }
+        if let Some(evidence_id) = evidence.evidence_id.as_deref() {
+            retained.push(format!("evidence {evidence_id}"));
+        }
+        if let Some(hash) = evidence.staged_content_hash.as_deref() {
+            retained.push(format!("staged content {hash}"));
+        }
+        if let Some(size) = evidence.staged_content_size_bytes {
+            retained.push(format!("{size} bytes"));
+        }
+        if let Some(local_state) = evidence.local_state.as_deref() {
+            retained.push(format!("local state {}", short_one_line(local_state, 128)));
+        }
+        if !retained.is_empty() {
+            lines.push(format!("Retained evidence: {}", retained.join(" · ")));
+        }
+    }
+    lines.push(format!(
+        "Safe next action: {}",
+        sifs_mount_attention_next_action_label(attention.safe_next_action)
+    ));
+    lines.join("\n")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SifsMountPresentation {
+    label: String,
+    tone: SemanticTone,
+    detail: String,
+    operator_action: Option<String>,
+}
+
+fn sifs_mount_presentation_at(
+    snapshot: &SifsMountSettingsSnapshot,
+    now: time::OffsetDateTime,
+) -> SifsMountPresentation {
+    let status = &snapshot.status;
+    let needs_attention = |detail: String, operator_action: &str| SifsMountPresentation {
+        label: "Needs attention".to_string(),
+        tone: SemanticTone::Danger,
+        detail,
+        operator_action: Some(operator_action.to_string()),
+    };
+
+    if let Some(error) = snapshot.status_error.as_deref() {
+        return needs_attention(
+            format!("{error}; last observation: {}", status.detail),
+            "Refresh status. If it remains unavailable, inspect the local daemon before changing the mount configuration.",
+        );
+    }
+    if status.phase == SifsMountRuntimePhase::Connected
+        && let Err(error) = validate_connected_cloud_files_status_at(status, now)
+    {
+        return needs_attention(
+            format!("{error}; last observation: {}", status.detail),
+            "Refresh status. Local writes must not be treated as synchronized until a new worker progress heartbeat is observed.",
+        );
+    }
+    if status.unregister_pending {
+        return needs_attention(
+            format!(
+                "A retired Cloud Files registration still requires cleanup; {}",
+                status.detail
+            ),
+            "Keep the daemon running and refresh status. Replacement activation stays blocked until cleanup completes.",
+        );
+    }
+    if status.failed_operations > 0
+        || status.conflict_count > 0
+        || !status.attention.is_empty()
+        || status.attention_overflow > 0
+    {
+        let evidence = status.attention.first().map_or_else(
+            || {
+                status
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| status.detail.clone())
+            },
+            |attention| {
+                format!(
+                    "{} at {}: {} · {}",
+                    sifs_mount_attention_kind_label(attention.kind),
+                    attention.path,
+                    attention.reason_code,
+                    short_one_line(&attention.reason, 256)
+                )
+            },
+        );
+        let overflow = (status.attention_overflow > 0).then(|| {
+            format!(
+                "; {} additional bounded attention summaries omitted",
+                status.attention_overflow
+            )
+        });
+        let action = status.attention.first().map_or(
+            "Keep the mount enabled so journaled work remains recoverable. Review the reported local path or provider error, then refresh; conflicts are never overwritten automatically.",
+            |attention| sifs_mount_attention_next_action_label(attention.safe_next_action),
+        );
+        return needs_attention(
+            format!(
+                "{} failed writeback operations and {} local/remote conflicts require review; latest detail: {evidence}{}",
+                status.failed_operations,
+                status.conflict_count,
+                overflow.as_deref().unwrap_or_default()
+            ),
+            action,
+        );
+    }
+    if let Some(error) = status.last_error.as_deref() {
+        return needs_attention(
+            format!("{}; latest error: {error}", status.detail),
+            "Refresh status after inspecting the local daemon and provider error. Do not assume pending local writes are synchronized.",
+        );
+    }
+    if status.pending_operations > 0 || status.retrying_operations > 0 {
+        return SifsMountPresentation {
+            label: if status.phase == SifsMountRuntimePhase::Connected {
+                "Syncing".to_string()
+            } else {
+                sifs_mount_phase_label(status.phase).to_string()
+            },
+            tone: SemanticTone::Warning,
+            detail: format!(
+                "{}; {} operations pending and {} retrying",
+                status.detail, status.pending_operations, status.retrying_operations
+            ),
+            operator_action: None,
+        };
+    }
+    SifsMountPresentation {
+        label: sifs_mount_phase_label(status.phase).to_string(),
+        tone: sifs_mount_phase_tone(status.phase),
+        detail: status.detail.clone(),
+        operator_action: None,
+    }
+}
+
+fn sifs_mount_section_presentation_at(
+    snapshot: &SifsMountSettingsSnapshot,
+    action_error: Option<&str>,
+    now: time::OffsetDateTime,
+) -> SifsMountPresentation {
+    if let Some(error) = snapshot.config_error.as_deref().or(action_error) {
+        return SifsMountPresentation {
+            label: "Needs attention".to_string(),
+            tone: SemanticTone::Danger,
+            detail: error.to_string(),
+            operator_action: None,
+        };
+    }
+    sifs_mount_presentation_at(snapshot, now)
 }
 
 fn section_remote_management(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -13700,6 +14850,13 @@ fn section_body(
         .with_child(section_page(
             shared,
             reader,
+            SettingsSection::SifsMount,
+            section_sifs_mount(shared, reader),
+            &scroll_states[SettingsSection::SifsMount.index()],
+        ))
+        .with_child(section_page(
+            shared,
+            reader,
             SettingsSection::RemoteManagement,
             section_remote_management(shared, reader),
             &scroll_states[SettingsSection::RemoteManagement.index()],
@@ -13832,6 +14989,14 @@ fn section_status_tone(shared: &Shared, section: SettingsSection) -> SemanticTon
             } else {
                 SemanticTone::Neutral
             }
+        }
+        SettingsSection::SifsMount => {
+            sifs_mount_section_presentation_at(
+                &settings.sifs_mount_snapshot,
+                settings.sifs_mount_action_error.as_deref(),
+                time::OffsetDateTime::now_utc(),
+            )
+            .tone
         }
         SettingsSection::RemoteManagement => {
             if settings.remote_management.permission_error.is_some()
@@ -14702,6 +15867,300 @@ mod tests {
     fn reload_config_state(state: &mut SettingsState) {
         state.config_items = resolve_items(state.config.as_ref());
         state.provider_forms = provider_forms(state.config.as_ref());
+    }
+
+    fn connected_sifs_mount_snapshot_at(
+        observed_at: time::OffsetDateTime,
+    ) -> SifsMountSettingsSnapshot {
+        let timestamp = observed_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("connected fixture timestamp");
+        let config = SifsMountConfig {
+            enabled: true,
+            mount_point: r"C:\SinomoSettingsMount".to_string(),
+            root_path: "/".to_string(),
+            read_only: false,
+            allow_other: false,
+            sync_local_changes: true,
+        };
+        let status = sinomo_runtime::dfs::SifsMountRuntimeStatus {
+            phase: SifsMountRuntimePhase::Connected,
+            platform: SifsMountPlatform::WindowsCloudFiles,
+            configured_mount_point: config.mount_point.clone(),
+            resolved_mount_point: Some(config.mount_point.clone()),
+            root_path: config.root_path.clone(),
+            read_only: config.read_only,
+            sync_local_changes: config.sync_local_changes,
+            writeback_mode: SifsMountWritebackMode::Active,
+            provider_registered: true,
+            provider_connected: true,
+            worker_alive: true,
+            worker_ready: true,
+            worker_health_generation: 7,
+            last_worker_heartbeat_at: Some(timestamp.clone()),
+            daemon_pid: Some(4242),
+            provider_content_hash: Some("abcdef0123456789".to_string()),
+            provider_interface_version: Some(SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION.to_string()),
+            placeholders_created: Some(3),
+            detail: "callbacks connected after a complete worker pass".to_string(),
+            updated_at: timestamp,
+            ..sinomo_runtime::dfs::SifsMountRuntimeStatus::default()
+        };
+        SifsMountSettingsSnapshot {
+            config,
+            status,
+            config_error: None,
+            status_error: None,
+        }
+    }
+
+    #[test]
+    fn sifs_mount_text_drafts_preserve_the_retained_form_structure() {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let before = settings_structure_key(&shared);
+
+        shared.settings_mut().edit_sifs_mount(|form| {
+            form.mount_point = "/tmp/sinomo-live".to_string();
+        });
+        assert_eq!(
+            settings_structure_key(&shared),
+            before,
+            "typing must not rebuild the section and discard TextInput focus or caret state"
+        );
+
+        shared.settings_mut().edit_sifs_mount(|form| {
+            form.read_only = !form.read_only;
+        });
+        assert_ne!(
+            settings_structure_key(&shared),
+            before,
+            "structural switch changes must still refresh the retained section"
+        );
+    }
+
+    #[test]
+    fn sifs_mount_live_observations_do_not_rebuild_the_editor() {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let before = {
+            let key = settings_structure_key(&shared);
+            SettingsSifsMountEditorStructure::from(
+                &key.0.as_deref().expect("settings snapshot").sifs_mount,
+            )
+        };
+
+        {
+            let mut settings = shared.settings_mut();
+            settings.sifs_mount_snapshot.status.worker_health_generation = 9;
+            settings.sifs_mount_snapshot.status.updated_at = "2026-08-10T21:00:00Z".to_string();
+            settings
+                .pending_operations
+                .insert(SettingsOperationScope::SifsMount, 99);
+        }
+
+        let after = {
+            let key = settings_structure_key(&shared);
+            SettingsSifsMountEditorStructure::from(
+                &key.0.as_deref().expect("settings snapshot").sifs_mount,
+            )
+        };
+        assert_eq!(
+            after, before,
+            "heartbeat refreshes and silent pending state must not replace focused mount inputs"
+        );
+    }
+
+    #[test]
+    fn sifs_mount_silent_refresh_result_preserves_the_editor_and_unsaved_draft() {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend.clone()));
+        let unsaved_mount_point = "/tmp/sinomo-unsaved-mount-draft".to_string();
+        {
+            let mut settings = shared.settings_mut();
+            settings.sifs_mount_snapshot.status.worker_health_generation = 91;
+            settings.sifs_mount_snapshot.status.detail = "older live observation".to_string();
+            settings.edit_sifs_mount(|form| {
+                form.mount_point = unsaved_mount_point.clone();
+            });
+        }
+        let before_status = shared.settings().sifs_mount_snapshot.status.clone();
+        let before_editor = {
+            let key = settings_structure_key(&shared);
+            SettingsSifsMountEditorStructure::from(
+                &key.0.as_deref().expect("settings snapshot").sifs_mount,
+            )
+        };
+
+        let effects = {
+            let mut settings = shared.settings_mut();
+            apply_test_operation(
+                &mut settings,
+                &backend,
+                SettingsOperationScope::SifsMount,
+                SettingsOperation::RefreshSifsMount {
+                    update_feedback: false,
+                },
+            )
+        };
+
+        assert!(effects.changed);
+        assert_ne!(shared.settings().sifs_mount_snapshot.status, before_status);
+        assert_eq!(
+            shared.settings().sifs_mount_form.mount_point,
+            unsaved_mount_point,
+            "a silent observation refresh must never discard an unsaved mount draft"
+        );
+        let after_editor = {
+            let key = settings_structure_key(&shared);
+            SettingsSifsMountEditorStructure::from(
+                &key.0.as_deref().expect("settings snapshot").sifs_mount,
+            )
+        };
+        assert_eq!(
+            after_editor, before_editor,
+            "the 1s live-status result must update only the runtime subtree"
+        );
+    }
+
+    #[test]
+    fn sifs_mount_save_draft_fails_closed_before_queueing() {
+        let backend = Backend::local_fallback();
+        let mut state = SettingsState::new(&backend);
+        state.edit_sifs_mount(|form| {
+            form.enabled = true;
+            form.mount_point = "relative/path".to_string();
+            form.root_path = "/teams/../private".to_string();
+        });
+
+        assert_eq!(
+            state.sifs_mount_save_config(),
+            Err("mount location must be absolute or begin with ~/".to_string())
+        );
+        assert!(!state.sifs_mount_pending());
+    }
+
+    #[test]
+    fn sifs_mount_structure_carries_observed_runtime_evidence() {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let snapshot = connected_sifs_mount_snapshot_at(time::OffsetDateTime::now_utc());
+        {
+            let mut settings = shared.settings_mut();
+            settings.sifs_mount_snapshot = snapshot;
+        }
+
+        let key = settings_structure_key(&shared);
+        let mount = &key.0.as_deref().expect("settings snapshot").sifs_mount;
+        assert_eq!(
+            mount.snapshot.status.phase,
+            SifsMountRuntimePhase::Connected
+        );
+        assert_eq!(mount.snapshot.status.daemon_pid, Some(4242));
+        assert_eq!(
+            mount.snapshot.status.provider_interface_version.as_deref(),
+            Some(SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION)
+        );
+        assert_eq!(
+            section_preview(&shared, SettingsSection::SifsMount),
+            "Connected"
+        );
+    }
+
+    #[test]
+    fn sifs_mount_connected_presentation_expires_without_a_new_rpc() {
+        let observed_at = time::OffsetDateTime::parse(
+            "2026-08-10T21:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("fixed observation time");
+        let snapshot = connected_sifs_mount_snapshot_at(observed_at);
+
+        let fresh = sifs_mount_presentation_at(&snapshot, observed_at);
+        assert_eq!(fresh.label, "Connected");
+        assert_eq!(fresh.tone, SemanticTone::Success);
+
+        let expired =
+            sifs_mount_presentation_at(&snapshot, observed_at + time::Duration::seconds(6));
+        assert_eq!(expired.label, "Needs attention");
+        assert_eq!(expired.tone, SemanticTone::Danger);
+        assert!(expired.detail.contains("freshness window"));
+    }
+
+    #[test]
+    fn sifs_mount_failed_and_conflicted_operations_are_never_green() {
+        let observed_at = time::OffsetDateTime::parse(
+            "2026-08-10T21:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("fixed observation time");
+        for (failed_operations, conflict_count) in [(1, 0), (0, 1)] {
+            let mut snapshot = connected_sifs_mount_snapshot_at(observed_at);
+            snapshot.status.failed_operations = failed_operations;
+            snapshot.status.conflict_count = conflict_count;
+
+            let presentation = sifs_mount_presentation_at(&snapshot, observed_at);
+            assert_eq!(presentation.label, "Needs attention");
+            assert_eq!(presentation.tone, SemanticTone::Danger);
+            assert!(presentation.operator_action.is_some());
+        }
+    }
+
+    #[test]
+    fn sifs_mount_bounded_attention_exposes_path_evidence_and_safe_action() {
+        let observed_at = time::OffsetDateTime::parse(
+            "2026-08-10T21:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("fixed observation time");
+        let mut snapshot = connected_sifs_mount_snapshot_at(observed_at);
+        let attention = SifsMountAttentionSummary {
+            kind: SifsMountAttentionKind::UnsupportedObjectKind,
+            path: "/teams/design/socket".to_string(),
+            reason_code: "unsupported-object-kind".to_string(),
+            reason: "Cloud Files cannot expose a Unix socket as a placeholder".to_string(),
+            retained_local_evidence: Some(sinomo_runtime::dfs::SifsMountRetainedLocalEvidence {
+                operation_id: Some("operation-7".to_string()),
+                evidence_id: Some("evidence-9".to_string()),
+                staged_content_hash: Some("blake3:abcdef".to_string()),
+                staged_content_size_bytes: Some(41),
+                local_state: Some("preserved".to_string()),
+            }),
+            safe_next_action: SifsMountAttentionNextAction::ReviewUnsupportedEntry,
+        };
+        snapshot.status.attention = vec![attention.clone()];
+        snapshot.status.attention_overflow = 3;
+
+        let presentation = sifs_mount_presentation_at(&snapshot, observed_at);
+        assert_eq!(presentation.label, "Needs attention");
+        assert_eq!(presentation.tone, SemanticTone::Danger);
+        assert!(presentation.detail.contains("/teams/design/socket"));
+        assert!(presentation.detail.contains("3 additional"));
+
+        let detail = sifs_mount_attention_detail(&attention);
+        assert!(detail.contains("unsupported-object-kind"));
+        assert!(detail.contains("operation-7"));
+        assert!(detail.contains("evidence-9"));
+        assert!(detail.contains("blake3:abcdef"));
+        assert!(detail.contains("preserve it outside the sync workflow"));
+    }
+
+    #[test]
+    fn sifs_mount_pending_or_retrying_work_is_warning_not_success() {
+        let observed_at = time::OffsetDateTime::parse(
+            "2026-08-10T21:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("fixed observation time");
+        for (pending_operations, retrying_operations) in [(1, 0), (0, 1)] {
+            let mut snapshot = connected_sifs_mount_snapshot_at(observed_at);
+            snapshot.status.pending_operations = pending_operations;
+            snapshot.status.retrying_operations = retrying_operations;
+
+            let presentation = sifs_mount_presentation_at(&snapshot, observed_at);
+            assert_eq!(presentation.label, "Syncing");
+            assert_eq!(presentation.tone, SemanticTone::Warning);
+        }
     }
 
     #[test]
