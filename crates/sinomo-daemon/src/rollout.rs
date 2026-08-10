@@ -6,8 +6,8 @@ use crate::spawn_shadow_rollout_completion_helper_process;
 use crate::{
     CandidateMainDiagnostics, DaemonClusterStatus, DaemonError, DaemonLock, DaemonPaths,
     DaemonProbeStatus, DaemonStatus, daemon_connect_address, prepare_background_command,
-    probe_daemon_status, read_daemon_status, send_daemon_shutdown_request,
-    spawn_candidate_main_daemon_process, spawn_main_daemon_process,
+    probe_daemon_status, read_daemon_endpoint_advertisement_config, read_daemon_status,
+    send_daemon_shutdown_request, spawn_candidate_main_daemon_process, spawn_main_daemon_process,
     spawn_shadow_rollout_recovery_helper_process,
 };
 use fs2::FileExt;
@@ -44,6 +44,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -720,7 +721,31 @@ fn daemon_rollout_telemetry_retry_delay(consecutive_failures: u32) -> Duration {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RolloutTerminationMode {
     ProcessOnly,
+    // Reserved for explicit orphan-descendant cleanup. A live daemon handoff
+    // must not select this on Windows because the supervisor or recovery
+    // helper can itself be a descendant of the target process.
     ProcessTree,
+}
+
+fn main_rollout_termination_mode() -> RolloutTerminationMode {
+    main_rollout_termination_mode_for_platform(cfg!(windows))
+}
+
+fn main_rollout_termination_mode_for_platform(
+    windows_uses_ancestry_scoped_tree_kill: bool,
+) -> RolloutTerminationMode {
+    if windows_uses_ancestry_scoped_tree_kill {
+        // CREATE_NEW_PROCESS_GROUP and DETACHED_PROCESS do not break Windows
+        // process ancestry. After one successful rollout the replacement
+        // shadow is a child of main, and the deferred recovery helper is also
+        // spawned by main. taskkill /T would therefore kill the process that
+        // must finish the handoff.
+        RolloutTerminationMode::ProcessOnly
+    } else {
+        // Preserve the historical non-Windows selection. The Unix termination
+        // implementation is PID-scoped and ignores this mode.
+        RolloutTerminationMode::ProcessTree
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1127,6 +1152,7 @@ pub fn prepare_local_rollout_main_activation(
     rollout_paths: &SelfRolloutPaths,
     artifacts: &LocalRolloutArtifacts,
     fallback_host: &str,
+    host_override: Option<&str>,
     fallback_port: u16,
     shadow_port: u16,
     requested_at: String,
@@ -1143,10 +1169,13 @@ pub fn prepare_local_rollout_main_activation(
         .as_ref()
         .and_then(|status| status.executable.clone())
         .unwrap_or_else(|| plan.install_main_binary.clone());
-    let main_host = previous_main_status
-        .as_ref()
-        .map(|status| status.host.clone())
-        .unwrap_or_else(|| fallback_host.to_string());
+    let (main_host, shadow_host) = local_rollout_listener_hosts(
+        previous_main_status
+            .as_ref()
+            .map(|status| status.host.as_str()),
+        fallback_host,
+        host_override,
+    );
     let main_port = previous_main_status
         .as_ref()
         .map(|status| status.port)
@@ -1163,12 +1192,26 @@ pub fn prepare_local_rollout_main_activation(
             native_dylib_loader_rollback_generation: None,
             main_host,
             main_port,
+            shadow_host,
             shadow_port,
             requested_at,
             mode: "local-apply".to_string(),
         },
         previous_main_status,
     }
+}
+
+fn local_rollout_listener_hosts(
+    current_main_host: Option<&str>,
+    fallback_host: &str,
+    host_override: Option<&str>,
+) -> (String, Option<String>) {
+    let main_host = host_override
+        .or(current_main_host)
+        .unwrap_or(fallback_host)
+        .to_string();
+    let shadow_host = host_override.map(str::to_string);
+    (main_host, shadow_host)
 }
 
 fn install_local_rollout_native_dylib_modules(
@@ -1297,6 +1340,7 @@ fn restore_rollout_binary_from_backup_with_retry(
 fn complete_pending_shadow_rollout_after_start(
     paths: &DaemonPaths,
     rollout_paths: &SelfRolloutPaths,
+    shadow_options: &crate::DaemonRunOptions,
 ) -> Result<(), DaemonError> {
     let Some(finalize) = read_pending_shadow_rollout(rollout_paths)? else {
         return Ok(());
@@ -1306,6 +1350,18 @@ fn complete_pending_shadow_rollout_after_start(
     };
     if !sinomo_rollout::same_path_if_exists(&current, &finalize.shadow_binary) {
         return Ok(());
+    }
+    if shadow_options.host != finalize.shadow_host || shadow_options.port != finalize.shadow_port {
+        return Err(DaemonError::Network {
+            address: daemon_connect_address(&finalize.shadow_host, finalize.shadow_port),
+            detail: format!(
+                "replacement shadow bound {}:{}, expected rollout listener {}:{}; refusing to finalize the rollout",
+                shadow_options.host,
+                shadow_options.port,
+                finalize.shadow_host,
+                finalize.shadow_port,
+            ),
+        });
     }
     if rehydrate_main_activation_if_staged_main_is_pending(paths, rollout_paths, &finalize)? {
         return Ok(());
@@ -1367,6 +1423,7 @@ fn rehydrate_main_activation_if_staged_main_is_pending(
             .clone(),
         main_host: finalize.main_host.clone(),
         main_port: finalize.main_port,
+        shadow_host: Some(finalize.shadow_host.clone()),
         shadow_port: finalize.shadow_port,
         requested_at: finalize.requested_at.clone(),
         mode: finalize.mode.clone(),
@@ -1500,6 +1557,7 @@ pub fn run_shadow_daemon_supervision_loop(
     finalize_timeout: Duration,
     probe_timeout: Duration,
 ) -> Result<(), DaemonError> {
+    crate::cluster::deny_shadow_daemon_local_raft_access(&shadow_paths)?;
     let _lock = DaemonLock::acquire(&shadow_paths, &options, cluster.clone())?;
     recover_native_loader_intents_before_registry_load(&shadow_paths)?;
     let bind_address = format!("{}:{}", options.host, options.port);
@@ -1540,7 +1598,9 @@ pub fn run_shadow_daemon_supervision_loop(
     // The shadow is an alternate supervision endpoint, not a cluster member.
     // The main daemon probes it and publishes its status; starting a publisher
     // here would let the shadow originate quorum writes and leader campaigns.
-    if let Err(error) = complete_pending_shadow_rollout_after_start(&shadow_paths, &rollout_paths) {
+    if let Err(error) =
+        complete_pending_shadow_rollout_after_start(&shadow_paths, &rollout_paths, &options)
+    {
         tracing::warn!("sinomo shadow daemon rollout finalization publish failed: {error}");
         crate::append_operational_log_best_effort(
             &shadow_paths,
@@ -2268,7 +2328,7 @@ fn terminate_pending_main_activation(
         Ok(status) if status_is_main_daemon(&status) => status,
         _ => return Ok(None),
     };
-    terminate_process_for_rollout_stop(status.pid, RolloutTerminationMode::ProcessTree)?;
+    terminate_process_for_rollout_stop(status.pid, main_rollout_termination_mode())?;
     let deadline = Instant::now() + wait_timeout;
     while Instant::now() < deadline {
         if matches!(
@@ -2443,6 +2503,15 @@ where
         });
     }
 
+    preflight_cluster_rollout_main_bind(
+        paths,
+        data_dir,
+        &request.manifest.host,
+        request.manifest.host_override.as_deref(),
+        request.manifest.port,
+        request.manifest.shadow_port,
+    )?;
+
     let paths = paths.clone();
     let manifest = request.manifest;
     let activation_manifest = manifest.clone();
@@ -2464,6 +2533,14 @@ pub fn handle_daemon_rollout_native_dylib_module_request(
     request: ClusterRolloutNativeDylibModuleRequest,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
+    preflight_cluster_rollout_main_bind(
+        paths,
+        data_dir,
+        &request.host,
+        request.host_override.as_deref(),
+        request.port,
+        request.shadow_port,
+    )?;
     let rollout_paths = SelfRolloutPaths::new(data_dir);
     ensure_rollout_layout(&rollout_paths)?;
     let source = request.source.clone();
@@ -2522,6 +2599,7 @@ pub fn handle_daemon_rollout_native_dylib_module_request(
         Some(staged_main_binary),
         Some(staged_shadow_binary),
         request.host.clone(),
+        request.host_override.clone(),
         request.port,
         request.shadow_port,
         requested_at.clone(),
@@ -2731,6 +2809,7 @@ fn activate_daemon_rollout_binary_request(
         Some(staged_main_binary),
         Some(staged_shadow_binary),
         manifest.host.clone(),
+        manifest.host_override.clone(),
         manifest.port,
         manifest.shadow_port,
         requested_at.clone(),
@@ -3292,13 +3371,18 @@ fn stage_main_only_rollout_without_existing_shadow(
     // transient bind/lock race during handoff does not leave the node without a
     // supervisor. In tests the spawn/probe is skipped.
     #[cfg(not(test))]
+    let desired_shadow_host = activation
+        .shadow_host
+        .as_deref()
+        .unwrap_or(&activation.main_host);
+    #[cfg(not(test))]
     let shadow_start = ensure_shadow_supervisor_running(
         data_dir,
         &activation.shadow_binary,
         &activation.main_binary,
         &activation.main_host,
         activation.main_port,
-        &activation.main_host,
+        desired_shadow_host,
         activation.shadow_port,
         SHADOW_RECOVERY_DEADLINE,
     );
@@ -3434,6 +3518,203 @@ struct ClusterRolloutMainActivationPlan {
     current_main_pid: Option<u32>,
 }
 
+fn cluster_rollout_current_main_status(
+    current_daemon_paths: &DaemonPaths,
+    data_dir: &Path,
+) -> Result<Option<DaemonStatus>, DaemonError> {
+    let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
+    let current_daemon_is_shadow = paths_equivalent(&current_daemon_paths.root, &shadow_paths.root);
+    if current_daemon_is_shadow {
+        let main_paths = DaemonPaths::with_root(data_dir.join("daemon"));
+        return Ok(
+            match probe_daemon_status(&main_paths, CLUSTER_HEALTH_PROBE_TIMEOUT) {
+                DaemonProbeStatus::Running(status) => Some(status),
+                DaemonProbeStatus::Locked { status } => status,
+                DaemonProbeStatus::NotRunning => None,
+            },
+        );
+    }
+    Ok(Some(read_daemon_status(current_daemon_paths)?))
+}
+
+fn cluster_rollout_current_shadow_status(data_dir: &Path) -> Option<DaemonStatus> {
+    let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
+    match probe_daemon_status(&shadow_paths, CLUSTER_HEALTH_PROBE_TIMEOUT) {
+        DaemonProbeStatus::Running(status) => Some(status),
+        DaemonProbeStatus::Locked { status } => status,
+        DaemonProbeStatus::NotRunning => None,
+    }
+}
+
+fn select_cluster_rollout_main_host(
+    current_host: Option<&str>,
+    supervised_main_host: Option<&str>,
+    requested_host: &str,
+    requested_host_override: Option<&str>,
+) -> String {
+    requested_host_override
+        .or(current_host)
+        .or(supervised_main_host)
+        .unwrap_or(requested_host)
+        .to_string()
+}
+
+fn select_cluster_rollout_shadow_host(
+    current_shadow_host: Option<&str>,
+    candidate_main_host: &str,
+    requested_host_override: Option<&str>,
+) -> String {
+    requested_host_override
+        .or(current_shadow_host)
+        .unwrap_or(candidate_main_host)
+        .to_string()
+}
+
+fn manual_endpoint_host(address: &str) -> Option<&str> {
+    if let Some(rest) = address.strip_prefix('[') {
+        return rest.split_once("]:").map(|(host, _)| host);
+    }
+    address.rsplit_once(':').map(|(host, _)| host)
+}
+
+fn rollout_bind_covers_manual_tcp_endpoint(
+    bind_host: &str,
+    bind_port: u16,
+    endpoint_address: &str,
+) -> bool {
+    rollout_bind_covers_manual_tcp_endpoint_with(
+        bind_host,
+        bind_port,
+        endpoint_address,
+        |host, port| {
+            (host, port)
+                .to_socket_addrs()
+                .map(|addresses| addresses.collect())
+                .unwrap_or_default()
+        },
+    )
+}
+
+fn rollout_bind_covers_manual_tcp_endpoint_with<R>(
+    bind_host: &str,
+    bind_port: u16,
+    endpoint_address: &str,
+    mut resolve_host: R,
+) -> bool
+where
+    R: FnMut(&str, u16) -> Vec<SocketAddr>,
+{
+    let endpoint_port = endpoint_address
+        .parse::<SocketAddr>()
+        .ok()
+        .map(|socket| socket.port())
+        .or_else(|| {
+            endpoint_address
+                .rsplit_once(':')
+                .and_then(|(_, port)| port.parse::<u16>().ok())
+        });
+    if endpoint_port != Some(bind_port) {
+        return false;
+    }
+
+    let bind_host = bind_host
+        .trim()
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or_else(|| bind_host.trim());
+    if let Ok(bind_ip) = bind_host.parse::<IpAddr>() {
+        if bind_ip.is_unspecified() {
+            if let Ok(endpoint) = endpoint_address.parse::<SocketAddr>() {
+                return bind_ip.is_ipv4() == endpoint.ip().is_ipv4();
+            }
+            let Some(endpoint_host) = manual_endpoint_host(endpoint_address) else {
+                return false;
+            };
+            let resolved = resolve_host(endpoint_host, bind_port);
+            return !resolved.is_empty()
+                && resolved.into_iter().all(|endpoint| {
+                    endpoint.port() == bind_port && bind_ip.is_ipv4() == endpoint.ip().is_ipv4()
+                });
+        }
+        return endpoint_address
+            .parse::<SocketAddr>()
+            .is_ok_and(|endpoint| endpoint.ip() == bind_ip);
+    }
+    manual_endpoint_host(endpoint_address)
+        .is_some_and(|endpoint_host| endpoint_host.eq_ignore_ascii_case(bind_host))
+}
+
+fn preflight_cluster_rollout_main_bind(
+    current_daemon_paths: &DaemonPaths,
+    data_dir: &Path,
+    requested_host: &str,
+    requested_host_override: Option<&str>,
+    requested_port: u16,
+    requested_shadow_port: u16,
+) -> Result<(), DaemonError> {
+    let main_status = cluster_rollout_current_main_status(current_daemon_paths, data_dir)?;
+    let shadow_status = cluster_rollout_current_shadow_status(data_dir);
+    let supervised_main_host = env::var(SHADOW_MAIN_HOST_ENV).ok();
+    let candidate_host = select_cluster_rollout_main_host(
+        main_status.as_ref().map(|status| status.host.as_str()),
+        supervised_main_host.as_deref(),
+        requested_host,
+        requested_host_override,
+    );
+    let candidate_port = main_status
+        .as_ref()
+        .map(|status| status.port)
+        .or_else(|| {
+            env::var(SHADOW_MAIN_PORT_ENV)
+                .ok()
+                .and_then(|value| value.parse::<u16>().ok())
+        })
+        .unwrap_or(requested_port);
+    let candidate_shadow_host = select_cluster_rollout_shadow_host(
+        shadow_status.as_ref().map(|status| status.host.as_str()),
+        &candidate_host,
+        requested_host_override,
+    );
+    let candidate_shadow_port = shadow_status
+        .as_ref()
+        .map(|status| status.port)
+        .unwrap_or(requested_shadow_port);
+    let config = read_daemon_endpoint_advertisement_config(data_dir)?;
+    for (role, host, port, endpoints) in [
+        (
+            "main",
+            candidate_host.as_str(),
+            candidate_port,
+            config.main_endpoints.as_slice(),
+        ),
+        (
+            "shadow",
+            candidate_shadow_host.as_str(),
+            candidate_shadow_port,
+            config.shadow_endpoints.as_slice(),
+        ),
+    ] {
+        for manual in endpoints {
+            let Some(endpoint_address) =
+                crate::status::normalize_manual_daemon_tcp_endpoint_address(&manual.address, port)
+            else {
+                continue;
+            };
+            if rollout_bind_covers_manual_tcp_endpoint(host, port, &endpoint_address) {
+                continue;
+            }
+            return Err(DaemonError::Parse {
+                detail: format!(
+                    "cluster rollout candidate would bind {role} at {}, but this node manually advertises {role} endpoint {}; pass an explicit --host that serves the advertised endpoint",
+                    daemon_connect_address(host, port),
+                    manual.address
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_cluster_rollout_main_activation(
     current_daemon_paths: &DaemonPaths,
@@ -3444,32 +3725,25 @@ fn prepare_cluster_rollout_main_activation(
     staged_main_binary: Option<PathBuf>,
     staged_shadow_binary: Option<PathBuf>,
     requested_host: String,
+    requested_host_override: Option<String>,
     requested_port: u16,
-    shadow_port: u16,
+    requested_shadow_port: u16,
     requested_at: String,
     mode: &str,
 ) -> Result<ClusterRolloutMainActivationPlan, DaemonError> {
-    let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
-    let current_daemon_is_shadow = paths_equivalent(&current_daemon_paths.root, &shadow_paths.root);
-    let main_status = if current_daemon_is_shadow {
-        let main_paths = DaemonPaths::with_root(data_dir.join("daemon"));
-        match probe_daemon_status(&main_paths, CLUSTER_HEALTH_PROBE_TIMEOUT) {
-            DaemonProbeStatus::Running(status) => Some(status),
-            DaemonProbeStatus::Locked { status } => status,
-            DaemonProbeStatus::NotRunning => None,
-        }
-    } else {
-        Some(read_daemon_status(current_daemon_paths)?)
-    };
+    let main_status = cluster_rollout_current_main_status(current_daemon_paths, data_dir)?;
+    let shadow_status = cluster_rollout_current_shadow_status(data_dir);
     let previous_main_binary = main_status
         .as_ref()
         .and_then(|status| status.executable.clone())
         .unwrap_or_else(|| main_binary.clone());
-    let main_host = main_status
-        .as_ref()
-        .map(|status| status.host.clone())
-        .or_else(|| env::var(SHADOW_MAIN_HOST_ENV).ok())
-        .unwrap_or(requested_host);
+    let supervised_main_host = env::var(SHADOW_MAIN_HOST_ENV).ok();
+    let main_host = select_cluster_rollout_main_host(
+        main_status.as_ref().map(|status| status.host.as_str()),
+        supervised_main_host.as_deref(),
+        &requested_host,
+        requested_host_override.as_deref(),
+    );
     let main_port = main_status
         .as_ref()
         .map(|status| status.port)
@@ -3479,6 +3753,15 @@ fn prepare_cluster_rollout_main_activation(
                 .and_then(|value| value.parse::<u16>().ok())
         })
         .unwrap_or(requested_port);
+    let shadow_host = select_cluster_rollout_shadow_host(
+        shadow_status.as_ref().map(|status| status.host.as_str()),
+        &main_host,
+        requested_host_override.as_deref(),
+    );
+    let shadow_port = shadow_status
+        .as_ref()
+        .map(|status| status.port)
+        .unwrap_or(requested_shadow_port);
     Ok(ClusterRolloutMainActivationPlan {
         activation: RolloutMainActivation {
             source,
@@ -3490,6 +3773,7 @@ fn prepare_cluster_rollout_main_activation(
             native_dylib_loader_rollback_generation: None,
             main_host,
             main_port,
+            shadow_host: Some(shadow_host),
             shadow_port,
             requested_at,
             mode: mode.to_string(),
@@ -3644,10 +3928,25 @@ fn stop_main_daemon_for_rollout(
         main_host,
         main_port,
         "main daemon",
-        RolloutTerminationMode::ProcessTree,
+        main_rollout_termination_mode(),
         timeout,
         probe_timeout,
     )
+}
+
+fn shadow_supervisor_status_matches_rollout(
+    status: &DaemonStatus,
+    shadow_binary: &Path,
+    shadow_host: &str,
+    shadow_port: u16,
+    expected_pid: Option<u32>,
+) -> bool {
+    status.host == shadow_host
+        && status.port == shadow_port
+        && expected_pid.is_none_or(|pid| status.pid == pid)
+        && status.executable.as_ref().is_some_and(|executable| {
+            sinomo_rollout::same_path_if_exists(executable, shadow_binary)
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3684,17 +3983,19 @@ fn ensure_shadow_supervisor_running_from_installed_path(
             });
         }
     };
-    if running
-        .executable
-        .as_ref()
-        .is_some_and(|executable| sinomo_rollout::same_path_if_exists(executable, shadow_binary))
-    {
+    if shadow_supervisor_status_matches_rollout(
+        &running,
+        shadow_binary,
+        shadow_host,
+        shadow_port,
+        None,
+    ) {
         return Ok(());
     }
     stop_shadow_supervisor_for_rollout(
         &shadow_paths,
-        shadow_host,
-        shadow_port,
+        &running.host,
+        running.port,
         Duration::from_secs(15),
         DAEMON_PROBE_TIMEOUT,
     )?;
@@ -3721,23 +4022,30 @@ fn ensure_shadow_supervisor_running_from_installed_path(
             });
         }
     };
-    if running
-        .executable
-        .as_ref()
-        .is_some_and(|executable| sinomo_rollout::same_path_if_exists(executable, shadow_binary))
-    {
+    if shadow_supervisor_status_matches_rollout(
+        &running,
+        shadow_binary,
+        shadow_host,
+        shadow_port,
+        None,
+    ) {
         Ok(())
     } else {
         Err(DaemonError::Network {
             address: daemon_connect_address(shadow_host, shadow_port),
             detail: format!(
-                "shadow supervisor started from {}, expected {}",
+                "shadow supervisor reported pid={} executable={} bind={}:{}, expected executable={} bind={}:{}",
+                running.pid,
                 running
                     .executable
                     .as_ref()
                     .map(|path| path.display().to_string())
                     .unwrap_or_else(|| "unknown executable".to_string()),
-                shadow_binary.display()
+                running.host,
+                running.port,
+                shadow_binary.display(),
+                shadow_host,
+                shadow_port,
             ),
         })
     }
@@ -3965,11 +4273,62 @@ fn ensure_shadow_supervisor_running(
     let rollout_paths = SelfRolloutPaths::new(data_dir);
     let overall_deadline = Instant::now() + deadline;
     loop {
-        if matches!(
-            probe_daemon_status(&shadow_paths, Duration::from_secs(2)),
-            DaemonProbeStatus::Running(_)
-        ) {
-            return Ok(());
+        let remaining = overall_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(DaemonError::Network {
+                address: daemon_connect_address(shadow_host, shadow_port),
+                detail: format!(
+                    "shadow supervisor did not converge to executable={} bind={}:{} before the rollout recovery deadline",
+                    shadow_binary.display(),
+                    shadow_host,
+                    shadow_port,
+                ),
+            });
+        }
+        match probe_daemon_status(&shadow_paths, Duration::from_secs(2).min(remaining)) {
+            DaemonProbeStatus::Running(status)
+                if shadow_supervisor_status_matches_rollout(
+                    &status,
+                    shadow_binary,
+                    shadow_host,
+                    shadow_port,
+                    None,
+                ) =>
+            {
+                return Ok(());
+            }
+            DaemonProbeStatus::Running(status)
+            | DaemonProbeStatus::Locked {
+                status: Some(status),
+            } if !shadow_supervisor_status_matches_rollout(
+                &status,
+                shadow_binary,
+                shadow_host,
+                shadow_port,
+                None,
+            ) =>
+            {
+                // A service manager can race the rollout handoff by restarting
+                // the previous stable-path supervisor with its old listener.
+                // It is live, but it is not the requested replacement and must
+                // not satisfy readiness or block the correct spawn indefinitely.
+                stop_shadow_supervisor_for_rollout(
+                    &shadow_paths,
+                    &status.host,
+                    status.port,
+                    remaining.min(Duration::from_secs(15)),
+                    DAEMON_PROBE_TIMEOUT.min(remaining),
+                )?;
+                continue;
+            }
+            DaemonProbeStatus::Locked { .. } => {
+                // A matching supervisor may still be publishing its control
+                // endpoint. Wait for a live RPC response rather than accepting
+                // durable status alone or racing it with another process.
+                thread::sleep(Duration::from_millis(100).min(remaining));
+                continue;
+            }
+            DaemonProbeStatus::NotRunning | DaemonProbeStatus::Running(_) => {}
         }
         // Registration happens before the shadow publishes its control status.
         // Let one live child use the remaining recovery budget; if it exits,
@@ -3988,6 +4347,7 @@ fn ensure_shadow_supervisor_running(
         .and_then(|(child, diagnostics)| {
             wait_for_shadow_rollout_health(
                 data_dir,
+                shadow_binary,
                 shadow_host,
                 shadow_port,
                 attempt_timeout,
@@ -4141,7 +4501,18 @@ pub fn promote_shadow_main_rollout(
     shadow_host: &str,
     shadow_port: u16,
 ) -> Result<crate::DaemonRunOptions, DaemonError> {
-    stage_pending_shadow_rollout(rollout_paths, pending, shadow_host, shadow_port)?;
+    let (desired_shadow_host, desired_shadow_port) = pending
+        .activation
+        .shadow_host
+        .as_deref()
+        .map(|host| (host, pending.activation.shadow_port))
+        .unwrap_or((shadow_host, shadow_port));
+    stage_pending_shadow_rollout(
+        rollout_paths,
+        pending,
+        desired_shadow_host,
+        desired_shadow_port,
+    )?;
     remove_main_activation(rollout_paths);
     Ok(pending.main_options.clone())
 }
@@ -4404,6 +4775,14 @@ pub fn handle_daemon_rollout_build_request(
     request: ClusterRolloutBuildRequest,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
+    preflight_cluster_rollout_main_bind(
+        paths,
+        data_dir,
+        &request.host,
+        request.host_override.as_deref(),
+        request.port,
+        request.shadow_port,
+    )?;
     let rollout_paths = SelfRolloutPaths::new(data_dir);
     ensure_rollout_layout(&rollout_paths)?;
     let source = request.source.clone();
@@ -4640,6 +5019,7 @@ pub fn handle_daemon_rollout_build_request(
         Some(staged_main_binary),
         Some(staged_shadow_binary),
         request.host.clone(),
+        request.host_override.clone(),
         request.port,
         request.shadow_port,
         requested_at.clone(),
@@ -4802,6 +5182,7 @@ pub fn spawn_shadow_for_cluster_rollout(
 
 pub fn wait_for_shadow_rollout_health(
     data_dir: &Path,
+    shadow_binary: &Path,
     shadow_host: &str,
     shadow_port: u16,
     timeout: Duration,
@@ -4810,11 +5191,18 @@ pub fn wait_for_shadow_rollout_health(
 ) -> Result<(), DaemonError> {
     let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
     let deadline = Instant::now() + timeout;
+    let expected_pid = child.id();
     while Instant::now() < deadline {
-        if matches!(
-            probe_daemon_status(&shadow_paths, Duration::from_secs(2)),
-            DaemonProbeStatus::Running(_)
-        ) {
+        if let DaemonProbeStatus::Running(status) =
+            probe_daemon_status(&shadow_paths, Duration::from_secs(2))
+            && shadow_supervisor_status_matches_rollout(
+                &status,
+                shadow_binary,
+                shadow_host,
+                shadow_port,
+                Some(expected_pid),
+            )
+        {
             reap_detached_shadow_supervisor(child);
             return Ok(());
         }
@@ -4834,7 +5222,10 @@ pub fn wait_for_shadow_rollout_health(
     Err(DaemonError::Network {
         address: daemon_connect_address(shadow_host, shadow_port),
         detail: format!(
-            "rolled out shadow daemon did not become ready; stdout_log={} stderr_log={}",
+            "rolled out shadow daemon pid={expected_pid} did not report executable={} bind={}:{}; stdout_log={} stderr_log={}",
+            shadow_binary.display(),
+            shadow_host,
+            shadow_port,
             diagnostics.stdout_log.display(),
             diagnostics.stderr_log.display()
         ),
@@ -5427,6 +5818,7 @@ mod tests {
             target_os: env::consts::OS.to_string(),
             target_arch: env::consts::ARCH.to_string(),
             host: "127.0.0.1".to_string(),
+            host_override: None,
             port: 21353,
             shadow_port: 21354,
             requested_at: "now".to_string(),
@@ -5691,14 +6083,188 @@ mod tests {
     }
 
     #[test]
-    fn shadow_force_stop_does_not_terminate_supervised_main_tree() {
+    fn windows_main_force_stop_is_separate_from_descendant_cleanup() {
+        let main_stop_mode = main_rollout_termination_mode_for_platform(true);
+        assert_eq!(main_stop_mode, RolloutTerminationMode::ProcessOnly);
         assert_eq!(
-            windows_taskkill_args_for_rollout_stop(42, RolloutTerminationMode::ProcessOnly),
+            windows_taskkill_args_for_rollout_stop(42, main_stop_mode),
             vec!["/PID", "42", "/F"]
         );
+
+        // Tree termination remains available as an explicit cleanup operation,
+        // but live main/shadow handoff paths do not select it on Windows.
         assert_eq!(
             windows_taskkill_args_for_rollout_stop(42, RolloutTerminationMode::ProcessTree),
             vec!["/PID", "42", "/T", "/F"]
+        );
+        assert_eq!(
+            main_rollout_termination_mode_for_platform(false),
+            RolloutTerminationMode::ProcessTree
+        );
+    }
+
+    #[cfg(windows)]
+    const WINDOWS_ROLLOUT_ANCESTRY_FIXTURE_ROLE: &str =
+        "SINOMO_WINDOWS_ROLLOUT_ANCESTRY_FIXTURE_ROLE";
+    #[cfg(windows)]
+    const WINDOWS_ROLLOUT_ANCESTRY_MAIN_PID: &str = "SINOMO_WINDOWS_ROLLOUT_ANCESTRY_MAIN_PID";
+    #[cfg(windows)]
+    const WINDOWS_ROLLOUT_ANCESTRY_MARKER: &str = "SINOMO_WINDOWS_ROLLOUT_ANCESTRY_MARKER";
+    #[cfg(windows)]
+    const WINDOWS_ROLLOUT_ANCESTRY_GATE: &str = "SINOMO_WINDOWS_ROLLOUT_ANCESTRY_GATE";
+    #[cfg(windows)]
+    const WINDOWS_ROLLOUT_ANCESTRY_SUPERVISOR_PID: &str =
+        "SINOMO_WINDOWS_ROLLOUT_ANCESTRY_SUPERVISOR_PID";
+
+    #[cfg(windows)]
+    fn windows_rollout_ancestry_fixture_test_name() -> String {
+        let module = module_path!();
+        let module = module
+            .strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::"))
+            .unwrap_or(module);
+        format!("{module}::windows_exact_main_stop_preserves_descendant_supervisor")
+    }
+
+    #[cfg(windows)]
+    fn run_windows_rollout_main_ancestry_fixture() -> ! {
+        let current_exe = env::current_exe().expect("current test executable");
+        let marker = env::var_os(WINDOWS_ROLLOUT_ANCESTRY_MARKER)
+            .map(PathBuf::from)
+            .expect("survival marker path");
+        let gate = env::var_os(WINDOWS_ROLLOUT_ANCESTRY_GATE)
+            .map(PathBuf::from)
+            .expect("supervisor gate path");
+        let supervisor_pid_path = env::var_os(WINDOWS_ROLLOUT_ANCESTRY_SUPERVISOR_PID)
+            .map(PathBuf::from)
+            .expect("supervisor pid path");
+        let test_name = windows_rollout_ancestry_fixture_test_name();
+        let mut supervisor_command = Command::new(current_exe);
+        prepare_background_command(&mut supervisor_command);
+        let supervisor = supervisor_command
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(WINDOWS_ROLLOUT_ANCESTRY_FIXTURE_ROLE, "supervisor")
+            .env(
+                WINDOWS_ROLLOUT_ANCESTRY_MAIN_PID,
+                std::process::id().to_string(),
+            )
+            .env(WINDOWS_ROLLOUT_ANCESTRY_MARKER, &marker)
+            .env(WINDOWS_ROLLOUT_ANCESTRY_GATE, &gate)
+            .env(
+                WINDOWS_ROLLOUT_ANCESTRY_SUPERVISOR_PID,
+                &supervisor_pid_path,
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn descendant supervisor fixture");
+        fs::write(&supervisor_pid_path, supervisor.id().to_string())
+            .expect("publish supervisor pid");
+        fs::write(&gate, b"ready").expect("release descendant supervisor fixture");
+        drop(supervisor);
+
+        loop {
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[cfg(windows)]
+    fn run_windows_rollout_supervisor_ancestry_fixture() {
+        let main_pid = env::var(WINDOWS_ROLLOUT_ANCESTRY_MAIN_PID)
+            .expect("main fixture pid")
+            .parse::<u32>()
+            .expect("numeric main fixture pid");
+        let marker = env::var_os(WINDOWS_ROLLOUT_ANCESTRY_MARKER)
+            .map(PathBuf::from)
+            .expect("survival marker path");
+        let gate = env::var_os(WINDOWS_ROLLOUT_ANCESTRY_GATE)
+            .map(PathBuf::from)
+            .expect("supervisor gate path");
+        let gate_deadline = Instant::now() + Duration::from_secs(10);
+        while !gate.exists() && Instant::now() < gate_deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            gate.exists(),
+            "main fixture did not publish the ancestry gate"
+        );
+
+        terminate_process_for_rollout_stop(main_pid, main_rollout_termination_mode())
+            .expect("terminate exact main fixture pid");
+        fs::write(marker, b"supervisor-survived").expect("write survival marker");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_exact_main_stop_preserves_descendant_supervisor() {
+        match env::var(WINDOWS_ROLLOUT_ANCESTRY_FIXTURE_ROLE).as_deref() {
+            Ok("main") => run_windows_rollout_main_ancestry_fixture(),
+            Ok("supervisor") => {
+                run_windows_rollout_supervisor_ancestry_fixture();
+                return;
+            }
+            _ => {}
+        }
+
+        let root = temp_rollout_test_root("windows-main-stop-ancestry");
+        let marker = root.join("supervisor-survived");
+        let gate = root.join("supervisor-gate");
+        let supervisor_pid_path = root.join("supervisor.pid");
+        let current_exe = env::current_exe().expect("current test executable");
+        let test_name = windows_rollout_ancestry_fixture_test_name();
+        let mut main = Command::new(current_exe)
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(WINDOWS_ROLLOUT_ANCESTRY_FIXTURE_ROLE, "main")
+            .env(WINDOWS_ROLLOUT_ANCESTRY_MARKER, &marker)
+            .env(WINDOWS_ROLLOUT_ANCESTRY_GATE, &gate)
+            .env(
+                WINDOWS_ROLLOUT_ANCESTRY_SUPERVISOR_PID,
+                &supervisor_pid_path,
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn main ancestry fixture");
+        let main_pid = main.id();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !marker.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        let supervisor_survived = marker.exists();
+        let supervisor_pid = fs::read_to_string(&supervisor_pid_path)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok());
+
+        let main_stopped = !rollout_process_is_running(main_pid);
+        if !main_stopped {
+            let _ = main.kill();
+        }
+        let _ = main.wait();
+
+        let supervisor_exited = supervisor_pid.is_some_and(|pid| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while rollout_process_is_running(pid) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(25));
+            }
+            !rollout_process_is_running(pid)
+        });
+        if !supervisor_exited && let Some(pid) = supervisor_pid {
+            let _ = terminate_process_for_rollout_stop(pid, RolloutTerminationMode::ProcessOnly);
+        }
+
+        assert!(main_stopped, "descendant supervisor did not terminate main");
+        assert!(
+            supervisor_survived,
+            "exact main termination also killed its descendant supervisor"
+        );
+        assert!(
+            supervisor_exited,
+            "descendant supervisor did not exit after publishing survival"
         );
     }
 
@@ -5994,6 +6560,7 @@ mod tests {
             Some(rollout_staged_main_binary(&rollout_paths)),
             Some(rollout_staged_shadow_binary(&rollout_paths)),
             "0.0.0.0".to_string(),
+            None,
             21353,
             21354,
             "2026-05-08T00:00:00Z".to_string(),
@@ -6008,8 +6575,265 @@ mod tests {
         );
         assert_eq!(plan.activation.main_host, "0.0.0.0");
         assert_eq!(plan.activation.main_port, 21353);
+        assert_eq!(plan.activation.shadow_host.as_deref(), Some("0.0.0.0"));
         assert_eq!(plan.activation.shadow_port, 21354);
         assert_eq!(plan.current_main_pid, None);
+    }
+
+    #[test]
+    fn explicit_cluster_rollout_host_overrides_and_persists_running_listener_binds() {
+        let root = temp_rollout_test_root("explicit-host-overrides-running-main");
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let main_paths = DaemonPaths::with_root(root.join("daemon"));
+        main_paths.ensure().expect("main paths");
+        let mut status = test_daemon_status(42);
+        status.data_dir = root.to_path_buf();
+        status.lock_file = main_paths.lock.clone();
+        status.executable = Some(rollout_paths.main_binary.clone());
+        crate::write_daemon_status(&main_paths, &status).expect("main status");
+
+        let plan = prepare_cluster_rollout_main_activation(
+            &main_paths,
+            &root,
+            "test-source".to_string(),
+            rollout_paths.main_binary.clone(),
+            rollout_paths.shadow_binary.clone(),
+            Some(rollout_staged_main_binary(&rollout_paths)),
+            Some(rollout_staged_shadow_binary(&rollout_paths)),
+            "127.0.0.1".to_string(),
+            Some("0.0.0.0".to_string()),
+            21353,
+            21354,
+            "2026-08-04T00:00:00Z".to_string(),
+            "cluster-binary-push",
+        )
+        .expect("prepare activation");
+
+        assert_eq!(plan.activation.main_host, "0.0.0.0");
+        assert_eq!(plan.activation.shadow_host.as_deref(), Some("0.0.0.0"));
+        assert_eq!(plan.current_main_pid, Some(42));
+    }
+
+    #[test]
+    fn default_cluster_rollout_host_preserves_existing_remote_listeners() {
+        assert_eq!(
+            select_cluster_rollout_main_host(Some("10.14.1.11"), None, "127.0.0.1", None,),
+            "10.14.1.11"
+        );
+        assert_eq!(
+            select_cluster_rollout_shadow_host(Some("10.14.1.12"), "10.14.1.11", None,),
+            "10.14.1.12"
+        );
+    }
+
+    #[test]
+    fn shadow_rollout_readiness_requires_replacement_pid_executable_and_bind() {
+        let current_exe = env::current_exe().expect("current executable");
+        let expected_pid = std::process::id();
+        let mut status = test_daemon_status(expected_pid);
+        status.host = "0.0.0.0".to_string();
+        status.port = 21354;
+        // Wildcard listeners intentionally publish a loopback control address
+        // for same-node readiness probes.
+        status.address = "127.0.0.1:21354".to_string();
+        status.executable = Some(current_exe.clone());
+
+        assert!(shadow_supervisor_status_matches_rollout(
+            &status,
+            &current_exe,
+            "0.0.0.0",
+            21354,
+            Some(expected_pid),
+        ));
+
+        let mut wrong_host = status.clone();
+        wrong_host.host = "127.0.0.1".to_string();
+        assert!(!shadow_supervisor_status_matches_rollout(
+            &wrong_host,
+            &current_exe,
+            "0.0.0.0",
+            21354,
+            Some(expected_pid),
+        ));
+        assert!(!shadow_supervisor_status_matches_rollout(
+            &status,
+            &current_exe,
+            "0.0.0.0",
+            21354,
+            Some(expected_pid.wrapping_add(1)),
+        ));
+        assert!(!shadow_supervisor_status_matches_rollout(
+            &status,
+            &current_exe.with_extension("wrong-shadow"),
+            "0.0.0.0",
+            21354,
+            Some(expected_pid),
+        ));
+    }
+
+    #[test]
+    fn cluster_rollout_preflight_rejects_loopback_binds_for_manual_lan_endpoints() {
+        let root = temp_rollout_test_root("manual-endpoint-bind-preflight");
+        let main_paths = DaemonPaths::with_root(root.join("daemon"));
+        main_paths.ensure().expect("main paths");
+        let mut status = test_daemon_status(42);
+        status.data_dir = root.to_path_buf();
+        status.lock_file = main_paths.lock.clone();
+        crate::write_daemon_status(&main_paths, &status).expect("main status");
+        let config_path = crate::daemon_endpoint_advertisement_config_file(&root);
+        fs::create_dir_all(config_path.parent().expect("config parent")).expect("config parent");
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&crate::DaemonEndpointAdvertisementConfig {
+                main_endpoints: vec![crate::DaemonManualEndpointConfig {
+                    address: "tcp://10.14.1.11:21353".to_string(),
+                    scope: None,
+                    priority: None,
+                }],
+                shadow_endpoints: vec![crate::DaemonManualEndpointConfig {
+                    address: "tcp://10.14.1.11:21354".to_string(),
+                    scope: None,
+                    priority: None,
+                }],
+            })
+            .expect("endpoint config"),
+        )
+        .expect("write endpoint config");
+
+        let error = preflight_cluster_rollout_main_bind(
+            &main_paths,
+            &root,
+            "127.0.0.1",
+            None,
+            21353,
+            21354,
+        )
+        .expect_err("loopback candidate cannot serve a LAN endpoint");
+        assert!(error.to_string().contains("10.14.1.11:21353"));
+
+        preflight_cluster_rollout_main_bind(
+            &main_paths,
+            &root,
+            "127.0.0.1",
+            Some("0.0.0.0"),
+            21353,
+            21354,
+        )
+        .expect("explicit wildcard serves both LAN endpoints");
+
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&crate::DaemonEndpointAdvertisementConfig {
+                main_endpoints: Vec::new(),
+                shadow_endpoints: vec![crate::DaemonManualEndpointConfig {
+                    address: "tcp://10.14.1.11:21354".to_string(),
+                    scope: None,
+                    priority: None,
+                }],
+            })
+            .expect("shadow endpoint config"),
+        )
+        .expect("write shadow endpoint config");
+        let error = preflight_cluster_rollout_main_bind(
+            &main_paths,
+            &root,
+            "127.0.0.1",
+            None,
+            21353,
+            21354,
+        )
+        .expect_err("loopback shadow cannot serve a LAN endpoint");
+        assert!(error.to_string().contains("shadow endpoint"));
+        assert!(error.to_string().contains("10.14.1.11:21354"));
+    }
+
+    #[test]
+    fn wildcard_ipv4_bind_requires_ipv4_hostname_resolution_proof() {
+        let resolve = |host: &str, port: u16| match host {
+            "v4.rollout.test" => vec![SocketAddr::from(([192, 0, 2, 41], port))],
+            "v6.rollout.test" => vec![SocketAddr::from((
+                "2001:db8::41".parse::<std::net::Ipv6Addr>().expect("IPv6"),
+                port,
+            ))],
+            "dual.rollout.test" => vec![
+                SocketAddr::from(([192, 0, 2, 43], port)),
+                SocketAddr::from((
+                    "2001:db8::43".parse::<std::net::Ipv6Addr>().expect("IPv6"),
+                    port,
+                )),
+            ],
+            _ => Vec::new(),
+        };
+
+        assert!(rollout_bind_covers_manual_tcp_endpoint_with(
+            "0.0.0.0",
+            21353,
+            "v4.rollout.test:21353",
+            resolve,
+        ));
+        assert!(!rollout_bind_covers_manual_tcp_endpoint_with(
+            "0.0.0.0",
+            21353,
+            "v6.rollout.test:21353",
+            resolve,
+        ));
+        assert!(!rollout_bind_covers_manual_tcp_endpoint_with(
+            "0.0.0.0",
+            21353,
+            "unresolved.rollout.test:21353",
+            resolve,
+        ));
+        assert!(!rollout_bind_covers_manual_tcp_endpoint_with(
+            "0.0.0.0",
+            21353,
+            "dual.rollout.test:21353",
+            resolve,
+        ));
+    }
+
+    #[test]
+    fn wildcard_ipv6_bind_requires_ipv6_hostname_resolution_proof() {
+        let resolve = |host: &str, port: u16| match host {
+            "v4.rollout.test" => vec![SocketAddr::from(([192, 0, 2, 42], port))],
+            "v6.rollout.test" => vec![SocketAddr::from((
+                "2001:db8::42".parse::<std::net::Ipv6Addr>().expect("IPv6"),
+                port,
+            ))],
+            "dual.rollout.test" => vec![
+                SocketAddr::from(([192, 0, 2, 44], port)),
+                SocketAddr::from((
+                    "2001:db8::44".parse::<std::net::Ipv6Addr>().expect("IPv6"),
+                    port,
+                )),
+            ],
+            _ => Vec::new(),
+        };
+
+        assert!(rollout_bind_covers_manual_tcp_endpoint_with(
+            "::",
+            21353,
+            "v6.rollout.test:21353",
+            resolve,
+        ));
+        assert!(!rollout_bind_covers_manual_tcp_endpoint_with(
+            "::",
+            21353,
+            "v4.rollout.test:21353",
+            resolve,
+        ));
+        assert!(!rollout_bind_covers_manual_tcp_endpoint_with(
+            "::",
+            21353,
+            "unresolved.rollout.test:21353",
+            resolve,
+        ));
+        assert!(!rollout_bind_covers_manual_tcp_endpoint_with(
+            "::",
+            21353,
+            "dual.rollout.test:21353",
+            resolve,
+        ));
     }
 
     #[test]
@@ -6028,6 +6852,7 @@ mod tests {
             &rollout_paths,
             &artifacts,
             "127.0.0.1",
+            None,
             21353,
             21354,
             "2026-05-08T00:00:00Z".to_string(),
@@ -6066,6 +6891,22 @@ mod tests {
     }
 
     #[test]
+    fn explicit_local_rollout_host_replaces_main_and_shadow_listener_binds() {
+        assert_eq!(
+            local_rollout_listener_hosts(Some("127.0.0.1"), "127.0.0.1", Some("0.0.0.0"),),
+            ("0.0.0.0".to_string(), Some("0.0.0.0".to_string()))
+        );
+    }
+
+    #[test]
+    fn default_local_rollout_host_preserves_the_running_listener() {
+        assert_eq!(
+            local_rollout_listener_hosts(Some("10.14.1.11"), "127.0.0.1", None),
+            ("10.14.1.11".to_string(), None)
+        );
+    }
+
+    #[test]
     fn promote_shadow_main_rollout_writes_local_shadow_finalize_state() {
         let root = temp_rollout_test_root("promote-local-finalize");
         let rollout_paths = SelfRolloutPaths::new(&root);
@@ -6076,7 +6917,8 @@ mod tests {
         let previous_shadow_binary = root.join("previous-shadow");
         write_test_executable(&previous_shadow_binary);
 
-        let activation = test_main_activation(&rollout_paths);
+        let mut activation = test_main_activation(&rollout_paths);
+        activation.shadow_host = Some("0.0.0.0".to_string());
         write_main_activation(&rollout_paths, &activation).expect("main activation");
         let monitor = ShadowMainRolloutMonitor {
             activation: activation.clone(),
@@ -6111,8 +6953,55 @@ mod tests {
             pending_shadow.staged_main_binary.as_deref(),
             activation.staged_main_binary.as_deref()
         );
+        assert_eq!(pending_shadow.shadow_host, "0.0.0.0");
+        assert_eq!(pending_shadow.shadow_port, 21354);
         assert!(!shadow_reexec_request_path(&rollout_paths).exists());
         assert!(rollout_paths.shadow_binary.exists());
+    }
+
+    #[test]
+    fn shadow_start_completion_refuses_wrong_explicit_listener() {
+        let root = temp_rollout_test_root("shadow-start-wrong-explicit-listener");
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let current_exe = env::current_exe().expect("current executable");
+        let mut activation = test_main_activation(&rollout_paths);
+        activation.shadow_binary = current_exe;
+        let monitor = ShadowMainRolloutMonitor {
+            activation,
+            main_options: crate::DaemonRunOptions {
+                host: "0.0.0.0".to_string(),
+                port: 21353,
+            },
+            previous_main_binary: rollout_paths.main_binary.clone(),
+            previous_shadow_binary: root.join("previous-shadow"),
+            diagnostics: CandidateMainDiagnostics {
+                stdout_log: root.join("stdout.log"),
+                stderr_log: root.join("stderr.log"),
+                diagnostics_path: root.join("diagnostics.json"),
+            },
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        stage_pending_shadow_rollout(&rollout_paths, &monitor, "0.0.0.0", 21354)
+            .expect("pending shadow");
+
+        let error = complete_pending_shadow_rollout_after_start(
+            &DaemonPaths::with_root(root.join("shadow-daemon")),
+            &rollout_paths,
+            &crate::DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port: 21354,
+            },
+        )
+        .expect_err("loopback shadow must not finalize an explicit wildcard rollout");
+
+        assert!(error.to_string().contains("refusing to finalize"));
+        assert!(rollout_shadow_finalize_path(&rollout_paths).exists());
+        assert!(
+            read_rollout_status(&rollout_paths)
+                .expect("read rollout status")
+                .is_none_or(|status| status.phase.as_deref() != Some("shadow-finalized"))
+        );
     }
 
     #[test]
@@ -6160,6 +7049,10 @@ mod tests {
         complete_pending_shadow_rollout_after_start(
             &DaemonPaths::with_root(root.join("shadow-daemon")),
             &rollout_paths,
+            &crate::DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port: 21354,
+            },
         )
         .expect("complete pending shadow");
 
@@ -6213,6 +7106,10 @@ mod tests {
         complete_pending_shadow_rollout_after_start(
             &DaemonPaths::with_root(root.join("shadow-daemon")),
             &rollout_paths,
+            &crate::DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port: 21354,
+            },
         )
         .expect("complete pending shadow");
 
@@ -6619,6 +7516,7 @@ mod tests {
             native_dylib_loader_rollback_generation: None,
             main_host: "127.0.0.1".to_string(),
             main_port: 21353,
+            shadow_host: None,
             shadow_port: 21354,
             requested_at: "2026-05-08T00:00:00Z".to_string(),
             mode: "cluster-remote-build".to_string(),

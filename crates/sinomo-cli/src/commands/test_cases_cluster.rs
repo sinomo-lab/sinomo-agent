@@ -51,7 +51,10 @@ sinomo_runtime::test::sinomo_test_case! {
         id: "cluster.migration.verify-joined",
         summary: "Verify a live single-node cluster join migration finalized with target KV authority",
         tags: ["cluster-migration", "probe"],
-        requirements: [SinomoTestRequirement::ClusterRuntime],
+        requirements: [
+            SinomoTestRequirement::ClusterRuntime,
+            SinomoTestRequirement::ClusterKvSnapshot,
+        ],
         run: {
             run_cluster_migration_verify_joined(ctx)
         }

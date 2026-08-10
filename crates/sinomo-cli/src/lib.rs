@@ -30,11 +30,11 @@ use sinomo_agent::{
     AGENT_RPC_CATEGORY, AGENT_SESSION_FOLLOW_UP_ROUTE, AGENT_SESSION_INSPECT_ROUTE,
     AGENT_SESSION_INTERRUPT_ROUTE, AGENT_SESSION_PROGRESS_ROUTE, AGENT_SESSION_RESUME_ROUTE,
     AGENT_SESSION_STEER_ROUTE, AGENT_SESSION_TERMINAL_RESULTS_ROUTE, Agent, AgentCancellationToken,
-    AgentCatalog, AgentDefinition, AgentDefinitionSifsStore, AgentDefinitionStore,
-    AgentEventPayload, AgentLoopDecision, AgentLoopInput, AgentModelEvent, AgentOp,
-    AgentPackageProvenance, AgentPackageSource, AgentReadinessCheckStatus, AgentReadinessReport,
-    AgentRole, AgentRuntimeEvent, AgentRuntimeEventCursor, AgentRuntimeEventPayload,
-    AgentRuntimeStorage, AgentSession, AgentSessionControlEventCursor, AgentSessionControlResponse,
+    AgentDefinition, AgentDefinitionSifsStore, AgentDefinitionStore, AgentEventPayload,
+    AgentLoopDecision, AgentLoopInput, AgentModelEvent, AgentOp, AgentPackageProvenance,
+    AgentPackageSource, AgentReadinessCheckStatus, AgentReadinessReport, AgentRole,
+    AgentRuntimeEvent, AgentRuntimeEventCursor, AgentRuntimeEventPayload, AgentRuntimeStorage,
+    AgentSession, AgentSessionControlEventCursor, AgentSessionControlResponse,
     AgentSessionFollowUpRequest, AgentSessionInspectRequest, AgentSessionInspectResponse,
     AgentSessionInterruptRequest, AgentSessionProgressRequest, AgentSessionProgressResponse,
     AgentSessionResumeRequest, AgentSessionResumeResponse, AgentSessionRuntime,
@@ -139,6 +139,7 @@ use sinomo_runtime::daemon::{
     run_shadow_daemon_supervision_loop as daemon_run_shadow_daemon_supervision_loop,
     send_daemon_cluster_maintenance_refresh as daemon_send_daemon_cluster_maintenance_refresh,
     send_daemon_cluster_maintenance_refresh_to_endpoint as daemon_send_daemon_cluster_maintenance_refresh_to_endpoint,
+    send_daemon_remote_shadow_shutdown_request,
     send_daemon_rollout_binary as daemon_send_daemon_rollout_binary,
     send_daemon_rollout_binary_to_endpoint as daemon_send_daemon_rollout_binary_to_endpoint,
     send_daemon_rollout_binary_to_target as daemon_send_daemon_rollout_binary_to_target,
@@ -211,9 +212,11 @@ use sinomo_runtime::dfs::{
 };
 use sinomo_runtime::events::{EventId, JsonlEventStore, SessionId};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore};
+#[cfg(test)]
+use sinomo_runtime::kv::KvTxnResponse;
 use sinomo_runtime::kv::{
-    ClusterKvTxnCommitResult, KvAuthoritativeRead, KvError, KvLocalRead, KvOp, KvSnapshot, KvTxn,
-    KvTxnRequest, KvTxnResponse,
+    ClusterKvTxnCommitResult, KvAuthoritativeRead, KvError, KvLocalRead, KvSnapshot, KvTxn,
+    KvTxnRequest,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::module::ModuleReplayReport;
@@ -299,32 +302,35 @@ pub use tui::*;
 pub(crate) use voice::*;
 
 trait CliDaemonTargetRpc {
-    fn object_rpc_to_target_with_deadline(
+    fn object_rpc_to_target_with_deadline_and_affinity(
         &self,
         target_node_id: &NodeId,
         request: &network::ObjectRpcRequest,
         connect_timeout: Duration,
         overall_timeout: Option<Duration>,
         observe_connectivity: bool,
+        destination_process_affinity: sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity,
     ) -> Result<network::ObjectRpcResponse, ()>;
 }
 
 impl CliDaemonTargetRpc for DaemonApiClient {
-    fn object_rpc_to_target_with_deadline(
+    fn object_rpc_to_target_with_deadline_and_affinity(
         &self,
         target_node_id: &NodeId,
         request: &network::ObjectRpcRequest,
         connect_timeout: Duration,
         overall_timeout: Option<Duration>,
         observe_connectivity: bool,
+        destination_process_affinity: sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity,
     ) -> Result<network::ObjectRpcResponse, ()> {
-        DaemonApiClient::object_rpc_to_target_with_deadline(
+        DaemonApiClient::object_rpc_to_target_with_deadline_and_affinity(
             self,
             target_node_id,
             request,
             connect_timeout,
             overall_timeout,
             observe_connectivity,
+            destination_process_affinity,
         )
         .map_err(|_| ())
     }
@@ -387,12 +393,13 @@ impl cluster::ClusterStateAuthorityReachabilityHost for CliClusterStateAuthority
             }
             let attempt_timeout = remaining.min(CLI_STATE_AUTHORITY_PROBE_ATTEMPT_TIMEOUT);
             if daemon
-                .object_rpc_to_target_with_deadline(
+                .object_rpc_to_target_with_deadline_and_affinity(
                     target_node_id,
                     &request,
                     attempt_timeout,
                     Some(attempt_timeout),
                     false,
+                    sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
                 )
                 .and_then(|response| response.error_detail().map_err(|_| ()))
                 .is_ok()
@@ -1582,12 +1589,13 @@ fn remote_management_cli_rpc(
             // so forwarding must cross the authenticated loopback daemon
             // boundary instead of constructing a routed client here.
             DaemonApiClient::at_address(status.address)
-                .object_rpc_call_to_target_with_transport_timeouts_async(
+                .object_rpc_call_to_target_with_transport_timeouts_and_affinity_async(
                     &target_node_id,
                     call,
                     timeouts,
                     None,
                     true,
+                    sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
                 )
                 .await
                 .map_err(|source| source.to_string())
@@ -1861,6 +1869,7 @@ pub(crate) fn agent_cli_command_handler() -> DeclarativeCommandHandler<AgentCliC
         parse_agent_matches,
         run_agent_command,
     )
+    .with_parsed_policy(agent_cli_policy)
 }
 
 pub(crate) fn skill_cli_command_handler() -> DeclarativeCommandHandler<SkillCliCommand> {
@@ -1871,6 +1880,35 @@ pub(crate) fn skill_cli_command_handler() -> DeclarativeCommandHandler<SkillCliC
         parse_skill_matches,
         run_skill_command,
     )
+    .with_parsed_policy(skill_cli_policy)
+}
+
+fn agent_cli_policy(command: &AgentCliCommand) -> CliCommandPolicy {
+    match command {
+        AgentCliCommand::Inspect(_)
+        | AgentCliCommand::Export(_)
+        | AgentCliCommand::Run(_)
+        | AgentCliCommand::Validate(AgentValidateOptions { file: None, .. }) => {
+            CliCommandPolicy::default()
+        }
+        AgentCliCommand::Import(_)
+        | AgentCliCommand::Readiness(_)
+        | AgentCliCommand::Session(_)
+        | AgentCliCommand::Validate(AgentValidateOptions { file: Some(_), .. }) => {
+            CliCommandPolicy::local_capable()
+        }
+    }
+}
+
+fn skill_cli_policy(command: &SkillCliCommand) -> CliCommandPolicy {
+    match command {
+        SkillCliCommand::List(_) | SkillCliCommand::Show(_) | SkillCliCommand::Export(_) => {
+            CliCommandPolicy::default()
+        }
+        SkillCliCommand::Import(_) | SkillCliCommand::Activate(_) => {
+            CliCommandPolicy::local_capable()
+        }
+    }
 }
 
 fn agent_cli_spec() -> CliCommandSpec {
@@ -2969,7 +3007,7 @@ pub(crate) fn run_skill_command(command: SkillCliCommand) -> Result<(), CliError
 }
 
 fn list_skills(options: SkillListOptions) -> Result<(), CliError> {
-    let store = skill_store_for_cli()?;
+    let store = skill_read_store_for_cli()?;
     let catalog = store.load_catalog().map_err(skill_catalog_cli_error)?;
     let active_keys = catalog
         .activations
@@ -3031,13 +3069,10 @@ fn list_skills(options: SkillListOptions) -> Result<(), CliError> {
 }
 
 fn show_skill(options: SkillShowOptions) -> Result<(), CliError> {
-    let store = skill_store_for_cli()?;
+    let store = skill_read_store_for_cli()?;
     let catalog = store.load_catalog().map_err(skill_catalog_cli_error)?;
     let entry = select_skill_entry(&catalog, &options.skill_id, options.version.as_deref())?;
-    let text = store
-        .read_skill_text(&entry)
-        .map_err(skill_catalog_cli_error)?
-        .unwrap_or_default();
+    let text = required_skill_text_for_cli(&store, &entry)?;
     if options.text {
         print!("{text}");
         return Ok(());
@@ -3086,6 +3121,22 @@ fn show_skill(options: SkillShowOptions) -> Result<(), CliError> {
         format_string_list(&entry.required_capabilities)
     );
     Ok(())
+}
+
+fn required_skill_text_for_cli(
+    store: &SkillCatalogSifsStore,
+    entry: &SkillCatalogEntry,
+) -> Result<String, CliError> {
+    store
+        .read_skill_text(entry)
+        .map_err(skill_catalog_cli_error)?
+        .ok_or_else(|| CliError::Io {
+            path: entry.sifs_path.clone(),
+            detail: format!(
+                "skill `{}@{}` catalog entry references missing content",
+                entry.skill_id, entry.version
+            ),
+        })
 }
 
 fn import_skill(options: SkillImportOptions) -> Result<(), CliError> {
@@ -3137,7 +3188,7 @@ fn import_skill(options: SkillImportOptions) -> Result<(), CliError> {
 }
 
 fn export_skill(options: SkillExportOptions) -> Result<(), CliError> {
-    let store = skill_store_for_cli()?;
+    let store = skill_read_store_for_cli()?;
     let catalog = store.load_catalog().map_err(skill_catalog_cli_error)?;
     let entry = select_skill_entry(&catalog, &options.skill_id, options.version.as_deref())?;
     let package = store
@@ -3222,6 +3273,29 @@ fn activate_skill(options: SkillActivateOptions) -> Result<(), CliError> {
 fn skill_store_for_cli() -> Result<SkillCatalogSifsStore, CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     SkillCatalogSifsStore::open(Some(data_dir.root())).map_err(skill_catalog_cli_error)
+}
+
+/// Open a read-only catalog through the resident daemon's SIFS service.
+///
+/// A short-lived CLI process must not construct a second local DFS service:
+/// even lazy mutation-lane hydration opens durable shard tables, namespace
+/// guards, journal cursors, and content reservation writer state before the
+/// first catalog byte is read. The daemon already owns that hydrated state and
+/// exposes the same SIFS contract through its browser RPCs.
+fn read_only_sifs_vfs_for_cli() -> Result<sinomo_runtime::vfs::VfsHandle, CliError> {
+    let daemon = default_main_daemon_status()?.ok_or_else(|| CliError::DaemonNotRunning {
+        detail: "SIFS catalog reads require the resident main daemon".to_string(),
+    })?;
+    sinomo_runtime::vfs::daemon_sifs(daemon.address).map_err(|source| CliError::Io {
+        path: "/".to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn skill_read_store_for_cli() -> Result<SkillCatalogSifsStore, CliError> {
+    Ok(SkillCatalogSifsStore::from_vfs(
+        read_only_sifs_vfs_for_cli()?
+    ))
 }
 
 fn skill_export_output_directory(path: &Path, skill_id: &str) -> Result<PathBuf, CliError> {
@@ -3719,12 +3793,11 @@ fn agent_task_status_label(status: &sinomo_agent::AgentTaskLifecycleStatus) -> &
 }
 
 pub(crate) fn inspect_agent_package(options: AgentInspectOptions) -> Result<(), CliError> {
-    let catalog = load_agent_catalog_for_cli()?;
-    let definition = agent_definition_from_catalog(&catalog, &options.agent)?;
+    let definition = resolve_agent_definition_for_cli(&options.agent)?;
     if options.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&agent_package_inspection_json(definition)).map_err(
+            serde_json::to_string_pretty(&agent_package_inspection_json(&definition)).map_err(
                 |source| CliError::Json {
                     path: "<agent inspect>".to_string(),
                     detail: source.to_string(),
@@ -3732,15 +3805,14 @@ pub(crate) fn inspect_agent_package(options: AgentInspectOptions) -> Result<(), 
             )?
         );
     } else {
-        print!("{}", agent_package_inspection_text(definition));
+        print!("{}", agent_package_inspection_text(&definition));
     }
     Ok(())
 }
 
 pub(crate) fn export_agent_package(options: AgentExportOptions) -> Result<(), CliError> {
-    let catalog = load_agent_catalog_for_cli()?;
-    let definition = agent_definition_from_catalog(&catalog, &options.agent)?;
-    let bytes = serde_json::to_vec_pretty(definition).map_err(|source| CliError::Json {
+    let definition = resolve_agent_definition_for_cli(&options.agent)?;
+    let bytes = serde_json::to_vec_pretty(&definition).map_err(|source| CliError::Json {
         path: "<agent export>".to_string(),
         detail: source.to_string(),
     })?;
@@ -3812,8 +3884,7 @@ pub(crate) fn validate_agent_package(options: AgentValidateOptions) -> Result<()
             Some(agent_package_source_path(&path)),
         )
     } else {
-        let catalog = load_agent_catalog_for_cli()?;
-        let definition = agent_definition_from_catalog(&catalog, &options.agent)?.clone();
+        let definition = resolve_agent_definition_for_cli(&options.agent)?;
         definition.validate().map_err(|source| CliError::Parse {
             detail: source.to_string(),
         })?;
@@ -3844,20 +3915,12 @@ pub(crate) fn validate_agent_package(options: AgentValidateOptions) -> Result<()
     Ok(())
 }
 
-fn load_agent_catalog_for_cli() -> Result<AgentCatalog, CliError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    AgentCatalog::load_from_data_dir(&data_dir).map_err(|source| CliError::Parse {
-        detail: source.to_string(),
-    })
-}
-
-fn agent_definition_from_catalog<'a>(
-    catalog: &'a AgentCatalog,
-    agent: &str,
-) -> Result<&'a AgentDefinition, CliError> {
-    catalog.get(agent).ok_or_else(|| CliError::Parse {
-        detail: format!("unknown agent `{agent}`"),
-    })
+fn resolve_agent_definition_for_cli(agent: &str) -> Result<AgentDefinition, CliError> {
+    app_api::resolve_agent_definition_with_catalog_vfs(agent, read_only_sifs_vfs_for_cli)
+        .map_err(|detail| CliError::Parse { detail })?
+        .ok_or_else(|| CliError::Parse {
+            detail: format!("unknown agent `{agent}`"),
+        })
 }
 
 fn read_agent_package_definition(path: &Path) -> Result<AgentDefinition, CliError> {
@@ -4178,12 +4241,14 @@ fn format_unbounded_runtime_limit<T: std::fmt::Display>(value: Option<T>) -> Str
         .unwrap_or_else(|| "unbounded".to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn best_effort_reconciled_skill_catalog(
     data_dir: &SinomoDataDir,
 ) -> sinomo_agent::SkillCatalog {
     sinomo_agent::load_reconciled_skill_catalog_from_sifs(data_dir).unwrap_or_default()
 }
 
+#[cfg(test)]
 pub(crate) fn best_effort_skill_catalog_texts(
     data_dir: &SinomoDataDir,
     catalog: &sinomo_agent::SkillCatalog,
@@ -4191,6 +4256,7 @@ pub(crate) fn best_effort_skill_catalog_texts(
     sinomo_agent::load_skill_catalog_texts_from_sifs(data_dir, catalog).unwrap_or_default()
 }
 
+#[cfg(test)]
 pub(crate) fn best_effort_skill_catalog_resources(
     data_dir: &SinomoDataDir,
     catalog: &sinomo_agent::SkillCatalog,
@@ -4198,58 +4264,79 @@ pub(crate) fn best_effort_skill_catalog_resources(
     sinomo_agent::load_skill_catalog_resources_from_sifs(data_dir, catalog).unwrap_or_default()
 }
 
-/// Keep the TUI's first frame independent of DFS recovery and cluster routing.
-/// The daemon remains the authoritative SIFS path, while the outer deadline
-/// also bounds daemon handlers whose internal DFS timeout exceeds the client
-/// idle timeout.
-pub(crate) fn best_effort_runtime_skill_catalog(
-    daemon: Option<&DaemonStatus>,
-) -> (
+type RuntimeSkillCatalog = (
     sinomo_agent::SkillCatalog,
     BTreeMap<String, String>,
     BTreeMap<String, Vec<sinomo_agent::AgentSkillPackageFile>>,
-) {
+);
+
+fn load_runtime_skill_catalog_from_vfs(
+    vfs: sinomo_runtime::vfs::VfsHandle,
+) -> Result<RuntimeSkillCatalog, sinomo_agent::SkillCatalogError> {
+    let store = SkillCatalogSifsStore::from_vfs(vfs);
+    let catalog = store.load_catalog()?;
+    let mut texts = BTreeMap::new();
+    let mut resources = BTreeMap::new();
+    for entry in &catalog.entries {
+        let package = store.read_skill_package(entry)?.ok_or_else(|| {
+            sinomo_agent::SkillCatalogError::Object {
+                path: entry.sifs_path.clone(),
+                detail: format!(
+                    "skill `{}@{}` catalog entry references missing package content",
+                    entry.skill_id, entry.version
+                ),
+            }
+        })?;
+        let key = sinomo_agent::skill_catalog_entry_text_key(entry);
+        texts.insert(key.clone(), package.markdown);
+        if !package.files.is_empty() {
+            resources.insert(key, package.files);
+        }
+    }
+    Ok((catalog, texts, resources))
+}
+
+/// Keep the TUI's first frame independent of unbounded DFS recovery while
+/// preserving catalog availability semantics. Intentional daemonless mode has
+/// no cluster skill view; once connected, an unavailable or malformed daemon
+/// SIFS catalog is an error rather than a semantically false empty catalog.
+/// The outer deadline bounds daemon handlers whose internal DFS timeout exceeds
+/// the client idle timeout.
+pub(crate) fn runtime_skill_catalog(
+    daemon: Option<&DaemonStatus>,
+) -> Result<RuntimeSkillCatalog, CliError> {
     let Some(daemon) = daemon else {
-        return Default::default();
+        return Ok(Default::default());
     };
-    let address = daemon.address.clone();
+    let vfs = sinomo_runtime::vfs::daemon_sifs_with_timeout(
+        daemon.address.clone(),
+        Duration::from_millis(250),
+    )
+    .map_err(|source| CliError::Io {
+        path: "/services/sinomo/skills".to_string(),
+        detail: source.to_string(),
+    })?;
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     if std::thread::Builder::new()
         .name("sinomo-tui-skills".to_string())
         .spawn(move || {
-            let loaded = (|| {
-                let store = sinomo_runtime::vfs::daemon_sifs_with_timeout(
-                    address,
-                    Duration::from_millis(250),
-                )
-                .ok()
-                .map(SkillCatalogSifsStore::from_vfs)?;
-                let catalog = store.load_catalog().ok()?;
-                let mut texts = BTreeMap::new();
-                let mut resources = BTreeMap::new();
-                for entry in &catalog.entries {
-                    let package = store.read_skill_package(entry).ok()?;
-                    if let Some(package) = package {
-                        let key = sinomo_agent::skill_catalog_entry_text_key(entry);
-                        texts.insert(key.clone(), package.markdown);
-                        if !package.files.is_empty() {
-                            resources.insert(key, package.files);
-                        }
-                    }
-                }
-                Some((catalog, texts, resources))
-            })();
-            let _ = sender.send(loaded);
+            let _ = sender.send(load_runtime_skill_catalog_from_vfs(vfs));
         })
         .is_err()
     {
-        return Default::default();
+        return Err(CliError::Parse {
+            detail: "failed to start the resident daemon skill-catalog reader".to_string(),
+        });
     }
-    receiver
-        .recv_timeout(Duration::from_millis(250))
-        .ok()
-        .flatten()
-        .unwrap_or_default()
+    match receiver.recv_timeout(Duration::from_millis(250)) {
+        Ok(loaded) => loaded.map_err(skill_catalog_cli_error),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(CliError::Parse {
+            detail: "resident daemon skill-catalog read timed out after 250ms".to_string(),
+        }),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(CliError::Parse {
+            detail: "resident daemon skill-catalog reader stopped without a result".to_string(),
+        }),
+    }
 }
 
 pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
@@ -4290,8 +4377,7 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         }
         None => options.agent.clone(),
     };
-    let catalog = load_agent_catalog_for_cli()?;
-    let definition = agent_definition_from_catalog(&catalog, &agent_name)?.clone();
+    let definition = resolve_agent_definition_for_cli(&agent_name)?;
     let (provider, model) = resolve_agent_run_model_selection(&options, &definition);
     let current_root = std::env::current_dir().map_err(|source| CliError::Io {
         path: "current directory".to_string(),
@@ -4399,9 +4485,9 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         sandbox_node_id,
         true,
     )?;
-    let skill_catalog = best_effort_reconciled_skill_catalog(&data_dir);
-    let skill_catalog_texts = best_effort_skill_catalog_texts(&data_dir, &skill_catalog);
-    let skill_catalog_resources = best_effort_skill_catalog_resources(&data_dir, &skill_catalog);
+    let daemon = default_main_daemon_status()?;
+    let (skill_catalog, skill_catalog_texts, skill_catalog_resources) =
+        runtime_skill_catalog(daemon.as_ref())?;
     let loop_model = ConfiguredInteractionModel {
         data_dir: data_dir.clone(),
         provider: provider.clone(),

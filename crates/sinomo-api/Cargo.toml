@@ -23,5 +23,6 @@ time.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+sinomo-core = { path = "../sinomo-core", features = ["network-test-support"] }
 sinomo-testdir = { path = "../sinomo-testdir" }
 tokio = { workspace = true, features = ["test-util"] }

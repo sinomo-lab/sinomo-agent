@@ -96,6 +96,38 @@ async fn materialize_daemon_client_value_response(
         .map_err(Into::into)
 }
 
+/// Runs a compatibility value call and folds its stream-native response body
+/// back into one response under the same whole-call budget. The network client
+/// deliberately returns `ObjectRpcResult` as soon as ownership of a streaming
+/// body is transferred; without this outer boundary, materialization could
+/// outlive the caller's requested overall timeout indefinitely.
+pub(crate) async fn materialize_daemon_client_value_call_with_options<F>(
+    operation: &'static str,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    call: F,
+) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError>
+where
+    F: std::future::Future<Output = Result<ObjectRpcResult, DaemonError>>,
+{
+    let call_and_materialize = async move {
+        let result = call.await?;
+        materialize_daemon_client_value_response(result).await
+    };
+    let Some(timeout) = options.overall_timeout() else {
+        return call_and_materialize.await;
+    };
+    match tokio::time::timeout(timeout, call_and_materialize).await {
+        Ok(result) => result,
+        Err(_) => Err(NetworkError::timeout(
+            operation,
+            sinomo_core::network::NetworkTimeoutPhase::Overall,
+            timeout,
+            sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+        )
+        .into()),
+    }
+}
+
 pub fn send_daemon_rpc(
     address: &str,
     request: &ObjectRpcRequest,
@@ -165,9 +197,29 @@ pub fn send_daemon_rpc_with_timeouts(
     request: &ObjectRpcRequest,
     timeouts: sinomo_core::network::DaemonRpcTimeouts,
 ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+    send_daemon_rpc_with_options(
+        address,
+        request,
+        sinomo_core::network::ClusterObjectRpcOptions::new(timeouts),
+    )
+}
+
+/// Sends a compatibility value RPC while preserving the caller's whole-call
+/// deadline across routing, transport progress, and response materialization.
+pub fn send_daemon_rpc_with_options(
+    address: &str,
+    request: &ObjectRpcRequest,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
     block_on_daemon_client(async {
         let runtime = tokio::runtime::Handle::current();
-        send_daemon_rpc_async(address, request, timeouts, &runtime).await
+        let call = ObjectRpcCall::value(request.clone());
+        materialize_daemon_client_value_call_with_options(
+            "daemon address object RPC value call",
+            options,
+            send_daemon_rpc_call_async(address, call, options, &runtime),
+        )
+        .await
     })
 }
 
@@ -351,6 +403,20 @@ pub fn send_daemon_rpc_to_endpoint_with_timeouts(
     request: &ObjectRpcRequest,
     timeouts: sinomo_core::network::DaemonRpcTimeouts,
 ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+    send_daemon_rpc_to_endpoint_with_options(
+        endpoint,
+        request,
+        sinomo_core::network::ClusterObjectRpcOptions::new(timeouts),
+    )
+}
+
+/// Sends to an authenticated endpoint while preserving the caller's
+/// whole-call deadline even when transport progress keeps the idle timer live.
+pub fn send_daemon_rpc_to_endpoint_with_options(
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         return if matches!(
             handle.runtime_flavor(),
@@ -358,9 +424,9 @@ pub fn send_daemon_rpc_to_endpoint_with_timeouts(
         ) {
             let runtime = handle.clone();
             tokio::task::block_in_place(|| {
-                runtime.block_on(send_daemon_rpc_to_endpoint_async(
-                    endpoint, request, timeouts, &runtime,
-                ))
+                send_daemon_rpc_to_endpoint_with_options_on_runtime(
+                    endpoint, request, options, &runtime,
+                )
             })
         } else {
             Err(DaemonError::Network {
@@ -369,21 +435,13 @@ pub fn send_daemon_rpc_to_endpoint_with_timeouts(
             })
         };
     }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|source| DaemonError::Network {
-            address: "daemon client runtime".to_string(),
-            detail: source.to_string(),
-        })?;
-    let output = runtime.block_on(send_daemon_rpc_to_endpoint_async(
+    let runtime = daemon_client_sync_runtime()?;
+    send_daemon_rpc_to_endpoint_with_options_on_runtime(
         endpoint,
         request,
-        timeouts,
+        options,
         runtime.handle(),
-    ));
-    runtime.shutdown_timeout(Duration::from_millis(250));
-    output
+    )
 }
 
 pub(crate) fn send_daemon_rpc_to_endpoint_with_options_on_runtime(
@@ -669,15 +727,18 @@ async fn send_daemon_rpc_to_endpoint_with_options_and_connectivity_async(
     runtime: &tokio::runtime::Handle,
     observe_connectivity: bool,
 ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
-    let result = send_daemon_rpc_result_to_endpoint_with_options_and_connectivity_async(
-        endpoint,
-        request,
+    materialize_daemon_client_value_call_with_options(
+        "cluster endpoint object RPC value call",
         options,
-        runtime,
-        observe_connectivity,
+        send_daemon_rpc_result_to_endpoint_with_options_and_connectivity_async(
+            endpoint,
+            request,
+            options,
+            runtime,
+            observe_connectivity,
+        ),
     )
-    .await?;
-    materialize_daemon_client_value_response(result).await
+    .await
 }
 
 async fn send_daemon_rpc_result_to_endpoint_with_options_and_connectivity_async(
@@ -800,11 +861,52 @@ pub(crate) async fn send_object_rpc_call_to_target_async_with_daemon_paths_and_n
         .await
 }
 
+/// Sends an object-RPC directly to a daemon listener on this machine while
+/// retaining the caller's streamed body and network delivery-state errors.
+///
+/// The caller must first prove which local process owns `address`; this helper
+/// deliberately does not infer a process role from a node identity shared by
+/// the main and shadow daemons.
+pub(crate) async fn send_object_rpc_call_to_local_daemon_address_with_daemon_paths_and_network_error(
+    daemon_paths: &DaemonPaths,
+    address: &str,
+    mut call: ObjectRpcCall,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    runtime: &tokio::runtime::Handle,
+) -> Result<ObjectRpcResult, sinomo_core::network::NetworkError> {
+    let data_dir = daemon_data_dir_from_paths(daemon_paths)?;
+    let mut host = DaemonObjectRpcAsyncHost::new(runtime, false).with_paths(daemon_paths);
+    call.request.auth = None;
+    if sinomo_core::network::is_loopback_connect_address(address) {
+        return sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host)
+            .call_loopback(&data_dir, address, call, options)
+            .await;
+    }
+    let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+    let state = sinomo_core::cluster::read_cluster_state_cached_shared(&cluster_paths)?;
+    let endpoint = local_session_endpoint_for_address(&state, address).map_err(|error| {
+        sinomo_core::network::NetworkError::delivery_failed(
+            "resolve exact local main daemon endpoint",
+            sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+            error.to_string(),
+        )
+    })?;
+    sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &cluster_paths)
+        .call_endpoint(&state, &endpoint, call, options)
+        .await
+}
+
 fn block_on_daemon_client<F, T>(future: F) -> Result<T, DaemonError>
 where
     F: std::future::Future<Output = Result<T, DaemonError>> + Send,
     T: Send,
 {
+    // Heap-pin the composed transport future before Tokio's synchronous
+    // bridge carries it through generic `block_on` frames. The response body
+    // is already streamed and heap-backed; retaining the concrete future by
+    // value here only multiplies its static stack footprint on callers such as
+    // bounded CLI fan-out workers.
+    let future = Box::pin(future);
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         return if matches!(
             handle.runtime_flavor(),
@@ -818,7 +920,7 @@ where
             })
         };
     }
-    block_on_daemon_client_on_process_runtime(future)
+    block_on_daemon_client_on_process_runtime_pinned(future)
 }
 
 fn block_on_daemon_client_stream<F, T>(future: F) -> Result<T, DaemonError>
@@ -831,7 +933,7 @@ where
             detail: "streaming daemon RPC sync client cannot run inside a Tokio runtime; use send_daemon_rpc_stream_async".to_string(),
         });
     }
-    block_on_daemon_client_on_process_runtime(future)
+    block_on_daemon_client_on_process_runtime_pinned(Box::pin(future))
 }
 
 fn block_on_daemon_client_on_owner_runtime<F, T>(
@@ -842,6 +944,7 @@ where
     F: std::future::Future<Output = Result<T, DaemonError>> + Send,
     T: Send,
 {
+    let future = Box::pin(future);
     if let Ok(current) = tokio::runtime::Handle::try_current() {
         return if matches!(
             current.runtime_flavor(),
@@ -877,6 +980,15 @@ fn daemon_client_sync_runtime() -> Result<&'static tokio::runtime::Runtime, Daem
 }
 
 fn block_on_daemon_client_on_process_runtime<F, T>(future: F) -> Result<T, DaemonError>
+where
+    F: std::future::Future<Output = Result<T, DaemonError>>,
+{
+    block_on_daemon_client_on_process_runtime_pinned(Box::pin(future))
+}
+
+fn block_on_daemon_client_on_process_runtime_pinned<F, T>(
+    future: std::pin::Pin<Box<F>>,
+) -> Result<T, DaemonError>
 where
     F: std::future::Future<Output = Result<T, DaemonError>>,
 {
@@ -1865,22 +1977,14 @@ pub fn send_object_rpc_to_target_with_options(
             observe_connectivity,
         );
     }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|source| DaemonError::Network {
-            address: "daemon client runtime".to_string(),
-            detail: source.to_string(),
-        })?;
-    let result = send_object_rpc_to_target_with_options_on_runtime(
+    let runtime = daemon_client_sync_runtime()?;
+    send_object_rpc_to_target_with_options_on_runtime(
         target_node_id,
         request,
         options,
         runtime.handle(),
         observe_connectivity,
-    );
-    runtime.shutdown_timeout(Duration::from_millis(250));
-    result
+    )
 }
 
 pub fn send_object_rpc_call_to_target_with_options(
@@ -1898,22 +2002,14 @@ pub fn send_object_rpc_call_to_target_with_options(
             observe_connectivity,
         );
     }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|source| DaemonError::Network {
-            address: "daemon client runtime".to_string(),
-            detail: source.to_string(),
-        })?;
-    let result = send_object_rpc_call_to_target_with_options_on_runtime(
+    let runtime = daemon_client_sync_runtime()?;
+    send_object_rpc_call_to_target_with_options_on_runtime(
         target_node_id,
         call,
         options,
         runtime.handle(),
         observe_connectivity,
-    );
-    runtime.shutdown_timeout(Duration::from_millis(250));
-    result
+    )
 }
 
 pub(crate) fn send_object_rpc_call_to_target_on_runtime_with_daemon_paths_and_options(
@@ -1951,15 +2047,14 @@ pub(crate) fn send_object_rpc_to_target_with_options_on_runtime(
     let request = request.clone();
     let runtime_for_future = runtime.clone();
     block_on_daemon_client_on_owner_runtime(runtime, async move {
-        let result = send_object_rpc_call_to_target_async_with_options(
+        send_object_rpc_to_target_async_with_options(
             &target_node_id,
-            ObjectRpcCall::value(request),
+            &request,
             options,
             &runtime_for_future,
             observe_connectivity,
         )
-        .await?;
-        materialize_daemon_client_value_response(result).await
+        .await
     })
 }
 
@@ -2010,15 +2105,18 @@ pub async fn send_object_rpc_to_target_async_with_options(
     runtime: &tokio::runtime::Handle,
     observe_connectivity: bool,
 ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
-    let result = send_object_rpc_call_to_target_async_with_options(
-        target_node_id,
-        ObjectRpcCall::value(request.clone()),
+    materialize_daemon_client_value_call_with_options(
+        "cluster target object RPC value call",
         options,
-        runtime,
-        observe_connectivity,
+        send_object_rpc_call_to_target_async_with_options(
+            target_node_id,
+            ObjectRpcCall::value(request.clone()),
+            options,
+            runtime,
+            observe_connectivity,
+        ),
     )
-    .await?;
-    materialize_daemon_client_value_response(result).await
+    .await
 }
 
 #[cfg(test)]
@@ -2121,6 +2219,19 @@ pub fn send_daemon_shutdown_request(
     send_daemon_rpc_value(
         address,
         crate::DAEMON_SHUTDOWN_ROUTE,
+        crate::DAEMON_RPC_CATEGORY,
+        (),
+        timeout,
+    )
+}
+
+pub fn send_daemon_remote_shadow_shutdown_request(
+    address: &str,
+    timeout: Duration,
+) -> Result<String, DaemonError> {
+    send_daemon_rpc_value(
+        address,
+        crate::DAEMON_REMOTE_SHADOW_SHUTDOWN_ROUTE,
         crate::DAEMON_RPC_CATEGORY,
         (),
         timeout,
@@ -3389,6 +3500,108 @@ mod tests {
         assert_eq!(value, 37);
     }
 
+    #[tokio::test]
+    async fn materialized_value_call_deadline_covers_a_stalled_streamed_response_body() {
+        let timeout = Duration::from_millis(20);
+        let (_body_sender, body) =
+            sinomo_core::network::ObjectRpcIncomingBody::test_channel(None, 1);
+        let response = sinomo_core::network::ObjectRpcResponse::from_encoded_body(
+            "/test/stalled-streamed-value",
+            Vec::new(),
+        );
+        let result =
+            sinomo_core::network::ObjectRpcResult::from_forwarded_body(response, body, true)
+                .expect("construct streamed value response");
+        let options =
+            sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout);
+
+        let error = match super::materialize_daemon_client_value_call_with_options(
+            "test object RPC value call",
+            options,
+            async move { Ok(result) },
+        )
+        .await
+        {
+            Ok(_) => panic!("a response body that never completes must time out"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                crate::DaemonError::Parse { ref detail }
+                    if detail == &sinomo_core::network::NetworkError::timeout(
+                        "test object RPC value call",
+                        sinomo_core::network::NetworkTimeoutPhase::Overall,
+                        timeout,
+                        sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                    )
+                    .to_string()
+            ),
+            "unexpected timeout error: {error}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn materialized_value_call_deadline_covers_a_progress_active_streamed_response() {
+        let timeout = Duration::from_millis(20);
+        let (body_sender, body) =
+            sinomo_core::network::ObjectRpcIncomingBody::test_channel(None, 1);
+        let response = sinomo_core::network::ObjectRpcResponse::from_encoded_body(
+            "/test/progress-active-streamed-value",
+            Vec::new(),
+        );
+        let result =
+            sinomo_core::network::ObjectRpcResult::from_forwarded_body(response, body, true)
+                .expect("construct streamed value response");
+        let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let producer_progress = std::sync::Arc::clone(&progress);
+        let producer = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                if body_sender.send(vec![1]).await.is_err() {
+                    return;
+                }
+                producer_progress.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let options =
+            sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout);
+        let started = tokio::time::Instant::now();
+
+        let error = match super::materialize_daemon_client_value_call_with_options(
+            "test progress-active object RPC value call",
+            options,
+            async move { Ok(result) },
+        )
+        .await
+        {
+            Ok(_) => panic!("continuous response progress must not extend the overall deadline"),
+            Err(error) => error,
+        };
+        let elapsed = tokio::time::Instant::now().duration_since(started);
+        producer.abort();
+
+        assert_eq!(elapsed, timeout);
+        assert!(
+            progress.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the response must make progress before the overall deadline wins"
+        );
+        assert!(
+            matches!(
+                error,
+                crate::DaemonError::Parse { ref detail }
+                    if detail == &sinomo_core::network::NetworkError::timeout(
+                        "test progress-active object RPC value call",
+                        sinomo_core::network::NetworkTimeoutPhase::Overall,
+                        timeout,
+                        sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                    )
+                    .to_string()
+            ),
+            "unexpected timeout error: {error}"
+        );
+    }
+
     #[test]
     fn local_cluster_kv_snapshot_decoder_preserves_observation_metadata() {
         let snapshot = sinomo_core::kv::InProcessKvStore::new()
@@ -3491,6 +3704,7 @@ mod tests {
             source_head: Some("abc123".to_string()),
             force_source_overwrite: false,
             host: "127.0.0.1".to_string(),
+            host_override: None,
             port: 21_353,
             shadow_port: 21_354,
             requested_at: "2026-07-12T00:00:00Z".to_string(),
@@ -3535,6 +3749,7 @@ mod tests {
                 target_os: std::env::consts::OS.to_string(),
                 target_arch: std::env::consts::ARCH.to_string(),
                 host: "127.0.0.1".to_string(),
+                host_override: None,
                 port: 21_353,
                 shadow_port: 21_354,
                 requested_at: "2026-07-12T00:00:00Z".to_string(),

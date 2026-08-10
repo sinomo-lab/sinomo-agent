@@ -55,7 +55,6 @@ use crate::sifs_file_manager::{
     SifsFileManagerBackend, SifsFileManagerObservation, SifsOneShotBulkWriteRequester,
 };
 use sinomo_runtime::api::DaemonApiClient;
-use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
 use sinomo_runtime::core::DfsObjectPolicy;
 use sinomo_runtime::dfs::{
@@ -486,13 +485,18 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         optional_usize_parameter(ctx, "max-remote-pending-repairs", usize::MAX)?;
     let data_dir = SinomoDataDir::new(ctx.data_dir());
     let cluster_paths = ClusterPaths::new(&data_dir);
-    super::refresh_cluster_kv_from_local_daemon(&cluster_paths).map_err(|error| {
+    super::refresh_cluster_kv_from_local_daemon_for_data_dir(&data_dir, &cluster_paths).map_err(
+        |error| {
+            SinomoTestError::failed(format!(
+                "cannot refresh cluster snapshot before DFS routed status: {error}"
+            ))
+        },
+    )?;
+    let (state, _) = super::cluster_health_rows_for_data_dir(&data_dir).map_err(|error| {
         SinomoTestError::failed(format!(
-            "cannot refresh cluster snapshot before DFS routed status: {error}"
+            "cannot read live cluster membership before DFS routed status: {error}"
         ))
     })?;
-    let state = cluster::read_cluster_state(&cluster_paths)
-        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
     let targets = filter_dfs_routed_status_targets(
         ctx,
         &state,
@@ -516,12 +520,42 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         )));
     }
 
-    let daemon_client = DaemonApiClient::connect()
-        .map_err(|source| {
-            SinomoTestError::failed(format!(
-                "cannot connect to local daemon for DFS routed status: {source}"
-            ))
-        })?
+    let daemon_status = match sinomo_runtime::daemon::probe_daemon_status(
+        &sinomo_runtime::daemon::DaemonPaths::new(&data_dir),
+        sinomo_runtime::daemon::DAEMON_API_PROBE_TIMEOUT,
+    ) {
+        sinomo_runtime::daemon::DaemonProbeStatus::Running(status) => status,
+        sinomo_runtime::daemon::DaemonProbeStatus::Locked { .. } => {
+            return Err(SinomoTestError::failed(
+                "the daemon owns the routed-status data directory but its RPC service is unavailable",
+            ));
+        }
+        sinomo_runtime::daemon::DaemonProbeStatus::NotRunning => {
+            return Err(SinomoTestError::failed(
+                "the routed-status data directory has no running main daemon",
+            ));
+        }
+    };
+    let Some(daemon_cluster) = daemon_status.cluster.as_ref() else {
+        return Err(SinomoTestError::failed(
+            "the routed-status daemon did not advertise a cluster identity",
+        ));
+    };
+    if daemon_cluster.cluster_id != state.cluster_id
+        || daemon_cluster.node_id != state.local_node_id
+        || daemon_cluster.process != sinomo_runtime::node::DAEMON_MAIN_CLUSTER_ROLE
+    {
+        return Err(SinomoTestError::failed(format!(
+            "the routed-status daemon advertised cluster/node/process {}/{}/{}, expected {}/{}/{}",
+            daemon_cluster.cluster_id,
+            daemon_cluster.node_id,
+            daemon_cluster.process,
+            state.cluster_id,
+            state.local_node_id,
+            sinomo_runtime::node::DAEMON_MAIN_CLUSTER_ROLE,
+        )));
+    }
+    let daemon_client = DaemonApiClient::at_address(daemon_status.address)
         .with_timeout(Duration::from_millis(timeout_ms));
     let request = dfs::dfs_status_rpc_request()
         .map_err(|source| SinomoTestError::failed(source.to_string()))?;
@@ -557,10 +591,18 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         let DfsRoutedStatusAttempt {
             statuses,
             repair_details,
+            bounded_omissions,
+            blocking_incomplete_reasons,
             target_elapsed_ms,
             failures,
         } = attempt;
         ctx.record("target_elapsed_ms", &target_elapsed_ms);
+        if !bounded_omissions.is_empty() {
+            ctx.record("bounded_omissions", &bounded_omissions);
+        }
+        if !blocking_incomplete_reasons.is_empty() {
+            ctx.record("blocking_incomplete_reasons", &blocking_incomplete_reasons);
+        }
         let dirty_statuses = routed_status_dirty_summaries(
             &statuses,
             max_remote_open_conflicts,
@@ -611,8 +653,9 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 )));
             }
             return Ok(SinomoTestOutcome::passed(format!(
-                "DFS routed status succeeded for {} remote main daemon(s)",
-                targets.len()
+                "DFS routed status succeeded for {} remote main daemon(s); {} target(s) reported bounded observation omissions",
+                targets.len(),
+                bounded_omissions.len()
             )));
         }
         if (!failures.is_empty() && wall_gate.exhausted(attempts, elapsed))
@@ -651,6 +694,8 @@ struct DfsRoutedStatusTargetProbe {
     elapsed_ms: u64,
     status: Option<BTreeMap<&'static str, u64>>,
     repair_details: Vec<BTreeMap<&'static str, String>>,
+    bounded_omissions: Vec<String>,
+    blocking_incomplete_reasons: Vec<String>,
     error: Option<String>,
 }
 
@@ -661,6 +706,8 @@ impl DfsRoutedStatusTargetProbe {
             elapsed_ms: started.elapsed().as_millis() as u64,
             status: None,
             repair_details: Vec::new(),
+            bounded_omissions: Vec::new(),
+            blocking_incomplete_reasons: Vec::new(),
             error: Some(error.into()),
         }
     }
@@ -670,6 +717,8 @@ impl DfsRoutedStatusTargetProbe {
 struct DfsRoutedStatusAttempt {
     statuses: BTreeMap<String, BTreeMap<&'static str, u64>>,
     repair_details: BTreeMap<String, Vec<BTreeMap<&'static str, String>>>,
+    bounded_omissions: BTreeMap<String, Vec<String>>,
+    blocking_incomplete_reasons: BTreeMap<String, Vec<String>>,
     target_elapsed_ms: BTreeMap<String, u64>,
     failures: Vec<String>,
 }
@@ -737,20 +786,42 @@ fn probe_dfs_routed_status_target(
             Vec::new()
         };
         let summary = dfs_status_probe_summary(&status, &repairs, unavailable_repair_targets);
+        let bounded_omissions = status
+            .bounded_omissions
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let mut blocking_incomplete_reasons = status
+            .blocking_incomplete_reasons()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if status.cross_shard_namespace_lock_count.is_none() {
+            blocking_incomplete_reasons.push(DFS_CROSS_SHARD_LOCK_STATUS_UNOBSERVED.to_string());
+        }
         let repair_details = repairs
             .iter()
             .map(dfs_repair_probe_summary)
             .collect::<Vec<_>>();
-        Ok((summary, repair_details))
+        Ok((
+            summary,
+            repair_details,
+            bounded_omissions,
+            blocking_incomplete_reasons,
+        ))
     })();
     match result {
-        Ok((status, repair_details)) => DfsRoutedStatusTargetProbe {
-            target,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-            status: Some(status),
-            repair_details,
-            error: None,
-        },
+        Ok((status, repair_details, bounded_omissions, blocking_incomplete_reasons)) => {
+            DfsRoutedStatusTargetProbe {
+                target,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                status: Some(status),
+                repair_details,
+                bounded_omissions,
+                blocking_incomplete_reasons,
+                error: None,
+            }
+        }
         Err(error) => DfsRoutedStatusTargetProbe::failed(target, started, error),
     }
 }
@@ -776,7 +847,19 @@ fn aggregate_dfs_routed_status_probes(
         };
         attempt.statuses.insert(target.clone(), status);
         if !probe.repair_details.is_empty() {
-            attempt.repair_details.insert(target, probe.repair_details);
+            attempt
+                .repair_details
+                .insert(target.clone(), probe.repair_details);
+        }
+        if !probe.bounded_omissions.is_empty() {
+            attempt
+                .bounded_omissions
+                .insert(target.clone(), probe.bounded_omissions);
+        }
+        if !probe.blocking_incomplete_reasons.is_empty() {
+            attempt
+                .blocking_incomplete_reasons
+                .insert(target, probe.blocking_incomplete_reasons);
         }
     }
     attempt
@@ -1498,6 +1581,9 @@ fn dfs_repair_probe_summary(repair: &DfsOperatorRepairView) -> BTreeMap<&'static
     ])
 }
 
+const DFS_CROSS_SHARD_LOCK_STATUS_UNOBSERVED: &str =
+    "durable cross-shard namespace lock status was not observed";
+
 fn dfs_status_probe_summary(
     status: &DfsOperatorStatus,
     repairs: &[DfsOperatorRepairView],
@@ -1509,6 +1595,16 @@ fn dfs_status_probe_summary(
         .pending_repair_count
         .saturating_sub(unavailable_pending_repairs);
     BTreeMap::from([
+        (
+            "incomplete_reasons",
+            status
+                .blocking_incomplete_reasons()
+                .len()
+                .saturating_add(usize::from(
+                    status.cross_shard_namespace_lock_count.is_none(),
+                )) as u64,
+        ),
+        ("bounded_omissions", status.bounded_omissions.len() as u64),
         ("file_systems", status.file_system_count as u64),
         ("objects", status.object_count as u64),
         ("pending_writes", status.pending_write_count as u64),
@@ -2012,10 +2108,13 @@ fn routed_status_dirty_summaries(
     statuses
         .iter()
         .filter_map(|(target, status)| {
+            let incomplete_reasons = *status.get("incomplete_reasons").unwrap_or(&0);
+            let bounded_omissions = *status.get("bounded_omissions").unwrap_or(&0);
             let open_conflicts = *status.get("open_conflicts").unwrap_or(&0);
             let pending_writes = *status.get("pending_writes").unwrap_or(&0);
             let pending_repairs = *status.get("pending_repairs").unwrap_or(&0);
-            if open_conflicts > max_remote_open_conflicts as u64
+            if incomplete_reasons > 0
+                || open_conflicts > max_remote_open_conflicts as u64
                 || pending_writes > max_remote_pending_writes as u64
                 || pending_repairs > max_remote_pending_repairs as u64
             {
@@ -2028,7 +2127,7 @@ fn routed_status_dirty_summaries(
                     .copied()
                     .unwrap_or(0);
                 Some(format!(
-                    "{target}: open_conflicts={open_conflicts}, pending_writes={pending_writes}, pending_repairs={pending_repairs}, total_pending_repairs={total_pending_repairs}, unavailable_pending_repairs={unavailable_pending_repairs}"
+                    "{target}: incomplete_reasons={incomplete_reasons}, bounded_omissions={bounded_omissions}, open_conflicts={open_conflicts}, pending_writes={pending_writes}, pending_repairs={pending_repairs}, total_pending_repairs={total_pending_repairs}, unavailable_pending_repairs={unavailable_pending_repairs}"
                 ))
             } else {
                 None
@@ -2525,8 +2624,15 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let deadline = Instant::now() + timeout;
     let data_dir = SinomoDataDir::new(ctx.data_dir());
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let cluster_state = cluster::read_cluster_state(&cluster_paths)
-        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
+    // The acceptance runner is a separate process from the resident daemon.
+    // Reuse the daemon-owned live-health projection instead of trying to open
+    // the daemon's local Raft store merely to select observation targets.
+    let (cluster_state, _) =
+        super::cluster_health_rows_for_data_dir(&data_dir).map_err(|error| {
+            SinomoTestError::failed(format!(
+                "cannot read live cluster membership before checking DFS invariants: {error}"
+            ))
+        })?;
     let live_online_remote_node_ids =
         super::test::live_online_remote_main_test_targets(&data_dir, &cluster_state)?
             .into_iter()
@@ -2558,6 +2664,21 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ));
         }
         let operator_status = snapshot.operator_status;
+        let status_completeness = assess_dfs_invariant_status_completeness(&operator_status);
+        violations.extend(
+            status_completeness
+                .blocking_incomplete_reasons
+                .iter()
+                .map(|reason| format!("operator status incomplete: {reason}")),
+        );
+        ctx.record(
+            "bounded_status_omissions",
+            &status_completeness.bounded_omissions,
+        );
+        ctx.record(
+            "blocking_status_incomplete_reasons",
+            &status_completeness.blocking_incomplete_reasons,
+        );
         let replica_assessment = assess_dfs_invariant_replica_health(
             &node,
             &operator_status.metadata_shards,
@@ -2574,9 +2695,16 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 "pending_metadata_replication_count",
                 metrics.pending_metadata_replication_count,
             );
-            return Ok(SinomoTestOutcome::passed(format!(
-                "DFS operational invariants hold on node {node}"
-            )));
+            return Ok(SinomoTestOutcome::passed(
+                if status_completeness.bounded_omissions.is_empty() {
+                    format!("DFS operational invariants hold on node {node}")
+                } else {
+                    format!(
+                        "DFS observed operational invariants are clean on node {node}; {} bounded metric observation(s) remain explicitly omitted",
+                        status_completeness.bounded_omissions.len()
+                    )
+                },
+            ));
         }
         if Instant::now() >= deadline {
             ctx.record("violations", &violations);
@@ -2587,6 +2715,29 @@ fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             )));
         }
         std::thread::sleep(EXPECT_POLL_INTERVAL);
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DfsInvariantStatusCompletenessAssessment {
+    bounded_omissions: Vec<String>,
+    blocking_incomplete_reasons: Vec<String>,
+}
+
+fn assess_dfs_invariant_status_completeness(
+    status: &DfsOperatorStatus,
+) -> DfsInvariantStatusCompletenessAssessment {
+    DfsInvariantStatusCompletenessAssessment {
+        bounded_omissions: status
+            .bounded_omissions
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        blocking_incomplete_reasons: status
+            .blocking_incomplete_reasons()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
     }
 }
 
@@ -3056,21 +3207,21 @@ fn run_lightweight_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             backend_open_elapsed.as_millis()
         )));
     }
-    if max_p50_us > 0 && worst_p50.1 > max_p50_us {
+    if latency_reaches_exclusive_limit(worst_p50.1, max_p50_us) {
         return Ok(SinomoTestOutcome::failed(format!(
-            "DFS lightweight latency worst p50 {}={}us is above allowed {max_p50_us}us",
+            "DFS lightweight latency worst p50 {}={}us is not below required {max_p50_us}us",
             worst_p50.0, worst_p50.1
         )));
     }
-    if max_p95_us > 0 && worst_p95.1 > max_p95_us {
+    if latency_reaches_exclusive_limit(worst_p95.1, max_p95_us) {
         return Ok(SinomoTestOutcome::failed(format!(
-            "DFS lightweight latency worst p95 {}={}us is above allowed {max_p95_us}us",
+            "DFS lightweight latency worst p95 {}={}us is not below required {max_p95_us}us",
             worst_p95.0, worst_p95.1
         )));
     }
-    if max_max_us > 0 && worst_max.1 > max_max_us {
+    if latency_reaches_exclusive_limit(worst_max.1, max_max_us) {
         return Ok(SinomoTestOutcome::failed(format!(
-            "DFS lightweight latency worst max {}={}us is above allowed {max_max_us}us",
+            "DFS lightweight latency worst max {}={}us is not below required {max_max_us}us",
             worst_max.0, worst_max.1
         )));
     }
@@ -5292,6 +5443,10 @@ fn percentile_value(sorted: &[u64], percentile: usize) -> u64 {
     sorted[index]
 }
 
+fn latency_reaches_exclusive_limit(observed_us: u64, limit_us: u64) -> bool {
+    limit_us > 0 && observed_us >= limit_us
+}
+
 fn mean_value(values: &[u64]) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -5461,6 +5616,14 @@ mod tests {
         ClusterEndpointSource, ClusterMemberRecord, ClusterTransportKind,
     };
     use sinomo_runtime::node::ClusterId;
+
+    #[test]
+    fn lightweight_latency_limit_is_strictly_exclusive() {
+        assert!(!latency_reaches_exclusive_limit(99_999, 100_000));
+        assert!(latency_reaches_exclusive_limit(100_000, 100_000));
+        assert!(latency_reaches_exclusive_limit(100_001, 100_000));
+        assert!(!latency_reaches_exclusive_limit(u64::MAX, 0));
+    }
 
     fn shard_layout_probe(
         lane: &'static str,
@@ -6137,12 +6300,15 @@ mod tests {
             NodeId::from_legacy_named("node_routed_status_failure").expect("failed target");
         let status = BTreeMap::from([("objects", 7_u64)]);
         let repair_details = vec![BTreeMap::from([("intent_id", "repair-a".to_string())])];
+        let bounded_omissions = vec!["historical routing visibility omitted".to_string()];
         let attempt = aggregate_dfs_routed_status_probes(vec![
             DfsRoutedStatusTargetProbe {
                 target: successful_target.clone(),
                 elapsed_ms: 41,
                 status: Some(status.clone()),
                 repair_details: repair_details.clone(),
+                bounded_omissions: bounded_omissions.clone(),
+                blocking_incomplete_reasons: Vec::new(),
                 error: None,
             },
             DfsRoutedStatusTargetProbe {
@@ -6150,6 +6316,8 @@ mod tests {
                 elapsed_ms: 73,
                 status: None,
                 repair_details: Vec::new(),
+                bounded_omissions: Vec::new(),
+                blocking_incomplete_reasons: Vec::new(),
                 error: Some("decode failed: fixture".to_string()),
             },
         ]);
@@ -6161,6 +6329,12 @@ mod tests {
         assert_eq!(
             attempt.repair_details.get(&successful_target.to_string()),
             Some(&repair_details)
+        );
+        assert_eq!(
+            attempt
+                .bounded_omissions
+                .get(&successful_target.to_string()),
+            Some(&bounded_omissions)
         );
         assert_eq!(
             attempt
@@ -6363,6 +6537,8 @@ mod tests {
         let mut unavailable_repair_targets = BTreeSet::new();
         unavailable_repair_targets.insert(unavailable.clone());
         let status = DfsOperatorStatus {
+            incomplete_reasons: Vec::new(),
+            bounded_omissions: Vec::new(),
             file_system_count: 1,
             object_count: 2,
             version_count: 3,
@@ -6374,6 +6550,7 @@ mod tests {
             repair_attempt_count: 2,
             pending_namespace_job_count: 0,
             failed_namespace_job_count: 0,
+            cross_shard_namespace_lock_count: Some(0),
             metadata_shards: Vec::new(),
             repair_attempts: vec![
                 repair_attempt("offline_replica", unavailable),
@@ -6402,6 +6579,8 @@ mod tests {
         let mut unavailable_repair_targets = BTreeSet::new();
         unavailable_repair_targets.insert(unavailable.clone());
         let status = DfsOperatorStatus {
+            incomplete_reasons: Vec::new(),
+            bounded_omissions: Vec::new(),
             file_system_count: 1,
             object_count: 2,
             version_count: 3,
@@ -6413,6 +6592,7 @@ mod tests {
             repair_attempt_count: 0,
             pending_namespace_job_count: 0,
             failed_namespace_job_count: 0,
+            cross_shard_namespace_lock_count: Some(0),
             metadata_shards: Vec::new(),
             repair_attempts: Vec::new(),
         };
@@ -6423,5 +6603,123 @@ mod tests {
         assert_eq!(summary.get("pending_repairs"), Some(&0));
         assert_eq!(summary.get("total_pending_repairs"), Some(&1));
         assert_eq!(summary.get("unavailable_pending_repairs"), Some(&1));
+    }
+
+    #[test]
+    fn dfs_routed_status_marks_incomplete_remote_status_dirty() {
+        let mut status = DfsOperatorStatus {
+            incomplete_reasons: vec![
+                "bounded resident metadata status unavailable: generation is cold".to_string(),
+            ],
+            bounded_omissions: Vec::new(),
+            file_system_count: 1,
+            object_count: 0,
+            version_count: 0,
+            receipt_count: 0,
+            intent_count: 0,
+            pending_write_count: 0,
+            open_conflict_count: 0,
+            pending_repair_count: 0,
+            repair_attempt_count: 0,
+            pending_namespace_job_count: 0,
+            failed_namespace_job_count: 0,
+            cross_shard_namespace_lock_count: Some(0),
+            metadata_shards: Vec::new(),
+            repair_attempts: Vec::new(),
+        };
+        let unavailable_repair_targets = BTreeSet::new();
+        let summary = dfs_status_probe_summary(&status, &[], &unavailable_repair_targets);
+
+        assert_eq!(summary.get("incomplete_reasons"), Some(&1));
+        assert_eq!(summary.get("bounded_omissions"), Some(&0));
+        let statuses = BTreeMap::from([("remote-node".to_string(), summary)]);
+        let dirty = routed_status_dirty_summaries(&statuses, usize::MAX, usize::MAX, usize::MAX);
+        assert_eq!(dirty.len(), 1);
+        assert!(dirty[0].contains("remote-node: incomplete_reasons=1"));
+
+        status.incomplete_reasons.clear();
+        status.cross_shard_namespace_lock_count = None;
+        let unobserved_summary =
+            dfs_status_probe_summary(&status, &[], &unavailable_repair_targets);
+        assert_eq!(unobserved_summary.get("incomplete_reasons"), Some(&1));
+        let unobserved_statuses = BTreeMap::from([("remote-node".to_string(), unobserved_summary)]);
+        assert_eq!(
+            routed_status_dirty_summaries(
+                &unobserved_statuses,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+            )
+            .len(),
+            1,
+            "old or bounded remote status must not report a false clean lock count"
+        );
+
+        status.cross_shard_namespace_lock_count = Some(0);
+        let complete_summary = dfs_status_probe_summary(&status, &[], &unavailable_repair_targets);
+        assert_eq!(complete_summary.get("incomplete_reasons"), Some(&0));
+        let complete_statuses = BTreeMap::from([("remote-node".to_string(), complete_summary)]);
+        assert!(
+            routed_status_dirty_summaries(&complete_statuses, usize::MAX, usize::MAX, usize::MAX,)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dfs_acceptance_keeps_bounded_omissions_visible_without_hiding_real_debt() {
+        let legacy_reason = "repair queue observation unavailable: bounded DFS repair queue status unavailable because the resident queue is not hydrated";
+        let mut status = DfsOperatorStatus {
+            incomplete_reasons: Vec::new(),
+            bounded_omissions: Vec::new(),
+            file_system_count: 1,
+            object_count: 0,
+            version_count: 0,
+            receipt_count: 0,
+            intent_count: 0,
+            pending_write_count: 0,
+            open_conflict_count: 0,
+            pending_repair_count: 0,
+            repair_attempt_count: 0,
+            pending_namespace_job_count: 0,
+            failed_namespace_job_count: 0,
+            cross_shard_namespace_lock_count: Some(0),
+            metadata_shards: Vec::new(),
+            repair_attempts: Vec::new(),
+        };
+        status.push_bounded_omission(
+            dfs::DfsOperatorStatusOmission::resident_repair_queue_not_hydrated(),
+        );
+        let unavailable_repair_targets = BTreeSet::new();
+
+        let summary = dfs_status_probe_summary(&status, &[], &unavailable_repair_targets);
+        assert_eq!(summary.get("incomplete_reasons"), Some(&0));
+        assert_eq!(summary.get("bounded_omissions"), Some(&1));
+        let statuses = BTreeMap::from([("remote-node".to_string(), summary)]);
+        assert!(
+            routed_status_dirty_summaries(&statuses, 0, 0, 0).is_empty(),
+            "a typed bounded omission is not itself observed debt"
+        );
+
+        let completeness = assess_dfs_invariant_status_completeness(&status);
+        assert!(completeness.blocking_incomplete_reasons.is_empty());
+        assert_eq!(completeness.bounded_omissions, vec![legacy_reason]);
+
+        status.open_conflict_count = 1;
+        let debt_summary = dfs_status_probe_summary(&status, &[], &unavailable_repair_targets);
+        let debt_statuses = BTreeMap::from([("remote-node".to_string(), debt_summary)]);
+        assert_eq!(
+            routed_status_dirty_summaries(&debt_statuses, 0, 0, 0).len(),
+            1,
+            "nonzero observed conflict debt must still fail beside an omission"
+        );
+
+        status
+            .incomplete_reasons
+            .push("resident metadata cursor projection is corrupt".to_string());
+        let incomplete = assess_dfs_invariant_status_completeness(&status);
+        assert_eq!(
+            incomplete.blocking_incomplete_reasons,
+            vec!["resident metadata cursor projection is corrupt"]
+        );
     }
 }

@@ -64,7 +64,7 @@ impl BackgroundWorkController {
             {
                 let mut chat = self.shared.chat_mut();
                 chat.start_provider_list_load(backend.config.clone(), waker.clone());
-                chat.start_agent_list_load(backend.data_dir.clone(), waker.clone());
+                chat.start_agent_list_load(waker.clone());
                 chat.start_session_list_load(waker);
             }
             if self.shared.active_tab() == Tab::Cluster {

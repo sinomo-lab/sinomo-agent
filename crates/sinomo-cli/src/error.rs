@@ -372,6 +372,10 @@ impl From<sinomo_runtime::api::DaemonApiError> for CliError {
                 address: "daemon RPC".to_string(),
                 detail,
             },
+            sinomo_runtime::api::DaemonApiError::UnknownRoute { route } => Self::Network {
+                address: "daemon RPC".to_string(),
+                detail: format!("unknown service route: {route}"),
+            },
             sinomo_runtime::api::DaemonApiError::ForwardNetwork { detail, .. } => Self::Network {
                 address: "daemon object RPC forward".to_string(),
                 detail,

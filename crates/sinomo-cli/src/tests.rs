@@ -50,12 +50,13 @@ use super::{
     parse_models_command, parse_provider_schema_for_test, parse_rollout_schema_for_test,
     parse_slash_command, parse_test_schema_for_test, parse_uninstall_schema_for_test,
     parse_usage_schema_for_test, probe_daemon_status_until_settled, read_cluster_rollout_status,
-    require_cluster_runtime_quorum_with_paths_and_daemon, rollout_advance_with_data_dir,
-    rollout_cluster_targets, rollout_cluster_targets_from_state, rollout_missing_status_grace,
-    rollout_pending_error_grace, rollout_progress_bar, rollout_status_matches_expectation,
-    rollout_target_endpoint_for_main_with_connectivity, rollout_telemetry_gates_set_with_data_dir,
-    rollout_terminal_response, run_tui_with_handler_io, run_tui_with_handler_io_and_daemon,
-    send_rollout_request_with_progress_for_test, shadow_daemon_node_id,
+    read_only_sifs_vfs_for_cli, require_cluster_runtime_quorum_with_paths_and_daemon,
+    rollout_advance_with_data_dir, rollout_cluster_targets, rollout_cluster_targets_from_state,
+    rollout_missing_status_grace, rollout_pending_error_grace, rollout_progress_bar,
+    rollout_status_matches_expectation, rollout_target_endpoint_for_main_with_connectivity,
+    rollout_telemetry_gates_set_with_data_dir, rollout_terminal_response, run_tui_with_handler_io,
+    run_tui_with_handler_io_and_daemon, send_rollout_request_with_progress_for_test,
+    send_rollout_request_with_restart_progress_for_test, shadow_daemon_node_id,
     sign_daemon_rpc_request_from_data_dir, stage_rollout_main_activation, sync_cluster_state_to_kv,
     test_command_requires_cluster_state, tui_default_daemon_status, uninstall_with_layout,
     with_cli_force_local_mode, with_rollout_activation_admission, write_daemon_status,
@@ -270,7 +271,7 @@ impl network::NetworkModule for TestIrohNetworkModule {
     }
 }
 
-fn install_test_iroh_network_module() {
+pub(crate) fn install_test_iroh_network_module() {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| {
         let registry = network::NetworkModuleRegistry::new();
@@ -7468,7 +7469,6 @@ fn daemonless_cli_uses_degraded_local_mode_for_local_capable_commands() {
     for args in [
         &["models", "list"][..],
         &["dfs", "status"][..],
-        &["skill", "list"][..],
         &["observe"][..],
     ] {
         let command = parse(args);
@@ -7516,6 +7516,55 @@ fn daemonless_cli_uses_degraded_local_mode_for_local_capable_commands() {
         None,
     ));
 }
+
+#[test]
+fn read_only_sifs_catalog_commands_skip_degraded_mode_quorum_preflight() {
+    let parse = |args: &[&str]| {
+        parse_cli_command(
+            &args
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .expect("parse command")
+        .expect("registered command")
+    };
+
+    for args in [
+        &["skill", "list"][..],
+        &["skill", "show", "skill.example"][..],
+        &["skill", "export", "skill.example"][..],
+        &["agent", "inspect", "main-agent"][..],
+        &["agent", "export", "main-agent"][..],
+        &["agent", "run", "hello"][..],
+        &["agent", "validate", "main-agent"][..],
+    ] {
+        let command = parse(args);
+        assert!(
+            !cli_command_requires_cluster_state(&command),
+            "read-only daemon-SIFS command must not add a separate cluster-state preflight: {args:?}"
+        );
+        assert!(
+            !cli_command_supports_degraded_local_mode(&command),
+            "read-only daemon-SIFS command must not enter a mounted local fallback: {args:?}"
+        );
+    }
+
+    for args in [
+        &["skill", "import", "skills/example"][..],
+        &["skill", "activate", "skill.example"][..],
+        &["agent", "import", "agent.json"][..],
+        &["agent", "validate", "--file", "agent.json"][..],
+        &["agent", "readiness"][..],
+    ] {
+        let command = parse(args);
+        assert!(
+            cli_command_supports_degraded_local_mode(&command),
+            "existing mutation/runtime policy changed for {args:?}"
+        );
+    }
+}
+
 #[test]
 fn cli_invocation_daemon_status_cache_is_scoped_and_nested() {
     assert_eq!(cli_default_main_daemon_status(), None);
@@ -7550,6 +7599,215 @@ fn cli_invocation_daemon_status_cache_is_scoped_and_nested() {
         assert_eq!(cli_default_main_daemon_status(), Some(status));
     }
     assert_eq!(cli_default_main_daemon_status(), None);
+}
+
+#[test]
+fn read_only_catalog_vfs_uses_resident_daemon_without_opening_local_dfs() {
+    let root = sinomo_testdir::TestDir::new("cli-read-only-sifs-vfs");
+    let status = DaemonStatus {
+        pid: 4242,
+        host: "127.0.0.1".to_string(),
+        port: 9,
+        address: "127.0.0.1:9".to_string(),
+        version: daemon_package_version(),
+        commit: None,
+        target_os: Some(std::env::consts::OS.to_string()),
+        target_arch: Some(std::env::consts::ARCH.to_string()),
+        hostname: None,
+        executable: None,
+        rollout: None,
+        started_at: "2026-08-09T00:00:00Z".to_string(),
+        data_dir: root.path().to_path_buf(),
+        lock_file: root.join("daemon/daemon.lock"),
+        cluster: None,
+        idle_stats: None,
+    };
+    assert!(!root.join("dfs").exists());
+
+    let _status = enter_cli_default_main_daemon_status(status);
+    let vfs = read_only_sifs_vfs_for_cli().expect("resident daemon SIFS VFS");
+
+    assert_eq!(vfs.backend_name(), "daemon-sifs");
+    assert!(
+        !root.join("dfs").exists(),
+        "constructing the list/show/inspect read transport must not open local DFS or content state"
+    );
+}
+
+#[test]
+fn tui_agent_catalog_uses_a_supplied_transport_without_opening_local_dfs() {
+    let root = sinomo_testdir::TestDir::new("tui-agent-catalog-vfs");
+    let status = DaemonStatus {
+        pid: 4242,
+        host: "127.0.0.1".to_string(),
+        port: 9,
+        address: "127.0.0.1:9".to_string(),
+        version: daemon_package_version(),
+        commit: None,
+        target_os: Some(std::env::consts::OS.to_string()),
+        target_arch: Some(std::env::consts::ARCH.to_string()),
+        hostname: None,
+        executable: None,
+        rollout: None,
+        started_at: "2026-08-09T00:00:00Z".to_string(),
+        data_dir: root.path().to_path_buf(),
+        lock_file: root.join("daemon/daemon.lock"),
+        cluster: None,
+        idle_stats: None,
+    };
+    let dfs_root = root.join("dfs");
+    assert!(!dfs_root.exists());
+
+    let daemon_vfs =
+        super::tui::tui_agent_catalog_vfs(Some(&status)).expect("TUI resident daemon catalog VFS");
+    assert_eq!(daemon_vfs.backend_name(), "daemon-sifs");
+    let catalog =
+        super::tui::load_tui_agent_catalog_from_vfs(sinomo_runtime::vfs::VfsHandle::memory())
+            .expect("catalog through injected transport");
+    assert!(catalog.get("main-agent").is_some());
+    assert!(
+        !dfs_root.exists(),
+        "TUI list/use/restore catalog setup must not construct mounted DFS state"
+    );
+
+    let error = super::tui::tui_agent_catalog_vfs(None)
+        .expect_err("custom TUI catalog reads fail closed without a daemon");
+    assert!(matches!(error, CliError::DaemonNotRunning { .. }));
+}
+
+#[test]
+fn runtime_skill_catalog_does_not_turn_catalog_failure_into_zero_skills() {
+    let vfs = sinomo_runtime::vfs::VfsHandle::memory();
+    vfs.create_dir_all("/services/sinomo/skills")
+        .expect("skill catalog parent");
+    vfs.write(
+        "/services/sinomo/skills/catalog.sobj",
+        b"not-a-sinomo-object",
+    )
+    .expect("malformed catalog fixture");
+
+    let error = crate::load_runtime_skill_catalog_from_vfs(vfs)
+        .expect_err("malformed or unavailable content must fail closed");
+
+    assert!(
+        !error.to_string().is_empty(),
+        "catalog failure must remain distinguishable from a confirmed empty catalog"
+    );
+}
+
+#[test]
+fn runtime_skill_catalog_rejects_a_catalog_entry_with_missing_package_content() {
+    let vfs = sinomo_runtime::vfs::VfsHandle::memory();
+    let store = sinomo_agent::SkillCatalogSifsStore::from_vfs(vfs.clone());
+    let write = sinomo_agent::SkillCatalogWrite::from_markdown_skill(
+        None,
+        "1.0.0",
+        sinomo_agent::SkillCatalogSource::user("runtime-missing-package-test"),
+        "---\nname: missing-runtime-skill\ndescription: Must retain its package.\n---\n\n# Missing runtime skill\n",
+    )
+    .expect("skill write");
+    let skill_path = write.entry.sifs_path.clone();
+    sinomo_agent::SkillCatalogStore::write_skill_version(&store, write)
+        .expect("persist skill fixture");
+    vfs.remove(&skill_path)
+        .expect("remove referenced package text");
+
+    let error = crate::load_runtime_skill_catalog_from_vfs(vfs)
+        .expect_err("catalog references must fail closed when their package is absent");
+
+    assert!(
+        error
+            .to_string()
+            .contains("references missing package content"),
+        "unexpected missing-package error: {error}"
+    );
+}
+
+#[test]
+fn runtime_skill_catalog_rejects_a_malformed_referenced_package() {
+    let vfs = sinomo_runtime::vfs::VfsHandle::memory();
+    let store = sinomo_agent::SkillCatalogSifsStore::from_vfs(vfs.clone());
+    let write = sinomo_agent::SkillCatalogWrite::from_markdown_skill(
+        None,
+        "1.0.0",
+        sinomo_agent::SkillCatalogSource::user("runtime-malformed-package-test"),
+        "---\nname: malformed-runtime-skill\ndescription: Must retain a valid package.\n---\n\n# Malformed runtime skill\n",
+    )
+    .expect("skill write");
+    let skill_path = write.entry.sifs_path.clone();
+    sinomo_agent::SkillCatalogStore::write_skill_version(&store, write)
+        .expect("persist skill fixture");
+    vfs.write(&skill_path, b"not-a-sinomo-object")
+        .expect("corrupt referenced package");
+
+    let error = crate::load_runtime_skill_catalog_from_vfs(vfs)
+        .expect_err("catalog references must fail closed when their package is malformed");
+
+    assert!(
+        !error.to_string().is_empty(),
+        "malformed package errors must remain distinguishable from an empty catalog"
+    );
+}
+
+#[test]
+fn skill_show_rejects_a_catalog_entry_with_missing_text() {
+    let vfs = sinomo_runtime::vfs::VfsHandle::memory();
+    let store = sinomo_agent::SkillCatalogSifsStore::from_vfs(vfs.clone());
+    let write = sinomo_agent::SkillCatalogWrite::from_markdown_skill(
+        None,
+        "1.0.0",
+        sinomo_agent::SkillCatalogSource::user("show-missing-text-test"),
+        "---\nname: missing-show-skill\ndescription: Must not render as blank.\n---\n\n# Missing show skill\n",
+    )
+    .expect("skill write");
+    let entry = write.entry.clone();
+    sinomo_agent::SkillCatalogStore::write_skill_version(&store, write)
+        .expect("persist skill fixture");
+    vfs.remove(&entry.sifs_path)
+        .expect("remove referenced skill text");
+
+    let error = super::required_skill_text_for_cli(&store, &entry)
+        .expect_err("skill show must reject missing referenced text");
+
+    assert!(error.to_string().contains("references missing content"));
+}
+
+#[test]
+fn daemonless_builtin_agent_inspect_and_export_resolution_skips_catalog_io() {
+    let catalog_opened = std::cell::Cell::new(false);
+    let definition =
+        crate::app_api::resolve_agent_definition_with_catalog_vfs("main-agent", || {
+            catalog_opened.set(true);
+            Err(CliError::DaemonNotRunning {
+                detail: "resident daemon is intentionally absent".to_string(),
+            })
+        })
+        .expect("built-in definition")
+        .expect("main-agent built-in");
+
+    assert!(
+        !catalog_opened.get(),
+        "built-in resolution must not open SIFS"
+    );
+    assert_eq!(
+        super::agent_package_inspection_json(&definition)["id"],
+        "main-agent"
+    );
+    let exported = serde_json::to_vec_pretty(&definition).expect("export built-in package");
+    assert_eq!(
+        serde_json::from_slice::<sinomo_agent::AgentDefinition>(&exported)
+            .expect("decode exported package")
+            .key(),
+        "main-agent"
+    );
+
+    let error = crate::app_api::resolve_agent_definition_with_catalog_vfs("custom-agent", || {
+        Err(CliError::DaemonNotRunning {
+            detail: "resident daemon is intentionally absent".to_string(),
+        })
+    })
+    .expect_err("custom definitions require the resident catalog");
+    assert!(error.contains("resident daemon is intentionally absent"));
 }
 
 #[test]
@@ -7666,7 +7924,10 @@ fn cluster_runtime_quorum_admission_uses_read_only_daemon_identity() {
     assert!(!local_daemon_matches_cluster_state(&daemon, &state));
     let error = require_cluster_runtime_quorum_with_paths_and_daemon(&paths, Some(&daemon))
         .expect_err("mismatched daemon identity");
-    assert!(matches!(error, CliError::ClusterReadOnly { .. }));
+    assert!(
+        matches!(&error, CliError::ClusterReadOnly { .. }),
+        "expected cluster read-only leave failure, got {error:?}"
+    );
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7676,6 +7937,7 @@ struct RecordedCliStateAuthorityProbe {
     connect_timeout: Duration,
     overall_timeout: Option<Duration>,
     observe_connectivity: bool,
+    destination_process_affinity: sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity,
 }
 
 struct RecordingCliDaemonTargetRpc {
@@ -7685,13 +7947,14 @@ struct RecordingCliDaemonTargetRpc {
 }
 
 impl CliDaemonTargetRpc for RecordingCliDaemonTargetRpc {
-    fn object_rpc_to_target_with_deadline(
+    fn object_rpc_to_target_with_deadline_and_affinity(
         &self,
         target_node_id: &NodeId,
         request: &network::ObjectRpcRequest,
         connect_timeout: Duration,
         overall_timeout: Option<Duration>,
         observe_connectivity: bool,
+        destination_process_affinity: sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity,
     ) -> Result<network::ObjectRpcResponse, ()> {
         let attempt = {
             let mut probes = self
@@ -7704,6 +7967,7 @@ impl CliDaemonTargetRpc for RecordingCliDaemonTargetRpc {
                 connect_timeout,
                 overall_timeout,
                 observe_connectivity,
+                destination_process_affinity,
             });
             probes.len()
         };
@@ -7784,6 +8048,10 @@ fn replica_quorum_admission_retries_remote_voter_through_local_daemon_with_total
             assert_eq!(probe.overall_timeout, Some(probe.connect_timeout));
             assert!(probe.connect_timeout <= Duration::from_secs(1));
             assert!(!probe.observe_connectivity);
+            assert_eq!(
+                probe.destination_process_affinity,
+                sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon
+            );
         }
     }
 }
@@ -8598,6 +8866,15 @@ fn cluster_init_persists_local_cluster_state() {
         .expect("kv main");
     assert_eq!(kv_main.state, ClusterMemberState::Voter);
     assert_eq!(kv_main.node_public_key, main.node_public_key);
+    let repeated_bootstrap =
+        cluster::bootstrap_single_voter_cluster_state_to_local_kv(&paths, &state)
+            .expect_err("bootstrap seeding must reject an already initialized KV store");
+    assert!(
+        repeated_bootstrap
+            .to_string()
+            .contains("empty revision-zero store"),
+        "unexpected repeated bootstrap error: {repeated_bootstrap}"
+    );
     assert_eq!(
         cluster_kv_state_authority_id(&paths, &state).expect("known state authority"),
         Some(NodeId::from_legacy_named("node_local").expect("node"))
@@ -11793,6 +12070,7 @@ fn network_raft_handlers_reject_mismatched_authenticated_peer() {
     let forged_append = sinomo_runtime::kv::ClusterRaftAppendRequest {
         state: forged_state.clone(),
         snapshot: None,
+        read_index_probe: false,
         append: sinomo_runtime::kv::RaftAppendEntriesRequest {
             term: 1,
             leader_id: remote_node_id.clone(),
@@ -12817,12 +13095,834 @@ fn rollout_progress_waits_for_terminal_status_after_handoff_route_gap() {
             poll_interval: Duration::from_millis(5),
             terminal_status_grace: Duration::from_millis(15),
             active_status_error_grace: Duration::from_millis(250),
+            status_probe_error_grace: Duration::from_millis(250),
         },
     )
     .expect("terminal status should win over transient handoff route loss");
 
     assert_eq!(response.status, "accepted");
     assert_eq!(response.source_head.as_deref(), Some("head-new"));
+}
+
+#[test]
+fn rollout_progress_surfaces_first_status_probe_timeout_without_active_evidence() {
+    let target = RolloutTarget::address("replica.test:21353".to_string());
+    let started = std::time::Instant::now();
+    let error = send_rollout_request_with_progress_for_test(
+        &target,
+        "remote build",
+        RolloutProgressExpectation {
+            source: "repo-a".to_string(),
+            requested_at: "2026-08-04T00:00:01Z".to_string(),
+            source_head: Some("head-new".to_string()),
+        },
+        |_| {
+            Err(CliError::Network {
+                address: "replica.test:21353".to_string(),
+                detail: "activation request outcome is unknown".to_string(),
+            })
+        },
+        |_| {
+            Err(CliError::Network {
+                address: "replica.test:21353".to_string(),
+                detail: "status idle timeout after 1500ms".to_string(),
+            })
+        },
+        RolloutProgressTiming {
+            poll_interval: Duration::from_millis(1),
+            terminal_status_grace: Duration::from_secs(30),
+            active_status_error_grace: Duration::from_secs(30),
+            status_probe_error_grace: Duration::from_millis(10),
+        },
+    )
+    .expect_err("a status timeout without matching progress must fail immediately");
+
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let detail = error.to_string();
+    assert!(detail.contains("status idle timeout after 1500ms"));
+    assert!(detail.contains("no matching active rollout progress"));
+    assert!(detail.contains("rollout diagnostics"));
+}
+
+#[test]
+fn rollout_progress_bounds_and_reports_status_errors_after_active_evidence() {
+    let target = RolloutTarget::address("replica.test:21353".to_string());
+    let expectation = RolloutProgressExpectation {
+        source: "repo-a".to_string(),
+        requested_at: "2026-08-04T00:00:01Z".to_string(),
+        source_head: Some("head-new".to_string()),
+    };
+    let active = sinomo_runtime::core::ClusterNodeRolloutStatus {
+        status: "in-progress".to_string(),
+        mode: Some("cluster-remote-build".to_string()),
+        detail: Some("cargo build running".to_string()),
+        phase: Some("building".to_string()),
+        progress_current: Some(2),
+        progress_total: Some(5),
+        progress_message: Some("cargo build running".to_string()),
+        source: Some(expectation.source.clone()),
+        requested_at: Some(expectation.requested_at.clone()),
+        staged_at: None,
+        updated_at: None,
+        failed_at: None,
+        diagnostics: None,
+        stdout_log: None,
+        stderr_log: None,
+        stdout_tail: None,
+        stderr_tail: None,
+    };
+    let mut polls = 0usize;
+    let started = std::time::Instant::now();
+    let error = send_rollout_request_with_progress_for_test(
+        &target,
+        "remote build",
+        expectation,
+        |_| {
+            std::thread::sleep(Duration::from_millis(50));
+            Err(CliError::Network {
+                address: "replica.test:21353".to_string(),
+                detail: "activation route closed during handoff".to_string(),
+            })
+        },
+        move |_| {
+            polls += 1;
+            if polls == 1 {
+                Ok(Some(active.clone()))
+            } else {
+                Err(CliError::Network {
+                    address: "replica.test:21353".to_string(),
+                    detail: format!("status route unavailable on retry {polls}"),
+                })
+            }
+        },
+        RolloutProgressTiming {
+            poll_interval: Duration::from_millis(2),
+            terminal_status_grace: Duration::from_secs(30),
+            active_status_error_grace: Duration::from_millis(12),
+            status_probe_error_grace: Duration::from_millis(3),
+        },
+    )
+    .expect_err("an active status must grant only a bounded status-error allowance");
+
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let detail = error.to_string();
+    assert!(detail.contains("status route unavailable on retry"));
+    assert!(detail.contains("last matching progress was phase \"building\" at 2/5"));
+    assert!(detail.contains("refusing to hide the probe failure"));
+}
+
+fn rollout_tracker_status(
+    status: &str,
+    phase: &str,
+    progress_current: u32,
+    detail: &str,
+) -> sinomo_runtime::core::ClusterNodeRolloutStatus {
+    sinomo_runtime::core::ClusterNodeRolloutStatus {
+        status: status.to_string(),
+        mode: Some("cluster-remote-build".to_string()),
+        detail: Some(detail.to_string()),
+        phase: Some(phase.to_string()),
+        progress_current: Some(progress_current),
+        progress_total: Some(5),
+        progress_message: Some(detail.to_string()),
+        source: Some("repo-a".to_string()),
+        requested_at: Some("2026-08-04T00:00:01Z".to_string()),
+        staged_at: None,
+        updated_at: None,
+        failed_at: None,
+        diagnostics: None,
+        stdout_log: None,
+        stderr_log: None,
+        stdout_tail: None,
+        stderr_tail: None,
+    }
+}
+
+#[test]
+fn rollout_progress_follows_shadow_evidence_beyond_main_probe_error_grace() {
+    let expectation = RolloutProgressExpectation {
+        source: "repo-a".to_string(),
+        requested_at: "2026-08-04T00:00:01Z".to_string(),
+        source_head: Some("head-new".to_string()),
+    };
+    let main_staged = rollout_tracker_status(
+        "main-staged",
+        "main-staged",
+        5,
+        "replacement main is restarting under shadow supervision",
+    );
+    let shadow_finalized = rollout_tracker_status(
+        "accepted",
+        "shadow-finalized",
+        5,
+        "shadow rollout finalized",
+    );
+    let target = RolloutTarget::address("replica.test:21353".to_string());
+    let mut main_polls = 0usize;
+    let main_staged_for_primary = main_staged.clone();
+    let main_staged_for_restart = main_staged;
+    let restart_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let restart_polls_for_probe = Arc::clone(&restart_polls);
+
+    let response = send_rollout_request_with_restart_progress_for_test(
+        &target,
+        "remote build",
+        expectation,
+        |_| {
+            Err(CliError::Network {
+                address: "replica.test:21353".to_string(),
+                detail: "activation request connection closed for restart".to_string(),
+            })
+        },
+        move |_| {
+            main_polls += 1;
+            if main_polls == 1 {
+                Ok(Some(main_staged_for_primary.clone()))
+            } else {
+                Err(CliError::Network {
+                    address: "replica.test:21353".to_string(),
+                    detail: "main endpoint absent during supervised restart".to_string(),
+                })
+            }
+        },
+        move |_, budget| {
+            assert!(budget <= Duration::from_millis(2));
+            let poll = restart_polls_for_probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if poll < 12 {
+                Ok(Some(main_staged_for_restart.clone()))
+            } else {
+                Ok(Some(shadow_finalized.clone()))
+            }
+        },
+        RolloutProgressTiming {
+            poll_interval: Duration::from_millis(1),
+            terminal_status_grace: Duration::from_millis(5),
+            active_status_error_grace: Duration::from_millis(100),
+            status_probe_error_grace: Duration::from_millis(2),
+        },
+    )
+    .expect("authoritative shadow evidence must bridge the expected main restart");
+
+    assert_eq!(response.status, "accepted");
+    assert_eq!(response.detail, "shadow rollout finalized");
+    assert_eq!(
+        restart_polls.load(std::sync::atomic::Ordering::SeqCst),
+        13,
+        "tracking must survive many primary errors beyond the unchanged generic grace"
+    );
+}
+
+#[test]
+fn rollout_progress_fails_when_main_and_restart_evidence_are_both_lost() {
+    let expectation = RolloutProgressExpectation {
+        source: "repo-a".to_string(),
+        requested_at: "2026-08-04T00:00:01Z".to_string(),
+        source_head: Some("head-new".to_string()),
+    };
+    let main_staged = rollout_tracker_status(
+        "main-staged",
+        "main-staged",
+        5,
+        "replacement main is restarting under shadow supervision",
+    );
+    let target = RolloutTarget::address("replica.test:21353".to_string());
+    let mut main_polls = 0usize;
+    let restart_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let restart_polls_for_probe = Arc::clone(&restart_polls);
+    let started = std::time::Instant::now();
+
+    let error = send_rollout_request_with_restart_progress_for_test(
+        &target,
+        "remote build",
+        expectation,
+        |_| {
+            std::thread::sleep(Duration::from_millis(50));
+            Err(CliError::Network {
+                address: "replica.test:21353".to_string(),
+                detail: "activation request connection closed for restart".to_string(),
+            })
+        },
+        move |_| {
+            main_polls += 1;
+            if main_polls == 1 {
+                Ok(Some(main_staged.clone()))
+            } else {
+                Err(CliError::Network {
+                    address: "replica.test:21353".to_string(),
+                    detail: "replacement main is unreachable".to_string(),
+                })
+            }
+        },
+        move |_, budget| {
+            assert!(budget <= Duration::from_millis(4));
+            restart_polls_for_probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(CliError::Network {
+                address: "replica.test:21354".to_string(),
+                detail: "shadow supervisor is unreachable".to_string(),
+            })
+        },
+        RolloutProgressTiming {
+            poll_interval: Duration::from_millis(1),
+            terminal_status_grace: Duration::from_secs(30),
+            active_status_error_grace: Duration::from_millis(12),
+            status_probe_error_grace: Duration::from_millis(4),
+        },
+    )
+    .expect_err("loss of both main and authoritative restart evidence must fail closed");
+
+    assert!(started.elapsed() >= Duration::from_millis(12));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(restart_polls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    let detail = error.to_string();
+    assert!(detail.contains("replacement main is unreachable"));
+    assert!(detail.contains("shadow supervisor is unreachable"));
+    assert!(detail.contains("last matching progress was phase \"main-staged\" at 5/5"));
+}
+
+#[test]
+fn rollout_progress_surfaces_terminal_failure_reported_by_shadow() {
+    let expectation = RolloutProgressExpectation {
+        source: "repo-a".to_string(),
+        requested_at: "2026-08-04T00:00:01Z".to_string(),
+        source_head: Some("head-new".to_string()),
+    };
+    let main_staged = rollout_tracker_status(
+        "main-staged",
+        "main-staged",
+        5,
+        "replacement main is restarting under shadow supervision",
+    );
+    let activation_failed = rollout_tracker_status(
+        "failed",
+        "activation-failed",
+        5,
+        "candidate main exited before health acceptance",
+    );
+    let target = RolloutTarget::address("replica.test:21353".to_string());
+    let mut main_polls = 0usize;
+
+    let response = send_rollout_request_with_restart_progress_for_test(
+        &target,
+        "remote build",
+        expectation,
+        |_| {
+            Err(CliError::Network {
+                address: "replica.test:21353".to_string(),
+                detail: "activation request connection closed for restart".to_string(),
+            })
+        },
+        move |_| {
+            main_polls += 1;
+            if main_polls == 1 {
+                Ok(Some(main_staged.clone()))
+            } else {
+                Err(CliError::Network {
+                    address: "replica.test:21353".to_string(),
+                    detail: "replacement main is unreachable".to_string(),
+                })
+            }
+        },
+        move |_, budget| {
+            assert!(budget <= Duration::from_millis(2));
+            Ok(Some(activation_failed.clone()))
+        },
+        RolloutProgressTiming {
+            poll_interval: Duration::from_millis(1),
+            terminal_status_grace: Duration::from_secs(30),
+            active_status_error_grace: Duration::from_secs(30),
+            status_probe_error_grace: Duration::from_millis(2),
+        },
+    )
+    .expect("authoritative shadow failure is a terminal rollout response");
+
+    assert_eq!(response.status, "failed");
+    assert_eq!(
+        response.detail,
+        "candidate main exited before health acceptance"
+    );
+}
+
+#[test]
+fn rollout_progress_recovers_when_main_restarts_before_the_first_status_read() {
+    let expectation = RolloutProgressExpectation {
+        source: "repo-a".to_string(),
+        requested_at: "2026-08-04T00:00:01Z".to_string(),
+        source_head: Some("head-new".to_string()),
+    };
+    let main_staged = rollout_tracker_status(
+        "main-staged",
+        "main-staged",
+        5,
+        "replacement main is restarting under shadow supervision",
+    );
+    let shadow_finalized = rollout_tracker_status(
+        "accepted",
+        "shadow-finalized",
+        5,
+        "shadow rollout finalized",
+    );
+    let target = RolloutTarget::address("replica.test:21353".to_string());
+    let main_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let main_polls_for_probe = Arc::clone(&main_polls);
+    let restart_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let restart_polls_for_probe = Arc::clone(&restart_polls);
+
+    let response = send_rollout_request_with_restart_progress_for_test(
+        &target,
+        "remote build",
+        expectation,
+        |_| {
+            Err(CliError::Network {
+                address: "replica.test:21353".to_string(),
+                detail: "activation outcome unknown after main restart".to_string(),
+            })
+        },
+        move |_| {
+            main_polls_for_probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(CliError::Network {
+                address: "replica.test:21353".to_string(),
+                detail: "main endpoint already absent".to_string(),
+            })
+        },
+        move |_, budget| {
+            assert!(budget <= Duration::from_millis(2));
+            let poll = restart_polls_for_probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if poll < 3 {
+                Ok(Some(main_staged.clone()))
+            } else {
+                Ok(Some(shadow_finalized.clone()))
+            }
+        },
+        RolloutProgressTiming {
+            poll_interval: Duration::from_millis(1),
+            terminal_status_grace: Duration::from_millis(5),
+            active_status_error_grace: Duration::from_millis(100),
+            status_probe_error_grace: Duration::from_millis(2),
+        },
+    )
+    .expect("exact shadow evidence must recover the first-main-probe restart race");
+
+    assert_eq!(response.status, "accepted");
+    assert_eq!(response.detail, "shadow rollout finalized");
+    assert_eq!(main_polls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    assert_eq!(restart_polls.load(std::sync::atomic::Ordering::SeqCst), 4);
+}
+
+#[test]
+fn rollout_progress_recovers_when_main_restarts_after_pre_restart_progress() {
+    let expectation = RolloutProgressExpectation {
+        source: "repo-a".to_string(),
+        requested_at: "2026-08-04T00:00:01Z".to_string(),
+        source_head: Some("head-new".to_string()),
+    };
+    let staging_modules = rollout_tracker_status(
+        "in-progress",
+        "staging-modules",
+        3,
+        "staging native modules",
+    );
+    let main_staged = rollout_tracker_status(
+        "main-staged",
+        "main-staged",
+        5,
+        "replacement main is restarting under shadow supervision",
+    );
+    let shadow_finalized = rollout_tracker_status(
+        "accepted",
+        "shadow-finalized",
+        5,
+        "shadow rollout finalized",
+    );
+    let target = RolloutTarget::address("replica.test:21353".to_string());
+    let mut main_polls = 0usize;
+    let restart_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let restart_polls_for_probe = Arc::clone(&restart_polls);
+
+    let response = send_rollout_request_with_restart_progress_for_test(
+        &target,
+        "remote build",
+        expectation,
+        |_| {
+            Err(CliError::Network {
+                address: "replica.test:21353".to_string(),
+                detail: "activation outcome unknown after main restart".to_string(),
+            })
+        },
+        move |_| {
+            main_polls += 1;
+            if main_polls == 1 {
+                Ok(Some(staging_modules.clone()))
+            } else {
+                Err(CliError::Network {
+                    address: "replica.test:21353".to_string(),
+                    detail: "main endpoint absent before main-staged was observed".to_string(),
+                })
+            }
+        },
+        move |_, budget| {
+            assert!(budget <= Duration::from_millis(4));
+            let poll = restart_polls_for_probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if poll == 0 {
+                Ok(Some(main_staged.clone()))
+            } else {
+                Ok(Some(shadow_finalized.clone()))
+            }
+        },
+        RolloutProgressTiming {
+            poll_interval: Duration::from_millis(1),
+            terminal_status_grace: Duration::from_millis(5),
+            active_status_error_grace: Duration::from_millis(100),
+            status_probe_error_grace: Duration::from_millis(4),
+        },
+    )
+    .expect("exact restart evidence must bridge teardown after pre-restart progress");
+
+    assert_eq!(response.status, "accepted");
+    assert_eq!(response.detail, "shadow rollout finalized");
+    assert_eq!(restart_polls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[test]
+fn rollout_progress_retries_fresh_restart_probe_budgets_until_replacement_is_authoritative() {
+    let expectation = RolloutProgressExpectation {
+        source: "repo-a".to_string(),
+        requested_at: "2026-08-04T00:00:01Z".to_string(),
+        source_head: Some("head-new".to_string()),
+    };
+    let staging_modules = rollout_tracker_status(
+        "in-progress",
+        "staging-modules",
+        3,
+        "staging native modules",
+    );
+    let main_staged = rollout_tracker_status(
+        "main-staged",
+        "main-staged",
+        5,
+        "replacement main is restarting under shadow supervision",
+    );
+    let shadow_finalized = rollout_tracker_status(
+        "accepted",
+        "shadow-finalized",
+        5,
+        "replacement main finalized the shadow rollout",
+    );
+    let target = RolloutTarget::address("replica.test:21353".to_string());
+    let mut main_polls = 0usize;
+    let restart_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let restart_polls_for_probe = Arc::clone(&restart_polls);
+
+    let response = send_rollout_request_with_restart_progress_for_test(
+        &target,
+        "remote build",
+        expectation,
+        |_| {
+            std::thread::sleep(Duration::from_millis(100));
+            Err(CliError::Network {
+                address: "replica.test:21353".to_string(),
+                detail: "activation request connection closed for restart".to_string(),
+            })
+        },
+        move |_| {
+            main_polls += 1;
+            if main_polls == 1 {
+                Ok(Some(staging_modules.clone()))
+            } else {
+                Err(CliError::Network {
+                    address: "replica.test:21353".to_string(),
+                    detail: "replacement main has not bound its listener yet".to_string(),
+                })
+            }
+        },
+        move |_, budget| {
+            assert_eq!(budget, Duration::from_millis(2));
+            let poll = restart_polls_for_probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match poll {
+                0..=2 => {
+                    // Exhaust this individual network attempt. The controller
+                    // must start a fresh bounded attempt while the total active
+                    // handoff grace remains, rather than treating this one
+                    // attempt as the complete replacement-startup deadline.
+                    std::thread::sleep(Duration::from_millis(3));
+                    Err(CliError::Network {
+                        address: "replica.test:21354".to_string(),
+                        detail: "bootstrap shadow is not externally reachable".to_string(),
+                    })
+                }
+                3 => Ok(Some(main_staged.clone())),
+                _ => Ok(Some(shadow_finalized.clone())),
+            }
+        },
+        RolloutProgressTiming {
+            poll_interval: Duration::from_millis(1),
+            terminal_status_grace: Duration::from_millis(5),
+            active_status_error_grace: Duration::from_millis(100),
+            status_probe_error_grace: Duration::from_millis(2),
+        },
+    )
+    .expect("a delayed replacement main must get fresh per-attempt restart probe budgets");
+
+    assert_eq!(response.status, "accepted");
+    assert_eq!(
+        response.detail,
+        "replacement main finalized the shadow rollout"
+    );
+    assert_eq!(restart_polls.load(std::sync::atomic::Ordering::SeqCst), 5);
+}
+
+#[test]
+fn rollout_progress_rejects_stale_restart_evidence_after_pre_restart_progress() {
+    let expectation = RolloutProgressExpectation {
+        source: "repo-a".to_string(),
+        requested_at: "2026-08-04T00:00:01Z".to_string(),
+        source_head: Some("head-new".to_string()),
+    };
+    let staging_modules = rollout_tracker_status(
+        "in-progress",
+        "staging-modules",
+        3,
+        "staging native modules",
+    );
+    let mut stale_main_staged = rollout_tracker_status(
+        "main-staged",
+        "main-staged",
+        5,
+        "an older replacement is restarting",
+    );
+    stale_main_staged.requested_at = Some("2026-08-03T23:59:59Z".to_string());
+    let target = RolloutTarget::address("replica.test:21353".to_string());
+    let mut main_polls = 0usize;
+    let restart_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let restart_polls_for_probe = Arc::clone(&restart_polls);
+
+    let error = send_rollout_request_with_restart_progress_for_test(
+        &target,
+        "remote build",
+        expectation,
+        |_| {
+            std::thread::sleep(Duration::from_millis(50));
+            Err(CliError::Network {
+                address: "replica.test:21353".to_string(),
+                detail: "activation outcome unknown after main restart".to_string(),
+            })
+        },
+        move |_| {
+            main_polls += 1;
+            if main_polls == 1 {
+                Ok(Some(staging_modules.clone()))
+            } else {
+                Err(CliError::Network {
+                    address: "replica.test:21353".to_string(),
+                    detail: "main endpoint absent before main-staged was observed".to_string(),
+                })
+            }
+        },
+        move |_, _| {
+            restart_polls_for_probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(stale_main_staged.clone()))
+        },
+        RolloutProgressTiming {
+            poll_interval: Duration::from_millis(1),
+            terminal_status_grace: Duration::from_secs(30),
+            active_status_error_grace: Duration::from_millis(12),
+            status_probe_error_grace: Duration::from_millis(4),
+        },
+    )
+    .expect_err("stale restart evidence must not advance a pre-restart handoff");
+
+    assert!(restart_polls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    let detail = error.to_string();
+    assert!(detail.contains("non-authoritative rollout main-staged/main-staged"));
+    assert!(detail.contains("last matching progress was phase \"staging-modules\" at 3/5"));
+}
+
+#[test]
+fn rollout_progress_rejects_stale_shadow_evidence_on_the_first_main_probe_error() {
+    let expectation = RolloutProgressExpectation {
+        source: "repo-a".to_string(),
+        requested_at: "2026-08-04T00:00:01Z".to_string(),
+        source_head: Some("head-new".to_string()),
+    };
+    let mut stale = rollout_tracker_status(
+        "main-staged",
+        "main-staged",
+        5,
+        "an older replacement is restarting",
+    );
+    stale.requested_at = Some("2026-08-03T23:59:59Z".to_string());
+    let target = RolloutTarget::address("replica.test:21353".to_string());
+    let restart_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let restart_polls_for_probe = Arc::clone(&restart_polls);
+
+    let error = send_rollout_request_with_restart_progress_for_test(
+        &target,
+        "remote build",
+        expectation,
+        |_| {
+            Err(CliError::Network {
+                address: "replica.test:21353".to_string(),
+                detail: "activation outcome unknown after main restart".to_string(),
+            })
+        },
+        |_| {
+            Err(CliError::Network {
+                address: "replica.test:21353".to_string(),
+                detail: "main endpoint already absent".to_string(),
+            })
+        },
+        move |_, _| {
+            restart_polls_for_probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(stale.clone()))
+        },
+        RolloutProgressTiming {
+            poll_interval: Duration::from_millis(1),
+            terminal_status_grace: Duration::from_secs(30),
+            active_status_error_grace: Duration::from_secs(30),
+            status_probe_error_grace: Duration::from_millis(2),
+        },
+    )
+    .expect_err("stale shadow progress cannot establish the current activation outcome");
+
+    assert_eq!(restart_polls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let detail = error.to_string();
+    assert!(detail.contains("non-authoritative rollout main-staged/main-staged"));
+    assert!(detail.contains("no matching active rollout progress was observed"));
+}
+
+#[test]
+fn rollout_progress_waits_for_shadow_finalization_after_early_acceptance() {
+    let expectation = RolloutProgressExpectation {
+        source: "repo-a".to_string(),
+        requested_at: "2026-08-04T00:00:01Z".to_string(),
+        source_head: Some("head-new".to_string()),
+    };
+    let main_staged = sinomo_runtime::core::ClusterNodeRolloutStatus {
+        status: "main-staged".to_string(),
+        mode: Some("cluster-remote-build".to_string()),
+        detail: Some("main daemon accepted replacement".to_string()),
+        phase: Some("main-staged".to_string()),
+        progress_current: Some(4),
+        progress_total: Some(5),
+        progress_message: Some("restarting shadow daemon".to_string()),
+        source: Some("repo-a".to_string()),
+        requested_at: Some("2026-08-04T00:00:01Z".to_string()),
+        staged_at: None,
+        updated_at: None,
+        failed_at: None,
+        diagnostics: None,
+        stdout_log: None,
+        stderr_log: None,
+        stdout_tail: None,
+        stderr_tail: None,
+    };
+    let shadow_finalized = sinomo_runtime::core::ClusterNodeRolloutStatus {
+        status: "accepted".to_string(),
+        mode: Some("cluster-remote-build".to_string()),
+        detail: Some("shadow rollout finalized".to_string()),
+        phase: Some("shadow-finalized".to_string()),
+        progress_current: Some(5),
+        progress_total: Some(5),
+        progress_message: Some("shadow rollout finalized".to_string()),
+        source: Some("repo-a".to_string()),
+        requested_at: Some("2026-08-04T00:00:01Z".to_string()),
+        staged_at: None,
+        updated_at: None,
+        failed_at: None,
+        diagnostics: None,
+        stdout_log: None,
+        stderr_log: None,
+        stdout_tail: None,
+        stderr_tail: None,
+    };
+    let target = RolloutTarget::address("replica.test:21353".to_string());
+    let send_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let send_calls_for_worker = Arc::clone(&send_calls);
+    let status_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let status_polls_for_probe = Arc::clone(&status_polls);
+
+    let response = send_rollout_request_with_progress_for_test(
+        &target,
+        "remote build",
+        expectation,
+        move |_| {
+            send_calls_for_worker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(sinomo_runtime::rollout::ClusterRolloutBinaryResponse {
+                status: "accepted".to_string(),
+                detail: "main daemon staged".to_string(),
+                main_binary: PathBuf::from("/rollout/main"),
+                shadow_binary: PathBuf::from("/rollout/shadow"),
+                source_head: Some("head-new".to_string()),
+            })
+        },
+        move |_| {
+            let poll = status_polls_for_probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if poll < 2 {
+                Ok(Some(main_staged.clone()))
+            } else {
+                Ok(Some(shadow_finalized.clone()))
+            }
+        },
+        RolloutProgressTiming {
+            poll_interval: Duration::from_millis(1),
+            terminal_status_grace: Duration::from_millis(20),
+            active_status_error_grace: Duration::from_millis(100),
+            status_probe_error_grace: Duration::from_millis(20),
+        },
+    )
+    .expect("early acceptance must wait for durable shadow finalization");
+
+    assert_eq!(send_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(status_polls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(response.status, "accepted");
+    assert_eq!(response.detail, "shadow rollout finalized");
+    assert_eq!(response.main_binary, PathBuf::from("/rollout/main"));
+    assert_eq!(response.shadow_binary, PathBuf::from("/rollout/shadow"));
+    assert_eq!(response.source_head.as_deref(), Some("head-new"));
+}
+
+#[test]
+fn rollout_progress_returns_non_accepted_worker_outcomes_without_polling() {
+    let target = RolloutTarget::address("replica.test:21353".to_string());
+    for terminal_status in ["rejected", "failed", "rolled-back"] {
+        let status_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let status_polls_for_probe = Arc::clone(&status_polls);
+        let response = send_rollout_request_with_progress_for_test(
+            &target,
+            "remote build",
+            RolloutProgressExpectation {
+                source: "repo-a".to_string(),
+                requested_at: "2026-08-04T00:00:01Z".to_string(),
+                source_head: Some("head-new".to_string()),
+            },
+            move |_| {
+                Ok(sinomo_runtime::rollout::ClusterRolloutBinaryResponse {
+                    status: terminal_status.to_string(),
+                    detail: "terminal worker response".to_string(),
+                    main_binary: PathBuf::new(),
+                    shadow_binary: PathBuf::new(),
+                    source_head: None,
+                })
+            },
+            move |_| {
+                status_polls_for_probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(None)
+            },
+            RolloutProgressTiming {
+                poll_interval: Duration::from_secs(1),
+                terminal_status_grace: Duration::from_millis(20),
+                active_status_error_grace: Duration::from_millis(100),
+                status_probe_error_grace: Duration::from_millis(20),
+            },
+        )
+        .expect("a non-accepted worker outcome is already terminal");
+
+        assert_eq!(response.status, terminal_status);
+        assert_eq!(
+            status_polls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{terminal_status} must not wait for rollout status"
+        );
+    }
 }
 
 #[test]
@@ -12919,6 +14019,7 @@ fn rollout_explicit_node_id_routes_without_changing_direct_recovery_targets() {
             non_main_node_id.to_string(),
         ],
         &state,
+        None,
     );
 
     assert_eq!(targets.len(), 7);
@@ -13178,6 +14279,73 @@ fn rollout_endpoint_candidates_include_remote_shadow_members() {
 
     assert!(endpoints.iter().any(|endpoint| {
         endpoint.node_id == remote_shadow_id && endpoint.address == "10.0.0.42:21354"
+    }));
+}
+
+#[test]
+fn rollout_cluster_target_preserves_an_advertised_iroh_shadow_sibling() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-iroh-shadow-sibling");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_rollout_iroh_shadow_sibling").expect("cluster");
+    let local_node_id =
+        NodeId::from_legacy_named("node_rollout_iroh_shadow_local").expect("local node");
+    let remote_main_id =
+        NodeId::from_legacy_named("node_rollout_iroh_shadow_main").expect("main node");
+    let remote_shadow_id = shadow_daemon_node_id(&remote_main_id);
+    let now = OffsetDateTime::now_utc();
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "rollout Iroh shadow sibling",
+        local_node_id,
+        "local",
+        "local-key",
+        now,
+    );
+    let mut remote_main = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        remote_main_id.clone(),
+        "remote main",
+        "remote-main-key",
+        now,
+    );
+    remote_main.capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
+    remote_main.allowed_capabilities = remote_main.capabilities.clone();
+    remote_main.endpoints.push(iroh_invite_introducer_endpoint(
+        &remote_main_id,
+        "iroh://main-rollout-route?relay=https://main-relay.example/".to_string(),
+    ));
+    let mut remote_shadow = ClusterMemberRecord::local_non_voting(
+        cluster_id,
+        remote_shadow_id.clone(),
+        "remote shadow",
+        "remote-shadow-key",
+        now,
+    );
+    remote_shadow
+        .endpoints
+        .push(iroh_invite_introducer_endpoint(
+            &remote_shadow_id,
+            "iroh://shadow-rollout-route?relay=https://shadow-relay.example/".to_string(),
+        ));
+    state.members.push(remote_main);
+    state.members.push(remote_shadow);
+
+    let targets = rollout_cluster_targets_from_state(&paths, &state, None);
+
+    assert_eq!(targets.len(), 1);
+    assert_eq!(
+        targets[0]
+            .endpoint
+            .as_ref()
+            .map(|endpoint| endpoint.node_id.clone()),
+        Some(remote_main_id)
+    );
+    assert!(targets[0].restart_endpoints().iter().any(|endpoint| {
+        endpoint.node_id == remote_shadow_id
+            && endpoint.address == "iroh://shadow-rollout-route?relay=https://shadow-relay.example/"
     }));
 }
 
@@ -13856,9 +15024,25 @@ fn rollout_cluster_target_ignores_local_only_shadow_endpoint() {
     assert!(rollout_target_endpoint_for_main(&main_node_id, &[shadow_endpoint]).is_none());
 }
 
+fn daemon_rollout_build_test_paths(data_dir: &std::path::Path) -> DaemonPaths {
+    let daemon_paths = DaemonPaths::with_root(data_dir.join("daemon"));
+    daemon_paths.ensure().expect("daemon paths");
+    let status = DaemonStatus::new(
+        &DaemonRunOptions {
+            host: "127.0.0.1".to_string(),
+            port: 21_353,
+        },
+        &daemon_paths,
+        None,
+    );
+    write_daemon_status(&daemon_paths, &status).expect("daemon status");
+    daemon_paths
+}
+
 #[test]
 fn daemon_rollout_build_rejects_missing_remote_repo() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-build-missing");
+    let daemon_paths = daemon_rollout_build_test_paths(&root);
     let request = ClusterRolloutBuildRequest {
         source: "test".to_string(),
         remote_repo: None,
@@ -13866,13 +15050,13 @@ fn daemon_rollout_build_rejects_missing_remote_repo() {
         source_head: None,
         force_source_overwrite: false,
         host: "127.0.0.1".to_string(),
+        host_override: None,
         port: 21_353,
         shadow_port: 21_354,
         requested_at: "now".to_string(),
     };
     let response =
-        handle_daemon_rollout_build_request(&DaemonPaths::with_root(root.join("daemon")), request)
-            .expect("build response");
+        handle_daemon_rollout_build_request(&daemon_paths, request).expect("build response");
 
     assert_eq!(response.status, "rejected");
     assert!(
@@ -13885,6 +15069,7 @@ fn daemon_rollout_build_rejects_missing_remote_repo() {
 #[test]
 fn daemon_rollout_build_imports_source_bundle_before_building() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-build-bundle");
+    let daemon_paths = daemon_rollout_build_test_paths(&root);
     let source_repo = root.join("source");
     let bundle = root.join("source.bundle");
     std::fs::create_dir_all(&source_repo).expect("source repo dir");
@@ -13947,13 +15132,13 @@ fn daemon_rollout_build_imports_source_bundle_before_building() {
         source_head: Some(expected_head.clone()),
         force_source_overwrite: false,
         host: "127.0.0.1".to_string(),
+        host_override: None,
         port: 21_353,
         shadow_port: 21_354,
         requested_at: "now".to_string(),
     };
     let response =
-        handle_daemon_rollout_build_request(&DaemonPaths::with_root(root.join("daemon")), request)
-            .expect("build response");
+        handle_daemon_rollout_build_request(&daemon_paths, request).expect("build response");
     let rollout_paths = SelfRolloutPaths::new(&root);
     let source_status = managed_source_status(&rollout_paths).expect("managed source status");
 
@@ -13970,6 +15155,7 @@ fn daemon_rollout_build_imports_source_bundle_before_building() {
 #[test]
 fn daemon_rollout_build_skips_bundle_import_when_source_head_matches() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-build-bundle-skip");
+    let daemon_paths = daemon_rollout_build_test_paths(&root);
     let rollout_paths = SelfRolloutPaths::new(&root);
     let source_repo = rollout_paths.source_repo.clone();
     std::fs::create_dir_all(&source_repo).expect("source repo dir");
@@ -14031,13 +15217,13 @@ fn daemon_rollout_build_skips_bundle_import_when_source_head_matches() {
         source_head: Some(expected_head),
         force_source_overwrite: false,
         host: "127.0.0.1".to_string(),
+        host_override: None,
         port: 21_353,
         shadow_port: 21_354,
         requested_at: "now".to_string(),
     };
     let response =
-        handle_daemon_rollout_build_request(&DaemonPaths::with_root(root.join("daemon")), request)
-            .expect("build response");
+        handle_daemon_rollout_build_request(&daemon_paths, request).expect("build response");
 
     assert_eq!(response.status, "rejected");
     assert!(
@@ -14066,6 +15252,7 @@ fn rollout_main_activation_without_shadow_requires_staged_binary() {
             native_dylib_loader_rollback_generation: None,
             main_host: "0.0.0.0".to_string(),
             main_port: 21_353,
+            shadow_host: None,
             shadow_port: 21_354,
             requested_at: "now".to_string(),
             mode: "test".to_string(),
@@ -14378,6 +15565,7 @@ fn rollout_parser_reuses_daemon_endpoint_defaults() {
         RolloutCliCommand::Apply(RolloutOptions {
             repo: None,
             host: "0.0.0.0".to_string(),
+            host_explicit: true,
             port: 21_400,
             ..RolloutOptions::default()
         })
@@ -14402,6 +15590,35 @@ fn daemon_parser_supports_shadow_daemon_on_separate_default_port() {
                 port: 21_354,
             },
             explicit_address: false,
+        })
+    );
+    assert_eq!(
+        parse_daemon_schema_for_test(&["shadow".to_string(), "stop".to_string()])
+            .expect("local shadow stop"),
+        DaemonCliCommand::ShadowStop(DaemonStatusOptions {
+            endpoint: DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port: 21_354,
+            },
+            explicit_address: false,
+        })
+    );
+    assert_eq!(
+        parse_daemon_schema_for_test(&[
+            "shadow".to_string(),
+            "stop".to_string(),
+            "--host".to_string(),
+            "10.14.5.15".to_string(),
+            "--port".to_string(),
+            "21354".to_string(),
+        ])
+        .expect("explicit shadow stop"),
+        DaemonCliCommand::ShadowStop(DaemonStatusOptions {
+            endpoint: DaemonRunOptions {
+                host: "10.14.5.15".to_string(),
+                port: 21_354,
+            },
+            explicit_address: true,
         })
     );
     assert_eq!(

@@ -50,6 +50,7 @@ tracing.workspace = true
 sysinfo.workspace = true
 
 [dev-dependencies]
-sinomo-core = { path = "../sinomo-core", features = ["cluster-test-support"] }
+sinomo-core = { path = "../sinomo-core", features = ["cluster-test-support", "network-test-support"] }
 sinomo-dfs = { path = "../sinomo-dfs", features = ["test-support"] }
 sinomo-testdir = { path = "../sinomo-testdir" }
+tokio = { workspace = true, features = ["test-util"] }

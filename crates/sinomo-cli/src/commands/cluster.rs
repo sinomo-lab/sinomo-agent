@@ -984,7 +984,7 @@ pub(crate) fn initialize_single_node_cluster_with_paths(
     cluster::assign_local_daemon_member_public_keys(&mut state, main_public_key, shadow_public_key);
     cluster::write_cluster_state(paths, &state)?;
     locked_set_cluster_raft_leader(paths, &state.local_node_id, 1)?;
-    sync_cluster_state_to_kv(paths, &state)?;
+    cluster::bootstrap_single_voter_cluster_state_to_local_kv(paths, &state)?;
 
     Ok(state)
 }
@@ -2081,9 +2081,24 @@ pub(crate) fn format_rollout_status(status: &ClusterNodeRolloutStatus) -> String
 
 pub(crate) fn cluster_doctor() -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
-    refresh_cluster_kv_from_local_daemon(&paths)?;
-    let state = read_cluster_state(&paths)?;
+    // Doctor is an observational command. Live daemon health and direct DFS
+    // probes below provide its current evidence; forcing an authoritative KV
+    // snapshot here would turn diagnosis into a quorum barrier and can prevent
+    // doctor from reporting the very authority failure it is meant to expose.
+    let mut state = read_cluster_doctor_state(&paths)?;
     let rows = cluster_health_rows_for_cli(&paths, &state)?;
+    if !rows.is_empty() {
+        // The daemon health response is already a bounded, live member
+        // projection. Use it for role/quorum findings instead of opening the
+        // local KV store merely to refresh the bootstrap topology.
+        state.members = rows.iter().map(|row| row.member.clone()).collect();
+        state
+            .members
+            .sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        state
+            .members
+            .dedup_by(|left, right| left.node_id == right.node_id);
+    }
     let graph = network::read_cluster_connectivity_graph(&paths).unwrap_or_default();
     let mut findings = cluster_doctor_findings(&state, &graph, &rows);
     if let Some(data_dir) = paths.root.parent() {
@@ -2114,6 +2129,16 @@ pub(crate) fn cluster_doctor() -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+fn read_cluster_doctor_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState, CliError> {
+    // Do not call `read_cluster_state`: its KV overlay is appropriate for
+    // commands that need the latest materialized directory, but it may attempt
+    // a local Raft checkout. Doctor starts with the bounded bootstrap record;
+    // `cluster_health_rows_for_cli` supplies the live daemon projection.
+    let mut state = cluster::read_cluster_state_without_kv(paths)?;
+    prepare_local_cluster_state_for_cli(paths, &mut state)?;
+    Ok(state)
 }
 
 fn dfs_reachability_findings(
@@ -2221,13 +2246,48 @@ pub(crate) fn cluster_health_rows_for_data_dir(
     data_dir: &SinomoDataDir,
 ) -> Result<(ClusterBootstrapState, Vec<ClusterHealthRow>), CliError> {
     let paths = ClusterPaths::new(data_dir);
-    if !cli_force_local_mode()
-        && let Some(status) = main_daemon_status_for_data_dir(data_dir)?
-        && let Ok(rows) = DaemonApiClient::at_address(status.address)
-            .with_timeout(CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT)
-            .cluster_health_with_peer_views()
-    {
-        return Ok((read_cluster_state(&paths)?, rows));
+    match probe_daemon_status(&DaemonPaths::new(data_dir), DAEMON_PROBE_TIMEOUT) {
+        DaemonProbeStatus::Running(status) => {
+            let bootstrap_state = cluster::read_cluster_state_without_kv(&paths)?;
+            let Some(daemon_cluster) = status.cluster.as_ref() else {
+                return Err(CliError::DaemonNotRunning {
+                    detail: "the daemon owning this data directory did not advertise a cluster identity; refusing to use it as the cluster-health authority".to_string(),
+                });
+            };
+            if daemon_cluster.cluster_id != bootstrap_state.cluster_id
+                || daemon_cluster.node_id != bootstrap_state.local_node_id
+                || daemon_cluster.process != DAEMON_MAIN_CLUSTER_ROLE
+            {
+                return Err(CliError::DaemonNotRunning {
+                    detail: format!(
+                        "the daemon owning this data directory advertised cluster/node/process {}/{}/{}, expected {}/{}/{}; refusing to use it as the cluster-health authority",
+                        daemon_cluster.cluster_id,
+                        daemon_cluster.node_id,
+                        daemon_cluster.process,
+                        bootstrap_state.cluster_id,
+                        bootstrap_state.local_node_id,
+                        DAEMON_MAIN_CLUSTER_ROLE,
+                    ),
+                });
+            }
+            let rows = DaemonApiClient::at_address(status.address)
+                .with_timeout(CLUSTER_HEALTH_DAEMON_RPC_TIMEOUT)
+                .cluster_health_with_peer_views()?;
+            // The daemon owns local Raft. Pair its live health rows with the
+            // materialized member projection instead of trying the process-local
+            // resident registry from this CLI process. A live daemon RPC failure
+            // remains an error rather than falling through across that boundary.
+            return Ok((
+                read_cluster_state_with_materialized_member_overlay(&paths)?,
+                rows,
+            ));
+        }
+        DaemonProbeStatus::Locked { .. } => {
+            return Err(CliError::DaemonNotRunning {
+                detail: "main daemon owns this data directory but its health RPC did not answer; refusing direct cluster-state access while Raft may be active".to_string(),
+            });
+        }
+        DaemonProbeStatus::NotRunning => {}
     }
 
     let state = match read_cluster_state(&paths) {
@@ -2925,13 +2985,13 @@ pub(crate) fn refresh_cluster_kv_from_local_daemon(paths: &ClusterPaths) -> Resu
     let Some(status) = default_main_daemon_status()? else {
         return refresh_cluster_kv_from_reachable_voters(paths);
     };
-    match daemon_fetch_cluster_kv_authoritative_snapshot(&status.address, DAEMON_PROBE_TIMEOUT) {
-        // The daemon owns both local Raft and its materialized projection. The
-        // barrier request makes that projection current; the CLI must not
-        // import a second plain snapshot into the same data directory.
-        Ok(_) => Ok(()),
-        Err(_) => refresh_cluster_kv_from_reachable_voters(paths),
-    }
+    // The daemon owns local Raft. Consume its current-term snapshot directly
+    // and materialize that verified projection for CLI readers; once a live
+    // daemon is discovered, an RPC failure stays fail-closed instead of
+    // falling through to a second authority path.
+    let snapshot =
+        daemon_fetch_cluster_kv_authoritative_snapshot(&status.address, DAEMON_PROBE_TIMEOUT)?;
+    install_daemon_authoritative_cluster_kv_snapshot(paths, snapshot)
 }
 
 /// Like [`refresh_cluster_kv_from_local_daemon`], but probes the daemon that
@@ -2942,82 +3002,104 @@ pub(crate) fn refresh_cluster_kv_from_local_daemon_for_data_dir(
     data_dir: &SinomoDataDir,
     paths: &ClusterPaths,
 ) -> Result<(), CliError> {
-    let Some(status) = main_daemon_status_for_data_dir(data_dir)? else {
-        return refresh_cluster_kv_from_reachable_voters(paths);
+    let status = match probe_daemon_status(&DaemonPaths::new(data_dir), DAEMON_PROBE_TIMEOUT) {
+        DaemonProbeStatus::Running(status) => status,
+        DaemonProbeStatus::Locked { .. } => {
+            return Err(CliError::DaemonNotRunning {
+                detail: "main daemon owns this data directory but its RPC service did not answer; refusing direct cluster-KV access while Raft may be active".to_string(),
+            });
+        }
+        DaemonProbeStatus::NotRunning => return refresh_cluster_kv_from_reachable_voters(paths),
     };
-    match daemon_fetch_cluster_kv_authoritative_snapshot(&status.address, DAEMON_PROBE_TIMEOUT) {
-        Ok(_) => Ok(()),
-        Err(_) => refresh_cluster_kv_from_reachable_voters(paths),
+    let snapshot =
+        daemon_fetch_cluster_kv_authoritative_snapshot(&status.address, DAEMON_PROBE_TIMEOUT)?;
+    install_daemon_authoritative_cluster_kv_snapshot(paths, snapshot)
+}
+
+fn install_daemon_authoritative_cluster_kv_snapshot(
+    paths: &ClusterPaths,
+    snapshot: KvAuthoritativeRead<KvSnapshot>,
+) -> Result<(), CliError> {
+    let wrote = sinomo_runtime::kv::write_cluster_kv_snapshot_if_changed(
+        &paths.kv_paths(),
+        &snapshot.value,
+    )?;
+    if wrote {
+        cluster::invalidate_cluster_kv_observed_read_models(paths);
+    }
+    Ok(())
+}
+
+struct CliClusterKvSnapshotRefreshHost {
+    paths: ClusterPaths,
+}
+
+impl cluster::ClusterKvSnapshotRefreshHost for CliClusterKvSnapshotRefreshHost {
+    fn known_kv_state_authority_id(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, network::NetworkError> {
+        cluster_kv_state_authority_id(paths, state).or(Ok(None))
+    }
+
+    fn call_node_object_rpc(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        request: &network::ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|source| network::NetworkError::Io {
+                operation: "cluster kv snapshot refresh runtime".to_string(),
+                detail: source.to_string(),
+            })?;
+        let mut host = CliEndpointRpcHost::new(
+            Some(state.cluster_id.clone()),
+            "cluster kv snapshot refresh signing",
+        );
+        let mut client = network::ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(
+            &mut host,
+            &self.paths,
+            state,
+        )?;
+        let result = runtime.block_on(async {
+            let result = client
+                .call_target(
+                    state,
+                    target_node_id,
+                    network::ObjectRpcCall::value(request.clone()),
+                    cluster::main_daemon_cluster_rpc_options(
+                        network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
+                    ),
+                )
+                .await?;
+            result.into_materialized_value_response(usize::MAX).await
+        });
+        runtime.shutdown_timeout(Duration::from_millis(250));
+        result
+    }
+
+    fn cache_cluster_kv_snapshot_if_newer_than_raft(
+        &mut self,
+        _paths: &ClusterPaths,
+        _local_node_id: &NodeId,
+        _snapshot: KvSnapshot,
+    ) -> Result<bool, network::NetworkError> {
+        // `refresh_current_cluster_kv_store_with_host` has already persisted
+        // the imported materialized projection before invoking this hook. A
+        // CLI process does not own the resident Raft node and must never open
+        // it merely to arbitrate a read snapshot; the daemon will reconcile
+        // its own Raft-backed projection on its next committed edge.
+        Ok(false)
     }
 }
 
 fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), CliError> {
-    struct CliClusterKvSnapshotRefreshHost {
-        paths: ClusterPaths,
-    }
-
-    impl cluster::ClusterKvSnapshotRefreshHost for CliClusterKvSnapshotRefreshHost {
-        fn known_kv_state_authority_id(
-            &mut self,
-            paths: &ClusterPaths,
-            state: &ClusterBootstrapState,
-        ) -> Result<Option<NodeId>, network::NetworkError> {
-            cluster_kv_state_authority_id(paths, state).or(Ok(None))
-        }
-
-        fn call_node_object_rpc(
-            &mut self,
-            state: &ClusterBootstrapState,
-            target_node_id: &NodeId,
-            request: &network::ObjectRpcRequest,
-            timeout: Duration,
-        ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|source| network::NetworkError::Io {
-                    operation: "cluster kv snapshot refresh runtime".to_string(),
-                    detail: source.to_string(),
-                })?;
-            let mut host = CliEndpointRpcHost::new(
-                Some(state.cluster_id.clone()),
-                "cluster kv snapshot refresh signing",
-            );
-            let mut client = network::ClusterObjectRpcClient::routed(&mut host, &self.paths);
-            let result = runtime.block_on(async {
-                let result = client
-                    .call_target(
-                        state,
-                        target_node_id,
-                        network::ObjectRpcCall::value(request.clone()),
-                        network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
-                    )
-                    .await?;
-                result.into_materialized_value_response(usize::MAX).await
-            });
-            runtime.shutdown_timeout(Duration::from_millis(250));
-            result
-        }
-
-        fn cache_cluster_kv_snapshot_if_newer_than_raft(
-            &mut self,
-            paths: &ClusterPaths,
-            local_node_id: &NodeId,
-            snapshot: KvSnapshot,
-        ) -> Result<bool, network::NetworkError> {
-            let _raft_guard =
-                sinomo_runtime::kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths())
-                    .map_err(sinomo_runtime::network::NetworkError::directory)
-                    .map_err(sinomo_runtime::network::NetworkError::directory)?;
-            paths
-                .kv_paths()
-                .local_cache()
-                .cache_snapshot_if_newer_than_raft(local_node_id.clone(), snapshot)
-                .map_err(sinomo_runtime::network::NetworkError::directory)
-        }
-    }
-
-    let Ok(state) = cluster::read_cluster_state(paths) else {
+    let Ok(state) = read_cluster_state_with_materialized_member_overlay(paths) else {
         return Ok(());
     };
     match cluster::refresh_current_cluster_kv_store_with_host(
@@ -3033,6 +3115,43 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
         Err(network::NetworkError::Io { .. }) => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn read_cluster_state_with_materialized_member_overlay(
+    paths: &ClusterPaths,
+) -> Result<ClusterBootstrapState, CliError> {
+    let mut state = cluster::read_cluster_state_without_kv(paths)?;
+    let Some(snapshot) = paths
+        .kv_paths()
+        .local_cache()
+        .cached_snapshot_arc_if_present()?
+    else {
+        return Ok(state);
+    };
+    let mut projected_members = cluster::read_cluster_members_from_snapshot(&snapshot)?;
+    if projected_members.is_empty() {
+        return Ok(state);
+    }
+
+    // KV is authoritative for member role/state, while the bootstrap file can
+    // retain a reachable endpoint learned before the latest materialization.
+    // Preserve those endpoints without consulting the daemon-owned Raft node.
+    for local_member in &state.members {
+        if let Some(projected) = projected_members
+            .iter_mut()
+            .find(|candidate| candidate.node_id == local_member.node_id)
+        {
+            for endpoint in &local_member.endpoints {
+                merge_cluster_member_endpoint(projected, endpoint.clone());
+            }
+        } else {
+            projected_members.push(local_member.clone());
+        }
+    }
+    projected_members.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    state.members = projected_members;
+    network::cleanup_cluster_endpoint_duplicates(&mut state);
+    Ok(state)
 }
 
 #[cfg(test)]
@@ -3258,6 +3377,224 @@ mod tests {
     use super::*;
 
     #[test]
+    fn daemon_authoritative_snapshot_refresh_materializes_newer_connectivity() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-snapshot-refresh-connectivity");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_cli_daemon_snapshot_refresh").expect("cluster");
+        let source_node_id =
+            NodeId::from_legacy_named("node_cli_daemon_snapshot_source").expect("source");
+        let target_node_id =
+            NodeId::from_legacy_named("node_cli_daemon_snapshot_target").expect("target");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "CLI daemon snapshot refresh",
+            source_node_id.clone(),
+            "local",
+            "public-key",
+            now,
+        );
+        cluster::write_cluster_state(&paths, &state).expect("cluster state");
+        let endpoint_id = sinomo_runtime::network::ClusterEndpointId::from_legacy_named(
+            "endpoint_cli_daemon_snapshot_refresh",
+        )
+        .expect("endpoint");
+        let stale = sinomo_runtime::network::ClusterConnectivityRecord {
+            cluster_id,
+            source_node_id: source_node_id.clone(),
+            target_node_id: target_node_id.clone(),
+            endpoint_id: endpoint_id.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "192.0.2.40:21353".to_string(),
+            state: sinomo_runtime::network::ClusterConnectivityState::Unreachable,
+            latency_ms: None,
+            consecutive_failures: 3,
+            last_success_at: None,
+            last_failure_at: Some("stale".to_string()),
+            failure_reason: Some(
+                sinomo_runtime::network::ClusterConnectivityFailureReason::IdentityMismatch,
+            ),
+            observed_at: now,
+            expires_at: now + time::Duration::hours(2),
+        };
+        let key = cluster::cluster_connectivity_key(&source_node_id, &target_node_id, &endpoint_id);
+        let mut store = sinomo_runtime::kv::InProcessKvStore::new();
+        store
+            .put_serde(key.clone(), &stale, None)
+            .expect("stale connectivity");
+        let stale_snapshot = store.try_snapshot().expect("stale snapshot");
+        sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &stale_snapshot)
+            .expect("write stale materialized snapshot");
+
+        let healthy = sinomo_runtime::network::ClusterConnectivityRecord {
+            state: sinomo_runtime::network::ClusterConnectivityState::Healthy,
+            latency_ms: Some(36),
+            consecutive_failures: 0,
+            last_success_at: Some("fresh".to_string()),
+            last_failure_at: None,
+            failure_reason: None,
+            observed_at: now + time::Duration::seconds(1),
+            expires_at: now + time::Duration::minutes(15),
+            ..stale
+        };
+        store
+            .put_serde(key.clone(), &healthy, None)
+            .expect("healthy connectivity");
+        let authoritative_snapshot = store.try_snapshot().expect("authoritative snapshot");
+        let authoritative = KvAuthoritativeRead {
+            authority: sinomo_runtime::kv::KvAuthorityProof {
+                term: 1,
+                commit_index: 2,
+                revision: authoritative_snapshot.revision,
+                basis: sinomo_runtime::kv::KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks: 2,
+                    required_quorum: 2,
+                },
+            },
+            value: authoritative_snapshot.clone(),
+        };
+
+        // A durable-state marker makes any accidental local Raft open inspect
+        // this node. A directory at the lock path then fails deterministically;
+        // the daemon snapshot installer must touch only the materialized cache.
+        let wal_paths = paths.kv_paths().raft_wal_paths(&source_node_id);
+        std::fs::create_dir_all(&wal_paths.root).expect("Raft root");
+        std::fs::write(&wal_paths.wal, b"").expect("durable-state marker");
+        std::fs::create_dir(&wal_paths.lock).expect("inaccessible node lock sentinel");
+
+        install_daemon_authoritative_cluster_kv_snapshot(&paths, authoritative)
+            .expect("install daemon authoritative snapshot");
+
+        let materialized = sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
+            .expect("materialized snapshot");
+        assert_eq!(materialized.revision, authoritative_snapshot.revision);
+        let record = materialized
+            .get(&key)
+            .expect("materialized connectivity")
+            .decode::<sinomo_runtime::network::ClusterConnectivityRecord>()
+            .expect("decode connectivity");
+        assert_eq!(
+            record.state,
+            sinomo_runtime::network::ClusterConnectivityState::Healthy
+        );
+        assert_eq!(record.latency_ms, Some(36));
+        assert_eq!(record.failure_reason, None);
+
+        let stale_authoritative = KvAuthoritativeRead {
+            authority: sinomo_runtime::kv::KvAuthorityProof {
+                term: 1,
+                commit_index: 1,
+                revision: stale_snapshot.revision,
+                basis: sinomo_runtime::kv::KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks: 2,
+                    required_quorum: 2,
+                },
+            },
+            value: stale_snapshot,
+        };
+        install_daemon_authoritative_cluster_kv_snapshot(&paths, stale_authoritative)
+            .expect("ignore older daemon authoritative snapshot");
+        let retained = sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
+            .expect("retained materialized snapshot");
+        assert_eq!(retained.revision, authoritative_snapshot.revision);
+        let retained_record = retained
+            .get(&key)
+            .expect("retained connectivity")
+            .decode::<sinomo_runtime::network::ClusterConnectivityRecord>()
+            .expect("decode retained connectivity");
+        assert_eq!(
+            retained_record.state,
+            sinomo_runtime::network::ClusterConnectivityState::Healthy
+        );
+    }
+
+    #[test]
+    fn cli_snapshot_refresh_host_never_opens_local_raft_storage() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cli-snapshot-refresh-no-raft-open");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let state = ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_cli_snapshot_no_raft_open").expect("cluster id"),
+            "CLI snapshot no Raft open",
+            NodeId::from_legacy_named("node_cli_snapshot_no_raft_open").expect("node id"),
+            "local",
+            "public-key",
+            OffsetDateTime::now_utc(),
+        );
+        cluster::write_cluster_state(&paths, &state).expect("cluster state");
+        let snapshot = sinomo_runtime::kv::InProcessKvStore::new()
+            .try_snapshot()
+            .expect("KV snapshot");
+        sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &snapshot)
+            .expect("materialized snapshot");
+
+        // A durable-state marker makes a latest-observed read try the Raft
+        // path. Making node.lock a directory turns any such attempt into a
+        // deterministic error without relying on timing or another process.
+        let wal_paths = paths.kv_paths().raft_wal_paths(&state.local_node_id);
+        std::fs::create_dir_all(&wal_paths.root).expect("Raft root");
+        std::fs::write(&wal_paths.wal, b"").expect("durable-state marker");
+        std::fs::create_dir(&wal_paths.lock).expect("inaccessible node lock sentinel");
+
+        let mut host = CliClusterKvSnapshotRefreshHost {
+            paths: paths.clone(),
+        };
+        assert!(
+            !cluster::ClusterKvSnapshotRefreshHost::cache_cluster_kv_snapshot_if_newer_than_raft(
+                &mut host,
+                &paths,
+                &state.local_node_id,
+                snapshot.clone(),
+            )
+            .expect("CLI snapshot cache hook"),
+            "the generic refresh already persisted the imported projection"
+        );
+        assert_eq!(
+            sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
+                .expect("materialized snapshot remains readable"),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn daemon_health_state_overlay_never_opens_local_raft_storage() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cli-health-state-no-raft-open");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let state = ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_cli_health_state_no_raft_open")
+                .expect("cluster id"),
+            "CLI health state no Raft open",
+            NodeId::from_legacy_named("node_cli_health_state_no_raft_open").expect("node id"),
+            "local",
+            "public-key",
+            OffsetDateTime::now_utc(),
+        );
+        cluster::write_cluster_state(&paths, &state).expect("cluster state");
+        let snapshot = sinomo_runtime::kv::InProcessKvStore::new()
+            .try_snapshot()
+            .expect("KV snapshot");
+        sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &snapshot)
+            .expect("materialized snapshot");
+
+        let wal_paths = paths.kv_paths().raft_wal_paths(&state.local_node_id);
+        std::fs::create_dir_all(&wal_paths.root).expect("Raft root");
+        std::fs::write(&wal_paths.wal, b"").expect("durable-state marker");
+        std::fs::create_dir(&wal_paths.lock).expect("inaccessible node lock sentinel");
+
+        let observed = read_cluster_state_with_materialized_member_overlay(&paths)
+            .expect("materialized health state");
+        assert_eq!(observed.cluster_id, state.cluster_id);
+        assert_eq!(observed.local_node_id, state.local_node_id);
+    }
+
+    #[test]
     fn cluster_doctor_summary_is_ok_for_info_only_observations() {
         let info = ClusterDoctorFinding {
             severity: "info".to_string(),
@@ -3271,6 +3608,35 @@ mod tests {
             ..info
         };
         assert_eq!(cluster_doctor_summary_label(&[warning]), "warnings");
+    }
+
+    #[test]
+    fn cluster_doctor_state_read_does_not_open_local_raft_storage() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cli-doctor-no-raft-open");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let state = ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_cli_doctor_no_raft_open").expect("cluster id"),
+            "CLI doctor no Raft open",
+            NodeId::from_legacy_named("node_cli_doctor_no_raft_open").expect("node id"),
+            "local",
+            "public-key",
+            OffsetDateTime::now_utc(),
+        );
+        cluster::write_cluster_state(&paths, &state).expect("cluster state");
+
+        // A durable marker plus an invalid lock path makes opening the local
+        // Raft node fail deterministically. Doctor must still be able to read
+        // its bounded bootstrap observation state.
+        let wal_paths = paths.kv_paths().raft_wal_paths(&state.local_node_id);
+        std::fs::create_dir_all(&wal_paths.root).expect("Raft root");
+        std::fs::write(&wal_paths.wal, b"").expect("durable-state marker");
+        std::fs::create_dir(&wal_paths.lock).expect("inaccessible node lock sentinel");
+
+        let observed = read_cluster_doctor_state(&paths).expect("observational doctor state");
+        assert_eq!(observed.cluster_id, state.cluster_id);
+        assert_eq!(observed.local_node_id, state.local_node_id);
     }
 
     #[test]
@@ -3438,6 +3804,7 @@ mod tests {
 
     #[test]
     fn repair_member_endpoint_replaces_same_address_with_canonical_identity() {
+        crate::tests::install_test_iroh_network_module();
         let cluster_id =
             ClusterId::from_legacy_named("cluster_repair_same_address").expect("cluster id");
         let main_node =

@@ -112,7 +112,10 @@ fn agent_config_snapshot_from_catalog(
 
 impl Backend {
     pub fn agent_config_snapshot(&self, selected_agent_id: Option<&str>) -> AgentConfigSnapshot {
-        let (catalog, error) = match AgentCatalog::load_from_data_dir(self.data_dir.as_ref()) {
+        let catalog = self
+            .catalog_read_vfs()
+            .and_then(|vfs| AgentCatalog::load_from_vfs(vfs).map_err(|error| error.to_string()));
+        let (catalog, error) = match catalog {
             Ok(catalog) => (catalog, None),
             Err(source) => (AgentCatalog::built_ins(), Some(source.to_string())),
         };
@@ -143,19 +146,21 @@ impl Backend {
     }
 
     pub fn delete_custom_agent_definition(&self, id: &str) -> Result<bool, String> {
-        let snapshot = self.agent_config_snapshot(Some(id));
-        let Some(agent) = snapshot
-            .selected_agent
-            .as_ref()
-            .filter(|agent| agent.key() == id)
-        else {
-            return Err(format!("agent definition `{id}` was not found"));
-        };
-        if !agent_definition_is_editable(agent) {
+        if AgentDefinition::built_in(id).is_some() {
             return Err("built-in and module-provided agents cannot be deleted".to_string());
         }
-        AgentDefinitionSifsStore::open(Some(self.data_dir.root()))
+        let store = AgentDefinitionSifsStore::open(Some(self.data_dir.root()))
+            .map_err(|error| error.to_string())?;
+        let agent = store
+            .load_definitions()
             .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|agent| agent.key() == id)
+            .ok_or_else(|| format!("agent definition `{id}` was not found"))?;
+        if !agent_definition_is_editable(&agent) {
+            return Err("built-in and module-provided agents cannot be deleted".to_string());
+        }
+        store
             .delete_definition(id)
             .map_err(|error| error.to_string())
     }
@@ -282,7 +287,10 @@ impl Backend {
         let (skills_ready, skills_detail) = if definition.skills.is_empty() {
             (true, "No packaged skills required".to_string())
         } else {
-            match sinomo_cli::app_api::skill_summaries(self.data_dir.as_ref(), true) {
+            match self
+                .catalog_read_vfs()
+                .and_then(|vfs| sinomo_cli::app_api::skill_summaries(&vfs, true))
+            {
                 Ok(skills) => {
                     let missing = definition
                         .skills
@@ -371,11 +379,10 @@ impl Backend {
     }
 
     fn agent_definition(&self, id: &str) -> Result<AgentDefinition, String> {
-        AgentCatalog::load_from_data_dir(self.data_dir.as_ref())
-            .map_err(|error| error.to_string())?
-            .get(id)
-            .cloned()
-            .ok_or_else(|| format!("agent definition `{id}` was not found"))
+        sinomo_cli::app_api::resolve_agent_definition_with_catalog_vfs(id, || {
+            self.catalog_read_vfs()
+        })?
+        .ok_or_else(|| format!("agent definition `{id}` was not found"))
     }
 }
 
@@ -513,8 +520,69 @@ mod tests {
     use sinomo_agent::{AgentDefinition, AgentMcpServerDefinition, AgentPackageDefinition};
 
     #[test]
+    fn daemonless_agent_snapshot_is_explicitly_degraded_without_mounting_sifs() {
+        let (data_dir, _cleanup) = crate::backend::local_fallback_data_dir();
+        let backend = Backend::local_fallback_for_data_dir(data_dir);
+        let dfs_root = backend.data_dir.root().join("dfs");
+        let metadata_root = dfs_root.join("metadata");
+        let content_root = dfs_root.join("content");
+        assert!(!metadata_root.exists());
+        assert!(!content_root.exists());
+
+        let snapshot = backend.agent_config_snapshot(None);
+
+        assert!(
+            snapshot
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("resident daemon SIFS is unavailable")),
+            "daemonless snapshot must surface why only built-ins are available: {:?}",
+            snapshot.error
+        );
+        assert!(snapshot.agents.iter().all(|agent| !agent.editable));
+        assert!(
+            !metadata_root.exists() && !content_root.exists(),
+            "read-only settings snapshot must not construct mounted DFS state"
+        );
+    }
+
+    #[test]
+    fn daemonless_builtin_agent_actions_do_not_open_catalog_sifs() {
+        let (data_dir, _cleanup) = crate::backend::local_fallback_data_dir();
+        let export_root = data_dir.root().join("exports");
+        let backend = Backend::local_fallback_for_data_dir(data_dir);
+        let dfs_root = backend.data_dir.root().join("dfs");
+        let metadata_root = dfs_root.join("metadata");
+        let content_root = dfs_root.join("content");
+        assert!(!metadata_root.exists());
+        assert!(!content_root.exists());
+
+        let validation = backend
+            .validate_agent_definition("main-agent")
+            .expect("validate built-in without daemon");
+        assert_eq!(validation.agent_id, "main-agent");
+        let exported = backend
+            .export_agent_definition("coding-agent", &export_root)
+            .expect("export built-in without daemon");
+        assert!(exported.exists());
+        assert!(
+            !metadata_root.exists() && !content_root.exists(),
+            "exact built-in actions must not construct mounted DFS state"
+        );
+
+        let error = backend
+            .validate_agent_definition("custom-agent")
+            .expect_err("custom definitions require resident daemon SIFS");
+        assert!(error.contains("resident daemon SIFS is unavailable"));
+        assert!(!metadata_root.exists() && !content_root.exists());
+    }
+
+    #[test]
     fn backend_saves_and_deletes_custom_agent_definitions() {
-        let backend = Backend::local_fallback();
+        let mut backend = Backend::local_fallback();
+        backend
+            .use_mounted_catalog_reads_for_tests()
+            .expect("test catalog VFS");
         let mut definition =
             AgentDefinition::custom("docs-agent", AgentRole::Deliberation, "Write docs.");
         definition.description = "Documentation specialist".to_string();
@@ -558,7 +626,10 @@ mod tests {
 
     #[test]
     fn backend_imports_validates_tests_and_exports_agent_packages() {
-        let backend = Backend::local_fallback();
+        let mut backend = Backend::local_fallback();
+        backend
+            .use_mounted_catalog_reads_for_tests()
+            .expect("test catalog VFS");
         let source = backend.data_dir.root().join("incoming-agent.json");
         let export_dir = backend.data_dir.root().join("exports");
         let mut definition =

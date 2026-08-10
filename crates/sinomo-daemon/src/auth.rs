@@ -374,9 +374,17 @@ pub fn authorize_authenticated_daemon_command(
         route if route == crate::DAEMON_SHUTDOWN_ROUTE => {
             authenticated.signer.can_run_local_command()
         }
+        route if route == crate::DAEMON_REMOTE_SHADOW_SHUTDOWN_ROUTE => {
+            matches!(
+                authenticated.signer,
+                DaemonSignerAuthority::Local | DaemonSignerAuthority::Voter
+            )
+        }
         route
             if route == crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE
                 || route == crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE
+                || route == crate::DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE
+                || route == crate::DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE
                 || route == crate::DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE
                 || route == crate::DAEMON_NETWORK_CHUNK_METRICS_ROUTE
                 || route == crate::DAEMON_EVENT_SUBSCRIBE_ROUTE =>
@@ -828,6 +836,14 @@ fn authorize_daemon_signer_after_membership_refresh(
         return Some(authority);
     }
 
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    if sinomo_core::kv::process_local_raft_access_is_denied(&cluster_paths.kv_paths().raft) {
+        // The shadow verifies only the accepted bootstrap/materialized
+        // projection. An unknown signer must fail closed instead of repairing
+        // the main voter's local Raft store from an authority response.
+        return None;
+    }
+
     refresh_daemon_auth_membership_snapshot(data_dir).ok()?;
     replace_cached_daemon_auth_verifier_context(data_dir, None);
     let verifier = cached_daemon_auth_verifier_context(data_dir).ok()?;
@@ -870,6 +886,13 @@ fn replace_cached_daemon_auth_verifier_context(
 fn refresh_daemon_auth_membership_snapshot(data_dir: &Path) -> Result<(), DaemonError> {
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
+    if sinomo_core::kv::process_local_raft_access_is_denied(&cluster_paths.kv_paths().raft) {
+        return Err(sinomo_core::kv::KvError::AuthorityUnavailable {
+            detail: "this process role cannot refresh authentication membership through local Raft storage"
+                .to_string(),
+        }
+        .into());
+    }
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
     let options =
         ClusterControlPlaneTimeouts::default_daemon_transport().kv_snapshot_refresh_options();
@@ -891,10 +914,10 @@ fn refresh_daemon_auth_membership_snapshot(data_dir: &Path) -> Result<(), Daemon
             &state,
             options,
             |target_node_id, timeout| {
-                let response = crate::client::send_object_rpc_to_target_with_timeouts(
+                let response = crate::client::send_object_rpc_to_target_with_options(
                     target_node_id,
                     &request,
-                    sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+                    daemon_auth_membership_rpc_options(timeout),
                     false,
                 )
                 .map_err(|error| sinomo_core::network::NetworkError::Io {
@@ -960,6 +983,16 @@ fn refresh_daemon_auth_membership_snapshot(data_dir: &Path) -> Result<(), Daemon
         });
     }
     Ok(())
+}
+
+fn daemon_auth_membership_rpc_options(
+    timeout: Duration,
+) -> sinomo_core::network::ClusterObjectRpcOptions {
+    sinomo_core::cluster::main_daemon_cluster_rpc_options(
+        sinomo_core::network::ClusterObjectRpcOptions::new(
+            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+        ),
+    )
 }
 
 fn cached_daemon_auth_verifier_context(
@@ -1279,6 +1312,15 @@ mod tests {
         CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE, CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE,
         CLUSTER_KV_LOCAL_WATCH_PREFIX_ROUTE, CLUSTER_KV_TXN_ROUTE, CLUSTER_KV_WATCH_EVENTS_ROUTE,
     };
+
+    #[test]
+    fn auth_membership_snapshot_refresh_is_main_daemon_affine() {
+        assert_eq!(
+            daemon_auth_membership_rpc_options(Duration::from_secs(5))
+                .destination_process_affinity(),
+            sinomo_core::network::DestinationProcessAffinity::MainDaemon
+        );
+    }
 
     fn authenticated_command(
         route: String,
@@ -2207,6 +2249,39 @@ mod tests {
     }
 
     #[test]
+    fn remote_shadow_shutdown_is_voter_only_and_does_not_widen_generic_shutdown() {
+        for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {
+            authorize_authenticated_daemon_command(&authenticated_command(
+                crate::DAEMON_REMOTE_SHADOW_SHUTDOWN_ROUTE.to_string(),
+                signer,
+            ))
+            .expect("local operators and cluster voters may stop a proven shadow process");
+        }
+        for signer in [
+            DaemonSignerAuthority::Member,
+            DaemonSignerAuthority::JoinCandidate,
+            DaemonSignerAuthority::StatusProbe,
+        ] {
+            assert!(
+                authorize_authenticated_daemon_command(&authenticated_command(
+                    crate::DAEMON_REMOTE_SHADOW_SHUTDOWN_ROUTE.to_string(),
+                    signer,
+                ))
+                .is_err(),
+                "non-voter signer must not stop a shadow process"
+            );
+        }
+        assert!(
+            authorize_authenticated_daemon_command(&authenticated_command(
+                crate::DAEMON_SHUTDOWN_ROUTE.to_string(),
+                DaemonSignerAuthority::Voter,
+            ))
+            .is_err(),
+            "the generic daemon shutdown route must remain local-only"
+        );
+    }
+
+    #[test]
     fn rollout_clear_status_authorizes_admin_signers() {
         for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {
             let authenticated =
@@ -2412,6 +2487,8 @@ mod tests {
         for route in [
             crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE,
             crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+            crate::DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+            crate::DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE,
             crate::DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
             crate::DAEMON_NETWORK_CHUNK_METRICS_ROUTE,
         ] {

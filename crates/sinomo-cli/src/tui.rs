@@ -3365,7 +3365,7 @@ fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
             Ok(tui_agent_status_outputs(&info))
         }
         TuiSlashCommand::Agent(TuiAgentCommand::List) => {
-            let catalog = load_tui_agent_catalog(data_dir)?;
+            let catalog = load_tui_agent_catalog(daemon)?;
             let mut outputs = Vec::new();
             for definition in catalog
                 .list()
@@ -3388,13 +3388,7 @@ fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
             Ok(outputs)
         }
         TuiSlashCommand::Agent(TuiAgentCommand::Use(agent_id)) => {
-            let catalog = load_tui_agent_catalog(data_dir)?;
-            let definition = catalog
-                .get(&agent_id)
-                .cloned()
-                .ok_or_else(|| CliError::Parse {
-                    detail: format!("unknown agent `{agent_id}`"),
-                })?;
+            let definition = load_tui_agent_definition(daemon, &agent_id)?;
             let session = runtime.session().clone();
             let info = runtime.handler.switch_tui_agent_for_session(
                 data_dir,
@@ -3490,11 +3484,42 @@ fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
     }
 }
 
-fn load_tui_agent_catalog(
-    data_dir: &SinomoDataDir,
-) -> Result<sinomo_agent::AgentCatalog, CliError> {
-    sinomo_agent::AgentCatalog::load_from_data_dir(data_dir).map_err(|source| CliError::Parse {
+pub(crate) fn tui_agent_catalog_vfs(
+    daemon: Option<&DaemonStatus>,
+) -> Result<sinomo_runtime::vfs::VfsHandle, CliError> {
+    let daemon = daemon.ok_or_else(|| CliError::DaemonNotRunning {
+        detail: "TUI agent catalog reads require the resident main daemon".to_string(),
+    })?;
+    sinomo_runtime::vfs::daemon_sifs(daemon.address.clone()).map_err(|source| CliError::Io {
+        path: "/".to_string(),
         detail: source.to_string(),
+    })
+}
+
+fn load_tui_agent_catalog(
+    daemon: Option<&DaemonStatus>,
+) -> Result<sinomo_agent::AgentCatalog, CliError> {
+    load_tui_agent_catalog_from_vfs(tui_agent_catalog_vfs(daemon)?)
+}
+
+pub(crate) fn load_tui_agent_catalog_from_vfs(
+    vfs: sinomo_runtime::vfs::VfsHandle,
+) -> Result<sinomo_agent::AgentCatalog, CliError> {
+    sinomo_agent::AgentCatalog::load_from_vfs(vfs).map_err(|source| CliError::Parse {
+        detail: source.to_string(),
+    })
+}
+
+fn load_tui_agent_definition(
+    daemon: Option<&DaemonStatus>,
+    agent_key: &str,
+) -> Result<sinomo_agent::AgentDefinition, CliError> {
+    crate::app_api::resolve_agent_definition_with_catalog_vfs(agent_key, || {
+        tui_agent_catalog_vfs(daemon)
+    })
+    .map_err(|detail| CliError::Parse { detail })?
+    .ok_or_else(|| CliError::Parse {
+        detail: format!("unknown agent `{agent_key}`"),
     })
 }
 
@@ -3650,6 +3675,7 @@ fn resume_tui_session_inner<H: TuiAgentRuntimeControl>(
     let restored_info = restore_tui_session_runtime_info(
         &mut runtime.handler,
         data_dir,
+        daemon,
         state.daemon_connected,
         &record.runtime_info,
         &resume_agent_key,
@@ -3732,6 +3758,7 @@ fn agent_transcript_from_tui_messages(messages: &[TuiMessage]) -> sinomo_agent::
 fn restore_tui_session_runtime_info<H: TuiAgentRuntimeControl>(
     handler: &mut H,
     data_dir: &SinomoDataDir,
+    daemon: Option<&DaemonStatus>,
     daemon_connected: bool,
     info: &TuiAgentRuntimeInfo,
     agent_key: &str,
@@ -3756,15 +3783,7 @@ fn restore_tui_session_runtime_info<H: TuiAgentRuntimeControl>(
             handler.tui_agent_runtime_info()
         }
     };
-    let catalog = load_tui_agent_catalog(data_dir)?;
-    let definition = catalog
-        .get(agent_key)
-        .cloned()
-        .ok_or_else(|| CliError::Parse {
-            detail: format!(
-                "canonical agent session references unknown agent definition `{agent_key}`"
-            ),
-        })?;
+    let definition = load_tui_agent_definition(daemon, agent_key)?;
     let prepared = handler
         .prepare_tui_agent(data_dir, daemon_connected, definition)
         .map_err(|error| CliError::Parse {
@@ -6936,6 +6955,49 @@ mod tui_tests {
     }
 
     #[test]
+    fn daemonless_tui_and_app_runtime_reject_agents_that_require_packaged_skills() {
+        let root = temp_file_browser_root("daemonless-agent-skill-catalog");
+        let data_dir = SinomoDataDir::new(root.to_path_buf());
+        let definition = AgentDefinition::custom(
+            "review-agent",
+            AgentRole::Deliberation,
+            "Review changes with the resident skill package.",
+        )
+        .with_skill("review.skill");
+
+        let mut tui_handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
+            &data_dir,
+            ModelRuntimeConfig::default(),
+        )
+        .expect("TUI handler");
+        let tui_error = tui_handler
+            .switch_tui_agent(&data_dir, false, definition.clone())
+            .expect_err("daemonless TUI must reject packaged skill requirements");
+        assert!(
+            tui_error
+                .to_string()
+                .contains("resident daemon SIFS skill catalog")
+        );
+        assert_eq!(tui_handler.tui_agent_runtime_info().agent, "main-agent");
+
+        let mut app_handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
+            &data_dir,
+            ModelRuntimeConfig::default(),
+        )
+        .expect("app handler");
+        let app_error = match app_switch_agent(&mut app_handler, &data_dir, definition, false) {
+            Ok(_) => panic!("daemonless app must reject packaged skill requirements"),
+            Err(error) => error,
+        };
+        assert!(
+            app_error
+                .to_string()
+                .contains("resident daemon SIFS skill catalog")
+        );
+        assert_eq!(app_handler.tui_agent_runtime_info().agent, "main-agent");
+    }
+
+    #[test]
     fn tui_agent_switch_rejects_roles_without_interactive_execution() {
         let root = temp_file_browser_root("agent-switch");
         let data_dir = SinomoDataDir::new(root.to_path_buf());
@@ -8307,6 +8369,7 @@ where
     fn validate_agent_definition(
         &self,
         definition: AgentDefinition,
+        daemon_connected: bool,
     ) -> Result<AgentDefinition, CliError> {
         let mut definition = definition;
         if definition.id.is_empty() {
@@ -8324,12 +8387,21 @@ where
                 ),
             });
         }
+        if !daemon_connected && !definition.skills.is_empty() {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "agent `{}` requires packaged skills ({}), but the resident daemon SIFS skill catalog is unavailable in daemonless mode",
+                    definition.key(),
+                    definition.skills.join(", ")
+                ),
+            });
+        }
         Ok(definition)
     }
 
     #[cfg(test)]
     fn set_agent_definition(&mut self, definition: AgentDefinition) -> Result<(), CliError> {
-        let definition = self.validate_agent_definition(definition)?;
+        let definition = self.validate_agent_definition(definition, true)?;
         self.agent_definition = definition;
         Ok(())
     }
@@ -8662,13 +8734,27 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         daemon: Option<&DaemonStatus>,
     ) -> Result<Self, CliError> {
         let daemon_connected = daemon.is_some();
+        let runtime_skill_catalog = runtime_skill_catalog(daemon)?;
+        Self::from_default_model_config_with_runtime_skill_catalog(
+            data_dir,
+            runtime_config,
+            daemon_connected,
+            runtime_skill_catalog,
+        )
+    }
+
+    fn from_default_model_config_with_runtime_skill_catalog(
+        data_dir: &SinomoDataDir,
+        runtime_config: ModelRuntimeConfig,
+        daemon_connected: bool,
+        runtime_skill_catalog: RuntimeSkillCatalog,
+    ) -> Result<Self, CliError> {
         let thinking = ThinkingControl::default();
         let tool_registry = main_agent_config_tool_registry(data_dir)?;
         let (config, _) =
             with_tui_model_config_mode(daemon_connected, || load_model_config_for_node(data_dir))?;
         let resolved = resolve_default_model(Some(&config), None)?;
-        let (skill_catalog, skill_catalog_texts, skill_catalog_resources) =
-            best_effort_runtime_skill_catalog(daemon);
+        let (skill_catalog, skill_catalog_texts, skill_catalog_resources) = runtime_skill_catalog;
         if resolved.provider == default_main_agent_chat_model_provider()
             && resolved.model == default_main_agent_chat_model_id()
         {
@@ -8731,7 +8817,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         daemon_connected: bool,
         rebind_agent_identity: bool,
     ) -> Result<TuiAgentRuntimeInfo, CliError> {
-        let definition = self.validate_agent_definition(definition)?;
+        let definition = self.validate_agent_definition(definition, daemon_connected)?;
         if let Ok(state) = read_cluster_state(&ClusterPaths::new(data_dir)) {
             validate_agent_local_placement(&definition, &state.local_node_id)?;
         } else if definition.placement.home_server_node_id.is_some()
@@ -8800,7 +8886,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         definition: AgentDefinition,
         daemon_connected: bool,
     ) -> Result<TuiAgentRuntimeInfo, CliError> {
-        let definition = self.validate_agent_definition(definition)?;
+        let definition = self.validate_agent_definition(definition, daemon_connected)?;
         self.ensure_runtime(interaction_session)?;
         let previous_session = self
             .agent_session_snapshot()?
@@ -9239,10 +9325,39 @@ impl From<&TuiAgentRuntimeInfo> for AppRuntimeInfo {
 /// Build the main-agent chat handler the GUI app drives (mirrors the TUI path).
 pub(crate) fn app_build_chat_handler(
     data_dir: &SinomoDataDir,
-    daemon: Option<DaemonStatus>,
+    daemon_connected: bool,
+    runtime_skill_catalog_vfs: Option<sinomo_runtime::vfs::VfsHandle>,
 ) -> Result<RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>, CliError> {
-    let (handler, _) = runtime_main_agent_handler_for_tui_with_data_dir(daemon, data_dir)?;
-    Ok(handler)
+    let (runtime_config, _) = load_tui_model_runtime_config(data_dir, daemon_connected)?;
+    let runtime_skill_catalog = match (daemon_connected, runtime_skill_catalog_vfs) {
+        (true, Some(vfs)) => {
+            load_runtime_skill_catalog_from_vfs(vfs).map_err(skill_catalog_cli_error)?
+        }
+        (true, None) => {
+            return Err(CliError::DaemonNotRunning {
+                detail: "GUI chat skill loading requires the resident main daemon SIFS transport"
+                    .to_string(),
+            });
+        }
+        (false, _) => RuntimeSkillCatalog::default(),
+    };
+    RuntimeMainAgentInteractionHandler::from_default_model_config_with_runtime_skill_catalog(
+        data_dir,
+        runtime_config,
+        daemon_connected,
+        runtime_skill_catalog,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn app_runtime_skill_catalog_for_test(
+    handler: &RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>,
+) -> RuntimeSkillCatalog {
+    (
+        handler.skill_catalog.clone(),
+        handler.skill_catalog_texts.clone(),
+        handler.skill_catalog_resources.clone(),
+    )
 }
 
 /// Switch the active provider/model/account on a GUI chat handler.

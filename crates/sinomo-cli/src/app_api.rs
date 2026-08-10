@@ -875,6 +875,14 @@ impl AgentChatSifsStorage {
     pub fn open_channel_store(&self) -> Result<SifsAgentChannelStore, String> {
         SifsAgentChannelStore::open_daemon_on_runtime(&self.address, &self.runtime)
     }
+
+    /// Build a cheap read transport into the SIFS service already owned by the
+    /// resident daemon. Keeping this handle beside the channel/checkpoint
+    /// stores prevents app catalog reads from mounting and hydrating a second
+    /// process-local DFS instance.
+    pub fn open_agent_catalog_vfs(&self) -> Result<VfsHandle, String> {
+        sinomo_runtime::vfs::daemon_sifs(self.address.clone()).map_err(|error| error.to_string())
+    }
 }
 
 /// SIFS-backed channel store used by the app chat runtime.
@@ -1287,10 +1295,8 @@ impl SifsAgentChannelStore {
             .read_files(paths)
             .map_err(|detail| channel_store_io(SIFS_AGENT_CHANNELS_ROOT, detail))?
         {
-            let bytes = match result {
-                Ok(bytes) => bytes,
-                Err(detail) if sifs_error_is_not_found(&detail) => continue,
-                Err(detail) => return Err(channel_store_io(&path, detail)),
+            let Some(bytes) = channel_optional_bulk_read_bytes(&path, result)? else {
+                continue;
             };
             let value = serde_json::from_slice(&bytes).map_err(|source| {
                 AgentChannelStoreError::Serialization {
@@ -1332,10 +1338,8 @@ impl SifsAgentChannelStore {
             .read_files(&paths)
             .map_err(|detail| channel_store_io(dir, detail))?
         {
-            let bytes = match result {
-                Ok(bytes) => bytes,
-                Err(detail) if sifs_error_is_not_found(&detail) => continue,
-                Err(detail) => return Err(channel_store_io(&path, detail)),
+            let Some(bytes) = channel_optional_bulk_read_bytes(&path, result)? else {
+                continue;
             };
             values.extend(parse_json_lines::<T>(&bytes)?);
         }
@@ -3580,6 +3584,8 @@ impl AgentChatToolContext {
 pub struct AgentChat {
     data_dir: SinomoDataDir,
     daemon_connected: bool,
+    agent_catalog_vfs: VfsHandle,
+    agent_catalog_authoritative: bool,
     channel_store: Box<dyn AgentChannelStore>,
     session_checkpoint_store: SifsAgentSessionCheckpointStore,
     channel: AgentChannel,
@@ -3605,6 +3611,12 @@ impl AgentChat {
         daemon_connected: bool,
         runtime_control_registry: AgentRuntimeControlRegistry,
     ) -> Result<Self, CliError> {
+        if daemon_connected {
+            return Err(CliError::DaemonNotRunning {
+                detail: "connected GUI chat construction requires the resident daemon SIFS storage transport"
+                    .to_string(),
+            });
+        }
         let channel_store =
             SifsAgentChannelStore::open(&data_dir).map_err(|detail| CliError::Parse {
                 detail: format!("open agent channel SIFS store failed: {detail}"),
@@ -3613,10 +3625,18 @@ impl AgentChat {
             SifsAgentSessionCheckpointStore::open(&data_dir).map_err(|detail| CliError::Parse {
                 detail: format!("open agent session checkpoint SIFS store failed: {detail}"),
             })?;
+        let agent_catalog_vfs =
+            sinomo_runtime::vfs::mounted_sifs(Some(data_dir.root())).map_err(|source| {
+                CliError::Parse {
+                    detail: format!("open local fallback agent catalog SIFS failed: {source}"),
+                }
+            })?;
         Self::with_runtime_control_registry_and_stores(
             data_dir,
             daemon_connected,
             runtime_control_registry,
+            agent_catalog_vfs,
+            false,
             Box::new(channel_store),
             session_checkpoint_store,
         )
@@ -3628,6 +3648,12 @@ impl AgentChat {
         runtime_control_registry: AgentRuntimeControlRegistry,
         storage: AgentChatSifsStorage,
     ) -> Result<Self, CliError> {
+        let agent_catalog_vfs =
+            storage
+                .open_agent_catalog_vfs()
+                .map_err(|detail| CliError::Parse {
+                    detail: format!("open resident daemon agent catalog SIFS failed: {detail}"),
+                })?;
         let channel_store = storage
             .open_channel_store()
             .map_err(|detail| CliError::Parse {
@@ -3644,6 +3670,8 @@ impl AgentChat {
             data_dir,
             daemon_connected,
             runtime_control_registry,
+            agent_catalog_vfs,
+            true,
             Box::new(channel_store),
             session_checkpoint_store,
         )
@@ -3653,11 +3681,15 @@ impl AgentChat {
         data_dir: SinomoDataDir,
         daemon_connected: bool,
         runtime_control_registry: AgentRuntimeControlRegistry,
+        agent_catalog_vfs: VfsHandle,
+        agent_catalog_authoritative: bool,
         channel_store: Box<dyn AgentChannelStore>,
         session_checkpoint_store: SifsAgentSessionCheckpointStore,
     ) -> Result<Self, CliError> {
-        let handler = tui::app_build_chat_handler(&data_dir, None)?
-            .with_runtime_control_registry(runtime_control_registry);
+        let runtime_skill_catalog_vfs = daemon_connected.then(|| agent_catalog_vfs.clone());
+        let handler =
+            tui::app_build_chat_handler(&data_dir, daemon_connected, runtime_skill_catalog_vfs)?
+                .with_runtime_control_registry(runtime_control_registry);
         let session = app_session(&data_dir, None);
         let mut runtime =
             InteractionRuntime::new(InMemoryEventStore::new(), handler, session.clone());
@@ -3666,13 +3698,16 @@ impl AgentChat {
             .replace_agent_session(&session, agent_transcript_from_history(&[]))?;
         let mut channel = AgentChannel::with_default_title(session.session_id.clone());
         let info: ChatRuntimeInfo = tui::app_runtime_info(runtime.handler()).into();
-        let tool_runtime = default_tool_runtime_for_agent(&data_dir, &info.agent);
+        let tool_runtime =
+            ChatToolRuntimeSelection::from_agent_definition(runtime.handler().agent_definition());
         let align_primary_session = should_align_primary_participant(&channel);
         let participant_id = ensure_primary_participant(&mut channel, &info, align_primary_session);
         set_participant_tool_runtime(&mut channel, &participant_id, &tool_runtime);
         Ok(Self {
             data_dir,
             daemon_connected,
+            agent_catalog_vfs,
+            agent_catalog_authoritative,
             channel_store,
             session_checkpoint_store,
             channel,
@@ -3681,6 +3716,11 @@ impl AgentChat {
             tool_runtime_explicit_override: false,
             resume_sync_warnings: Vec::new(),
         })
+    }
+
+    #[cfg(test)]
+    fn use_injected_authoritative_agent_catalog_for_test(&mut self) {
+        self.agent_catalog_authoritative = true;
     }
 
     /// Begin a brand-new chat (clears the in-memory transcript/context).
@@ -3696,7 +3736,9 @@ impl AgentChat {
         self.channel = AgentChannel::with_default_title(session.session_id.clone());
         let info = self.runtime_info();
         if !self.tool_runtime_explicit_override {
-            self.tool_runtime = default_tool_runtime_for_agent(&self.data_dir, &info.agent);
+            self.tool_runtime = ChatToolRuntimeSelection::from_agent_definition(
+                self.runtime.handler().agent_definition(),
+            );
         }
         let participant_id = ensure_primary_participant(&mut self.channel, &info, true);
         let tool_runtime = self.tool_runtime.clone();
@@ -3803,7 +3845,11 @@ impl AgentChat {
             let participant_tool_runtime =
                 chat_tool_runtime_from_agent_runtime_definition(&participant.tool_runtime);
             self.tool_runtime = if participant_tool_runtime.is_default() {
-                default_tool_runtime_for_agent(&self.data_dir, &participant_agent_key)
+                default_tool_runtime_for_agent(
+                    &self.agent_catalog_vfs,
+                    self.agent_catalog_authoritative,
+                    &participant_agent_key,
+                )?
             } else {
                 participant_tool_runtime
             };
@@ -3855,14 +3901,17 @@ impl AgentChat {
                         });
                     }
                 };
-                let definition = resolve_agent(&self.data_dir, &persisted_agent_key).ok_or_else(
-                    || CliError::Parse {
+                let definition = resolve_agent(
+                    &self.agent_catalog_vfs,
+                    self.agent_catalog_authoritative,
+                    &persisted_agent_key,
+                )?
+                .ok_or_else(|| CliError::Parse {
                         detail: format!(
                             "agent session `{}` references unknown agent definition `{persisted_agent_key}`",
                             persisted.session_id
                         ),
-                    },
-                )?;
+                    })?;
                 if let Some(durable_participant) = durable_participant_before_resume
                     .as_ref()
                     .filter(|durable_participant| {
@@ -3943,15 +3992,17 @@ impl AgentChat {
                 )?;
             }
             None => {
-                let definition =
-                    resolve_agent(&self.data_dir, &participant.agent_key).ok_or_else(|| {
-                        CliError::Parse {
-                            detail: format!(
-                                "chat participant references unknown agent definition `{}`",
-                                participant.agent_key
-                            ),
-                        }
-                    })?;
+                let definition = resolve_agent(
+                    &self.agent_catalog_vfs,
+                    self.agent_catalog_authoritative,
+                    &participant.agent_key,
+                )?
+                .ok_or_else(|| CliError::Parse {
+                    detail: format!(
+                        "chat participant references unknown agent definition `{}`",
+                        participant.agent_key
+                    ),
+                })?;
                 tui::app_switch_agent(
                     self.runtime.handler_mut(),
                     &self.data_dir,
@@ -4572,6 +4623,8 @@ impl AgentChat {
         }
         let executor = AppAgentChannelExecutor {
             data_dir: &data_dir,
+            agent_catalog_vfs: &self.agent_catalog_vfs,
+            agent_catalog_authoritative: self.agent_catalog_authoritative,
             daemon_connected,
             runtime: &mut self.runtime,
             session_checkpoint_store: &self.session_checkpoint_store,
@@ -4600,7 +4653,11 @@ impl AgentChat {
             InMemoryEventStore::new(),
             previous_interaction_session.clone(),
         );
-        if let Some(definition) = resolve_agent(&data_dir, &previous_agent) {
+        if let Some(definition) = resolve_agent(
+            &self.agent_catalog_vfs,
+            self.agent_catalog_authoritative,
+            &previous_agent,
+        )? {
             tui::app_switch_agent(
                 self.runtime.handler_mut(),
                 &data_dir,
@@ -4745,10 +4802,14 @@ impl AgentChat {
 
     /// Switch to a named built-in / stored agent definition.
     pub fn set_agent(&mut self, agent_key: &str) -> Result<ChatRuntimeInfo, CliError> {
-        let definition =
-            resolve_agent(&self.data_dir, agent_key).ok_or_else(|| CliError::Parse {
-                detail: format!("unknown agent `{agent_key}`"),
-            })?;
+        let definition = resolve_agent(
+            &self.agent_catalog_vfs,
+            self.agent_catalog_authoritative,
+            agent_key,
+        )?
+        .ok_or_else(|| CliError::Parse {
+            detail: format!("unknown agent `{agent_key}`"),
+        })?;
         if !definition.supports_interactive_chat() {
             return Err(CliError::Parse {
                 detail: format!(
@@ -4991,6 +5052,8 @@ fn agent_channel_store_cli_error(action: &str, source: AgentChannelStoreError) -
 
 struct AppAgentChannelExecutor<'a> {
     data_dir: &'a SinomoDataDir,
+    agent_catalog_vfs: &'a VfsHandle,
+    agent_catalog_authoritative: bool,
     daemon_connected: bool,
     runtime: &'a mut InteractionRuntime<InMemoryEventStore, Handler>,
     session_checkpoint_store: &'a SifsAgentSessionCheckpointStore,
@@ -5021,7 +5084,13 @@ impl AgentChannelTurnExecutor for AppAgentChannelExecutor<'_> {
         session: &mut AgentSession,
         on_event: &mut dyn FnMut(AgentChannelRuntimeEvent),
     ) -> Result<String, AgentChannelExecutorError> {
-        let definition = resolve_agent(self.data_dir, &participant.agent_key).ok_or_else(|| {
+        let definition = resolve_agent(
+            self.agent_catalog_vfs,
+            self.agent_catalog_authoritative,
+            &participant.agent_key,
+        )
+        .map_err(|error| AgentChannelExecutorError::new(error.to_string()))?
+        .ok_or_else(|| {
             AgentChannelExecutorError::new(format!(
                 "unknown channel agent `{}`",
                 participant.agent_key
@@ -5911,13 +5980,16 @@ fn set_participant_tool_runtime(
 }
 
 fn default_tool_runtime_for_agent(
-    data_dir: &SinomoDataDir,
+    agent_catalog_vfs: &VfsHandle,
+    agent_catalog_authoritative: bool,
     agent_key: &str,
-) -> ChatToolRuntimeSelection {
-    resolve_agent(data_dir, agent_key)
-        .as_ref()
-        .map(ChatToolRuntimeSelection::from_agent_definition)
-        .unwrap_or_default()
+) -> Result<ChatToolRuntimeSelection, CliError> {
+    Ok(
+        resolve_agent(agent_catalog_vfs, agent_catalog_authoritative, agent_key)?
+            .as_ref()
+            .map(ChatToolRuntimeSelection::from_agent_definition)
+            .unwrap_or_default(),
+    )
 }
 
 fn chat_tool_runtime_from_agent_runtime_definition(
@@ -6581,17 +6653,20 @@ fn parse_chat_tool_runtime_node_id(value: &str) -> Result<NodeId, CliError> {
         })
 }
 
-/// All agents available for selection (stored definitions first, else built-ins).
-pub fn agent_summaries(data_dir: &SinomoDataDir) -> Vec<AgentSummary> {
-    agent_summaries_with_error(data_dir).0
+/// All agents available for selection through an already-selected SIFS read
+/// transport (stored definitions first, else built-ins on an explicit error).
+pub fn agent_summaries(agent_catalog_vfs: &VfsHandle) -> Vec<AgentSummary> {
+    agent_summaries_with_error(agent_catalog_vfs).0
 }
 
 /// Like [`agent_summaries`], but also reports the catalog-load error (if any) that
-/// forced the fallback to built-ins. The stored catalog lives in SIFS, so this can
-/// be slow or fail while the distributed file system is unhealthy — callers off the
+/// forced the fallback to built-ins. Production callers supply the resident
+/// daemon VFS so this never mounts a second process-local DFS. Callers off the
 /// UI thread use the error to surface a degraded-state notice.
-pub fn agent_summaries_with_error(data_dir: &SinomoDataDir) -> (Vec<AgentSummary>, Option<String>) {
-    match AgentCatalog::load_from_data_dir(data_dir) {
+pub fn agent_summaries_with_error(
+    agent_catalog_vfs: &VfsHandle,
+) -> (Vec<AgentSummary>, Option<String>) {
+    match AgentCatalog::load_from_vfs(agent_catalog_vfs.clone()) {
         Ok(catalog) => (agent_catalog_summaries(&catalog), None),
         Err(error) => (
             agent_catalog_summaries(&AgentCatalog::built_ins()),
@@ -6623,19 +6698,53 @@ fn agent_catalog_summaries(catalog: &AgentCatalog) -> Vec<AgentSummary> {
         .collect()
 }
 
-fn resolve_agent(data_dir: &SinomoDataDir, key: &str) -> Option<AgentDefinition> {
-    let catalog =
-        AgentCatalog::load_from_data_dir(data_dir).unwrap_or_else(|_| AgentCatalog::built_ins());
-    catalog.get(key).cloned()
+/// Resolve an exact agent definition without touching SIFS for built-ins.
+///
+/// The VFS opener is deliberately lazy: startup and degraded-mode surfaces can
+/// continue to use the immutable built-in definitions when the resident daemon
+/// is unavailable, while custom and module-provided definitions still fail
+/// closed unless their authoritative catalog can be read.
+pub fn resolve_agent_definition_with_catalog_vfs<E>(
+    key: &str,
+    open_catalog_vfs: impl FnOnce() -> Result<VfsHandle, E>,
+) -> Result<Option<AgentDefinition>, String>
+where
+    E: std::fmt::Display,
+{
+    if let Some(definition) = AgentDefinition::built_in(key) {
+        return Ok(Some(definition));
+    }
+    let agent_catalog_vfs = open_catalog_vfs().map_err(|error| error.to_string())?;
+    AgentCatalog::load_from_vfs(agent_catalog_vfs)
+        .map(|catalog| catalog.get(key).cloned())
+        .map_err(|source| format!("load configured agent catalog SIFS failed: {source}"))
+}
+
+fn resolve_agent(
+    agent_catalog_vfs: &VfsHandle,
+    agent_catalog_authoritative: bool,
+    key: &str,
+) -> Result<Option<AgentDefinition>, CliError> {
+    resolve_agent_definition_with_catalog_vfs(key, || {
+        if agent_catalog_authoritative {
+            Ok(agent_catalog_vfs.clone())
+        } else {
+            Err(CliError::DaemonNotRunning {
+                detail:
+                    "custom and module agent definitions require the resident daemon SIFS catalog"
+                        .to_string(),
+            })
+        }
+    })
+    .map_err(|detail| CliError::Parse { detail })
 }
 
 /// List skills available to app management surfaces.
 pub fn skill_summaries(
-    data_dir: &SinomoDataDir,
+    catalog_vfs: &VfsHandle,
     include_all: bool,
 ) -> Result<Vec<SkillSummary>, String> {
-    let store =
-        SkillCatalogSifsStore::open(Some(data_dir.root())).map_err(|error| error.to_string())?;
+    let store = SkillCatalogSifsStore::from_vfs(catalog_vfs.clone());
     let catalog = store.load_catalog().map_err(|error| error.to_string())?;
     let entries = if include_all {
         catalog.entries.iter().collect::<Vec<_>>()
@@ -6652,18 +6761,22 @@ pub fn skill_summaries(
 
 /// Read one skill descriptor plus its stored `SKILL.md` text.
 pub fn skill_detail(
-    data_dir: &SinomoDataDir,
+    catalog_vfs: &VfsHandle,
     skill_id: &str,
     version: Option<&str>,
 ) -> Result<SkillDetail, String> {
-    let store =
-        SkillCatalogSifsStore::open(Some(data_dir.root())).map_err(|error| error.to_string())?;
+    let store = SkillCatalogSifsStore::from_vfs(catalog_vfs.clone());
     let catalog = store.load_catalog().map_err(|error| error.to_string())?;
     let entry = select_skill_entry_for_app(&catalog, skill_id, version)?;
     let text = store
         .read_skill_text(&entry)
         .map_err(|error| error.to_string())?
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            format!(
+                "skill `{}@{}` catalog entry references missing content at {}",
+                entry.skill_id, entry.version, entry.sifs_path
+            )
+        })?;
     Ok(SkillDetail::from_entry(
         &entry,
         skill_entry_is_active_for_app(&catalog, &entry),
@@ -6711,13 +6824,12 @@ pub fn import_skill(
 
 /// Export a catalog skill as a portable Agent Skills package.
 pub fn export_skill(
-    data_dir: &SinomoDataDir,
+    catalog_vfs: &VfsHandle,
     skill_id: &str,
     version: Option<&str>,
     output: Option<&Path>,
 ) -> Result<SkillMutationResult, String> {
-    let store =
-        SkillCatalogSifsStore::open(Some(data_dir.root())).map_err(|error| error.to_string())?;
+    let store = SkillCatalogSifsStore::from_vfs(catalog_vfs.clone());
     let catalog = store.load_catalog().map_err(|error| error.to_string())?;
     let entry = select_skill_entry_for_app(&catalog, skill_id, version)?;
     let package = store
@@ -7801,7 +7913,7 @@ impl RemoteSifsBrowser {
     }
 
     fn stat(&self, path: &str) -> Result<SifsObjectDetails, String> {
-        let response: sinomo_runtime::api::DaemonDfsBrowserStatResponse = self.read_rpc(
+        let response: sinomo_runtime::api::DaemonDfsBrowserStatOutcomeResponse = self.read_rpc(
             sinomo_runtime::api::DAEMON_DFS_BROWSER_STAT_ROUTE,
             &sinomo_runtime::api::DaemonDfsBrowserStatRequest {
                 path: path.to_string(),
@@ -7811,6 +7923,7 @@ impl RemoteSifsBrowser {
                 max_staleness_millis: 250,
             },
         )?;
+        let response = response.into_result().map_err(|error| error.to_string())?;
         Ok(sifs_details_from_rpc(response))
     }
 
@@ -7821,7 +7934,7 @@ impl RemoteSifsBrowser {
                 path: path.to_string(),
             },
         )?;
-        Ok(response.bytes)
+        response.into_result().map_err(|error| error.to_string())
     }
 
     fn read_object_version(
@@ -7852,10 +7965,8 @@ impl RemoteSifsBrowser {
                 max_bytes,
             },
         )?;
-        Ok(SifsFileRead {
-            bytes: response.bytes,
-            truncated: response.truncated,
-        })
+        let (bytes, truncated) = response.into_result().map_err(|error| error.to_string())?;
+        Ok(SifsFileRead { bytes, truncated })
     }
 
     fn read_files(
@@ -7872,12 +7983,9 @@ impl RemoteSifsBrowser {
             .files
             .into_iter()
             .map(|file| {
-                let result = match (file.bytes, file.error) {
-                    (Some(bytes), _) => Ok(bytes),
-                    (_, Some(error)) => Err(error),
-                    (None, None) => Err("daemon returned no bytes".to_string()),
-                };
-                (file.path, result)
+                let path = file.path.clone();
+                let result = file.into_result().map_err(|error| error.to_string());
+                (path, result)
             })
             .collect())
     }
@@ -8588,7 +8696,18 @@ fn daemon_sort_direction_from_sifs(
 }
 
 fn sifs_error_is_not_found(error: &str) -> bool {
-    error.contains("not found:")
+    error.starts_with("SIFS path not found:")
+}
+
+fn channel_optional_bulk_read_bytes(
+    path: &str,
+    result: Result<Vec<u8>, String>,
+) -> Result<Option<Vec<u8>>, AgentChannelStoreError> {
+    match result {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(detail) if sifs_error_is_not_found(&detail) => Ok(None),
+        Err(detail) => Err(channel_store_io(path, detail)),
+    }
 }
 
 fn normalize_sifs_browser_path(path: &str) -> Result<String, String> {
@@ -8651,6 +8770,225 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(ids, vec!["coding-agent", "main-agent"]);
+    }
+
+    #[test]
+    fn app_catalog_summaries_use_the_supplied_read_transport() {
+        let root = sinomo_testdir::TestDir::new("app-catalog-read-vfs");
+        let vfs = VfsHandle::memory();
+
+        let agents = agent_summaries(&vfs);
+        let skills = skill_summaries(&vfs, true).expect("empty memory skill catalog");
+
+        assert!(agents.iter().any(|agent| agent.key == "main-agent"));
+        assert!(skills.is_empty());
+        assert!(
+            !root.join("dfs").exists(),
+            "app summary reads must not construct a mounted DFS from a data directory"
+        );
+    }
+
+    #[test]
+    fn daemonless_chat_resolution_uses_built_ins_but_rejects_custom_keys() {
+        let root = sinomo_testdir::TestDir::new("daemonless-chat-agent-resolution");
+        let vfs = VfsHandle::memory();
+
+        let built_in = resolve_agent(&vfs, false, "coding-agent")
+            .expect("built-in resolution must not require daemon SIFS")
+            .expect("coding agent");
+        assert_eq!(built_in.key(), "coding-agent");
+
+        let error = resolve_agent(&vfs, false, "custom-agent")
+            .expect_err("custom agent resolution requires resident daemon SIFS");
+        assert!(error.to_string().contains("resident daemon SIFS catalog"));
+        assert!(
+            !root.join("dfs").exists(),
+            "daemonless exact resolution must not construct local DFS state"
+        );
+    }
+
+    #[test]
+    fn connected_gui_chat_rejects_a_missing_resident_sifs_transport_before_local_mount() {
+        let root = sinomo_testdir::TestDir::new("connected-chat-missing-resident-sifs");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+
+        let error = match AgentChat::with_runtime_control_registry(
+            data_dir.clone(),
+            true,
+            AgentRuntimeControlRegistry::new(),
+        ) {
+            Ok(_) => panic!("connected chat must require resident daemon SIFS storage"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("resident daemon SIFS storage transport")
+        );
+        assert!(
+            !data_dir.root().join("dfs").exists(),
+            "a missing connected transport must fail before mounting local DFS"
+        );
+    }
+
+    #[test]
+    fn gui_chat_runtime_loads_resident_skill_instructions_and_resources_without_local_dfs() {
+        let root = sinomo_testdir::TestDir::new("app-chat-runtime-resident-skills");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let vfs = VfsHandle::memory();
+        let markdown = "---\nname: resident-gui-skill\ndescription: Exercise resident GUI loading.\n---\n\n# Resident GUI skill\nFollow the resident instructions.\n";
+        let resource = sinomo_agent::AgentSkillPackageFile {
+            relative_path: "references/checklist.md".to_string(),
+            bytes: b"# Checklist\nVerify resident resources.\n".to_vec(),
+        };
+        let write = SkillCatalogWrite::from_agent_skill_package(
+            None,
+            "1.0.0",
+            SkillCatalogSource::user("gui-runtime-test"),
+            sinomo_agent::AgentSkillPackage {
+                markdown: markdown.to_string(),
+                files: vec![resource.clone()],
+            },
+        )
+        .expect("skill package")
+        .activate_for_scope(
+            SkillActivationScope::Cluster.as_str(),
+            "test",
+            "GUI runtime regression",
+        );
+        let entry = write.entry.clone();
+        let key = sinomo_agent::skill_catalog_entry_text_key(&entry);
+        SkillCatalogSifsStore::from_vfs(vfs.clone())
+            .write_skill_version(write)
+            .expect("persist resident skill");
+        assert!(!data_dir.root().join("dfs").exists());
+
+        let handler = tui::app_build_chat_handler(&data_dir, true, Some(vfs))
+            .expect("GUI chat handler with resident skill catalog");
+        let (catalog, texts, resources) = tui::app_runtime_skill_catalog_for_test(&handler);
+
+        assert!(catalog.entry("resident-gui-skill", "1.0.0").is_some());
+        assert_eq!(texts.get(&key).map(String::as_str), Some(markdown));
+        assert_eq!(resources.get(&key), Some(&vec![resource]));
+        assert!(
+            !data_dir.root().join("dfs").exists(),
+            "resident GUI catalog loading must not mount process-local DFS state"
+        );
+    }
+
+    #[test]
+    fn gui_chat_runtime_rejects_missing_resident_skill_package() {
+        let root = sinomo_testdir::TestDir::new("app-chat-runtime-missing-skill");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let vfs = VfsHandle::memory();
+        let write = SkillCatalogWrite::from_markdown_skill(
+            None,
+            "1.0.0",
+            SkillCatalogSource::user("gui-runtime-test"),
+            "---\nname: missing-gui-skill\ndescription: Must fail closed.\n---\n\n# Missing GUI skill\n",
+        )
+        .expect("skill write");
+        let skill_path = write.entry.sifs_path.clone();
+        SkillCatalogSifsStore::from_vfs(vfs.clone())
+            .write_skill_version(write)
+            .expect("persist skill fixture");
+        vfs.remove(&skill_path)
+            .expect("remove referenced package text");
+
+        let error = match tui::app_build_chat_handler(&data_dir, true, Some(vfs)) {
+            Ok(_) => panic!("GUI runtime must reject a missing referenced package"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("references missing package content")
+        );
+        assert!(!data_dir.root().join("dfs").exists());
+    }
+
+    #[test]
+    fn gui_chat_runtime_rejects_malformed_resident_skill_package() {
+        let root = sinomo_testdir::TestDir::new("app-chat-runtime-malformed-skill");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let vfs = VfsHandle::memory();
+        let write = SkillCatalogWrite::from_markdown_skill(
+            None,
+            "1.0.0",
+            SkillCatalogSource::user("gui-runtime-test"),
+            "---\nname: malformed-gui-skill\ndescription: Must fail closed.\n---\n\n# Malformed GUI skill\n",
+        )
+        .expect("skill write");
+        let skill_path = write.entry.sifs_path.clone();
+        SkillCatalogSifsStore::from_vfs(vfs.clone())
+            .write_skill_version(write)
+            .expect("persist skill fixture");
+        vfs.write(&skill_path, b"not-a-sinomo-object")
+            .expect("corrupt referenced package");
+
+        let error = match tui::app_build_chat_handler(&data_dir, true, Some(vfs)) {
+            Ok(_) => panic!("GUI runtime must reject malformed referenced packages"),
+            Err(error) => error,
+        };
+
+        assert!(!error.to_string().is_empty());
+        assert!(!data_dir.root().join("dfs").exists());
+    }
+
+    #[test]
+    fn agent_channel_bulk_loader_skips_only_typed_confirmed_absence() {
+        let missing = sinomo_runtime::api::DaemonDfsBrowserFileRead::not_found(
+            "/services/sinomo-agent/channels/missing.json",
+        )
+        .into_result()
+        .expect_err("typed missing item")
+        .to_string();
+        assert!(
+            channel_optional_bulk_read_bytes(
+                "/services/sinomo-agent/channels/missing.json",
+                Err(missing),
+            )
+            .expect("confirmed absence is optional")
+            .is_none()
+        );
+
+        let unavailable = sinomo_runtime::api::DaemonDfsBrowserFileRead::content_unavailable(
+            "/services/sinomo-agent/channels/present.json",
+            "content source returned not found: authoritative metadata still exists",
+        )
+        .into_result()
+        .expect_err("typed unavailable item")
+        .to_string();
+        assert!(
+            channel_optional_bulk_read_bytes(
+                "/services/sinomo-agent/channels/present.json",
+                Err(unavailable),
+            )
+            .is_err(),
+            "metadata-present content unavailability must fail the hydration"
+        );
+
+        let legacy = sinomo_runtime::api::DaemonDfsBrowserFileRead {
+            path: "/services/sinomo-agent/channels/legacy.json".to_string(),
+            bytes: None,
+            error: Some(
+                "SIFS path not found: /services/sinomo-agent/channels/legacy.json".to_string(),
+            ),
+            failure: None,
+        }
+        .into_result()
+        .expect_err("legacy untyped failure")
+        .to_string();
+        assert!(
+            channel_optional_bulk_read_bytes(
+                "/services/sinomo-agent/channels/legacy.json",
+                Err(legacy),
+            )
+            .is_err(),
+            "a new client must fail closed against an old daemon's untyped error"
+        );
     }
 
     #[test]
@@ -9730,6 +10068,7 @@ mod tests {
             store.save_channel(&channel).expect("save durable channel");
 
             let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+            chat.use_injected_authoritative_agent_catalog_for_test();
             assert_eq!(chat.runtime_info().agent, "main-agent");
             chat.resume_session(&channel_id.to_string(), &[])
                 .expect("resume durable group channel");
@@ -9813,6 +10152,7 @@ mod tests {
         store.save_channel(&channel).expect("save durable channel");
 
         let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        chat.use_injected_authoritative_agent_catalog_for_test();
         chat.resume_session(&channel_id.to_string(), &[])
             .expect("resume durable group channel");
         chat.set_tool_runtime_node(Some("updated-node".to_string()))
@@ -9960,6 +10300,7 @@ mod tests {
         store.save_channel(&channel).expect("save durable channel");
 
         let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        chat.use_injected_authoritative_agent_catalog_for_test();
         chat.resume_session(&channel_id.to_string(), &[])
             .expect("resume durable group channel");
         let steering = chat.steer("focus on correctness").expect("queue steering");
@@ -10002,10 +10343,14 @@ mod tests {
         };
         let checkpoint_store =
             SifsAgentSessionCheckpointStore::open(&data_dir).expect("checkpoint store");
+        let agent_catalog_vfs =
+            sinomo_runtime::vfs::mounted_sifs(Some(data_dir.root())).expect("agent catalog VFS");
         let chat = AgentChat::with_runtime_control_registry_and_stores(
             data_dir,
             false,
             AgentRuntimeControlRegistry::new(),
+            agent_catalog_vfs,
+            false,
             Box::new(channel_store),
             checkpoint_store,
         )
@@ -10604,10 +10949,14 @@ mod tests {
             .save_session(&seeded)
             .expect("save device A canonical session");
 
+        let agent_catalog_vfs_a = sinomo_runtime::vfs::mounted_sifs(Some(data_dir_a.root()))
+            .expect("device A agent catalog VFS");
         let mut chat_a = AgentChat::with_runtime_control_registry_and_stores(
             data_dir_a.clone(),
             false,
             AgentRuntimeControlRegistry::new(),
+            agent_catalog_vfs_a,
+            false,
             Box::new(
                 SifsAgentChannelStore::open(&data_dir_a)
                     .expect("reopen shared channel store for A"),
@@ -10682,10 +11031,14 @@ mod tests {
                 .is_none(),
             "device B starts without a node-local canonical session"
         );
+        let agent_catalog_vfs_b = sinomo_runtime::vfs::mounted_sifs(Some(data_dir_b.root()))
+            .expect("device B agent catalog VFS");
         let mut chat_b = AgentChat::with_runtime_control_registry_and_stores(
             data_dir_b.clone(),
             false,
             AgentRuntimeControlRegistry::new(),
+            agent_catalog_vfs_b,
+            false,
             Box::new(
                 SifsAgentChannelStore::open(&data_dir_a).expect("open shared channel store for B"),
             ),
@@ -10730,6 +11083,7 @@ mod tests {
             .expect("save agent definition");
 
         let mut chat = AgentChat::new(data_dir, false).expect("chat runtime");
+        chat.use_injected_authoritative_agent_catalog_for_test();
         let error = chat
             .set_agent("worker-agent")
             .expect_err("placement cannot be silently ignored");
@@ -11024,6 +11378,7 @@ mod tests {
         store.save_channel(&channel).expect("save channel");
 
         let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        chat.use_injected_authoritative_agent_catalog_for_test();
         chat.resume_session(&channel_id.to_string(), &[])
             .expect("resume channel");
         let outer_agent = chat.runtime_info().agent;

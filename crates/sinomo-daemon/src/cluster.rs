@@ -1,6 +1,7 @@
 use crate::client::{
     cancel_cluster_kv_watch_from_endpoint_async, drain_cluster_kv_watch_from_endpoint_async,
     fetch_cluster_kv_local_snapshot_from_endpoint_async,
+    materialize_daemon_client_value_call_with_options,
     start_cluster_kv_authoritative_watch_from_endpoint_async,
 };
 #[cfg(test)]
@@ -78,7 +79,7 @@ use sinomo_rollout::{
     SelfRolloutPaths, cluster_rollout_progress_status, read_rollout_status, write_rollout_status,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -291,7 +292,6 @@ pub(crate) struct ClusterConnectivityPendingPublish {
 #[derive(Default)]
 pub(crate) struct ClusterNetworkMaintenancePendingWork {
     publish_claimed: bool,
-    publish_planning_failed: bool,
     probe_claimed: bool,
     connectivity_publish_claimed: bool,
     connectivity_publish: Option<ClusterConnectivityPendingPublish>,
@@ -358,6 +358,7 @@ struct ClusterNodeStatusPendingOutcome {
 /// Owns a separately scheduled daemon operation and aborts it when its caller
 /// is cancelled. This keeps task boundaries from detaching uncertain cluster
 /// mutations when an enclosing deadline expires.
+#[derive(Debug)]
 struct OwnedDaemonTask<T> {
     task: Option<tokio::task::JoinHandle<T>>,
 }
@@ -375,6 +376,13 @@ impl<T> OwnedDaemonTask<T> {
             .await;
         self.task.take();
         result
+    }
+
+    #[cfg(test)]
+    fn is_finished(&self) -> bool {
+        self.task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
     }
 }
 
@@ -432,12 +440,17 @@ fn owner_runtime_handle_can_block(runtime: &tokio::runtime::Handle) -> bool {
 
 const OWNER_RUNTIME_NOT_BLOCKABLE_DETAIL: &str = "daemon cluster owner-runtime bridge requires a multi-threaded owner runtime; blocking on an undriven current-thread Tokio runtime handle would deadlock — use the async cluster API";
 
-fn block_on_cluster_network_future_on_owner_runtime<F, T>(
+type ClusterNetworkOwnerRuntimeFuture<'a, T> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<T, sinomo_core::network::NetworkError>> + Send + 'a,
+    >,
+>;
+
+fn block_on_cluster_network_future_on_owner_runtime<T>(
     runtime: &tokio::runtime::Handle,
-    future: F,
+    future: ClusterNetworkOwnerRuntimeFuture<'_, T>,
 ) -> Result<T, sinomo_core::network::NetworkError>
 where
-    F: std::future::Future<Output = Result<T, sinomo_core::network::NetworkError>> + Send,
     T: Send,
 {
     if !owner_runtime_handle_can_block(runtime) {
@@ -462,12 +475,23 @@ where
     runtime.block_on(future)
 }
 
-fn block_on_daemon_cluster_future_on_owner_runtime<F, T>(
+type DaemonClusterOwnerRuntimeFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, DaemonError>> + Send + 'a>>;
+
+/// Cross the synchronous daemon/cluster boundary with the composed async
+/// state machine resident on the heap.
+///
+/// Several authority operations compose Raft forwarding, routed transport,
+/// and response decoding futures. Accepting their concrete future type here
+/// made `Handle::block_on` retain that complete state machine in a Tokio
+/// blocking worker's stack frame. Keep the trait-object boundary in the type
+/// signature so new synchronous callers cannot accidentally restore that
+/// stack amplification.
+fn block_on_daemon_cluster_future_on_owner_runtime<T>(
     runtime: &tokio::runtime::Handle,
-    future: F,
+    future: DaemonClusterOwnerRuntimeFuture<'_, T>,
 ) -> Result<T, DaemonError>
 where
-    F: std::future::Future<Output = Result<T, DaemonError>> + Send,
     T: Send,
 {
     if !owner_runtime_handle_can_block(runtime) {
@@ -1288,16 +1312,30 @@ pub(crate) fn handle_daemon_cluster_kv_snapshot(
 
 pub(crate) fn prune_local_cluster_raft_uncommitted_tail(
     paths: &DaemonPaths,
-) -> Result<(), DaemonError> {
+) -> Result<bool, DaemonError> {
+    if crate::daemon_paths_are_shadow(paths) {
+        return Ok(false);
+    }
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
     let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths) else {
-        return Ok(());
+        return Ok(false);
     };
     cluster_paths
         .kv_paths()
         .locked_discard_raft_uncommitted_tail(&state.local_node_id)
-        .map(|_| ())?;
-    Ok(())
+        .map(|_| true)
+        .map_err(Into::into)
+}
+
+/// Installs the process-wide storage backstop for the shadow role before any
+/// routing, authentication, service, or maintenance component can touch KV.
+pub(crate) fn deny_shadow_daemon_local_raft_access(paths: &DaemonPaths) -> Result<(), DaemonError> {
+    if !crate::daemon_paths_are_shadow(paths) {
+        return Ok(());
+    }
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    sinomo_core::kv::deny_process_local_raft_access_for_root(cluster_paths.kv_paths().raft)
+        .map_err(Into::into)
 }
 
 pub(crate) async fn handle_daemon_cluster_kv_request_async_on_runtime_with_timeouts(
@@ -1382,33 +1420,87 @@ pub(crate) async fn handle_daemon_cluster_kv_authoritative_range_prefix_request_
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<sinomo_core::kv::KvEntry>>, DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    let timeouts = cluster_control_plane_timeouts();
     let task_runtime = runtime.clone();
     let mut task = OwnedDaemonTask::new(runtime.spawn(async move {
-        let mut state = sinomo_core::cluster::read_cluster_state_without_kv_async(
-            &task_runtime,
+        read_cluster_kv_authoritative_range_prefix_with_cluster_paths_async_on_runtime(
             &cluster_paths,
-        )
-        .await?;
-        let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
-            DaemonClusterRpcMode::from_handle(&task_runtime),
-            timeouts,
-        );
-        sinomo_core::cluster::read_cluster_kv_authoritative_range_prefix_async_with_host(
-            &task_runtime,
-            &cluster_paths,
-            &mut state,
             prefix,
-            timeouts.kv_txn_quorum_options(allow_forwarding),
-            &mut host,
+            allow_forwarding,
+            &task_runtime,
         )
         .await
-        .map_err(DaemonError::from)
     }));
     task.join().await.map_err(|source| DaemonError::Network {
         address: "cluster KV authoritative prefix read task".to_string(),
         detail: source.to_string(),
     })?
+}
+
+/// Read one bounded prefix through the daemon-owned Raft authority path
+/// without materializing or publishing the complete cluster KV snapshot.
+pub(crate) async fn read_cluster_kv_authoritative_range_prefix_with_cluster_paths_async_on_runtime(
+    cluster_paths: &ClusterPaths,
+    prefix: String,
+    allow_forwarding: bool,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<sinomo_core::kv::KvEntry>>, DaemonError> {
+    let timeouts = cluster_control_plane_timeouts();
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(timeouts.raft_append_timeout)
+        .unwrap_or(started);
+    let mut state = read_daemon_cluster_state_for_authority_before_deadline(
+        runtime,
+        cluster_paths,
+        deadline,
+        timeouts.raft_append_timeout,
+    )
+    .await?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(daemon_cluster_kv_authority_timeout(
+            timeouts.raft_append_timeout,
+        ));
+    }
+    let mut remaining_timeouts = timeouts;
+    remaining_timeouts.raft_append_timeout = remaining;
+    let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+        DaemonClusterRpcMode::from_handle(runtime),
+        remaining_timeouts,
+    );
+    let read = sinomo_core::cluster::read_cluster_kv_authoritative_range_prefix_async_with_host(
+        runtime,
+        cluster_paths,
+        &mut state,
+        prefix,
+        remaining_timeouts.kv_txn_quorum_options(allow_forwarding),
+        &mut host,
+    );
+    match tokio::time::timeout(remaining, read).await {
+        Ok(result) => result.map_err(DaemonError::from),
+        Err(_) => Err(daemon_cluster_kv_authority_timeout(
+            timeouts.raft_append_timeout,
+        )),
+    }
+}
+
+pub(crate) fn read_cluster_kv_authoritative_range_prefix_with_cluster_paths_on_runtime(
+    cluster_paths: &ClusterPaths,
+    prefix: String,
+    allow_forwarding: bool,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<sinomo_core::kv::KvEntry>>, DaemonError> {
+    block_on_daemon_cluster_future_on_owner_runtime(
+        runtime,
+        Box::pin(
+            read_cluster_kv_authoritative_range_prefix_with_cluster_paths_async_on_runtime(
+                cluster_paths,
+                prefix,
+                allow_forwarding,
+                runtime,
+            ),
+        ),
+    )
 }
 
 pub(crate) async fn handle_daemon_cluster_kv_authoritative_entry_request_async_on_runtime(
@@ -1445,6 +1537,153 @@ pub(crate) async fn handle_daemon_cluster_kv_authoritative_entry_request_async_o
         address: "cluster KV authoritative point read task".to_string(),
         detail: source.to_string(),
     })?
+}
+
+pub(crate) async fn handle_daemon_cluster_kv_authoritative_entries_request_async_on_runtime(
+    paths: &DaemonPaths,
+    keys: Vec<String>,
+    allow_forwarding: bool,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<Option<sinomo_core::kv::KvEntry>>>, DaemonError>
+{
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    let task_runtime = runtime.clone();
+    let mut task = OwnedDaemonTask::new(runtime.spawn(async move {
+        read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime(
+            &cluster_paths,
+            keys,
+            allow_forwarding,
+            &task_runtime,
+        )
+        .await
+    }));
+    task.join().await.map_err(|source| DaemonError::Network {
+        address: "cluster KV authoritative exact-key-set read task".to_string(),
+        detail: source.to_string(),
+    })?
+}
+
+/// Read one exact key set through the daemon-owned Raft authority path without
+/// materializing or publishing the complete cluster KV snapshot.
+pub(crate) async fn read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime(
+    cluster_paths: &ClusterPaths,
+    keys: Vec<String>,
+    allow_forwarding: bool,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<Option<sinomo_core::kv::KvEntry>>>, DaemonError>
+{
+    let timeouts = cluster_control_plane_timeouts();
+    read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime_with_timeouts(
+        cluster_paths,
+        keys,
+        allow_forwarding,
+        runtime,
+        timeouts,
+    )
+    .await
+}
+
+async fn read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime_with_timeouts(
+    cluster_paths: &ClusterPaths,
+    keys: Vec<String>,
+    allow_forwarding: bool,
+    runtime: &tokio::runtime::Handle,
+    timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
+) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<Option<sinomo_core::kv::KvEntry>>>, DaemonError>
+{
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(timeouts.raft_append_timeout)
+        .unwrap_or(started);
+    let mut state = read_daemon_cluster_state_for_authority_before_deadline(
+        runtime,
+        cluster_paths,
+        deadline,
+        timeouts.raft_append_timeout,
+    )
+    .await?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(daemon_cluster_kv_authority_timeout(
+            timeouts.raft_append_timeout,
+        ));
+    }
+    let mut remaining_timeouts = timeouts;
+    remaining_timeouts.raft_append_timeout = remaining;
+    let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+        DaemonClusterRpcMode::from_handle(runtime),
+        remaining_timeouts,
+    );
+    let read = sinomo_core::cluster::read_cluster_kv_authoritative_entries_async_with_host(
+        runtime,
+        cluster_paths,
+        &mut state,
+        keys,
+        remaining_timeouts.kv_txn_quorum_options(allow_forwarding),
+        &mut host,
+    );
+    match tokio::time::timeout(remaining, read).await {
+        Ok(result) => result.map_err(DaemonError::from),
+        Err(_) => Err(daemon_cluster_kv_authority_timeout(
+            timeouts.raft_append_timeout,
+        )),
+    }
+}
+
+fn daemon_cluster_kv_authority_timeout(timeout: Duration) -> DaemonError {
+    sinomo_core::network::NetworkError::timeout(
+        "load local cluster state for authoritative cluster KV read",
+        sinomo_core::network::NetworkTimeoutPhase::Overall,
+        timeout,
+        sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+    )
+    .into()
+}
+
+async fn read_daemon_cluster_state_for_authority_before_deadline(
+    runtime: &tokio::runtime::Handle,
+    cluster_paths: &ClusterPaths,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<ClusterBootstrapState, DaemonError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(daemon_cluster_kv_authority_timeout(timeout));
+    }
+    let task_paths = cluster_paths.clone();
+    let mut task = OwnedDaemonTask::new(runtime.spawn_blocking(move || {
+        sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&task_paths)
+            .map(|state| Arc::try_unwrap(state).unwrap_or_else(|state| (*state).clone()))
+    }));
+    match tokio::time::timeout(remaining, task.join()).await {
+        Ok(result) => result
+            .map_err(|source| DaemonError::Network {
+                address: "local cluster state authority-read task".to_string(),
+                detail: source.to_string(),
+            })?
+            .map_err(DaemonError::from),
+        Err(_) => Err(daemon_cluster_kv_authority_timeout(timeout)),
+    }
+}
+
+pub(crate) fn read_cluster_kv_authoritative_entries_with_cluster_paths_on_runtime(
+    cluster_paths: &ClusterPaths,
+    keys: Vec<String>,
+    allow_forwarding: bool,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<Option<sinomo_core::kv::KvEntry>>>, DaemonError>
+{
+    block_on_daemon_cluster_future_on_owner_runtime(
+        runtime,
+        Box::pin(
+            read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime(
+                cluster_paths,
+                keys,
+                allow_forwarding,
+                runtime,
+            ),
+        ),
+    )
 }
 
 pub(crate) async fn handle_daemon_cluster_kv_request_outcome_request_async_on_runtime(
@@ -1549,11 +1788,13 @@ pub(crate) fn handle_cluster_kv_txn_request_with_cluster_paths_on_runtime(
 ) -> Result<KvTxnResponse, DaemonError> {
     block_on_daemon_cluster_future_on_owner_runtime(
         runtime,
-        handle_cluster_kv_txn_request_with_cluster_paths_async_on_runtime(
-            cluster_paths,
-            txn,
-            allow_forwarding,
-            runtime,
+        Box::pin(
+            handle_cluster_kv_txn_request_with_cluster_paths_async_on_runtime(
+                cluster_paths,
+                txn,
+                allow_forwarding,
+                runtime,
+            ),
         ),
     )
 }
@@ -1943,8 +2184,10 @@ pub(crate) async fn forward_cluster_invite_challenge_to_cluster_state_authority_
                     sinomo_core::network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
                     challenge,
                 )?,
-                sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(
-                    sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
+                sinomo_core::cluster::main_daemon_cluster_rpc_options(
+                    sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(
+                        sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
+                    ),
                 ),
             )
             .await
@@ -2067,20 +2310,32 @@ fn call_node_object_rpc_on_runtime(
         detail: "cluster paths are unavailable for node object RPC".to_string(),
     })?;
     let mut host = DaemonObjectRpcAsyncHost::new(runtime, true).with_cluster_paths(&paths);
-    let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &paths);
-    block_on_cluster_network_future_on_owner_runtime(runtime, async {
-        client
-            .call_target(
-                state,
-                target_node_id,
-                sinomo_core::network::ObjectRpcCall::value(rpc_request.clone()),
-                options,
-            )
-            .await?
-            .into_materialized_value_response(usize::MAX)
-            .await
-    })
-    .map_err(DaemonError::from)
+    // This bridge is used by KV authority forwarding/snapshot refresh. The
+    // caller has already projected the exact Raft membership fence carried in
+    // `state`; resolving the route through the KV-backed directory would make
+    // recovery of that KV recursively depend on materializing it first.
+    let mut client =
+        sinomo_core::network::ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(
+            &mut host, &paths, state,
+        )?;
+    block_on_daemon_cluster_future_on_owner_runtime(
+        runtime,
+        Box::pin(materialize_daemon_client_value_call_with_options(
+            "cluster node object RPC value call",
+            options,
+            async {
+                client
+                    .call_target(
+                        state,
+                        target_node_id,
+                        sinomo_core::network::ObjectRpcCall::value(rpc_request.clone()),
+                        options,
+                    )
+                    .await
+                    .map_err(DaemonError::from)
+            },
+        )),
+    )
 }
 
 #[cfg(test)]
@@ -2125,49 +2380,6 @@ pub(crate) async fn publish_local_members_to_quorum_if_needed_async(
     )
     .await
     .map_err(Into::into)
-}
-
-pub(crate) fn refresh_cluster_kv_store_from_peers_on_runtime(
-    paths: &ClusterPaths,
-    runtime: &tokio::runtime::Handle,
-) -> Result<bool, DaemonError> {
-    let state = sinomo_core::cluster::read_cluster_state_without_kv(paths)?;
-    let timeouts = cluster_control_plane_timeouts();
-    let transport = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
-        DaemonClusterRpcMode::from_handle(runtime),
-        timeouts,
-    );
-    let mut host =
-        sinomo_core::cluster::ClusterControlPlaneDriver::with_timeouts(transport, timeouts);
-    match sinomo_core::cluster::refresh_current_cluster_kv_store_with_outcome(
-        paths,
-        &state,
-        timeouts.kv_snapshot_refresh_options(),
-        &mut host,
-    ) {
-        Ok(outcome) => Ok(outcome.fetched_remote),
-        Err(sinomo_core::network::NetworkError::ClusterReadOnly { .. }) => Ok(false),
-        Err(error) => Err(DaemonError::from(error)),
-    }
-}
-
-pub(crate) async fn refresh_cluster_kv_store_from_peers_async_on_runtime(
-    paths: &ClusterPaths,
-    runtime: &tokio::runtime::Handle,
-) -> Result<bool, DaemonError> {
-    let paths = paths.clone();
-    let error_path = paths.kv_paths().snapshot.display().to_string();
-    let runtime = runtime.clone();
-    let blocking_runtime = runtime.clone();
-    runtime
-        .spawn_blocking(move || {
-            refresh_cluster_kv_store_from_peers_on_runtime(&paths, &blocking_runtime)
-        })
-        .await
-        .map_err(|source| DaemonError::Io {
-            path: error_path,
-            detail: format!("cluster KV snapshot refresh task failed: {source}"),
-        })?
 }
 
 /// Installs the KV-backed cluster directory provider exactly once per process
@@ -2840,16 +3052,13 @@ async fn daemon_desired_rollout_optional_deadline(deadline: Option<Instant>) {
 fn daemon_desired_rollout_watch_targets(
     cluster_paths: &ClusterPaths,
 ) -> Result<Vec<ClusterEndpointRecord>, DaemonError> {
-    let state = sinomo_core::cluster::read_cluster_state_cached(cluster_paths)?;
-    let known_leader = cluster_paths
-        .kv_paths()
-        .known_raft_voter_leader_id(&state)?;
+    // This reactor runs in the shadow process. Select authority endpoints from
+    // the passive bootstrap projection and let the RPC path discover/forward
+    // to the current leader; a local leader lookup would open and retain the
+    // main voter's Raft store in the shadow.
+    let state = sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(cluster_paths)?;
     let mut targets = Vec::new();
-    let local_can_host = state.node_is_raft_voter(&state.local_node_id)
-        && known_leader
-            .as_ref()
-            .is_none_or(|leader_id| leader_id == &state.local_node_id);
-    if local_can_host {
+    if state.node_is_raft_voter(&state.local_node_id) {
         let data_dir = cluster_paths.root.parent().ok_or_else(|| DaemonError::Io {
             path: cluster_paths.root.display().to_string(),
             detail: "cluster paths have no data directory parent".to_string(),
@@ -2867,9 +3076,6 @@ fn daemon_desired_rollout_watch_targets(
         .try_select(ClusterEndpointSelectionPurpose::ClusterStateAuthority)?
     {
         if endpoint.node_id == state.local_node_id
-            || known_leader
-                .as_ref()
-                .is_some_and(|leader_id| leader_id != &endpoint.node_id)
             || targets.iter().any(|target| {
                 target.node_id == endpoint.node_id && target.address == endpoint.address
             })
@@ -2881,13 +3087,45 @@ fn daemon_desired_rollout_watch_targets(
     if targets.is_empty() {
         return Err(DaemonError::Network {
             address: "cluster rollout desired watch".to_string(),
-            detail: known_leader.map_or_else(
-                || "no KV voter endpoint is currently known".to_string(),
-                |leader_id| format!("known KV leader {leader_id} has no usable endpoint"),
-            ),
+            detail: "no KV voter endpoint is currently known".to_string(),
         });
     }
     Ok(targets)
+}
+
+type DaemonClusterStorageMutationGuard = tokio::sync::OwnedMutexGuard<()>;
+type LocalRaftResidentInitializationTaskOutput =
+    (Result<bool, DaemonError>, DaemonClusterStorageMutationGuard);
+
+#[derive(Debug)]
+enum LocalRaftResidentInitialization {
+    Pending,
+    InFlight(OwnedDaemonTask<LocalRaftResidentInitializationTaskOutput>),
+    Ready,
+}
+
+impl LocalRaftResidentInitialization {
+    fn from_startup(initialized: bool) -> Self {
+        if initialized {
+            Self::Ready
+        } else {
+            Self::Pending
+        }
+    }
+
+    fn is_in_flight(&self) -> bool {
+        matches!(self, Self::InFlight(_))
+    }
+
+    #[cfg(test)]
+    fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    #[cfg(test)]
+    fn in_flight_task_is_finished(&self) -> bool {
+        matches!(self, Self::InFlight(task) if task.is_finished())
+    }
 }
 
 #[derive(Debug)]
@@ -2900,6 +3138,11 @@ pub(crate) struct ClusterNetworkMaintenance {
     pub connectivity_converged: bool,
     pub environment_id: Option<String>,
     pub local_node_role: ClusterNodeRole,
+    /// Tracks the single cancellation-safe attempt that opens the local voter
+    /// through the canonical resident slot. The in-flight task owns the
+    /// storage-mutation guard, so a timed-out tick cannot detach a waiter or
+    /// expose the live paths to leave/quarantine before it is rejoined.
+    local_raft_resident_initialization: LocalRaftResidentInitialization,
     pub solo_cluster_idle: bool,
     pub startup_settle_until: Option<Instant>,
     pub tick: u64,
@@ -2958,8 +3201,8 @@ fn daemon_cluster_publish_interval_on_runtime(
 /// background maintenance tick, whose publishes commit into those same files.
 /// Without this, a leave racing a tick can quarantine files mid-commit or
 /// have the tick re-create state the leave just moved aside.
-static DAEMON_CLUSTER_STORAGE_MUTATION_LOCK: tokio::sync::Mutex<()> =
-    tokio::sync::Mutex::const_new(());
+static DAEMON_CLUSTER_STORAGE_MUTATION_LOCK: LazyLock<Arc<tokio::sync::Mutex<()>>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DaemonNodeStatusPublishPhase {
@@ -3039,7 +3282,10 @@ impl Drop for DaemonNodeStatusPublishPhaseObservation {
 }
 
 impl ClusterNetworkMaintenance {
-    pub async fn with_idle_stats(idle_stats: Arc<IdleStatsAtomics>) -> Self {
+    pub async fn with_idle_stats(
+        idle_stats: Arc<IdleStatsAtomics>,
+        startup_local_raft_resident_initialized: bool,
+    ) -> Self {
         let now = Instant::now();
         Self {
             discovery: AsyncMdnsDiscoverySocket::bind_default().await.ok(),
@@ -3049,6 +3295,9 @@ impl ClusterNetworkMaintenance {
             connectivity_converged: false,
             environment_id: None,
             local_node_role: ClusterNodeRole::default(),
+            local_raft_resident_initialization: LocalRaftResidentInitialization::from_startup(
+                startup_local_raft_resident_initialized,
+            ),
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
@@ -3092,6 +3341,59 @@ impl ClusterNetworkMaintenance {
         self
     }
 
+    async fn retry_main_local_raft_resident_initialization(
+        &mut self,
+        paths: &DaemonPaths,
+    ) -> Result<DaemonClusterStorageMutationGuard, DaemonError> {
+        if daemon_paths_are_shadow(paths)
+            || matches!(
+                &self.local_raft_resident_initialization,
+                LocalRaftResidentInitialization::Ready
+            )
+        {
+            return Ok(Arc::clone(&*DAEMON_CLUSTER_STORAGE_MUTATION_LOCK)
+                .lock_owned()
+                .await);
+        }
+
+        if matches!(
+            &self.local_raft_resident_initialization,
+            LocalRaftResidentInitialization::Pending
+        ) {
+            let storage_guard = Arc::clone(&*DAEMON_CLUSTER_STORAGE_MUTATION_LOCK)
+                .lock_owned()
+                .await;
+            let retry_paths = paths.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                let result = prune_local_cluster_raft_uncommitted_tail(&retry_paths);
+                crate::control::request_daemon_cluster_maintenance(
+                    crate::control::DaemonClusterMaintenanceReason::LifecycleWake,
+                );
+                (result, storage_guard)
+            });
+            self.local_raft_resident_initialization =
+                LocalRaftResidentInitialization::InFlight(OwnedDaemonTask::new(task));
+        }
+
+        let task_result = match &mut self.local_raft_resident_initialization {
+            LocalRaftResidentInitialization::InFlight(task) => task.join().await,
+            LocalRaftResidentInitialization::Pending | LocalRaftResidentInitialization::Ready => {
+                unreachable!("local Raft resident initialization task must be in flight")
+            }
+        };
+        // `join` removes the completed handle. Restore a retryable terminal
+        // state before propagating either the join or initialization error.
+        self.local_raft_resident_initialization = LocalRaftResidentInitialization::Pending;
+        let (initialized, storage_guard) = task_result.map_err(|source| DaemonError::Io {
+            path: paths.root.display().to_string(),
+            detail: format!("local Raft resident initialization task failed: {source}"),
+        })?;
+        if initialized? {
+            self.local_raft_resident_initialization = LocalRaftResidentInitialization::Ready;
+        }
+        Ok(storage_guard)
+    }
+
     pub async fn tick_async(
         &mut self,
         paths: &DaemonPaths,
@@ -3128,17 +3430,28 @@ impl ClusterNetworkMaintenance {
             && !self.probe_retry_waiting(now);
         let discovery_due = (due.discovery_due || self.discovery_retry_due(now))
             && !self.discovery_retry_waiting(now);
-        if !(publish_due || probe_due || discovery_due || connectivity_publish_retry_due) {
+        let scheduled_work_due =
+            publish_due || probe_due || discovery_due || connectivity_publish_retry_due;
+        if !scheduled_work_due && !self.local_raft_resident_initialization.is_in_flight() {
             return Ok(None);
         }
-        self.claim_due_classes(
-            now,
-            publish_due,
-            probe_due,
-            discovery_due,
-            connectivity_publish_retry_due,
-        );
-        let _storage_guard = DAEMON_CLUSTER_STORAGE_MUTATION_LOCK.lock().await;
+        if scheduled_work_due {
+            self.claim_due_classes(
+                now,
+                publish_due,
+                probe_due,
+                discovery_due,
+                connectivity_publish_retry_due,
+            );
+        }
+        let _storage_guard = self
+            .retry_main_local_raft_resident_initialization(paths)
+            .await?;
+        // A completion wake only harvests the one retained initializer and
+        // releases its mutation fence. It must not create unscheduled work.
+        if !scheduled_work_due {
+            return Ok(None);
+        }
         let mut pending_work = ClusterNetworkMaintenancePendingWork::default();
 
         let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
@@ -3165,6 +3478,31 @@ impl ClusterNetworkMaintenance {
             if discovery_due {
                 self.last_discovery = now;
             }
+            self.complete_all_active_due_claims();
+            return Ok(None);
+        }
+
+        // The shadow observes the bootstrap projection for passive topology
+        // context only. It must return before discovery writes, KV-backed
+        // reads, local voter repair, publication, or authority-bearing work.
+        if daemon_paths_are_shadow(paths) {
+            self.idle_stats.incr_disk_reads_cluster_state();
+            let state =
+                sinomo_core::cluster::read_cluster_state_without_kv_async(&runtime, &cluster_paths)
+                    .await
+                    .map_err(DaemonError::from)?;
+            self.local_node_role = sinomo_core::network::cluster_local_node_role(&state);
+            if publish_due {
+                self.last_publish = now;
+            }
+            if probe_due {
+                self.last_probe = now;
+            }
+            if discovery_due {
+                self.last_discovery = now;
+            }
+            self.settle_connectivity_without_publication();
+            self.solo_cluster_idle = sinomo_core::network::cluster_is_settled_solo(&state);
             self.complete_all_active_due_claims();
             return Ok(None);
         }
@@ -3248,21 +3586,6 @@ impl ClusterNetworkMaintenance {
         {
             self.startup_settle_until = now.checked_add(DAEMON_CLUSTER_STARTUP_SETTLE_DURATION);
         }
-        if daemon_paths_are_shadow(paths) {
-            if publish_due {
-                self.last_publish = now;
-            }
-            if probe_due {
-                self.last_probe = now;
-            }
-            if discovery_due {
-                self.last_discovery = now;
-            }
-            self.settle_connectivity_without_publication();
-            self.solo_cluster_idle = sinomo_core::network::cluster_is_settled_solo(&state);
-            self.complete_all_active_due_claims();
-            return Ok(None);
-        }
         let state_before_maintenance = state.clone();
         let mut discovered = false;
 
@@ -3335,23 +3658,12 @@ impl ClusterNetworkMaintenance {
 
         if publish_due {
             self.last_publish = now;
-            let mut publish_failed = false;
             // Default DFS is derived control-plane state owned by its
             // committed-snapshot reactor. A generic network publication tick
             // must never poll or republish DFS state.
             if cluster_is_solo {
                 // no-op: nothing to publish to absent peers
             } else if sinomo_core::kv::cluster_kv_raft_local_is_voter(&state) {
-                if !sinomo_core::node::cluster_bootstrap_state_stable_eq(
-                    &state_before_maintenance,
-                    &state,
-                ) && let Err(error) =
-                    sync_cluster_state_to_kv_async_on_runtime(&cluster_paths, &state, &runtime)
-                        .await
-                {
-                    tracing::warn!("sinomo daemon cluster state publish failed: {error}");
-                    publish_failed = true;
-                }
                 self.idle_stats.incr_kv_publish_member();
                 pending_work
                     .member_publishes
@@ -3411,9 +3723,6 @@ impl ClusterNetworkMaintenance {
                         },
                     );
                 }
-            }
-            if publish_failed {
-                pending_work.publish_planning_failed = true;
             }
         }
 
@@ -3774,6 +4083,7 @@ fn reconcile_desired_rollout_record(
             host: desired
                 .host
                 .unwrap_or_else(|| SINOMO_DAEMON_DEFAULT_HOST.to_string()),
+            host_override: None,
             port: desired.port.unwrap_or(SINOMO_DAEMON_DEFAULT_PORT),
             shadow_port: desired
                 .shadow_port
@@ -3865,7 +4175,6 @@ impl ClusterNetworkMaintenance {
     ) {
         let ClusterNetworkMaintenancePendingWork {
             publish_claimed,
-            publish_planning_failed,
             probe_claimed,
             connectivity_publish_claimed,
             connectivity_publish,
@@ -3875,7 +4184,7 @@ impl ClusterNetworkMaintenance {
             low_priority_node_status_refreshes,
             service_instance_publish,
         } = pending;
-        let mut publish_succeeded = !publish_planning_failed;
+        let mut publish_succeeded = true;
         let mut publish_followup_needed = false;
         let mut presence_metadata_followup_needed = false;
         let mut probe_succeeded = true;
@@ -5243,12 +5552,12 @@ where
     let accepted_source_node_id = accepted_endpoint.node_id.clone();
     let result = block_on_cluster_network_future_on_owner_runtime(
         runtime,
-        import_accepted_join_connectivity_from_future_async(
+        Box::pin(import_accepted_join_connectivity_from_future_async(
             paths.clone(),
             state.clone(),
             runtime.clone(),
             fetch,
-        ),
+        )),
     );
     match result {
         Ok(imported) => {
@@ -6149,6 +6458,7 @@ pub(crate) fn sync_cluster_state_to_kv(
     sync_cluster_state_to_kv_on_runtime(paths, state, runtime.handle())
 }
 
+#[cfg(test)]
 pub(crate) fn sync_cluster_state_to_kv_on_runtime(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -6159,21 +6469,6 @@ pub(crate) fn sync_cluster_state_to_kv_on_runtime(
         state,
         &mut DaemonClusterMemberMutationHost::new_on_runtime(runtime),
     )
-    .map_err(Into::into)
-}
-
-pub(crate) async fn sync_cluster_state_to_kv_async_on_runtime(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    runtime: &tokio::runtime::Handle,
-) -> Result<KvSnapshot, DaemonError> {
-    sinomo_core::cluster::sync_cluster_state_to_kv_async_with_host(
-        runtime,
-        paths,
-        state,
-        &mut DaemonClusterMemberMutationHost::new_on_runtime(runtime),
-    )
-    .await
     .map_err(Into::into)
 }
 
@@ -6207,7 +6502,10 @@ async fn fetch_local_cluster_health_rows_from_member_async(
         state,
         member,
         &request,
-        CLUSTER_HEALTH_PEER_ROWS_TIMEOUT,
+        sinomo_core::cluster::main_daemon_cluster_rpc_options(
+            sinomo_core::network::ClusterObjectRpcOptions::default()
+                .with_overall_timeout(CLUSTER_HEALTH_PEER_ROWS_TIMEOUT),
+        ),
         runtime,
         "cluster health peer rows",
     )
@@ -6240,7 +6538,9 @@ async fn fetch_cluster_health_rows_from_member_without_recursive_peers_async(
         state,
         member,
         &request,
-        timeout,
+        sinomo_core::cluster::main_daemon_cluster_rpc_options(
+            sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
+        ),
         runtime,
         "cluster health peer view",
     )
@@ -6507,7 +6807,8 @@ async fn probe_member_routed_ping_status_async(
         state,
         member,
         &request,
-        CLUSTER_HEALTH_ROUTED_PING_TIMEOUT,
+        sinomo_core::network::ClusterObjectRpcOptions::default()
+            .with_overall_timeout(CLUSTER_HEALTH_ROUTED_PING_TIMEOUT),
         runtime,
         "cluster health routed ping probe",
     )
@@ -6610,7 +6911,7 @@ async fn call_member_object_rpc_target_async(
     state: &ClusterBootstrapState,
     member: &ClusterMemberRecord,
     request: &sinomo_core::network::ObjectRpcRequest,
-    timeout: Duration,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
     runtime: &tokio::runtime::Handle,
     operation: &str,
 ) -> Result<Option<sinomo_core::network::ObjectRpcResponse>, DaemonError> {
@@ -6621,7 +6922,7 @@ async fn call_member_object_rpc_target_async(
             state,
             &member.node_id,
             sinomo_core::network::ObjectRpcCall::value(request.clone()),
-            sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
+            options,
         )
         .await
     {
@@ -6800,7 +7101,7 @@ pub(crate) fn initialize_local_cluster_on_runtime(
     node_display_name: String,
     node_role: ClusterNodeRole,
     now: OffsetDateTime,
-    runtime: &tokio::runtime::Handle,
+    _runtime: &tokio::runtime::Handle,
 ) -> Result<ClusterBootstrapState, DaemonError> {
     paths.ensure()?;
     if paths.state.exists() {
@@ -6845,7 +7146,7 @@ pub(crate) fn initialize_local_cluster_on_runtime(
         refresh_local_daemon_membership(paths, &mut state, &main_options, &shadow_options, now)?;
     sinomo_core::cluster::write_cluster_state(paths, &state)?;
     daemon_locked_set_cluster_raft_leader(paths, &state.local_node_id, 1)?;
-    sync_cluster_state_to_kv_on_runtime(paths, &state, runtime)?;
+    sinomo_core::cluster::bootstrap_single_voter_cluster_state_to_local_kv(paths, &state)?;
     Ok(state)
 }
 
@@ -6881,7 +7182,10 @@ fn daemon_cluster_control_rpc_options(
         sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_IROH_FOREGROUND_ATTEMPT_TIMEOUT,
         sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_COMMAND_TIMEOUT,
     );
-    sinomo_core::network::ClusterObjectRpcOptions::new(health.into()).with_overall_timeout(timeout)
+    sinomo_core::cluster::main_daemon_cluster_rpc_options(
+        sinomo_core::network::ClusterObjectRpcOptions::new(health.into())
+            .with_overall_timeout(timeout),
+    )
 }
 
 /// Hostname-derived default display name for the local node.
@@ -7182,7 +7486,7 @@ fn handle_daemon_cluster_control_join_single_node_migration_on_runtime(
     // import window, like the leave handler: the tick must not commit into
     // storage being moved aside (this handler runs on a blocking service
     // thread, never on the async workers).
-    let _storage_guard = DAEMON_CLUSTER_STORAGE_MUTATION_LOCK.blocking_lock();
+    let _storage_guard = Arc::clone(&*DAEMON_CLUSTER_STORAGE_MUTATION_LOCK).blocking_lock_owned();
     let target_node_display_name = requested_node_display_name.or_else(|| {
         let source_name = source.local_node_display_name.trim();
         (!source_name.is_empty()).then(|| source_name.to_string())
@@ -7638,7 +7942,7 @@ pub(crate) fn handle_daemon_cluster_control_leave_on_runtime(
     // Hold the storage-mutation lock across quarantine + re-init so the
     // maintenance tick cannot commit into files being moved aside (this
     // handler runs on a blocking service thread, never on the async workers).
-    let _storage_guard = DAEMON_CLUSTER_STORAGE_MUTATION_LOCK.blocking_lock();
+    let _storage_guard = Arc::clone(&*DAEMON_CLUSTER_STORAGE_MUTATION_LOCK).blocking_lock_owned();
     let quarantine =
         if existing.is_some() || sinomo_core::cluster::cluster_storage_has_live_artifacts(&paths) {
             Some(sinomo_core::cluster::quarantine_cluster_storage_for_leave(
@@ -7934,14 +8238,14 @@ impl sinomo_core::cluster::ClusterLocalDaemonMembershipObserver
         let runtime_for_future = self.runtime.clone();
         let observation = block_on_daemon_cluster_future_on_owner_runtime(
             &self.runtime,
-            local_daemon_membership_observation_async(
+            Box::pin(local_daemon_membership_observation_async(
                 data_dir,
                 state,
                 &main_options,
                 &shadow_options,
                 timestamp,
                 &runtime_for_future,
-            ),
+            )),
         );
         observation
             .map(Some)
@@ -8144,6 +8448,40 @@ fn cluster_raft_vote_object_rpc_request(
     cluster_kv_object_rpc_request(payload).with_response_retry_safe()
 }
 
+/// Decode the response body inside the original Raft RPC budget. Routed calls
+/// return as soon as ownership of a streamed body transfers; without this
+/// outer boundary, a peer can send a prompt response head and then stall the
+/// consensus task indefinitely during body decoding.
+async fn decode_cluster_raft_rpc_before<T, F>(
+    operation: &'static str,
+    timeout: Duration,
+    call: F,
+) -> Result<T, sinomo_core::network::NetworkError>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+    F: std::future::Future<
+            Output = Result<
+                sinomo_core::network::ObjectRpcResult,
+                sinomo_core::network::NetworkError,
+            >,
+        >,
+{
+    match tokio::time::timeout(timeout, async move {
+        let response = call.await?;
+        response.decode_body().await
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(sinomo_core::network::NetworkError::timeout(
+            operation,
+            sinomo_core::network::NetworkTimeoutPhase::Overall,
+            timeout,
+            sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+        )),
+    }
+}
+
 async fn send_cluster_raft_append_routed_async(
     paths: &ClusterPaths,
     target_node_id: &NodeId,
@@ -8158,16 +8496,26 @@ async fn send_cluster_raft_append_routed_async(
     )?;
     call.request = call.request.with_response_retry_safe();
     let mut host = DaemonObjectRpcAsyncHost::new(runtime, true).with_cluster_paths(paths);
-    let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, paths);
-    let response = client
-        .call_target(
+    // Every Raft message carries the committed/projected membership fence that
+    // selected this target. Consensus traffic must not consult the dynamic KV
+    // directory whose contents it is responsible for replicating.
+    let mut client =
+        sinomo_core::network::ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(
+            &mut host,
+            paths,
+            &request.state,
+        )?;
+    decode_cluster_raft_rpc_before(
+        "cluster Raft append RPC",
+        timeout,
+        client.call_target(
             &request.state,
             target_node_id,
             call,
-            sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
-        )
-        .await?;
-    response.decode_body().await
+            daemon_main_routed_rpc_options(timeout),
+        ),
+    )
+    .await
 }
 
 fn send_cluster_raft_append_routed_on_runtime(
@@ -8179,7 +8527,13 @@ fn send_cluster_raft_append_routed_on_runtime(
 ) -> Result<ClusterRaftAppendResponse, sinomo_core::network::NetworkError> {
     block_on_cluster_network_future_on_owner_runtime(
         runtime,
-        send_cluster_raft_append_routed_async(paths, target_node_id, request, timeout, runtime),
+        Box::pin(send_cluster_raft_append_routed_async(
+            paths,
+            target_node_id,
+            request,
+            timeout,
+            runtime,
+        )),
     )
 }
 
@@ -8197,16 +8551,23 @@ async fn send_cluster_raft_vote_routed_async(
     )?;
     call.request = call.request.with_response_retry_safe();
     let mut host = DaemonObjectRpcAsyncHost::new(runtime, true).with_cluster_paths(paths);
-    let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, paths);
-    let response = client
-        .call_target(
+    let mut client =
+        sinomo_core::network::ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(
+            &mut host,
+            paths,
+            &request.state,
+        )?;
+    decode_cluster_raft_rpc_before(
+        "cluster Raft vote RPC",
+        timeout,
+        client.call_target(
             &request.state,
             target_node_id,
             call,
-            sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
-        )
-        .await?;
-    response.decode_body().await
+            daemon_main_routed_rpc_options(timeout),
+        ),
+    )
+    .await
 }
 
 fn send_cluster_raft_vote_routed_on_runtime(
@@ -8218,7 +8579,21 @@ fn send_cluster_raft_vote_routed_on_runtime(
 ) -> Result<ClusterRaftVoteResponse, sinomo_core::network::NetworkError> {
     block_on_cluster_network_future_on_owner_runtime(
         runtime,
-        send_cluster_raft_vote_routed_async(paths, target_node_id, request, timeout, runtime),
+        Box::pin(send_cluster_raft_vote_routed_async(
+            paths,
+            target_node_id,
+            request,
+            timeout,
+            runtime,
+        )),
+    )
+}
+
+fn daemon_main_routed_rpc_options(
+    timeout: Duration,
+) -> sinomo_core::network::ClusterObjectRpcOptions {
+    sinomo_core::cluster::main_daemon_cluster_rpc_options(
+        sinomo_core::network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
     )
 }
 
@@ -8379,6 +8754,13 @@ impl DaemonClusterControlPlaneTransport {
 }
 
 impl sinomo_core::cluster::ClusterControlPlaneTransport for DaemonClusterControlPlaneTransport {
+    fn replace_active_cluster_paths(
+        &mut self,
+        paths: Option<ClusterPaths>,
+    ) -> Option<ClusterPaths> {
+        std::mem::replace(&mut self.active_cluster_paths, paths)
+    }
+
     fn send_kv_replication(
         &mut self,
         endpoint: &ClusterEndpointRecord,
@@ -8403,6 +8785,79 @@ impl sinomo_core::cluster::ClusterControlPlaneTransport for DaemonClusterControl
         })
     }
 
+    fn send_kv_read_index_probes(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+        request: &ClusterKvReplicationRequest,
+        timeout: Duration,
+        required_acks: usize,
+    ) -> Result<
+        Vec<(
+            NodeId,
+            Result<ClusterKvReplicationResponse, sinomo_core::network::NetworkError>,
+        )>,
+        sinomo_core::network::NetworkError,
+    > {
+        let paths = self.cluster_paths_for_routed_control_rpc().ok_or_else(|| {
+            sinomo_core::network::NetworkError::Io {
+                operation: "concurrent cluster ReadIndex probes".to_string(),
+                detail: "cluster paths are unavailable for routed ReadIndex probes".to_string(),
+            }
+        })?;
+        let owner_runtime = self.rpc_mode.runtime().clone();
+        let runtime = owner_runtime.clone();
+        let request = std::sync::Arc::new(request.clone());
+        block_on_cluster_network_future_on_owner_runtime(
+            &owner_runtime,
+            Box::pin(async move {
+                let mut tasks = tokio::task::JoinSet::new();
+                for target in targets {
+                    let paths = paths.clone();
+                    let runtime = runtime.clone();
+                    let request = std::sync::Arc::clone(&request);
+                    tasks.spawn(async move {
+                        let result = send_cluster_raft_append_routed_async(
+                            &paths, &target, &request, timeout, &runtime,
+                        )
+                        .await;
+                        (target, result)
+                    });
+                }
+
+                let expected_term = request.append.term;
+                let mut accepted = 0_usize;
+                let mut outcomes = Vec::new();
+                let collect = tokio::time::timeout(timeout, async {
+                    while let Some(joined) = tasks.join_next().await {
+                        let (target, result) =
+                            joined.map_err(|source| sinomo_core::network::NetworkError::Io {
+                                operation: "join concurrent cluster ReadIndex probe".to_string(),
+                                detail: source.to_string(),
+                            })?;
+                        if result.as_ref().is_ok_and(|response| {
+                            response.accepted && response.append.term == expected_term
+                        }) {
+                            accepted = accepted.saturating_add(1);
+                        }
+                        outcomes.push((target, result));
+                        if accepted >= required_acks {
+                            break;
+                        }
+                    }
+                    Ok::<(), sinomo_core::network::NetworkError>(())
+                })
+                .await;
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                if let Ok(result) = collect {
+                    result?;
+                }
+                Ok(outcomes)
+            }),
+        )
+    }
+
     fn request_kv_state_authority_vote(
         &mut self,
         endpoint: &ClusterEndpointRecord,
@@ -8425,6 +8880,95 @@ impl sinomo_core::cluster::ClusterControlPlaneTransport for DaemonClusterControl
                 detail: error.to_string(),
             }
         })
+    }
+
+    fn request_kv_state_authority_votes_from_nodes(
+        &mut self,
+        state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+        request: &ClusterKvStateAuthorityVoteRequest,
+        timeout: Duration,
+        required_grants: usize,
+    ) -> Result<
+        Vec<(
+            NodeId,
+            Result<ClusterKvStateAuthorityVoteResponse, sinomo_core::network::NetworkError>,
+        )>,
+        sinomo_core::network::NetworkError,
+    > {
+        let paths = self.cluster_paths_for_routed_control_rpc().ok_or_else(|| {
+            sinomo_core::network::NetworkError::Io {
+                operation: "concurrent cluster Raft votes".to_string(),
+                detail: "cluster paths are unavailable for routed Raft votes".to_string(),
+            }
+        })?;
+        let owner_runtime = self.rpc_mode.runtime().clone();
+        let runtime = owner_runtime.clone();
+        let state = std::sync::Arc::new(state.clone());
+        let request = std::sync::Arc::new(request.clone());
+        block_on_cluster_network_future_on_owner_runtime(
+            &owner_runtime,
+            Box::pin(async move {
+                let mut tasks = tokio::task::JoinSet::new();
+                for target in targets {
+                    let paths = paths.clone();
+                    let runtime = runtime.clone();
+                    let request = std::sync::Arc::clone(&request);
+                    tasks.spawn(async move {
+                        let result = send_cluster_raft_vote_routed_async(
+                            &paths, &target, &request, timeout, &runtime,
+                        )
+                        .await;
+                        (target, result)
+                    });
+                }
+
+                let mut granted = 0_usize;
+                let mut outcomes = Vec::new();
+                let collect = tokio::time::timeout(timeout, async {
+                    while let Some(joined) = tasks.join_next().await {
+                        let (target, result) =
+                            joined.map_err(|source| sinomo_core::network::NetworkError::Io {
+                                operation: "join concurrent cluster Raft vote".to_string(),
+                                detail: source.to_string(),
+                            })?;
+                        if result.as_ref().is_ok_and(|response| {
+                            response.accepted
+                                && response.vote.vote_granted
+                                && response.vote.term == request.vote.term
+                        }) {
+                            granted = granted.saturating_add(1);
+                        }
+                        outcomes.push((target, result));
+                        if granted >= required_grants {
+                            // Capture every response that completed concurrently
+                            // with quorum, especially a mandatory higher term,
+                            // before cancelling genuinely outstanding RPCs.
+                            while let Some(joined) = tasks.try_join_next() {
+                                let (target, result) = joined.map_err(|source| {
+                                    sinomo_core::network::NetworkError::Io {
+                                        operation: "join ready concurrent cluster Raft vote"
+                                            .to_string(),
+                                        detail: source.to_string(),
+                                    }
+                                })?;
+                                outcomes.push((target, result));
+                            }
+                            break;
+                        }
+                    }
+                    Ok::<(), sinomo_core::network::NetworkError>(())
+                })
+                .await;
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                if let Ok(result) = collect {
+                    result?;
+                }
+                let _ = state;
+                Ok(outcomes)
+            }),
+        )
     }
 
     fn probe_cluster_state_authority(
@@ -8636,8 +9180,7 @@ impl sinomo_core::cluster::ClusterStateAuthorityReachabilityAsyncHost
                         crate::DAEMON_RPC_CATEGORY,
                         (),
                     )?,
-                    sinomo_core::network::ClusterObjectRpcOptions::default()
-                        .with_overall_timeout(timeout),
+                    daemon_main_routed_rpc_options(timeout),
                 )
                 .await;
             Ok(match result {
@@ -8674,6 +9217,84 @@ impl sinomo_core::cluster::ClusterKvTxnQuorumAsyncHost for DaemonClusterControlP
                 operation: "cluster raft vote".to_string(),
                 detail: "cluster paths are unavailable for routed node vote".to_string(),
             })
+        })
+    }
+
+    fn request_kv_state_authority_votes_async<'a>(
+        &'a mut self,
+        _state: &'a ClusterBootstrapState,
+        targets: Vec<NodeId>,
+        request: &'a ClusterKvStateAuthorityVoteRequest,
+        timeout: Duration,
+        required_grants: usize,
+    ) -> sinomo_core::network::ClusterMembershipRpcFuture<
+        'a,
+        Vec<(
+            NodeId,
+            Result<ClusterKvStateAuthorityVoteResponse, sinomo_core::network::NetworkError>,
+        )>,
+    > {
+        let runtime = self.rpc_mode.runtime().clone();
+        let paths = self.cluster_paths_for_routed_control_rpc();
+        let request = std::sync::Arc::new(request.clone());
+        Box::pin(async move {
+            let paths = paths.ok_or_else(|| sinomo_core::network::NetworkError::Io {
+                operation: "concurrent cluster Raft votes".to_string(),
+                detail: "cluster paths are unavailable for routed Raft votes".to_string(),
+            })?;
+            let mut tasks = tokio::task::JoinSet::new();
+            for target in targets {
+                let paths = paths.clone();
+                let runtime = runtime.clone();
+                let request = std::sync::Arc::clone(&request);
+                tasks.spawn(async move {
+                    let result = send_cluster_raft_vote_routed_async(
+                        &paths, &target, &request, timeout, &runtime,
+                    )
+                    .await;
+                    (target, result)
+                });
+            }
+            let mut granted = 0_usize;
+            let mut outcomes = Vec::new();
+            let collect = tokio::time::timeout(timeout, async {
+                while let Some(joined) = tasks.join_next().await {
+                    let (target, result) =
+                        joined.map_err(|source| sinomo_core::network::NetworkError::Io {
+                            operation: "join concurrent cluster Raft vote".to_string(),
+                            detail: source.to_string(),
+                        })?;
+                    if result.as_ref().is_ok_and(|response| {
+                        response.accepted
+                            && response.vote.vote_granted
+                            && response.vote.term == request.vote.term
+                    }) {
+                        granted = granted.saturating_add(1);
+                    }
+                    outcomes.push((target, result));
+                    if granted >= required_grants {
+                        while let Some(joined) = tasks.try_join_next() {
+                            let (target, result) = joined.map_err(|source| {
+                                sinomo_core::network::NetworkError::Io {
+                                    operation: "join ready concurrent cluster Raft vote"
+                                        .to_string(),
+                                    detail: source.to_string(),
+                                }
+                            })?;
+                            outcomes.push((target, result));
+                        }
+                        break;
+                    }
+                }
+                Ok::<(), sinomo_core::network::NetworkError>(())
+            })
+            .await;
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+            if let Ok(result) = collect {
+                result?;
+            }
+            Ok(outcomes)
         })
     }
 }
@@ -8973,8 +9594,10 @@ impl sinomo_core::cluster::ClusterKvCommittedFanoutAsyncHost
                         sinomo_core::kv::CLUSTER_KV_RPC_CATEGORY,
                         request,
                     )?,
-                    sinomo_core::network::ClusterObjectRpcOptions::default()
-                        .with_overall_timeout(timeout),
+                    sinomo_core::cluster::main_daemon_cluster_rpc_options(
+                        sinomo_core::network::ClusterObjectRpcOptions::default()
+                            .with_overall_timeout(timeout),
+                    ),
                 )
                 .await?;
             response.decode_body().await
@@ -9383,14 +10006,14 @@ fn local_daemon_membership_observation_from_daemon_paths_on_runtime(
     let runtime_for_future = runtime.clone();
     block_on_daemon_cluster_future_on_owner_runtime(
         runtime,
-        local_daemon_membership_observation_async(
+        Box::pin(local_daemon_membership_observation_async(
             data_dir,
             state,
             &main_options,
             &shadow_options,
             now,
             &runtime_for_future,
-        ),
+        )),
     )
 }
 
@@ -9463,14 +10086,14 @@ fn refresh_local_daemon_membership_on_runtime(
     let runtime_for_future = runtime.clone();
     let observation = block_on_daemon_cluster_future_on_owner_runtime(
         runtime,
-        local_daemon_membership_observation_async(
+        Box::pin(local_daemon_membership_observation_async(
             data_dir,
             state,
             main_options,
             shadow_options,
             timestamp,
             &runtime_for_future,
-        ),
+        )),
     )?;
     sinomo_core::cluster::refresh_local_daemon_membership_from_disk(paths, state, observation)
         .map_err(Into::into)
@@ -9679,6 +10302,128 @@ fn cluster_kv_txn_quorum_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn stalled_cluster_raft_response_body_error<T>(
+        operation: &'static str,
+        timeout: Duration,
+        response_head_delay: Duration,
+    ) -> (sinomo_core::network::NetworkError, Duration)
+    where
+        T: serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
+    {
+        let (body_sender, body) =
+            sinomo_core::network::ObjectRpcIncomingBody::test_channel(Some(16), 1);
+        let response = sinomo_core::network::ObjectRpcResponse::from_encoded_body(
+            "/test/stalled-cluster-raft-body",
+            Vec::new(),
+        );
+        let result =
+            sinomo_core::network::ObjectRpcResult::from_forwarded_body(response, body, true)
+                .expect("construct streamed Raft response");
+        let started_at = tokio::time::Instant::now();
+        let error = decode_cluster_raft_rpc_before::<T, _>(operation, timeout, async move {
+            tokio::time::sleep(response_head_delay).await;
+            Ok(result)
+        })
+        .await
+        .expect_err("a stalled streamed Raft body must time out");
+        // Keep the sending half alive through decode so the receiver genuinely
+        // stalls instead of observing an immediately closed test channel.
+        drop(body_sender);
+        (error, tokio::time::Instant::now() - started_at)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn raft_append_deadline_covers_a_stalled_streamed_response_body() {
+        let timeout = Duration::from_millis(80);
+        let (error, elapsed) =
+            stalled_cluster_raft_response_body_error::<ClusterRaftAppendResponse>(
+                "cluster Raft append RPC",
+                timeout,
+                Duration::from_millis(55),
+            )
+            .await;
+        assert_eq!(elapsed, timeout);
+        assert!(matches!(
+            error,
+            sinomo_core::network::NetworkError::Timeout {
+                ref operation,
+                phase: sinomo_core::network::NetworkTimeoutPhase::Overall,
+                timeout: actual_timeout,
+                delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+            } if operation == "cluster Raft append RPC" && actual_timeout == timeout
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn raft_vote_deadline_covers_a_stalled_streamed_response_body() {
+        let timeout = Duration::from_millis(80);
+        let (error, elapsed) = stalled_cluster_raft_response_body_error::<ClusterRaftVoteResponse>(
+            "cluster Raft vote RPC",
+            timeout,
+            Duration::from_millis(55),
+        )
+        .await;
+        assert_eq!(elapsed, timeout);
+        assert!(matches!(
+            error,
+            sinomo_core::network::NetworkError::Timeout {
+                ref operation,
+                phase: sinomo_core::network::NetworkTimeoutPhase::Overall,
+                timeout: actual_timeout,
+                delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+            } if operation == "cluster Raft vote RPC" && actual_timeout == timeout
+        ));
+    }
+
+    #[test]
+    fn exact_authority_bootstrap_load_is_bounded_while_blocking_pool_is_saturated() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("authority-read runtime");
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let blocker = runtime.spawn_blocking(move || {
+            entered_tx.send(()).expect("announce blocking owner");
+            release_rx.recv().expect("release blocking owner");
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocking pool owner started");
+
+        let root = sinomo_testdir::TestDir::new("daemon-exact-authority-bootstrap-deadline");
+        let data_dir = SinomoDataDir::new(root.path());
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let mut timeouts = cluster_control_plane_timeouts();
+        let timeout = Duration::from_millis(80);
+        timeouts.raft_append_timeout = timeout;
+        let started = Instant::now();
+        let result = runtime.block_on(
+            read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime_with_timeouts(
+                &cluster_paths,
+                vec!["/sifs/authority".to_string()],
+                false,
+                runtime.handle(),
+                timeouts,
+            ),
+        );
+        let elapsed = started.elapsed();
+
+        release_tx.send(()).expect("release blocking owner");
+        runtime.block_on(blocker).expect("join blocking owner");
+        let error = result.expect_err("queued bootstrap load must respect authority deadline");
+        assert!(
+            error.to_string().contains("after 80ms"),
+            "unexpected deadline error: {error}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(70) && elapsed < Duration::from_millis(500),
+            "blocking-pool saturation must consume only the original authority budget, elapsed {elapsed:?}"
+        );
+    }
 
     #[test]
     fn node_status_publish_observation_phase_labels_are_bounded_and_exhaustive() {
@@ -9992,9 +10737,10 @@ mod tests {
             .expect("caller runtime");
 
         let error = caller_runtime.block_on(async {
-            block_on_cluster_network_future_on_owner_runtime(owner_runtime.handle(), async {
-                Ok::<_, sinomo_core::network::NetworkError>(())
-            })
+            block_on_cluster_network_future_on_owner_runtime(
+                owner_runtime.handle(),
+                Box::pin(async { Ok::<_, sinomo_core::network::NetworkError>(()) }),
+            )
             .expect_err("cluster bridge must not spawn a helper thread")
         });
 
@@ -10165,6 +10911,7 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
@@ -10186,6 +10933,395 @@ mod tests {
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
         }
+    }
+
+    #[test]
+    fn main_raft_resident_initialization_retries_after_predecessor_lock_handoff() {
+        let (_root, cluster_paths, state) = seeded_single_node_cluster_for_publish_cache_test(
+            "main_raft_resident_initialization_handoff",
+        );
+        let data_dir =
+            SinomoDataDir::new(cluster_paths.root.parent().expect("cluster data directory"));
+        let daemon_paths = DaemonPaths::with_root(data_dir.root().join("daemon"));
+        daemon_paths.ensure().expect("daemon paths");
+        let wal_paths = cluster_paths
+            .kv_paths()
+            .raft_wal_paths(&state.local_node_id);
+        assert!(
+            sinomo_core::kv::evict_resident_raft_node_for_test(&wal_paths),
+            "fixture initialization must release its resident slot before the predecessor opens"
+        );
+
+        // Model the predecessor shadow that still owns node.lock while the
+        // replacement main performs its one-shot startup repair.
+        let predecessor = sinomo_core::kv::DurableRaftKvNode::open(
+            state.local_node_id.clone(),
+            wal_paths.clone(),
+        )
+        .expect("predecessor raft holder");
+        let startup_error = prune_local_cluster_raft_uncommitted_tail(&daemon_paths)
+            .expect_err("startup initialization must observe the predecessor lock");
+        assert!(
+            matches!(
+                startup_error,
+                DaemonError::Parse { ref detail } if detail.contains("raft node is busy")
+            ),
+            "unexpected startup initialization error: {startup_error}"
+        );
+
+        let runtime = daemon_cluster_test_runtime();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
+        assert!(matches!(
+            &maintenance.local_raft_resident_initialization,
+            LocalRaftResidentInitialization::Pending
+        ));
+        let retry_error = runtime
+            .block_on(maintenance.retry_main_local_raft_resident_initialization(&daemon_paths))
+            .expect_err("maintenance worker must observe the retained predecessor lock");
+        assert!(
+            matches!(
+                retry_error,
+                DaemonError::Parse { ref detail } if detail.contains("raft node is busy")
+            ),
+            "unexpected maintenance initialization error: {retry_error}"
+        );
+        assert!(matches!(
+            &maintenance.local_raft_resident_initialization,
+            LocalRaftResidentInitialization::Pending
+        ));
+        drop(predecessor);
+
+        runtime
+            .block_on(maintenance.retry_main_local_raft_resident_initialization(&daemon_paths))
+            .expect("maintenance retry after predecessor handoff");
+        assert!(maintenance.local_raft_resident_initialization.is_ready());
+        sinomo_core::kv::read_cluster_kv_resident_local_entry(
+            &cluster_paths.kv_paths(),
+            &state.local_node_id,
+            &sinomo_core::kv::cluster_kv_raft_config_key(),
+        )
+        .expect("readiness local entry uses the initialized resident");
+
+        // Once initialized, later maintenance ticks must not repeat the cold
+        // open. Evicting the test slot makes any accidental retry observable.
+        assert!(sinomo_core::kv::evict_resident_raft_node_for_test(
+            &wal_paths
+        ));
+        runtime
+            .block_on(maintenance.retry_main_local_raft_resident_initialization(&daemon_paths))
+            .expect("completed initialization remains a no-op");
+        assert!(
+            !sinomo_core::kv::evict_resident_raft_node_for_test(&wal_paths),
+            "completed initialization must not re-open the resident on a later tick"
+        );
+        assert!(matches!(
+            sinomo_core::kv::read_cluster_kv_resident_local_entry(
+                &cluster_paths.kv_paths(),
+                &state.local_node_id,
+                &sinomo_core::kv::cluster_kv_raft_config_key(),
+            ),
+            Err(sinomo_core::kv::KvError::Busy { .. })
+        ));
+    }
+
+    #[test]
+    fn cancelled_main_raft_resident_initialization_retains_one_waiter_and_storage_fence() {
+        let (_root, cluster_paths, state) = seeded_single_node_cluster_for_publish_cache_test(
+            "main_raft_resident_initialization_cancellation",
+        );
+        let data_dir =
+            SinomoDataDir::new(cluster_paths.root.parent().expect("cluster data directory"));
+        let daemon_paths = DaemonPaths::with_root(data_dir.root().join("daemon"));
+        daemon_paths.ensure().expect("daemon paths");
+        let kv_paths = cluster_paths.kv_paths();
+        let wal_paths = kv_paths.raft_wal_paths(&state.local_node_id);
+        assert!(sinomo_core::kv::evict_resident_raft_node_for_test(
+            &wal_paths
+        ));
+
+        let operation_guard = sinomo_core::kv::lock_cluster_kv_raft_operation_for_paths(&kv_paths)
+            .expect("hold local Raft operation lock");
+        let runtime = daemon_cluster_test_runtime();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
+
+        for attempt in 1..=3 {
+            let timed_out = runtime.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_millis(25),
+                    maintenance.retry_main_local_raft_resident_initialization(&daemon_paths),
+                )
+                .await
+            });
+            assert!(
+                timed_out.is_err(),
+                "initializer attempt {attempt} must remain blocked by the operation guard"
+            );
+            let queue_deadline = Instant::now() + Duration::from_secs(1);
+            while sinomo_core::kv::cluster_kv_raft_operation_queue_depth_for_test(&kv_paths) != 1 {
+                assert!(
+                    Instant::now() < queue_deadline,
+                    "initializer did not register exactly one operation waiter"
+                );
+                std::thread::yield_now();
+            }
+            assert!(matches!(
+                &maintenance.local_raft_resident_initialization,
+                LocalRaftResidentInitialization::InFlight(_)
+            ));
+            assert_eq!(
+                sinomo_core::kv::cluster_kv_raft_operation_queue_depth_for_test(&kv_paths),
+                1,
+                "cancelled retries must rejoin the retained worker instead of accumulating waiters"
+            );
+        }
+
+        let storage_lock = Arc::clone(&*DAEMON_CLUSTER_STORAGE_MUTATION_LOCK);
+        let (storage_acquired_tx, storage_acquired_rx) = std::sync::mpsc::sync_channel(0);
+        let storage_contender = std::thread::spawn(move || {
+            let guard = storage_lock.blocking_lock_owned();
+            storage_acquired_tx
+                .send(())
+                .expect("report storage lock acquisition");
+            drop(guard);
+        });
+        assert!(
+            storage_acquired_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "initializer must retain the storage-mutation fence while it is blocked"
+        );
+
+        drop(operation_guard);
+        let completion_deadline = Instant::now() + Duration::from_secs(1);
+        while !maintenance
+            .local_raft_resident_initialization
+            .in_flight_task_is_finished()
+        {
+            assert!(
+                Instant::now() < completion_deadline,
+                "initializer did not finish after the operation guard was released"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            sinomo_core::kv::cluster_kv_raft_operation_queue_depth_for_test(&kv_paths),
+            0,
+            "the retained worker must leave no stale operation waiter after completion"
+        );
+        assert!(
+            storage_acquired_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "the completed task output must retain the storage fence until it is rejoined"
+        );
+
+        let storage_guard = runtime
+            .block_on(maintenance.retry_main_local_raft_resident_initialization(&daemon_paths))
+            .expect("rejoin the retained initializer");
+        assert!(maintenance.local_raft_resident_initialization.is_ready());
+        assert!(
+            storage_acquired_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "the resumed tick must receive the same storage fence without a gap"
+        );
+        drop(storage_guard);
+        storage_acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("storage contender acquires only after the resumed tick releases its guard");
+        storage_contender.join().expect("storage contender joined");
+
+        sinomo_core::kv::read_cluster_kv_resident_local_entry(
+            &kv_paths,
+            &state.local_node_id,
+            &sinomo_core::kv::cluster_kv_raft_config_key(),
+        )
+        .expect("resident local reads recover after the retained initializer completes");
+    }
+
+    #[test]
+    fn timed_out_maintenance_ticks_rejoin_one_initializer_and_charge_one_failure() {
+        let (_root, cluster_paths, state) = seeded_single_node_cluster_for_publish_cache_test(
+            "main_raft_resident_initialization_tick_timeout",
+        );
+        let data_dir =
+            SinomoDataDir::new(cluster_paths.root.parent().expect("cluster data directory"));
+        let daemon_paths = DaemonPaths::with_root(data_dir.root().join("daemon"));
+        daemon_paths.ensure().expect("daemon paths");
+        let kv_paths = cluster_paths.kv_paths();
+        let wal_paths = kv_paths.raft_wal_paths(&state.local_node_id);
+        assert!(sinomo_core::kv::evict_resident_raft_node_for_test(
+            &wal_paths
+        ));
+
+        let operation_guard = sinomo_core::kv::lock_cluster_kv_raft_operation_for_paths(&kv_paths)
+            .expect("hold local Raft operation lock");
+        let runtime = daemon_cluster_test_runtime();
+        let now = Instant::now();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(now);
+        maintenance.last_publish = now
+            .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL + Duration::from_secs(1))
+            .expect("due publish");
+        let options = DaemonRunOptions::default();
+
+        for attempt in 1..=3 {
+            let timed_out = runtime.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_millis(25),
+                    maintenance.tick_async(&daemon_paths, &options, runtime.handle().clone()),
+                )
+                .await
+            });
+            assert!(
+                timed_out.is_err(),
+                "production-shaped tick attempt {attempt} must await the retained initializer"
+            );
+            maintenance.record_active_tick_plan_failure(Instant::now());
+
+            let queue_deadline = Instant::now() + Duration::from_secs(1);
+            while sinomo_core::kv::cluster_kv_raft_operation_queue_depth_for_test(&kv_paths) != 1 {
+                assert!(
+                    Instant::now() < queue_deadline,
+                    "timed-out tick did not retain exactly one operation waiter"
+                );
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                sinomo_core::kv::cluster_kv_raft_operation_queue_depth_for_test(&kv_paths),
+                1,
+                "each outer timeout must rejoin, never detach another operation waiter"
+            );
+            assert_eq!(
+                maintenance.publish_failure_streak, 1,
+                "only the originally claimed publish generation may be charged"
+            );
+            assert!(maintenance.active_due_claims.is_empty());
+        }
+
+        drop(operation_guard);
+        let resumed = runtime
+            .block_on(maintenance.tick_async(&daemon_paths, &options, runtime.handle().clone()))
+            .expect("completion wake rejoins the retained initializer");
+        assert!(resumed.is_none());
+        assert!(maintenance.local_raft_resident_initialization.is_ready());
+        assert_eq!(
+            sinomo_core::kv::cluster_kv_raft_operation_queue_depth_for_test(&kv_paths),
+            0
+        );
+        assert_eq!(maintenance.publish_failure_streak, 1);
+        assert!(maintenance.active_due_claims.is_empty());
+        sinomo_core::kv::read_cluster_kv_resident_local_entry(
+            &kv_paths,
+            &state.local_node_id,
+            &sinomo_core::kv::cluster_kv_raft_config_key(),
+        )
+        .expect("production-shaped timeout recovery restores resident reads");
+    }
+
+    #[test]
+    fn successful_startup_raft_resident_initialization_is_propagated() {
+        let (_root, cluster_paths, state) = seeded_single_node_cluster_for_publish_cache_test(
+            "startup_raft_resident_initialization_propagated",
+        );
+        let data_dir =
+            SinomoDataDir::new(cluster_paths.root.parent().expect("cluster data directory"));
+        let daemon_paths = DaemonPaths::with_root(data_dir.root().join("daemon"));
+        daemon_paths.ensure().expect("daemon paths");
+        let wal_paths = cluster_paths
+            .kv_paths()
+            .raft_wal_paths(&state.local_node_id);
+
+        let startup_initialized = prune_local_cluster_raft_uncommitted_tail(&daemon_paths)
+            .expect("startup initializes the resident voter");
+        assert!(startup_initialized);
+        assert!(sinomo_core::kv::evict_resident_raft_node_for_test(
+            &wal_paths
+        ));
+
+        let runtime = daemon_cluster_test_runtime();
+        let mut maintenance = runtime.block_on(ClusterNetworkMaintenance::with_idle_stats(
+            Arc::new(IdleStatsAtomics::new()),
+            startup_initialized,
+        ));
+        assert!(maintenance.local_raft_resident_initialization.is_ready());
+        runtime
+            .block_on(maintenance.retry_main_local_raft_resident_initialization(&daemon_paths))
+            .expect("startup-ready maintenance acquires only the storage fence");
+        assert!(
+            !sinomo_core::kv::evict_resident_raft_node_for_test(&wal_paths),
+            "a propagated startup success must suppress the duplicate maintenance cold-open"
+        );
+    }
+
+    #[test]
+    fn main_raft_resident_initialization_stays_pending_without_readable_state() {
+        let root = unique_cluster_test_root("main_raft_resident_initialization_pending_state");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let daemon_paths = DaemonPaths::with_root(data_dir.root().join("daemon"));
+        daemon_paths.ensure().expect("daemon paths");
+        let runtime = daemon_cluster_test_runtime();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
+
+        runtime
+            .block_on(maintenance.retry_main_local_raft_resident_initialization(&daemon_paths))
+            .expect("missing state keeps initialization pending");
+        assert!(matches!(
+            &maintenance.local_raft_resident_initialization,
+            LocalRaftResidentInitialization::Pending
+        ));
+
+        std::fs::write(&cluster_paths.state, b"not a cluster state object")
+            .expect("write unreadable cluster state");
+        runtime
+            .block_on(maintenance.retry_main_local_raft_resident_initialization(&daemon_paths))
+            .expect("unreadable state keeps initialization pending");
+        assert!(matches!(
+            &maintenance.local_raft_resident_initialization,
+            LocalRaftResidentInitialization::Pending
+        ));
+    }
+
+    #[test]
+    fn shadow_raft_resident_initialization_is_a_zero_open_noop() {
+        let (_root, cluster_paths, state) = seeded_single_node_cluster_for_publish_cache_test(
+            "shadow_raft_resident_initialization_noop",
+        );
+        let data_dir =
+            SinomoDataDir::new(cluster_paths.root.parent().expect("cluster data directory"));
+        let shadow_paths = DaemonPaths::for_shadow(&data_dir);
+        shadow_paths.ensure().expect("shadow paths");
+        let wal_paths = cluster_paths
+            .kv_paths()
+            .raft_wal_paths(&state.local_node_id);
+        assert!(sinomo_core::kv::evict_resident_raft_node_for_test(
+            &wal_paths
+        ));
+        deny_shadow_daemon_local_raft_access(&shadow_paths).expect("deny shadow raft ownership");
+
+        let runtime = daemon_cluster_test_runtime();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
+        runtime
+            .block_on(maintenance.retry_main_local_raft_resident_initialization(&shadow_paths))
+            .expect("shadow initialization is skipped");
+        assert!(matches!(
+            &maintenance.local_raft_resident_initialization,
+            LocalRaftResidentInitialization::Pending
+        ));
+        assert!(
+            !sinomo_core::kv::evict_resident_raft_node_for_test(&wal_paths),
+            "shadow initialization must not register a resident slot"
+        );
+        assert!(sinomo_core::kv::process_local_raft_access_is_denied(
+            &wal_paths.root
+        ));
+        assert!(
+            sinomo_core::kv::clear_process_local_raft_access_denial_for_test(
+                &cluster_paths.kv_paths().raft
+            )
+        );
     }
 
     fn pending_join_state_for_test(
@@ -10412,6 +11548,7 @@ mod tests {
         let runtime = daemon_cluster_test_runtime();
         let mut maintenance = runtime.block_on(ClusterNetworkMaintenance::with_idle_stats(
             Arc::new(IdleStatsAtomics::new()),
+            false,
         ));
         maintenance.discovery = None;
         maintenance.connectivity_converged = true;
@@ -10455,6 +11592,7 @@ mod tests {
         let runtime = daemon_cluster_test_runtime();
         let mut maintenance = runtime.block_on(ClusterNetworkMaintenance::with_idle_stats(
             Arc::new(IdleStatsAtomics::new()),
+            false,
         ));
         maintenance.discovery = None;
 
@@ -11710,6 +12848,7 @@ mod tests {
             .expect("runtime");
         let mut maintenance = runtime.block_on(ClusterNetworkMaintenance::with_idle_stats(
             Arc::new(IdleStatsAtomics::new()),
+            false,
         ));
         assert_eq!(
             maintenance.publish_failure_backoff(),
@@ -13140,6 +14279,7 @@ mod tests {
             .expect("runtime");
         let mut maintenance = runtime.block_on(ClusterNetworkMaintenance::with_idle_stats(
             Arc::new(IdleStatsAtomics::new()),
+            false,
         ));
         maintenance.local_node_role = ClusterNodeRole::Workstation;
         maintenance.last_publish = Instant::now();
@@ -13195,6 +14335,7 @@ mod tests {
             connectivity_converged: false,
             environment_id: None,
             local_node_role: ClusterNodeRole::Sensor,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
             startup_settle_until: Some(
                 now.checked_add(DAEMON_CLUSTER_STARTUP_SETTLE_DURATION)
@@ -13287,6 +14428,7 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -13334,6 +14476,7 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Mobile,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -13384,6 +14527,7 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Mobile,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -13444,6 +14588,7 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -13487,6 +14632,7 @@ mod tests {
             connectivity_converged: false,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -13519,6 +14665,7 @@ mod tests {
         let runtime = daemon_cluster_test_runtime();
         let mut maintenance = runtime.block_on(ClusterNetworkMaintenance::with_idle_stats(
             Arc::new(IdleStatsAtomics::new()),
+            false,
         ));
         maintenance.discovery = None;
         maintenance.connectivity_converged = false;
@@ -13562,6 +14709,7 @@ mod tests {
             connectivity_converged: true,
             environment_id: Some("old-environment".to_string()),
             local_node_role: ClusterNodeRole::Mobile,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -13655,6 +14803,7 @@ mod tests {
             connectivity_converged: false,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
 
             startup_settle_until: Some(
@@ -13991,6 +15140,7 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -14054,6 +15204,7 @@ mod tests {
             connectivity_converged: false,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
 
             startup_settle_until: Some(
@@ -14172,6 +15323,9 @@ mod tests {
             "pk-local",
             now,
         );
+        state.members[0].capabilities =
+            sinomo_core::node::main_daemon_capabilities(&state.members[0].role);
+        state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
         let endpoint =
             sinomo_core::network::daemon_lan_endpoint(&remote_node, "127.0.0.1:1".to_string(), 10);
         let mut remote_member = ClusterMemberRecord::local_non_voting(
@@ -14188,6 +15342,13 @@ mod tests {
         state.members.push(remote_member);
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
             .expect("write cluster state");
+        daemon_locked_set_cluster_raft_leader(&cluster_paths, &local_node, state.term)
+            .expect("establish local raft leader");
+        sinomo_core::cluster::bootstrap_single_voter_cluster_state_to_local_kv(
+            &cluster_paths,
+            &state,
+        )
+        .expect("bootstrap local raft state");
 
         let idle_stats = Arc::new(IdleStatsAtomics::new());
         let maintenance_now = Instant::now();
@@ -14203,6 +15364,7 @@ mod tests {
             connectivity_converged: false,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
@@ -14405,10 +15567,23 @@ mod tests {
         remote_member.allowed_capabilities = remote_member.capabilities.clone();
         remote_member.endpoints = vec![endpoint];
         state.members.push(remote_member);
+        // This fixture models one live daemon across a deliberately stalled
+        // 2.5-second network phase. Keep its lightweight resident coordination
+        // slot owned for that lifetime so unrelated parallel test roots cannot
+        // make the process-wide bounded cache treat this live daemon as stale.
+        let _resident_raft_pin = sinomo_core::kv::pin_resident_raft_node_registry_for_test(
+            &cluster_paths.kv_paths().raft_wal_paths(&local_node),
+        )
+        .expect("pin live daemon resident raft slot");
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
             .expect("write cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
-            .expect("sync state to local kv");
+        daemon_locked_set_cluster_raft_leader(&cluster_paths, &local_node, state.term)
+            .expect("establish local raft leader");
+        sinomo_core::cluster::bootstrap_single_voter_cluster_state_to_local_kv(
+            &cluster_paths,
+            &state,
+        )
+        .expect("bootstrap local raft state");
         let cluster =
             daemon_cluster_status(&state, crate::DaemonClusterProcess::Main).expect("cluster");
         write_daemon_status(
@@ -14431,6 +15606,7 @@ mod tests {
             connectivity_converged: false,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
@@ -14525,14 +15701,15 @@ mod tests {
                 network_info_deferred: false,
             }
         );
-        let snapshot =
-            sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(&cluster_paths)
-                .expect("post-metadata snapshot");
+        let network_info_entry = sinomo_core::kv::read_cluster_kv_local_entry(
+            &cluster_paths.kv_paths(),
+            &local_node,
+            &cluster_network_info_key(&local_node),
+        )
+        .expect("post-metadata local entry");
         assert!(
-            snapshot
-                .get(&cluster_network_info_key(&local_node))
-                .is_some(),
-            "the follow-up generation must publish the deferred network metadata"
+            network_info_entry.value.is_some(),
+            "the follow-up generation must publish the deferred network metadata; local read={network_info_entry:?}"
         );
     }
 
@@ -14633,6 +15810,7 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: sinomo_core::network::cluster_local_node_role(&state),
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
@@ -14934,6 +16112,7 @@ mod tests {
             connectivity_converged: false,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
@@ -15104,6 +16283,7 @@ mod tests {
             connectivity_converged: false,
             environment_id: None,
             local_node_role: sinomo_core::network::cluster_local_node_role(&state),
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
             startup_settle_until: Some(
                 maintenance_now
@@ -15171,6 +16351,7 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
@@ -15303,6 +16484,7 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: sinomo_core::network::cluster_local_node_role(&state),
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
@@ -15362,7 +16544,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_network_maintenance_returns_pending_async_member_publish() {
+    fn cluster_network_maintenance_plans_probe_and_source_publish_without_full_state_sync() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -15391,9 +16573,12 @@ mod tests {
             "pk-local",
             now,
         );
+        state.members[0].capabilities =
+            sinomo_core::node::main_daemon_capabilities(&state.members[0].role);
+        state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
         let mut remote_member = ClusterMemberRecord::local_non_voting(
             cluster_id,
-            remote_node,
+            remote_node.clone(),
             "remote",
             "pk-remote",
             now,
@@ -15401,11 +16586,43 @@ mod tests {
         remote_member.capabilities =
             sinomo_core::node::main_daemon_capabilities(&remote_member.role);
         remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![sinomo_core::network::daemon_lan_endpoint(
+            &remote_node,
+            "127.0.0.1:1".to_string(),
+            10,
+        )];
         state.members.push(remote_member);
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
             .expect("write cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
-            .expect("sync state to local kv");
+        daemon_locked_set_cluster_raft_leader(&cluster_paths, &local_node, state.term)
+            .expect("establish local raft leader");
+        sinomo_core::cluster::bootstrap_single_voter_cluster_state_to_local_kv(
+            &cluster_paths,
+            &state,
+        )
+        .expect("bootstrap local raft state");
+        let remote_endpoints_before_tick =
+            sinomo_core::cluster::read_cluster_members_from_kv(&cluster_paths)
+                .expect("members before node-local observation")
+                .into_iter()
+                .find(|member| member.node_id == remote_node)
+                .expect("remote member before node-local observation")
+                .endpoints;
+        let mut observed_endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &remote_node,
+            "127.0.0.1:notaport".to_string(),
+            20,
+        );
+        observed_endpoint.source = ClusterEndpointSource::Observed;
+        state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == remote_node)
+            .expect("remote member for node-local observation")
+            .endpoints
+            .push(observed_endpoint.clone());
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write node-local remote observation");
         let cluster =
             daemon_cluster_status(&state, crate::DaemonClusterProcess::Main).expect("cluster");
         write_daemon_status(
@@ -15425,9 +16642,10 @@ mod tests {
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
             connectivity_cursor: 0,
-            connectivity_converged: true,
+            connectivity_converged: false,
             environment_id: None,
             local_node_role: sinomo_core::network::cluster_local_node_role(&state),
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
@@ -15444,9 +16662,26 @@ mod tests {
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
             last_discovery: maintenance_now,
-            last_probe: maintenance_now,
+            last_probe: maintenance_now
+                .checked_sub(DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL)
+                .unwrap_or(maintenance_now),
             idle_stats: idle_stats.clone(),
         };
+
+        let members_before_tick =
+            sinomo_core::cluster::read_cluster_members_from_kv(&cluster_paths)
+                .expect("members before maintenance tick");
+        let local_before_tick = members_before_tick
+            .iter()
+            .find(|member| member.node_id == local_node)
+            .expect("local member before maintenance tick");
+        assert!(
+            local_before_tick.endpoints.is_empty(),
+            "fixture must start before local daemon endpoint publication"
+        );
+        let kv_before_tick =
+            sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(&cluster_paths)
+                .expect("KV snapshot before maintenance tick");
 
         let pending = run_cluster_network_maintenance_tick_for_test(
             &mut maintenance,
@@ -15459,16 +16694,59 @@ mod tests {
         assert_eq!(pending.member_publishes.len(), 1);
         assert!(!pending.member_publishes[0].force_kv_snapshot_sync);
         assert_eq!(pending.node_status_refreshes.len(), 1);
-        assert!(pending.connectivity_probe.is_none());
+        assert!(
+            pending.connectivity_probe.is_some(),
+            "a same-tick local membership change must not prevent the due direct probe from being returned"
+        );
+
+        let refreshed_state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+            .expect("refreshed local cluster state");
+        let refreshed_local = refreshed_state
+            .members
+            .iter()
+            .find(|member| member.node_id == local_node)
+            .expect("refreshed local member");
+        assert!(
+            !refreshed_local.endpoints.is_empty(),
+            "tick planning must observe the running daemon endpoint"
+        );
+        let members_after_planning =
+            sinomo_core::cluster::read_cluster_members_from_kv(&cluster_paths)
+                .expect("members after maintenance planning");
+        let local_after_planning = members_after_planning
+            .iter()
+            .find(|member| member.node_id == local_node)
+            .expect("local member after maintenance planning");
+        assert!(
+            local_after_planning.endpoints.is_empty(),
+            "tick planning must not run a full-state authority transaction before returning connectivity work"
+        );
+        assert_eq!(
+            sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(&cluster_paths)
+                .expect("KV snapshot after maintenance planning"),
+            kv_before_tick,
+            "tick planning must not mutate or advance the local Raft/KV projection"
+        );
 
         runtime.block_on(maintenance.run_pending_work_async(pending, runtime.handle().clone()));
 
         assert_eq!(idle_stats.snapshot().kv_publish_member, 1);
         let members = sinomo_core::cluster::read_cluster_members_from_kv(&cluster_paths)
             .expect("members from kv");
+        let published_remote = members
+            .iter()
+            .find(|member| member.node_id == remote_node)
+            .expect("published remote member");
+        assert_eq!(
+            published_remote.endpoints, remote_endpoints_before_tick,
+            "source-owned local member publication must not publish or overwrite a remote node's node-local observed endpoint"
+        );
         assert!(
-            members.iter().any(|member| member.node_id == local_node),
-            "pending async member publish should publish the local member"
+            published_remote
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.endpoint_id != observed_endpoint.endpoint_id),
+            "the node-local remote observation must remain outside authoritative KV"
         );
     }
 
@@ -15549,6 +16827,7 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: sinomo_core::network::cluster_local_node_role(&state),
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
@@ -15655,6 +16934,7 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: sinomo_core::network::cluster_local_node_role(&state),
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
@@ -15725,6 +17005,7 @@ mod tests {
             connectivity_converged: false,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: true,
 
             startup_settle_until: Some(
@@ -16298,7 +17579,7 @@ mod tests {
     }
 
     #[test]
-    fn source_only_member_publish_commits_barrier_without_advancing_revision() {
+    fn source_only_member_publish_uses_read_index_without_advancing_revision_or_wal() {
         let root = unique_cluster_test_root("sinomo-daemon-source-only-member-no-append");
         let data_dir = SinomoDataDir::new(root.join("data"));
         data_dir.ensure_root_layout().expect("data dir");
@@ -16376,7 +17657,7 @@ mod tests {
             local.as_str(),
             &mut host,
         )
-        .expect("source-only member publish should commit a barrier");
+        .expect("source-only member publish should establish ReadIndex authority");
         assert!(response.accepted);
         assert_eq!(response.detail, "member endpoints already current");
         assert!(
@@ -16394,12 +17675,12 @@ mod tests {
         );
         assert_eq!(snapshot_after.get(&member_key), Some(&member_entry));
         assert_eq!(snapshot_after.get(&endpoint_key), Some(&endpoint_entry));
-        assert!(
+        assert_eq!(
             std::fs::metadata(&wal_path)
                 .expect("wal after source no-effect")
-                .len()
-                > wal_len_before,
-            "source-only member publishes must append quorum evidence to the Raft WAL"
+                .len(),
+            wal_len_before,
+            "source-only member publishes must reuse ReadIndex authority without a Raft write"
         );
     }
 
@@ -17043,7 +18324,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_cluster_state_sync_returns_current_snapshot_not_stale_materialized() {
+    fn stable_cluster_state_sync_returns_current_snapshot_without_rewriting_materialized_cache() {
         let root = unique_cluster_test_root("sinomo-daemon-state-sync-current-snapshot");
         let data_dir = SinomoDataDir::new(root.join("data"));
         data_dir.ensure_root_layout().expect("data dir");
@@ -17102,18 +18383,18 @@ mod tests {
             returned.get(&member_key).is_some(),
             "stable sync must not return the stale materialized fallback"
         );
-        assert!(
+        assert_eq!(
             std::fs::metadata(&wal_path)
                 .expect("wal after stable sync")
-                .len()
-                > wal_len_before,
-            "stable sync must append current-term quorum evidence even when state is unchanged"
+                .len(),
+            wal_len_before,
+            "stable sync must use ReadIndex quorum evidence without appending a write"
         );
         let materialized = sinomo_core::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
             .expect("materialized after sync");
         assert!(
-            materialized.get(&member_key).is_some(),
-            "authoritative stable sync should repair the stale materialized cache"
+            materialized.get(&member_key).is_none(),
+            "ReadIndex must not rewrite the complete materialized snapshot for a stable read"
         );
     }
 
@@ -17228,6 +18509,7 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -17417,6 +18699,7 @@ mod tests {
             connectivity_converged: true,
             environment_id: Some("old-environment".to_string()),
             local_node_role: ClusterNodeRole::Workstation,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -17538,6 +18821,7 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -18358,6 +19642,7 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: sinomo_core::network::cluster_local_node_role(&state),
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -18494,6 +19779,7 @@ mod tests {
             connectivity_converged: true,
             environment_id: None,
             local_node_role: ClusterNodeRole::Workstation,
+            local_raft_resident_initialization: LocalRaftResidentInitialization::Pending,
             solo_cluster_idle: false,
 
             startup_settle_until: None,
@@ -20383,8 +21669,38 @@ mod tests {
 
         assert_eq!(
             daemon_cluster_control_rpc_options(timeout),
-            sinomo_core::network::ClusterObjectRpcOptions::new(health.into())
-                .with_overall_timeout(timeout)
+            sinomo_core::cluster::main_daemon_cluster_rpc_options(
+                sinomo_core::network::ClusterObjectRpcOptions::new(health.into())
+                    .with_overall_timeout(timeout)
+            )
+        );
+    }
+
+    #[test]
+    fn raft_append_routing_excludes_a_faster_folded_shadow_endpoint() {
+        let node_id = NodeId::from_legacy_named("node_raft_affinity_target").expect("node id");
+        let main = sinomo_core::network::daemon_lan_endpoint(
+            &node_id,
+            "198.51.100.90:21353".to_string(),
+            0,
+        );
+        let shadow_node_id = sinomo_core::node::shadow_daemon_node_id(&node_id);
+        let mut folded_shadow = sinomo_core::network::daemon_lan_endpoint(
+            &shadow_node_id,
+            "198.51.100.90:21354".to_string(),
+            0,
+        );
+        folded_shadow.node_id = node_id;
+
+        assert!(sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(&main));
+        assert!(
+            !sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(&folded_shadow),
+            "a shadow endpoint folded under the voter's node identity must not terminate Raft append"
+        );
+        assert_eq!(
+            daemon_main_routed_rpc_options(Duration::from_secs(5)).destination_process_affinity(),
+            sinomo_core::network::DestinationProcessAffinity::MainDaemon,
+            "Raft append/vote must not let lower shadow latency choose a process without consensus routes"
         );
     }
 

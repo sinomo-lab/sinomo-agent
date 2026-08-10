@@ -6,7 +6,7 @@ use crate::cluster::{
 use crate::dfs::{
     DaemonDfsMaintenanceTickOutcome, DaemonDfsPendingMaintenanceWork,
     daemon_dfs_maintenance_notify, daemon_dfs_node_transport, daemon_dfs_node_transport_on_runtime,
-    daemon_dfs_now_unix_nanos, daemon_dfs_pending_reactive_maintenance_work,
+    daemon_dfs_now_unix_nanos, daemon_dfs_pending_reactive_maintenance_work_on_runtime,
     daemon_dfs_repair_queue_work_is_known, evict_daemon_dfs_message_service_cache_on_shutdown,
     notify_daemon_dfs_maintenance_work,
     notify_daemon_dfs_metadata_publish_route_generation_on_runtime,
@@ -1727,6 +1727,7 @@ pub fn run_daemon_control_loop_with_services_and_profile(
     service_hooks: Vec<crate::DaemonServiceRegistryHook>,
     execution_profile: crate::DaemonExecutionProfile,
 ) -> Result<(), DaemonError> {
+    crate::cluster::deny_shadow_daemon_local_raft_access(&paths)?;
     crate::cluster::ensure_cluster_directory_installed();
     let _lock = DaemonLock::acquire(&paths, &options, cluster.clone())?;
     let _data_owner_lock = if label == "daemon" {
@@ -1748,9 +1749,14 @@ pub fn run_daemon_control_loop_with_services_and_profile(
         tracing::warn!("sinomo {label} observe runtime initialization failed: {error}");
     }
     crate::observe::register_observe_metric_exporters(&service_hooks);
-    if let Err(error) = prune_local_cluster_raft_uncommitted_tail(&paths) {
-        tracing::warn!("sinomo {label} cluster raft startup repair skipped: {error}");
-    }
+    let startup_local_raft_resident_initialized =
+        match prune_local_cluster_raft_uncommitted_tail(&paths) {
+            Ok(initialized) => initialized,
+            Err(error) => {
+                tracing::warn!("sinomo {label} cluster raft startup repair skipped: {error}");
+                false
+            }
+        };
     let daemon_runtime = crate::build_daemon_async_runtime_with_profile(label, execution_profile)?;
     let daemon_runtime_handle = daemon_runtime.handle().clone();
     // Identity-bound background work must use the immutable identity captured
@@ -1981,6 +1987,7 @@ pub fn run_daemon_control_loop_with_services_and_profile(
             maintenance_service_registry,
             maintenance_runtime,
             maintenance_startup_cluster,
+            startup_local_raft_resident_initialized,
             maintenance_connectivity_topology_subscription,
             startup_cluster_runtime_enabled,
             maintenance_default_dfs_enabled,
@@ -2434,6 +2441,7 @@ async fn run_daemon_background_maintenance_loop(
     service_registry: sinomo_core::service::ServiceRegistrySnapshotStore,
     runtime: tokio::runtime::Handle,
     startup_cluster: Option<DaemonClusterStatus>,
+    startup_local_raft_resident_initialized: bool,
     connectivity_topology_subscription: Option<DaemonConnectivityTopologySubscriptions>,
     maintain_cluster_runtime: bool,
     maintain_default_dfs: bool,
@@ -2443,9 +2451,12 @@ async fn run_daemon_background_maintenance_loop(
     // source for connectivity. Retain it for exactly the maintenance owner's
     // lifetime; periodic probing remains only an expiry refresh mechanism.
     let _connectivity_topology_subscription = connectivity_topology_subscription;
-    let mut cluster_network = ClusterNetworkMaintenance::with_idle_stats(idle_stats.clone())
-        .await
-        .with_service_registry(service_registry);
+    let mut cluster_network = ClusterNetworkMaintenance::with_idle_stats(
+        idle_stats.clone(),
+        startup_local_raft_resident_initialized,
+    )
+    .await
+    .with_service_registry(service_registry);
     let desired_rollout_task = if maintain_cluster_runtime && daemon_paths_are_shadow(&paths) {
         match cluster_paths_from_daemon_paths(&paths).and_then(|cluster_paths| {
             DaemonDesiredRolloutReactor::new(&cluster_paths).map(|reactor| (cluster_paths, reactor))
@@ -2653,8 +2664,12 @@ async fn run_daemon_background_maintenance_loop(
                     // ordinary maintenance interval at join time.
                     let committed_edge_latched = dfs_immediate_continuation_requested;
                     let probe_paths = paths.clone();
+                    let probe_runtime = runtime.clone();
                     let work = match tokio::task::spawn_blocking(move || {
-                        daemon_dfs_pending_reactive_maintenance_work(&probe_paths)
+                        daemon_dfs_pending_reactive_maintenance_work_on_runtime(
+                            &probe_paths,
+                            &probe_runtime,
+                        )
                     })
                     .await
                     {
@@ -2718,8 +2733,12 @@ async fn run_daemon_background_maintenance_loop(
             && daemon_dfs_maintenance_probe_is_due(Instant::now(), next_dfs_maintenance_probe)
         {
             let probe_paths = paths.clone();
+            let probe_runtime = runtime.clone();
             let work = match tokio::task::spawn_blocking(move || {
-                daemon_dfs_pending_reactive_maintenance_work(&probe_paths)
+                daemon_dfs_pending_reactive_maintenance_work_on_runtime(
+                    &probe_paths,
+                    &probe_runtime,
+                )
             })
             .await
             {
@@ -4008,6 +4027,8 @@ async fn dispatch_daemon_object_rpc_call_request_async(
         Ok((response, false, route))
     } else if route == crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE
         || route == crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE
+        || route == crate::DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE
+        || route == crate::DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE
     {
         let timeline =
             sinomo_core::network::network_timeline_trace_context_for_request(&request.request);
@@ -4057,7 +4078,11 @@ async fn dispatch_daemon_object_rpc_call_request_async(
             decode_started_ns,
             payload.is_ok(),
         );
-        let (payload, request_body) = payload?;
+        let (mut payload, request_body) = payload?;
+        crate::service_adapter::enforce_daemon_object_rpc_forward_route_affinity(
+            &route,
+            &mut payload,
+        )?;
         let (forwarded, body) =
             crate::service_adapter::forward_object_rpc_call_from_daemon_control(
                 paths,
@@ -7080,8 +7105,24 @@ mod tests {
             },
             "a committed relay edge must wake retained DFS lanes without forcing a probe round"
         );
+        let topology_only_baseline = snapshot(
+            6,
+            vec![
+                entry(
+                    &member_key,
+                    encode_kv_value(&member).expect("encode unchanged member"),
+                    3,
+                ),
+                entry(
+                    &endpoint_key,
+                    encode_kv_value(&external_endpoint).expect("encode current external endpoint"),
+                    6,
+                ),
+            ],
+            Vec::new(),
+        );
         let mut topology_only_projection = DaemonConnectivityTopologyProjection::new(false);
-        topology_only_projection.seed_if_newer(&changed_route);
+        topology_only_projection.seed_if_newer(&topology_only_baseline);
         assert_eq!(
             topology_only_projection.observe(&connectivity_route),
             DaemonConnectivityProjectionChange::default(),
@@ -7432,6 +7473,8 @@ mod tests {
         for route in [
             crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE,
             crate::DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+            crate::DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+            crate::DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE,
         ] {
             let payload = crate::DaemonObjectRpcForwardRequest {
                 target_node_id: target_node.clone(),
@@ -7441,6 +7484,7 @@ mod tests {
                 idle_timeout_millis: None,
                 overall_timeout_millis: None,
                 observe_connectivity: false,
+                destination_process_affinity: crate::DaemonObjectRpcDestinationProcessAffinity::Any,
             };
             let request = sinomo_core::network::ObjectRpcRequest::encode_body(
                 route,
@@ -7768,6 +7812,60 @@ mod tests {
         assert_eq!(rollout.status, "accepted");
         assert_eq!(rollout.phase.as_deref(), Some("shadow-finalized"));
         assert_eq!(rollout.progress_current, Some(5));
+    }
+
+    #[test]
+    fn shadow_liveness_status_response_uses_shared_rollout_state_file() {
+        let root = sinomo_testdir::TestDir::new("sinomo-shadow-liveness-rollout-state");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let paths = DaemonPaths::for_shadow(&data_dir);
+        paths.ensure().expect("shadow daemon paths");
+        let options = DaemonRunOptions::default();
+        let expected = crate::DaemonStatus::new(&options, &paths, None);
+        crate::write_daemon_status(&paths, &expected).expect("write shadow daemon status");
+        let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
+        sinomo_rollout::write_rollout_status(
+            &rollout_paths,
+            &sinomo_core::ClusterNodeRolloutStatus {
+                status: "main-staged".to_string(),
+                mode: Some("cluster-remote-build".to_string()),
+                detail: None,
+                phase: Some("main-staged".to_string()),
+                progress_current: Some(5),
+                progress_total: Some(5),
+                progress_message: Some("candidate main staged".to_string()),
+                source: Some("snapshot".to_string()),
+                requested_at: Some("2026-08-08T22:37:42Z".to_string()),
+                staged_at: Some("2026-08-08T22:40:00Z".to_string()),
+                updated_at: None,
+                failed_at: None,
+                diagnostics: None,
+                stdout_log: None,
+                stderr_log: None,
+                stdout_tail: None,
+                stderr_tail: None,
+            },
+        )
+        .expect("write shared rollout status");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let actual = runtime
+            .block_on(daemon_status_response_async(&paths, None))
+            .expect("shadow liveness status");
+
+        assert_eq!(actual.pid, expected.pid);
+        let rollout = actual.rollout.expect("shared rollout status");
+        assert_eq!(rollout.status, "main-staged");
+        assert_eq!(rollout.phase.as_deref(), Some("main-staged"));
+        assert_eq!(rollout.source.as_deref(), Some("snapshot"));
+        assert_eq!(
+            rollout.requested_at.as_deref(),
+            Some("2026-08-08T22:37:42Z")
+        );
     }
 
     fn append_cluster_raft_command(
@@ -8270,6 +8368,13 @@ mod tests {
             .build()
             .expect("runtime");
 
+        let data_owner = Arc::new(
+            crate::DaemonDataOwnerLock::acquire(&target_daemon_paths)
+                .expect("target main data owner"),
+        );
+        crate::dfs::register_daemon_dfs_data_owner_lock(&target_daemon_paths, &data_owner)
+            .expect("register target main data owner");
+
         let request = request.with_auth(signed);
         let service_host = runtime
             .block_on(
@@ -8312,6 +8417,133 @@ mod tests {
         let status =
             sinomo_dfs::decode_dfs_status_rpc_response(&response).expect("dfs status response");
         assert_eq!(status.file_system_count, 0);
+    }
+
+    #[test]
+    fn signed_shadow_dfs_dispatch_rejects_before_raft_or_backend_hydration() {
+        let target_root = sinomo_testdir::TestDir::new("sinomo-shadow-dfs-no-raft-target");
+        let target_data_dir = SinomoDataDir::new(&target_root);
+        target_data_dir.ensure_root_layout().expect("target layout");
+        let target_daemon_paths = DaemonPaths::for_shadow(&target_data_dir);
+        let target_identity =
+            sinomo_core::node::load_or_create_main_node_identity(&target_data_dir.root())
+                .expect("target identity");
+        let peer_root = sinomo_testdir::TestDir::new("sinomo-shadow-dfs-no-raft-peer");
+        let peer_data_dir = SinomoDataDir::new(&peer_root);
+        peer_data_dir.ensure_root_layout().expect("peer layout");
+        let peer_identity =
+            sinomo_core::node::load_or_create_main_node_identity(&peer_data_dir.root())
+                .expect("peer identity");
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_shadow_dfs_no_raft")
+                .expect("cluster id");
+        let target_node =
+            NodeId::from_legacy_named("node_shadow_dfs_no_raft_target").expect("target node");
+        let peer_node =
+            NodeId::from_legacy_named("node_shadow_dfs_no_raft_peer").expect("peer node");
+        let now = OffsetDateTime::now_utc();
+        let mut target_state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "shadow DFS no Raft",
+            target_node.clone(),
+            "target",
+            target_identity.public_key.clone(),
+            now,
+        );
+        target_state
+            .members
+            .push(sinomo_core::ClusterMemberRecord::local_non_voting(
+                cluster_id.clone(),
+                peer_node.clone(),
+                "peer",
+                peer_identity.public_key.clone(),
+                now,
+            ));
+        let target_cluster_paths = sinomo_core::network::ClusterPaths::new(&target_data_dir);
+        sinomo_core::cluster::write_cluster_state(&target_cluster_paths, &target_state)
+            .expect("write target state");
+
+        let mut peer_state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "shadow DFS no Raft",
+            peer_node,
+            "peer",
+            peer_identity.public_key,
+            now,
+        );
+        peer_state
+            .members
+            .push(sinomo_core::ClusterMemberRecord::local_voter(
+                cluster_id,
+                target_node.clone(),
+                "target",
+                target_identity.public_key,
+                now,
+            ));
+        sinomo_core::cluster::write_cluster_state(
+            &sinomo_core::network::ClusterPaths::new(&peer_data_dir),
+            &peer_state,
+        )
+        .expect("write peer state");
+
+        crate::cluster::deny_shadow_daemon_local_raft_access(&target_daemon_paths)
+            .expect("install shadow local-Raft denial");
+        let request = sinomo_dfs::dfs_status_rpc_request()
+            .expect("DFS status request")
+            .with_trace_context_if_missing();
+        let signed = sign_daemon_rpc_request_from_data_dir(&peer_data_dir, &request)
+            .expect("signed DFS request");
+        let request = request.with_auth(signed);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let service_host = runtime
+            .block_on(
+                crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime(
+                    target_daemon_paths.clone(),
+                    runtime.handle().clone(),
+                ),
+            )
+            .expect("shadow service host");
+        let authenticated =
+            crate::service_adapter::authenticate_daemon_control_request_via_registry(
+                &target_daemon_paths,
+                &request,
+                &service_host,
+            )
+            .expect("authenticate accepted peer from passive membership projection");
+        let error = runtime
+            .block_on(
+                crate::service_adapter::dispatch_rpc_via_registry_with_body_async(
+                    &service_host,
+                    &authenticated,
+                    sinomo_core::network::ObjectRpcIncomingRequest::value(request),
+                    Some(&target_daemon_paths),
+                ),
+            )
+            .expect_err("shadow DFS host must fail closed without main data ownership");
+        assert!(
+            error.to_string().contains("data-owner capability"),
+            "unexpected shadow DFS rejection: {error}"
+        );
+        assert_eq!(
+            crate::dfs::daemon_dfs_test_message_service_lane_open_count(&target_data_dir),
+            0,
+            "shadow rejection must precede DFS service-lane hydration"
+        );
+        let kv_paths = target_cluster_paths.kv_paths();
+        let wal_paths = kv_paths.raft_wal_paths(&target_node);
+        assert!(
+            !wal_paths.root.exists(),
+            "signed shadow dispatch must not create the main voter's Raft node root"
+        );
+
+        assert!(sinomo_core::kv::clear_process_local_raft_access_denial_for_test(&kv_paths.raft));
+        drop(
+            sinomo_core::kv::DurableRaftKvNode::open(target_node, wal_paths)
+                .expect("fresh main can acquire node.lock after shadow rejection"),
+        );
     }
 
     #[test]
@@ -8750,6 +8982,7 @@ mod tests {
         );
         state.members[0].capabilities =
             sinomo_core::node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+        state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
         sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
             .expect("cluster KV");
@@ -8780,14 +9013,16 @@ mod tests {
         }
 
         let file_system = sinomo_dfs::default_cluster_sifs(&state);
-        let shard_entries = sinomo_core::kv::read_cluster_kv_prefix_entries(
-            &cluster_paths.kv_paths(),
-            &format!(
-                "{}/",
-                sinomo_dfs::metadata_shards_prefix(&file_system.file_system_id)
-            ),
-        )
-        .expect("metadata shard topology");
+        let shard_entries = sinomo_core::cluster::read_cluster_kv_current_snapshot(&cluster_paths)
+            .expect("current canonical shard authority")
+            .range_prefix_limited(
+                &format!(
+                    "{}/",
+                    sinomo_dfs::metadata_shards_prefix(&file_system.file_system_id)
+                ),
+                sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+            )
+            .expect("metadata shard topology");
         let backend =
             sinomo_dfs::open_cluster_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)
                 .expect("open sharded backend")

@@ -497,11 +497,12 @@ impl Backend {
         let inner = ObjectRpcRequest::encode_body(route, CONFIG_RPC_CATEGORY, body)
             .map_err(|error| error.to_string())?;
         let response = DaemonApiClient::at_address(address)
-            .object_rpc_to_target_from_data_dir(
+            .object_rpc_to_target_from_data_dir_with_affinity(
                 self.data_dir.as_ref(),
                 &target_node_id,
                 inner,
                 MODULE_CONFIG_RPC_TIMEOUT,
+                sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
             )
             .map_err(|error| error.to_string())?;
         response.decode_body().map_err(|error| error.to_string())

@@ -1,8 +1,9 @@
 //! Typed client for the running daemon's control API.
 
 use crate::{
-    DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
-    DAEMON_NETWORK_CHUNK_METRICS_ROUTE, DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
+    DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+    DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE, DAEMON_NETWORK_CHUNK_METRICS_ROUTE,
+    DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE, DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
     DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE, DaemonApiError,
     DaemonLocalConnectivityReloadRequest, DaemonLocalConnectivityReloadResponse,
     DaemonNetworkChunkMetricsResponse, DaemonObjectRpcForwardDeliveryState,
@@ -232,27 +233,54 @@ impl DaemonApiClient {
         request: ObjectRpcRequest,
         timeout: Duration,
     ) -> Result<ObjectRpcResponse, DaemonApiError> {
+        self.object_rpc_to_target_from_data_dir_with_affinity(
+            data_dir,
+            target_node_id,
+            request,
+            timeout,
+            crate::DaemonObjectRpcDestinationProcessAffinity::Any,
+        )
+    }
+
+    pub fn object_rpc_to_target_from_data_dir_with_affinity(
+        &self,
+        data_dir: &SinomoDataDir,
+        target_node_id: &NodeId,
+        request: ObjectRpcRequest,
+        timeout: Duration,
+        destination_process_affinity: crate::DaemonObjectRpcDestinationProcessAffinity,
+    ) -> Result<ObjectRpcResponse, DaemonApiError> {
         let address = self.address.clone();
         let data_dir = data_dir.clone();
         let target_node_id = target_node_id.clone();
         block_on_daemon_client(async move {
             let runtime = tokio::runtime::Handle::current();
-            let result = send_daemon_object_rpc_call_async(
-                data_dir,
-                &address,
-                DAEMON_OBJECT_RPC_FORWARD_ROUTE,
-                &target_node_id,
-                ObjectRpcCall::value(request),
-                timeout,
-                None,
-                Some(timeout),
-                false,
-                sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
-                None,
-                &runtime,
+            let deadline = daemon_api_overall_deadline(Some(timeout));
+            run_daemon_api_with_overall_deadline(
+                "daemon-mediated object RPC value call",
+                deadline,
+                async move {
+                    let result = send_daemon_object_rpc_call_with_affinity_async(
+                        data_dir,
+                        &address,
+                        DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+                        &target_node_id,
+                        ObjectRpcCall::value(request),
+                        timeout,
+                        None,
+                        Some(timeout),
+                        false,
+                        destination_process_affinity,
+                        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+                        None,
+                        None,
+                        &runtime,
+                    )
+                    .await?;
+                    decode_object_rpc_value_response(result).await
+                },
             )
-            .await?;
-            decode_object_rpc_value_response(result).await
+            .await
         })
     }
 
@@ -289,12 +317,34 @@ impl DaemonApiClient {
         overall_timeout: Option<Duration>,
         observe_connectivity: bool,
     ) -> Result<ObjectRpcResponse, DaemonApiError> {
-        block_on_daemon_client(self.object_rpc_to_target_with_deadline_async(
+        block_on_daemon_client(self.object_rpc_to_target_with_deadline_and_affinity_async(
             target_node_id,
             request,
             connect_timeout,
             overall_timeout,
             observe_connectivity,
+            crate::DaemonObjectRpcDestinationProcessAffinity::Any,
+        ))
+    }
+
+    /// Sends an object-RPC from the resident daemon with an explicit
+    /// destination-process requirement.
+    pub fn object_rpc_to_target_with_deadline_and_affinity(
+        &self,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        connect_timeout: Duration,
+        overall_timeout: Option<Duration>,
+        observe_connectivity: bool,
+        destination_process_affinity: crate::DaemonObjectRpcDestinationProcessAffinity,
+    ) -> Result<ObjectRpcResponse, DaemonApiError> {
+        block_on_daemon_client(self.object_rpc_to_target_with_deadline_and_affinity_async(
+            target_node_id,
+            request,
+            connect_timeout,
+            overall_timeout,
+            observe_connectivity,
+            destination_process_affinity,
         ))
     }
 
@@ -309,17 +359,46 @@ impl DaemonApiClient {
         overall_timeout: Option<Duration>,
         observe_connectivity: bool,
     ) -> Result<ObjectRpcResponse, DaemonApiError> {
-        let call = ObjectRpcCall::value(request.clone());
-        let result = self
-            .object_rpc_call_to_target_with_deadline_async(
-                target_node_id,
-                call,
-                connect_timeout,
-                overall_timeout,
-                observe_connectivity,
-            )
-            .await?;
-        decode_object_rpc_value_response(result).await
+        self.object_rpc_to_target_with_deadline_and_affinity_async(
+            target_node_id,
+            request,
+            connect_timeout,
+            overall_timeout,
+            observe_connectivity,
+            crate::DaemonObjectRpcDestinationProcessAffinity::Any,
+        )
+        .await
+    }
+
+    pub async fn object_rpc_to_target_with_deadline_and_affinity_async(
+        &self,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        connect_timeout: Duration,
+        overall_timeout: Option<Duration>,
+        observe_connectivity: bool,
+        destination_process_affinity: crate::DaemonObjectRpcDestinationProcessAffinity,
+    ) -> Result<ObjectRpcResponse, DaemonApiError> {
+        let deadline = daemon_api_overall_deadline(overall_timeout);
+        run_daemon_api_with_overall_deadline(
+            "daemon-mediated object RPC value call",
+            deadline,
+            async {
+                let call = ObjectRpcCall::value(request.clone());
+                let result = self
+                    .object_rpc_call_to_target_with_deadline_and_affinity_async(
+                        target_node_id,
+                        call,
+                        connect_timeout,
+                        overall_timeout,
+                        observe_connectivity,
+                        destination_process_affinity,
+                    )
+                    .await?;
+                decode_object_rpc_value_response(result).await
+            },
+        )
+        .await
     }
 
     /// Sends a value RPC through the local daemon and returns the elapsed time
@@ -334,24 +413,34 @@ impl DaemonApiClient {
         overall_timeout: Option<Duration>,
         observe_connectivity: bool,
     ) -> Result<(ObjectRpcResponse, Duration), DaemonApiError> {
-        let call = ObjectRpcCall::value(request.clone());
-        let (result, forward_elapsed) = self
-            .object_rpc_call_to_target_with_forward_elapsed_async(
-                target_node_id,
-                call,
-                connect_timeout,
-                overall_timeout,
-                observe_connectivity,
-            )
-            .await?;
-        let response = decode_object_rpc_value_response(result).await?;
-        Ok((response, forward_elapsed))
+        let deadline = daemon_api_overall_deadline(overall_timeout);
+        run_daemon_api_with_overall_deadline(
+            "daemon-mediated object RPC value call with forward timing",
+            deadline,
+            async {
+                let call = ObjectRpcCall::value(request.clone());
+                let (result, forward_elapsed) = self
+                    .object_rpc_call_to_target_with_forward_elapsed_async(
+                        target_node_id,
+                        call,
+                        connect_timeout,
+                        overall_timeout,
+                        observe_connectivity,
+                    )
+                    .await?;
+                let response = decode_object_rpc_value_response(result).await?;
+                Ok((response, forward_elapsed))
+            },
+        )
+        .await
     }
 
     /// Sends one stream-native object-RPC call through the local daemon and
     /// returns the elapsed time measured around the daemon's inner routed
     /// call. The result retains its owned response body so callers can decode
-    /// a large typed value incrementally.
+    /// a large typed value incrementally. An explicit overall deadline covers
+    /// routing and decoding the daemon's forwarding envelope; ownership of the
+    /// returned inner body then transfers to the caller.
     pub async fn object_rpc_call_to_target_with_forward_elapsed_async(
         &self,
         target_node_id: &NodeId,
@@ -404,7 +493,9 @@ impl DaemonApiClient {
 
     /// Sends one stream-native object-RPC call through the running local daemon.
     /// Ordinary values are represented by [`ObjectRpcCall::value`];
-    /// explicit attachments remain streams.
+    /// explicit attachments remain streams. An explicit overall deadline
+    /// covers routing and the forwarding envelope; the caller owns the
+    /// lifetime of a returned inner stream.
     pub async fn object_rpc_call_to_target_with_deadline_async(
         &self,
         target_node_id: &NodeId,
@@ -413,9 +504,29 @@ impl DaemonApiClient {
         overall_timeout: Option<Duration>,
         observe_connectivity: bool,
     ) -> Result<ObjectRpcResult, DaemonApiError> {
+        self.object_rpc_call_to_target_with_deadline_and_affinity_async(
+            target_node_id,
+            call,
+            connect_timeout,
+            overall_timeout,
+            observe_connectivity,
+            crate::DaemonObjectRpcDestinationProcessAffinity::Any,
+        )
+        .await
+    }
+
+    pub async fn object_rpc_call_to_target_with_deadline_and_affinity_async(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcCall,
+        connect_timeout: Duration,
+        overall_timeout: Option<Duration>,
+        observe_connectivity: bool,
+        destination_process_affinity: crate::DaemonObjectRpcDestinationProcessAffinity,
+    ) -> Result<ObjectRpcResult, DaemonApiError> {
         let data_dir = SinomoDataDir::from_env_or_home()?;
         let runtime = tokio::runtime::Handle::current();
-        send_daemon_object_rpc_call_async(
+        send_daemon_object_rpc_call_with_affinity_async(
             data_dir,
             &self.address,
             DAEMON_OBJECT_RPC_FORWARD_ROUTE,
@@ -425,7 +536,9 @@ impl DaemonApiClient {
             None,
             overall_timeout,
             observe_connectivity,
+            destination_process_affinity,
             self.object_rpc_forward_control_timeouts(overall_timeout),
+            None,
             None,
             &runtime,
         )
@@ -444,6 +557,26 @@ impl DaemonApiClient {
         overall_timeout: Option<Duration>,
         observe_connectivity: bool,
     ) -> Result<ObjectRpcResult, DaemonApiError> {
+        self.object_rpc_call_to_target_with_transport_timeouts_and_affinity_async(
+            target_node_id,
+            call,
+            transport_timeouts,
+            overall_timeout,
+            observe_connectivity,
+            crate::DaemonObjectRpcDestinationProcessAffinity::Any,
+        )
+        .await
+    }
+
+    pub async fn object_rpc_call_to_target_with_transport_timeouts_and_affinity_async(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcCall,
+        transport_timeouts: sinomo_core::network::DaemonRpcTimeouts,
+        overall_timeout: Option<Duration>,
+        observe_connectivity: bool,
+        destination_process_affinity: crate::DaemonObjectRpcDestinationProcessAffinity,
+    ) -> Result<ObjectRpcResult, DaemonApiError> {
         let connect_timeout =
             transport_timeouts
                 .connect_timeout
@@ -459,7 +592,7 @@ impl DaemonApiClient {
                 })?;
         let data_dir = SinomoDataDir::from_env_or_home()?;
         let runtime = tokio::runtime::Handle::current();
-        send_daemon_object_rpc_call_async(
+        send_daemon_object_rpc_call_with_affinity_async(
             data_dir,
             &self.address,
             DAEMON_OBJECT_RPC_FORWARD_ROUTE,
@@ -469,7 +602,9 @@ impl DaemonApiClient {
             Some(idle_timeout),
             overall_timeout,
             observe_connectivity,
+            destination_process_affinity,
             transport_timeouts,
+            None,
             None,
             &runtime,
         )
@@ -508,23 +643,33 @@ impl DaemonApiClient {
         let request = request.clone();
         block_on_daemon_client(async move {
             let runtime = tokio::runtime::Handle::current();
-            let call = ObjectRpcCall::value(request);
-            let result = send_daemon_object_rpc_call_async(
-                data_dir,
-                &address,
-                DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
-                &target_node_id,
-                call,
-                options.connect_timeout,
-                None,
-                options.overall_timeout,
-                options.observe_connectivity,
-                outer_timeouts,
-                None,
-                &runtime,
+            let deadline = daemon_api_overall_deadline(options.overall_timeout);
+            run_daemon_api_with_overall_deadline(
+                "daemon-mediated DFS object RPC value call",
+                deadline,
+                async move {
+                    let call = ObjectRpcCall::value(request);
+                    let result = send_daemon_object_rpc_call_with_affinity_async(
+                        data_dir,
+                        &address,
+                        DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+                        &target_node_id,
+                        call,
+                        options.connect_timeout,
+                        None,
+                        options.overall_timeout,
+                        options.observe_connectivity,
+                        crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+                        outer_timeouts,
+                        None,
+                        None,
+                        &runtime,
+                    )
+                    .await?;
+                    decode_object_rpc_value_response(result).await
+                },
             )
-            .await?;
-            decode_object_rpc_value_response(result).await
+            .await
         })
     }
 
@@ -696,6 +841,7 @@ fn object_rpc_forward_request(
         idle_timeout,
         overall_timeout,
         observe_connectivity,
+        crate::DaemonObjectRpcDestinationProcessAffinity::Any,
     );
     let outer = ObjectRpcRequest::encode_body(route, DAEMON_RPC_CATEGORY, &payload)
         .map_err(DaemonApiError::from)?;
@@ -710,6 +856,7 @@ fn object_rpc_forward_payload(
     idle_timeout: Option<Duration>,
     overall_timeout: Option<Duration>,
     observe_connectivity: bool,
+    destination_process_affinity: crate::DaemonObjectRpcDestinationProcessAffinity,
 ) -> DaemonObjectRpcForwardRequest {
     DaemonObjectRpcForwardRequest {
         target_node_id: target_node_id.clone(),
@@ -721,6 +868,7 @@ fn object_rpc_forward_payload(
         overall_timeout_millis: overall_timeout
             .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
         observe_connectivity,
+        destination_process_affinity,
     }
 }
 
@@ -860,23 +1008,42 @@ async fn call_loopback_daemon_rpc_with_overall_deadline_async(
     overall_deadline: Option<(tokio::time::Instant, Duration)>,
     runtime: &tokio::runtime::Handle,
 ) -> Result<ObjectRpcResult, DaemonApiError> {
-    let pending = call_loopback_daemon_rpc_async(data_dir, address, call, options, runtime);
+    run_daemon_api_with_overall_deadline(
+        "daemon-mediated object RPC outer call",
+        overall_deadline,
+        call_loopback_daemon_rpc_async(data_dir, address, call, options, runtime),
+    )
+    .await
+}
+
+fn daemon_api_overall_deadline(
+    timeout: Option<Duration>,
+) -> Option<(tokio::time::Instant, Duration)> {
+    timeout.map(|timeout| (tokio::time::Instant::now() + timeout, timeout))
+}
+
+async fn run_daemon_api_with_overall_deadline<T, F>(
+    operation: &'static str,
+    overall_deadline: Option<(tokio::time::Instant, Duration)>,
+    pending: F,
+) -> Result<T, DaemonApiError>
+where
+    F: std::future::Future<Output = Result<T, DaemonApiError>>,
+{
     let Some((deadline_at, timeout)) = overall_deadline else {
         return pending.await;
     };
-    tokio::pin!(pending);
-    let deadline = tokio::time::sleep_until(deadline_at);
-    tokio::pin!(deadline);
-    tokio::select! {
-        biased;
-        _ = &mut deadline => Err(sinomo_core::network::NetworkError::timeout(
-            "daemon-mediated object RPC outer call",
+    match tokio::time::timeout_at(deadline_at, pending).await {
+        Ok(result) => result,
+        Err(_) => Err(sinomo_core::network::NetworkError::timeout(
+            operation,
             sinomo_core::network::NetworkTimeoutPhase::Overall,
             timeout,
-            // The local daemon may already have dispatched the inner request.
+            // A daemon or target may already have dispatched the request even
+            // when its streamed response value has not finished arriving.
             sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
-        ).into()),
-        result = &mut pending => result,
+        )
+        .into()),
     }
 }
 
@@ -905,6 +1072,7 @@ async fn call_daemon_address_rpc_async(
         .map_err(Into::into)
 }
 
+#[cfg(test)]
 async fn send_daemon_object_rpc_call_async(
     data_dir: SinomoDataDir,
     address: &str,
@@ -919,7 +1087,7 @@ async fn send_daemon_object_rpc_call_async(
     known_local_node_id: Option<&NodeId>,
     runtime: &tokio::runtime::Handle,
 ) -> Result<ObjectRpcResult, DaemonApiError> {
-    send_daemon_object_rpc_call_with_forward_elapsed_async(
+    send_daemon_object_rpc_call_with_affinity_async(
         data_dir,
         address,
         forward_route,
@@ -929,8 +1097,45 @@ async fn send_daemon_object_rpc_call_async(
         forwarded_idle_timeout,
         overall_timeout,
         observe_connectivity,
+        crate::DaemonObjectRpcDestinationProcessAffinity::Any,
         outer_timeouts,
         known_local_node_id,
+        None,
+        runtime,
+    )
+    .await
+}
+
+async fn send_daemon_object_rpc_call_with_affinity_async(
+    data_dir: SinomoDataDir,
+    address: &str,
+    forward_route: &'static str,
+    target_node_id: &NodeId,
+    call: ObjectRpcCall,
+    connect_timeout: Duration,
+    forwarded_idle_timeout: Option<Duration>,
+    overall_timeout: Option<Duration>,
+    observe_connectivity: bool,
+    destination_process_affinity: crate::DaemonObjectRpcDestinationProcessAffinity,
+    outer_timeouts: sinomo_core::network::DaemonRpcTimeouts,
+    known_local_node_id: Option<&NodeId>,
+    known_connected_process_affinity: Option<crate::DaemonObjectRpcDestinationProcessAffinity>,
+    runtime: &tokio::runtime::Handle,
+) -> Result<ObjectRpcResult, DaemonApiError> {
+    send_daemon_object_rpc_call_with_forward_elapsed_and_affinity_async(
+        data_dir,
+        address,
+        forward_route,
+        target_node_id,
+        call,
+        connect_timeout,
+        forwarded_idle_timeout,
+        overall_timeout,
+        observe_connectivity,
+        destination_process_affinity,
+        outer_timeouts,
+        known_local_node_id,
+        known_connected_process_affinity,
         runtime,
     )
     .await
@@ -951,8 +1156,42 @@ async fn send_daemon_object_rpc_call_with_forward_elapsed_async(
     known_local_node_id: Option<&NodeId>,
     runtime: &tokio::runtime::Handle,
 ) -> Result<(ObjectRpcResult, Option<Duration>), DaemonApiError> {
-    let overall_deadline =
-        overall_timeout.map(|timeout| (tokio::time::Instant::now() + timeout, timeout));
+    send_daemon_object_rpc_call_with_forward_elapsed_and_affinity_async(
+        data_dir,
+        address,
+        forward_route,
+        target_node_id,
+        call,
+        connect_timeout,
+        forwarded_idle_timeout,
+        overall_timeout,
+        observe_connectivity,
+        crate::DaemonObjectRpcDestinationProcessAffinity::Any,
+        outer_timeouts,
+        known_local_node_id,
+        None,
+        runtime,
+    )
+    .await
+}
+
+async fn send_daemon_object_rpc_call_with_forward_elapsed_and_affinity_async(
+    data_dir: SinomoDataDir,
+    address: &str,
+    forward_route: &'static str,
+    target_node_id: &NodeId,
+    call: ObjectRpcCall,
+    connect_timeout: Duration,
+    forwarded_idle_timeout: Option<Duration>,
+    overall_timeout: Option<Duration>,
+    observe_connectivity: bool,
+    destination_process_affinity: crate::DaemonObjectRpcDestinationProcessAffinity,
+    outer_timeouts: sinomo_core::network::DaemonRpcTimeouts,
+    known_local_node_id: Option<&NodeId>,
+    known_connected_process_affinity: Option<crate::DaemonObjectRpcDestinationProcessAffinity>,
+    runtime: &tokio::runtime::Handle,
+) -> Result<(ObjectRpcResult, Option<Duration>), DaemonApiError> {
+    let overall_deadline = daemon_api_overall_deadline(overall_timeout);
     let target_is_local = match known_local_node_id {
         Some(local_node_id) => target_node_id == local_node_id,
         None => target_node_id == &cached_daemon_api_local_node_id(&data_dir)?,
@@ -961,7 +1200,11 @@ async fn send_daemon_object_rpc_call_with_forward_elapsed_async(
     if let Some(overall_timeout) = overall_timeout {
         outer_options = outer_options.with_overall_timeout(overall_timeout);
     }
-    if target_is_local {
+    if daemon_object_rpc_local_direct_allowed(
+        target_is_local,
+        destination_process_affinity,
+        known_connected_process_affinity,
+    ) {
         return call_loopback_daemon_rpc_with_overall_deadline_async(
             data_dir,
             address,
@@ -973,6 +1216,8 @@ async fn send_daemon_object_rpc_call_with_forward_elapsed_async(
         .await
         .map(|result| (result, None));
     }
+    let forward_route =
+        daemon_object_rpc_forward_route_for_affinity(forward_route, destination_process_affinity)?;
     let forward_payload = object_rpc_forward_payload(
         target_node_id,
         &call.request,
@@ -981,6 +1226,7 @@ async fn send_daemon_object_rpc_call_with_forward_elapsed_async(
         forwarded_idle_timeout,
         overall_timeout,
         observe_connectivity,
+        destination_process_affinity,
     );
     let outer = if call.body.is_empty() {
         let mut outer =
@@ -994,18 +1240,58 @@ async fn send_daemon_object_rpc_call_with_forward_elapsed_async(
         );
         ObjectRpcCall::new(forward_request, call.body)
     };
-    let result = call_loopback_daemon_rpc_with_overall_deadline_async(
-        data_dir,
-        address,
-        outer,
-        outer_options,
+    run_daemon_api_with_overall_deadline(
+        "daemon-mediated object RPC outer call and forwarding envelope",
         overall_deadline,
-        runtime,
+        async move {
+            let result =
+                call_loopback_daemon_rpc_async(data_dir, address, outer, outer_options, runtime)
+                    .await?;
+            let (result, elapsed) =
+                decode_daemon_object_rpc_forward_call_response_with_elapsed(result).await?;
+            Ok((result, Some(elapsed)))
+        },
     )
-    .await?;
-    let (result, elapsed) =
-        decode_daemon_object_rpc_forward_call_response_with_elapsed(result).await?;
-    Ok((result, Some(elapsed)))
+    .await
+}
+
+fn daemon_object_rpc_forward_route_for_affinity(
+    forward_route: &'static str,
+    destination_process_affinity: crate::DaemonObjectRpcDestinationProcessAffinity,
+) -> Result<&'static str, DaemonApiError> {
+    match (forward_route, destination_process_affinity) {
+        (
+            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+            crate::DaemonObjectRpcDestinationProcessAffinity::Any,
+        ) => Ok(DAEMON_OBJECT_RPC_FORWARD_ROUTE),
+        (
+            DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+            crate::DaemonObjectRpcDestinationProcessAffinity::Any,
+        ) => Ok(DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE),
+        (
+            DAEMON_OBJECT_RPC_FORWARD_ROUTE | DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+            crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+        ) => Ok(DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE),
+        (
+            DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE | DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+            crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+        ) => Ok(DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE),
+        _ => Err(DaemonApiError::Parse {
+            detail: format!(
+                "daemon forwarding route {forward_route} is incompatible with destination process affinity {destination_process_affinity:?}"
+            ),
+        }),
+    }
+}
+
+fn daemon_object_rpc_local_direct_allowed(
+    target_is_local: bool,
+    destination_process_affinity: crate::DaemonObjectRpcDestinationProcessAffinity,
+    known_connected_process_affinity: Option<crate::DaemonObjectRpcDestinationProcessAffinity>,
+) -> bool {
+    target_is_local
+        && (destination_process_affinity == crate::DaemonObjectRpcDestinationProcessAffinity::Any
+            || known_connected_process_affinity == Some(destination_process_affinity))
 }
 
 /// DFS peer transport that deliberately terminates at the running local
@@ -1017,6 +1303,7 @@ pub struct DaemonDfsPeerTransport {
     data_dir: SinomoDataDir,
     address: String,
     local_node_id: NodeId,
+    connected_process_affinity: crate::DaemonObjectRpcDestinationProcessAffinity,
     runtime: std::sync::Arc<tokio::runtime::Runtime>,
 }
 
@@ -1035,6 +1322,8 @@ impl DaemonDfsPeerTransport {
             data_dir,
             address: client.address,
             local_node_id,
+            connected_process_affinity:
+                crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
             runtime,
         })
     }
@@ -1045,10 +1334,26 @@ impl DaemonDfsPeerTransport {
         address: impl Into<String>,
         local_node_id: NodeId,
     ) -> Self {
+        Self::at_address_with_process_affinity(
+            data_dir,
+            address,
+            local_node_id,
+            crate::DaemonObjectRpcDestinationProcessAffinity::Any,
+        )
+    }
+
+    #[cfg(test)]
+    fn at_address_with_process_affinity(
+        data_dir: SinomoDataDir,
+        address: impl Into<String>,
+        local_node_id: NodeId,
+        connected_process_affinity: crate::DaemonObjectRpcDestinationProcessAffinity,
+    ) -> Self {
         Self {
             data_dir,
             address: address.into(),
             local_node_id,
+            connected_process_affinity,
             runtime: daemon_dfs_peer_runtime().expect("daemon DFS peer runtime"),
         }
     }
@@ -1060,7 +1365,7 @@ impl DaemonDfsPeerTransport {
         options: sinomo_dfs::DfsObjectRpcSendOptions,
         runtime: &tokio::runtime::Handle,
     ) -> Result<ObjectRpcResult, DaemonApiError> {
-        send_daemon_object_rpc_call_async(
+        send_daemon_object_rpc_call_with_affinity_async(
             self.data_dir.clone(),
             &self.address,
             DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
@@ -1070,8 +1375,10 @@ impl DaemonDfsPeerTransport {
             None,
             options.overall_timeout,
             options.observe_connectivity,
+            crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
             sinomo_core::network::DaemonRpcTimeouts::default(),
             Some(&self.local_node_id),
+            Some(self.connected_process_affinity),
             runtime,
         )
         .await
@@ -1114,12 +1421,7 @@ impl sinomo_dfs::DfsPeerTransport for DaemonDfsPeerTransport {
             result.response.error_detail()?;
             Ok(result)
         })
-        .map_err(|source| {
-            sinomo_dfs::DfsPeerTransportError::with_delivery_state(
-                source.to_string(),
-                source.delivery_state(),
-            )
-        })
+        .map_err(daemon_api_dfs_peer_transport_error)
     }
 }
 
@@ -1139,18 +1441,28 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsPeerTransport {
             let result = self
                 .call_rpc_inner(target_node_id, call, options, &runtime)
                 .await
-                .map_err(|source| {
-                    sinomo_dfs::DfsPeerTransportError::with_delivery_state(
-                        source.to_string(),
-                        source.delivery_state(),
-                    )
-                })?;
+                .map_err(daemon_api_dfs_peer_transport_error)?;
             result
                 .response
                 .error_detail()
                 .map_err(sinomo_dfs::DfsPeerTransportError::from_network)?;
             Ok(result)
         })
+    }
+}
+
+fn daemon_api_dfs_peer_transport_error(
+    source: DaemonApiError,
+) -> sinomo_dfs::DfsPeerTransportError {
+    let delivery_state = source.delivery_state();
+    match source {
+        DaemonApiError::UnknownRoute { route } => sinomo_dfs::DfsPeerTransportError::from_network(
+            sinomo_core::network::NetworkError::UnknownRoute { route },
+        ),
+        source => sinomo_dfs::DfsPeerTransportError::with_delivery_state(
+            source.to_string(),
+            delivery_state,
+        ),
     }
 }
 
@@ -1723,6 +2035,13 @@ where
     F: std::future::Future<Output = Result<T, DaemonApiError>> + Send,
     T: Send,
 {
+    // Keep the concrete RPC state machine out of synchronous callers' stacks.
+    // Routed object-RPC futures are intentionally composed from the complete
+    // transport path and can be large even though their streamed payloads are
+    // heap-backed. `Runtime::block_on` carries its future through several
+    // generic frames, so passing that concrete value by hand can amplify its
+    // stack footprint on ordinary 2 MiB worker threads.
+    let future = Box::pin(future);
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         return if matches!(
             handle.runtime_flavor(),
@@ -1736,7 +2055,7 @@ where
             })
         };
     }
-    block_on_daemon_client_on_process_runtime(future)
+    block_on_daemon_client_on_process_runtime_pinned(future)
 }
 
 fn block_on_daemon_client_stream<F, T>(future: F) -> Result<T, DaemonApiError>
@@ -1749,7 +2068,7 @@ where
             detail: "streaming daemon RPC sync client cannot run inside a Tokio runtime; use send_daemon_rpc_stream_async".to_string(),
         });
     }
-    block_on_daemon_client_on_process_runtime(future)
+    block_on_daemon_client_on_process_runtime_pinned(Box::pin(future))
 }
 
 fn block_on_daemon_client_on_owner_runtime<F, T>(
@@ -1760,6 +2079,7 @@ where
     F: std::future::Future<Output = Result<T, DaemonApiError>> + Send,
     T: Send,
 {
+    let future = Box::pin(future);
     if let Ok(current) = tokio::runtime::Handle::try_current() {
         return if matches!(
             current.runtime_flavor(),
@@ -1794,7 +2114,9 @@ fn daemon_api_sync_runtime() -> Result<&'static tokio::runtime::Runtime, DaemonA
     }
 }
 
-fn block_on_daemon_client_on_process_runtime<F, T>(future: F) -> Result<T, DaemonApiError>
+fn block_on_daemon_client_on_process_runtime_pinned<F, T>(
+    future: std::pin::Pin<Box<F>>,
+) -> Result<T, DaemonApiError>
 where
     F: std::future::Future<Output = Result<T, DaemonApiError>>,
 {
@@ -1806,6 +2128,116 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn stalled_streamed_value_result(
+        route: &str,
+    ) -> (impl Send, sinomo_core::network::ObjectRpcResult) {
+        let (sender, body) = sinomo_core::network::ObjectRpcIncomingBody::test_channel(Some(16), 1);
+        let response = ObjectRpcResponse::from_encoded_body(route, Vec::new());
+        let result = ObjectRpcResult::from_forwarded_body(response, body, true)
+            .expect("construct stalled streamed response value");
+        (sender, result)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overall_deadline_covers_forwarding_envelope_decode() {
+        let timeout = Duration::from_millis(40);
+        let started_at = tokio::time::Instant::now();
+        let deadline = daemon_api_overall_deadline(Some(timeout));
+        let (sender, result) = stalled_streamed_value_result(DAEMON_OBJECT_RPC_FORWARD_ROUTE);
+
+        let error = run_daemon_api_with_overall_deadline(
+            "test forwarding envelope decode",
+            deadline,
+            async move {
+                let _hold_sender = sender;
+                decode_daemon_object_rpc_forward_call_response_with_elapsed(result)
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await
+        .expect_err("a stalled forwarding envelope must honor the overall deadline");
+
+        assert_eq!(tokio::time::Instant::now() - started_at, timeout);
+        assert_eq!(
+            error.delivery_state(),
+            Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied)
+        );
+        assert!(error.to_string().contains("Overall"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn value_materialization_uses_only_the_original_remaining_budget() {
+        let timeout = Duration::from_millis(80);
+        let head_delay = Duration::from_millis(55);
+        let started_at = tokio::time::Instant::now();
+        let deadline = daemon_api_overall_deadline(Some(timeout));
+        let (sender, result) = stalled_streamed_value_result("/test/stalled-inner-value");
+
+        let error = run_daemon_api_with_overall_deadline(
+            "test complete value call",
+            deadline,
+            async move {
+                tokio::time::sleep(head_delay).await;
+                let _hold_sender = sender;
+                decode_object_rpc_value_response(result).await.map(|_| ())
+            },
+        )
+        .await
+        .expect_err("value materialization must not receive a fresh timeout after its head");
+
+        assert_eq!(tokio::time::Instant::now() - started_at, timeout);
+        assert_eq!(
+            error.delivery_state(),
+            Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied)
+        );
+        assert!(error.to_string().contains("Overall"));
+    }
+
+    #[test]
+    fn sync_bridge_materializes_large_streamed_observe_response_on_two_mib_stack() {
+        const WORKER_STACK_BYTES: usize = 2 * 1024 * 1024;
+        const RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+        const CHUNK_BYTES: usize = 64 * 1024;
+
+        std::thread::Builder::new()
+            .name("sinomo-api-two-mib-observe-bridge".to_string())
+            .stack_size(WORKER_STACK_BYTES)
+            .spawn(|| {
+                let (sender, body) = sinomo_core::network::ObjectRpcIncomingBody::test_channel(
+                    Some(RESPONSE_BYTES as u64),
+                    2,
+                );
+                let response = ObjectRpcResponse::from_encoded_body("/observe/metrics", Vec::new());
+                let result = sinomo_core::network::ObjectRpcResult::from_forwarded_body(
+                    response, body, true,
+                )
+                .expect("construct streamed observe response");
+
+                let response = block_on_daemon_client(async move {
+                    let producer = tokio::spawn(async move {
+                        for _ in 0..(RESPONSE_BYTES / CHUNK_BYTES) {
+                            sender
+                                .send(vec![0x5a; CHUNK_BYTES])
+                                .await
+                                .expect("stream observe response chunk");
+                        }
+                    });
+                    let response = decode_object_rpc_value_response(result).await?;
+                    producer.await.expect("join observe response producer");
+                    Ok(response)
+                })
+                .expect("materialize streamed observe response");
+
+                assert_eq!(response.route, "/observe/metrics");
+                assert_eq!(response.body.len(), RESPONSE_BYTES);
+                assert!(response.body.iter().all(|byte| *byte == 0x5a));
+            })
+            .expect("spawn two-MiB observe bridge worker")
+            .join()
+            .expect("join two-MiB observe bridge worker");
+    }
 
     #[test]
     fn request_outcome_client_rejects_a_committed_record_for_another_request() {
@@ -2976,7 +3408,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn daemon_dfs_peer_transport_sends_the_dfs_forward_route() {
+    async fn daemon_dfs_peer_transport_sends_the_fail_closed_main_dfs_forward_route() {
         let (_root, data_dir) = test_channel_data_dir("sinomo-api-dfs-forward-route");
         let local_node =
             NodeId::from_legacy_named("node_api_dfs_forward_local").expect("local node");
@@ -2997,18 +3429,23 @@ mod tests {
                 move |inbound, _peer| async move {
                     assert_eq!(
                         inbound.request.route,
-                        DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
-                        "the real DFS peer transport must not fall back to the generic daemon forward route"
+                        DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+                        "the real DFS peer transport must use a route an old daemon cannot silently downgrade"
                     );
                     let forward = inbound
                         .decode_body::<DaemonObjectRpcForwardRequest>()
                         .await
                         .expect("forward request");
                     assert_eq!(forward.target_node_id, expected_target);
+                    assert_eq!(
+                        forward.destination_process_affinity,
+                        crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+                        "DFS forwarding must terminate at the main daemon; shadow DFS is fail-closed"
+                    );
                     let inner = ObjectRpcResponse::encode_body(forward.request.route, &"dfs-pong")
                         .expect("inner response");
                     sinomo_core::network::ObjectRpcOutgoingResponse::encode_borrowed_value(
-                        DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+                        DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE,
                         &DaemonObjectRpcForwardResponse::Success {
                             response: inner,
                             streamed_value_body: false,
@@ -3094,6 +3531,104 @@ mod tests {
         assert_eq!(payload.connect_timeout_millis, 5_000);
         assert_eq!(payload.idle_timeout_millis, Some(5_000));
         assert_eq!(payload.overall_timeout_millis, Some(10_000));
+        assert_eq!(
+            payload.destination_process_affinity,
+            crate::DaemonObjectRpcDestinationProcessAffinity::Any
+        );
+    }
+
+    #[test]
+    fn explicit_main_affinity_selects_only_fail_closed_forward_routes() {
+        assert_eq!(
+            daemon_object_rpc_forward_route_for_affinity(
+                DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+                crate::DaemonObjectRpcDestinationProcessAffinity::Any,
+            )
+            .expect("legacy generic route"),
+            DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+        );
+        assert_eq!(
+            daemon_object_rpc_forward_route_for_affinity(
+                DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+                crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+            )
+            .expect("main generic route"),
+            DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+        );
+        assert_eq!(
+            daemon_object_rpc_forward_route_for_affinity(
+                DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+                crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+            )
+            .expect("main DFS route"),
+            DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+        );
+        assert!(
+            daemon_object_rpc_forward_route_for_affinity(
+                DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+                crate::DaemonObjectRpcDestinationProcessAffinity::Any,
+            )
+            .is_err(),
+            "a main-only route must never be paired with process-agnostic semantics"
+        );
+    }
+
+    #[test]
+    fn forward_affinity_is_backward_compatible_on_the_sobj_wire() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct LegacyForwardRequest {
+            target_node_id: NodeId,
+            request: ObjectRpcRequest,
+            streamed_value_body: bool,
+            connect_timeout_millis: u64,
+            idle_timeout_millis: Option<u64>,
+            overall_timeout_millis: Option<u64>,
+            observe_connectivity: bool,
+        }
+
+        let target_node_id =
+            NodeId::from_legacy_named("node_legacy_forward_affinity").expect("node id");
+        let request =
+            ObjectRpcRequest::encode_body("/test/legacy-affinity", "test", &()).expect("request");
+        let legacy = LegacyForwardRequest {
+            target_node_id: target_node_id.clone(),
+            request: request.clone(),
+            streamed_value_body: false,
+            connect_timeout_millis: 5_000,
+            idle_timeout_millis: None,
+            overall_timeout_millis: None,
+            observe_connectivity: false,
+        };
+        let legacy_wire =
+            ObjectRpcRequest::encode_body("/test/legacy-forward-envelope", "test", &legacy)
+                .expect("encode legacy payload");
+        let decoded: DaemonObjectRpcForwardRequest =
+            legacy_wire.decode_body().expect("decode legacy payload");
+        assert_eq!(
+            decoded.destination_process_affinity,
+            crate::DaemonObjectRpcDestinationProcessAffinity::Any
+        );
+
+        let current = object_rpc_forward_payload(
+            &target_node_id,
+            &request,
+            false,
+            Duration::from_secs(5),
+            None,
+            None,
+            false,
+            crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+        );
+        let current_wire =
+            ObjectRpcRequest::encode_body("/test/current-forward-envelope", "test", &current)
+                .expect("encode current payload");
+        let decoded_legacy: LegacyForwardRequest = current_wire
+            .decode_body()
+            .expect("an old daemon must ignore the new affinity field");
+        assert_eq!(
+            decoded_legacy.target_node_id, target_node_id,
+            "the payload remains decodable, while the dedicated main route prevents an old daemon from dispatching it with lost affinity"
+        );
     }
 
     #[test]
@@ -3258,7 +3793,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_dfs_peer_transport_dispatches_local_target_directly_with_bodies() {
+    async fn daemon_dfs_peer_transport_uses_proven_main_for_a_local_target() {
         let root = sinomo_testdir::TestDir::new("sinomo-api-dfs-local-target-session");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("data directory");
@@ -3294,7 +3829,8 @@ mod tests {
             serve_test_stream_native_service(stream, move |incoming, _peer| async move {
                 assert_eq!(
                     incoming.request.route,
-                    sinomo_core::kv::CLUSTER_KV_TXN_ROUTE
+                    sinomo_core::kv::CLUSTER_KV_TXN_ROUTE,
+                    "a transport connected through the main-daemon discovery path must keep the local target on the one-hop direct path"
                 );
                 let request_body = incoming
                     .body
@@ -3302,12 +3838,13 @@ mod tests {
                     .await
                     .expect("local request body");
                 assert_eq!(request_body, expected_request);
+                let inner = ObjectRpcResponse::encode_body(
+                    sinomo_core::kv::CLUSTER_KV_TXN_ROUTE,
+                    &"local-ok",
+                )
+                .expect("local response head");
                 Ok(sinomo_core::network::ObjectRpcOutgoingResponse {
-                    response: ObjectRpcResponse::encode_body(
-                        sinomo_core::kv::CLUSTER_KV_TXN_ROUTE,
-                        &"local-ok",
-                    )
-                    .expect("local response head"),
+                    response: inner,
                     body: sinomo_core::network::ObjectRpcBodySource::bytes(server_response),
                 })
             })
@@ -3315,10 +3852,11 @@ mod tests {
             .expect("serve local stream-native request");
         });
 
-        let transport = DaemonDfsPeerTransport::at_address(
+        let transport = DaemonDfsPeerTransport::at_address_with_process_affinity(
             data_dir.clone(),
             address.clone(),
             local_node.clone(),
+            crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
         );
         let request = ObjectRpcRequest::encode_body(
             sinomo_core::kv::CLUSTER_KV_TXN_ROUTE,
@@ -3355,5 +3893,101 @@ mod tests {
             response_body
         );
         server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn unproven_local_main_target_uses_the_fail_closed_forward_route() {
+        let root = sinomo_testdir::TestDir::new("sinomo-api-unproven-local-main-forward");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data directory");
+        let identity = sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
+            .expect("main identity");
+        let local_node =
+            NodeId::from_legacy_named("node_api_unproven_local_main_forward").expect("local node");
+        write_test_cluster_state(
+            &data_dir,
+            "unproven_local_main_forward",
+            local_node.clone(),
+            identity.public_key,
+        );
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("listener address");
+        let expected_node = local_node.clone();
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept local carrier");
+            serve_test_stream_native_service(stream, move |incoming, _peer| async move {
+                assert_eq!(
+                    incoming.request.route, DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+                    "an address-only client must not direct-dispatch or use a legacy route"
+                );
+                let payload: DaemonObjectRpcForwardRequest =
+                    incoming.decode_body().await.expect("forward payload");
+                assert_eq!(payload.target_node_id, expected_node);
+                assert_eq!(
+                    payload.destination_process_affinity,
+                    crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+                );
+                let inner = ObjectRpcResponse::encode_body(payload.request.route, &"forwarded")
+                    .expect("inner response");
+                sinomo_core::network::ObjectRpcOutgoingResponse::encode_borrowed_value(
+                    DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+                    &DaemonObjectRpcForwardResponse::Success {
+                        response: inner,
+                        streamed_value_body: false,
+                        forward_elapsed_micros: 0,
+                    },
+                )
+            })
+            .await
+            .expect("serve fail-closed forward");
+        });
+
+        let transport = DaemonDfsPeerTransport::at_address(data_dir, address, local_node.clone());
+        let request = ObjectRpcRequest::encode_body("/test/unproven-local-main", "test", &())
+            .expect("inner request");
+        let result = transport
+            .call_rpc_inner(
+                &local_node,
+                ObjectRpcCall::value(request),
+                sinomo_dfs::DfsObjectRpcSendOptions::new(Duration::from_secs(2))
+                    .with_overall_timeout(Duration::from_secs(5)),
+                &tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("unproven local forward");
+        assert_eq!(
+            result
+                .response
+                .decode_body::<String>()
+                .expect("inner response"),
+            "forwarded",
+        );
+        server.await.expect("server task");
+    }
+
+    #[test]
+    fn local_target_shortcut_never_drops_explicit_main_affinity() {
+        assert!(daemon_object_rpc_local_direct_allowed(
+            true,
+            crate::DaemonObjectRpcDestinationProcessAffinity::Any,
+            None,
+        ));
+        assert!(!daemon_object_rpc_local_direct_allowed(
+            true,
+            crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+            None,
+        ));
+        assert!(daemon_object_rpc_local_direct_allowed(
+            true,
+            crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+            Some(crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon),
+        ));
+        assert!(!daemon_object_rpc_local_direct_allowed(
+            false,
+            crate::DaemonObjectRpcDestinationProcessAffinity::Any,
+            Some(crate::DaemonObjectRpcDestinationProcessAffinity::MainDaemon),
+        ));
     }
 }

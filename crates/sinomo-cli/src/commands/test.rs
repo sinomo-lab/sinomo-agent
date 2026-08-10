@@ -378,6 +378,11 @@ fn test_list(options: TestListOptions) -> Result<(), CliError> {
 
 fn test_run(options: TestRunOptions) -> Result<(), CliError> {
     let registry = test_registry()?;
+    let load_cluster_snapshot = test_selection_requires_cluster_kv_snapshot(
+        &registry,
+        options.id.as_deref(),
+        options.tag.as_deref(),
+    );
     let mut context = test_context(
         options.provider.as_deref(),
         &options.account,
@@ -385,6 +390,7 @@ fn test_run(options: TestRunOptions) -> Result<(), CliError> {
         options.live,
         options.require_cluster,
         &options.params,
+        load_cluster_snapshot,
         options.tag.is_none(),
     )?;
     if let Some(tag) = options.tag.as_deref() {
@@ -402,6 +408,26 @@ fn test_run(options: TestRunOptions) -> Result<(), CliError> {
         })?;
     print_test_report(&report, options.json)?;
     test_report_result(&report)
+}
+
+fn test_selection_requires_cluster_kv_snapshot(
+    registry: &SinomoTestRegistry,
+    id: Option<&str>,
+    tag: Option<&str>,
+) -> bool {
+    let requires_snapshot = |case: &SinomoTestCaseMetadata| {
+        case.requirements
+            .contains(&sinomo_runtime::test::SinomoTestRequirement::ClusterKvSnapshot)
+    };
+    if let Some(tag) = tag {
+        return registry
+            .metadata()
+            .iter()
+            .filter(|case| case.tags.iter().any(|candidate| candidate == tag))
+            .any(requires_snapshot);
+    }
+    id.and_then(|id| registry.get(id))
+        .is_some_and(|case| requires_snapshot(case.metadata()))
 }
 
 fn test_run_tag(
@@ -497,6 +523,7 @@ fn test_context(
     live: bool,
     require_cluster: bool,
     params: &[(String, String)],
+    load_cluster_snapshot: bool,
     preserve_cluster_authority: bool,
 ) -> Result<SinomoTestContext, CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
@@ -524,20 +551,24 @@ fn test_context(
             });
     context = context.with_runtime_capabilities(native_dylib_capabilities);
     if model_config_uses_cluster(&data_dir) {
-        let paths = ClusterPaths::new(&data_dir);
-        let snapshot = model_config_cluster_snapshot_read(&paths)?;
-        context = match snapshot {
-            ModelConfigClusterSnapshot::Authoritative(read) if preserve_cluster_authority => {
-                context.try_with_authoritative_cluster_snapshot(read, paths.kv_paths().snapshot)?
-            }
-            ModelConfigClusterSnapshot::Authoritative(read) => {
-                context.with_cluster_snapshot(read.value, paths.kv_paths().snapshot)
-            }
-            #[cfg(test)]
-            ModelConfigClusterSnapshot::Unverified(snapshot) => {
-                context.with_cluster_snapshot(snapshot, paths.kv_paths().snapshot)
-            }
-        };
+        context = context.with_cluster_runtime_available(true);
+        if load_cluster_snapshot {
+            let paths = ClusterPaths::new(&data_dir);
+            let snapshot = model_config_cluster_snapshot_read(&paths)?;
+            context = match snapshot {
+                ModelConfigClusterSnapshot::Authoritative(read) if preserve_cluster_authority => {
+                    context
+                        .try_with_authoritative_cluster_snapshot(read, paths.kv_paths().snapshot)?
+                }
+                ModelConfigClusterSnapshot::Authoritative(read) => {
+                    context.with_cluster_snapshot(read.value, paths.kv_paths().snapshot)
+                }
+                #[cfg(test)]
+                ModelConfigClusterSnapshot::Unverified(snapshot) => {
+                    context.with_cluster_snapshot(snapshot, paths.kv_paths().snapshot)
+                }
+            };
+        }
     } else if require_cluster {
         return Err(CliError::Parse {
             detail: "test requires cluster runtime, but this CLI invocation is in local mode"
@@ -858,6 +889,37 @@ mod tests {
                 "missing {id} from cluster-network-dfs-acceptance"
             );
         }
+    }
+
+    #[test]
+    fn full_cluster_snapshot_is_loaded_only_for_explicit_consumers() {
+        let registry = test_registry().expect("registry");
+
+        assert!(!test_selection_requires_cluster_kv_snapshot(
+            &registry,
+            Some("cluster.dfs.read-your-write"),
+            None,
+        ));
+        assert!(!test_selection_requires_cluster_kv_snapshot(
+            &registry,
+            Some("cluster.dfs.bulk-write"),
+            None,
+        ));
+        assert!(!test_selection_requires_cluster_kv_snapshot(
+            &registry,
+            None,
+            Some("cluster-network-dfs-acceptance"),
+        ));
+        assert!(test_selection_requires_cluster_kv_snapshot(
+            &registry,
+            Some("cluster.migration.verify-joined"),
+            None,
+        ));
+        assert!(test_selection_requires_cluster_kv_snapshot(
+            &registry,
+            None,
+            Some("cluster-migration"),
+        ));
     }
 
     #[test]

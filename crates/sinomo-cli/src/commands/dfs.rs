@@ -9,6 +9,8 @@ use sinomo_runtime::cli_registry::{
 use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
 
+use crate::sifs_file_manager::SifsControlPlaneKvClient;
+
 const DFS_CLUSTER_STATUS_REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 const DFS_SMOKE_DAEMON_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(9_500);
 const DFS_PLACEMENT_AUTHORITY_ADMIN_RPC_TIMEOUT: std::time::Duration =
@@ -1265,13 +1267,13 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             Ok(())
         }
         DfsCliCommand::Smoke { json } => {
-            let data_dir = SinomoDataDir::from_env_or_home()?;
-            data_dir.ensure_root_layout()?;
-            let report = if let Some(status) = default_main_daemon_status()? {
-                run_dfs_smoke_via_daemon_address(&status.address, DFS_SMOKE_DAEMON_RPC_TIMEOUT)?
-            } else {
-                run_local_dfs_smoke(&data_dir)?
-            };
+            let status =
+                default_main_daemon_status()?.ok_or_else(|| CliError::DaemonNotRunning {
+                    detail: "DFS smoke requires the local main daemon; offline cluster mutation is reserved for explicit recovery"
+                        .to_string(),
+                })?;
+            let report =
+                run_dfs_smoke_via_daemon_address(&status.address, DFS_SMOKE_DAEMON_RPC_TIMEOUT)?;
             if json {
                 print_json("<dfs-smoke>", &report)?;
             } else {
@@ -1569,7 +1571,11 @@ fn run_dfs_metadata_shard_transfer_primary(
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let mut kv = CliDfsControlPlaneKvClient::new(&cluster_paths);
+    default_main_daemon_status()?.ok_or_else(|| CliError::DaemonNotRunning {
+        detail: "DFS metadata shard transfer requires the local main daemon; offline cluster mutation is reserved for explicit recovery"
+            .to_string(),
+    })?;
+    let mut kv = SifsControlPlaneKvClient::new(&data_dir, &cluster_paths);
     let mut store = sinomo_runtime::dfs::DfsControlPlaneStore::new(&mut kv);
     let previous = store
         .get_metadata_shard(&options.file_system_id, &options.shard_id)?
@@ -2153,108 +2159,13 @@ fn run_dfs_smoke_via_daemon_address(
     sinomo_runtime::dfs::decode_dfs_smoke_rpc_response(&response).map_err(Into::into)
 }
 
-#[derive(Clone, Debug)]
-struct CliDfsControlPlaneKvClient {
-    cluster_paths: ClusterPaths,
-}
-
-impl CliDfsControlPlaneKvClient {
-    fn new(cluster_paths: &ClusterPaths) -> Self {
-        Self {
-            cluster_paths: cluster_paths.clone(),
-        }
-    }
-
-    fn kv_error(&self, source: impl std::fmt::Display) -> KvError {
-        KvError::Io {
-            path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
-            detail: source.to_string(),
-        }
-    }
-}
-
-impl sinomo_runtime::dfs::DfsControlPlaneKvClient for CliDfsControlPlaneKvClient {
-    fn get(&self, key: &str) -> Result<Option<sinomo_runtime::kv::KvEntry>, KvError> {
-        sinomo_runtime::kv::read_cluster_kv_entry(&self.cluster_paths.kv_paths(), key)
-    }
-
-    fn range_prefix(&self, prefix: &str) -> Result<Vec<sinomo_runtime::kv::KvEntry>, KvError> {
-        sinomo_runtime::kv::read_cluster_kv_prefix_entries(&self.cluster_paths.kv_paths(), prefix)
-    }
-
-    fn put(
-        &mut self,
-        key: String,
-        value: Vec<u8>,
-    ) -> Result<sinomo_runtime::kv::KvRevision, KvError> {
-        let response = self.txn(KvTxn {
-            compares: Vec::new(),
-            success: vec![KvOp::Put {
-                key,
-                value,
-                lease_id: None,
-            }],
-            failure: Vec::new(),
-        })?;
-        Ok(response.revision)
-    }
-
-    fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
-        let mut state = cluster::read_cluster_state(&self.cluster_paths)
-            .map_err(|source| self.kv_error(source))?;
-        let result =
-            cli_commit_cluster_kv_txn_with_quorum_response(&self.cluster_paths, &mut state, txn)
-                .map_err(|source| self.kv_error(source))?;
-        result.txn_response.ok_or_else(|| KvError::Serialization {
-            detail: "cluster KV returned a barrier result for a DFS control-plane transaction"
-                .to_string(),
-        })
-    }
-}
-
-fn run_local_dfs_smoke(
-    data_dir: &SinomoDataDir,
-) -> Result<sinomo_runtime::dfs::DfsSmokeReport, CliError> {
-    data_dir.ensure_root_layout()?;
-    let cluster_paths = ClusterPaths::new(data_dir);
-    let control_plane = cluster_paths.kv_paths().snapshot.exists().then(|| {
-        Box::new(CliDfsControlPlaneKvClient::new(&cluster_paths))
-            as Box<dyn sinomo_runtime::dfs::DfsControlPlaneKvClient>
-    });
-    let Some(report) = sinomo_runtime::dfs::run_default_cluster_dfs_smoke_with_peer_transport(
-        data_dir,
-        &cluster_paths,
-        cli_dfs_peer_transport(),
-        Box::new(CliDfsControlPlaneKvClient::new(&cluster_paths)),
-        control_plane,
-        sinomo_runtime::dfs::DfsDefaultClusterSmokeOptions {
-            bootstrap: sinomo_runtime::dfs::DfsDefaultClusterBootstrapOptions {
-                publish_cluster_control: false,
-                materialize_local_metadata: false,
-                local_zone: None,
-            },
-            smoke: foreground_dfs_smoke_options(),
-        },
-    )?
-    else {
-        return Err(CliError::ClusterOrphan);
-    };
-    Ok(report)
-}
-
-fn foreground_dfs_smoke_options() -> sinomo_runtime::dfs::DfsSmokeOptions {
-    sinomo_runtime::dfs::DfsSmokeOptions {
-        stable_path: true,
-        remote_replica_candidates: false,
-        foreground_replica_repair: false,
-        inspect_pending_repairs: false,
-        publish_metadata: false,
-        metadata_replication: sinomo_runtime::dfs::DfsMetadataJournalReplicationOptions {
-            max_batches_per_target: 0,
-            ..sinomo_runtime::dfs::DfsMetadataJournalReplicationOptions::default()
-        },
-        ..sinomo_runtime::dfs::DfsSmokeOptions::default()
-    }
+fn run_dfs_status_via_daemon_address(
+    address: &str,
+    timeout: std::time::Duration,
+) -> Result<sinomo_runtime::dfs::DfsOperatorStatus, CliError> {
+    let rpc_request = sinomo_runtime::dfs::dfs_status_rpc_request()?;
+    let response = daemon_send_daemon_rpc(address, &rpc_request, timeout)?;
+    sinomo_runtime::dfs::decode_dfs_status_rpc_response(&response).map_err(Into::into)
 }
 
 fn cli_dfs_peer_transport() -> std::sync::Arc<dyn sinomo_runtime::dfs::DfsPeerTransport> {
@@ -2289,12 +2200,13 @@ fn daemon_dfs_object_rpc_to_target(
     let client = DaemonApiClient::at_address(status.address);
     let send = async {
         let mut result = client
-            .object_rpc_call_to_target_with_deadline_async(
+            .object_rpc_call_to_target_with_deadline_and_affinity_async(
                 target_node_id,
                 call,
                 options.connect_timeout,
                 options.overall_timeout,
                 options.observe_connectivity,
+                sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
             )
             .await
             .map_err(CliError::from)?;
@@ -2329,12 +2241,13 @@ where
     let call = sinomo_runtime::network::ObjectRpcCall::encode_value(route, category, value)?;
     let send = async {
         client
-            .object_rpc_call_to_target_with_deadline_async(
+            .object_rpc_call_to_target_with_deadline_and_affinity_async(
                 target_node_id,
                 call,
                 options.connect_timeout,
                 options.overall_timeout,
                 options.observe_connectivity,
+                sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
             )
             .await
             .map_err(CliError::from)?
@@ -2607,8 +2520,17 @@ pub(crate) fn inspect_cluster_dfs_status_with_data_dir(
         ),
     );
     let local_status_started_at = std::time::Instant::now();
-    let local_status =
-        sinomo_runtime::dfs::inspect_cluster_aware_dfs_status(&data_dir, &cluster_paths)?;
+    let daemon_status = main_daemon_status_for_data_dir(&data_dir)?;
+    let local_status = inspect_local_cluster_dfs_status_from_owner(
+        daemon_status.as_ref().map(|status| status.address.as_str()),
+        |daemon_address| {
+            run_dfs_status_via_daemon_address(daemon_address, DFS_CLUSTER_STATUS_REMOTE_TIMEOUT)
+        },
+        || {
+            sinomo_runtime::dfs::inspect_cluster_aware_dfs_status(&data_dir, &cluster_paths)
+                .map_err(CliError::from)
+        },
+    )?;
     trace_dfs_cluster_status(
         trace,
         started_at,
@@ -2688,6 +2610,63 @@ pub(crate) fn inspect_cluster_dfs_status_with_data_dir(
         format_args!("complete nodes={}", nodes.len()),
     );
     Ok(DfsClusterStatusReport { nodes })
+}
+
+fn inspect_local_cluster_dfs_status_from_owner<T>(
+    daemon_address: Option<&str>,
+    inspect_daemon: impl FnOnce(&str) -> Result<T, CliError>,
+    inspect_standalone: impl FnOnce() -> Result<T, CliError>,
+) -> Result<T, CliError> {
+    match daemon_address {
+        Some(address) => inspect_daemon(address),
+        None => inspect_standalone(),
+    }
+}
+
+#[cfg(test)]
+mod local_cluster_dfs_status_tests {
+    use super::inspect_local_cluster_dfs_status_from_owner;
+    use std::cell::Cell;
+
+    #[test]
+    fn local_cluster_status_uses_daemon_owner_instead_of_standalone_storage() {
+        let daemon_calls = Cell::new(0_u32);
+        let standalone_calls = Cell::new(0_u32);
+
+        let selected = inspect_local_cluster_dfs_status_from_owner(
+            Some("127.0.0.1:21353"),
+            |address| {
+                daemon_calls.set(daemon_calls.get() + 1);
+                Ok(address.to_string())
+            },
+            || {
+                standalone_calls.set(standalone_calls.get() + 1);
+                Ok("standalone".to_string())
+            },
+        )
+        .expect("daemon-owned status");
+
+        assert_eq!(selected, "127.0.0.1:21353");
+        assert_eq!(daemon_calls.get(), 1);
+        assert_eq!(standalone_calls.get(), 0);
+
+        let selected = inspect_local_cluster_dfs_status_from_owner(
+            None,
+            |_| {
+                daemon_calls.set(daemon_calls.get() + 1);
+                Ok("daemon".to_string())
+            },
+            || {
+                standalone_calls.set(standalone_calls.get() + 1);
+                Ok("standalone".to_string())
+            },
+        )
+        .expect("offline standalone status");
+
+        assert_eq!(selected, "standalone");
+        assert_eq!(daemon_calls.get(), 1);
+        assert_eq!(standalone_calls.get(), 1);
+    }
 }
 
 pub(crate) fn dfs_cluster_status_unavailable_reason(

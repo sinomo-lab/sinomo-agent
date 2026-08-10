@@ -1649,8 +1649,21 @@ impl AgentCatalog {
     pub fn load_from_data_dir(
         data_dir: &sinomo_runtime::local::SinomoDataDir,
     ) -> Result<Self, AgentCatalogError> {
+        Self::load_from_store(AgentDefinitionSifsStore::open(Some(data_dir.root()))?)
+    }
+
+    /// Load the catalog through a caller-selected SIFS transport.
+    ///
+    /// Callers that already have a resident daemon read transport use this
+    /// path so opening a catalog does not construct another DFS service.
+    /// [`Self::load_from_data_dir`] remains an explicit mounted read path;
+    /// mutation callers construct [`AgentDefinitionSifsStore::open`] directly.
+    pub fn load_from_vfs(vfs: sinomo_runtime::vfs::VfsHandle) -> Result<Self, AgentCatalogError> {
+        Self::load_from_store(AgentDefinitionSifsStore::from_vfs(vfs)?)
+    }
+
+    fn load_from_store(store: AgentDefinitionSifsStore) -> Result<Self, AgentCatalogError> {
         let mut catalog = Self::built_ins();
-        let store = AgentDefinitionSifsStore::open(Some(data_dir.root()))?;
         for definition in store.load_definitions()? {
             catalog.upsert(definition)?;
         }
@@ -1726,6 +1739,16 @@ pub struct AgentDefinitionSifsStore {
 impl AgentDefinitionSifsStore {
     pub fn open(data_dir: Option<PathBuf>) -> Result<Self, AgentDefinitionStoreError> {
         Self::open_with_handle(sinomo_runtime::vfs::mounted_sifs(data_dir))
+    }
+
+    /// Open the definition store over an already selected VFS transport.
+    ///
+    /// This lets read-only callers use the daemon-resident SIFS service while
+    /// retaining the mounted authority path for catalog mutations.
+    pub fn from_vfs(
+        vfs: sinomo_runtime::vfs::VfsHandle,
+    ) -> Result<Self, AgentDefinitionStoreError> {
+        Self::open_with_handle(Ok(vfs))
     }
 
     fn open_with_handle(
@@ -2794,11 +2817,121 @@ mod tests {
     use super::*;
     use sinomo_runtime::events::{EventId, EventStore, InMemoryEventStore};
     use sinomo_runtime::node::NodeId;
+    use sinomo_runtime::vfs::{
+        VfsAppendOptions, VfsBackend, VfsDirEntry, VfsError, VfsFileRead, VfsRemoveOptions,
+        VfsWriteOptions,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     struct FakeInteractionModel {
         response: &'static str,
+    }
+
+    #[derive(Debug)]
+    struct ContentUnavailableCatalogVfsBackend {
+        list_unavailable: bool,
+    }
+
+    impl ContentUnavailableCatalogVfsBackend {
+        fn unavailable(&self, path: &str) -> VfsError {
+            VfsError::Backend {
+                backend: self.backend_name().to_string(),
+                path: path.to_string(),
+                detail: "authoritative metadata exists but catalog content is unavailable"
+                    .to_string(),
+            }
+        }
+
+        fn unsupported(&self, detail: &str) -> VfsError {
+            VfsError::Unsupported {
+                backend: self.backend_name().to_string(),
+                detail: detail.to_string(),
+            }
+        }
+    }
+
+    impl VfsBackend for ContentUnavailableCatalogVfsBackend {
+        fn backend_name(&self) -> &'static str {
+            "content-unavailable-catalog"
+        }
+
+        fn stat(
+            &self,
+            path: &str,
+        ) -> sinomo_runtime::vfs::Result<sinomo_runtime::vfs::VfsMetadata> {
+            Err(VfsError::NotFound {
+                path: path.to_string(),
+            })
+        }
+
+        fn list(&self, path: &str) -> sinomo_runtime::vfs::Result<Vec<VfsDirEntry>> {
+            if path == AGENT_DEFINITION_SIFS_ROOT {
+                if self.list_unavailable {
+                    return Err(VfsError::Backend {
+                        backend: self.backend_name().to_string(),
+                        path: path.to_string(),
+                        detail: "daemon route not found while catalog metadata is unavailable"
+                            .to_string(),
+                    });
+                }
+                return Ok(vec![VfsDirEntry {
+                    name: "unavailable-agent.json".to_string(),
+                    path: format!("{AGENT_DEFINITION_SIFS_ROOT}/unavailable-agent.json"),
+                    kind: VfsObjectKind::File,
+                    size_bytes: Some(1),
+                }]);
+            }
+            Err(VfsError::NotFound {
+                path: path.to_string(),
+            })
+        }
+
+        fn read(&self, path: &str) -> sinomo_runtime::vfs::Result<Vec<u8>> {
+            Err(self.unavailable(path))
+        }
+
+        fn read_prefix(
+            &self,
+            path: &str,
+            _max_bytes: u64,
+        ) -> sinomo_runtime::vfs::Result<VfsFileRead> {
+            Err(self.unavailable(path))
+        }
+
+        fn write(
+            &self,
+            _path: &str,
+            _bytes: &[u8],
+            _options: &VfsWriteOptions,
+        ) -> sinomo_runtime::vfs::Result<()> {
+            Err(self.unsupported("write"))
+        }
+
+        fn append(
+            &self,
+            _path: &str,
+            _bytes: &[u8],
+            _options: &VfsAppendOptions,
+        ) -> sinomo_runtime::vfs::Result<()> {
+            Err(self.unsupported("append"))
+        }
+
+        fn create_dir_all(&self, _path: &str) -> sinomo_runtime::vfs::Result<()> {
+            Err(self.unsupported("create directory"))
+        }
+
+        fn rename(&self, _from: &str, _to: &str) -> sinomo_runtime::vfs::Result<()> {
+            Err(self.unsupported("rename"))
+        }
+
+        fn remove(
+            &self,
+            _path: &str,
+            _options: &VfsRemoveOptions,
+        ) -> sinomo_runtime::vfs::Result<()> {
+            Err(self.unsupported("remove"))
+        }
     }
 
     impl InteractionModel for FakeInteractionModel {
@@ -3666,6 +3799,75 @@ mod tests {
             catalog.get("catalog-agent").is_some(),
             "catalog load should surface the mounted-SIFS definition"
         );
+    }
+
+    #[test]
+    fn agent_catalog_loads_from_an_injected_read_transport() {
+        let vfs = sinomo_runtime::vfs::VfsHandle::memory();
+        let writer =
+            AgentDefinitionSifsStore::from_vfs(vfs.clone()).expect("in-memory definition store");
+        let definition = AgentDefinition::custom(
+            "resident-read-agent",
+            AgentRole::Deliberation,
+            "Use the caller-selected SIFS transport.",
+        );
+        writer
+            .save_definition(&definition)
+            .expect("save definition");
+
+        let catalog = AgentCatalog::load_from_vfs(vfs).expect("catalog through injected VFS");
+
+        assert!(catalog.get("resident-read-agent").is_some());
+    }
+
+    #[test]
+    fn catalog_reads_distinguish_confirmed_absence_from_content_unavailability() {
+        let absent = sinomo_runtime::vfs::VfsHandle::memory();
+        let skill_catalog = SkillCatalogSifsStore::from_vfs(absent.clone())
+            .load_catalog()
+            .expect("confirmed missing skill catalog is empty");
+        assert_eq!(skill_catalog, SkillCatalog::default());
+        let agent_catalog =
+            AgentCatalog::load_from_vfs(absent).expect("confirmed missing agent directory");
+        assert_eq!(
+            agent_catalog.list().count(),
+            AgentDefinition::built_ins().len(),
+            "confirmed namespace absence retains the built-in catalog"
+        );
+
+        let unavailable = sinomo_runtime::vfs::VfsHandle::new(
+            Arc::new(ContentUnavailableCatalogVfsBackend {
+                list_unavailable: false,
+            }),
+            "/",
+        )
+        .expect("unavailable catalog VFS");
+        let skill_error = SkillCatalogSifsStore::from_vfs(unavailable.clone())
+            .load_catalog()
+            .expect_err("skill content unavailability must not become an empty catalog");
+        assert!(matches!(skill_error, SkillCatalogError::Store { .. }));
+
+        let agent_error = AgentCatalog::load_from_vfs(unavailable)
+            .expect_err("agent content unavailability must not become built-ins only");
+        assert!(matches!(
+            agent_error,
+            AgentCatalogError::Store(AgentDefinitionStoreError::Io { .. })
+        ));
+
+        let listing_unavailable = sinomo_runtime::vfs::VfsHandle::new(
+            Arc::new(ContentUnavailableCatalogVfsBackend {
+                list_unavailable: true,
+            }),
+            "/",
+        )
+        .expect("unavailable catalog-list VFS");
+        let agent_error = AgentCatalog::load_from_vfs(listing_unavailable)
+            .expect_err("opaque listing failures must not become built-ins only");
+        assert!(matches!(
+            agent_error,
+            AgentCatalogError::Store(AgentDefinitionStoreError::Io { ref detail, .. })
+                if detail.contains("route not found")
+        ));
     }
 
     #[test]

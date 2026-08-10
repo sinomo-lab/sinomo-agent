@@ -41,6 +41,7 @@ use sinomo_runtime::daemon::{
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::ClusterPaths;
 use sinomo_runtime::node::{NodeId, NodeProfile};
+use sinomo_runtime::vfs::VfsHandle;
 
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 /// Timeout for bounded startup/config RPCs to a connected daemon.
@@ -139,6 +140,13 @@ impl Connection {
     }
 }
 
+fn build_catalog_read_vfs(connection: &Connection) -> Result<VfsHandle, String> {
+    let address = connection.daemon_address().ok_or_else(|| {
+        "resident daemon SIFS is unavailable; catalog reads require a daemon connection".to_string()
+    })?;
+    sinomo_runtime::vfs::daemon_sifs(address.to_string()).map_err(|error| error.to_string())
+}
+
 /// Shared, cheaply-cloneable handle to runtime facilities.
 #[derive(Clone)]
 pub struct Backend {
@@ -146,6 +154,9 @@ pub struct Backend {
     pub app_runtime: Arc<tokio::runtime::Runtime>,
     pub node: NodeProfile,
     pub connection: Connection,
+    /// Read-only SIFS transport into the resident daemon. Catalog mutations
+    /// deliberately continue to use their mounted authority stores.
+    catalog_read_vfs: Result<VfsHandle, String>,
     /// The configuration service the app reads/writes through — always RPC to a daemon (the
     /// app's own in-process one when no external daemon exists). The app holds no config state.
     pub config: Arc<dyn ConfigClient>,
@@ -236,12 +247,14 @@ impl Backend {
         reconcile_android_cluster_node_role(&connection, data_dir.as_ref());
         progress("Preparing configuration…");
         let config = build_config_client(&connection, &data_dir, app_runtime.handle());
+        let catalog_read_vfs = build_catalog_read_vfs(&connection);
 
         Backend {
             data_dir,
             app_runtime,
             node,
             connection,
+            catalog_read_vfs,
             config,
             agent_runtime_control,
             _daemon: daemon.map(Arc::new),
@@ -256,6 +269,10 @@ impl Backend {
         let (data_dir, cleanup) = local_fallback_data_dir();
         let mut backend = Self::local_fallback_for_data_dir(data_dir);
         backend._local_fallback_data_dir_cleanup = Some(cleanup);
+        #[cfg(test)]
+        backend
+            .use_mounted_catalog_reads_for_tests()
+            .expect("headless test catalog VFS");
         backend
     }
 
@@ -272,12 +289,14 @@ impl Backend {
 
         let connection = Connection::LocalFallback { reason: None };
         let config = build_config_client(&connection, &data_dir, app_runtime.handle());
+        let catalog_read_vfs = build_catalog_read_vfs(&connection);
 
         Backend {
             data_dir,
             app_runtime,
             node,
             connection,
+            catalog_read_vfs,
             config,
             agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry::new(),
             _daemon: None,
@@ -348,6 +367,20 @@ impl Backend {
         })
     }
 
+    pub(crate) fn catalog_read_vfs(&self) -> Result<VfsHandle, String> {
+        self.catalog_read_vfs.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn use_mounted_catalog_reads_for_tests(&mut self) -> Result<(), String> {
+        self.catalog_read_vfs = sinomo_runtime::vfs::mounted_sifs(Some(self.data_dir.root()))
+            .map_err(|error| error.to_string());
+        self.catalog_read_vfs
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| error.clone())
+    }
+
     /// Apply a live daemon observation and rebuild connection-bound clients as one backend update.
     ///
     /// An in-process classification is retained only when the probe reached the exact process this
@@ -373,6 +406,7 @@ impl Backend {
         if binding_changed {
             self.config =
                 build_config_client(&self.connection, &self.data_dir, self.app_runtime.handle());
+            self.catalog_read_vfs = build_catalog_read_vfs(&self.connection);
         }
         binding_changed
     }

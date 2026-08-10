@@ -34,6 +34,9 @@ impl From<sinomo_api::DaemonApiError> for DaemonError {
             sinomo_api::DaemonApiError::Io { path, detail } => Self::Io { path, detail },
             sinomo_api::DaemonApiError::Json { path, detail } => Self::Json { path, detail },
             sinomo_api::DaemonApiError::Parse { detail } => Self::Parse { detail },
+            sinomo_api::DaemonApiError::UnknownRoute { route } => Self::Parse {
+                detail: format!("unknown object rpc route: {route}"),
+            },
             sinomo_api::DaemonApiError::Network { address, detail } => {
                 Self::Network { address, detail }
             }

@@ -87,9 +87,8 @@ use sinomo_cli::app_api::{
     ChatAttachmentSource, ChatContextSnapshot, ChatHistoryMessage, ChatLocalAttachmentProvenance,
     ChatProcessSnapshot, ChatQueuedTurnInput, ChatQueuedTurnInputKind,
     ChatSifsAttachmentProvenance, ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection,
-    ChatUsageSnapshot, ProviderSummary, SifsAgentChannelStore, agent_summaries,
-    agent_summaries_with_error, built_in_agent_summaries, project_stable_chat_agent_message,
-    reasoning_efforts,
+    ChatUsageSnapshot, ProviderSummary, SifsAgentChannelStore, agent_summaries_with_error,
+    built_in_agent_summaries, project_stable_chat_agent_message, reasoning_efforts,
 };
 use sinomo_runtime::{
     api::{
@@ -100,6 +99,7 @@ use sinomo_runtime::{
     events::SessionId,
     local::SinomoDataDir,
     network::{DaemonRpcTimeouts, ObjectRpcRequest},
+    vfs::VfsHandle,
 };
 
 use crate::backend::Backend;
@@ -1753,6 +1753,7 @@ struct ConversationTimelineLoad {
 pub struct ChatState {
     pub data_dir: Arc<SinomoDataDir>,
     daemon_address: Option<String>,
+    agent_catalog_vfs: Option<VfsHandle>,
     sifs_daemon: Option<SifsDaemonAccess>,
     daemon_event_rx: Receiver<DaemonEventWorkerUpdate>,
     daemon_event_abort: Option<tokio::task::AbortHandle>,
@@ -2418,6 +2419,11 @@ impl ChatState {
     pub fn new_with_waker(backend: &Backend, waker: Option<sui::UiHandle>) -> Self {
         let daemon_connected = backend.connection.is_daemon();
         let daemon_address = backend.connection.daemon_address().map(str::to_string);
+        let (agent_catalog_vfs, agent_catalog_transport_error) = match backend.catalog_read_vfs() {
+            Ok(vfs) => (Some(vfs), None),
+            Err(error) if daemon_connected => (None, Some(error)),
+            Err(_) => (None, None),
+        };
         let sifs_storage = daemon_address
             .as_deref()
             .map(|address| AgentChatSifsStorage::new(address, backend.app_runtime.handle()));
@@ -2438,11 +2444,14 @@ impl ChatState {
         // status, and SIFS grinds through multi-second distributed timeouts whenever
         // the cluster DFS is unhealthy. Boot with the built-ins (no I/O) and let the
         // shell load the stored catalog in the background once the app is ready.
-        let defer_agent_load = waker.is_some();
-        let agents = if defer_agent_load {
-            built_in_agent_summaries()
+        let defer_agent_load = waker.is_some() && agent_catalog_vfs.is_some();
+        let (agents, agent_catalog_load_error) = if defer_agent_load {
+            (built_in_agent_summaries(), None)
         } else {
-            agent_summaries(&backend.data_dir)
+            agent_catalog_vfs
+                .as_ref()
+                .map(agent_summaries_with_error)
+                .unwrap_or_else(|| (built_in_agent_summaries(), None))
         };
         let defer_provider_load = waker.is_some() && backend.connection.daemon_address().is_some();
         let providers = if defer_provider_load {
@@ -2480,6 +2489,7 @@ impl ChatState {
         let mut state = Self {
             data_dir: backend.data_dir.clone(),
             daemon_address,
+            agent_catalog_vfs,
             sifs_daemon,
             daemon_event_rx,
             daemon_event_abort,
@@ -2579,6 +2589,12 @@ impl ChatState {
             state.notice = Some(detail.clone());
             state.replace_activity("connection", detail, ActivityTone::Warn);
         }
+        if let Some(detail) = agent_catalog_transport_error.or(agent_catalog_load_error) {
+            if state.notice.is_none() {
+                state.notice = Some(format!("agent catalog unavailable: {detail}"));
+            }
+            state.replace_activity("agents", detail, ActivityTone::Warn);
+        }
         // Eagerly fetch the default/initial provider's models so the model picker is populated
         // without requiring a manual provider toggle. (Results arrive async via `ChatEvent::Models`;
         // a no-op if there is no provider or the list is already populated.)
@@ -2639,6 +2655,7 @@ impl ChatState {
 
         self.handle = handle;
         self.daemon_address = daemon_address.clone();
+        self.agent_catalog_vfs = backend.catalog_read_vfs().ok();
         self.sifs_daemon = daemon_address
             .map(|address| SifsDaemonAccess::new(address, backend.app_runtime.handle()));
         self.daemon_event_rx = daemon_event_rx;
@@ -2720,6 +2737,9 @@ impl ChatState {
 
         let waker = self.ui_waker.clone();
         self.start_provider_list_load(backend.config.clone(), waker.clone());
+        self.agents_loading = self.agent_catalog_vfs.is_some();
+        self.agent_list_rx = None;
+        self.start_agent_list_load(waker.clone());
         self.start_session_list_load(waker);
         true
     }
@@ -5997,14 +6017,19 @@ impl ChatState {
     /// Load the stored (SIFS-backed) agent catalog in the background. The composer
     /// starts on the built-ins; this upgrades it once — or reports the catalog as
     /// degraded — without ever blocking the boot path on the distributed file system.
-    pub fn start_agent_list_load(
-        &mut self,
-        data_dir: Arc<SinomoDataDir>,
-        waker: Option<sui::UiHandle>,
-    ) -> bool {
+    pub fn start_agent_list_load(&mut self, waker: Option<sui::UiHandle>) -> bool {
         if !self.agents_loading || self.agent_list_rx.is_some() {
             return false;
         }
+        let Some(agent_catalog_vfs) = self.agent_catalog_vfs.clone() else {
+            self.agents_loading = false;
+            self.replace_activity(
+                "agents",
+                "agent catalog unavailable: resident daemon SIFS is not connected",
+                ActivityTone::Warn,
+            );
+            return true;
+        };
         let (tx, rx) = mpsc::channel();
         match thread::Builder::new()
             .name("sinomo-app-chat-agents".to_string())
@@ -6012,7 +6037,7 @@ impl ChatState {
                 let result = match crate::backend::run_with_timeout(
                     "agent-catalog",
                     AGENT_CATALOG_LOAD_TIMEOUT,
-                    move || agent_summaries_with_error(&data_dir),
+                    move || agent_summaries_with_error(&agent_catalog_vfs),
                 ) {
                     Ok((agents, error)) => AgentListWorkerResult {
                         agents: Some(agents),
@@ -18421,13 +18446,13 @@ mod tests {
     }
 
     #[test]
-    fn headless_chat_state_loads_agent_catalog_synchronously() {
+    fn headless_chat_state_uses_built_ins_without_scheduling_catalog_io() {
         let backend = Backend::local_fallback();
         let state = ChatState::new(&backend);
 
         assert!(
             !state.agents.is_empty(),
-            "headless construction should load agents synchronously"
+            "headless construction should retain the built-in agents"
         );
         assert!(
             !state.agents_loading,
@@ -18436,19 +18461,20 @@ mod tests {
     }
 
     #[test]
-    fn background_agent_list_load_upgrades_built_ins() {
+    fn background_agent_list_load_uses_the_injected_read_transport() {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
         // Mirror the interactive boot: built-ins only, catalog deferred.
         state.agents = built_in_agent_summaries();
+        state.agent_catalog_vfs = Some(VfsHandle::memory());
         state.agents_loading = true;
 
         assert!(
-            state.start_agent_list_load(backend.data_dir.clone(), None),
+            state.start_agent_list_load(None),
             "background agent load should start"
         );
         assert!(
-            !state.start_agent_list_load(backend.data_dir.clone(), None),
+            !state.start_agent_list_load(None),
             "a second load must not start while one is in flight"
         );
 

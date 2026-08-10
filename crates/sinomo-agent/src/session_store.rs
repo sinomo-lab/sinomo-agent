@@ -1840,6 +1840,49 @@ mod tests {
     }
 
     #[test]
+    fn guarded_task_activity_projection_does_not_skip_unavailable_content() {
+        let data_root =
+            sinomo_testdir::TestDir::new("sinomo-agent-task-activity-unavailable-content");
+        let vfs = mounted_sifs(Some(data_root.path().to_path_buf())).expect("mounted SIFS VFS");
+        let store = AgentTaskActivityProjectionStore::from_vfs(vfs.clone());
+        let snapshot = AgentTaskSnapshot::new(
+            crate::AgentTaskRef::new("maintenance", "retained unavailable projection"),
+            crate::AgentTaskLifecycleStatus::Running,
+        )
+        .with_agent_definition_key("main-agent");
+        let projection =
+            AgentTaskActivityProjection::from_snapshot(&snapshot).expect("owned projection");
+        let directory = task_activity_sifs_dir_for_agent("main-agent");
+        let path = format!("{directory}/{}.json", projection.activity_id.as_str());
+        let mut bytes = serialize_task_activity_projection(&projection).expect("projection bytes");
+        // Keep this as a loose blob so the test can remove only content while
+        // retaining the authoritative directory entry and object metadata.
+        bytes.resize(2 * 1024 * 1024 + 4096, b' ');
+        vfs.create_dir_all(&directory)
+            .expect("create activity directory");
+        vfs.write_with_options(&path, bytes, VfsWriteOptions::service_artifact())
+            .expect("write activity projection");
+        let content_hash = vfs
+            .stat(&path)
+            .expect("stat activity projection")
+            .content_hash
+            .expect("activity content hash");
+        sinomo_runtime::dfs::LocalContentStore::new(data_root.join("dfs").join("content"))
+            .expect("open activity content store")
+            .debug_remove_loose_blob(&content_hash)
+            .expect("remove only the activity content blob");
+
+        let error = store
+            .load_page("main-agent", None, 1, u64::MAX)
+            .expect_err("guarded projection must fail instead of omitting unavailable content");
+        assert!(matches!(&error, AgentSessionStoreError::Io { .. }));
+        assert!(
+            error.to_string().contains("temporarily unavailable"),
+            "unexpected guarded projection error: {error}"
+        );
+    }
+
+    #[test]
     fn roaming_task_activity_projection_bounds_and_scrubs_private_runtime_text() {
         let roaming = AgentTaskActivityProjectionStore::from_test_vfs_without_no_link_guards(
             VfsHandle::memory(),

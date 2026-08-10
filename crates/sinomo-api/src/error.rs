@@ -12,6 +12,8 @@ pub enum DaemonApiError {
     Json { path: String, detail: String },
     #[error("failed to parse command: {detail}")]
     Parse { detail: String },
+    #[error("unknown object rpc route: {route}")]
+    UnknownRoute { route: String },
     #[error("network error at {address}: {detail}")]
     Network { address: String, detail: String },
     #[error("daemon network request failed ({delivery_state:?}): {detail}")]
@@ -57,9 +59,7 @@ impl From<sinomo_core::service::ServiceError> for DaemonApiError {
             ServiceError::NotClustered(route) => DaemonApiError::ClusterReadOnly {
                 detail: format!("service route {route} requires an initialized cluster"),
             },
-            ServiceError::UnknownRoute(route) => DaemonApiError::Parse {
-                detail: format!("unknown service route: {route}"),
-            },
+            ServiceError::UnknownRoute(route) => DaemonApiError::UnknownRoute { route },
             ServiceError::Service(detail) => DaemonApiError::Parse { detail },
         }
     }
@@ -97,6 +97,9 @@ impl From<sinomo_core::network::NetworkError> for DaemonApiError {
             }
             sinomo_core::network::NetworkError::InvalidClusterCommand { detail } => {
                 Self::Parse { detail }
+            }
+            sinomo_core::network::NetworkError::UnknownRoute { route } => {
+                Self::UnknownRoute { route }
             }
             sinomo_core::network::NetworkError::Json { path, detail } => {
                 Self::Json { path, detail }

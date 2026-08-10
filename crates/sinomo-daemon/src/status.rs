@@ -406,6 +406,27 @@ fn parse_manual_daemon_endpoint(
     }
 }
 
+/// Returns the normalized socket address for a manual TCP daemon endpoint.
+///
+/// Rollout preflight uses the same normalization as endpoint publication so it
+/// can prove that the replacement main daemon will listen on an address capable
+/// of serving every manually advertised TCP endpoint. Module-owned endpoint
+/// schemes deliberately return `None`: their reachability is not governed by
+/// the daemon's TCP bind host.
+pub(crate) fn normalize_manual_daemon_tcp_endpoint_address(
+    raw: &str,
+    default_port: u16,
+) -> Option<String> {
+    let value = raw.trim();
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return normalize_tcp_manual_endpoint_address(value, default_port);
+    };
+    match scheme.to_ascii_lowercase().as_str() {
+        "tcp" | "lan-tcp" => normalize_tcp_manual_endpoint_address(rest, default_port),
+        _ => None,
+    }
+}
+
 fn default_scope_for_url_manual_endpoint(address: &str) -> Option<ClusterEndpointPrivacy> {
     let (_, query) = address.split_once('?')?;
     let has_relay = query.split('&').any(|part| {

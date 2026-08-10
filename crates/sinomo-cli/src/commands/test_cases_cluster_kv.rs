@@ -7,7 +7,11 @@
 
 use sinomo_runtime::api::DaemonApiClient;
 use sinomo_runtime::cluster;
-use sinomo_runtime::kv::{KvEntry, KvOp, KvTxn, KvTxnRequest, KvTxnResponse};
+use sinomo_runtime::kv::{
+    CLUSTER_KV_QUORUM_COMMIT_BENCHMARK_PREFIX, ClusterKvKeyspaceClass, KvEntry, KvOp, KvTxn,
+    KvTxnRequest, KvTxnResponse, cluster_kv_key_may_defer_materialized_projection,
+    cluster_kv_keyspace_class,
+};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::test::{
@@ -37,6 +41,7 @@ const DEFAULT_RANGE_ENTRIES: usize = 64;
 const MAX_RANGE_ENTRIES: usize = 1_024;
 const MAX_RANGE_VALUE_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_MIN_READS_PER_SECOND: f64 = 0.0;
+const RANGE_SEED_CONVERGENCE_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
 pub fn register_cluster_kv_test_cases(
     builder: SinomoTestRegistryBuilder,
@@ -210,7 +215,7 @@ impl ClusterKvReadConsistency {
 
     const fn storage_path(self) -> &'static str {
         match self {
-            Self::Local => "daemon-object-rpc/local-materialized-snapshot",
+            Self::Local => "daemon-object-rpc/local-resident-raft-prefix-with-durable-fallback",
             Self::Authoritative => "daemon-object-rpc/current-term-quorum-barrier",
         }
     }
@@ -386,11 +391,19 @@ fn run_cluster_kv_quorum_commit_benchmark(ctx: &mut SinomoTestContext) -> Sinomo
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let key_prefix = format!(
-        "/tests/performance/cluster-kv/{}/{}-{nonce}/",
-        state.local_node_id,
-        std::process::id()
+    let key_prefix = cluster_kv_quorum_commit_benchmark_key_prefix(
+        &state.local_node_id.to_string(),
+        std::process::id(),
+        nonce,
     );
+    let keyspace_class = cluster_kv_keyspace_class(&key_prefix);
+    let materialized_projection_deferred =
+        cluster_kv_key_may_defer_materialized_projection(&key_prefix);
+    if keyspace_class != ClusterKvKeyspaceClass::Telemetry || !materialized_projection_deferred {
+        return Err(SinomoTestError::failed(format!(
+            "quorum-commit benchmark keyspace {key_prefix} is {keyspace_class:?} with deferred projection={materialized_projection_deferred}; expected telemetry with deferred projection"
+        )));
+    }
     let value = benchmark_value(options.value_bytes);
     let mut latencies_us = Vec::with_capacity(options.iterations);
     let mut revisions = Vec::with_capacity(options.iterations);
@@ -399,6 +412,8 @@ fn run_cluster_kv_quorum_commit_benchmark(ctx: &mut SinomoTestContext) -> Sinomo
     ctx.record("node_id", state.local_node_id.to_string());
     ctx.record("transport_path", "daemon-object-rpc/cluster-kv-txn");
     ctx.record("storage_path", "raft-quorum-commit");
+    ctx.record("keyspace_class", keyspace_class);
+    ctx.record("materialized_projection_mode", "deferred");
     record_benchmark_profile(ctx);
     ctx.record("key_prefix", &key_prefix);
     ctx.record("iterations", options.iterations);
@@ -531,6 +546,19 @@ struct ClusterKvRangeRead {
     revision: u64,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ClusterKvRangeSeedConvergence {
+    initial_revision: Option<u64>,
+    attempts: usize,
+    elapsed: Duration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClusterKvRangeSeedConvergenceError {
+    report: ClusterKvRangeSeedConvergence,
+    detail: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct ClusterKvRangeBenchmarkMetrics {
     success_count: usize,
@@ -639,6 +667,37 @@ fn run_cluster_kv_range_read_benchmark(ctx: &mut SinomoTestContext) -> SinomoTes
     ctx.record("max_p50_ms", options.max_p50_ms);
     ctx.record("max_p95_ms", options.max_p95_ms);
     ctx.record("min_reads_per_second", options.min_reads_per_second);
+
+    if options.consistency == ClusterKvReadConsistency::Local {
+        let convergence = wait_for_cluster_kv_local_range_seed(
+            Duration::from_millis(options.timeout_ms),
+            &expected_prefix,
+            options.entries,
+            &value,
+            seed_revision,
+            |remaining| {
+                let attempt_client = client.clone().with_timeout(remaining);
+                read_daemon_cluster_kv_range(
+                    &attempt_client,
+                    &expected_prefix,
+                    ClusterKvReadConsistency::Local,
+                )
+            },
+            std::thread::sleep,
+        );
+        match convergence {
+            Ok(report) => record_range_seed_convergence(ctx, &report),
+            Err(error) => {
+                record_range_seed_convergence(ctx, &error.report);
+                let cleanup = cleanup_benchmark_prefix(&client, &key_prefix);
+                record_cleanup(ctx, &cleanup);
+                return Ok(SinomoTestOutcome::failed(format!(
+                    "cluster-KV local range seed did not converge before warmup: {}",
+                    error.detail
+                )));
+            }
+        }
+    }
 
     for iteration in 0..options.warmup_iterations {
         let warmup = read_daemon_cluster_kv_range(&client, &expected_prefix, options.consistency)
@@ -809,6 +868,80 @@ fn read_daemon_cluster_kv_range(
     }
 }
 
+fn wait_for_cluster_kv_local_range_seed<R, W>(
+    timeout: Duration,
+    prefix: &str,
+    expected_entries: usize,
+    expected_value: &[u8],
+    minimum_revision: u64,
+    mut read: R,
+    mut wait: W,
+) -> Result<ClusterKvRangeSeedConvergence, ClusterKvRangeSeedConvergenceError>
+where
+    R: FnMut(Duration) -> Result<ClusterKvRangeRead, String>,
+    W: FnMut(Duration),
+{
+    let started = Instant::now();
+    let mut report = ClusterKvRangeSeedConvergence::default();
+    let mut last_detail = format!("local range has not reached seed revision {minimum_revision}");
+
+    loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if report.attempts > 0 && remaining.is_zero() {
+            report.elapsed = started.elapsed();
+            return Err(ClusterKvRangeSeedConvergenceError {
+                detail: format!(
+                    "timed out after {}ms and {} attempts: {last_detail}",
+                    timeout.as_millis(),
+                    report.attempts
+                ),
+                report,
+            });
+        }
+
+        report.attempts = report.attempts.saturating_add(1);
+        let attempt_timeout = remaining.max(Duration::from_millis(1));
+        match read(attempt_timeout) {
+            Ok(read) => {
+                report.initial_revision.get_or_insert(read.revision);
+                if read.revision >= minimum_revision {
+                    if let Err(detail) = validate_benchmark_range_read(
+                        &read,
+                        prefix,
+                        expected_entries,
+                        expected_value,
+                        minimum_revision,
+                    ) {
+                        report.elapsed = started.elapsed();
+                        return Err(ClusterKvRangeSeedConvergenceError {
+                            detail: format!(
+                                "local range reached revision {} but seed validation failed: {detail}",
+                                read.revision
+                            ),
+                            report,
+                        });
+                    }
+                    report.elapsed = started.elapsed();
+                    return Ok(report);
+                }
+                last_detail = format!(
+                    "local range revision {} predates seed revision {minimum_revision}",
+                    read.revision
+                );
+            }
+            Err(detail) => {
+                last_detail = format!("local range read failed: {detail}");
+            }
+        }
+
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            continue;
+        }
+        wait(RANGE_SEED_CONVERGENCE_RETRY_INTERVAL.min(remaining));
+    }
+}
+
 fn validate_benchmark_range_read(
     read: &ClusterKvRangeRead,
     prefix: &str,
@@ -865,6 +998,14 @@ fn benchmark_put_txn(
         success,
         failure: Vec::new(),
     }
+}
+
+fn cluster_kv_quorum_commit_benchmark_key_prefix(
+    node_id: &str,
+    process_id: u32,
+    nonce: u128,
+) -> String {
+    format!("{CLUSTER_KV_QUORUM_COMMIT_BENCHMARK_PREFIX}{node_id}/{process_id}-{nonce}/")
 }
 
 fn validate_benchmark_commit_response(
@@ -1016,6 +1157,17 @@ fn record_range_metrics(
             failures.iter().take(12).cloned().collect::<Vec<_>>(),
         );
     }
+}
+
+fn record_range_seed_convergence(
+    ctx: &mut SinomoTestContext,
+    report: &ClusterKvRangeSeedConvergence,
+) {
+    let elapsed_us = duration_micros_u64(report.elapsed);
+    ctx.record("seed_initial_revision", report.initial_revision);
+    ctx.record("seed_convergence_attempts", report.attempts);
+    ctx.record("seed_convergence_us", elapsed_us);
+    ctx.record("seed_convergence_ms", micros_to_millis(elapsed_us));
 }
 
 fn benchmark_value(bytes: usize) -> Vec<u8> {
@@ -1198,10 +1350,130 @@ mod tests {
     }
 
     #[test]
+    fn quorum_commit_benchmark_uses_declared_telemetry_keyspace() {
+        let prefix = cluster_kv_quorum_commit_benchmark_key_prefix("node-a", 123, 456);
+
+        assert_eq!(prefix, "/cluster/benchmarks/quorum-commit/node-a/123-456/");
+        assert_eq!(
+            cluster_kv_keyspace_class(&prefix),
+            ClusterKvKeyspaceClass::Telemetry
+        );
+        assert!(cluster_kv_key_may_defer_materialized_projection(&prefix));
+    }
+
+    fn fixture_range_read(
+        prefix: &str,
+        entries: usize,
+        value: &[u8],
+        revision: u64,
+    ) -> ClusterKvRangeRead {
+        ClusterKvRangeRead {
+            entries: (0..entries)
+                .map(|index| KvEntry {
+                    key: format!("{prefix}{index:04}"),
+                    value: value.to_vec(),
+                    create_revision: sinomo_runtime::kv::KvRevision(revision),
+                    modify_revision: sinomo_runtime::kv::KvRevision(revision),
+                    version: sinomo_runtime::kv::KvVersion(1),
+                    lease_id: None,
+                })
+                .collect(),
+            revision,
+        }
+    }
+
+    #[test]
+    fn local_range_seed_convergence_waits_for_fanout_before_benchmark_samples() {
+        let prefix = "/tests/performance/range/seed/0000/";
+        let value = b"seed";
+        let mut reads = vec![
+            ClusterKvRangeRead {
+                entries: Vec::new(),
+                revision: 100,
+            },
+            fixture_range_read(prefix, 2, value, 102),
+        ]
+        .into_iter();
+        let mut waits = Vec::new();
+
+        let report = wait_for_cluster_kv_local_range_seed(
+            Duration::from_secs(1),
+            prefix,
+            2,
+            value,
+            102,
+            |_| Ok(reads.next().expect("bounded convergence read")),
+            |duration| waits.push(duration),
+        )
+        .expect("local seed converges before warmups and measured samples");
+
+        assert_eq!(report.initial_revision, Some(100));
+        assert_eq!(report.attempts, 2);
+        assert_eq!(waits.len(), 1);
+        assert!(waits[0] <= RANGE_SEED_CONVERGENCE_RETRY_INTERVAL);
+    }
+
+    #[test]
+    fn local_range_seed_convergence_timeout_retains_last_read_error() {
+        let mut waits = 0_usize;
+        let error = wait_for_cluster_kv_local_range_seed(
+            Duration::ZERO,
+            "/tests/performance/range/seed/0000/",
+            1,
+            b"seed",
+            10,
+            |_| Err("resident Raft view is busy".to_string()),
+            |_| waits = waits.saturating_add(1),
+        )
+        .expect_err("seed convergence must remain bounded");
+
+        assert_eq!(error.report.initial_revision, None);
+        assert_eq!(error.report.attempts, 1);
+        assert_eq!(waits, 0);
+        assert!(error.detail.contains("timed out after 0ms and 1 attempts"));
+        assert!(error.detail.contains("resident Raft view is busy"));
+    }
+
+    #[test]
+    fn local_range_seed_convergence_does_not_retry_a_fresh_invalid_view() {
+        let mut reads = 0_usize;
+        let error = wait_for_cluster_kv_local_range_seed(
+            Duration::from_secs(1),
+            "/tests/performance/range/seed/0000/",
+            1,
+            b"seed",
+            10,
+            |_| {
+                reads = reads.saturating_add(1);
+                Ok(ClusterKvRangeRead {
+                    entries: Vec::new(),
+                    revision: 10,
+                })
+            },
+            |_| panic!("fresh invalid data is terminal, not a convergence delay"),
+        )
+        .expect_err("fresh but invalid range must fail precisely");
+
+        assert_eq!(reads, 1);
+        assert_eq!(error.report.initial_revision, Some(10));
+        assert_eq!(error.report.attempts, 1);
+        assert!(error.detail.contains("seed validation failed"));
+        assert!(
+            error
+                .detail
+                .contains("range returned 0 entries, expected 1")
+        );
+    }
+
+    #[test]
     fn range_benchmark_options_distinguish_local_and_authoritative_reads() {
         let local = ClusterKvRangeBenchmarkOptions::from_context(&SinomoTestContext::new("unused"))
             .expect("local options");
         assert_eq!(local.consistency, ClusterKvReadConsistency::Local);
+        assert_eq!(
+            local.consistency.storage_path(),
+            "daemon-object-rpc/local-resident-raft-prefix-with-durable-fallback"
+        );
 
         let authoritative = ClusterKvRangeBenchmarkOptions::from_context(
             &SinomoTestContext::new("unused")

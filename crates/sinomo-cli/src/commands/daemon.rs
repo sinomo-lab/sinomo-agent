@@ -16,7 +16,7 @@ pub(crate) enum DaemonCliCommand {
     ShadowRun(DaemonRunOptions),
     ShadowStart(DaemonRunOptions),
     ShadowStatus(DaemonStatusOptions),
-    ShadowStop(DaemonRunOptions),
+    ShadowStop(DaemonStatusOptions),
     CompleteShadowRollout,
 }
 
@@ -121,7 +121,7 @@ fn parse_daemon_matches(matches: &CliCommandMatches) -> Result<DaemonCliCommand,
         ["daemon", "shadow", "run"] => shadow().map(DaemonCliCommand::ShadowRun),
         ["daemon", "shadow", "start"] => shadow().map(DaemonCliCommand::ShadowStart),
         ["daemon", "shadow", "status"] => shadow_status().map(DaemonCliCommand::ShadowStatus),
-        ["daemon", "shadow", "stop"] => shadow().map(DaemonCliCommand::ShadowStop),
+        ["daemon", "shadow", "stop"] => shadow_status().map(DaemonCliCommand::ShadowStop),
         ["daemon", "__complete-shadow-rollout"] => Ok(DaemonCliCommand::CompleteShadowRollout),
         _ => Err(CliParseError::Parse {
             detail: "daemon requires a subcommand".to_string(),
@@ -286,28 +286,18 @@ fn register_shadow_daemon_cluster_node_best_effort(
     shadow_paths: &DaemonPaths,
     registration: &DaemonClusterRegistration,
 ) -> Result<Option<DaemonClusterStatus>, CliError> {
-    match register_daemon_cluster_node(registration) {
+    let data_dir = shadow_paths.root.parent().ok_or_else(|| CliError::Io {
+        path: shadow_paths.root.display().to_string(),
+        detail: "shadow daemon paths have no data directory parent".to_string(),
+    })?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    match daemon_cluster_status_from_local_state(&cluster_paths, registration) {
         Ok(cluster) => Ok(Some(cluster)),
-        Err(register_error) => {
-            let data_dir = shadow_paths.root.parent().ok_or_else(|| CliError::Io {
-                path: shadow_paths.root.display().to_string(),
-                detail: "shadow daemon paths have no data directory parent".to_string(),
-            })?;
-            let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
-            match daemon_cluster_status_from_local_state(&cluster_paths, registration) {
-                Ok(cluster) => {
-                    eprintln!(
-                        "sinomo shadow daemon cluster registration failed: {register_error}; continuing with local cluster identity for repair routing"
-                    );
-                    Ok(Some(cluster))
-                }
-                Err(fallback_error) => {
-                    eprintln!(
-                        "sinomo shadow daemon cluster registration failed: {register_error}; local cluster identity unavailable: {fallback_error}; continuing unclustered"
-                    );
-                    Ok(None)
-                }
-            }
+        Err(error) => {
+            eprintln!(
+                "sinomo shadow daemon local cluster identity unavailable: {error}; continuing unclustered"
+            );
+            Ok(None)
         }
     }
 }
@@ -595,12 +585,92 @@ pub(crate) fn stop_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
     stop_daemon_with_paths(daemon_paths_from_defaults()?, options, "daemon")
 }
 
-pub(crate) fn stop_shadow_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
+pub(crate) fn stop_shadow_daemon(options: DaemonStatusOptions) -> Result<(), CliError> {
+    if options.explicit_address {
+        let body = stop_explicit_shadow_daemon(&options.endpoint)?;
+        println!("{}", body.trim());
+        return Ok(());
+    }
     stop_daemon_with_paths(
         shadow_daemon_paths_from_defaults()?,
-        options,
+        options.endpoint,
         "shadow daemon",
     )
+}
+
+fn stop_explicit_shadow_daemon(options: &DaemonRunOptions) -> Result<String, CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let state = cluster::read_cluster_state_without_kv(&cluster_paths)?;
+    stop_explicit_shadow_daemon_with(
+        &state,
+        options,
+        |address| {
+            daemon_fetch_daemon_status_from_address(address, DAEMON_PROBE_TIMEOUT)
+                .map_err(Into::into)
+        },
+        |address| {
+            send_daemon_remote_shadow_shutdown_request(address, DAEMON_PROBE_TIMEOUT)
+                .map_err(Into::into)
+        },
+    )
+}
+
+fn stop_explicit_shadow_daemon_with(
+    state: &ClusterBootstrapState,
+    options: &DaemonRunOptions,
+    mut fetch_status: impl FnMut(&str) -> Result<DaemonStatus, CliError>,
+    mut send_shutdown: impl FnMut(&str) -> Result<String, CliError>,
+) -> Result<String, CliError> {
+    let address = daemon_connect_address(&options.host, options.port);
+    let mut matching = state
+        .members
+        .iter()
+        .flat_map(|member| member.endpoints.iter())
+        .filter(|endpoint| endpoint.address == address);
+    let endpoint = matching.next().ok_or_else(|| CliError::Parse {
+        detail: format!(
+            "refusing to stop unregistered remote shadow endpoint {address}; no exact cluster endpoint is recorded"
+        ),
+    })?;
+    if !network::cluster_endpoint_identifies_shadow_daemon_for_node(endpoint)
+        || matching.any(|candidate| {
+            candidate.node_id != endpoint.node_id
+                || !network::cluster_endpoint_identifies_shadow_daemon_for_node(candidate)
+        })
+    {
+        return Err(CliError::Parse {
+            detail: format!(
+                "refusing to stop {address}; the exact endpoint is not uniquely classified as daemon-shadow"
+            ),
+        });
+    }
+
+    let status = fetch_status(&address)?;
+    let cluster = status.cluster.as_ref().ok_or_else(|| CliError::Parse {
+        detail: format!(
+            "refusing to stop {address}; the endpoint did not report a cluster process identity"
+        ),
+    })?;
+    if cluster.cluster_id != state.cluster_id
+        || cluster.node_id != endpoint.node_id
+        || cluster.process != sinomo_runtime::node::DAEMON_SHADOW_CLUSTER_ROLE
+        || status.port != options.port
+    {
+        return Err(CliError::Parse {
+            detail: format!(
+                "refusing to stop {address}; expected cluster {} node {} daemon-shadow on port {}, got cluster {} node {} {} on port {}",
+                state.cluster_id,
+                endpoint.node_id,
+                options.port,
+                cluster.cluster_id,
+                cluster.node_id,
+                cluster.process,
+                status.port,
+            ),
+        });
+    }
+    send_shutdown(&address)
 }
 
 pub(crate) fn stop_daemon_with_paths(
@@ -621,14 +691,6 @@ pub(crate) fn stop_daemon_with_paths(
             detail: "no daemon lock is held".to_string(),
         }),
     }
-}
-
-pub(crate) fn cli_commit_cluster_kv_txn_with_quorum_response(
-    paths: &ClusterPaths,
-    state: &mut ClusterBootstrapState,
-    txn: KvTxn,
-) -> Result<sinomo_runtime::kv::ClusterKvTxnCommitResult, network::NetworkError> {
-    cli_commit_cluster_kv_request_with_quorum_response(paths, state, KvTxnRequest::generated(txn))
 }
 
 pub(crate) fn cli_commit_cluster_kv_request_with_quorum_response(
@@ -726,12 +788,13 @@ impl CliClusterControlPlaneTransport {
         let connect_timeout = timeout.min(network::DEFAULT_NETWORK_TIMEOUT);
         Some(
             client
-                .object_rpc_to_target_with_deadline(
+                .object_rpc_to_target_with_deadline_and_affinity(
                     target_node_id,
                     request,
                     connect_timeout,
                     Some(timeout),
                     true,
+                    sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
                 )
                 .map_err(|error| {
                     cli_daemon_forward_network_error("daemon-mediated cluster node rpc", error)
@@ -758,8 +821,14 @@ impl CliClusterControlPlaneTransport {
         if let Some(data_dir) = self.matching_data_dir() {
             host = host.with_data_dir(data_dir);
         }
-        let options = network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout);
-        let mut client = network::ClusterObjectRpcClient::routed(&mut host, &self.cluster_paths);
+        let options = cluster::main_daemon_cluster_rpc_options(
+            network::ClusterObjectRpcOptions::default().with_overall_timeout(timeout),
+        );
+        let mut client = network::ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(
+            &mut host,
+            &self.cluster_paths,
+            state,
+        )?;
         let result = runtime.block_on(async {
             let result = client
                 .call_target(
@@ -796,6 +865,122 @@ impl cluster::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
         cli_send_cluster_raft_append(endpoint, request, timeout)
     }
 
+    fn send_kv_read_index_probes(
+        &mut self,
+        state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+        request: &sinomo_runtime::kv::ClusterKvReplicationRequest,
+        timeout: Duration,
+        required_acks: usize,
+    ) -> Result<
+        Vec<(
+            NodeId,
+            Result<sinomo_runtime::kv::ClusterKvReplicationResponse, network::NetworkError>,
+        )>,
+        network::NetworkError,
+    > {
+        let expected_term = request.append.term;
+        let payload =
+            sinomo_runtime::kv::cluster_raft_append_rpc_payload(request).map_err(|error| {
+                network::NetworkError::Io {
+                    operation: "encode concurrent CLI ReadIndex probe".to_string(),
+                    detail: error.to_string(),
+                }
+            })?;
+        let rpc_request = network::ObjectRpcRequest::from_encoded_body(
+            payload.route,
+            payload.category,
+            payload.body,
+        )
+        .with_response_retry_safe();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| network::NetworkError::Io {
+                operation: "CLI concurrent ReadIndex runtime".to_string(),
+                detail: error.to_string(),
+            })?;
+        let cluster_paths = self.cluster_paths.clone();
+        let data_dir = self.matching_data_dir();
+        let state = std::sync::Arc::new(state.clone());
+        let request = std::sync::Arc::new(rpc_request);
+        let result = runtime.block_on(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            for target in targets {
+                let cluster_paths = cluster_paths.clone();
+                let data_dir = data_dir.clone();
+                let state = std::sync::Arc::clone(&state);
+                let request = std::sync::Arc::clone(&request);
+                tasks.spawn(async move {
+                    let mut host = CliEndpointRpcHost::new(
+                        Some(state.cluster_id.clone()),
+                        "cli concurrent ReadIndex signing",
+                    );
+                    if let Some(data_dir) = data_dir {
+                        host = host.with_data_dir(data_dir);
+                    }
+                    let mut client =
+                        network::ClusterObjectRpcClient::routed(&mut host, &cluster_paths);
+                    let result = async {
+                        let response = client
+                            .call_target(
+                                &state,
+                                &target,
+                                network::ObjectRpcCall::value((*request).clone()),
+                                cluster::main_daemon_cluster_rpc_options(
+                                    network::ClusterObjectRpcOptions::default()
+                                        .with_overall_timeout(timeout),
+                                ),
+                            )
+                            .await?
+                            .into_materialized_value_response(usize::MAX)
+                            .await?;
+                        response.error_detail()?;
+                        sinomo_runtime::kv::decode_cluster_raft_append_rpc_response_body(
+                            &response.body,
+                        )
+                        .map_err(|error| network::NetworkError::Io {
+                            operation: "decode concurrent CLI ReadIndex response".to_string(),
+                            detail: error.to_string(),
+                        })
+                    }
+                    .await;
+                    (target, result)
+                });
+            }
+
+            let mut accepted = 0_usize;
+            let mut outcomes = Vec::new();
+            let collect = tokio::time::timeout(timeout, async {
+                while let Some(joined) = tasks.join_next().await {
+                    let (target, result) = joined.map_err(|source| network::NetworkError::Io {
+                        operation: "join concurrent CLI ReadIndex probe".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                    if result.as_ref().is_ok_and(|response| {
+                        response.accepted && response.append.term == expected_term
+                    }) {
+                        accepted = accepted.saturating_add(1);
+                    }
+                    outcomes.push((target, result));
+                    if accepted >= required_acks {
+                        break;
+                    }
+                }
+                Ok::<(), network::NetworkError>(())
+            })
+            .await;
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+            if let Ok(result) = collect {
+                result?;
+            }
+            Ok(outcomes)
+        });
+        runtime.shutdown_timeout(Duration::from_millis(250));
+        result
+    }
+
     fn request_kv_state_authority_vote(
         &mut self,
         endpoint: &ClusterEndpointRecord,
@@ -804,6 +989,130 @@ impl cluster::ClusterControlPlaneTransport for CliClusterControlPlaneTransport {
     ) -> Result<sinomo_runtime::kv::ClusterKvStateAuthorityVoteResponse, network::NetworkError>
     {
         cli_send_cluster_raft_vote(endpoint, request, timeout)
+    }
+
+    fn request_kv_state_authority_votes_from_nodes(
+        &mut self,
+        state: &ClusterBootstrapState,
+        targets: Vec<NodeId>,
+        request: &sinomo_runtime::kv::ClusterKvStateAuthorityVoteRequest,
+        timeout: Duration,
+        required_grants: usize,
+    ) -> Result<
+        Vec<(
+            NodeId,
+            Result<sinomo_runtime::kv::ClusterKvStateAuthorityVoteResponse, network::NetworkError>,
+        )>,
+        network::NetworkError,
+    > {
+        let expected_term = request.vote.term;
+        let payload =
+            sinomo_runtime::kv::cluster_raft_vote_rpc_payload(request).map_err(|error| {
+                network::NetworkError::Io {
+                    operation: "encode concurrent CLI Raft vote".to_string(),
+                    detail: error.to_string(),
+                }
+            })?;
+        let rpc_request = network::ObjectRpcRequest::from_encoded_body(
+            payload.route,
+            payload.category,
+            payload.body,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| network::NetworkError::Io {
+                operation: "CLI concurrent Raft vote runtime".to_string(),
+                detail: error.to_string(),
+            })?;
+        let cluster_paths = self.cluster_paths.clone();
+        let data_dir = self.matching_data_dir();
+        let state = std::sync::Arc::new(state.clone());
+        let request = std::sync::Arc::new(rpc_request);
+        let result = runtime.block_on(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            for target in targets {
+                let cluster_paths = cluster_paths.clone();
+                let data_dir = data_dir.clone();
+                let state = std::sync::Arc::clone(&state);
+                let request = std::sync::Arc::clone(&request);
+                tasks.spawn(async move {
+                    let mut host = CliEndpointRpcHost::new(
+                        Some(state.cluster_id.clone()),
+                        "cli concurrent Raft vote signing",
+                    );
+                    if let Some(data_dir) = data_dir {
+                        host = host.with_data_dir(data_dir);
+                    }
+                    let mut client =
+                        network::ClusterObjectRpcClient::routed(&mut host, &cluster_paths);
+                    let result = async {
+                        let response = client
+                            .call_target(
+                                &state,
+                                &target,
+                                network::ObjectRpcCall::value((*request).clone()),
+                                cluster::main_daemon_cluster_rpc_options(
+                                    network::ClusterObjectRpcOptions::default()
+                                        .with_overall_timeout(timeout),
+                                ),
+                            )
+                            .await?
+                            .into_materialized_value_response(usize::MAX)
+                            .await?;
+                        response.error_detail()?;
+                        sinomo_runtime::kv::decode_cluster_raft_vote_rpc_response_body(
+                            &response.body,
+                        )
+                        .map_err(|error| network::NetworkError::Io {
+                            operation: "decode concurrent CLI Raft vote response".to_string(),
+                            detail: error.to_string(),
+                        })
+                    }
+                    .await;
+                    (target, result)
+                });
+            }
+            let mut granted = 0_usize;
+            let mut outcomes = Vec::new();
+            let collect = tokio::time::timeout(timeout, async {
+                while let Some(joined) = tasks.join_next().await {
+                    let (target, result) = joined.map_err(|source| network::NetworkError::Io {
+                        operation: "join concurrent CLI Raft vote".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                    if result.as_ref().is_ok_and(|response| {
+                        response.accepted
+                            && response.vote.vote_granted
+                            && response.vote.term == expected_term
+                    }) {
+                        granted = granted.saturating_add(1);
+                    }
+                    outcomes.push((target, result));
+                    if granted >= required_grants {
+                        while let Some(joined) = tasks.try_join_next() {
+                            let (target, result) =
+                                joined.map_err(|source| network::NetworkError::Io {
+                                    operation: "join ready concurrent CLI Raft vote".to_string(),
+                                    detail: source.to_string(),
+                                })?;
+                            outcomes.push((target, result));
+                        }
+                        break;
+                    }
+                }
+                Ok::<(), network::NetworkError>(())
+            })
+            .await;
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+            if let Ok(result) = collect {
+                result?;
+            }
+            Ok(outcomes)
+        });
+        runtime.shutdown_timeout(Duration::from_millis(250));
+        result
     }
 
     fn probe_cluster_state_authority(
@@ -1060,6 +1369,115 @@ pub(crate) fn handle_daemon_rollout_build_request(
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    fn explicit_shadow_stop_fixture(
+        process: &str,
+        status_node_id: NodeId,
+    ) -> (ClusterBootstrapState, DaemonRunOptions, DaemonStatus) {
+        let timestamp = OffsetDateTime::UNIX_EPOCH;
+        let cluster_id = Id::from_legacy_named("cluster_explicit_shadow_stop").expect("cluster id");
+        let local_node_id =
+            NodeId::from_legacy_named("node_explicit_shadow_stop_local").expect("local node");
+        let shadow_node_id =
+            NodeId::from_legacy_named("node_explicit_shadow_stop_remote").expect("remote node");
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            shadow_node_id.clone(),
+            "remote",
+            "remote-key",
+            timestamp,
+        );
+        member.endpoints.push(network::daemon_lan_endpoint(
+            &shadow_node_id,
+            "10.14.5.15:21354".to_string(),
+            10,
+        ));
+        let state = ClusterBootstrapState {
+            cluster_id: cluster_id.clone(),
+            cluster_name: "explicit-shadow-stop".to_string(),
+            local_node_id,
+            local_node_display_name: "local".to_string(),
+            term: 1,
+            kv_revision: 1,
+            members: vec![member],
+            initialized_at: timestamp,
+            updated_at: timestamp,
+        };
+        let options = DaemonRunOptions {
+            host: "10.14.5.15".to_string(),
+            port: 21_354,
+        };
+        let root = sinomo_testdir::TestDir::new("sinomo-cli-explicit-shadow-stop-status");
+        let data_dir = SinomoDataDir::new(&root);
+        let status = DaemonStatus::new(
+            &DaemonRunOptions {
+                host: "0.0.0.0".to_string(),
+                port: 21_354,
+            },
+            &DaemonPaths::for_shadow(&data_dir),
+            Some(DaemonClusterStatus {
+                cluster_id,
+                node_id: status_node_id,
+                process: process.to_string(),
+                member_role: ClusterMemberRole::Voter,
+                member_state: ClusterMemberState::Voter,
+            }),
+        );
+        (state, options, status)
+    }
+
+    #[test]
+    fn explicit_shadow_stop_requires_exact_shadow_process_before_shutdown() {
+        let remote_node =
+            NodeId::from_legacy_named("node_explicit_shadow_stop_remote").expect("remote node");
+        let (state, options, status) = explicit_shadow_stop_fixture(
+            sinomo_runtime::node::DAEMON_SHADOW_CLUSTER_ROLE,
+            remote_node.clone(),
+        );
+        let shutdowns = Cell::new(0_u32);
+        let response = stop_explicit_shadow_daemon_with(
+            &state,
+            &options,
+            |_| Ok(status.clone()),
+            |address| {
+                assert_eq!(address, "10.14.5.15:21354");
+                shutdowns.set(shutdowns.get().saturating_add(1));
+                Ok("shadow daemon shutdown requested".to_string())
+            },
+        )
+        .expect("exact shadow stop");
+        assert_eq!(response, "shadow daemon shutdown requested");
+        assert_eq!(shutdowns.get(), 1);
+
+        for (process, node_id) in [
+            (
+                sinomo_runtime::node::DAEMON_MAIN_CLUSTER_ROLE,
+                remote_node.clone(),
+            ),
+            (
+                sinomo_runtime::node::DAEMON_SHADOW_CLUSTER_ROLE,
+                NodeId::from_legacy_named("node_explicit_shadow_stop_wrong").expect("wrong node"),
+            ),
+        ] {
+            let (state, options, status) = explicit_shadow_stop_fixture(process, node_id);
+            let shutdowns = Cell::new(0_u32);
+            let error = stop_explicit_shadow_daemon_with(
+                &state,
+                &options,
+                |_| Ok(status.clone()),
+                |_| {
+                    shutdowns.set(shutdowns.get().saturating_add(1));
+                    Ok("must not stop".to_string())
+                },
+            )
+            .expect_err("wrong process identity must fail closed");
+            assert!(
+                error.to_string().contains("refusing to stop"),
+                "unexpected error: {error}"
+            );
+            assert_eq!(shutdowns.get(), 0);
+        }
+    }
 
     #[test]
     fn cli_control_plane_transport_scopes_daemon_discovery_to_supplied_paths() {

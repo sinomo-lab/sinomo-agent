@@ -32,6 +32,7 @@ use sinomo_agent::{
 };
 use sinomo_cli::app_api::{
     AgentSummary, ProviderSummary, SkillDetail, SkillMutationResult, SkillSummary, agent_summaries,
+    built_in_agent_summaries,
 };
 use sui::{
     Align, Alignment, ArrangeCtx, Checkbox, Command, ConstraintQuery, ConstraintView, Constraints,
@@ -51,6 +52,7 @@ use sinomo_runtime::config::{
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::node::LocalNodePermissions;
+use sinomo_runtime::vfs::VfsHandle;
 
 use crate::backend::Backend;
 use crate::backend::agents::{
@@ -1520,10 +1522,11 @@ impl SettingsState {
         let provider_health = provider_health_states(load_provider_health(config.as_ref()));
         let data_dir = backend.data_dir.clone();
         let skills_include_all = true;
-        let skills_data_dir = data_dir.clone();
         let (skills, skill_selected, skill_detail, skill_action_error) =
-            match crate::backend::run_with_timeout("skill-catalog", sifs_timeout, move || {
-                load_initial_skill_state(skills_data_dir.as_ref(), skills_include_all)
+            match backend.catalog_read_vfs().and_then(|catalog_vfs| {
+                crate::backend::run_with_timeout("skill-catalog", sifs_timeout, move || {
+                    load_initial_skill_state(&catalog_vfs, skills_include_all)
+                })
             }) {
                 Ok(state) => state,
                 Err(error) => {
@@ -4171,7 +4174,7 @@ fn execute_settings_operation(
             include_all,
             selected,
         } => SettingsOperationPayload::Skills(load_skill_operation_success(
-            backend.data_dir.as_ref(),
+            backend,
             include_all,
             selected,
             None,
@@ -4185,7 +4188,7 @@ fn execute_settings_operation(
                 true,
             )?;
             load_skill_operation_success(
-                backend.data_dir.as_ref(),
+                backend,
                 true,
                 Some((result.skill.id.clone(), result.skill.version.clone())),
                 Some(skill_mutation_message(&result)),
@@ -4197,14 +4200,15 @@ fn execute_settings_operation(
             output,
             include_all,
         } => SettingsOperationPayload::Skills((|| {
+            let catalog_vfs = backend.catalog_read_vfs()?;
             let result = sinomo_cli::app_api::export_skill(
-                backend.data_dir.as_ref(),
+                &catalog_vfs,
                 &skill_id,
                 Some(&version),
                 Some(&output),
             )?;
             load_skill_operation_success(
-                backend.data_dir.as_ref(),
+                backend,
                 include_all,
                 Some((skill_id, version)),
                 Some(skill_mutation_message(&result)),
@@ -4221,7 +4225,7 @@ fn execute_settings_operation(
                 Some(&version),
             )?;
             load_skill_operation_success(
-                backend.data_dir.as_ref(),
+                backend,
                 include_all,
                 Some((result.skill.id.clone(), result.skill.version.clone())),
                 Some(skill_mutation_message(&result)),
@@ -4279,9 +4283,16 @@ fn agent_operation_success(
 ) -> AgentOperationSuccess {
     AgentOperationSuccess {
         snapshot: backend.agent_config_snapshot(selected_id),
-        chat_agents: agent_summaries(backend.data_dir.as_ref()),
+        chat_agents: agent_summaries_for_backend(backend),
         effect,
     }
+}
+
+fn agent_summaries_for_backend(backend: &Backend) -> Vec<AgentSummary> {
+    backend
+        .catalog_read_vfs()
+        .map(|vfs| agent_summaries(&vfs))
+        .unwrap_or_else(|_| built_in_agent_summaries())
 }
 
 fn module_operation_success(
@@ -4306,12 +4317,13 @@ fn module_operation_success(
 }
 
 fn load_skill_operation_success(
-    data_dir: &SinomoDataDir,
+    backend: &Backend,
     include_all: bool,
     selected: Option<(String, String)>,
     message: Option<String>,
 ) -> Result<SkillOperationSuccess, String> {
-    let skills = sinomo_cli::app_api::skill_summaries(data_dir, include_all)?;
+    let catalog_vfs = backend.catalog_read_vfs()?;
+    let skills = sinomo_cli::app_api::skill_summaries(&catalog_vfs, include_all)?;
     let selected = selected
         .filter(|(id, version)| {
             skills
@@ -4325,7 +4337,7 @@ fn load_skill_operation_success(
         });
     let detail = match selected.as_ref() {
         Some((id, version)) => Some(sinomo_cli::app_api::skill_detail(
-            data_dir,
+            &catalog_vfs,
             id,
             Some(version),
         )?),
@@ -4340,7 +4352,7 @@ fn load_skill_operation_success(
 }
 
 fn load_initial_skill_state(
-    data_dir: &SinomoDataDir,
+    catalog_vfs: &VfsHandle,
     include_all: bool,
 ) -> (
     Vec<SkillSummary>,
@@ -4348,16 +4360,22 @@ fn load_initial_skill_state(
     Option<SkillDetail>,
     Option<String>,
 ) {
-    let skills = match sinomo_cli::app_api::skill_summaries(data_dir, include_all) {
+    let skills = match sinomo_cli::app_api::skill_summaries(catalog_vfs, include_all) {
         Ok(skills) => skills,
         Err(error) => return (Vec::new(), None, None, Some(error)),
     };
     let selected = skills
         .first()
         .map(|skill| (skill.id.clone(), skill.version.clone()));
-    let detail = selected.as_ref().and_then(|(skill_id, version)| {
-        sinomo_cli::app_api::skill_detail(data_dir, skill_id, Some(version)).ok()
-    });
+    let detail = match selected.as_ref() {
+        Some((skill_id, version)) => {
+            match sinomo_cli::app_api::skill_detail(catalog_vfs, skill_id, Some(version)) {
+                Ok(detail) => Some(detail),
+                Err(error) => return (skills, selected, None, Some(error)),
+            }
+        }
+        None => None,
+    };
     (skills, selected, detail, None)
 }
 
@@ -14661,6 +14679,14 @@ mod tests {
     use crate::state::{AppState, Shared};
     use crate::ui::chat::{ActivityTone, ChatActivityEntry};
 
+    fn backend_with_mounted_agent_catalog() -> Backend {
+        let mut backend = Backend::local_fallback();
+        backend
+            .use_mounted_catalog_reads_for_tests()
+            .expect("test agent catalog VFS");
+        backend
+    }
+
     /// A settings state plus the index of a non-boolean (text-editable) config key, or `None`
     /// when this environment has no such keys registered.
     fn editable_state() -> Option<(SettingsState, usize)> {
@@ -14954,6 +14980,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn initial_skill_state_reports_unavailable_package_content() {
+        use sinomo_agent::{
+            SkillCatalogSifsStore, SkillCatalogSource, SkillCatalogStore, SkillCatalogWrite,
+        };
+
+        let vfs = VfsHandle::memory();
+        let write = SkillCatalogWrite::from_markdown_skill(
+            None,
+            "1.0.0",
+            SkillCatalogSource::user("settings-test"),
+            "---\nname: unavailable-skill\ndescription: Exercise unavailable skill content.\n---\n\n# Unavailable skill\n",
+        )
+        .expect("skill write");
+        let skill_path = write.entry.sifs_path.clone();
+        SkillCatalogSifsStore::from_vfs(vfs.clone())
+            .write_skill_version(write)
+            .expect("persist skill fixture");
+        vfs.remove(&skill_path).expect("remove package content");
+
+        let (skills, selected, detail, error) = load_initial_skill_state(&vfs, true);
+
+        assert_eq!(skills.len(), 1, "catalog descriptor remains visible");
+        assert!(selected.is_some());
+        assert!(detail.is_none());
+        assert!(
+            error.is_some(),
+            "package read failure must not masquerade as an absent detail"
+        );
+    }
+
     fn provider_section_signature_for_state(settings: &SettingsState) -> String {
         let mut parts = vec![
             format!("action-error:{:?}", settings.provider_action_error),
@@ -14979,7 +15036,10 @@ mod tests {
                 .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let backend = Backend::local_fallback_for_data_dir(SinomoDataDir::new(root.clone()));
+        let mut backend = Backend::local_fallback_for_data_dir(SinomoDataDir::new(root.clone()));
+        backend
+            .use_mounted_catalog_reads_for_tests()
+            .expect("test catalog VFS");
         (backend, root)
     }
 
@@ -15971,7 +16031,7 @@ mod tests {
 
     #[test]
     fn agent_settings_state_saves_renames_and_deletes_custom_agent() {
-        let backend = Backend::local_fallback();
+        let backend = backend_with_mounted_agent_catalog();
         let mut state = SettingsState::new(&backend);
 
         state.create_agent();
@@ -16024,7 +16084,7 @@ mod tests {
         );
         assert_eq!(saved.tools.len(), default_tool_count + 1);
         assert!(saved.tools.iter().any(|tool| tool.name == added_tool));
-        let summaries = agent_summaries(backend.data_dir.as_ref());
+        let summaries = agent_summaries_for_backend(&backend);
         assert!(
             summaries.iter().any(|agent| {
                 agent.key == "docs-agent" && agent.description == "Writes project documentation"
@@ -16040,7 +16100,7 @@ mod tests {
             SettingsOperationScope::Agents,
             operation,
         );
-        let summaries = agent_summaries(backend.data_dir.as_ref());
+        let summaries = agent_summaries_for_backend(&backend);
         assert!(summaries.iter().any(|agent| agent.key == "docs-agent-v2"));
         assert!(
             !summaries.iter().any(|agent| agent.key == "docs-agent"),
@@ -16056,7 +16116,7 @@ mod tests {
                 id: "docs-agent-v2".to_string(),
             },
         );
-        let summaries = agent_summaries(backend.data_dir.as_ref());
+        let summaries = agent_summaries_for_backend(&backend);
         assert!(!summaries.iter().any(|agent| agent.key == "docs-agent-v2"));
     }
 
@@ -16127,7 +16187,7 @@ mod tests {
 
     #[test]
     fn agent_settings_state_imports_exports_and_reports_readiness() {
-        let backend = Backend::local_fallback();
+        let backend = backend_with_mounted_agent_catalog();
         let package_path = backend.data_dir.root().join("settings-agent.json");
         let export_dir = backend.data_dir.root().join("agent-exports");
         let definition = AgentDefinition::custom(
@@ -16199,7 +16259,7 @@ mod tests {
 
     #[test]
     fn settings_agents_section_renders_management_controls() -> sui::Result<()> {
-        let backend = Backend::local_fallback();
+        let backend = backend_with_mounted_agent_catalog();
         let mut definition =
             AgentDefinition::custom("render-agent", AgentRole::Main, "Render settings detail.");
         definition.description = "Rendered custom agent".to_string();
@@ -16448,7 +16508,7 @@ mod tests {
 
     #[test]
     fn settings_agents_section_drills_between_list_and_detail_when_compact() -> sui::Result<()> {
-        let backend = Backend::local_fallback();
+        let backend = backend_with_mounted_agent_catalog();
         let mut alpha =
             AgentDefinition::custom("alpha-agent", AgentRole::Main, "Alpha system prompt.");
         alpha.name = "Alpha Agent".to_string();
@@ -16526,7 +16586,7 @@ mod tests {
 
     #[test]
     fn settings_agent_reorder_preserves_virtual_row_ids() -> sui::Result<()> {
-        let backend = Backend::local_fallback();
+        let backend = backend_with_mounted_agent_catalog();
         for (id, name) in [
             ("virtual-agent-alpha", "Virtual agent alpha"),
             ("virtual-agent-beta", "Virtual agent beta"),
