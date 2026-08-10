@@ -460,7 +460,15 @@ fn dfs_attachment_size_for_platform(
     })
 }
 
-pub(crate) fn materialize_dfs_routed_call_sync(
+/// Materializes one routed call for a synchronous in-process or loopback
+/// transport boundary.
+///
+/// Ordinary value calls return their routed message unchanged. Semantic
+/// attachments are collected with the descriptor's exact platform-bounded
+/// size, validated, and attached to the typed DFS message. Network transports
+/// should keep using the owned body source directly instead of materializing
+/// it through this compatibility helper.
+pub fn materialize_dfs_routed_call_sync(
     call: DfsRoutedCall,
 ) -> Result<DfsRoutedMessage, NetworkError> {
     let DfsRoutedCall {

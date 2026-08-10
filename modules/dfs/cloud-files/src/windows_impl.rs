@@ -2956,6 +2956,11 @@ impl DfsCloudFilesEndpointTransport {
         call: DfsRoutedCall,
         require_local_source: bool,
     ) -> std::result::Result<(), NetworkError> {
+        if target_node_id == &self.local_node_id {
+            self.incoming_messages
+                .push_back(dfs::materialize_dfs_routed_call_sync(call)?);
+            return Ok(());
+        }
         let message = &call.message;
         if require_local_source && message.source_node_id != self.local_node_id {
             return Err(NetworkError::FrameSourceMismatch {
@@ -3371,6 +3376,99 @@ mod tests {
         );
         assert_eq!(transport.set_operation_deadline(None), Some(deadline));
         assert_eq!(transport.operation_deadline(), None);
+    }
+
+    #[test]
+    fn cloud_files_transport_queues_local_value_calls_without_network_routing() {
+        let local = NodeId::from_legacy_named("cloud_files_loopback_value").expect("local");
+        let data_dir = SinomoDataDir::new(std::env::temp_dir().join("sinomo-cloud-files-loopback"));
+        let mut transport = DfsCloudFilesEndpointTransport::new(
+            local.clone(),
+            network::ClusterPaths::new(&data_dir),
+            Vec::new(),
+        );
+        let message = DfsRoutedMessage {
+            source_node_id: local.clone(),
+            target_node_id: local.clone(),
+            frame_id: 41,
+            message_id: 41,
+            message: dfs::DfsNetworkMessage::ReadRequest(dfs::DfsReadRequest {
+                request_id: "cloud-files-loopback-read".to_string(),
+                object_id: dfs::DfsObjectId::from_legacy_named("cloud_files_loopback_object")
+                    .expect("object id"),
+                version: None,
+                content_hash: None,
+                content_size_bytes: None,
+                range_offset: None,
+                range_max_bytes: None,
+            }),
+        };
+
+        transport
+            .send_routed_call(&local, DfsRoutedCall::value(message.clone()))
+            .expect("queue local value call");
+
+        assert_eq!(
+            transport
+                .drain_incoming_messages()
+                .expect("drain loopback value"),
+            vec![message]
+        );
+    }
+
+    #[test]
+    fn cloud_files_transport_materializes_local_attachments_before_queueing() {
+        let local = NodeId::from_legacy_named("cloud_files_loopback_attachment").expect("local");
+        let data_dir =
+            SinomoDataDir::new(std::env::temp_dir().join("sinomo-cloud-files-loopback-attachment"));
+        let mut transport = DfsCloudFilesEndpointTransport::new(
+            local.clone(),
+            network::ClusterPaths::new(&data_dir),
+            Vec::new(),
+        );
+        let bytes = b"cloud-files-loopback-attachment".to_vec();
+        let message = DfsRoutedMessage {
+            source_node_id: local.clone(),
+            target_node_id: local.clone(),
+            frame_id: 43,
+            message_id: 43,
+            message: dfs::DfsNetworkMessage::StageBlob(dfs::DfsStageBlobCommand {
+                request_id: "cloud-files-loopback-stage".to_string(),
+                intent_id: "cloud-files-loopback-intent".to_string(),
+                file_system_id: dfs::sifs_file_system_id(),
+                object_id: dfs::DfsObjectId::from_legacy_named(
+                    "cloud_files_loopback_attachment_object",
+                )
+                .expect("object id"),
+                expected_base_version: None,
+                version: dfs::DfsVersion::from_legacy_named(
+                    "cloud_files_loopback_attachment_version",
+                )
+                .expect("version"),
+                content_hash: "cloud-files-loopback-content".to_string(),
+                bytes: Vec::new(),
+                object_metadata: None,
+                authority_shard: None,
+            }),
+        };
+        let call = DfsRoutedCall::with_attachment(
+            message,
+            dfs::DfsOutboundAttachment::from_bytes(bytes.clone(), "cloud-files-loopback-content"),
+        );
+
+        transport
+            .send_routed_call(&local, call)
+            .expect("queue local attachment call");
+
+        let queued = transport
+            .drain_incoming_messages()
+            .expect("drain loopback attachment");
+        assert_eq!(queued.len(), 1);
+        let dfs::DfsNetworkMessage::StageBlob(command) = &queued[0].message else {
+            panic!("expected staged blob loopback message");
+        };
+        assert_eq!(command.bytes, bytes);
+        assert_eq!(command.content_hash, "cloud-files-loopback-content");
     }
 
     #[test]

@@ -293,13 +293,11 @@ pub use maintenance::{
 pub(crate) use maintenance::{
     run_cluster_dfs_maintenance_tick, write_legacy_dfs_metadata_replication_cursor,
 };
+pub(crate) use message_transport::DfsMetadataJournalBatchDirectGroup;
 pub use message_transport::{
     AsyncDfsMessageTransport, DfsMessageTransport, DfsMessageTransportFuture,
     DfsOutboundAttachment, DfsRoutedCall, DfsRoutedSend, DfsRoutedSendOutcome,
-    DfsTransportIdentity,
-};
-pub(crate) use message_transport::{
-    DfsMetadataJournalBatchDirectGroup, materialize_dfs_routed_call_sync,
+    DfsTransportIdentity, materialize_dfs_routed_call_sync,
 };
 pub use metadata_api::{
     DfsMetadataBackend, DfsMetadataReplicaApplyReport, DfsMetadataReplicaIngestPermit,
