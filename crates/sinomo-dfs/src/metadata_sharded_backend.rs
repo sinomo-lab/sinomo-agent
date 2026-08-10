@@ -5476,6 +5476,33 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(None)
     }
 
+    fn get_intent_on_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        object_id: &DfsObjectId,
+        intent_id: &str,
+    ) -> Result<Option<DfsWriteIntentRecord>> {
+        let Some(slot) = self.shards.get(shard_id) else {
+            return Ok(None);
+        };
+        slot.backend()?
+            .get_intent_on_shard(shard_id, object_id, intent_id)
+    }
+
+    fn get_receipt_on_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+    ) -> Result<Option<DfsReplicaReceiptRecord>> {
+        let Some(slot) = self.shards.get(shard_id) else {
+            return Ok(None);
+        };
+        slot.backend()?
+            .get_receipt_on_shard(shard_id, object_id, version, replica_node_id)
+    }
+
     fn write_intent_counter_floor(&self) -> Result<u64> {
         self.shards.values().try_fold(0_u64, |floor, slot| {
             let backend = slot.backend()?;

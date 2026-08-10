@@ -1436,6 +1436,29 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         intent_id: &str,
     ) -> Result<Option<DfsWriteIntentRecord>>;
 
+    /// Fetch one exact write-intent key from one physical local metadata
+    /// shard. Unlike [`Self::get_intent`], this never follows an object index
+    /// or merges historical shard copies. Bounded recovery uses it to prove
+    /// that an active intent has exactly one durable shard provenance before
+    /// making an invisible create visible.
+    fn get_intent_on_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        object_id: &DfsObjectId,
+        intent_id: &str,
+    ) -> Result<Option<DfsWriteIntentRecord>>;
+
+    /// Fetch one exact receipt key from one physical local metadata shard.
+    /// This is the receipt counterpart to [`Self::get_intent_on_shard`] and
+    /// avoids relying on a visible-object routing index during create recovery.
+    fn get_receipt_on_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+    ) -> Result<Option<DfsReplicaReceiptRecord>>;
+
     /// Highest generated intent counter which must not be reused after compact
     /// receipts have been evicted.
     fn write_intent_counter_floor(&self) -> Result<u64> {

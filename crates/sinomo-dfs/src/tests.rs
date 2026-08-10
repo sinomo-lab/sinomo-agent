@@ -1947,6 +1947,68 @@ impl DfsControlPlaneKvClient for CountingSharedDfsControlPlaneKvClient {
     }
 }
 
+#[derive(Clone, Debug)]
+struct FailingMetadataOperationFloorReadKvClient {
+    inner: SharedDfsControlPlaneKvClient<InProcessKvStore>,
+    fail_operation_floor_reads: Arc<AtomicBool>,
+    failed_operation_floor_reads: Arc<AtomicUsize>,
+    refresh_calls: Arc<AtomicUsize>,
+}
+
+impl FailingMetadataOperationFloorReadKvClient {
+    fn new(inner: SharedDfsControlPlaneKvClient<InProcessKvStore>) -> Self {
+        Self {
+            inner,
+            fail_operation_floor_reads: Arc::new(AtomicBool::new(false)),
+            failed_operation_floor_reads: Arc::new(AtomicUsize::new(0)),
+            refresh_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn set_fail_operation_floor_reads(&self, fail: bool) {
+        self.fail_operation_floor_reads
+            .store(fail, Ordering::SeqCst);
+    }
+}
+
+impl DfsControlPlaneKvClient for FailingMetadataOperationFloorReadKvClient {
+    fn refresh_latest(&mut self) -> Result<(), KvError> {
+        self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.with_client(|kv| kv.refresh_latest())
+    }
+
+    fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
+        if key.contains("/metadata-operation-floors/")
+            && self.fail_operation_floor_reads.load(Ordering::SeqCst)
+        {
+            self.failed_operation_floor_reads
+                .fetch_add(1, Ordering::SeqCst);
+            return Err(KvError::Io {
+                path: "test-cluster-authoritative-view".to_string(),
+                detail: "resident Raft view changed after ReadIndex quorum; retry the read"
+                    .to_string(),
+            });
+        }
+        self.inner
+            .with_client(|kv| DfsControlPlaneKvClient::get(kv, key))
+    }
+
+    fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+        self.inner
+            .with_client(|kv| DfsControlPlaneKvClient::range_prefix(kv, prefix))
+    }
+
+    fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
+        self.inner
+            .with_client(|kv| DfsControlPlaneKvClient::put(kv, key, value))
+    }
+
+    fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+        self.inner
+            .with_client(|kv| DfsControlPlaneKvClient::txn(kv, txn))
+    }
+}
+
 #[derive(Clone)]
 struct CountingEmptyTransport {
     local_node_id: NodeId,
@@ -23776,6 +23838,213 @@ fn hydrate_from_metadata_backend_touches_new_object_parent_atomically_once() {
         after_second_restart, after,
         "child visibility must durably prove that the atomic parent touch already ran"
     );
+}
+
+#[test]
+fn hydrate_recovers_zero_byte_create_after_authoritative_view_refresh_failure_once() {
+    let root = temp_root("hydrate-zero-byte-creates-after-authority-refresh-failure");
+    let owner = NodeId::from_legacy_named("node_hydrate_zero_create_refresh_owner").expect("owner");
+    let metadata_replica =
+        NodeId::from_legacy_named("node_hydrate_zero_create_refresh_replica").expect("replica");
+    let file_system = file_system(owner.clone());
+    let metadata_shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: owner.clone(),
+        replica_node_ids: vec![metadata_replica],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let shared_control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    shared_control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&metadata_shard)
+            .expect("metadata shard");
+    });
+    let control_plane =
+        FailingMetadataOperationFloorReadKvClient::new(shared_control_plane.clone());
+    let metadata_root = root.join("metadata");
+    let content_root = root.join("content");
+    let parent_path = "/services/authority-refresh-recovery";
+    let child_path = "/services/authority-refresh-recovery/page-01.txt";
+    let operation_id = format!("cf_{}", sinomo_core::Id::generate());
+    let empty_content_hash = content_hash(&[]);
+    let metadata = open_root_local_metadata_backend(&metadata_root).expect("metadata backend");
+    let mut original = NetworkedDfsService::new(
+        FailingSendTransport {
+            local_node_id: owner.clone(),
+        },
+        LocalContentStore::new(&content_root).expect("content store"),
+    )
+    .with_control_plane(control_plane.clone())
+    .with_metadata_backend(metadata)
+    .expect("attach metadata backend");
+    original
+        .bootstrap_distributed_sifs()
+        .expect("bootstrap SIFS");
+    original
+        .posix_mkdir_all(parent_path)
+        .expect("create parent");
+    let parent_before = original.posix_stat(parent_path).expect("parent before");
+    let parent_version_count_before = original
+        .metadata_backend()
+        .expect("metadata backend")
+        .versions_for_object(&parent_before.object_id)
+        .expect("parent versions before")
+        .len();
+
+    control_plane.set_fail_operation_floor_reads(true);
+    let error = original
+        .posix_create_file_with_contents_and_attrs_and_operation_id(
+            child_path,
+            &[],
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+            DfsPosixCreateAttrs::new(0o640, 6101, 6102),
+            &operation_id,
+        )
+        .expect_err("post-prepare authoritative view failure must reach the caller");
+    assert!(
+        error.to_string().contains("retry the read"),
+        "unexpected injected create error: {error}"
+    );
+    control_plane.set_fail_operation_floor_reads(false);
+    assert!(
+        control_plane
+            .failed_operation_floor_reads
+            .load(Ordering::SeqCst)
+            > 0,
+        "the create must reach the post-prepare operation-floor read"
+    );
+    assert!(
+        control_plane.refresh_calls.load(Ordering::SeqCst) > 0,
+        "bounded retry must refresh the authoritative view before surfacing exhaustion"
+    );
+    let pending_page = original
+        .metadata_backend()
+        .expect("metadata backend")
+        .write_intents_page(None, 16)
+        .expect("pending intents");
+    let pending = pending_page
+        .intents
+        .iter()
+        .filter(|intent| intent.status == DfsWriteIntentStatus::ReceiptsPending)
+        .collect::<Vec<_>>();
+    assert_eq!(pending.len(), 1);
+    let intent = pending[0];
+    assert!(intent.touch_parent_on_create);
+    assert_eq!(
+        intent.content_hash.as_deref(),
+        Some(empty_content_hash.as_str()),
+        "pending intent must retain the canonical zero-byte content identity"
+    );
+    assert_eq!(
+        original
+            .metadata_backend()
+            .expect("metadata backend")
+            .receipts_for_version(&intent.object_id, &intent.target_version)
+            .expect("durable local receipt")
+            .len(),
+        1,
+        "the failed zero-byte create must remain commit-ready"
+    );
+    assert_eq!(
+        original
+            .metadata_backend()
+            .expect("metadata backend")
+            .metadata_summary()
+            .expect("metadata summary")
+            .pending_write_count,
+        1
+    );
+    assert!(
+        original
+            .metadata_backend()
+            .expect("metadata backend")
+            .get_object_by_path(&sifs_file_system_id(), child_path)
+            .expect("hidden path lookup")
+            .is_none(),
+        "failed create must stay hidden until recovery"
+    );
+    drop(original);
+
+    let recovered_metadata =
+        open_root_local_metadata_backend(&metadata_root).expect("recovered metadata backend");
+    let recovered = NetworkedDfsService::new(
+        FailingSendTransport {
+            local_node_id: owner.clone(),
+        },
+        LocalContentStore::new(&content_root).expect("recovered content store"),
+    )
+    .with_control_plane(control_plane.clone())
+    .with_metadata_backend(recovered_metadata)
+    .expect("healthy reopen must recover commit-ready creates");
+    let recovered_child = recovered
+        .posix_stat(child_path)
+        .expect("recovered zero-byte child");
+    assert_eq!(recovered_child.size_bytes, Some(0));
+    assert_eq!(
+        recovered
+            .metadata_backend()
+            .expect("metadata backend")
+            .metadata_summary()
+            .expect("metadata summary")
+            .pending_write_count,
+        0
+    );
+    assert!(recovered.pending_writes.is_empty());
+    let parent_after_recovery = recovered.posix_stat(parent_path).expect("recovered parent");
+    assert_ne!(parent_after_recovery.version, parent_before.version);
+    assert!(parent_after_recovery.modified_at_unix_nanos > parent_before.modified_at_unix_nanos);
+    assert_eq!(
+        recovered
+            .metadata_backend()
+            .expect("metadata backend")
+            .versions_for_object(&parent_before.object_id)
+            .expect("parent versions after recovery")
+            .len(),
+        parent_version_count_before + 1,
+        "the recovered create must touch the parent exactly once"
+    );
+    drop(recovered);
+
+    let reopened_metadata =
+        open_root_local_metadata_backend(&metadata_root).expect("reopened metadata backend");
+    let reopened = NetworkedDfsService::new(
+        FailingSendTransport {
+            local_node_id: owner,
+        },
+        LocalContentStore::new(&content_root).expect("reopened content store"),
+    )
+    .with_control_plane(control_plane)
+    .with_metadata_backend(reopened_metadata)
+    .expect("second reopen must be idempotent");
+    let reopened_child = reopened.posix_stat(child_path).expect("reopened child");
+    assert_eq!(reopened_child.object_id, recovered_child.object_id);
+    assert_eq!(reopened_child.version, recovered_child.version);
+    assert_eq!(reopened_child.size_bytes, Some(0));
+    assert_eq!(
+        reopened.posix_stat(parent_path).expect("reopened parent"),
+        parent_after_recovery,
+        "second hydration must not repeat recovered parent effects"
+    );
+    assert_eq!(
+        reopened
+            .metadata_backend()
+            .expect("metadata backend")
+            .metadata_summary()
+            .expect("metadata summary")
+            .pending_write_count,
+        0
+    );
+    assert!(reopened.pending_writes.is_empty());
+    drop(reopened);
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]

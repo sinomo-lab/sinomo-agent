@@ -9250,6 +9250,31 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             }))
     }
 
+    fn get_intent_on_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        object_id: &DfsObjectId,
+        intent_id: &str,
+    ) -> Result<Option<DfsWriteIntentRecord>> {
+        if shard_id != &self.shard_id {
+            return Ok(None);
+        }
+        self.get_intent(object_id, intent_id)
+    }
+
+    fn get_receipt_on_shard(
+        &self,
+        shard_id: &DfsMetadataShardId,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+    ) -> Result<Option<DfsReplicaReceiptRecord>> {
+        if shard_id != &self.shard_id {
+            return Ok(None);
+        }
+        LocalSobjMetadataBackend::receipt_for_replica(self, object_id, version, replica_node_id)
+    }
+
     fn write_intent_counter_floor(&self) -> Result<u64> {
         let tables = self.current_tables_snapshot()?;
         Ok(tables.intent_receipt_retention.max_evicted_counter())

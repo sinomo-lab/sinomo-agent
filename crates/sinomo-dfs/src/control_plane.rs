@@ -45,6 +45,33 @@ const MAX_RECENT_PLACEMENT_RECONCILIATION_ACTIVITIES: usize = 256;
 const FILE_SYSTEM_CONFIG_CAS_RETRIES: usize = 8;
 const PLACEMENT_AUTHORITY_RECOVERY_CAS_RETRIES: usize = 4;
 
+#[derive(Debug, Eq, PartialEq)]
+enum MetadataOperationPermitAttempt {
+    Certified(String),
+    Rejected,
+    RetryAfterCompareMiss,
+}
+
+fn metadata_operation_authority_view_error_is_retryable(error: &KvError) -> bool {
+    match error {
+        KvError::Busy { .. }
+        | KvError::LeaderOffline { .. }
+        | KvError::QuorumUnavailable { .. }
+        | KvError::CommittedViewUnavailable { .. }
+        | KvError::AuthorityUnavailable { .. } => true,
+        // Cluster-backed clients retain the typed cluster error inside the KV
+        // filesystem adapter. This exact marker is emitted when ReadIndex
+        // reached quorum but the resident Raft generation changed before the
+        // projection was consumed. Retrying the same operation-bound floor is
+        // safe: its digest and prepared sequence are compared in Raft below.
+        KvError::Io { detail, .. } => {
+            detail.contains("resident Raft view changed after ReadIndex quorum")
+                && detail.contains("retry the read")
+        }
+        _ => false,
+    }
+}
+
 /// Exact phrase required by the deliberately exceptional placement-authority
 /// break-glass path. Callers must treat the matching value as an operator
 /// acknowledgement, not as a generic force flag.
@@ -3173,118 +3200,153 @@ impl<'a> DfsControlPlaneStore<'a> {
         let handoff_key =
             metadata_shard_membership_handoff_key(&expected.file_system_id, &expected.shard_id);
         for attempt in 0..METADATA_OPERATION_FLOOR_PUBLISH_RETRIES {
-            let Some(shard_entry) = self.kv.get(&shard_key)? else {
-                return Ok(None);
-            };
-            if shard_entry.decode::<DfsMetadataShardConfig>()? != *expected {
-                return Ok(None);
-            }
-            if self.kv.get(&handoff_key)?.is_some() {
-                return Ok(None);
-            }
-
-            let floor_entry = self.kv.get(&floor_key)?;
-            if let Some(previous_entry) = floor_entry.as_ref() {
-                let previous = previous_entry.decode::<DfsMetadataShardOperationFloor>()?;
-                if previous.authority_epoch == expected.epoch
-                    && previous.prepared_sequence == prepared_sequence
-                    && previous.operation_digest == operation_digest
-                    && !previous.permit_id.is_empty()
-                {
-                    // The floor came from an observational projection. Reuse
-                    // its permit only after one authoritative transaction has
-                    // revalidated the exact assignment, exact floor bytes,
-                    // and absence of a handoff. The nonce advances only the
-                    // generic authority barrier; exact replay must not replace
-                    // the operation floor or mint a new permit.
-                    let response = self.kv.txn(KvTxn {
-                        compares: vec![
-                            KvCompare::ValueEquals {
-                                key: shard_key.clone(),
-                                value: shard_entry.value.clone(),
-                            },
-                            KvCompare::ValueEquals {
-                                key: floor_key.clone(),
-                                value: previous_entry.value.clone(),
-                            },
-                            KvCompare::Missing {
-                                key: handoff_key.clone(),
-                            },
-                        ],
-                        success: vec![KvOp::Put {
-                            key: metadata_shard_authority_barrier_key(
-                                &expected.file_system_id,
-                                &expected.shard_id,
-                            ),
-                            value: sinomo_core::kv::encode_kv_value(
-                                &sinomo_core::Id::generate().to_string(),
-                            )?,
-                            lease_id: None,
-                        }],
-                        failure: Vec::new(),
-                    })?;
-                    if response.succeeded {
-                        return Ok(Some(previous.permit_id));
-                    }
-                    if attempt + 1 < METADATA_OPERATION_FLOOR_PUBLISH_RETRIES {
-                        self.kv.refresh_latest()?;
-                        continue;
-                    }
-                    return Ok(None);
-                }
-                if previous.authority_epoch > expected.epoch
-                    || previous.prepared_sequence > prepared_sequence
-                    || (previous.prepared_sequence == prepared_sequence
-                        && previous.operation_digest != operation_digest)
-                {
-                    return Ok(None);
-                }
-            }
-
-            let permit_id = sinomo_core::Id::generate().to_string();
-            let floor = DfsMetadataShardOperationFloor {
-                operation_digest: operation_digest.to_string(),
+            let retryable_error = match self.certify_metadata_shard_operation_once(
+                expected,
+                operation_digest,
                 prepared_sequence,
-                authority_epoch: expected.epoch,
-                permit_id: permit_id.clone(),
+                &shard_key,
+                &floor_key,
+                &handoff_key,
+            ) {
+                Ok(MetadataOperationPermitAttempt::Certified(permit_id)) => {
+                    return Ok(Some(permit_id));
+                }
+                Ok(MetadataOperationPermitAttempt::Rejected) => return Ok(None),
+                Ok(MetadataOperationPermitAttempt::RetryAfterCompareMiss) => None,
+                Err(error) if metadata_operation_authority_view_error_is_retryable(&error) => {
+                    Some(error)
+                }
+                Err(error) => return Err(error),
             };
-            let floor_compare = match floor_entry.as_ref() {
-                Some(entry) => KvCompare::ValueEquals {
-                    key: floor_key.clone(),
-                    value: entry.value.clone(),
-                },
-                None => KvCompare::Missing {
-                    key: floor_key.clone(),
-                },
-            };
-            let response = self.kv.txn(KvTxn {
-                compares: vec![
-                    KvCompare::ValueEquals {
-                        key: shard_key.clone(),
-                        value: shard_entry.value,
-                    },
-                    floor_compare,
-                    KvCompare::Missing {
-                        key: handoff_key.clone(),
-                    },
-                ],
-                success: vec![KvOp::put_serde(floor_key.clone(), &floor, None)?],
-                failure: Vec::new(),
-            })?;
-            if response.succeeded {
-                return Ok(Some(permit_id));
+            if attempt + 1 == METADATA_OPERATION_FLOOR_PUBLISH_RETRIES {
+                return match retryable_error {
+                    Some(error) => Err(error),
+                    None => Ok(None),
+                };
             }
-            // Reads above may come from a lagging materialized projection,
-            // while the transaction compare always executes against the
-            // authoritative Raft state. Do not repeat the same stale CAS for
-            // every retry: refresh before rebuilding the next compare. This
-            // path is reached only after the healthy full-shard DFS authority
-            // probe could not complete.
-            if attempt + 1 < METADATA_OPERATION_FLOOR_PUBLISH_RETRIES {
-                self.kv.refresh_latest()?;
+            // Reads may come from a lagging materialized projection while the
+            // transaction compare executes against authoritative Raft. A
+            // ReadIndex generation race is equally observational: refresh and
+            // replay the same digest/prepare sequence instead of leaking a
+            // commit-ready DFS intent to the caller as a permanent failure.
+            if let Err(error) = self.kv.refresh_latest() {
+                if metadata_operation_authority_view_error_is_retryable(&error) {
+                    continue;
+                }
+                return Err(error);
             }
         }
-        Ok(None)
+        unreachable!("metadata operation floor retry loop always returns")
+    }
+
+    fn certify_metadata_shard_operation_once(
+        &mut self,
+        expected: &DfsMetadataShardConfig,
+        operation_digest: &str,
+        prepared_sequence: u64,
+        shard_key: &str,
+        floor_key: &str,
+        handoff_key: &str,
+    ) -> Result<MetadataOperationPermitAttempt, KvError> {
+        let Some(shard_entry) = self.kv.get(shard_key)? else {
+            return Ok(MetadataOperationPermitAttempt::Rejected);
+        };
+        if shard_entry.decode::<DfsMetadataShardConfig>()? != *expected {
+            return Ok(MetadataOperationPermitAttempt::Rejected);
+        }
+        if self.kv.get(handoff_key)?.is_some() {
+            return Ok(MetadataOperationPermitAttempt::Rejected);
+        }
+
+        let floor_entry = self.kv.get(floor_key)?;
+        if let Some(previous_entry) = floor_entry.as_ref() {
+            let previous = previous_entry.decode::<DfsMetadataShardOperationFloor>()?;
+            if previous.authority_epoch == expected.epoch
+                && previous.prepared_sequence == prepared_sequence
+                && previous.operation_digest == operation_digest
+                && !previous.permit_id.is_empty()
+            {
+                // The floor may come from an observational projection. Reuse
+                // its permit only after an authoritative transaction verifies
+                // the assignment, exact floor bytes, and missing handoff.
+                let response = self.kv.txn(KvTxn {
+                    compares: vec![
+                        KvCompare::ValueEquals {
+                            key: shard_key.to_string(),
+                            value: shard_entry.value.clone(),
+                        },
+                        KvCompare::ValueEquals {
+                            key: floor_key.to_string(),
+                            value: previous_entry.value.clone(),
+                        },
+                        KvCompare::Missing {
+                            key: handoff_key.to_string(),
+                        },
+                    ],
+                    success: vec![KvOp::Put {
+                        key: metadata_shard_authority_barrier_key(
+                            &expected.file_system_id,
+                            &expected.shard_id,
+                        ),
+                        value: sinomo_core::kv::encode_kv_value(
+                            &sinomo_core::Id::generate().to_string(),
+                        )?,
+                        lease_id: None,
+                    }],
+                    failure: Vec::new(),
+                })?;
+                return if response.succeeded {
+                    Ok(MetadataOperationPermitAttempt::Certified(
+                        previous.permit_id,
+                    ))
+                } else {
+                    Ok(MetadataOperationPermitAttempt::RetryAfterCompareMiss)
+                };
+            }
+            if previous.authority_epoch > expected.epoch
+                || previous.prepared_sequence > prepared_sequence
+                || (previous.prepared_sequence == prepared_sequence
+                    && previous.operation_digest != operation_digest)
+            {
+                return Ok(MetadataOperationPermitAttempt::Rejected);
+            }
+        }
+
+        let permit_id = sinomo_core::Id::generate().to_string();
+        let floor = DfsMetadataShardOperationFloor {
+            operation_digest: operation_digest.to_string(),
+            prepared_sequence,
+            authority_epoch: expected.epoch,
+            permit_id: permit_id.clone(),
+        };
+        let floor_compare = match floor_entry.as_ref() {
+            Some(entry) => KvCompare::ValueEquals {
+                key: floor_key.to_string(),
+                value: entry.value.clone(),
+            },
+            None => KvCompare::Missing {
+                key: floor_key.to_string(),
+            },
+        };
+        let response = self.kv.txn(KvTxn {
+            compares: vec![
+                KvCompare::ValueEquals {
+                    key: shard_key.to_string(),
+                    value: shard_entry.value,
+                },
+                floor_compare,
+                KvCompare::Missing {
+                    key: handoff_key.to_string(),
+                },
+            ],
+            success: vec![KvOp::put_serde(floor_key.to_string(), &floor, None)?],
+            failure: Vec::new(),
+        })?;
+        if response.succeeded {
+            Ok(MetadataOperationPermitAttempt::Certified(permit_id))
+        } else {
+            Ok(MetadataOperationPermitAttempt::RetryAfterCompareMiss)
+        }
     }
 
     /// Refresh cluster configuration and verify that `expected` is still the
@@ -5637,6 +5699,49 @@ mod tests {
 
         fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
             self.authoritative.txn(txn)
+        }
+    }
+
+    #[derive(Debug)]
+    struct RetryAuthoritativeViewKv {
+        inner: InProcessKvStore,
+        remaining_retryable_get_failures: AtomicUsize,
+        refresh_calls: AtomicUsize,
+    }
+
+    impl DfsControlPlaneKvClient for RetryAuthoritativeViewKv {
+        fn refresh_latest(&mut self) -> Result<(), KvError> {
+            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
+            if self
+                .remaining_retryable_get_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    (remaining > 0).then(|| remaining - 1)
+                })
+                .is_ok()
+            {
+                return Err(KvError::Io {
+                    path: "test-cluster-authoritative-view".to_string(),
+                    detail: "resident Raft view changed after ReadIndex quorum; retry the read"
+                        .to_string(),
+                });
+            }
+            Ok(self.inner.get(key).cloned())
+        }
+
+        fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+            self.inner.range_prefix(prefix)
+        }
+
+        fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
+            self.inner.put(key, value, None)
+        }
+
+        fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+            self.inner.txn(txn)
         }
     }
 
@@ -8818,6 +8923,73 @@ mod tests {
         assert_eq!(committed.prepared_sequence, requested_sequence);
         assert_eq!(committed.authority_epoch, shard.epoch);
         assert_eq!(committed.permit_id, permit_id);
+    }
+
+    #[test]
+    fn metadata_operation_floor_retries_readindex_generation_race() {
+        let owner = node("node_operation_floor_readindex_retry_owner");
+        let replica = node("node_operation_floor_readindex_retry_replica");
+        let file_system_id = file_system_id();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner,
+            replica_node_ids: vec![replica],
+            epoch: 74,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut inner = InProcessKvStore::new();
+        DfsControlPlaneStore::new(&mut inner)
+            .put_metadata_shard(&shard)
+            .expect("put metadata shard");
+        let mut client = RetryAuthoritativeViewKv {
+            inner,
+            remaining_retryable_get_failures: AtomicUsize::new(1),
+            refresh_calls: AtomicUsize::new(0),
+        };
+
+        let digest = "blake3:readindex-generation-retry";
+        let sequence = 20452;
+        let permit_id = DfsControlPlaneStore::new(&mut client)
+            .certify_metadata_shard_operation(&shard, digest, sequence)
+            .expect("retry transient authoritative view")
+            .expect("operation permit");
+
+        assert_eq!(client.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            client
+                .remaining_retryable_get_failures
+                .load(Ordering::SeqCst),
+            0
+        );
+        let floor = client
+            .inner
+            .get(&metadata_shard_operation_floor_key(
+                &file_system_id,
+                &shard.shard_id,
+            ))
+            .expect("operation floor")
+            .decode::<DfsMetadataShardOperationFloor>()
+            .expect("decode operation floor");
+        assert_eq!(floor.operation_digest, digest);
+        assert_eq!(floor.prepared_sequence, sequence);
+        assert_eq!(floor.authority_epoch, shard.epoch);
+        assert_eq!(floor.permit_id, permit_id);
+
+        assert!(!metadata_operation_authority_view_error_is_retryable(
+            &KvError::Io {
+                path: "test-disk".to_string(),
+                detail: "permission denied".to_string(),
+            }
+        ));
+        assert!(!metadata_operation_authority_view_error_is_retryable(
+            &KvError::Io {
+                path: "test-disk".to_string(),
+                detail: "permission denied; retry the read".to_string(),
+            }
+        ));
     }
 
     #[test]
